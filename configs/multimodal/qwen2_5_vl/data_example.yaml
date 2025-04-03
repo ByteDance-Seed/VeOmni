@@ -1,0 +1,11 @@
+sources:
+- seed.seed.sharegpt4v_captioner
+- seed.seed.fineweb_100BT
+names:
+- sharegpt4v_captioner
+- fineweb_100BT
+schedule:
+- schedule_type: const
+  init_token: 0
+  end_token: 100000000000000
+  weights: [1, 0]

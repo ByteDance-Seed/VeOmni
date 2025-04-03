@@ -1,0 +1,46 @@
+model:
+  model_path: deepseek-ai/DeepSeek-V3-0324
+  attn_implementation: flash_attention_2
+  moe_implementation: fused
+
+data:
+  train_path: None
+  data_type: conversation
+  chat_template: default
+  max_seq_len: 8192
+  train_size: 40000000
+  text_keys: messages
+
+train:
+  output_dir: deepseek_v3
+  data_parallel_mode: fsdp1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 8
+  global_batch_size: 32
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: true
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+  optimizer: adamw
+  lr: 3.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: bytecheckpoint
+  load_checkpoint_path: ""
+  save_steps: 100
+  save_hf_weights: true
+  wandb_project: DeepSeek-V3
+  wandb_name: dsv3_sft_ep8

@@ -6,7 +6,7 @@
 ## VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework
 
 <p align="center">
-  <a href="https://github.com/Byte dance-Seed/VeOmni/stargazers">
+  <a href="https://github.com/ByteDance-Seed/VeOmni/stargazers">
     <img src="https://img.shields.io/github/stars/ByteDance-Seed/VeOmni?style=social"></a>
   <a href="https://github.com/ByteDance-Seed/VeOmni">
     <img src="https://img.shields.io/badge/VeOmni-Project Page-yellow"></a>
@@ -23,96 +23,121 @@
 
 </div>
 
-## News
-<br>
-[2025/04/03]🔥We release VeOmni.
+## 🔗 Overview
+VeOmni is a versatile framework for both single- and multi-modal pre-training and post-training. It empowers users to seamlessly scale models of any modality across various accelerators, offering both flexibility and user-friendliness.
 
-## Overview
-VeOmni is a versatile single-modal/multi-modal pre-training/post-training framework. With VeOmni, users can easily scale any modality model to any accelerator, making it flexible and user-friendly.
+Our guiding principles when building VeOmni are:
+- **Flexibility and Modularity**: VeOmni is built with a modular design, allowing users to decouple most components and replace them with their own implementations as needed.
+- **Trainer-free**: VeOmni avoids rigid, structured trainer classes (e.g., [PyTorch-Lightning](https://github.com/Lightning-AI/pytorch-lightning) or [HuggingFace](https://huggingface.co/docs/transformers/v4.50.0/en/main_classes/trainer#transformers.Trainer) Trainer). Instead, VeOmni keeps training scripts linear, exposing the entire training logic to users for maximum transparency and control.
+
+- **Omni model native**: VeOmni enables users to effortlessly scale any omni-model across devices and accelerators.
+- **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
+
+### 🔥 Latest News
+
+- [2025/04/03] We release VeOmni.
 
 
-## Table of Contents
+## 🔖 Table of Contents
+
 - [VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework](#veomni-scaling-any-modality-model-training-to-any-accelerators-with-pytorch-native-training-framework)
-- [News](#news)
-- [Overview](#overview)
-- [Table of Contents](#table-of-contents)
-- [Key Features](#key-features)
-  - [Upcoming Features](#upcoming-features)
-- [Getting Started](#getting-started)
-  - [Installation](#installation)
-  - [Quick Start](#quick-start)
-  - [Merge checkpoints](#merge-checkpoints)
-  - [Build Docker](#build-docker)
-- [Training Examples](#training-examples)
-- [Supported Models](#supported-models)
-- [Performance](#performance)
-- [Acknowledgement](#acknowledgement)
-- [Citation](#citation)
-- [About ByteDance Seed Team](#about-bytedance-seed-team)
+- [🔗 Overview](#-overview)
+  - [🔥 Latest News](#-latest-news)
+- [🔖 Table of Contents](#-table-of-contents)
+- [📚 Key Features](#-key-features)
+  - [🧪 Upcoming Features](#-upcoming-features)
+- [🎈 Getting Started](#-getting-started)
+  - [🔧 Installation](#-installation)
+  - [🚀 Quick Start](#-quick-start)
+  - [🔒 Merge checkpoints](#-merge-checkpoints)
+  - [📦 Build Docker](#-build-docker)
+- [🧱 Training Examples](#-training-examples)
+- [✏️ Supported Models](#️-supported-models)
+- [⛰️ Performance](#️-performance)
+- [😊 Acknowledgement](#-acknowledgement)
+- [💡 Awesome work using VeOmni](#-awesome-work-using-veomni)
+- [🎨 Contributing](#-contributing)
+- [📝 Citation](#-citation)
+- [🌱 About ByteDance Seed Team](#-about-bytedance-seed-team)
 
-
-## Key Features
+## 📚 Key Features
 
 - **Parallelism**
-    - Parallel state by [DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html)
-    - Torch FSDP1/2
-    - Experts parallelism
-    - Tensor parallelism
-    - Easy to add new parallelism plan
-    - Sequence parallelism
-      - [Ulysess](https://arxiv.org/abs/2309.14509)
-      - Async ulysses
-    - Activation offloading
-    - Activation checkpointing
+  - Parallel state by [DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html)
+  - Torch FSDP1/2
+  - Experts parallelism(Experimental)
+  - Easy to add new parallelism plan
+  - Sequence parallelism
+    - [Ulysess](https://arxiv.org/abs/2309.14509)
+    - Async-Ulysses
+  - Activation offloading
+  - Activation checkpointing
 - **Kernels**
-    - GroupGemm ops for moe
-    - [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) integrations
+  - GroupGemm ops for moe
+  - [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) integrations
 - **Model**
   - Any [transformers](https://github.com/huggingface/transformers) models.
   - Multi-modal
-    - Qwen2VL
+    - Qwen2.5-VL
+    - Qwen2-VL
     - Seed-Omni
-    - ...
 - **Data IO**
-    - Dynamic batching strategy
-    - Omnidata processing
+  - Dynamic batching strategy
+  - Omnidata processing
 - **Distributed Checkpointing**
-  - [ByteCheckpoint](https://arxiv.org/abs/2407.20143)(Recommend)
+  - [ByteCheckpoint](https://github.com/ByteDance-Seed/ByteCheckpoint) (Recommend)
   - Torch Distributed checkpointing
   - Dcp merge tools
 - **Other tools**
   - Profiling tools
   - Easy yaml configuration and argument parsing
 
-### Upcoming Features
+### 🧪 Upcoming Features
+
 - [ ] [veScale](https://github.com/volcengine/veScale/tree/main) FSDP
+- [ ] Torch native parallelism
 - [ ] torch.compile
-- [ ] Torch native pipeline parallelism
 - [ ] [Flux: Fine-grained Computation-communication Overlapping GPU Kernel](https://github.com/bytedance/flux/tree/main/test) integrations
 - [ ] Better offloading strategy
-- [ ] Ring attention
 - [ ] More models support
+- [ ] Torch native pipeline parallelism
 
-## Getting Started
-### Installation
+
+## 🎈 Getting Started
+
+Read the [VeOmni Best Practice](docs/start/best_practice.md) for more details.
+
+### 🔧 Installation
+
+Install using PyPI:
+
+```shell
+pip3 install veomni
+```
+
+Install from source code:
+
 ```shell
 pip3 install -e .
 ```
 
-- Install veScale(optional)
+Install veScale(Not available yet)
+
 ```shell
 git clone https://github.com/volcengine/veScale.git
 pip3 install .
 ```
 
-### Quick Start
-Start training like this:
+### 🚀 Quick Start
+
+User can quickly start training like this:
 
 ```shell
 bash train.sh $TRAIN_SCRIPT $CONFIG.yaml
 ```
 
-You can override arguments in yaml by passing arguments from an external command line
+You can also override arguments in yaml by passing arguments from an external command line:
+
 ```shell
 bash train.sh $TRAIN_SCRIPT $CONFIG.yaml \
     --model.model_path PATH/TO/MODEL \
@@ -120,10 +145,10 @@ bash train.sh $TRAIN_SCRIPT $CONFIG.yaml \
     --train.global_batch_size GLOBAL_BATCH_SIZE \
 ```
 
-Here is an end-to-end workflow for preparing a subset of the fineweb dataset, continue training an qwen2_5 model with sequence parallel 2 for 20 steps, and than merge the global_step_10 distributed checkpoint to hf weight by ByteCheckpoint.
+Here is an end-to-end workflow for preparing a subset of the fineweb dataset, continuing training a qwen2_5 model with sequence parallel 2 for 20 steps, and then merging the global_step_10 distributed checkpoint to hf weight by ByteCheckpoint.
 
+1. Download fineweb dataset
 
-- Download fineweb dataset
 ```shell
 python3 scripts/download_hf_data.py \
   --repo_id HuggingFaceFW/fineweb \
@@ -131,25 +156,30 @@ python3 scripts/download_hf_data.py \
   --allow_patterns sample/10BT/*
 ```
 
-- Download qwen2_5 model
+2. Download qwen2_5 model
+
 ```shell
 python3 scripts/download_hf_model.py \
   --repo_id Qwen/Qwen2.5-7B \
-  --local_dir Qwen2.5-7B
+  --local_dir .
 ```
 
-- Start training
+3. Training
+
 ```shell
 bash train.sh tasks/train_torch.py configs/pretrain/qwen2_5.yaml \
-    --model.model_path Qwen2.5-7B \
+    --model.model_path ./Qwen2.5-7B \
     --data.train_path ./fineweb/sample/10BT/ \
+    --train.global_batch_size 512 \
+    --train.lr 5e-7 \
     --train.ulysses_parallel_size 2 \
     --train.save_steps 10 \
     --train.max_steps 20 \
-    --train.output_dir Qwen2.5-7B-Instruct_CT
+    --train.output_dir Qwen2.5-7B_CT
 ```
 
-- merge checkpoints
+4. Merge checkpoints
+
 ```shell
 python3 scripts/mereg_dcp_to_hf.py \
     --load-dir Qwen2.5-7B-Instruct_CT/checkpoints/global_step_10 \
@@ -157,15 +187,17 @@ python3 scripts/mereg_dcp_to_hf.py \
     --save-dir Qwen2.5-7B-Instruct_CT/checkpoints/global_step_10/hf_ckpt
 ```
 
-- test inference
+5. Inference
+
 ```shell
 python3 tasks/infer.py \
-  --infer.model_path Qwen2.5-7B-Instruct_CT/checkpoints/global_step_10/hf_ckpt \
+  --infer.model_path Qwen2.5-7B-Instruct_CT/checkpoints/global_step_10/hf_ckpt
 ```
 
 
-### Merge checkpoints
-we use ByteCheckpoint to save checkpoints in torch.distributed.checkpoint(dcp) format. you can merge dcp file by this command:
+### 🔒 Merge checkpoints
+
+we use [ByteCheckpoint](https://github.com/ByteDance-Seed/ByteCheckpoint) to save checkpoints in torch.distributed.checkpoint(dcp) format. You can merge the dcp files using this command:
 
 ```shell
 python3 scripts/mereg_dcp_to_hf.py \
@@ -174,7 +206,7 @@ python3 scripts/mereg_dcp_to_hf.py \
     --save-dir PATH/TO/SAVE_HF_WEIGHT \
 ```
 
-for example, your output_dir is like this `seed_omni`, you want to merge global_step_100 checkpoint to hf weight.
+For example, your output_dir is `seed_omni`, and you want to merge global_step_100 checkpoint to huggingface-type weight:
 
 ```shell
 python3 scripts/mereg_dcp_to_hf.py \
@@ -183,31 +215,36 @@ python3 scripts/mereg_dcp_to_hf.py \
     --save-dir seed_omni/hf_ckpt \
 ```
 
-### Build Docker
+### 📦 Build Docker
+
 ```shell
 cd docker/
 docker compose up -d
 docker compose exec VeOmni bash
 ```
 
-## Training Examples
-- PyTorch FSDP2 Qwen2VL
+## 🧱 Training Examples
+
+PyTorch FSDP2 Qwen2VL
+
 ```shell
 bash train.sh tasks/multimodal/omni/train_qwen2_vl.py configs/multimodal/qwen2_vl/qwen2_vl.yaml
 ```
 
-- PyTorch FSDP2 Qwen2 CT
+PyTorch FSDP2 Qwen2
 
 ```shell
-bash train.sh tasks/train_torch.py  configs/pretrain/qwen2_5.yaml
+bash train.sh tasks/train_torch.py configs/pretrain/qwen2_5.yaml
 ```
 
-- PyTorch FSDP2 llama3-8b-instruct CT
+PyTorch FSDP2 llama3-8b-instruct
+
 ```shell
 bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 ```
 
-## Supported Models
+## ✏️ Supported Models
+
 | Model                                                             | Model size                       | Example config File                                       |
 | ----------------------------------------------------------------- | -------------------------------- | --------------------------------------------------------- |
 | [DeepSeek 2.5/3/R1](https://huggingface.co/deepseek-ai)           | 236B/671B                        | [deepseek.yaml](configs/pretrain/deepseek.yaml)           |
@@ -221,20 +258,31 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 > If you want to add a new model, you can add a new model in the model registry. See in [Support costom model]() docs.
 
-## Performance
+## ⛰️ Performance
+
 Coming soon with tech report.
 
-## Acknowledgement
+## 😊 Acknowledgement
+
 Thanks to the following projects for their excellent work:
-- [veScale](https://github.com/volcengine/veScale)
-- [torchtitan](https://github.com/pytorch/torchtitan/)
-- [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
-- [torchtune](https://github.com/pytorch/torchtune)
-- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
+
 - [ByteCheckpoint](https://arxiv.org/abs/2407.20143)
+- [veScale](https://github.com/volcengine/veScale)
+- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
+- [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
+- [torchtitan](https://github.com/pytorch/torchtitan/)
+- [torchtune](https://github.com/pytorch/torchtune)
+
+## 💡 Awesome work using VeOmni
+- [UI-TARS](https://github.com/bytedance/UI-TARS)
+
+## 🎨 Contributing
+
+Contributions from the community are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) our project roadmap(To be updated),
 
 
-## Citation
+## 📝 Citation
+
 If you find VeOmni useful for your research and applications, feel free to give us a star ⭐ or cite us using:
 
 ```bibtex
@@ -248,7 +296,8 @@ If you find VeOmni useful for your research and applications, feel free to give 
 }
 ```
 
-## About [ByteDance Seed Team](https://team.doubao.com/)
+
+## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
 
 ![seed logo](https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216)
 

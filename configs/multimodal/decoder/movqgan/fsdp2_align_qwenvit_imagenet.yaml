@@ -1,0 +1,21 @@
+model:
+  model_path: movqgan_270M
+  teacher_model_path: qwen2-vision-model
+  teacher_model_kwargs:
+    return_hidden_states: true
+  model_kwargs:
+    use_semantic_decoder: true
+
+data:
+  train_path: imagenet1k_train
+
+train:
+  output_dir: movqgan_align_qwenvit_imagenet
+  data_parallel_mode: fsdp2
+  rmpad: false
+  lr: 1.0e-4
+  lr_decay_style: constant
+  num_train_epochs: 40
+  micro_batch_size: 8
+  global_batch_size: 128
+  enable_gradient_checkpointing: False

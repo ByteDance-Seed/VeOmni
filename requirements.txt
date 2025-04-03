@@ -1,6 +1,12 @@
+blobfile>=3.0.0
+bytecheckpoint
 byted-hdfs-io # https://www.piwheels.org/project/byted-hdfs-io/
 datasets>=2.16.0,<=2.21.0
 diffusers>=0.30.0,<=0.31.0
+flash-attn>=2.6.3
+liger-kernel>=0.5.5
 packaging>=23.0,<26.0
+tiktoken>=0.9.0
 torchdata>=0.8.0,<1.0
 transformers[torch]>=4.46.2,<=4.49.0
+wandb

@@ -1,0 +1,25 @@
+model:
+  model_path: hdfs://haruna/home/byte_data_seed/ssd_lq/public/veomni/models/qwen2_5vl-7b-instruct
+
+data:
+  train_path: configs/multimodal/qwen2_5_vl/data_example.yaml
+  data_type: conversation
+  chat_template: qwen2_5vl
+  max_seq_len: 8196 # max_seq_len >= image nums * max_pixels // patch_size ** 2 // adapooling_factor ** 2
+  train_size: 80000000
+
+train:
+  output_dir: qwen2_5_vl_sft
+  data_parallel_mode: fsdp1
+  wandb_project: qwen2_5_vl
+  wandb_name: qwen2_5_vl
+  rmpad: false
+  rmpad_with_pos_ids: true
+  ulysses_parallel_size: 1
+  freeze_vit: false
+  lr: 1.0e-5
+  lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_steps: 2000

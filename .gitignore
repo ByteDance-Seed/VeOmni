@@ -58,9 +58,6 @@ coverage.xml
 local_settings.py
 db.sqlite3
 
-# streaming log
-logfile
-
 # Flask stuff:
 instance/
 .webassets-cache
@@ -131,7 +128,7 @@ log*
 veomni_cli.yaml
 demo.parquet
 
-# omnistore
+# bytecheckpoint
 *.metadata
 *.distcp
 *.pt

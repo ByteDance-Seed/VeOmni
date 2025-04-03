@@ -1,6 +1,22 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "veomni"
+dynamic = ["dependencies", "optional-dependencies"]
+version = "0.0.3"
+authors = [
+  { name="Fazzie", email="maqianli.fazzie@bytedance.com" },
+]
+description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[project.urls]
+Homepage = "https://github.com/ByteDance-Seed/VeOmni"
+Issues = "https://github.com/ByteDance-Seed/VeOmni/issues"
 
 [tool.ruff]
 target-version = "py38"
@@ -17,16 +33,10 @@ select = ["C", "E", "F", "I", "W"]
 [tool.ruff.lint.isort]
 lines-after-imports = 2
 known-first-party = ["veomni"]
-known-third-party = ["torch", "transformers", "vescale", "wandb"]
+known-third-party = ["torch", "transformers", "wandb"]
 
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
-
-[tool.pytest.ini_options]
-addopts = [
-    "--ignore=tests/test_streaming_data.py",
-    "--ignore=tests/test_model_saveload.py",
-]

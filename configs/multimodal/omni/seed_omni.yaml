@@ -1,0 +1,25 @@
+model:
+  model_path: qwen2vl-7b-foundation
+  input_encoder: encoder
+  output_encoder: encoder
+  encoders:
+    image:
+      model_path: qwen2-vision-model
+      add_projector: false
+
+data:
+  train_path: sharegpt4v_pretrain
+  data_type: conversation
+  chat_template: qwen2vl
+  max_seq_len: 8192
+
+train:
+  output_dir: omni_sft
+  data_parallel_mode: fsdp1
+  rmpad: false
+  lr: 1.0e-5
+  lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 2
+  global_batch_size: 64
+  freeze_encoder: true

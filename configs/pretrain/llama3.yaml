@@ -1,0 +1,42 @@
+model:
+  model_path: meta-llama/Meta-Llama-3-8B
+
+data:
+  train_path: fineweb_100BT
+  train_size: 1000000000000
+  data_type: plaintext
+  max_seq_len: 8192
+  text_keys: text
+  drop_last: true
+
+train:
+  output_dir: llama3-8b
+  data_parallel_mode: fsdp1
+  ulysses_parallel_size: 1
+  global_batch_size: 512
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: true
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  optimizer: adamw
+  lr: 3.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: bytecheckpoint
+  load_checkpoint_path: ""
+  save_steps: 100
+  save_hf_weights: true
+  wandb_project: Meta-Llama-3-8B
+  wandb_name: Meta-Llama-3-8B-CT
