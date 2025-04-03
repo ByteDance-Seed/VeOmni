@@ -10,14 +10,14 @@
     <img src="https://img.shields.io/github/stars/ByteDance-Seed/VeOmni?style=social"></a>
   <a href="https://github.com/ByteDance-Seed/VeOmni">
     <img src="https://img.shields.io/badge/VeOmni-Project Page-yellow"></a>
-  <a href="https://arxiv.org/pdf/2502.19811">
-    <img src="https://img.shields.io/badge/VeOmni-Tech Report-red"></a>
   <a href="XXXX">
+    <img src="https://img.shields.io/badge/VeOmni-Tech Report-red"></a>
+  <a href="https://huggingface.co/ByteDance-Seed">
     <img src="https://img.shields.io/badge/VeOmni-Hugging Face-orange"></a>
   <br>
-  <a href="https://github.com/user-attachments/assets/d3fcb3bf-466b-4efe-8c3f-5f85258202ae">
-    <img src="https://img.shields.io/badge/VeOmni-Wechat Communication Group-07C160"></a>
   <a href="XXX">
+    <img src="https://img.shields.io/badge/VeOmni-Wechat Communication Group-07C160"></a>
+  <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-Apache--2.0-blue"></a>
 </p>
 
