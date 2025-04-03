@@ -57,6 +57,7 @@ Our guiding principles when building VeOmni are:
 - [😊 Acknowledgement](#-acknowledgement)
 - [💡 Awesome work using VeOmni](#-awesome-work-using-veomni)
 - [🎨 Contributing](#-contributing)
+- [📄 License](#-license)
 - [📝 Citation](#-citation)
 - [🌱 About ByteDance Seed Team](#-about-bytedance-seed-team)
 
@@ -280,6 +281,10 @@ Thanks to the following projects for their excellent work:
 
 Contributions from the community are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) our project roadmap(To be updated),
 
+## 📄 License
+
+This project is licensed under Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+
 
 ## 📝 Citation
 
@@ -295,7 +300,6 @@ If you find VeOmni useful for your research and applications, feel free to give 
       url={https://github.com/ByteDance-Seed/VeOmni},
 }
 ```
-
 
 ## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
 
