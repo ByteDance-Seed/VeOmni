@@ -61,6 +61,16 @@ if is_fused_moe_available():
 if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
+from ....utils.import_utils import is_liger_kernel_available
+
+
+if is_liger_kernel_available():
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss  # type: ignore
+    from liger_kernel.transformers.rms_norm import LigerRMSNorm
+    from liger_kernel.transformers.rope import liger_rotary_pos_emb
+    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "DeepseekV3Config"
@@ -299,7 +309,13 @@ class DeepseekV3MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        if is_liger_kernel_available():
+            down_proj = self.down_proj(
+                LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x))
+            )
+        else:
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
         return down_proj
 
 
@@ -1405,21 +1421,27 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-        logits = logits.float()
-
+        logits = None
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            if is_liger_kernel_available():
+                loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="mean")
+                hidden_states = hidden_states[..., :-1, :].contiguous()
+                hidden_states = hidden_states.view(-1, self.config.hidden_size)
+                loss = loss_fct(self.lm_head.weight, hidden_states, shift_labels)
+            else:
+                logits = self.lm_head(hidden_states)
+                logits = logits.float()
+                shift_logits = logits[..., :-1, :].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1624,4 +1646,23 @@ class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
         )
 
 
+def apply_rotary_pos_emb_deepseek_v3(q, k, cos, sin, unsqueeze_dim=1):
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    q_embed, k_embed = liger_rotary_pos_emb(q, k, cos, sin)
+    return q_embed, k_embed
+
+
+if is_liger_kernel_available():
+    apply_rotary_pos_emb = apply_rotary_pos_emb_deepseek_v3
+    DeepseekV3RMSNorm = LigerRMSNorm
+    logger.info_rank0("Apply liger kernel to Deepseek-V3.")
+
+
 ModelClass = DeepseekV3ForCausalLM
+
+__all__ = ["DeepseekV3ForCausalLM", "DeepseekV3Model"]
