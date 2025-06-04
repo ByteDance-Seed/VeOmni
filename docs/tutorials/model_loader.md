@@ -16,7 +16,7 @@ VeOmni uses a model registry system that allows you to:
 1. Support both HuggingFace models and their custom implementations
 2. Register your custom model implementation
 3. Automatically load the appropriate model based on the configuration
- 
+
 ## 🔍 Model Registry System
 
 To enable users to quickly train models from HuggingFace and flexibly train custom models, VeOmni adopts a model registration system to support model loading and initialization. This design is inspired by [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang). An overall architecture diagram is shown below.
@@ -81,11 +81,11 @@ class YourCustomConfig(PretrainedConfig):
 
 class YourCustomModel(PreTrainedModel):
     config_class = YourCustomConfig
-    
+
     def __init__(self, config):
         super().__init__(config)
         # Initialize your model components
-        
+
     def forward(self, input_ids, **kwargs):
         ...
 

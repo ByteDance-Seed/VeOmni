@@ -107,7 +107,7 @@ class DataCollatorWithPacking(DataCollator):
         seqlens = torch.tensor([len(feature["input_ids"]) for feature in features], dtype=torch.long)
         batch = {"cu_seqlens": len2culen(seqlens)}
         for input_name in features[0].keys():
-            if input_name in ("input_ids", "attention_mask", "labels"):
+            if input_name in ("input_ids", "attention_mask", "labels", "id"):
                 batch[input_name] = torch.cat([feature[input_name] for feature in features])
             else:
                 batch[input_name] = default_collate([feature[input_name] for feature in features])
@@ -124,7 +124,7 @@ class DataCollatorWithPositionIDs(DataCollator):
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = {}
         for input_name in features[0].keys():
-            if input_name in ("input_ids", "attention_mask", "labels", "position_ids"):
+            if input_name in ("input_ids", "attention_mask", "labels", "position_ids", "id"):
                 batch[input_name] = torch.cat([feature[input_name] for feature in features], dim=-1).unsqueeze(0)
             else:
                 batch[input_name] = default_collate([feature[input_name] for feature in features])
@@ -158,7 +158,12 @@ class UnpackDataCollator(DataCollator):
     """
 
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
-        return features[0]
+        if len(features) == 0:
+            raise ValueError("features is empty")
+        if isinstance(features[0], list):
+            return [f for feature in features for f in feature]
+        else:
+            return features
 
 
 @dataclass

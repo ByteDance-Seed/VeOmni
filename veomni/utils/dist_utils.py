@@ -38,12 +38,13 @@ def all_reduce(
     data: Union[int, float, List[Union[int, float]], "torch.Tensor"],
     op: Literal["mean", "sum", "max"] = "mean",
     group: Optional["ProcessGroup"] = None,
+    device: Optional[torch.device] = torch.device("cuda"),
 ) -> Union[int, float, List[Union[int, float]]]:
     """
     Performs all reduce in the given process group.
     """
     if not isinstance(data, torch.Tensor):
-        data = torch.tensor(data, dtype=torch.float, device="cuda")
+        data = torch.tensor(data, dtype=torch.float, device=device)
 
     reduce_ops = {"mean": dist.ReduceOp.SUM, "sum": dist.ReduceOp.SUM, "max": dist.ReduceOp.MAX}
     dist.all_reduce(data, op=reduce_ops[op], group=group)
