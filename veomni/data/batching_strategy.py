@@ -165,7 +165,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
 
     def put_item(self, item: Dict[str, Any]):
         if len(item["input_ids"]) == 1:
-            print("WARNING: EMPTY STRING.")
+            print("WARNING: EMPTY STRING.", item)
             return
         self.buffer.append(item)
 
