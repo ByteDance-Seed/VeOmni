@@ -421,7 +421,7 @@ def main():
 
         data_loader_tqdm.close()
         start_step = 0
-        helper.print_device_mem_info(f"VRAM usage after epoch {epoch+1}")
+        helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
