@@ -15,7 +15,7 @@
   <a href="https://huggingface.co/ByteDance-Seed">
     <img src="https://img.shields.io/badge/VeOmni-Hugging Face-orange"></a>
   <br>
-  <a href="https://github.com/ByteDance-Seed/VeOmni">
+  <a href="https://github.com/ByteDance-Seed/VeOmni/asserts/wechat.png">
     <img src="https://img.shields.io/badge/VeOmni-Wechat Communication Group-07C160"></a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-Apache--2.0-blue"></a>
