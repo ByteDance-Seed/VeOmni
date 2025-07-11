@@ -71,7 +71,7 @@ class ModelArguments:
         default=False,
         metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
     )
-    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2"]] = field(
+    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3"]] = field(
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
@@ -124,7 +124,7 @@ class DataArguments:
         default=10_000_000,
         metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
     )
-    data_type: Literal["plaintext", "conversation"] = field(
+    data_type: Literal["plaintext", "conversation", "diffusion"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -629,6 +629,7 @@ def parse_args(rootclass: T) -> T:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     base_to_subclass = {}
     dict_fields = set()
+    list_fields = set()
     for subclass in fields(rootclass):
         base = subclass.name
         base_to_subclass[base] = subclass.default_factory
@@ -680,6 +681,7 @@ def parse_args(rootclass: T) -> T:
             elif isclass(origin_type) and issubclass(origin_type, list):
                 parser_kwargs["type"] = attr_type.__args__[0]
                 parser_kwargs["nargs"] = "+"
+                list_fields.add(f"{base}.{attr.name}")
                 if attr.default_factory is not MISSING:
                     parser_kwargs["default"] = attr.default_factory()
                 elif attr.default is MISSING:
@@ -720,8 +722,16 @@ def parse_args(rootclass: T) -> T:
     for base, arg_dict in input_data.items():
         for arg_name, arg_value in arg_dict.items():
             if f"--{base}.{arg_name}=" not in cmd_args_string:  # lower priority
+                # Skip list fields with None values to use default
+                if f"{base}.{arg_name}" in list_fields and arg_value is None:
+                    continue
+
                 cmd_args.append(f"--{base}.{arg_name}")
-                cmd_args.append(arg_value if isinstance(arg_value, str) else json.dumps(arg_value))
+                if f"{base}.{arg_name}" in list_fields and isinstance(arg_value, list):
+                    # For list fields, extend the arguments with individual elements
+                    cmd_args.extend([str(item) for item in arg_value])
+                else:
+                    cmd_args.append(arg_value if isinstance(arg_value, str) else json.dumps(arg_value))
 
     args, remaining_args = parser.parse_known_args(cmd_args)
     if remaining_args:

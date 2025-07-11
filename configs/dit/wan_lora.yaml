@@ -1,0 +1,59 @@
+model:
+  model_path: Wan-AI/Wan2.1-I2V-14B-480P
+  config_path: ./configs/model_configs/wan/wani2v_14b.json
+  attn_implementation: flash_attention_2
+  lora_target_modules: q,k,v,o,ffn.0,ffn.2
+  lora_rank: 32
+  lora_alpha: 32
+
+data:
+  train_path: Wanmini480
+  train_size: 1000000000000
+  dataloader_type: native
+  data_type: diffusion
+  max_seq_len: 8192
+  text_keys: text
+  drop_last: true
+  datasets_repeat: 10
+
+train:
+  output_dir: wan2.1-i2v-14b-480p
+  train_architecture: lora
+  data_parallel_mode: fsdp1
+  ulysses_parallel_size: 4
+  global_batch_size: 8
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: bytecheckpoint
+  load_checkpoint_path: ""
+  max_steps: 200
+  save_epochs: 1
+  num_train_epochs: 20
+  save_hf_weights: true
+  use_wandb: false
+  wandb_project: Wan2.1-I2V-14B-480P
+  wandb_name: lora_wan_i2v_14b
+  ops_to_save:
+    # - aten.addmm.default
+    - torch.ops.flash_attn._flash_attn_forward.default
+    - aten._scaled_dot_product_flash_attention.default
+    - torch.ops.flash_attn_3.fwd.default
