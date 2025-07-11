@@ -23,7 +23,7 @@ from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel, MixedPr
 from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.checkpoint import noop_context_fn
+from torch.utils.checkpoint import create_selective_checkpoint_contexts, noop_context_fn
 
 from ..models import load_model_weights
 from ..utils import logging
@@ -97,11 +97,12 @@ def build_parallelize_model(
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        ops_to_save = kwargs.pop("ops_to_save", None)
+        context_fn = (
+            partial(create_selective_checkpoint_contexts, ops_to_save) if ops_to_save is not None else noop_context_fn
+        )
         model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={
-                "use_reentrant": use_reentrant,
-                "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
-            },
+            gradient_checkpointing_kwargs={"use_reentrant": use_reentrant, "context_fn": context_fn}
         )
 
     if parallel_state.tp_enabled:

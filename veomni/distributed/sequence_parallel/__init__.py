@@ -44,6 +44,7 @@ from .ulysses import (
     gather_outputs,
     gather_seq_scatter_heads,
     slice_input_tensor,
+    slice_input_tensor_scale_grad,
 )
 from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
 
@@ -66,6 +67,7 @@ __all__ = [
     "get_unified_sequence_parallel_rank",
     "get_unified_sequence_parallel_world_size",
     "slice_input_tensor",
+    "slice_input_tensor_scale_grad",
     "gather_heads_scatter_seq",
     "gather_seq_scatter_heads",
     "all_to_all_images",
