@@ -225,6 +225,22 @@ def slice_input_tensor(x: Tensor, dim: int, padding: bool = True, group: Process
     return x[slc].contiguous()
 
 
+def slice_input_tensor_scale_grad(
+    x: Tensor,
+    dim: int,
+    group: ProcessGroup = None,
+    scale_grad=True,
+):
+    """
+    A func to gather the outputs for the model result in sequence parallel
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    if not group:
+        return x
+    x = _Slice.apply(group, x, dim, scale_grad)
+    return x
+
+
 def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:
     """
     A func to sync attention result with alltoall in sequence parallel
