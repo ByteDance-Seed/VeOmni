@@ -21,14 +21,10 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from veomni.utils import logging
-
 from .comm import get_ulysses_sequence_parallel_group
 from .ulysses import all_to_all_tensor
 from .utils import padding_tensor_for_seqeunce_parallel, unpadding_tensor_for_seqeunce_parallel
 
-
-logger = logging.get_logger(__name__)
 
 fused_layer_norm_cuda = None
 
@@ -381,7 +377,6 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
         unpadded_dim_size: int,
         group: ProcessGroup,
     ):
-        # logger.info_rank0(f"unpadded_dim_size: {unpadded_dim_size}")
         sp_group = get_ulysses_sequence_parallel_group() if group is None else group
 
         # out projection
@@ -437,8 +432,6 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
 
         # output grad communication collect
         grad_o = grad_out_res()
-        # logger.info_rank0(f"grad_o: {grad_o.shape}")
-        # logger.info_rank0(f"unpadded_dim_size: {unpadded_dim_size}")
         grad_o = unpadding_tensor_for_seqeunce_parallel(grad_o, seq_dimension, unpadded_dim_size)
 
         return (
