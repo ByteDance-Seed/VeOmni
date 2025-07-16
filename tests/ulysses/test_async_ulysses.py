@@ -13,14 +13,9 @@ from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.comm import set_ulysses_sequence_parallel_group
-from veomni.distributed.sequence_parallel.ulysses import (
-    gather_outputs,
-    slice_input_tensor,
-)
-from veomni.distributed.sequence_parallel.utils import (
-    unpadding_tensor_for_seqeunce_parallel,
-)
-from veomni.utils.helper import set_seed
+from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
+from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
 from .utils import (
@@ -164,4 +159,5 @@ if __name__ == "__main__":
     assert not torch.cuda._initialized, "test_distributed must not have initialized CUDA context on main process"
 
     set_seed(seed=0, full_determinism=True)
+    enable_high_precision_for_bf16()
     run_tests()

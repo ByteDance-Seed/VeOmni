@@ -12,15 +12,13 @@ import torch.distributed as dist
 from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.sequence_parallel.comm import set_ulysses_sequence_parallel_group
-from veomni.distributed.sequence_parallel.ulysses import (
-    gather_outputs,
-    slice_input_tensor,
+from veomni.distributed.sequence_parallel.comm import (
+    get_ulysses_sequence_parallel_group,
+    set_ulysses_sequence_parallel_group,
 )
-from veomni.distributed.sequence_parallel.utils import (
-    unpadding_tensor_for_seqeunce_parallel,
-)
-from veomni.utils.helper import set_seed
+from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
+from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
 from .utils import (
@@ -65,9 +63,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
     @skip_if_lt_x_gpu(4)
     def test_self_attn(self):
         self._get_process_group()
+        sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data()
         unpad_size = full_input.size(1)
-        part_input = slice_input_tensor(full_input, dim=1)
+        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
         full_input.requires_grad = True
         part_input.requires_grad = True
 
@@ -85,7 +84,9 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
         # forward & backward for sp
         sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False)
+        sp_full_rst = gather_outputs(
+            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+        )
         loss_sp = loss_func(sp_rst)
         loss_sp.backward()
         attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
@@ -114,9 +115,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
     @skip_if_lt_x_gpu(4)
     def test_self_attn_padding(self):
         self._get_process_group()
+        sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data_for_padding()
         unpad_size = full_input.size(1)
-        part_input = slice_input_tensor(full_input, dim=1)
+        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
         full_input.requires_grad = True
         part_input.requires_grad = True
 
@@ -134,7 +136,9 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
         # forward & backward for sp
         sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False)
+        sp_full_rst = gather_outputs(
+            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+        )
         loss_sp = loss_func(sp_rst)
         loss_sp.backward()
         attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
@@ -164,4 +168,5 @@ if __name__ == "__main__":
     assert not torch.cuda._initialized, "test_distributed must not have initialized CUDA context on main process"
 
     set_seed(seed=0, full_determinism=True)
+    enable_high_precision_for_bf16()
     run_tests()

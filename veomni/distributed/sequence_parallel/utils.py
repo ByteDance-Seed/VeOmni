@@ -56,10 +56,10 @@ def padding_tensor_for_seqeunce_parallel(x: Tensor, dim: int, group: ProcessGrou
     return x
 
 
-def pad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
+def pad_tensor(x: Tensor, dim: int, padding_size: int, padding_value: int = 0) -> Tensor:
     shape = list(x.shape)
     shape[dim] = padding_size
-    pad = torch.zeros(shape, dtype=x.dtype, device=x.device)
+    pad = torch.full(shape, padding_value, dtype=x.dtype, device=x.device)
     return torch.cat([x, pad], dim=dim)
 
 

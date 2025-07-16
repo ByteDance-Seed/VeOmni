@@ -22,13 +22,11 @@ from torch.distributed import ProcessGroup
 
 from .comm import (
     get_ulysses_sequence_parallel_group,
-    get_ulysses_sequence_parallel_rank,
     get_ulysses_sequence_parallel_world_size,
 )
 from .utils import (
     pad_tensor,
     unpad_tensor,
-    unpadding_tensor_for_seqeunce_parallel,
 )
 
 
@@ -36,13 +34,16 @@ def _all_gather(
     x: Tensor,
     group: dist.ProcessGroup,
 ):
-    dim_size = list(x.size())
+    device = x.device
+    dtype = x.dtype
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
-    dim_size[0] = dim_size[0] * sp_world_size
-    output = torch.empty(dim_size, dtype=x.dtype, device=torch.cuda.current_device())
-    dist.all_gather_into_tensor(output, x, group=group)
-    return output
+    x_size = torch.tensor(x.size()).to(device)
+    size_list = [torch.zeros(x_size.size(), dtype=torch.int64, device=device) for i in range(sp_world_size)]
+    dist.all_gather(size_list, x_size, group=group)
+    tensor_list = [torch.zeros(torch.Size(size_list[i]), dtype=dtype, device=device) for i in range(sp_world_size)]
+    dist.all_gather(tensor_list, x, group=group)
+    return tensor_list, size_list
 
 
 def _all_to_all(
@@ -188,11 +189,10 @@ class _Gather(torch.autograd.Function):
         ctx.grad_scale = grad_scale
         seq_world_size = dist.get_world_size(group)
         ctx.seq_world_size = seq_world_size
-        dim_size = list(local_input.size())
-        split_size = dim_size[0]
-        ctx.part_size = dim_size[dim]
-        output = _all_gather(local_input.contiguous(), group=ctx.group)
-        return torch.cat(output.split(split_size), dim=dim)
+        output, size_list = _all_gather(local_input.contiguous(), group=ctx.group)
+        dim_size_list = [size_list[i][dim].item() for i in range(seq_world_size)]
+        ctx.dim_size_list = dim_size_list
+        return torch.cat(output, dim=dim)
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
@@ -200,45 +200,10 @@ class _Gather(torch.autograd.Function):
             grad_output = grad_output * ctx.seq_world_size
         return (
             None,
-            grad_output.split(ctx.part_size, dim=ctx.dim)[ctx.rank].contiguous(),
+            grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous(),
             None,
             None,
         )
-
-
-def slice_input_tensor(x: Tensor, dim: int, padding: bool = True, group: ProcessGroup = None) -> Tensor:
-    """
-    A func to slice the input sequence in sequence parallel
-    """
-    group = get_ulysses_sequence_parallel_group() if group is None else group
-    if not group:
-        return x
-    sp_rank = get_ulysses_sequence_parallel_rank(group)
-    sp_world = get_ulysses_sequence_parallel_world_size(group)
-    dim_size = x.shape[dim]
-    unit = (dim_size + sp_world - 1) // sp_world
-    if padding and dim_size % sp_world:
-        padding_size = sp_world - (dim_size % sp_world)
-        x = pad_tensor(x, dim, padding_size)
-    slc = [slice(None)] * len(x.shape)
-    slc[dim] = slice(unit * sp_rank, unit * (sp_rank + 1))
-    return x[slc].contiguous()
-
-
-def slice_input_tensor_scale_grad(
-    x: Tensor,
-    dim: int,
-    group: ProcessGroup = None,
-    scale_grad=True,
-):
-    """
-    A func to gather the outputs for the model result in sequence parallel
-    """
-    group = get_ulysses_sequence_parallel_group() if group is None else group
-    if not group:
-        return x
-    x = _Slice.apply(group, x, dim, scale_grad)
-    return x
 
 
 def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:
@@ -279,26 +244,6 @@ def gather_seq_scatter_heads(
             padding_size = x.size(seq_dim) - unpadded_dim_size
             x = unpad_tensor(x, seq_dim, padding_size)
         return x
-
-
-def gather_outputs(
-    x: Tensor,
-    gather_dim: int,
-    padding_dim: Optional[int] = None,
-    unpad_dim_size: Optional[int] = None,
-    scale_grad=True,
-    group: ProcessGroup = None,
-):
-    """
-    A func to gather the outputs for the model result in sequence parallel
-    """
-    group = get_ulysses_sequence_parallel_group() if group is None else group
-    if not group:
-        return x
-    x = _Gather.apply(group, x, gather_dim, scale_grad)
-    if padding_dim is not None:
-        x = unpadding_tensor_for_seqeunce_parallel(x, padding_dim, unpad_dim_size, group)
-    return x
 
 
 def gather_seq_scatter_heads_qkv(

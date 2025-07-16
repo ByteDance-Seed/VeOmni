@@ -37,14 +37,17 @@ from .comm import (
     set_ulysses_sequence_parallel_group,
     set_unified_sequence_parallel_group,
 )
+from .data import (
+    gather_outputs,
+    sequence_parallel_preprocess,
+    slice_input_tensor,
+    slice_position_embedding,
+)
 from .loss import reduce_sequence_parallel_loss
 from .ulysses import (
     all_to_all_images,
     gather_heads_scatter_seq,
-    gather_outputs,
     gather_seq_scatter_heads,
-    slice_input_tensor,
-    slice_input_tensor_scale_grad,
 )
 from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
 
@@ -68,6 +71,8 @@ __all__ = [
     "get_unified_sequence_parallel_world_size",
     "slice_input_tensor",
     "slice_input_tensor_scale_grad",
+    "slice_position_embedding",
+    "sequence_parallel_preprocess",
     "gather_heads_scatter_seq",
     "gather_seq_scatter_heads",
     "all_to_all_images",
