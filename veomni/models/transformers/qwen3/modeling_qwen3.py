@@ -25,10 +25,7 @@ from transformers.utils import (
 )
 
 from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
-)
+from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
 from ...modeling_layers import GradientCheckpointingLayer
@@ -204,25 +201,6 @@ class Qwen3Attention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        # ulysses sp patch
-        if get_parallel_state().ulysses_enabled:
-            ulysses_group = get_parallel_state().ulysses_group
-            ulysses_size = get_parallel_state().ulysses_size
-            assert self.config.num_attention_heads % ulysses_size == 0, (
-                f"num_query_heads ({self.config.num_attention_heads}) must be divisible by ulysses_size ({ulysses_size})"
-            )
-            if ulysses_size > self.config.num_key_value_heads:
-                assert ulysses_size % self.config.num_key_value_heads == 0, (
-                    f"ulysses_size ({ulysses_size}) must be divisible by num_key_value_heads ({self.config.num_key_value_heads})"
-                )
-                n_repeat = ulysses_size // self.config.num_key_value_heads
-                key_states = repeat_kv(key_states, n_repeat)
-                value_states = repeat_kv(value_states, n_repeat)
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=2, head_dim=1, group=ulysses_group)
-            key_states = gather_seq_scatter_heads(key_states, seq_dim=2, head_dim=1, group=ulysses_group)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=2, head_dim=1, group=ulysses_group)
-        # ulysses sp patch
-
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -252,12 +230,6 @@ class Qwen3Attention(nn.Module):
             sliding_window=self.sliding_window,  # diff with Llama
             **kwargs,
         )
-
-        # ulysses sp patch
-        if get_parallel_state().ulysses_enabled:
-            ulysses_group = get_parallel_state().ulysses_group
-            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, group=ulysses_group)
-        # ulysses sp patch
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -499,6 +471,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -567,6 +540,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # --- slice position embedding if using sp ---
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
+        # --- slice position embedding if using sp ---
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None

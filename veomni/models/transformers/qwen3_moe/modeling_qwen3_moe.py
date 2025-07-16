@@ -45,10 +45,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 
 from ....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
 from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
-)
+from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
 from ....utils.import_utils import is_fused_moe_available, is_liger_kernel_available
@@ -307,6 +304,7 @@ class Qwen3MoeAttention(nn.Module):
         )
         self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.sliding_window = getattr(config, "sliding_window", None)
 
     def forward(
         self,
@@ -317,20 +315,12 @@ class Qwen3MoeAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-        hidden_shape = (bsz, q_len, -1, self.head_dim)
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        if get_parallel_state().ulysses_enabled:
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=2, head_dim=1)
-            key_states = gather_seq_scatter_heads(key_states, seq_dim=2, head_dim=1)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=2, head_dim=1)
-
-        full_q_len = query_states.size(2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -340,23 +330,9 @@ class Qwen3MoeAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        sliding_window = None
-        if (
-            self.config.use_sliding_window
-            and getattr(self.config, "sliding_window", None) is not None
-            and self.layer_idx >= self.config.max_window_layers
-        ):
-            sliding_window = self.config.sliding_window
-
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -366,13 +342,11 @@ class Qwen3MoeAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=sliding_window,  # main diff with Llama
+            sliding_window=self.sliding_window,  # diff with Llama
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(bsz, full_q_len, -1).contiguous()
-        if get_parallel_state().ulysses_enabled:
-            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -853,6 +827,10 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # --- slice position embedding if using sp ---
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
+        # --- slice position embedding if using sp ---
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None

@@ -38,19 +38,14 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 
-from ....data.constants import IGNORE_INDEX
 from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
-    reduce_sequence_parallel_loss,
-)
+from ....distributed.sequence_parallel import slice_position_embedding
+from ....ops.loss import causallm_loss_function
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
 
 
 if is_liger_kernel_available():
-    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss  # type: ignore
     from liger_kernel.transformers.rms_norm import LigerRMSNorm
     from liger_kernel.transformers.rope import liger_rotary_pos_emb
     from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
@@ -175,19 +170,13 @@ class Qwen2Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()  # q_len = seq_length / sp_size
-        hidden_shape = (bsz, q_len, -1, self.head_dim)
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        if get_parallel_state().ulysses_enabled:
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=2, head_dim=1)
-            key_states = gather_seq_scatter_heads(key_states, seq_dim=2, head_dim=1)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=2, head_dim=1)
-            # (batch_size, num_head / sp_size, seq_length, head_size)
 
-        full_q_len = query_states.size(2)  # full_q_len = seq_length
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -226,11 +215,7 @@ class Qwen2Attention(nn.Module):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(bsz, full_q_len, -1, self.head_dim).contiguous()
-        if get_parallel_state().ulysses_enabled:
-            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1)
-
-        attn_output = attn_output.reshape(bsz, q_len, self.config.hidden_size).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -518,6 +503,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         )
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -583,6 +569,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # --- slice position embedding if using sp ---
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
+        # --- slice position embedding if using sp ---
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -802,6 +792,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.loss_function = causallm_loss_function
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -880,25 +871,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if not get_parallel_state().sp_enabled and labels is not None:
-            # Shift so that tokens < n predict n
-            labels = labels[..., 1:].contiguous()
-            labels = labels.view(-1)
-            if (
-                position_ids is not None
-                and position_ids.size(0) == 1
-                and not (torch.diff(position_ids, dim=-1) >= 0).all()
-            ):
-                position_ids_ = position_ids.flatten()
-                indices_q = torch.arange(position_ids_.size(0), device=position_ids_.device, dtype=torch.int32)
-                cu_seq_lens = torch.cat(
-                    (
-                        indices_q[position_ids_ == 0],
-                        torch.tensor(position_ids_.size(), device=position_ids_.device, dtype=torch.int32),
-                    )
-                )
-                labels[cu_seq_lens[1:-1] - 1] = IGNORE_INDEX
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -921,34 +893,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
-        if labels is not None:
-            labels = labels.view(-1)  # flatten label
-            if is_liger_kernel_available():
-                loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="mean")
-                if not get_parallel_state().sp_enabled:
-                    # Shift so that tokens < n predict n
-                    hidden_states = hidden_states[..., :-1, :].contiguous()
-
-                hidden_states = hidden_states.view(-1, self.config.hidden_size)
-                loss = loss_fct(self.lm_head.weight, hidden_states, labels)
-            else:
-                loss_fct = torch.nn.CrossEntropyLoss(reduction="mean")
-                logits = self.lm_head(hidden_states)
-                # Upcast to float if we need to compute the loss to avoid potential precision issues
-                logits = logits.float()
-                if not get_parallel_state().sp_enabled:
-                    # Shift so that tokens < n predict n
-                    logits = logits[..., :-1, :].contiguous()
-
-                # Flatten the tokens
-                logits = logits.view(-1, self.vocab_size)
-                loss = loss_fct(logits, labels)
-
-            if get_parallel_state().sp_enabled:
-                num_valid_tokens = (labels != IGNORE_INDEX).sum()
-                loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
-        else:
-            logits = self.lm_head(hidden_states)
+        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

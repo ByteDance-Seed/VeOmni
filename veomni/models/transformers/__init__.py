@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+from ...ops.attention import flash_attention_forward
+
+
+ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+
 from . import deepseek_v3, llama, qwen2, qwen2_vl, qwen3, qwen3_moe, wan
 
 
