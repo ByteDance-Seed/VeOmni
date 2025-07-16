@@ -41,6 +41,7 @@ from .data import (
     gather_outputs,
     sequence_parallel_preprocess,
     slice_input_tensor,
+    slice_input_tensor_scale_grad,
     slice_position_embedding,
 )
 from .loss import reduce_sequence_parallel_loss

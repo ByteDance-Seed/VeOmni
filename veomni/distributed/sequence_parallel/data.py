@@ -7,8 +7,8 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 
 from ...data.constants import IGNORE_INDEX
-from .comm import get_unified_sequence_parallel_group
-from .ulysses import _Gather
+from .comm import get_ulysses_sequence_parallel_group, get_unified_sequence_parallel_group
+from .ulysses import _Gather, _Slice
 from .utils import pad_tensor, unpadding_tensor_for_seqeunce_parallel
 
 
@@ -35,6 +35,22 @@ def slice_input_tensor(
     slc = [slice(None)] * len(x.shape)
     slc[dim] = slice(unit * sp_rank, unit * (sp_rank + 1))
     return x[slc].contiguous()
+
+
+def slice_input_tensor_scale_grad(
+    x: Tensor,
+    dim: int,
+    group: ProcessGroup = None,
+    scale_grad=True,
+):
+    """
+    A func to gather the outputs for the model result in sequence parallel
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    if not group:
+        return x
+    x = _Slice.apply(group, x, dim, scale_grad)
+    return x
 
 
 def gather_outputs(
