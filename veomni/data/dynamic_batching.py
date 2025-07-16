@@ -138,7 +138,6 @@ class DynamicBatchSizeDataLoader:
             # put processing_item to buffer
             if isinstance(processing_item, dict):
                 processing_item = [processing_item]
-
             for item in processing_item:
                 self.batching_strategy.put_item(item)
 
