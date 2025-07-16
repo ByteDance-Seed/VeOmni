@@ -95,6 +95,7 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
         if local_ep_fsdp_sharded_norm is not None:
             total_ep_fsdp_sharded_norm = local_ep_fsdp_sharded_norm**norm_type
             dist.all_reduce(total_ep_fsdp_sharded_norm, group=ep_fsdp_process_group)
+            dist.all_reduce(total_ep_fsdp_sharded_norm, group=ep_group)
             total_norm += total_ep_fsdp_sharded_norm
 
         # All-reducing the local non-sharded norm would count it an extra

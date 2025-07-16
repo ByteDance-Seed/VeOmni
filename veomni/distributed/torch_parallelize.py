@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel, MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp._common_utils import _get_module_fsdp_state_if_fully_sharded_module
 from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -176,11 +177,6 @@ def build_parallelize_model(
             wrap_policy = partial(
                 lambda_auto_wrap_policy, lambda_fn=lambda module: module.__class__.__name__ in basic_modules
             )
-            # set fsdp/hsdp sharding strategy
-            if parallel_state.fsdp_mesh.ndim > 1 and parallel_state.fsdp_mesh.size() > 1:
-                strategy = ShardingStrategy.HYBRID_SHARD
-            else:
-                strategy = ShardingStrategy.FULL_SHARD
 
             # set fsdp/hsdp sharding strategy
             if parallel_state.fsdp_mesh.ndim > 1 and parallel_state.fsdp_mesh.size() > 1:
@@ -257,8 +253,8 @@ def build_parallelize_model(
                     moe_sharding_strategy = ShardingStrategy.NO_SHARD
                     ep_fsdp_device_mesh = parallel_state.fsdp_mesh
                 else:
-                    moe_sharding_strategy = ShardingStrategy.HYBRID_SHARD
-                    ep_fsdp_device_mesh = parallel_state.ep_fsdp_mesh
+                    moe_sharding_strategy = ShardingStrategy.FULL_SHARD
+                    ep_fsdp_device_mesh = parallel_state.ep_fsdp_mesh["ep_fsdp"]
 
                 logger.info_rank0(f"Apply {moe_sharding_strategy} states on '{fsdp_no_shard_states_fqn}'.")
                 fsdp_kwargs.pop("ignored_states", None)
@@ -281,7 +277,10 @@ def build_parallelize_model(
                         fsdp_kwargs["param_init_fn"] = parallel_init_fsdp_fn(
                             no_shard_module, shard_states, specific_param_name=ep_param_suffix
                         )
-                    set_module_from_path(model, fqn, FullyShardedDataParallel(no_shard_module, **fsdp_kwargs))
+                    fsdp_module = FullyShardedDataParallel(no_shard_module, **fsdp_kwargs)
+                    fsdp_state = _get_module_fsdp_state_if_fully_sharded_module(fsdp_module)
+                    fsdp_state._gradient_postdivide_factor *= parallel_state.ep_size
+                    set_module_from_path(model, fqn, fsdp_module)
 
             _lazy_init(model, model)
 
