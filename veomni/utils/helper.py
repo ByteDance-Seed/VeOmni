@@ -185,6 +185,14 @@ class EnvironMeter:
         return metrics
 
 
+def enable_high_precision_for_bf16():
+    """
+    Set high accumulation dtype for matmul and reduction.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+
 def set_seed(seed: int, full_determinism: bool = False) -> None:
     """
     Sets a manual seed on all devices.
