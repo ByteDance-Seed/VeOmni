@@ -159,6 +159,7 @@ def main():
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
+        force_use_huggingface=args.model.force_use_huggingface,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")

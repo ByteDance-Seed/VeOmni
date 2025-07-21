@@ -141,6 +141,7 @@ def main():
         init_device=args.train.init_device,
         torch_dtype="bfloat16",
         attn_implementation=args.model.attn_implementation,
+        force_use_huggingface=args.model.force_use_huggingface,
     )
     model.micro_batch_size = args.train.micro_batch_size
 

@@ -26,8 +26,8 @@ from veomni.data.multimodal.multimodal_transform import encode_multimodal_sample
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_omni_model, build_omni_processor, save_model_assets, save_model_weights
-from veomni.models.seed_omni import SeedOmniModel
+from veomni.models import save_model_assets, save_model_weights
+from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args

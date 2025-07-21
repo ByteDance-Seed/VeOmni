@@ -32,7 +32,7 @@ torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_helpe
 """
 
 
-def run_environ_meter(args):
+def run_environ_meter(args: Arguments):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(f"cuda:{args.train.local_rank}")
@@ -54,6 +54,7 @@ def run_environ_meter(args):
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
+        force_use_huggingface=args.model.force_use_huggingface,
     )
     print(f"Model Class: {type(model)}")
 

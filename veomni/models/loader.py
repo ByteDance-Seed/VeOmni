@@ -154,11 +154,11 @@ def _get_model_arch_from_config(model_config):
 
 def get_loader(model_config, force_use_huggingface):
     model_arch = _get_model_arch_from_config(model_config)
-    model_registry = get_registry()
-    if model_arch in model_registry.supported_models and not force_use_huggingface:
-        model_cls = model_registry.get_model_cls_from_model_arch(model_arch)
-        loader = CustomizedModelingLoader(model_cls=model_cls)
-    else:
-        loader = HuggingfaceLoader()
+    loader = HuggingfaceLoader()
+    if not force_use_huggingface:
+        model_registry = get_registry()
+        if model_arch in model_registry.supported_models:
+            model_cls = model_registry.get_model_cls_from_model_arch(model_arch)
+            loader = CustomizedModelingLoader(model_cls=model_cls)
 
     return loader

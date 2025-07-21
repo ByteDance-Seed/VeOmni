@@ -85,6 +85,7 @@ def build_omni_model(
     empty_init: bool = False,
     init_device: Literal["cpu", "cuda"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
+    force_use_huggingface: bool = False,
 ) -> "PreTrainedModel":
     """
     Builds omni modality model using foundation model, encoders, and decoders.
@@ -104,6 +105,7 @@ def build_omni_model(
             empty_init=empty_init,
             init_device=init_device,
             config_kwargs=config_kwargs,
+            force_use_huggingface=force_use_huggingface,
         )
 
     foundation_config = foundation_config.to_dict()

@@ -125,6 +125,7 @@ def main():
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,
+        force_use_huggingface=args.model.force_use_huggingface,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")

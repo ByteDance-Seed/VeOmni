@@ -71,6 +71,7 @@ def run_checkpointer_test():
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,
+        force_use_huggingface=args.model.force_use_huggingface,
     )
 
     model = build_parallelize_model(
