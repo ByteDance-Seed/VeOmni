@@ -28,7 +28,7 @@ from ..utils import logging
 
 logger = logging.get_logger(__name__)
 
-MODELING_PATH = ["veomni.models.transformers", "veomni.models.seed_omni"]
+MODELING_PATH = ["veomni.models.transformers", "veomni.models.seed_omni", "veomni.models.custom"]
 
 
 @dataclass

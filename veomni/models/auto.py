@@ -76,6 +76,13 @@ def build_foundation_model(
 
     loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)
 
+    if not force_use_huggingface:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        from ..ops.attention import flash_attention_forward
+
+        ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+
     init_kwargs = {
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),
