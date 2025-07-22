@@ -33,10 +33,20 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 
+from ....distributed.parallel_state import get_parallel_state
+from ....distributed.sequence_parallel import slice_position_embedding
+from ....ops.loss import causallm_loss_function
+from ....utils import logging
+from ....utils.import_utils import is_liger_kernel_available
 from .configuration_seed import SeedConfig
 
+
+if is_liger_kernel_available():
+    from liger_kernel.transformers.rms_norm import LigerRMSNorm
+    from liger_kernel.transformers.rope import liger_rotary_pos_emb
+    from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
 
 logger = logging.get_logger(__name__)
 
@@ -427,6 +437,10 @@ class SeedModel(SeedPreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # --- slice position embedding if using sp ---
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
+        # --- slice position embedding if using sp ---
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -480,7 +494,7 @@ class SeedForCausalLM(SeedPreTrainedModel, GenerationMixin):
         self.model = SeedModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.loss_function = causallm_loss_function
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -563,11 +577,11 @@ class SeedForCausalLM(SeedPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        hidden_states = hidden_states[:, slice_indices, :]
 
         loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        logits = None
+        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -811,6 +825,13 @@ class SeedForTokenClassification(SeedPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+if is_liger_kernel_available():
+    apply_rotary_pos_emb = liger_rotary_pos_emb
+    SeedRMSNorm = LigerRMSNorm
+    SeedMLP = LigerSwiGLUMLP
+    logger.info_rank0("Apply liger kernel to seed-dense.")
 
 
 ModelClass = SeedForCausalLM
