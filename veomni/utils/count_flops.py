@@ -47,6 +47,8 @@ def get_device_flops(unit="T"):
         flops = 148e12
     elif "910B" in device_name:
         flops = 354e12
+    elif "B200" in device_name:
+        flops = 2250e12
     flops_unit = unit_convert(flops, unit)
     return flops_unit
 
@@ -64,15 +66,58 @@ class VeomniFlopsCounter:
     def __init__(self, config: PretrainedConfig):
         self.estimate_func = {
             "qwen2_vl": self._estimate_qwen2_vl_flops,
+            # the only difference between Qwen2 and Qwen2.5 for counting flops is the window attention
+            # used in the ViT for Qwen2.5VL which is considered in the _estimate_qwen2_vl_flops function.
+            "qwen2_5_vl": self._estimate_qwen2_vl_flops,
             "deepseek_v3": self._estimate_deepseek_v3_flops,
             "qwen3_moe": self._estimate_qwen3_moe_flops,
             "llama": self._estimate_llama_flops,
             "qwen2": self._estimate_qwen2_flops,
+            # qwen3 reused _estimate_qwen2_flops func because the only model structure diff between qwen2 dense and qwen3 dense is that
+            # qwen3 has additional RMSNorm layers for q and k.
+            # RMSNorm layers have minimal impact at the MFU and can be ignored.
+            "qwen3": self._estimate_qwen2_flops,
+            "seed": self._estimate_seed_flops,
         }
+
         self.config = config
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
+
+    def _estimate_seed_flops(self, tokens_sum, batch_seqlens, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        # non-attn per layer parm
+        # llama use SwiGelu, gate, having up and down linear layer in mlp
+        mlp_N = hidden_size * intermediate_size * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # non-attn all_layer parm
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        # non-attn all_layer & all_token fwd & bwd flops
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        # attn all_layer & all_token fwd & bwd flops
+        seqlen_square_sum = 0
+        for seqlen in batch_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        # all_layer & all_token fwd & bwd flops
+        flops_all_token = dense_N_flops + attn_qkv_flops
+        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        return flops_achieved
 
     def _estimate_deepseek_v3_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
@@ -259,7 +304,7 @@ class VeomniFlopsCounter:
         # vit flops
         image_seqlens = kargs.get("image_seqlens", None)
         if image_seqlens is not None:
-            vit_flops = self.estimate_vit_flop(image_seqlens, self.config.vision_config)
+            vit_flops = self._estimate_qwen_vit_flop(image_seqlens, self.config.vision_config)
         else:
             vit_flops = 0
 
@@ -268,22 +313,42 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def estimate_vit_flop(self, image_seqlens, config):
+    def _estimate_qwen_vit_flop(self, image_seqlens, config):
+        """
+        Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
+        """
+
         if config is None:
             return 0
         tokens_sum = sum(image_seqlens)
 
         num_heads = config.num_heads
         depth = config.depth
-        dim = config.embed_dim
-        hidden_size = config.hidden_size
+
+        # In Qwen2 VL and Qwen2.5VL, the parameters naming are different:
+        #
+        # Parameter                 | Qwen2 VL         | Qwen2.5 VL
+        # --------------------------|------------------|------------------
+        # ViT hidden dimension      | embed_dim        | hidden_size
+        # ViT output dimension      | hidden_size      | out_hidden_size
+        # ViT MLP intermediate dim  | embed_dim * mlp_ratio | intermediate_size
+        #
+        # See https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/config.json
+        # and https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/blob/main/config.json for an example.
+        is_qwen2_vl = hasattr(config, "embed_dim")
+        dim = config.embed_dim if is_qwen2_vl else config.hidden_size
+        mlp_hidden_dim = int(config.embed_dim * config.mlp_ratio) if is_qwen2_vl else config.intermediate_size
+        out_hidden_size = config.hidden_size if is_qwen2_vl else config.out_hidden_size
+
         spatial_merge_size = config.spatial_merge_size
         head_dim = dim // num_heads
-        mlp_hidden_dim = int(config.embed_dim * config.mlp_ratio)
 
-        mlp_N = dim * mlp_hidden_dim * 2
+        # Qwen 2.5 VL uses SiLU, thus 3.
+        mlp_N = dim * mlp_hidden_dim * (2 if is_qwen2_vl else 3)
         attn_linear_N = dim * (4 * dim)  # qkv and output proj
-        patch_embed_and_merger_N = (hidden_size + (dim * (spatial_merge_size**2))) * (dim * (spatial_merge_size**2))
+        patch_embed_and_merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (
+            dim * (spatial_merge_size**2)
+        )
 
         # non-attn all_layer parm
         dense_N = (mlp_N + attn_linear_N) * depth + patch_embed_and_merger_N
@@ -291,11 +356,20 @@ class VeomniFlopsCounter:
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * dense_N * tokens_sum
 
-        # attn all_layer & all_token fwd & bwd flops
+        # In Qwen2.5 VL, windowed attention is used in some layers.
+        full_attn_layer_num = config.depth if is_qwen2_vl else len(config.fullatt_block_indexes)
+        window_attn_layer_num = config.depth - full_attn_layer_num
+
+        # full attn layer & all_token fwd & bwd flops
         seqlen_square_sum = 0
         for seqlen in image_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * depth
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
+
+        # If window attention is used, add the window attention flops
+        if window_attn_layer_num > 0:
+            window_attn_compute_flops = 12 * tokens_sum * (config.window_size**2) * head_dim * num_heads
+            attn_qkv_flops += window_attn_compute_flops * window_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
 
