@@ -46,6 +46,20 @@ def _all_gather(
     return tensor_list, size_list
 
 
+def _all_gather_into_tensor(
+    x: Tensor,
+    group: dist.ProcessGroup,
+):
+    dim_size = list(x.size())
+
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    sp_world_size = dist.get_world_size(group)
+    dim_size[0] = dim_size[0] * sp_world_size
+    output = torch.empty(dim_size, dtype=x.dtype, device=torch.cuda.current_device())
+    dist.all_gather_into_tensor(output, x, group=group)
+    return output
+
+
 def _all_to_all(
     local_input: Tensor,
     scatter_dim: int,
@@ -168,7 +182,7 @@ class _Slice(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None]:
         dim_size = list(grad_output.size())
         split_size = dim_size[0]
-        output = _all_gather(grad_output, group=ctx.group)
+        output = _all_gather_into_tensor(grad_output, group=ctx.group)
         if ctx.scale_grad:
             output = output / ctx.seq_world_size
         return (None, torch.cat(output.split(split_size), dim=ctx.dim), None, None)
