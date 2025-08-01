@@ -1,5 +1,5 @@
 model:
-  model_path: meta-llama/Meta-Llama-3-8B
+  model_path: /mnt/hdfs/seed_models/Seed-1.6-9b/
 
 data:
   train_path: fineweb_100BT
