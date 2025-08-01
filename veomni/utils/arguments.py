@@ -87,6 +87,30 @@ class ModelArguments:
         default=False,
         metadata={"help": "Force loading model from huggingface."},
     )
+    lora_rank: int = field(
+        default=4,
+        metadata={"help": "The dimension of the LoRA update matrices."},
+    )
+    lora_alpha: float = field(
+        default=4.0,
+        metadata={"help": "The weight of the LoRA update matrices."},
+    )
+    lora_target_modules: str = field(
+        default="q,k,v,o,ffn.0,ffn.2",
+        metadata={"help": "Modules to train with LoRA (must be in lora_target_modules_support)."},
+    )
+    lora_target_modules_support: str = field(
+        default="q,k,v,o,ffn.0,ffn.2",
+        metadata={"help": "All modules supported by the model for LoRA training."},
+    )
+    init_lora_weights: Optional[Literal["kaiming", "full"]] = field(
+        default="kaiming",
+        metadata={"help": "Initialization method for LoRA weights."},
+    )
+    pretrained_lora_path: str = field(
+        default=None,
+        metadata={"help": "Pretrained LoRA path. Required if the training is resumed."},
+    )
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
@@ -427,6 +451,10 @@ class TrainingArguments:
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
+    )
+    train_architecture: Literal["lora", "full"] = field(
+        default="full",
+        metadata={"help": "Model structure to train. LoRA training or full training."},
     )
 
     def __post_init__(self):

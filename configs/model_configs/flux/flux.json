@@ -1,0 +1,22 @@
+{
+  "architectures": "FluxModel",
+  "_class_name": "FluxModel",
+  "_diffusers_version": "0.30.0.dev0",
+  "attention_head_dim": 128,
+  "guidance_embeds": true,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "num_attention_heads": 24,
+  "num_layers": 19,
+  "num_single_layers": 38,
+  "patch_size": 1,
+  "pooled_projection_dim": 768,
+  "model_type": "flux",
+  "tie_word_embeddings": false,
+  "tokenizer_1_path": "configs/model_configs/flux/tokenizer_1",
+  "tokenizer_2_path": "configs/model_configs/flux/tokenizer_2",
+  "disable_guidance_embedder": false,
+  "input_dim": 64,
+  "num_blocks": 19,
+  "vocab_size": 49408
+}
