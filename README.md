@@ -3,14 +3,14 @@
 
 <img src="./assets/logo.png" width="50%">
 
-## VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework
+## VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
 
 <p align="center">
   <a href="https://github.com/ByteDance-Seed/VeOmni/stargazers">
     <img src="https://img.shields.io/github/stars/ByteDance-Seed/VeOmni?style=social"></a>
   <a href="https://github.com/ByteDance-Seed/VeOmni">
     <img src="https://img.shields.io/badge/VeOmni-Project Page-yellow"></a>
-  <a href="https://github.com/ByteDance-Seed/VeOmni">
+  <a href="https://arxiv.org/abs/2508.02317">
     <img src="https://img.shields.io/badge/VeOmni-Tech Report-red"></a>
   <a href="https://huggingface.co/ByteDance-Seed">
     <img src="https://img.shields.io/badge/VeOmni-Hugging Face-orange"></a>
@@ -33,14 +33,19 @@ Our guiding principles when building VeOmni are:
 - **Omni model native**: VeOmni enables users to effortlessly scale any omni-model across devices and accelerators.
 - **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
 
+<div align="center">
+<img src="./assets/system.png" width="100%">
+</div>
+
 ### 🔥 Latest News
 
+- [2025/08/01] We release VeOmni Tech report (https://arxiv.org/abs/2508.02317) and Open the Wechat Group
 - [2025/04/03] We release VeOmni.
 
 
 ## 🔖 Table of Contents
 
-- [VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework](#veomni-scaling-any-modality-model-training-to-any-accelerators-with-pytorch-native-training-framework)
+- [VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](#veomni-scaling-any-modality-model-training-with-model-centric-distributed-recipe-zoo)
 - [🔗 Overview](#-overview)
   - [🔥 Latest News](#-latest-news)
 - [🔖 Table of Contents](#-table-of-contents)
@@ -261,7 +266,7 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 ## ⛰️ Performance
 
-Coming soon with tech report.
+Seed in Tech report (https://arxiv.org/abs/2508.02317)
 
 ## 😊 Acknowledgement
 
