@@ -39,8 +39,8 @@ Our guiding principles when building VeOmni are:
 
 ### 🔥 Latest News
 
-- [2025/08/01] We release VeOmni Tech report (https://arxiv.org/abs/2508.02317) and Open the Wechat Group
-- [2025/04/03] We release VeOmni.
+- [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./assets/wechat.png). Feel free to join us!
+- [2025/04/03] We release VeOmni!
 
 
 ## 🔖 Table of Contents
@@ -101,7 +101,7 @@ Our guiding principles when building VeOmni are:
 ### 🧪 Upcoming Features
 
 - [ ] [veScale](https://github.com/volcengine/veScale/tree/main) FSDP
-- [ ] Torch native parallelism
+- [ ] Torch native Tensor parallelism
 - [ ] torch.compile
 - [ ] [Flux: Fine-grained Computation-communication Overlapping GPU Kernel](https://github.com/bytedance/flux/tree/main/test) integrations
 - [ ] Better offloading strategy
@@ -251,13 +251,15 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 ## ✏️ Supported Models
 
-| Model                                                             | Model size                       | Example config File                                       |
-| ----------------------------------------------------------------- | -------------------------------- | --------------------------------------------------------- |
-| [DeepSeek 2.5/3/R1](https://huggingface.co/deepseek-ai)           | 236B/671B                        | [deepseek.yaml](configs/pretrain/deepseek.yaml)           |
-| [Llama 3-3.3](https://huggingface.co/meta-llama)                  | 1B/3B/8B/70B                     | [llama3.yaml](configs/pretrain/llama3.yaml)               |
-| [Qwen 2-2.5](https://huggingface.co/Qwen)                         | 0.5B/1.5B/3B/7B/14B/32B/72B/     | [qwen2_5.yaml](configs/pretrain/qwen2_5.yaml)       |
-| [Qwen2-VL/Qwen2.5-VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B                 | [qwen2_vl.yaml](configs/multimodal/qwen2_vl/qwen2_vl.yaml)|
-| Seed_omni                                      | any foundation model with any omni encoder&&decoder | [seed_omni.yaml](configs/multimodal/omni/seed_omni.yaml)  |
+| Model                                                    | Model size                    | Example config File                                       |
+| -------------------------------------------------------- | ----------------------------- | --------------------------------------------------------- |
+| [DeepSeek 2.5/3/R1](https://huggingface.co/deepseek-ai)  | 236B/671B                     | [deepseek.yaml](configs/pretrain/deepseek.yaml)           |
+| [Llama 3-3.3](https://huggingface.co/meta-llama)         | 1B/3B/8B/70B                  | [llama3.yaml](configs/pretrain/llama3.yaml)               |
+| [Qwen 2-3](https://huggingface.co/Qwen)                  | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/pretrain/qwen2_5.yaml)             |
+| [Qwen2-VL/Qwen2.5-VL/QVQ](https://huggingface.co/Qwen)   | 2B/3B/7B/32B/72B              | [qwen2_vl.yaml](configs/multimodal/qwen2_vl/qwen2_vl.yaml)|
+| [Qwen3-MoE](https://huggingface.co/Qwen)                 | A330B/A22B235B                | [qwen2_vl.yaml](configs/pretrain/qwen3-moe.yaml)          |
+| [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/pretrain/wan_sft.yaml)          |
+| Omni Model                                               | Any Modality Training         | [seed_omni.yaml](configs/multimodal/omni/seed_omni.yaml)  |
 
 
 > VeOmni Support all [transformers](https://github.com/huggingface/transformers) models if you don't need sequence parallelism or experts parallelism or other parallelism and cuda kernal optimize in VeOmni. We design a [model registry mechanism](veomni/models/registry.py). When the model is registered in veomni, we will automatically load the model and optimizer in VeOmni. Otherwise, it will default to load the modeling file in transformers.
