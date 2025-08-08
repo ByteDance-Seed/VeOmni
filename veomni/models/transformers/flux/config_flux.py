@@ -1,3 +1,4 @@
+# Copyright 2024-2025 The Black-forest-labs Authors. All rights reserved.
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-from ...ops.attention import flash_attention_forward
+from transformers import PretrainedConfig
 
 
-ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+class FluxConfig(PretrainedConfig):
+    model_type = "flux"
 
-from . import deepseek_v3, flux, llama, qwen2, qwen2_vl, qwen3, qwen3_moe, wan
+    def __init__(self, disable_guidance_embedder=False, input_dim=64, num_blocks=19, **kwargs):
+        self.disable_guidance_embedder = disable_guidance_embedder
+        self.input_dim = input_dim
+        self.num_blocks = num_blocks
 
-
-__all__ = ["qwen2_vl", "deepseek_v3", "qwen2", "llama", "qwen3", "qwen3_moe", "wan", "flux"]
+        super().__init__(**kwargs)
