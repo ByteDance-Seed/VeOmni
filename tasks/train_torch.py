@@ -240,6 +240,7 @@ def main():
 
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
+                micro_batches.pop("id", None)  # maybe has another option to remove id
             except StopIteration:
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
