@@ -257,7 +257,7 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 | [Llama 3-3.3](https://huggingface.co/meta-llama)         | 1B/3B/8B/70B                  | [llama3.yaml](configs/pretrain/llama3.yaml)               |
 | [Qwen 2-3](https://huggingface.co/Qwen)                  | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/pretrain/qwen2_5.yaml)             |
 | [Qwen2-VL/Qwen2.5-VL/QVQ](https://huggingface.co/Qwen)   | 2B/3B/7B/32B/72B              | [qwen2_vl.yaml](configs/multimodal/qwen2_vl/qwen2_vl.yaml)|
-| [Qwen3-MoE](https://huggingface.co/Qwen)                 | A330B/A22B235B                | [qwen2_vl.yaml](configs/pretrain/qwen3-moe.yaml)          |
+| [Qwen3-MoE](https://huggingface.co/Qwen)                 | A330B/A22B235B                | [qwen3-moe.yaml](configs/pretrain/qwen3-moe.yaml)          |
 | [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/pretrain/wan_sft.yaml)          |
 | Omni Model                                               | Any Modality Training         | [seed_omni.yaml](configs/multimodal/omni/seed_omni.yaml)  |
 
