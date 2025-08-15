@@ -131,3 +131,8 @@ def flash_attention_forward(
             attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2, group=ulysses_group)
 
     return attn_output, None
+
+
+def flash_attention_3_forward():
+    # TODO: add flash attention 3
+    pass

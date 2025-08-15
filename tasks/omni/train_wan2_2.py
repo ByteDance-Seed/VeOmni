@@ -88,6 +88,14 @@ class MyTrainingArguments(TrainingArguments):
         default=1e-6,
         metadata={"help": "Learning rate for visual encoder parameters."},
     )
+    max_timestep_boundary: float = field(
+        default=1.0,
+        metadata={"help": "Max timestep boundary for diffusion model."},
+    )
+    min_timestep_boundary: float = field(
+        default=0.875,
+        metadata={"help": "Min timestep boundary for diffusion model."},
+    )
     train_architecture: Literal["lora", "full"] = field(
         default="full",
         metadata={"help": "Model structure to train. LoRA training or full training."},
@@ -312,6 +320,7 @@ def main():
     )
 
     helper.empty_cache()
+    model.to(torch.bfloat16)
     model.train()
     logger.info(
         f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
@@ -347,25 +356,33 @@ def main():
 
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch, model_type="wan")
+
+                # 如果不存在就是1
+                max_timestep_boundary = int(
+                    (args.train.max_timestep_boundary if args.train.max_timestep_boundary is not None else 1)
+                    * flow_scheduler.num_train_timesteps
+                )
+                min_timestep_boundary = int(
+                    (args.train.min_timestep_boundary if args.train.min_timestep_boundary is not None else 0)
+                    * flow_scheduler.num_train_timesteps
+                )
                 latents = micro_batch["latents"].to(model.device)
                 prompt_emb = micro_batch["prompt_emb"]
+
                 if args.train.micro_batch_size > 1:
                     prompt_emb["context"] = prompt_emb["context"].squeeze(1).to(model.device)
                     image_emb = micro_batch["image_emb"]
-                    if "clip_feature" in image_emb:
-                        image_emb["clip_feature"] = image_emb["clip_feature"].squeeze(1).to(model.device)
                     if "y" in image_emb:
                         image_emb["y"] = image_emb["y"].squeeze(1).to(model.device)
                 else:
                     prompt_emb["context"] = prompt_emb["context"][0].to(model.device)
                     image_emb = micro_batch["image_emb"]
-                    if "clip_feature" in image_emb:
-                        image_emb["clip_feature"] = image_emb["clip_feature"][0].to(model.device)
                     if "y" in image_emb:
                         image_emb["y"] = image_emb["y"][0].to(model.device)
 
                 noise = torch.randn_like(latents)
-                timestep_id = torch.randint(0, flow_scheduler.num_train_timesteps, (latents.size(0),))
+                timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+                # timestep = flow_scheduler.timesteps[timestep_id].to(latents.dtype, latents.device)
                 timestep = flow_scheduler.timesteps[timestep_id].to(latents.dtype).to(latents.device)
                 # noise and target
                 noisy_latents = flow_scheduler.add_noise(
@@ -375,17 +392,22 @@ def main():
                     args.train.micro_batch_size,
                     args.train.enable_mixed_precision,
                 )
+                noisy_latents = noisy_latents.to(model.dtype)
                 training_target = flow_scheduler.training_target(latents, noise, timestep)
+                # input["timesteps"] = timestep
+                context = prompt_emb["context"].to(model.dtype)
+                y = image_emb["y"].to(model.dtype)
                 # predict noise
                 with model_fwd_context:
                     noise_pred = model.forward(
-                        noisy_latents,
-                        timestep=timestep,
-                        **prompt_emb,
-                        **image_emb,
+                        x=noisy_latents,
+                        t=timestep,
+                        context=context,
+                        seq_len=environ_meter.batch_seqlens[0],
+                        y=y,
                     )
                     # MSE loss with weights
-                    loss = F.mse_loss(noise_pred.float(), training_target.float(), reduction="none")
+                    loss = F.mse_loss(noise_pred[0].float(), training_target.float(), reduction="none")
                     weight = flow_scheduler.training_weight(timestep, args.train.micro_batch_size)
                     # shape: [B, ...], weight: [B]
                     loss = (loss.view(latents.size(0), -1).mean(dim=1) * weight).mean() / len(micro_batches)

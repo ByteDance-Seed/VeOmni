@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers import AutoConfig
 
-from ...ops.attention import flash_attention_3_forward, flash_attention_forward
-
-
-ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
-ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_3_forward)
+from .config_wan2_2 import WanConfig2_2
+from .modeling_wan2_2 import WanModel2_2
 
 
-from . import deepseek_v3, flux, llama, qwen2, qwen2_vl, qwen3, qwen3_moe, wan, wan2_2
+AutoConfig.register("wan2_2", WanConfig2_2)
 
-
-__all__ = ["qwen2_vl", "deepseek_v3", "qwen2", "llama", "qwen3", "qwen3_moe", "wan", "flux", "wan2_2"]
+__all__ = ["WanModel2_2", "WanConfig2_2"]
