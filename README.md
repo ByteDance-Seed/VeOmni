@@ -103,7 +103,7 @@ Our guiding principles when building VeOmni are:
 - [ ] [veScale](https://github.com/volcengine/veScale/tree/main) FSDP
 - [ ] Torch native Tensor parallelism
 - [ ] torch.compile
-- [ ] [Flux: Fine-grained Computation-communication Overlapping GPU Kernel](https://github.com/bytedance/flux/tree/main/test) integrations
+- [ ] [Flux: Fine-grained Computation-communication Overlapping GPU Kernel](https://github.com/bytedance/flux) integrations
 - [ ] Better offloading strategy
 - [ ] More models support
 - [ ] Torch native pipeline parallelism
@@ -127,7 +127,7 @@ Install from source code:
 pip3 install -e .
 ```
 
-Install veScale(Not available yet)
+Install veScale (Not available yet)
 
 ```shell
 git clone https://github.com/volcengine/veScale.git
@@ -298,13 +298,11 @@ This project is licensed under Apache License 2.0. See the [LICENSE](LICENSE) fi
 If you find VeOmni useful for your research and applications, feel free to give us a star ⭐ or cite us using:
 
 ```bibtex
-@software{VeOmni,
-      title={VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework},
-      author={Qianli Ma, Yaowei Zheng, Zhelun Shi, Zhongkai Zhao, Bin jia, Ziyue Huang, Zhi Zhang},
-      year={2025},
-      howpublished={GitHub repository},
-      publisher={ByteDance Seed},
-      url={https://github.com/ByteDance-Seed/VeOmni},
+@article{ma2025veomni,
+  title={VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo},
+  author={Ma, Qianli and Zheng, Yaowei and Shi, Zhelun and Zhao, Zhongkai and Jia, Bin and Huang, Ziyue and Lin, Zhiqi and Li, Youjie and Yang, Jiacheng and Peng, Yanghua and others},
+  journal={arXiv preprint arXiv:2508.02317},
+  year={2025}
 }
 ```
 
