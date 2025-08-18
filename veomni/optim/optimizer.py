@@ -142,7 +142,15 @@ def build_optimizer(
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> "torch.optim.Optimizer":
     if param_groups is None:
-        param_groups = filter(lambda p: p.requires_grad, model.parameters())
+        weight_param_groups = []
+        bias_param_groups = []
+        for name, value in model.named_parameters():
+            if 'bias' in name and value.requires_grad != False:
+                bias_param_groups.append(value)
+            if 'bias' not in name and value.requires_grad != False:
+                weight_param_groups.append(value)
+        param_groups = [{'params': weight_param_groups},
+                        {'params': bias_param_groups, 'weight_decay': 0}]
 
     if optimizer_type == "adamw":
         foreach = False if is_torch_npu_available() else (not fused)
