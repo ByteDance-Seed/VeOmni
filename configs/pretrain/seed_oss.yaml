@@ -1,5 +1,5 @@
 model:
-  model_path: /mnt/hdfs/seed_models/Seed-Oss/Seed-OSS-36B-Base/
+  model_path: /PATH/TO/SEED-OSS
 
 data:
   train_path: fineweb_100BT
