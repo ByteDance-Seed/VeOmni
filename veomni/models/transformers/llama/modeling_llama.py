@@ -756,7 +756,6 @@ class LlamaModel(LlamaPreTrainedModel):
         return causal_mask
 
 
-
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
