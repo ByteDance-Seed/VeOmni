@@ -584,6 +584,9 @@ class TrainingArguments:
                 f"`global_batch_size` should be a multiple of {self.micro_batch_size * self.data_parallel_size}."
             )
 
+        if self.data_parallel_mode != 'ddp' and self.world_size == 1:
+            raise ValueError('Single GPU only support DDP')
+
         if self.gradient_accumulation_steps > 1 and self.enable_fsdp_offload:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
