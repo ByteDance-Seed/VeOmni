@@ -233,7 +233,7 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
-class WanRMSNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.dim = dim
@@ -249,18 +249,6 @@ class WanRMSNorm(nn.Module):
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
-
-class WanLayerNorm(nn.LayerNorm):
-    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
-        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
-
-    def forward(self, x):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-        """
-        return super().forward(x.float()).type_as(x)
 
 
 class WanSelfAttention(nn.Module):
@@ -279,8 +267,8 @@ class WanSelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""

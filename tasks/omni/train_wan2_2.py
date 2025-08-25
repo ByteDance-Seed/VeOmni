@@ -357,7 +357,7 @@ def main():
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch, model_type="wan")
 
-                # 如果不存在就是1
+                # If it doesn't exist, set it to 1
                 max_timestep_boundary = int(
                     (args.train.max_timestep_boundary if args.train.max_timestep_boundary is not None else 1)
                     * flow_scheduler.num_train_timesteps
