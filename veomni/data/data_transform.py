@@ -57,12 +57,16 @@ def process_pretrain_example(
         raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
 
     tokens = tokenizer.encode(text_example, add_special_tokens=False) + [tokenizer.eos_token_id]
+    current_id = 0
+    if "id" in example:
+        current_id = example["id"]
     for input_ids in split_into_chunks(tokens, max_seq_len):
         examples.append(
             {
                 "input_ids": torch.tensor(input_ids),
                 "attention_mask": torch.tensor([1] * len(input_ids)),
                 "labels": torch.tensor(input_ids),
+                "id": torch.tensor(current_id).view(1),
             }
         )
 
@@ -89,4 +93,6 @@ def process_sft_example(
 
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+    if "id" in example:
+        tokenized_example["id"] = torch.tensor(example["id"]).view(1)
     return [tokenized_example]
