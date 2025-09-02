@@ -152,7 +152,7 @@ class DataArguments:
         default="streaming",
         metadata={"help": "Type of the dataloader."},
     )
-    datasets_type: Literal["byted", "mapping", "iterable"] = field(
+    datasets_type: Literal["byted", "mapping", "iterable", "energon"] = field(
         default="byted",
         metadata={"help": "Type of the datasets."},
     )
