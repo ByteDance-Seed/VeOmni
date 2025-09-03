@@ -24,7 +24,11 @@ from .data_collator import (
     UnpackDataCollator,
 )
 from .data_loader import build_dataloader
-from .dataset import build_iterative_dataset, build_mapping_dataset
+from .dataset import (
+    build_iterative_dataset, 
+    build_mapping_dataset,
+    build_energon_dataset,
+)
 from .multimodal.data_collator import (
     OmniDataCollatorWithPacking,
     OmniDataCollatorWithPadding,

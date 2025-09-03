@@ -136,7 +136,7 @@ class DataArguments:
         default="native",
         metadata={"help": "Type of the dataloader."},
     )
-    datasets_type: Literal["mapping", "iterable"] = field(
+    datasets_type: Literal["mapping", "iterable", "energon"] = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
     )
