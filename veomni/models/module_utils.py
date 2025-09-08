@@ -162,6 +162,182 @@ def _dispatch_parameter(
         module._parameters[name].data.copy_(tensor)
 
 
+def _dispatch_parameter_cached(
+    module: "nn.Module",
+    name: str,
+    tensor: "torch.Tensor",
+    module_cache: dict,
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+) -> None:
+    """
+    Assigns parameter to an empty model with module reference caching.
+
+    This is optimized for MoE models where the same module path is accessed multiple times.
+    """
+    # Check cache first
+    if name in module_cache:
+        target_module, param_name = module_cache[name]
+    else:
+        # Cache miss: find module and cache the result
+        target_module, param_name = _find_submodule(module, name)
+        module_cache[name] = (target_module, param_name)
+
+    # Get the parameter tensor
+    orig_tensor = target_module._parameters[param_name].data
+    tensor = tensor.to(orig_tensor)
+    if hasattr(orig_tensor, "device_mesh"):  # dtensor
+        if orig_tensor.device.type == "cpu":
+            raise ValueError("Cannot load dtensor on CPU.")
+
+        device_mesh = getattr(orig_tensor, "device_mesh")
+        placements = getattr(orig_tensor, "placements")
+        target_module._parameters[param_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+    else:  # not dtensor
+        target_module._parameters[param_name].data.copy_(tensor)
+
+
+def _batch_dispatch_moe_parameters(
+    module: "nn.Module",
+    moe_weights: List[Tuple[str, "torch.Tensor"]],
+    module_cache: dict,
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+) -> None:
+    """
+    Batch dispatch multiple MoE expert weights to the same parameter.
+    
+    This is a major optimization for MoE models where multiple expert weights
+    (e.g., experts.0.gate_proj, experts.1.gate_proj, ..., experts.99.gate_proj)
+    need to be loaded into the same stacked parameter tensor.
+    """
+    if not moe_weights:
+        return
+    
+    # Get all parameter names from the module for mapping
+    module_parameter_names = {name for name, _ in module.named_parameters()}
+    
+    # Group weights by their mapped parameter name
+    param_groups = {}
+    for checkpoint_name, tensor in moe_weights:
+        mapped_name = _map_moe_expert_key(checkpoint_name, module_parameter_names)
+        if mapped_name:
+            if mapped_name not in param_groups:
+                param_groups[mapped_name] = []
+            param_groups[mapped_name].append((checkpoint_name, tensor))
+    
+    # Process each parameter group
+    for param_name, weight_list in param_groups.items():
+        if len(weight_list) == 1:
+            # Single weight, use normal dispatch
+            checkpoint_name, tensor = weight_list[0]
+            _dispatch_parameter_cached(module, param_name, tensor, module_cache, dtensor_factory)
+        else:
+            # Multiple weights for the same parameter - batch process
+            _batch_load_moe_parameter(module, param_name, weight_list, module_cache, dtensor_factory)
+
+
+def _batch_load_moe_parameter(
+    module: "nn.Module",
+    param_name: str,
+    weight_list: List[Tuple[str, "torch.Tensor"]],
+    module_cache: dict,
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+) -> None:
+    """
+    Efficiently load multiple expert weights into a single stacked parameter.
+    
+    This function extracts the expert index from checkpoint names and places
+    each weight at the correct position in the stacked parameter tensor.
+    """
+    # Get the target parameter tensor
+    if param_name in module_cache:
+        target_module, param_name_short = module_cache[param_name]
+    else:
+        target_module, param_name_short = _find_submodule(module, param_name)
+        module_cache[param_name] = (target_module, param_name_short)
+    
+    orig_tensor = target_module._parameters[param_name_short].data
+    
+    # Process each expert weight
+    for checkpoint_name, tensor in weight_list:
+        # Extract expert index from checkpoint name (e.g., "experts.99.gate_proj.weight" -> 99)
+        import re
+        match = re.search(r'\.experts\.(\d+)\.', checkpoint_name)
+        if match:
+            expert_idx = int(match.group(1))
+            tensor = tensor.to(orig_tensor)
+            
+            # Copy to the correct expert position in the stacked tensor
+            if hasattr(orig_tensor, "device_mesh"):  # dtensor
+                if orig_tensor.device.type == "cpu":
+                    raise ValueError("Cannot load dtensor on CPU.")
+                
+                device_mesh = getattr(orig_tensor, "device_mesh")
+                placements = getattr(orig_tensor, "placements")
+                # For dtensor, we need to handle this carefully
+                orig_tensor[expert_idx].copy_(tensor)
+            else:
+                # Direct copy to the expert slice
+                orig_tensor[expert_idx].copy_(tensor)
+
+
+def _map_moe_expert_key(name: str, parameter_names: set) -> Optional[str]:
+    """
+    Maps MoE expert keys from checkpoint format to model format.
+    
+    Args:
+        name: Key from checkpoint (e.g., 'model.layers.0.mlp.experts.0.gate_proj.weight')
+        parameter_names: Set of parameter names in the model
+        
+    Returns:
+        Mapped key name if found, None otherwise
+    """
+    # Check if this is a MoE expert key (contains 'experts.N.')
+    if 'experts.' in name and '.experts.' in name:
+        # Use a simple and robust approach: regex to remove expert index and .weight
+        if name.endswith('.weight'):
+            # Remove .weight suffix
+            name_no_weight = name[:-7]
+            # Remove expert index (any number after 'experts.')
+            import re
+
+            mapped_name = re.sub(r'\.experts\.\d+\.', '.experts.', name_no_weight)
+            
+            # Try with model. prefix first (since that's what the model actually has)
+            if mapped_name in parameter_names:
+                return mapped_name
+            
+            # Try without model. prefix as fallback
+            if mapped_name.startswith('model.'):
+                mapped_name_no_prefix = mapped_name[6:]
+                if mapped_name_no_prefix in parameter_names:
+                    return mapped_name_no_prefix
+            
+            # If stacked parameter doesn't exist, we need to create a mapping
+            # from individual expert parameters to the stacked parameter
+            # This is the key insight: when checkpoint has individual experts but model expects stacked
+            expert_pattern = re.search(r'\.experts\.(\d+)\.', name)
+            if expert_pattern:
+                # Extract the parameter type (e.g., 'gate_proj', 'up_proj', 'down_proj')
+                param_type = name_no_weight.split('.')[-1]
+                
+                # Create the expected stacked parameter name
+                layer_base = '.'.join(name_no_weight.split('.')[:-2])  # e.g., 'model.layers.1.mlp'
+                stacked_param_name = f"{layer_base}.experts.{param_type}"
+
+                # Check if this stacked parameter exists in the model
+                if stacked_param_name in parameter_names:
+                    return stacked_param_name
+                
+                # Also check without model. prefix
+                stacked_param_name_no_prefix = stacked_param_name[6:] if stacked_param_name.startswith('model.') else stacked_param_name
+                if stacked_param_name_no_prefix in parameter_names:
+                    return stacked_param_name_no_prefix
+
+                return None
+
+    return None
+
+
 def _dispatch_buffer(
     module: "nn.Module",
     name: str,
@@ -211,11 +387,19 @@ def load_model_weights(
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names = {name for name, _ in model.named_parameters()}
+
     model.to_empty(device=init_device)
+    
+    # Initialize module cache for MoE optimization
+    module_cache = {}
+    
     state_dict_iterators = _load_state_dict(weights_path)
     for state_dict_iterator in tqdm(
         state_dict_iterators, desc="Loading checkpoint shards", disable=int(os.getenv("LOCAL_RANK", "-1")) > 0
     ):
+        # Collect MoE weights for batch processing
+        moe_weights = []
+        
         for name, tensor in state_dict_iterator:
             if name in buffer_dict.keys():  # persistent buffers
                 buffer_dict[name] = tensor.clone()
@@ -223,7 +407,33 @@ def load_model_weights(
                 parameter_names.remove(name)
                 _dispatch_parameter(model, name, tensor, dtensor_factory)
             else:
-                logger.info_rank0(f"Unexpected key in state dict: {name}.")
+                # Check if this is a MoE expert weight
+                mapped_name = _map_moe_expert_key(name, parameter_names)
+                if mapped_name and mapped_name in parameter_names:
+                    moe_weights.append((name, tensor))
+                elif 'experts.' in name and '.experts.' in name:
+                    # Still try to add it to moe_weights for processing
+                    if mapped_name:  # If we have a mapped name, use it
+                        moe_weights.append((name, tensor))
+                else:
+                    # This is a truly unexpected key
+                    logger.info_rank0(f"Unexpected key in state dict: {name}.")
+
+        # Batch process MoE weights for maximum efficiency
+        if moe_weights:
+            _batch_dispatch_moe_parameters(model, moe_weights, module_cache, dtensor_factory)
+
+            # Remove mapped MoE parameters from parameter_names after processing
+            # This ensures we don't remove them prematurely when multiple experts map to the same parameter
+            processed_moe_params = set()
+            for checkpoint_name, _ in moe_weights:
+                mapped_name = _map_moe_expert_key(checkpoint_name, parameter_names)
+                if mapped_name and mapped_name in parameter_names:
+                    processed_moe_params.add(mapped_name)
+
+            # Remove all processed MoE parameters at once
+            for param_name in processed_moe_params:
+                parameter_names.discard(param_name)
 
         del state_dict_iterator
         empty_cache()
