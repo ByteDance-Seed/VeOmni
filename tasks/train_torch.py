@@ -121,7 +121,7 @@ def main():
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,

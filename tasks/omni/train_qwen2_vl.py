@@ -166,7 +166,7 @@ def main():
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
         init_device=args.train.init_device,
         force_use_huggingface=args.model.force_use_huggingface,
     )

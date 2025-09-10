@@ -122,7 +122,7 @@ def main():
     model: SeedOmniModel = build_omni_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
         encoders=args.model.encoders,
         decoders=args.model.decoders,
         input_encoder=args.model.input_encoder,
