@@ -35,6 +35,8 @@ from .triton_utils.utils import (
     make_blocked,
 )
 
+from ....utils.device import get_torch_device
+
 
 def _get_cuda_autotune_config():
     return [
@@ -203,7 +205,7 @@ def group_gemm_same_nk(
     if save_activation:
         act = torch.empty_like(c)
 
-    with torch.cuda.device(a.device):
+    with get_torch_device().device(a.device):
         group_gemm_same_nk_kernel[
             lambda x: (
                 triton.cdiv(max_M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),
@@ -375,7 +377,7 @@ def group_gemm_same_mn(
     assert len(cumsum_K) == c.shape[0], f"{len(cumsum_K), c.shape}"
     assert a.is_contiguous() and b.is_contiguous() and c.is_contiguous(), "Not implemented: Noncontiguous input."
 
-    with torch.cuda.device(a.device):
+    with get_torch_device().device(a.device):
         group_gemm_same_mn_kernel[
             lambda x: (
                 triton.cdiv(M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),

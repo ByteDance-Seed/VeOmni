@@ -28,7 +28,6 @@ from transformers import (
 from transformers.modeling_utils import no_init_weights
 
 from ..utils import logging
-from ..utils.import_utils import is_torch_npu_available
 from .module_utils import init_empty_weights, load_model_weights
 from .registry import ModelRegistry
 
@@ -73,8 +72,6 @@ class HuggingfaceLoader(BaseModelLoader):
         )
 
         if weights_path is None:  # init empty model from config
-            if is_torch_npu_available() and init_device == "cuda":
-                init_device = "npu"
             if init_device == "meta":
                 with init_empty_weights():
                     logger.info_rank0("Init empty model on meta device from config without init_weights.")
@@ -112,8 +109,6 @@ class CustomizedModelingLoader(BaseModelLoader):
         )
 
         if weights_path is None:  # init empty model from config
-            if is_torch_npu_available() and init_device == "cuda":
-                init_device = "npu"
             if init_device == "meta":
                 with init_empty_weights():
                     logger.info_rank0("Init empty model on meta device from config without init_weights.")

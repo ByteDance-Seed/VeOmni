@@ -37,6 +37,7 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.utils.dit_utils import EnvironMeter, save_model_weights
 from veomni.utils.lora_utils import add_lora_to_model, freeze_parameters
 from veomni.utils.recompute_utils import convert_ops_to_objects
+from veomni.utils.device import get_torch_device, get_device_type, execute_torch_synchronize, get_dist_communication_backend
 
 
 logger = helper.create_logger(__name__)
@@ -150,8 +151,8 @@ def get_param_groups(model: torch.nn.Module, default_lr: float, vit_lr: float):
 
 def main():
     args = parse_args(Arguments)
-    torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-    dist.init_process_group(backend="nccl")
+    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    dist.init_process_group(backend=get_dist_communication_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
@@ -213,14 +214,14 @@ def main():
     config = AutoConfig.from_pretrained(args.model.config_path, trust_remote_code=True, **config_kwargs)
     model = FluxModel(config)
     model_weights = load_model(
-        file_path=args.model.model_path, device=f"cuda:{args.train.local_rank}", torch_dtype=torch.bfloat16
+        file_path=args.model.model_path, device=f"{get_device_type()}:{args.train.local_rank}", torch_dtype=torch.bfloat16
     )
     model_weights = load_model_from_single_file(
         state_dict=model_weights,
         model_class=model,
         model_resource="civitai",
         torch_dtype=torch.bfloat16,
-        device=f"cuda:{args.train.local_rank}",
+        device=f"{get_device_type()}:{args.train.local_rank}",
     )
     model.load_state_dict(model_weights)
     model.micro_batch_size = args.train.micro_batch_size
@@ -229,7 +230,7 @@ def main():
     tokenizer_2 = T5TokenizerFast.from_pretrained(args.model.tokenizer_2_path)
     text_encoder_1 = SD3TextEncoder1(vocab_size=49408)
     text_encoder_1_weights = load_model(
-        file_path=args.model.pretrained_text_encoder_path, device="cuda", torch_dtype=torch.bfloat16
+        file_path=args.model.pretrained_text_encoder_path, device=get_device_type(), torch_dtype=torch.bfloat16
     )
     converted_text_encoder_1_weights = from_diffusers(text_encoder_1_weights)
     text_encoder_1.load_state_dict(converted_text_encoder_1_weights)
@@ -237,18 +238,18 @@ def main():
         file_path=args.model.pretrained_text_encoder_2_path,
         model_classes=FluxTextEncoder2,
         torch_dtype=torch.bfloat16,
-        device="cuda",
+        device=get_device_type(),
     )
     vae_encoder = FluxVAEEncoder()
     vae_encoder_weights = load_model(
-        file_path=args.model.pretrained_vae_path, device="cuda", torch_dtype=torch.bfloat16
+        file_path=args.model.pretrained_vae_path, device=get_device_type(), torch_dtype=torch.bfloat16
     )
     vae_encoder_weights = load_model_from_single_file(
         state_dict=vae_encoder_weights,
         model_class=vae_encoder,
         model_resource="civitai",
         torch_dtype=torch.bfloat16,
-        device="cuda",
+        device=get_device_type(),
     )
     if hasattr(vae_encoder, "eval"):
         vae_encoder = vae_encoder.eval()
@@ -408,7 +409,7 @@ def main():
         epoch_loss = 0
         for _ in range(args.train.train_steps):
             global_step += 1
-            torch.cuda.synchronize()
+            execute_torch_synchronize()
             total_loss = 0
             start_time = time.time()
             try:
@@ -476,7 +477,7 @@ def main():
 
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
             epoch_loss += total_loss
-            torch.cuda.synchronize()
+            execute_torch_synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
@@ -544,7 +545,7 @@ def main():
             if args.train.global_rank == 0:
                 save_hf_weights(args, save_checkpoint_path, model_assets)
 
-    torch.cuda.synchronize()
+    execute_torch_synchronize()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()

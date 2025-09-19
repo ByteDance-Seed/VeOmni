@@ -7,6 +7,7 @@ from PIL import Image
 from veomni.models import build_foundation_model, build_processor
 from veomni.utils import helper
 from veomni.utils.arguments import InferArguments, parse_args
+from veomni.utils.device import get_device_type
 
 
 logger = helper.create_logger(__name__)
@@ -22,7 +23,7 @@ def main() -> None:
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     helper.set_seed(args.infer.seed)
     helper.enable_third_party_logging()
-    model = build_foundation_model(args.infer.model_path, args.infer.model_path).eval().cuda()
+    model = build_foundation_model(args.infer.model_path, args.infer.model_path).eval().to(get_device_type())
     processor = build_processor(args.infer.tokenizer_path)
     image_token_id = processor.tokenizer.encode(processor.image_token)[0]
     model.config.image_token_id = image_token_id
@@ -48,7 +49,7 @@ def main() -> None:
     )
 
     inputs["image_mask"] = inputs["input_ids"] == image_token_id
-    inputs = inputs.to("cuda")
+    inputs = inputs.to(get_device_type())
     gen_kwargs = {
         "do_sample": args.infer.do_sample,
         "temperature": args.infer.temperature,

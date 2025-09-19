@@ -6,6 +6,7 @@ import torch.distributed as dist
 from torch.distributed._tensor import DTensor
 
 from ...utils.logging import get_logger
+from ...utils.device import get_device_type
 from ..parallel_state import get_parallel_state
 
 
@@ -134,7 +135,7 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
         acc = acc + (gn**p)
     if acc is None:
         # no grads; choose a reasonable device
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = torch.device(get_device_type())
         acc = torch.tensor(0.0, device=dev, dtype=torch.float32)
     return acc
 
@@ -156,7 +157,7 @@ def _local_max(params: List[torch.nn.Parameter]) -> torch.Tensor:
         gn = torch.max(torch.abs(g_local.detach().to(torch.float32)))
         mx = torch.maximum(mx, gn)
     if mx is None:
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = torch.device(get_device_type())
         mx = torch.tensor(0.0, device=dev, dtype=torch.float32)
     return mx
 
