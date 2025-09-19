@@ -8,6 +8,7 @@ from veomni.utils.dist_utils import all_reduce
 
 from ...data.constants import IGNORE_INDEX
 from .modeling_seed_omni import SeedOmniModel
+from ...utils.device import get_device_type
 
 
 def omni_token_meter(batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]):
@@ -33,7 +34,7 @@ def mean_global_batch_loss(
     - √ image_loss = image_loss * micro_batch_image_token_num / global_batch_image_token_num
     - x image_loss = image_loss / (len(global_batch))
     """
-    loss = torch.tensor(0.0, device="cuda")
+    loss = torch.tensor(0.0, device=get_device_type())
     for key in losses.keys():
         if "foundation" in key:
             losses[key] *= micro_batch_meter["text_tokens"]

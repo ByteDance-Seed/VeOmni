@@ -25,7 +25,8 @@ import torch
 from torch import distributed as dist
 
 from ..utils import logging
-from ..utils.import_utils import is_torch_npu_available, is_torch_version_greater_than
+from ..utils.import_utils import is_torch_version_greater_than
+from ..utils.device import get_device_type
 
 
 if is_torch_version_greater_than("2.4"):
@@ -85,7 +86,7 @@ class ParallelState:
     cp_size: int = 1
     ulysses_size: int = 1
     dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1"
-    device_type: str = "npu" if is_torch_npu_available() else "cuda"
+    device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
     ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
@@ -451,7 +452,7 @@ def init_parallel_state(
         return
 
     if device_type is None:
-        device_type = "npu" if is_torch_npu_available() else "cuda"
+        device_type = get_device_type()
 
     # Set dp_shard_size to dp_size if dp_shard_size and dp_replicate_size are not set when dp enabled
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:

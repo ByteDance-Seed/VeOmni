@@ -14,6 +14,7 @@ from veomni.models import build_foundation_model, build_tokenizer
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.utils.device import get_torch_device, get_device_type, get_dist_communication_backend
 
 
 logger = helper.create_logger(__name__)
@@ -46,8 +47,8 @@ def run_checkpointer_test():
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
-    torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-    dist.init_process_group(backend="nccl")
+    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    dist.init_process_group(backend=get_dist_communication_backend())
 
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
@@ -114,7 +115,7 @@ def run_checkpointer_test():
         "attention_mask": torch.ones_like(input_ids),
         "labels": input_ids,
     }
-    micro_batch = {k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()}
+    micro_batch = {k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()}
 
     helper.print_example(micro_batch, rank=args.train.local_rank)
 

@@ -40,6 +40,7 @@ from .fsdp import (
 )
 from .parallel_state import get_parallel_state
 from .utils import get_module_from_path, set_module_from_path
+from ..utils.device import get_device_id, get_device_type
 
 
 if is_torch_version_greater_than("2.4"):
@@ -109,7 +110,7 @@ def parallelize_model_fsdp1(
     fsdp_kwargs = {
         "auto_wrap_policy": wrap_policy,
         "ignored_states": fsdp_no_shard_states,
-        "device_id": torch.cuda.current_device(),
+        "device_id": get_device_id(),
         "sharding_strategy": strategy if enable_full_shard else ShardingStrategy.NO_SHARD,
         "use_orig_params": True,
     }
@@ -134,7 +135,7 @@ def parallelize_model_fsdp1(
         logger.info_rank0("Enable rank0-only initialization.")
         fsdp_kwargs["sync_module_states"] = True
         if parallel_state.global_rank != 0:
-            fsdp_kwargs["param_init_fn"] = init_fsdp_fn(model, device="cuda")
+            fsdp_kwargs["param_init_fn"] = init_fsdp_fn(model, device=get_device_type())
     elif kwargs.get("init_device") == "meta":
         logger.info_rank0("Enable meta initialization.")
         if weights_path is None:
@@ -363,7 +364,7 @@ def parallelize_model_fsdp2(
             from torch.distributed.tensor import distribute_tensor
 
             logger.info_rank0("starting to load model weights...")
-            load_model_weights(model, weights_path, "cuda", dtensor_factory=distribute_tensor)
+            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
@@ -390,7 +391,7 @@ def build_parallelize_model(
     fsdp_no_shard_states = None
 
     if not parallel_state.fsdp_enabled:
-        if kwargs.get("init_device") != "cuda":
+        if kwargs.get("init_device") not in ["cuda", "npu"]:
             raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
         if kwargs.pop("enable_fsdp_offload", False):
             raise ValueError("Only FSDP training supports `enable_fsdp_offload`.")

@@ -22,6 +22,8 @@ from .triton_utils.memory import (
     store_with_pred_1d,
 )
 
+from ....utils.device import get_torch_device
+
 
 @triton.heuristics(values={"BLOCK_ALIGNED": lambda args: args["num_elts"] % args["BLOCK_SIZE"] == 0})
 @triton.jit
@@ -68,7 +70,7 @@ def expert_histogram(input: torch.Tensor, num_bins: int) -> torch.Tensor:
     BLOCK_SIZE = 1024
     num_elts = flattened.numel()
     grid = (triton.cdiv(num_elts, BLOCK_SIZE),)
-    with torch.cuda.device(input.device):
+    with get_torch_device().device(input.device):
         _expert_histogram_kernel[grid](
             out_ptr=out,
             x_ptr=flattened,
@@ -137,7 +139,7 @@ def moe_gather(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     out = torch.empty(M, N, dtype=out_dtype, device=x.device)
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
-    with torch.cuda.device(x.device):
+    with get_torch_device().device(x.device):
         _moe_gather_kernel[grid](
             x,
             out,
@@ -223,7 +225,7 @@ def moe_add_gather(x: torch.Tensor, y: torch.Tensor, index: torch.Tensor, out_dt
     out = torch.empty(M, N, dtype=out_dtype, device=x.device)
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
-    with torch.cuda.device(x.device):
+    with get_torch_device().device(x.device):
         _moe_add_gather_kernel[grid](
             x,
             y,
@@ -311,7 +313,7 @@ def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     assert lambda: index.unique().numel() == M * topk, "Holes in output?"
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
-    with torch.cuda.device(x.device):
+    with get_torch_device().device(x.device):
         _moe_scatter_kernel[grid](
             x,
             out,
@@ -404,7 +406,7 @@ def moe_index_compute(experts_for_tokens: torch.Tensor, expert_histogram_cumsum:
     histogram_cumsum_copy = expert_histogram_cumsum.clone().detach()  # Temporary workspace.
     indices = torch.empty_like(experts_for_tokens, dtype=int)
 
-    with torch.cuda.device(experts_for_tokens.device):
+    with get_torch_device().device(experts_for_tokens.device):
         _moe_index_compute_kernel[(triton.cdiv(experts_for_tokens.numel(), BLOCK_SIZE),)](
             indices_ptr=indices,
             experts_for_tokens_ptr=experts_for_tokens,

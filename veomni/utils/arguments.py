@@ -140,6 +140,12 @@ class DataArguments:
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
+    source_name: str = field(
+        metadata={"help": "Dataset source name, used for preparing corresponding preprocessor."}
+    )
+    enable_multisource: bool = field(
+        metadata={"help": "Whether to enable multi-source."}
+    )
     train_size: int = field(
         default=10_000_000,
         metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
@@ -369,10 +375,10 @@ class TrainingArguments:
             "help": "Enable rank0-only initialization for FSDP1 training. Note: this argument will be deprecated in the future, please use `init_device=cpu` instead."
         },
     )
-    init_device: Literal["cpu", "cuda", "meta"] = field(
+    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta."
+            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
     enable_full_determinism: bool = field(

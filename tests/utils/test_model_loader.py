@@ -4,13 +4,13 @@ import subprocess
 from dataclasses import dataclass, field
 
 import pytest
-import torch
 import torch.distributed as dist
 
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.models import build_foundation_model
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.utils.device import get_torch_device, get_device_type, get_dist_communication_backend
 
 
 logger = helper.create_logger(__name__)
@@ -35,8 +35,8 @@ torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_helpe
 def run_environ_meter(args: Arguments):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
-    torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-    dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    dist.init_process_group(backend=get_dist_communication_backend(), world_size=world_size, rank=rank)
 
     init_parallel_state(
         dp_size=args.train.data_parallel_size,

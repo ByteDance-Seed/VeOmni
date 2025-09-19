@@ -29,6 +29,8 @@ from .utils import (
     unpad_tensor,
 )
 
+from ...utils.device import get_device_id
+
 
 def _all_gather(
     x: Tensor,
@@ -55,7 +57,7 @@ def _all_gather_into_tensor(
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
     dim_size[0] = dim_size[0] * sp_world_size
-    output = torch.empty(dim_size, dtype=x.dtype, device=torch.cuda.current_device())
+    output = torch.empty(dim_size, dtype=x.dtype, device=get_device_id())
     dist.all_gather_into_tensor(output, x, group=group)
     return output
 

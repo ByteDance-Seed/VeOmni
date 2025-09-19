@@ -54,9 +54,9 @@ def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
-    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2"]] = "flash_attention_2",
+    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]] = "flash_attention_2",
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
-    init_device: Literal["cpu", "cuda", "meta"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     force_use_huggingface: Optional[bool] = False,
 ) -> "PreTrainedModel":

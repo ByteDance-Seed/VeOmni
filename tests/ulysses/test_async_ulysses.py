@@ -16,6 +16,7 @@ from veomni.distributed.sequence_parallel.comm import set_ulysses_sequence_paral
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
+from veomni.utils.device import get_torch_device, get_device_type
 
 from .attention import Attention
 from .utils import (
@@ -31,7 +32,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         hidden_dim = 64 * heads
         batch_size = 2
         seq_len = 8192
-        input_ = torch.randn(batch_size, seq_len, hidden_dim).cuda()
+        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())
         dist.broadcast(input_, src=0)
 
         return input_
@@ -42,7 +43,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         hidden_dim = 64 * heads
         batch_size = 2
         seq_len = 8191
-        input_ = torch.randn(batch_size, seq_len, hidden_dim).cuda()
+        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())
         dist.broadcast(input_, src=0)
 
         return input_
@@ -69,10 +70,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         # initialize attn module
         attn_dp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).cuda()
+        ).to(get_device_type())
         attn_sp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=True
-        ).cuda()
+        ).to(get_device_type())
         attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
         attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
@@ -118,10 +119,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         # initialize attn module
         attn_dp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).cuda()
+        ).to(get_device_type())
         attn_sp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=True
-        ).cuda()
+        ).to(get_device_type())
         attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
         attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
@@ -156,7 +157,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
 
 if __name__ == "__main__":
-    assert not torch.cuda._initialized, "test_distributed must not have initialized CUDA context on main process"
+    assert not get_torch_device()._initialized, "test_distributed must not have initialized CUDA context on main process"
 
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()

@@ -10,6 +10,7 @@ from safetensors.torch import load_file
 from tqdm import tqdm
 
 from veomni.models import save_model_weights
+from veomni.utils.device import execute_torch_empty_cache, get_device_type
 
 
 def main(fp8_path, bf16_path):
@@ -29,7 +30,7 @@ def main(fp8_path, bf16_path):
         file_name = weight_map[tensor_name]
         if file_name not in loaded_files:
             file_path = os.path.join(fp8_path, file_name)
-            loaded_files[file_name] = load_file(file_path, device="cuda")
+            loaded_files[file_name] = load_file(file_path, device=get_device_type())
         return loaded_files[file_name][tensor_name]
 
     safetensor_files = list(glob(os.path.join(fp8_path, "*.safetensors")))
@@ -37,7 +38,7 @@ def main(fp8_path, bf16_path):
     new_state_dict = {}
     for safetensor_file in tqdm(safetensor_files):
         file_name = os.path.basename(safetensor_file)
-        current_state_dict = load_file(safetensor_file, device="cuda")
+        current_state_dict = load_file(safetensor_file, device=get_device_type())
         loaded_files[file_name] = current_state_dict
 
         for weight_name, weight in current_state_dict.items():
@@ -60,7 +61,7 @@ def main(fp8_path, bf16_path):
         if len(loaded_files) > 2:
             oldest_file = next(iter(loaded_files))
             del loaded_files[oldest_file]
-            torch.cuda.empty_cache()
+            execute_torch_empty_cache()
 
     num_experts = 256
     start_layer, end_layer = 3, 61
