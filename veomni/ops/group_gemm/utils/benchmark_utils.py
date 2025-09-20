@@ -20,7 +20,10 @@ import torch
 import torch.testing
 
 from . import envvars
-from . import logger as blog
+from ....utils import logging
+from ....utils.device import get_torch_device, execute_torch_synchronize
+
+logger = logging.get_logger(__name__)
 
 
 _BENCHMARK_RESULT_FILE = "benchmark_results.txt"
@@ -38,8 +41,8 @@ def _benchmark_fn(f, repeats):
         repeats = 1
         warmup_repeats = 0
 
-    start_event = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
-    end_event = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+    start_event = [get_torch_device().Event(enable_timing=True) for _ in range(repeats)]
+    end_event = [get_torch_device().Event(enable_timing=True) for _ in range(repeats)]
     for _ in range(warmup_repeats):
         f()
 
@@ -51,7 +54,7 @@ def _benchmark_fn(f, repeats):
         start_event[i].record()
         f()
         end_event[i].record()
-    torch.cuda.synchronize()
+    execute_torch_synchronize()
 
     durations = sorted([start_event[i].elapsed_time(end_event[i]) for i in range(repeats)])
     if repeats >= 10:  # We only preserve 25% to 75% timings.
@@ -87,7 +90,7 @@ def _report_benchmark_result(
         name = name + " [baseline]"  # ...
 
     msec_per_iter = 1000 / iters_per_sec
-    blog.logging.info(
+    logger.info(
         f"{name}: used {elapsed_secs:.2f} seconds ({msec_per_iter:.2f} ms per iter), "
         f"{measurement:.2f} {measurement_unit}/s"
     )

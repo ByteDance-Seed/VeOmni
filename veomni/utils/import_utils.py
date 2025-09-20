@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Dict
 
 from packaging import version
 
+from .device import is_cuda_available
+
 
 if TYPE_CHECKING:
     from packaging.version import Version
@@ -41,7 +43,6 @@ def _get_package_version(name: str) -> "Version":
 _PACKAGE_FLAGS: Dict[str, bool] = {
     "flash_attn": _is_package_available("flash_attn"),
     "liger_kernel": _is_package_available("liger_kernel"),
-    "torch_npu": _is_package_available("torch_npu"),
     "vescale": _is_package_available("vescale"),
     "seed_kernels": _is_package_available("seed_kernels"),
     "bytecheckpoint": _is_package_available("bytecheckpoint"),
@@ -62,10 +63,6 @@ def is_liger_kernel_available() -> bool:
     return _PACKAGE_FLAGS["liger_kernel"]
 
 
-def is_torch_npu_available() -> bool:
-    return _PACKAGE_FLAGS["torch_npu"]
-
-
 def is_vescale_available() -> bool:
     return _PACKAGE_FLAGS["vescale"]
 
@@ -83,9 +80,7 @@ def is_diffusers_available() -> bool:
 
 
 def is_fused_moe_available() -> bool:
-    import torch
-
-    return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
+    return is_cuda_available and _PACKAGE_FLAGS["triton"]
 
 
 def is_video_audio_available() -> bool:

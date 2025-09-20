@@ -14,6 +14,7 @@
 
 from functools import lru_cache
 
+from ....utils.device import get_device_name
 
 @lru_cache
 def get_device_key() -> str:
@@ -25,7 +26,8 @@ def get_device_key() -> str:
     if torch.cuda.get_device_capability() == (9, 0):
         return "H100"
 
-    name = torch.cuda.get_device_name()
+    name = get_device_name()
     if name.startswith("NVIDIA "):
         name = name[len("NVIDIA ") :]
+
     return name

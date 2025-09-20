@@ -12,6 +12,7 @@ from veomni.models import build_foundation_model, build_processor
 from veomni.models.seed_omni import SeedOmniModel, SeedOmniProcessor
 from veomni.utils import helper
 from veomni.utils.arguments import InferArguments, parse_args
+from veomni.utils.device import get_device_type
 
 
 logger = helper.create_logger(__name__)
@@ -117,7 +118,7 @@ def main() -> None:
     helper.set_seed(args.infer.seed)
     helper.enable_third_party_logging()
     # config model and processor
-    model: SeedOmniModel = build_foundation_model(args.infer.model_path, args.infer.model_path).eval().cuda()
+    model: SeedOmniModel = build_foundation_model(args.infer.model_path, args.infer.model_path).eval().to(get_device_type())
     position_id_func = model.get_position_id_func()
     modality_info = model.get_modality()
     processor: SeedOmniProcessor = build_processor(args.infer.model_path)

@@ -79,7 +79,7 @@ def build_omni_model(
     output_encoder: str = "decoder",
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2"]] = "flash_attention_2",
-    init_device: Literal["cpu", "cuda"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     force_use_huggingface: bool = False,
 ) -> "PreTrainedModel":
