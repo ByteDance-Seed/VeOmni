@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import hdfs_io
 import numpy as np
 import psutil
 import torch
@@ -48,9 +47,11 @@ from .multisource_utils import parse_multisource_config
 
 
 try:
+    import hdfs_io
     from hdfs_io import copy
-except ImportError:
-    from .hdfs_io import copy
+except (ImportError, ModuleNotFoundError):
+    from veomni.utils import hdfs_io
+    from veomni.utils.hdfs_io import copy
 
 if is_torch_npu_available():
     import torch_npu  # noqa: F401 # type: ignore

@@ -17,8 +17,16 @@ from typing import List, Optional, Union
 
 import torch
 from transformers import BatchFeature
-from transformers.image_utils import ImageInput, PILImageResampling, VideoInput
+from transformers.image_utils import ImageInput, PILImageResampling
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+
+if is_transformers_version_greater_or_equal_to("4.52.0"):
+    from transformers.video_utils import VideoInput
+else:
+    from transformers.image_utils import VideoInput
 
 from ..base import BaseEncoderProcessorMixin
 
