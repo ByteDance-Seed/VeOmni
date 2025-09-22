@@ -39,7 +39,7 @@ from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from transformers.utils.import_utils import is_safetensors_available
 
 from ..utils import logging
-from ..utils.device import execute_torch_synchronize
+from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 
 
@@ -416,7 +416,7 @@ def save_model_weights(
 
             empty_cache()
             if global_rank is not None and dist.is_initialized():  # avoid process hanging
-                execute_torch_synchronize()
+                synchronize()
                 dist.barrier()
 
         if global_rank is None or global_rank == 0:

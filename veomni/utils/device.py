@@ -65,7 +65,7 @@ def get_device_id() -> int:
     return get_torch_device().current_device()
 
 
-def get_dist_communication_backend() -> str:
+def get_nccl_backend() -> str:
     """Return distributed communication backend type based on device type."""
     if IS_CUDA_AVAILABLE:
         return "nccl"
@@ -75,11 +75,11 @@ def get_dist_communication_backend() -> str:
         raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
 
 
-def execute_torch_synchronize() -> None:
+def synchronize() -> None:
     """Execute torch synchronize operation."""
     get_torch_device().synchronize()
 
 
-def execute_torch_empty_cache() -> None:
+def empty_cache() -> None:
     """Execute torch empty cache operation."""
     get_torch_device().empty_cache()

@@ -14,7 +14,7 @@ from veomni.models import build_foundation_model, build_tokenizer
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.utils.device import get_device_type, get_dist_communication_backend, get_torch_device
+from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
@@ -48,7 +48,7 @@ def run_checkpointer_test():
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_dist_communication_backend())
+    dist.init_process_group(backend=get_nccl_backend())
 
     init_parallel_state(
         dp_size=args.train.data_parallel_size,

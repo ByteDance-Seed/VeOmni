@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
 from veomni.distributed.sequence_parallel import set_ulysses_sequence_parallel_group
-from veomni.utils.device import get_device_id, get_dist_communication_backend, get_torch_device
+from veomni.utils.device import get_device_id, get_nccl_backend, get_torch_device
 
 
 def sync_tensor(variable, dim=1):
@@ -69,7 +69,7 @@ class SequenceParallelTest(CommonDistributedDataParallelTest, MultiProcessTestCa
         store = self._get_store()
         get_torch_device().set_device(self.rank)
         c10d.init_process_group(
-            get_dist_communication_backend(), store=store, rank=self.rank, world_size=self.world_size
+            get_nccl_backend(), store=store, rank=self.rank, world_size=self.world_size
         )
         group = c10d.distributed_c10d._get_default_group()
         set_ulysses_sequence_parallel_group(group)

@@ -26,9 +26,9 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
-    execute_torch_synchronize,
+    synchronize,
     get_device_type,
-    get_dist_communication_backend,
+    get_nccl_backend,
     get_torch_device,
 )
 from veomni.utils.dist_utils import all_reduce
@@ -49,7 +49,7 @@ def main():
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_dist_communication_backend())
+    dist.init_process_group(backend=get_nccl_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
@@ -254,7 +254,7 @@ def main():
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0
-            execute_torch_synchronize()
+            synchronize()
             start_time = time.time()
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
@@ -285,7 +285,7 @@ def main():
 
             # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
-            execute_torch_synchronize()
+            synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
@@ -345,7 +345,7 @@ def main():
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
-    execute_torch_synchronize()
+    synchronize()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()

@@ -10,7 +10,7 @@ from safetensors.torch import load_file
 from tqdm import tqdm
 
 from veomni.models import save_model_weights
-from veomni.utils.device import execute_torch_empty_cache, get_device_type
+from veomni.utils.device import empty_cache, get_device_type
 
 
 def main(fp8_path, bf16_path):
@@ -61,7 +61,7 @@ def main(fp8_path, bf16_path):
         if len(loaded_files) > 2:
             oldest_file = next(iter(loaded_files))
             del loaded_files[oldest_file]
-            execute_torch_empty_cache()
+            empty_cache()
 
     num_experts = 256
     start_layer, end_layer = 3, 61

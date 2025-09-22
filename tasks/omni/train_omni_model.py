@@ -31,7 +31,7 @@ from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.utils.device import execute_torch_synchronize, get_device_type, get_torch_device
+from veomni.utils.device import synchronize, get_device_type, get_torch_device
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
 
@@ -404,7 +404,7 @@ def main():
 
             total_loss = 0
             total_losses = defaultdict(int)
-            execute_torch_synchronize()
+            synchronize()
             start_time = time.time()
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
@@ -443,7 +443,7 @@ def main():
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
             for key, v in total_losses.items():
                 total_losses[key] = all_reduce((v), group=get_parallel_state().fsdp_group)
-            execute_torch_synchronize()
+            synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time=delta_time, global_step=global_step)
@@ -511,7 +511,7 @@ def main():
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
-    execute_torch_synchronize()
+    synchronize()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()

@@ -20,7 +20,7 @@ import torch
 import torch.testing
 
 from ....utils import logging
-from ....utils.device import execute_torch_synchronize, get_torch_device
+from ....utils.device import synchronize, get_torch_device
 from . import envvars
 
 
@@ -55,7 +55,7 @@ def _benchmark_fn(f, repeats):
         start_event[i].record()
         f()
         end_event[i].record()
-    execute_torch_synchronize()
+    synchronize()
 
     durations = sorted([start_event[i].elapsed_time(end_event[i]) for i in range(repeats)])
     if repeats >= 10:  # We only preserve 25% to 75% timings.

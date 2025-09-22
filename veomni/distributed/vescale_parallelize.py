@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from ..utils import logging
-from ..utils.device import execute_torch_empty_cache, get_device_type
+from ..utils.device import empty_cache, get_device_type
 from .parallel_state import get_parallel_state
 
 
@@ -91,7 +91,7 @@ def build_parallelize_model(
             if enable_fsdp_offload:
                 module.cpu()
                 gc.collect()
-                execute_torch_empty_cache()
+                empty_cache()
             else:
                 model.to(get_device_type())
             fully_shard(
@@ -118,7 +118,7 @@ def build_parallelize_model(
         offload_policy=cpu_offload_policy,
     )
     gc.collect()
-    execute_torch_empty_cache()
+    empty_cache()
 
     # NOTE: uncomment below for saving memory fragmentation
     model._set_unshard_async_op(True)
