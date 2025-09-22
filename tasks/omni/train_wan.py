@@ -30,10 +30,10 @@ from veomni.utils.arguments import (
     save_args,
 )
 from veomni.utils.device import (
-    synchronize,
     get_device_type,
     get_nccl_backend,
     get_torch_device,
+    synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.dit_utils import EnvironMeter, save_model_weights

@@ -20,7 +20,7 @@ import torch
 import torch.testing
 
 from ....utils import logging
-from ....utils.device import synchronize, get_torch_device
+from ....utils.device import get_torch_device, synchronize
 from . import envvars
 
 

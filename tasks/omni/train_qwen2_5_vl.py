@@ -32,10 +32,10 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
-    synchronize,
     get_device_type,
     get_nccl_backend,
     get_torch_device,
+    synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
 
