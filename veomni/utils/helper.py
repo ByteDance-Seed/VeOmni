@@ -42,7 +42,6 @@ from veomni.utils.count_flops import VeomniFlopsCounter
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
     IS_NPU_AVAILABLE,
-    empty_cache,
     get_device_type,
     get_torch_device,
 )
@@ -471,6 +470,7 @@ def empty_cache() -> None:
     gc.collect()
 
     if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
+        from veomni.utils.device import empty_cache
         empty_cache()
 
 

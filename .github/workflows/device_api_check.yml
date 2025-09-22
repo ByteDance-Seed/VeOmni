@@ -1,5 +1,5 @@
 # c.f. https://github.com/pre-commit/action?tab=readme-ov-file#using-this-action
-name: pre-commit
+name: device-api-check
 
 # No need to avoid / cancel lightweight pre-commit jobs
 on:
@@ -24,12 +24,9 @@ jobs:
           fetch-depth: 0
           path: .
       - uses: actions/setup-python@v3
-      - name: Install ruff
-        run: pip install -e ".[dev]"
-
-      - name: Run ruff format and check
+      - name: Run device api usage normativity in VeOmni/tasks
         run: |
-          pwd && ls -la
-          ruff check tasks tests veomni docs
-          ruff format --check tasks tests veomni docs
-
+          python tests/special_senity/check_device_api_usage.py -d tasks
+      - name: Run device api usage normativity in VeOmni/veomni
+        run: |
+          python tests/special_senity/check_device_api_usage.py -d veomni
