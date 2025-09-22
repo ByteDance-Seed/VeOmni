@@ -1,7 +1,6 @@
-# c.f. https://github.com/pre-commit/action?tab=readme-ov-file#using-this-action
 name: device-api-check
 
-# No need to avoid / cancel lightweight pre-commit jobs
+# No need to avoid / cancel lightweight device api check job
 on:
   pull_request:
   push:
@@ -13,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  pre-commit:
+  device-api-check:
     runs-on: ubuntu-latest
     strategy:
       matrix:
