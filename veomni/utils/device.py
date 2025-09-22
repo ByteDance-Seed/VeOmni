@@ -19,19 +19,10 @@ from typing import Any
 import torch
 
 from . import logging
+from .import_utils import is_torch_npu_available
 
 
 logger = logging.get_logger(__name__)
-
-
-def is_torch_npu_available() -> bool:
-    """Check the availability of NPU."""
-    try:
-        import torch_npu  # noqa: F401
-
-        return torch.npu.is_available()
-    except ImportError:
-        return False
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()

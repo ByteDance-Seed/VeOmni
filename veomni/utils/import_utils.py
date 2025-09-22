@@ -43,6 +43,7 @@ def _get_package_version(name: str) -> "Version":
 _PACKAGE_FLAGS: Dict[str, bool] = {
     "flash_attn": _is_package_available("flash_attn"),
     "liger_kernel": _is_package_available("liger_kernel"),
+    "torch_npu": _is_package_available("torch_npu"),
     "vescale": _is_package_available("vescale"),
     "seed_kernels": _is_package_available("seed_kernels"),
     "bytecheckpoint": _is_package_available("bytecheckpoint"),
@@ -61,6 +62,10 @@ def is_flash_attn_2_available() -> bool:
 
 def is_liger_kernel_available() -> bool:
     return _PACKAGE_FLAGS["liger_kernel"]
+
+
+def is_torch_npu_available() -> bool:
+    return _PACKAGE_FLAGS["torch_npu"]
 
 
 def is_vescale_available() -> bool:
