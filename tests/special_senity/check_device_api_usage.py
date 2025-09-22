@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Following codes are inspired from https://github.com/volcengine/verl/blob/main/tests/special_sanity/check_device_api_usage.py
+
 """
 This CI test is used for checking whether device api usage is irregular, suggest using api in `veomni/utils/device.py`.
-Search targets include .py files in verl/recipe and verl/verl.
+Search targets include .py files in VeOmni/tasks and VeOmni/veomni.
 Some files that must contain ".cuda", "cuda" or "nccl" keyword is pre-defined in whitelist below.
 
 Should be run as follows:
@@ -101,5 +103,5 @@ if __name__ == "__main__":
 
             assert not find_invalid_device_management, (
                 f'file {path_in_str} contains .cuda/"cuda"/"nccl" usage, please use api in '
-                f"verl/utils/device.py directly."
+                f"veomni/utils/device.py directly."
             )
