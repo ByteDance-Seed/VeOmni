@@ -40,11 +40,11 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils import logging
 from veomni.utils.count_flops import VeomniFlopsCounter
 from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
     execute_torch_empty_cache,
     get_device_type,
     get_torch_device,
-    IS_CUDA_AVAILABLE,
-    IS_NPU_AVAILABLE,
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
