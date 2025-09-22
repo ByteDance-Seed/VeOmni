@@ -471,6 +471,7 @@ def empty_cache() -> None:
 
     if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
         from veomni.utils.device import empty_cache
+
         empty_cache()
 
 
