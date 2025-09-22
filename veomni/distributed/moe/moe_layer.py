@@ -18,12 +18,12 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from ...utils.device import is_npu_available
+from ...utils.device import IS_NPU_AVAILABLE
 from .comm import all_to_all
 from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
 
 
-if not is_npu_available:
+if not IS_NPU_AVAILABLE:
     from ...ops.group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
 

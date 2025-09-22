@@ -34,18 +34,18 @@ def is_torch_npu_available() -> bool:
         return False
 
 
-is_cuda_available = torch.cuda.is_available()
-is_npu_available = is_torch_npu_available()
+IS_CUDA_AVAILABLE = torch.cuda.is_available()
+IS_NPU_AVAILABLE = is_torch_npu_available()
 
-if is_npu_available:
+if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
 
 
 def get_device_type() -> str:
     """Get device type based on current machine, currently only support CPU, CUDA, NPU."""
-    if is_cuda_available:
+    if IS_CUDA_AVAILABLE:
         device = "cuda"
-    elif is_npu_available:
+    elif IS_NPU_AVAILABLE:
         device = "npu"
     else:
         device = "cpu"
@@ -76,9 +76,9 @@ def get_device_id() -> int:
 
 def get_dist_communication_backend() -> str:
     """Return distributed communication backend type based on device type."""
-    if is_cuda_available:
+    if IS_CUDA_AVAILABLE:
         return "nccl"
-    elif is_npu_available:
+    elif IS_NPU_AVAILABLE:
         return "hccl"
     else:
         raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")

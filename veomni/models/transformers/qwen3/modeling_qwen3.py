@@ -28,7 +28,7 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
-from ....utils.device import is_npu_available
+from ....utils.device import IS_NPU_AVAILABLE
 from ....utils.import_utils import is_liger_kernel_available
 
 
@@ -878,7 +878,7 @@ if is_liger_kernel_available():
     Qwen3MLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Qwen3.")
 
-if is_npu_available:
+if IS_NPU_AVAILABLE:
     from veomni_kernels.rms_norm.npu_ttx_rmsnorm_kernel import triton_rmsnorm_npu
     from veomni_kernels.rope.npu_ttx_rope_kernel import triton_rope_npu
 

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Dict
 
 from packaging import version
 
-from .device import is_cuda_available
+from .device import IS_CUDA_AVAILABLE
 
 
 if TYPE_CHECKING:
@@ -80,7 +80,7 @@ def is_diffusers_available() -> bool:
 
 
 def is_fused_moe_available() -> bool:
-    return is_cuda_available and _PACKAGE_FLAGS["triton"]
+    return IS_CUDA_AVAILABLE and _PACKAGE_FLAGS["triton"]
 
 
 def is_video_audio_available() -> bool:

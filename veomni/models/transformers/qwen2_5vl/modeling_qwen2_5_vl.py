@@ -56,7 +56,7 @@ from ....distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
     unpad_tensor,
 )
-from ....utils.device import is_cuda_available
+from ....utils.device import IS_CUDA_AVAILABLE
 from ....utils.import_utils import is_liger_kernel_available
 
 
@@ -64,7 +64,7 @@ if is_liger_kernel_available():
     from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss  # type: ignore
 
 
-if is_flash_attn_2_available() and is_cuda_available:
+if is_flash_attn_2_available() and IS_CUDA_AVAILABLE:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.layers.rotary import apply_rotary_emb
     from transformers.modeling_flash_attention_utils import _flash_attention_forward

@@ -43,8 +43,8 @@ from veomni.utils.device import (
     execute_torch_empty_cache,
     get_device_type,
     get_torch_device,
-    is_cuda_available,
-    is_npu_available,
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
@@ -60,7 +60,7 @@ except (ImportError, ModuleNotFoundError):
     from veomni.utils import hdfs_io
     from veomni.utils.hdfs_io import copy
 
-if is_npu_available:
+if IS_NPU_AVAILABLE:
     import torch_npu
 
 
@@ -386,11 +386,11 @@ def enable_high_precision_for_bf16():
     """
     Set high accumulation dtype for matmul and reduction.
     """
-    if is_cuda_available:
+    if IS_CUDA_AVAILABLE:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
-    if is_npu_available:
+    if IS_NPU_AVAILABLE:
         torch.npu.matmul.allow_tf32 = False
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
@@ -470,7 +470,7 @@ def empty_cache() -> None:
     """
     gc.collect()
 
-    if is_cuda_available or is_npu_available:
+    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
         execute_torch_empty_cache()
 
 
@@ -612,7 +612,7 @@ def create_profiler(
         time = int(datetime.datetime.now().timestamp())
 
         # torch_npu does not support export gzip trace json directly
-        trace_file_extention = "pt.trace.json" if is_npu_available else "pt.trace.json.gz"
+        trace_file_extention = "pt.trace.json" if IS_NPU_AVAILABLE else "pt.trace.json.gz"
         memory_timeline_file_extention = "html"
         gpu_memory_file_extension = "pkl"
 
@@ -633,12 +633,12 @@ def create_profiler(
 
         p.export_memory_timeline(memory_timeline_file)
         logger.info(f"Profiling memory timeline saved at {memory_timeline_file}.")
-        if is_cuda_available or is_npu_available:
+        if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
             get_torch_device().memory._dump_snapshot(gpu_memory_file)
             logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         # In NPU, compress the trace file to .gz format ourselves.
-        if is_npu_available:
+        if IS_NPU_AVAILABLE:
             gz_path = trace_file + ".gz"
             import gzip
 
@@ -663,7 +663,7 @@ def create_profiler(
             except Exception as e:
                 logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
 
-    if is_npu_available:
+    if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
     else:
@@ -690,7 +690,7 @@ def create_profiler(
         with_modules=True,
         with_stack=with_stack,
     )
-    if is_cuda_available:
+    if IS_CUDA_AVAILABLE:
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler

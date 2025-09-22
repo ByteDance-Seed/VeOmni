@@ -31,7 +31,7 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from ..utils.device import is_npu_available
+from ..utils.device import IS_NPU_AVAILABLE
 
 
 logger = logging.get_logger(__name__)
@@ -346,8 +346,8 @@ def build_ep_fsdp2_optimizer(
     )
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
-        foreach = False if is_npu_available else (not fused)
-        fused_ = False if is_npu_available else fused
+        foreach = False if IS_NPU_AVAILABLE else (not fused)
+        fused_ = False if IS_NPU_AVAILABLE else fused
         if optimizer_type == "adamw":
             return AdamW(groups, lr, betas, eps, weight_decay, fused=fused_, foreach=foreach)
         elif optimizer_type == "anyprecision_adamw":
