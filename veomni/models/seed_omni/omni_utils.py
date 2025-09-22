@@ -7,8 +7,8 @@ import torch.distributed as dist
 from veomni.utils.dist_utils import all_reduce
 
 from ...data.constants import IGNORE_INDEX
-from .modeling_seed_omni import SeedOmniModel
 from ...utils.device import get_device_type
+from .modeling_seed_omni import SeedOmniModel
 
 
 def omni_token_meter(batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]):

@@ -29,11 +29,16 @@ from veomni.utils.arguments import (
     parse_args,
     save_args,
 )
+from veomni.utils.device import (
+    execute_torch_synchronize,
+    get_device_type,
+    get_dist_communication_backend,
+    get_torch_device,
+)
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.dit_utils import EnvironMeter, save_model_weights
 from veomni.utils.lora_utils import add_lora_to_model, freeze_parameters
 from veomni.utils.recompute_utils import convert_ops_to_objects
-from veomni.utils.device import get_torch_device, get_device_type, execute_torch_synchronize, get_dist_communication_backend
 
 
 logger = helper.create_logger(__name__)

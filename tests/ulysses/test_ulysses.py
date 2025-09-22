@@ -18,8 +18,8 @@ from veomni.distributed.sequence_parallel.comm import (
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.utils.device import get_device_type, get_torch_device
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
-from veomni.utils.device import get_torch_device, get_device_type
 
 from .attention import Attention
 from .utils import (

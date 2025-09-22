@@ -13,9 +13,8 @@ from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
+from veomni.utils.device import get_device_type, get_torch_device
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
-from veomni.utils.device import get_torch_device, get_device_type
-
 
 from .utils import (
     SequenceParallelTest,

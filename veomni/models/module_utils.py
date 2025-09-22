@@ -39,8 +39,8 @@ from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from transformers.utils.import_utils import is_safetensors_available
 
 from ..utils import logging
-from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.device import execute_torch_synchronize
+from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 
 
 if is_safetensors_available():

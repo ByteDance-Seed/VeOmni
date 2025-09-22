@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ....utils.device import get_torch_device
 from ..utils.pretuned import algo_key_scaled, pretuned
 from .triton_utils.activation import (
     ActivationType,
@@ -34,8 +35,6 @@ from .triton_utils.utils import (
     get_pid_mn,
     make_blocked,
 )
-
-from ....utils.device import get_torch_device
 
 
 def _get_cuda_autotune_config():

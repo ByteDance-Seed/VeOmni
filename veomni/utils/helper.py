@@ -38,9 +38,15 @@ from transformers import set_seed as set_seed_func
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils import logging
 from veomni.utils.count_flops import VeomniFlopsCounter
+from veomni.utils.device import (
+    execute_torch_empty_cache,
+    get_device_type,
+    get_torch_device,
+    is_cuda_available,
+    is_npu_available,
+)
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
-from veomni.utils.device import get_torch_device, get_device_type, is_cuda_available, is_npu_available, execute_torch_empty_cache
 
 from .import_utils import is_veomni_patch_available
 from .multisource_utils import parse_multisource_config

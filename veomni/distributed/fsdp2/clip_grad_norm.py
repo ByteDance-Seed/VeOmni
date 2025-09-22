@@ -5,8 +5,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
 
-from ...utils.logging import get_logger
 from ...utils.device import get_device_type
+from ...utils.logging import get_logger
 from ..parallel_state import get_parallel_state
 
 

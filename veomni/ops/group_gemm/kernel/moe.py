@@ -17,12 +17,11 @@ import torch
 import triton
 import triton.language as tl
 
+from ....utils.device import get_torch_device
 from .triton_utils.memory import (
     load_with_pred_1d,
     store_with_pred_1d,
 )
-
-from ....utils.device import get_torch_device
 
 
 @triton.heuristics(values={"BLOCK_ALIGNED": lambda args: args["num_elts"] % args["BLOCK_SIZE"] == 0})

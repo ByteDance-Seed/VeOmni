@@ -56,8 +56,8 @@ from ....distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
     unpad_tensor,
 )
-from ....utils.import_utils import is_liger_kernel_available
 from ....utils.device import is_cuda_available
+from ....utils.import_utils import is_liger_kernel_available
 
 
 if is_liger_kernel_available():

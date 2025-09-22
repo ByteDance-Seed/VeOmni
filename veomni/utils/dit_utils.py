@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from .helper import EnvironMeter as OriginalEnvironMeter
 from .device import execute_torch_synchronize
+from .helper import EnvironMeter as OriginalEnvironMeter
 
 
 if TYPE_CHECKING:

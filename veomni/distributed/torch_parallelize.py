@@ -29,6 +29,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 from ..models import load_model_weights
 from ..utils import logging
+from ..utils.device import get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
 from .checkpoint import CheckpointFunction
 from .fsdp import (
@@ -40,7 +41,6 @@ from .fsdp import (
 )
 from .parallel_state import get_parallel_state
 from .utils import get_module_from_path, set_module_from_path
-from ..utils.device import get_device_id, get_device_type
 
 
 if is_torch_version_greater_than("2.4"):

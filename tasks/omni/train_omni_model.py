@@ -31,9 +31,9 @@ from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.utils.device import execute_torch_synchronize, get_device_type, get_torch_device
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
-from veomni.utils.device import get_torch_device, get_device_type, execute_torch_synchronize
 
 
 logger = helper.create_logger(__name__)

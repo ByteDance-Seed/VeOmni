@@ -11,7 +11,7 @@ from transformers import Qwen2Config
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.utils.device import get_torch_device, get_device_type, get_dist_communication_backend
+from veomni.utils.device import get_device_type, get_dist_communication_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)

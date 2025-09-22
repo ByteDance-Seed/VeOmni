@@ -28,8 +28,8 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
-from ....utils.import_utils import is_liger_kernel_available
 from ....utils.device import is_npu_available
+from ....utils.import_utils import is_liger_kernel_available
 
 
 if is_torch_flex_attn_available():

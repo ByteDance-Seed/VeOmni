@@ -14,7 +14,7 @@ from veomni.models import build_foundation_model, build_tokenizer
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.utils.device import get_torch_device, get_device_type, get_dist_communication_backend
+from veomni.utils.device import get_device_type, get_dist_communication_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)

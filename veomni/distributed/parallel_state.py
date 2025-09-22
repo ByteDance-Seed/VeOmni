@@ -25,8 +25,8 @@ import torch
 from torch import distributed as dist
 
 from ..utils import logging
-from ..utils.import_utils import is_torch_version_greater_than
 from ..utils.device import get_device_type
+from ..utils.import_utils import is_torch_version_greater_than
 
 
 if is_torch_version_greater_than("2.4"):

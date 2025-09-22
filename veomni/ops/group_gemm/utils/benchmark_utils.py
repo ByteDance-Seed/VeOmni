@@ -19,9 +19,10 @@ from typing import Callable, Optional
 import torch
 import torch.testing
 
-from . import envvars
 from ....utils import logging
-from ....utils.device import get_torch_device, execute_torch_synchronize
+from ....utils.device import execute_torch_synchronize, get_torch_device
+from . import envvars
+
 
 logger = logging.get_logger(__name__)
 

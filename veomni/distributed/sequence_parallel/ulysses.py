@@ -20,6 +20,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
+from ...utils.device import get_device_id
 from .comm import (
     get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
@@ -28,8 +29,6 @@ from .utils import (
     pad_tensor,
     unpad_tensor,
 )
-
-from ...utils.device import get_device_id
 
 
 def _all_gather(

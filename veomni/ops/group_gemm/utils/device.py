@@ -16,6 +16,7 @@ from functools import lru_cache
 
 from ....utils.device import get_device_name
 
+
 @lru_cache
 def get_device_key() -> str:
     import torch

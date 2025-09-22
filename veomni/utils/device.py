@@ -15,9 +15,11 @@
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
 
 from typing import Any
+
 import torch
 
 from . import logging
+
 
 logger = logging.get_logger(__name__)
 
