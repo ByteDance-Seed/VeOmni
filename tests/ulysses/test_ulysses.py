@@ -166,7 +166,9 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
 
 if __name__ == "__main__":
-    assert not get_torch_device()._initialized, "test_distributed must not have initialized CUDA context on main process"
+    assert not get_torch_device()._initialized, (
+        "test_distributed must not have initialized CUDA context on main process"
+    )
 
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()

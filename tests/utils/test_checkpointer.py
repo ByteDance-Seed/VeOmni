@@ -115,7 +115,10 @@ def run_checkpointer_test():
         "attention_mask": torch.ones_like(input_ids),
         "labels": input_ids,
     }
-    micro_batch = {k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()}
+    micro_batch = {
+        k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
+        for k, v in micro_batch.items()
+    }
 
     helper.print_example(micro_batch, rank=args.train.local_rank)
 

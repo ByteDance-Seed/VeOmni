@@ -31,6 +31,7 @@ import numpy as np
 import psutil
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import transformers
 from transformers import enable_full_determinism
 from transformers import set_seed as set_seed_func

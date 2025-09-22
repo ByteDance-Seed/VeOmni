@@ -363,7 +363,8 @@ def main():
                     micro_batch.pop("cur_token_num", None)
 
                 micro_batch = {
-                    k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
+                    k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
                     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss / len(micro_batches)

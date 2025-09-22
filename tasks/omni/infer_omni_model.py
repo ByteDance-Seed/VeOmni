@@ -118,7 +118,9 @@ def main() -> None:
     helper.set_seed(args.infer.seed)
     helper.enable_third_party_logging()
     # config model and processor
-    model: SeedOmniModel = build_foundation_model(args.infer.model_path, args.infer.model_path).eval().to(get_device_type())
+    model: SeedOmniModel = (
+        build_foundation_model(args.infer.model_path, args.infer.model_path).eval().to(get_device_type())
+    )
     position_id_func = model.get_position_id_func()
     modality_info = model.get_modality()
     processor: SeedOmniProcessor = build_processor(args.infer.model_path)

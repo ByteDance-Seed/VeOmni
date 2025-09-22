@@ -219,7 +219,9 @@ def main():
     config = AutoConfig.from_pretrained(args.model.config_path, trust_remote_code=True, **config_kwargs)
     model = FluxModel(config)
     model_weights = load_model(
-        file_path=args.model.model_path, device=f"{get_device_type()}:{args.train.local_rank}", torch_dtype=torch.bfloat16
+        file_path=args.model.model_path,
+        device=f"{get_device_type()}:{args.train.local_rank}",
+        torch_dtype=torch.bfloat16,
     )
     model_weights = load_model_from_single_file(
         state_dict=model_weights,
