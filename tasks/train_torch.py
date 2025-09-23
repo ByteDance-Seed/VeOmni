@@ -14,9 +14,9 @@ from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     build_chat_template,
     build_dataloader,
+    build_energon_dataset,
     build_iterative_dataset,
     build_mapping_dataset,
-    build_energon_dataset,
 )
 from veomni.data.data_transform import process_pretrain_example, process_sft_example
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -104,11 +104,17 @@ def main():
         elif args.data.datasets_type == "energon":
             logger.info_rank0("Start building Megatron-Energon native dataset")
             train_dataset = build_energon_dataset(
-                args.data.train_path, 
+                args.data.train_path,
                 transform=transform,
-                max_samples_per_sequence=args.data.max_samples_per_sequence if hasattr(args.data, 'max_samples_per_sequence') else None,
-                virtual_epoch_length=args.data.virtual_epoch_length if hasattr(args.data, 'virtual_epoch_length') else None,
-                shuffle_buffer_size=args.data.shuffle_buffer_size if hasattr(args.data, 'shuffle_buffer_size') else None,
+                max_samples_per_sequence=args.data.max_samples_per_sequence
+                if hasattr(args.data, "max_samples_per_sequence")
+                else None,
+                virtual_epoch_length=args.data.virtual_epoch_length
+                if hasattr(args.data, "virtual_epoch_length")
+                else None,
+                shuffle_buffer_size=args.data.shuffle_buffer_size
+                if hasattr(args.data, "shuffle_buffer_size")
+                else None,
                 num_workers=args.data.num_workers,
             )
             args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))

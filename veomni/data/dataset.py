@@ -265,7 +265,7 @@ class EnergonDataset(IterativeDataset):
     - TextSample to dict conversion
     - Native state management using save_state/restore_state
     - Epoch-based state reset
-    
+
     Args:
         data (Dataset): underlying Megatron-Energon dataset
         transform (Optional[Callable]): transform function
@@ -277,15 +277,16 @@ class EnergonDataset(IterativeDataset):
 
     def __len__(self):
         """Get the length of the dataset."""
-        if hasattr(self._data, '__len__'):
+        if hasattr(self._data, "__len__"):
             return len(self._data)
 
     def __iter__(self):
         """Iterate over the dataset with WorkerConfig management and TextSample conversion."""
         # For Megatron-Energon datasets, we need to set up the WorkerConfig properly
-        if hasattr(self._data, 'worker_config'):
+        if hasattr(self._data, "worker_config"):
             try:
                 from megatron.energon import WorkerConfig
+
                 # Ensure active_worker_config is None before activation
                 WorkerConfig.active_worker_config = None
                 # Activate the worker config
@@ -293,30 +294,30 @@ class EnergonDataset(IterativeDataset):
                 logger.debug("Activated WorkerConfig for Megatron-Energon dataset")
             except Exception as e:
                 logger.warning(f"Failed to activate WorkerConfig: {e}")
-        
+
         try:
             for sample in self._data:
                 # Convert Megatron-Energon TextSample to dict for compatibility
-                if hasattr(sample, '__dict__') and not isinstance(sample, dict):
+                if hasattr(sample, "__dict__") and not isinstance(sample, dict):
                     # Convert TextSample or similar objects to dict
                     sample_dict = {}
                     for key, value in sample.__dict__.items():
-                        if not key.startswith('_'):  # Skip private attributes
+                        if not key.startswith("_"):  # Skip private attributes
                             sample_dict[key] = value
-                    
+
                     # Handle special case for TextSample
-                    if hasattr(sample, 'text'):
-                        sample_dict['text'] = sample.text
-                    
+                    if hasattr(sample, "text"):
+                        sample_dict["text"] = sample.text
+
                     sample = sample_dict
-                
+
                 if self._transform is not None:
                     yield self._transform(sample)
                 else:
                     yield sample
         finally:
             # Clean up WorkerConfig
-            if hasattr(self._data, 'worker_config'):
+            if hasattr(self._data, "worker_config"):
                 try:
                     self._data.worker_config.worker_deactivate()
                     logger.debug("Deactivated WorkerConfig for Megatron-Energon dataset")
@@ -325,13 +326,13 @@ class EnergonDataset(IterativeDataset):
 
     def load_state_dict(self, state_dict):
         """Load the state of the dataset from checkpointing."""
-        if hasattr(self._data, 'restore_state'):
+        if hasattr(self._data, "restore_state"):
             # Use Megatron-Energon's native restore_state method
             try:
                 self._data.restore_state(state_dict["dataset"])
             except Exception as e:
                 logger.warning(f"Failed to restore state using restore_state: {e}")
-        elif hasattr(self._data, 'load_state_dict'):
+        elif hasattr(self._data, "load_state_dict"):
             # Fallback to load_state_dict if available
             self._data.load_state_dict(state_dict["dataset"])
         else:
@@ -339,7 +340,7 @@ class EnergonDataset(IterativeDataset):
 
     def state_dict(self):
         """Get the state of the dataset for checkpointing."""
-        if hasattr(self._data, 'save_state'):
+        if hasattr(self._data, "save_state"):
             # Use Megatron-Energon's native save_state method
             try:
                 state = self._data.save_state()
@@ -347,7 +348,7 @@ class EnergonDataset(IterativeDataset):
             except Exception as e:
                 logger.warning(f"Failed to save state using save_state: {e}")
                 return {"dataset": {}}
-        elif hasattr(self._data, 'state_dict'):
+        elif hasattr(self._data, "state_dict"):
             # Fallback to state_dict if available
             return {"dataset": self._data.state_dict()}
         else:
@@ -356,9 +357,9 @@ class EnergonDataset(IterativeDataset):
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the dataset."""
-        if hasattr(self._data, 'set_epoch'):
+        if hasattr(self._data, "set_epoch"):
             self._data.set_epoch(epoch)
-        elif hasattr(self._data, 'reset_state_deep'):
+        elif hasattr(self._data, "reset_state_deep"):
             # For Megatron-Energon datasets, reset state when epoch changes
             try:
                 self._data.reset_state_deep()
@@ -472,13 +473,13 @@ def build_energon_dataset(
 ) -> "Dataset":
     """
     Build Megatron-Energon native dataset using the official get_train_dataset function.
-    
+
     This is the recommended way to use Megatron-Energon datasets as it provides:
     - Automatic length calculation based on virtual_epoch_length
     - Built-in field mapping (txt -> text)
     - Professional streaming dataset support
     - Built-in error handling and performance optimizations
-    
+
     Args:
         data_path (str): Path to the energon dataset directory
         transform (Optional[Callable]): Transform function to apply to samples
@@ -487,37 +488,31 @@ def build_energon_dataset(
         virtual_epoch_length (Optional[int]): Virtual epoch length for length calculation
         shuffle_buffer_size (Optional[int]): Shuffle buffer size
         num_workers (Optional[int]): Number of workers (if None, will be auto-detected)
-    
+
     Returns:
         Dataset: Megatron-Energon native dataset
     """
     try:
-        from megatron.energon import get_train_dataset, WorkerConfig
-        from megatron.energon.epathlib import EPath
+        from megatron.energon import WorkerConfig, get_train_dataset
     except ImportError:
-        raise ImportError(
-            "Megatron-Energon is not installed. Please install it with: "
-            "pip install megatron-energon"
-        )
-    
+        raise ImportError("Megatron-Energon is not installed. Please install it with: pip install megatron-energon")
+
     # Get parallel state for distributed training
     parallel_state = get_parallel_state()
-    
+
     # Auto-detect number of workers if not provided
     if num_workers is None:
         # Try to get from environment or use a reasonable default
-        num_workers = int(os.environ.get('TORCH_DATA_WORKERS', '1'))
+        num_workers = int(os.environ.get("TORCH_DATA_WORKERS", "1"))
 
     # Create base WorkerConfig
     base_worker_config = WorkerConfig(
-        rank=parallel_state.dp_rank,
-        world_size=parallel_state.dp_size,
-        num_workers=num_workers
+        rank=parallel_state.dp_rank, world_size=parallel_state.dp_size, num_workers=num_workers
     )
-    
+
     # Wrap it with our compatible version
     worker_config = base_worker_config
-    
+
     logger.info(f"Created WorkerConfig: rank={parallel_state.dp_rank}, world_size={parallel_state.dp_size}")
 
     if virtual_epoch_length is None:
@@ -526,10 +521,11 @@ def build_energon_dataset(
             meta_path = os.path.join(data_path, ".nv-meta", "info.json")
             if os.path.exists(meta_path):
                 import json
-                with open(meta_path, 'r') as f:
+
+                with open(meta_path, "r") as f:
                     info = json.load(f)
-                    if 'splits' in info and 'train' in info['splits']:
-                        virtual_epoch_length = info['splits']['train'].get('num_samples', 1000000)
+                    if "splits" in info and "train" in info["splits"]:
+                        virtual_epoch_length = info["splits"]["train"].get("num_samples", 1000000)
                     else:
                         virtual_epoch_length = 0
         except Exception as e:
@@ -553,8 +549,8 @@ def build_energon_dataset(
         virtual_epoch_length=virtual_epoch_length,
         repeat=True,  # Always repeat for training
     )
-    
+
     logger.info(f"Dataset type: {type(dataset)} Dataset length: {len(dataset)}")
-    
+
     # Wrap in our EnergonDataset for Megatron-Energon specific functionality
     return EnergonDataset(dataset, transform)
