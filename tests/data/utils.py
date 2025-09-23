@@ -6,7 +6,11 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 
+from veomni.utils import helper
 from veomni.utils.helper import get_cache_dir
+
+
+logger = helper.create_logger(__name__)
 
 
 class DummyDataset:
@@ -66,3 +70,40 @@ def process_dummy_example(
         else:
             tokenized_example[k] = torch.tensor(v[:max_seq_len], dtype=torch.long)
     return [tokenized_example]
+
+
+class FakeModel:
+    def __init__(self) -> None:
+        pass
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, *args, **kwargs):
+        pass
+
+
+def compare_items(item, rank, group_size, group):
+    item = item.to("cuda")
+    item_list = [torch.empty_like(item) for _ in range(group_size)]
+
+    dist.all_gather(item_list, item, group=group)
+
+    for i in range(0, group_size):
+        if not torch.equal(item, item_list[i]):
+            logger.info(f"[rank{rank}]: group_rank {i} item is not equal to item {rank}")
+            return False
+
+    return True
+
+
+def compare_global_batch(global_batch_list, global_batch_resume_list):
+    for global_batch, global_batch_resume in zip(global_batch_list, global_batch_resume_list):
+        for micro_batch, micro_batch_resume in zip(global_batch, global_batch_resume):
+            for key in micro_batch.keys():
+                if torch.is_tensor(micro_batch[key]):
+                    assert torch.all(micro_batch[key] == micro_batch_resume[key])
+
+
+def compare_metrics(metrics, metrics_resume):
+    assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]

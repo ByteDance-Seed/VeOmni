@@ -7,6 +7,7 @@ from functools import partial
 
 import torch
 import torch.distributed as dist
+import yaml
 from transformers import PretrainedConfig
 from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
 
@@ -14,12 +15,11 @@ from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_dataloader,
     build_interleave_dataset,
-    build_iterative_dataset,
-    build_mapping_dataset,
 )
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.utils.helper import get_cache_dir
 
 
 logger = helper.create_logger(__name__)
@@ -59,20 +59,26 @@ def run_data_test():
     )
 
     # build dummy data
-    dummy_dataset = DummyDataset(size=20)
-    train_path = dummy_dataset.save_path
+    multisource_names = ["dataset_a", "dataset_b"]
+    multisource_weights = [0.5, 0.5]
+    multisource_datasets = [DummyDataset(size=1000, dataset_name=name) for name in multisource_names]
+    multisource_path = [dataset.save_path for dataset in multisource_datasets]
 
-    if args.data.enable_multisource:
-        logger.info_rank0("Start building interleave dataset")
-        train_dataset = build_interleave_dataset(
-            train_path, args.data.datasets_type, transform=transform, seed=args.train.seed
-        )
-    elif args.data.datasets_type == "iterable":
-        logger.info_rank0("Start building iterative dataset")
-        train_dataset = build_iterative_dataset(train_path, transform=transform, seed=args.train.seed)
-    elif args.data.datasets_type == "mapping":
-        logger.info_rank0("Start building mapping dataset")
-        train_dataset = build_mapping_dataset(train_path, transform=transform)
+    multisource_config = dict(
+        sources=multisource_path,
+        names=multisource_names,
+        weights=multisource_weights,
+    )
+
+    tmp_yaml_path = os.path.join(get_cache_dir("./tmp.yaml"), "tmp.yaml")
+    with open(tmp_yaml_path, "w") as f:
+        yaml.safe_dump(multisource_config, f)
+
+    args.data.enable_multisource = True
+    logger.info_rank0("Start building interleave dataset")
+    train_dataset = build_interleave_dataset(
+        tmp_yaml_path, args.data.datasets_type, transform=transform, seed=args.train.seed
+    )
 
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
@@ -87,12 +93,13 @@ def run_data_test():
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
-        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+        bsz_warmup_ratio=0.0,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         num_workers=1,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
+        dyn_bsz_buffer_size=1,
     )
 
     config = PretrainedConfig()
@@ -102,6 +109,8 @@ def run_data_test():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
+        enable_multisource=args.data.enable_multisource,
+        data_path=tmp_yaml_path,
     )
 
     gt_global_batch_list = []
@@ -174,7 +183,6 @@ def run_data_test():
                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
                 dist.barrier()
-
     # resume
     state = {"model": FakeModel(), "extra_state": {}}  # cannot be None
     Checkpointer.load(save_checkpoint_path, state)
@@ -210,10 +218,17 @@ def run_data_test():
 
     compare_metrics(metrics, metrics_resume)
 
+    logger.info_rank0(
+        f"dataset_a: {metrics.get('multi_source/consumed_chunk_num/dataset_a', 0)} dataset_b: {metrics.get('multi_source/consumed_chunk_num/dataset_b', 0)}"
+    )
+
     if dist.is_initialized():
         dist.barrier()
 
-    del dummy_dataset
+    del multisource_datasets
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        os.remove(tmp_yaml_path)
 
     if world_size > 1:
         dist.destroy_process_group()
@@ -236,7 +251,8 @@ def build_command(dataset_type, dataloader_type):
         "--nnodes=1",
         "--nproc_per_node=8",
         f"--master_port={port}",
-        "tests/data/test_native_datasets.py",
+        "tests/data/test_multisource.py",
+        "--data.enable_multisource=True",
         "--model.config_path=test",
         "--data.train_path=None",
         "--data.train_size=1000",
@@ -254,28 +270,28 @@ def build_command(dataset_type, dataloader_type):
     return command
 
 
-def test_data_rmpad():
-    command = build_command("mapping", "rmpad")
+def test_multisource_data_rmpad():
+    command = build_command(dataset_type="mapping", dataloader_type="rmpad")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
-    command = build_command("iterable", "rmpad")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-
-def test_data_rmpad_with_pos_ids():
-    command = build_command("mapping", "rmpad_with_pos_ids")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-    command = build_command("iterable", "rmpad_with_pos_ids")
+    command = build_command(dataset_type="iterable", dataloader_type="rmpad")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
 
-def test_data_padding():
-    command = build_command("mapping", "padding")
+def test_multisource_data_rmpad_with_pos_ids():
+    command = build_command(dataset_type="mapping", dataloader_type="rmpad_with_pos_ids")
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+    command = build_command(dataset_type="iterable", dataloader_type="rmpad_with_pos_ids")
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+def test_multisource_data_padding():
+    command = build_command(dataset_type="mapping", dataloader_type="padding")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
