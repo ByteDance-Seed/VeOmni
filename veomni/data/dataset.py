@@ -179,7 +179,7 @@ def build_iterative_dataset(
     return IterativeDataset(dataset, transform)
 
 
-def build_multisource_dataset(
+def build_interleave_dataset(
     data_path: str,
     datasets_type: str = "mapping",
     namespace: Literal["train", "test"] = "train",
@@ -231,37 +231,3 @@ def build_multisource_dataset(
     return InterleavedMappingDataset(
         interleave_datasets(datasets=datasets, probabilities=weights, seed=seed), transform=transform
     )
-
-
-def build_dataset(
-    data_path: str,
-    datasets_type: str = "mapping",
-    enable_multisource: bool = False,
-    namespace: Literal["train", "test"] = "train",
-    transform: Optional[Callable] = None,
-    seed: int = 42,
-    download_mode: str = None,
-    **kwargs,
-):
-    if enable_multisource:
-        return build_multisource_dataset(
-            data_path=data_path,
-            datasets_type=datasets_type,
-            namespace=namespace,
-            transform=transform,
-            seed=seed,
-            download_mode=download_mode,
-            **kwargs,
-        )
-    if datasets_type == "mapping":
-        logger.info_rank0("Start building mapping dataset")
-        return build_mapping_dataset(
-            data_path=data_path, namespace=namespace, transform=transform, download_mode=download_mode, **kwargs
-        )
-    elif datasets_type == "iterable":
-        logger.info_rank0("Start building iterative dataset")
-        return build_iterative_dataset(
-            data_path=data_path, namespace=namespace, transform=transform, download_mode=download_mode, **kwargs
-        )
-    else:
-        raise ValueError(f"datasets_type {datasets_type} is not supported.")

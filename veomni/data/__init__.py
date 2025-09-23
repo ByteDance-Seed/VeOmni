@@ -26,7 +26,7 @@ from .data_collator import (
     UnpackDataCollator,
 )
 from .data_loader import build_dataloader
-from .dataset import build_iterative_dataset, build_mapping_dataset
+from .dataset import build_interleave_dataset, build_iterative_dataset, build_mapping_dataset
 from .dummy_dataset import build_dummy_dataset
 from .multimodal.data_collator import (
     OmniDataCollatorWithPacking,
@@ -80,4 +80,5 @@ __all__ = [
     "OmniDataCollatorWithPacking",
     "OmniDataCollatorWithPadding",
     "OmniSequenceShardCollator",
+    "build_interleave_dataset",
 ]
