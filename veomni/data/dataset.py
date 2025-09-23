@@ -185,8 +185,6 @@ def build_interleave_dataset(
     namespace: Literal["train", "test"] = "train",
     transform: Optional[Callable] = None,
     seed: int = 42,
-    download_mode: str = None,
-    **kwargs,
 ):
     multisource_config = parse_multisource_config(data_path)
     logger.info_rank0(f"multisource_config: {multisource_config}")
@@ -205,9 +203,7 @@ def build_interleave_dataset(
             return HFIterableDataset.from_generator(gen)
 
         for idx, source in enumerate(sources):
-            dataset = build_iterative_dataset(
-                source, transform=transform, namespace=namespace, seed=seed, download_mode=download_mode
-            )
+            dataset = build_iterative_dataset(source, transform=transform, namespace=namespace, seed=seed)
             ds = dataset._data
             ds = add_ds_idx_to_iterable(ds, idx)
             datasets.append(ds)
@@ -221,9 +217,7 @@ def build_interleave_dataset(
         logger.info_rank0("Start building mapping multisource dataset")
 
         for idx, source in enumerate(sources):
-            dataset = build_mapping_dataset(
-                source, transform=transform, namespace=namespace, download_mode=download_mode
-            )
+            dataset = build_mapping_dataset(source, transform=transform, namespace=namespace)
             ds = dataset._data
             ds = ds.add_column("ds_idx", [idx] * len(ds))
             datasets.append(ds)
