@@ -17,7 +17,8 @@ import os
 from typing import Callable, Dict, List, Literal, Optional
 
 import torch
-from datasets import load_dataset
+from datasets import IterableDataset as HFIterableDataset
+from datasets import interleave_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset, IterableDataset
@@ -31,6 +32,7 @@ except ImportError:
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.dist_utils import main_process_first
+from ..utils.multisource_utils import parse_multisource_config
 
 
 logger = logging.get_logger(__name__)
@@ -52,7 +54,7 @@ class MappingDataset(Dataset):
 
 
 class IterativeDataset(IterableDataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
+    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
         self._data = data
         self._transform = transform
 
@@ -71,6 +73,18 @@ class IterativeDataset(IterableDataset):
 
     def set_epoch(self, epoch: int):
         self._data.set_epoch(epoch)
+
+
+class InterleavedIterableDataset(IterativeDataset):
+    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
+        self._data = data
+        self._transform = transform
+
+
+class InterleavedMappingDataset(MappingDataset):
+    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
+        self._data = data
+        self._transform = transform
 
 
 def build_mapping_dataset(
@@ -163,3 +177,91 @@ def build_iterative_dataset(
     dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
 
     return IterativeDataset(dataset, transform)
+
+
+def build_multisource_dataset(
+    data_path: str,
+    datasets_type: str = "mapping",
+    namespace: Literal["train", "test"] = "train",
+    transform: Optional[Callable] = None,
+    seed: int = 42,
+    download_mode: str = None,
+    **kwargs,
+):
+    multisource_config = parse_multisource_config(data_path)
+    logger.info_rank0(f"multisource_config: {multisource_config}")
+    sources = multisource_config["sources"]
+    weights = multisource_config["weights"]
+
+    datasets = []
+    if datasets_type == "iterable":
+        logger.info_rank0("Start building iterable multisource dataset")
+
+        def add_ds_idx_to_iterable(dataset, ds_idx):
+            def gen():
+                for x in dataset:
+                    yield {**x, "ds_idx": ds_idx}
+
+            return HFIterableDataset.from_generator(gen)
+
+        for idx, source in enumerate(sources):
+            dataset = build_iterative_dataset(
+                source, transform=transform, namespace=namespace, seed=seed, download_mode=download_mode
+            )
+            ds = dataset._data
+            ds = add_ds_idx_to_iterable(ds, idx)
+            datasets.append(ds)
+
+        return InterleavedIterableDataset(
+            interleave_datasets(datasets=datasets, probabilities=weights, seed=seed + get_parallel_state().dp_rank),
+            transform=transform,
+        )
+
+    elif datasets_type == "mapping":
+        logger.info_rank0("Start building mapping multisource dataset")
+
+        for idx, source in enumerate(sources):
+            dataset = build_mapping_dataset(
+                source, transform=transform, namespace=namespace, download_mode=download_mode
+            )
+            ds = dataset._data
+            ds = ds.add_column("ds_idx", [idx] * len(ds))
+            datasets.append(ds)
+
+    return InterleavedMappingDataset(
+        interleave_datasets(datasets=datasets, probabilities=weights, seed=seed), transform=transform
+    )
+
+
+def build_dataset(
+    data_path: str,
+    datasets_type: str = "mapping",
+    enable_multisource: bool = False,
+    namespace: Literal["train", "test"] = "train",
+    transform: Optional[Callable] = None,
+    seed: int = 42,
+    download_mode: str = None,
+    **kwargs,
+):
+    if enable_multisource:
+        return build_multisource_dataset(
+            data_path=data_path,
+            datasets_type=datasets_type,
+            namespace=namespace,
+            transform=transform,
+            seed=seed,
+            download_mode=download_mode,
+            **kwargs,
+        )
+    if datasets_type == "mapping":
+        logger.info_rank0("Start building mapping dataset")
+        return build_mapping_dataset(
+            data_path=data_path, namespace=namespace, transform=transform, download_mode=download_mode, **kwargs
+        )
+    elif datasets_type == "iterable":
+        logger.info_rank0("Start building iterative dataset")
+        return build_iterative_dataset(
+            data_path=data_path, namespace=namespace, transform=transform, download_mode=download_mode, **kwargs
+        )
+    else:
+        raise ValueError(f"datasets_type {datasets_type} is not supported.")

@@ -156,6 +156,10 @@ class DataArguments:
         default="byted",
         metadata={"help": "Type of the datasets."},
     )
+    enable_multisource: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable multisource training."},
+    )
     data_name: str = field(
         default=None,
         metadata={"help": "Dataset name for multimodal training."},
