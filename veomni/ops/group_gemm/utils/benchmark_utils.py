@@ -19,12 +19,9 @@ from typing import Callable, Optional
 import torch
 import torch.testing
 
-from ....utils import logging
 from ....utils.device import get_torch_device, synchronize
 from . import envvars
-
-
-logger = logging.get_logger(__name__)
+from . import logger as blog
 
 
 _BENCHMARK_RESULT_FILE = "benchmark_results.txt"
@@ -91,7 +88,7 @@ def _report_benchmark_result(
         name = name + " [baseline]"  # ...
 
     msec_per_iter = 1000 / iters_per_sec
-    logger.info(
+    blog.logging.info(
         f"{name}: used {elapsed_secs:.2f} seconds ({msec_per_iter:.2f} ms per iter), "
         f"{measurement:.2f} {measurement_unit}/s"
     )

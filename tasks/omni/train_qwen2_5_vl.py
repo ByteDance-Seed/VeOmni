@@ -182,7 +182,6 @@ def main():
         processor=processor,
         chat_template=chat_template,
         position_id_func=position_id_func,
-        source_name=args.data.source_name,
     )
 
     if args.train.rmpad:

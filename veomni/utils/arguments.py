@@ -140,8 +140,6 @@ class DataArguments:
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
-    source_name: str = field(metadata={"help": "Dataset source name, used for preparing corresponding preprocessor."})
-    enable_multisource: bool = field(metadata={"help": "Whether to enable multi-source."})
     train_size: int = field(
         default=10_000_000,
         metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
