@@ -328,7 +328,7 @@ def parallelize_model_fsdp2(
     #      | -- Gating (to be ignored with mix precision)
     #      | -- MLP (experts)
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
-        # register all the FSDPModule inside this deocder layer for the convenience of prefetching configuration
+        # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
         if parallel_state.ep_enabled and experts_mod is not None:
             # shard expert
@@ -341,14 +341,17 @@ def parallelize_model_fsdp2(
         if ignore_classes:
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, ignore_classes) and sub_mod is not layer_mod:
-                    # this will also create a communication group for AllGather,
+                    # this will also create a AllGather communication group
                     # when modules here are small (like gating), this would slightly impacts the peformance
+                    # a better method might be adding them to ignored_params of fully_shard
+                    # but then they will need to be initialized separately
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     layer_mod._fsdp_modules.append(sub_mod)
 
         # shard everything else in the decoder layer
         fully_shard(layer_mod, **fsdp_kwargs)
         layer_mod._fsdp_modules.append(layer_mod)
+        logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
     # shard root model
     fully_shard(model, **fsdp_kwargs)
 
@@ -363,7 +366,8 @@ def parallelize_model_fsdp2(
                 assert len(prefetch_modules) > 1, (
                     "Modules to manually prefetch should not be empty when EP is enabled or there are modules to be ignored by mixed precision policy"
                 )
-                current_block.set_modules_to_forward_prefetch(prefetch_modules)
+                # prefetch in order of attn, gate, experts
+                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
 
         # configure backward prefetch
         rev_blocks = list(reversed(blocks))
@@ -371,7 +375,7 @@ def parallelize_model_fsdp2(
         for current_block, prev_block in zip(rev_blocks, prev_blocks):
             if prev_block is not None:
                 prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(prefetch_modules)
+                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
