@@ -424,7 +424,7 @@ class TrainingArguments:
         metadata={"help": "Ring-attn context parallel size."},
     )
     ckpt_manager: Literal["omnistore", "dcp", "bytecheckpoint"] = field(
-        default="dcp",
+        default="omnistore",
         metadata={"help": "Checkpoint manager."},
     )
     save_async: bool = field(
