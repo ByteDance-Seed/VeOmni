@@ -102,20 +102,19 @@ class InterleavedMappingDataset(MappingDataset):
         self._data = data
         self._transform = transform
 
-    def __iter__(self):
-        for sample in self._data:
-            if self._transform is not None:
-                ds_idx = sample["ds_idx"]
-                transformed_sample = self._transform(sample)
-                if isinstance(transformed_sample, List):
-                    for idx in range(len(transformed_sample)):
-                        transformed_sample[idx]["ds_idx"] = ds_idx
-                    yield transformed_sample
-                else:
-                    transformed_sample["ds_idx"] = ds_idx
-                    yield transformed_sample
+    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
+        if self._transform is not None:
+            sample = self._data[index]
+            ds_idx = sample["ds_idx"]
+            transformed_sample = self._transform(sample)
+            if isinstance(transformed_sample, List):
+                for idx in range(len(transformed_sample)):
+                    transformed_sample[idx]["ds_idx"] = ds_idx
             else:
-                yield sample
+                transformed_sample["ds_idx"] = ds_idx
+            return transformed_sample
+        else:
+            return self._data[index]
 
 
 def build_mapping_dataset(
@@ -265,7 +264,6 @@ def build_interleave_dataset(
             ds = ds.add_column("ds_idx", [idx] * len(ds))
             ds = ds.add_column("source_name", [source_names[idx]] * len(ds))
             datasets.append(ds)
-
         return InterleavedMappingDataset(
             interleave_datasets(datasets=datasets, probabilities=weights, seed=seed),
             transform=transform,
