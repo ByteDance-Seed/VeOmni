@@ -7,7 +7,7 @@
 
 ## Motivation
 
-EP+FSDP1 is supported in VeOmni in the first day. 
+EP+FSDP1 is supported in VeOmni in the first day.
 However, with the [deprecation of FSDP1](https://docs.pytorch.org/tutorials/intermediate/FSDP1_tutorial.html), FSDP2 becomes a necessary upgrade, which also introduces several benefits besides maintainability:
 
 * Flexibility of per-parameter sharding (along any dimension of the tensor)
@@ -23,11 +23,11 @@ In this section, we introduce the overall design of EP+FSDP2 in VeOmni so that y
 
 ### Sharding Dimension
 
-In VeOmni, experts module is defined as tensors of [E, H, I] (Expert number, hidden dim, intermediate size) for down projection weights, and [E, I, H] for gate projection and up projection. 
+In VeOmni, experts module is defined as tensors of [E, H, I] (Expert number, hidden dim, intermediate size) for down projection weights, and [E, I, H] for gate projection and up projection.
 
 > please see [example of how we merge the Qwen3-MoE expert weight](../examples/qwen3_moe.md)
 
-The expert parallelism (EP) is applied on dim-0 (expert number), while FSDP2 is applied on dim-1 instead of default dim-0. 
+The expert parallelism (EP) is applied on dim-0 (expert number), while FSDP2 is applied on dim-1 instead of default dim-0.
 
 This is to enable more flexible parallelism setup. Otherwise, if we also choose dim-0 for FSDP2, EP size x FSDP2 size needs to be exact expert number.
 
@@ -103,7 +103,7 @@ Then, we need to find the experts inside the layers if they exist. We cannot rel
 
 Due to the nested sharding of EP+FSDP2, the default prefetching configuration of FSDP2 is no longer efficient, and we need to set the prefetching manually.
 
-In short words, each decoder layer need to prefetch the next/prev decoder layer's attention and expert module explicitly during forward/backward. 
+In short words, each decoder layer need to prefetch the next/prev decoder layer's attention and expert module explicitly during forward/backward.
 
 Otherwise, the attention and expert modules are treated as separate layers. In this case, the time of attention computation often cannot fully overlap the AllGather for expert module.
 
@@ -121,7 +121,7 @@ These consequences like the parallelization method, are transparent to the end u
 
 > File: veomni/checkpoint/checkpointer.py
 
-Since EP-dim is dropped for expert modules, the DCP has no way to be aware about the EP rank infomations. 
+Since EP-dim is dropped for expert modules, the DCP has no way to be aware about the EP rank infomations.
 
 To address this issue, we temporarily restore EP-dim when saving model state dicts to DCP checkpoints. This ensures we can restore model state dicts correctly when load them back.
 
@@ -131,6 +131,6 @@ Note that this is implemented in `ModelState` class, which is used for saving ch
 
 ## Acknoledgements
 
-We largely refer the implementations in [TorchTitan](https://github.com/pytorch/torchtitan) to address the consequences of mixed sharding. 
+We largely refer the implementations in [TorchTitan](https://github.com/pytorch/torchtitan) to address the consequences of mixed sharding.
 
 Big thanks to ByteDance Seed and AML team: Qianli Ma, Bin Jia, Yifan Pi, Xiao Yu

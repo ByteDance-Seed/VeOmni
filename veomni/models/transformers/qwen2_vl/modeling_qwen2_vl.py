@@ -680,7 +680,7 @@ class Qwen2VLAttention(nn.Module):
 
         if not is_seed_kernels_available():
             position_ids = kwargs.get("position_ids", None)
-            if position_ids is not None:
+            if position_ids is not None and position_ids.shape[-1] != 1:
                 _, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa2_from_position_ids(
                     position_ids[0]
                 )

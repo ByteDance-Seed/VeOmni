@@ -32,4 +32,3 @@ jobs:
           pwd && ls -la
           ruff check tasks tests veomni docs
           ruff format --check tasks tests veomni docs
-
