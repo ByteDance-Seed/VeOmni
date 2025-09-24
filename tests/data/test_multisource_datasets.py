@@ -67,12 +67,21 @@ def run_data_test():
     multisource_config = dict(
         sources=multisource_path,
         names=multisource_names,
-        weights=multisource_weights,
+        schedule=[
+            dict(
+                schedule_type="const",
+                weights=multisource_weights,
+            )
+        ],
     )
 
     tmp_yaml_path = os.path.join(get_cache_dir("./tmp.yaml"), "tmp.yaml")
-    with open(tmp_yaml_path, "w") as f:
-        yaml.safe_dump(multisource_config, f)
+
+    if dist.get_rank() == 0:
+        with open(tmp_yaml_path, "w") as f:
+            yaml.safe_dump(multisource_config, f)
+    logger.info_rank0(f"[{rank}] multisource_config saved in {tmp_yaml_path}")
+    dist.barrier()
 
     args.data.enable_multisource = True
     logger.info_rank0("Start building interleave dataset")
@@ -110,6 +119,7 @@ def run_data_test():
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
         enable_multisource=args.data.enable_multisource,
+        dataloader=dataloader,
         data_path=tmp_yaml_path,
     )
 
@@ -251,7 +261,7 @@ def build_command(dataset_type, dataloader_type):
         "--nnodes=1",
         "--nproc_per_node=8",
         f"--master_port={port}",
-        "tests/data/test_multisource.py",
+        "tests/data/test_multisource_datasets.py",
         "--data.enable_multisource=True",
         "--model.config_path=test",
         "--data.train_path=None",

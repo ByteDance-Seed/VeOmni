@@ -189,7 +189,12 @@ def build_interleave_dataset(
     multisource_config = parse_multisource_config(data_path)
     logger.info_rank0(f"multisource_config: {multisource_config}")
     sources = multisource_config["sources"]
-    weights = multisource_config["weights"]
+    schedule = multisource_config["schedule"]
+
+    if len(schedule) > 1 or schedule[0]["schedule_type"] != "const":
+        logger.info_rank0("Interleaved dataset only supports const schedule type.")
+
+    weights = schedule[0]["weights"]
 
     datasets = []
     if datasets_type == "iterable":
