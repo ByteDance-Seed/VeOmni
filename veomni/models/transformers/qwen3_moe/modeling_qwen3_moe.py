@@ -283,8 +283,8 @@ def eager_attention_forward(
 class ModelingFlashAttnExtraConfig:
     cu_seq_lens_k: torch.Tensor = None
     cu_seq_lens_q: torch.Tensor = None
-    max_length_q: int = 0
-    max_length_k: int = 0
+    max_length_q: int = None
+    max_length_k: int = None
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -813,7 +813,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         all_router_logits = () if output_router_logits else None
 
         modelingFlashAttnExtraConfig = ModelingFlashAttnExtraConfig()
-        if position_ids is not None:
+        if position_ids is not None and position_ids.shape[-1] != 1:
             # for bsh cases, cache_position.unsqueeze(0) will create a tensor of shape [1,max_seq_len]
             # we expand it to make it match the batch size otherwise the calculated cu_seq_len and max_length might be wrong
             if position_ids.shape[0] != input_ids.shape[0]:

@@ -600,7 +600,7 @@ class TrainingArguments:
         if self.load_checkpoint_path == "auto":
             from .checkpoint_utils import get_checkpoint_path
 
-            self.load_checkpoint_path = get_checkpoint_path(self.output_dir)
+            self.load_checkpoint_path = get_checkpoint_path(self.output_dir, is_rank0=self.global_rank == 0)
 
         # save paths
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")

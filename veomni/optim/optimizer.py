@@ -180,6 +180,14 @@ class MultiOptimizer(Optimizer, Stateful):
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
             sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            # check for key clashes before merging
+            overlap = set(merged.keys()) & set(sd.keys())
+            if overlap:
+                raise KeyError(
+                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
+                )
+            else:
+                logger.info_rank0("No clashes when merging MultiOptimizer state dicts")
             merged.update(sd)
 
         return merged

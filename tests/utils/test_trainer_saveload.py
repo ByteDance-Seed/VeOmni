@@ -1,7 +1,7 @@
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -23,6 +23,23 @@ from veomni.utils.dist_utils import all_reduce
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
 --model.model_path Qwen/Qwen3-4B \
 --train.expert_parallel_size 1 \
+--train.global_batch_size 8 \
+--train.micro_batch_size 1 \
+--data.max_seq_len 128 \
+--data.train_path "dummy" \
+--train.output_dir ./test_trainer_saveload \
+--train.max_steps 5 \
+--train.rmpad false \
+--train.rmpad_with_pos_ids true \
+--train.data_parallel_mode "fsdp2" \
+--train.init_device "meta" \
+--train.ckpt_manager "dcp"
+
+torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
+--model.model_path /path/to/Qwen3-30B-A3B-Instruct-2507-merge \
+--model.moe_implementation fused \
+--model.attn_implementation flash_attention_2 \
+--train.expert_parallel_size 4 \
 --train.global_batch_size 8 \
 --train.micro_batch_size 1 \
 --data.max_seq_len 128 \
@@ -61,7 +78,7 @@ def flatten_dict(d, parent_key="", sep="_"):
     return dict(items)
 
 
-def check_state_dict(lhs_dict, rhs_dict, need_flatten=False):
+def check_state_dict(lhs_dict, rhs_dict, need_flatten=False, tied_weight_key: Optional[list[str]] = None):
     if need_flatten:
         lhs_dict = flatten_dict(lhs_dict)
         rhs_dict = flatten_dict(rhs_dict)
@@ -69,9 +86,17 @@ def check_state_dict(lhs_dict, rhs_dict, need_flatten=False):
     for k, v in rhs_dict.items():
         if "step" in k or "param_groups" in k:
             continue
-        lhs, rhs = lhs_dict[k], v
+        if tied_weight_key and k in tied_weight_key:
+            logger.info_rank0(f"skipping tied_weights_key: {k}")
+            continue
 
-        assert torch.allclose(lhs.to_local(), rhs.to_local())
+        lhs, rhs = lhs_dict[k], v
+        logger.info_rank0(f"checking {k}...")
+        # unwrap to local if available
+        lhs_val = lhs.to_local() if hasattr(lhs, "to_local") else lhs
+        rhs_val = rhs.to_local() if hasattr(rhs, "to_local") else rhs
+
+        torch.testing.assert_close(rhs_val, lhs_val)
 
 
 @dataclass
@@ -317,7 +342,11 @@ def main():
     Checkpointer.load(load_path, state)
     dist.barrier()
 
-    check_state_dict(golden_model_sd, model.state_dict())
+    tied_weights_keys = None
+    if hasattr(model, "_tied_weights_keys"):
+        tied_weights_keys = model._tied_weights_keys
+
+    check_state_dict(golden_model_sd, model.state_dict(), tied_weights_keys)
     check_state_dict(golden_optim_sd, optimizer.state_dict(), need_flatten=True)
 
     torch.cuda.synchronize()

@@ -24,9 +24,9 @@ except ImportError:
     from .hdfs_io import copy, exists
 
 
-def get_last_iteration(output_dir):
+def get_last_iteration(output_dir, is_rank0: bool):
     meta_file = "latest_checkpointed_iteration.txt"
-    if dist.get_global_rank() == 0:
+    if is_rank0:
         latest_file = os.path.join(output_dir, "checkpoints", meta_file)
         if exists(latest_file):
             copy(latest_file, meta_file)
@@ -39,14 +39,14 @@ def get_last_iteration(output_dir):
         iteration = 0
 
     dist.barrier()
-    if dist.get_global_rank() == 0:
+    if is_rank0:
         if os.path.exists(meta_file):
             os.remove(meta_file)
 
     return iteration
 
 
-def get_checkpoint_path(output_dir):
-    iteration = get_last_iteration(output_dir)
+def get_checkpoint_path(output_dir, is_rank0: bool):
+    iteration = get_last_iteration(output_dir, is_rank0)
     if iteration:
         return os.path.join(output_dir, "checkpoints", f"global_step_{iteration}")

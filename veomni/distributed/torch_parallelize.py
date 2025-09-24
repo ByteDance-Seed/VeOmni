@@ -257,8 +257,7 @@ def parallelize_model_fsdp2(
         # EP parameters are loaded as local tensors to be later sharded by fully_shard
         ep_mesh = parallel_state.ep_fsdp_device_mesh["ep"]
         # experts_map is a dict {experts_fqn: experts_mod}
-        # - Qwen3MoE keys: model.layers.N.mlp.experts
-        # - M8 keys: transformer.h.N.mlp.moe.experts
+        # For example, Qwen3MoE keys: model.layers.N.mlp.experts
         experts_map = parallel_plan.get_fsdp_no_shard_info(model)
 
         logger.info_rank0(f"Applied EP: expert tensors sliced along expert dimension (EP mesh: {ep_mesh})")
@@ -286,7 +285,7 @@ def parallelize_model_fsdp2(
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh}
-    # 2.1: mp_policy kwargs
+    # mp_policy kwargs
     if enable_mixed_precision:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
@@ -299,7 +298,18 @@ def parallelize_model_fsdp2(
     else:
         modules_to_ignore_in_mixed_precision = None
 
-    # 2.2: ep_fsdp2 kwargs
+    if modules_to_ignore_in_mixed_precision:
+        assert isinstance(modules_to_ignore_in_mixed_precision, tuple), (
+            "modules_to_ignore_in_mixed_precision needs to be a tuple!"
+        )
+        mp_ignored_classes = modules_to_ignore_in_mixed_precision
+        fsdp_kwargs_without_mp = dict(fsdp_kwargs)
+        fsdp_kwargs_without_mp.pop("mp_policy", None)
+    else:
+        mp_ignored_classes = ()
+        fsdp_kwargs_without_mp = fsdp_kwargs
+
+    # prepare ep_fsdp2 kwargs
     if parallel_state.ep_enabled:
         # Use the ep_fsdp dimension as DP mesh for experts (shards orthogonal to EP)
         ep_fsdp_mesh = parallel_state.ep_fsdp_device_mesh["ep_fsdp"]
@@ -312,59 +322,73 @@ def parallelize_model_fsdp2(
 
         expert_fsdp_kwargs["shard_placement_fn"] = _experts_shard_placement_fn
 
-    # a helper method that shards layer with mp_policy control
-    def _apply_fsdp_to_block(block: "nn.Module") -> None:
-        logger.info_rank0(f"Apply FSDP2 to {block.__class__.__name__}.")
-        if (
-            modules_to_ignore_in_mixed_precision is not None
-            and block.__class__ in modules_to_ignore_in_mixed_precision
-        ):
-            # pass all kwargs except mp_policy
-            fully_shard(block, **{k: v for k, v in fsdp_kwargs.items() if k != "mp_policy"})
-        else:
-            fully_shard(block, **fsdp_kwargs)
-
+    # Here we have a basic assumption for the decoder layer hierarchy
+    # Decoder Layer
+    # | -- layers that are sharded by fully_shard(decode_layer) (e.g., Attention)
+    # | -- experts layer (apply fully_shard separately in order to shard across EP groups on the same EP rank instead of sharding globally)
+    # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
+    #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
+        # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
+        layer_mod._fsdp_modules = []
         if parallel_state.ep_enabled and experts_mod is not None:
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
             if hasattr(experts_mod, "set_gradient_divide_factor"):
-                # Align gradient scaling with FSDP1: average EP grads across EP ranks
+                # average EP grads across EP ranks
                 experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
-        # shard decoder layer
-        _apply_fsdp_to_block(layer_mod)
+            layer_mod._fsdp_modules.append(experts_mod)
+        # shard module that needs to ignore mixed precision control
+        if mp_ignored_classes:
+            for sub_mod in layer_mod.modules():
+                if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
+                    # this will also create a AllGather communication group
+                    # when modules here are small (like gating), this would slightly impacts the peformance
+                    # a better method might be adding them to ignored_params of fully_shard
+                    # but then they will need to be initialized separately
+                    fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    layer_mod._fsdp_modules.append(sub_mod)
+
+        # shard everything else in the decoder layer
+        fully_shard(layer_mod, **fsdp_kwargs)
+        layer_mod._fsdp_modules.append(layer_mod)
+        logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
     # shard root model
     fully_shard(model, **fsdp_kwargs)
 
-    if parallel_state.ep_enabled:
-        # configure forward prefetch
+    # configure manual prefetching when needed
+    need_manual_prefetch = parallel_state.ep_enabled or mp_ignored_classes is not None
+    if need_manual_prefetch:
         blocks = [pair[1] for pair in layer_pairs]
-        experts = [pair[2] for pair in layer_pairs]
         next_blocks = blocks[1:] + [None]
-        next_experts = experts[1:] + [None]
-        for current_block, next_block, next_expert in zip(blocks, next_blocks, next_experts):
+        for current_block, next_block in zip(blocks, next_blocks):
             if next_block is not None:
-                current_block.set_modules_to_forward_prefetch([next_block, next_expert])
+                prefetch_modules = next_block._fsdp_modules
+                assert len(prefetch_modules) > 1, (
+                    "Modules to manually prefetch should not be empty when EP is enabled or there are modules to be ignored by mixed precision policy"
+                )
+                # prefetch in order of attn, gate, experts
+                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
 
         # configure backward prefetch
         rev_blocks = list(reversed(blocks))
-        rev_experts = list(reversed(experts))
         prev_blocks = rev_blocks[1:] + [None]
-        prev_experts = rev_experts[1:] + [None]
-        for current_block, prev_block, prev_expert in zip(rev_blocks, prev_blocks, prev_experts):
+        for current_block, prev_block in zip(rev_blocks, prev_blocks):
             if prev_block is not None:
-                current_block.set_modules_to_backward_prefetch([prev_block, prev_expert])
+                prefetch_modules = prev_block._fsdp_modules
+                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
-    if kwargs.get("init_device") == "meta":
-        if weights_path is None:
-            model.to_empty(device="cuda")
-            model.init_weights()
-        else:
-            from torch.distributed.tensor import distribute_tensor
+    assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
 
-            logger.info_rank0("starting to load model weights...")
-            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+    if weights_path is None:
+        model.to_empty(device="cuda")
+        model.init_weights()
+    else:
+        from torch.distributed.tensor import distribute_tensor
+
+        logger.info_rank0("starting to load model weights...")
+        load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
