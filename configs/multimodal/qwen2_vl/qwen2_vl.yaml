@@ -25,4 +25,4 @@ train:
   micro_batch_size: 1
   global_batch_size: 32
   max_steps: 2000
-  ckpt_manager: bytecheckpoint
+  ckpt_manager: dcp

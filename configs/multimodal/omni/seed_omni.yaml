@@ -25,4 +25,4 @@ train:
   micro_batch_size: 2
   global_batch_size: 64
   freeze_encoder: true
-  ckpt_manager: bytecheckpoint
+  ckpt_manager: dcp
