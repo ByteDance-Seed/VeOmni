@@ -212,6 +212,9 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
+        enable_multisource=args.data.enable_multisource,
+        dataloader=train_dataloader,
+        data_path=args.data.train_path,
     )
 
     if args.train.load_checkpoint_path:
@@ -267,6 +270,9 @@ def main():
             start_time = time.time()
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
+                if args.data.enable_multisource:
+                    micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("source_name", None)
 
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v

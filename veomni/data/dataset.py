@@ -14,6 +14,7 @@
 
 
 import os
+from functools import partial
 from typing import Callable, Dict, List, Literal, Optional
 
 import torch
@@ -80,17 +81,48 @@ class InterleavedIterableDataset(IterativeDataset):
         self._data = data
         self._transform = transform
 
+    def __iter__(self):
+        for sample in self._data:
+            if self._transform is not None:
+                ds_idx = sample["ds_idx"]
+                transformed_sample = self._transform(sample)
+                if isinstance(transformed_sample, List):
+                    for idx in range(len(transformed_sample)):
+                        transformed_sample[idx]["ds_idx"] = ds_idx
+                    yield transformed_sample
+                else:
+                    transformed_sample["ds_idx"] = ds_idx
+                    yield transformed_sample
+            else:
+                yield sample
+
 
 class InterleavedMappingDataset(MappingDataset):
     def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
         self._data = data
         self._transform = transform
 
+    def __iter__(self):
+        for sample in self._data:
+            if self._transform is not None:
+                ds_idx = sample["ds_idx"]
+                transformed_sample = self._transform(sample)
+                if isinstance(transformed_sample, List):
+                    for idx in range(len(transformed_sample)):
+                        transformed_sample[idx]["ds_idx"] = ds_idx
+                    yield transformed_sample
+                else:
+                    transformed_sample["ds_idx"] = ds_idx
+                    yield transformed_sample
+            else:
+                yield sample
+
 
 def build_mapping_dataset(
     data_path: str,
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
+    source_name: Optional[str] = None,
 ) -> "Dataset":
     """
     Build mapping dataset.
@@ -127,6 +159,8 @@ def build_mapping_dataset(
     with main_process_first():
         dataset = load_dataset(file_extenstion, data_files=data_files, split=namespace)
 
+    if transform:
+        transform = partial(transform, source_name=source_name)
     return MappingDataset(data=dataset, transform=transform)
 
 
@@ -135,6 +169,7 @@ def build_iterative_dataset(
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
     seed: int = 42,
+    source_name: Optional[str] = None,
 ) -> "IterableDataset":
     """
     Build iterative dataset.
@@ -176,7 +211,9 @@ def build_iterative_dataset(
     dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
     dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
 
-    return IterativeDataset(dataset, transform)
+    if transform:
+        transform = partial(transform, source_name=source_name)
+    return IterativeDataset(dataset, transform=transform)
 
 
 def build_interleave_dataset(
@@ -190,6 +227,7 @@ def build_interleave_dataset(
     logger.info_rank0(f"multisource_config: {multisource_config}")
     sources = multisource_config["sources"]
     schedule = multisource_config["schedule"]
+    source_names = multisource_config["names"]
 
     if len(schedule) > 1 or schedule[0]["schedule_type"] != "const":
         logger.info_rank0("Interleaved dataset only supports const schedule type.")
@@ -200,17 +238,17 @@ def build_interleave_dataset(
     if datasets_type == "iterable":
         logger.info_rank0("Start building iterable multisource dataset")
 
-        def add_ds_idx_to_iterable(dataset, ds_idx):
+        def add_ds_idx_to_iterable(dataset, ds_idx, source_name):
             def gen():
                 for x in dataset:
-                    yield {**x, "ds_idx": ds_idx}
+                    yield {**x, "ds_idx": ds_idx, "source_name": source_name}
 
             return HFIterableDataset.from_generator(gen)
 
         for idx, source in enumerate(sources):
-            dataset = build_iterative_dataset(source, transform=transform, namespace=namespace, seed=seed)
+            dataset = build_iterative_dataset(source, namespace=namespace, seed=seed)
             ds = dataset._data
-            ds = add_ds_idx_to_iterable(ds, idx)
+            ds = add_ds_idx_to_iterable(ds, idx, source_names[idx])
             datasets.append(ds)
 
         return InterleavedIterableDataset(
@@ -222,11 +260,13 @@ def build_interleave_dataset(
         logger.info_rank0("Start building mapping multisource dataset")
 
         for idx, source in enumerate(sources):
-            dataset = build_mapping_dataset(source, transform=transform, namespace=namespace)
+            dataset = build_mapping_dataset(source, namespace=namespace)
             ds = dataset._data
             ds = ds.add_column("ds_idx", [idx] * len(ds))
+            ds = ds.add_column("source_name", [source_names[idx]] * len(ds))
             datasets.append(ds)
 
-    return InterleavedMappingDataset(
-        interleave_datasets(datasets=datasets, probabilities=weights, seed=seed), transform=transform
-    )
+        return InterleavedMappingDataset(
+            interleave_datasets(datasets=datasets, probabilities=weights, seed=seed),
+            transform=transform,
+        )

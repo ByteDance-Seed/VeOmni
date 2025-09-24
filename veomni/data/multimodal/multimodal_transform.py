@@ -202,12 +202,11 @@ def encode_multimodal_sample(
     **kwargs,
 ) -> Dict[str, List[int]]:
     model_inputs = {}
+    source = sample.pop("source_name") if "source_name" in sample else kwargs["source_name"]
     modality = set(modality_info["input"] + modality_info["output"])
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
+    conversations = sample["text"] if source == "fineweb_100BT" else sample["conversations"]  # text-only data
     if isinstance(conversations, bytes):
         conversations = json.loads(conversations.decode("utf-8"))
-    source = kwargs["source_name"] if "source_name" in kwargs else sample["source"]
-    sample.pop("source_name", None)
     conversations = conv_preprocess(source, conversations, **kwargs)
     processor_input = {}
 

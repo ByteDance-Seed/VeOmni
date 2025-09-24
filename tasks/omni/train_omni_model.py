@@ -237,10 +237,14 @@ def main():
             )
         elif args.data.datasets_type == "iterable":
             logger.info_rank0("Start building iterative dataset")
-            train_dataset = build_iterative_dataset(args.data.train_path, transform=transform, seed=args.train.seed)
+            train_dataset = build_iterative_dataset(
+                args.data.train_path, transform=transform, seed=args.train.seed, source_name=args.data.source_name
+            )
         elif args.data.datasets_type == "mapping":
             logger.info_rank0("Start building mapping dataset")
-            train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
+            train_dataset = build_mapping_dataset(
+                args.data.train_path, transform=transform, source_name=args.data.source_name
+            )
 
         dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
         if args.data.datasets_type == "mapping":
@@ -359,6 +363,9 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
+        enable_multisource=args.data.enable_multisource,
+        dataloader=train_dataloader,
+        data_path=args.data.train_path,
     )
 
     if args.train.load_checkpoint_path:
@@ -417,6 +424,9 @@ def main():
             start_time = time.time()
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
+                if args.data.enable_multisource:
+                    micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("source_name", None)
 
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v

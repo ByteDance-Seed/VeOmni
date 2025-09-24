@@ -160,9 +160,9 @@ class DataArguments:
         default=False,
         metadata={"help": "Whether to enable multisource training."},
     )
-    data_name: str = field(
+    source_name: str = field(
         default=None,
-        metadata={"help": "Dataset name for multimodal training."},
+        metadata={"help": "Dataset name for training. If multisource, dataset name will be loaded from yaml config."},
     )
     data_tag: Literal["default", "mmtag"] = field(
         default="default",

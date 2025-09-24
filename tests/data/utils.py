@@ -62,11 +62,12 @@ class DummyDataset:
 def process_dummy_example(
     example: Dict[str, Any],
     max_seq_len: int,
+    source_name: str = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
     tokenized_example = {}
     for k, v in example.items():
-        if k == "ds_idx":
-            tokenized_example["ds_idx"] = torch.tensor(v, dtype=torch.long)
+        if k == "ds_idx" or k == "source_name":
+            continue
         else:
             tokenized_example[k] = torch.tensor(v[:max_seq_len], dtype=torch.long)
     return [tokenized_example]

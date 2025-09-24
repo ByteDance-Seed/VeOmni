@@ -1,0 +1,9 @@
+sources:
+- sharegpt4v_cap_100k
+- fineweb
+names:
+- sharegpt4v_captioner_sft
+- fineweb_100BT
+schedule:
+- schedule_type: const
+  weights: [0.5, 0.5]
