@@ -91,7 +91,7 @@ Our guiding principles when building VeOmni are:
   - Dynamic batching strategy
   - Omnidata processing
 - **Distributed Checkpointing**
-  - [ByteCheckpoint](https://github.com/ByteDance-Seed/ByteCheckpoint) (Recommend)
+  - [ByteCheckpoint](https://github.com/ByteDance-Seed/ByteCheckpoint)
   - Torch Distributed checkpointing
   - Dcp merge tools
 - **Other tools**
