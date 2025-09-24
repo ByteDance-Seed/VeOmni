@@ -306,7 +306,7 @@ def parallelize_model_fsdp2(
         fsdp_kwargs_without_mp = dict(fsdp_kwargs)
         fsdp_kwargs_without_mp.pop("mp_policy", None)
     else:
-        mp_ignored_classes = ()
+        mp_ignored_classes = None
         fsdp_kwargs_without_mp = fsdp_kwargs
 
     # prepare ep_fsdp2 kwargs

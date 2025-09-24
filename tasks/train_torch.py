@@ -272,10 +272,15 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
+            # Prefer model-provided clip_grad_norm_ (now both FSDP1 and FSDP2 registers custom grad norm clipping)
+            if hasattr(model, "clip_grad_norm_"):
+                _gn = model.clip_grad_norm_(args.train.max_grad_norm)
+                grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+                logger.info_rank0(
+                    "Can NOT find regitsered clip_grad_norm_ method in the model, using PyTorch default implementation.."
+                )
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
