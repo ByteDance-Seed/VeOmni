@@ -443,7 +443,7 @@ def build_energon_dataset(
             if os.path.exists(meta_path):
                 import json
 
-                with open(meta_path, "r") as f:
+                with open(meta_path) as f:
                     info = json.load(f)
                     if "splits" in info and "train" in info["splits"]:
                         virtual_epoch_length = info["splits"]["train"].get("num_samples", 1000000)
