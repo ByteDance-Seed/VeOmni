@@ -14,10 +14,12 @@
 
 
 import os
+from functools import partial
 from typing import Callable, Dict, List, Literal, Optional
 
 import torch
-from datasets import load_dataset
+from datasets import IterableDataset as HFIterableDataset
+from datasets import interleave_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset, IterableDataset
@@ -31,183 +33,10 @@ except ImportError:
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.dist_utils import main_process_first
+from ..utils.multisource_utils import parse_multisource_config
 
 
 logger = logging.get_logger(__name__)
-
-
-class DummyTextDataset(Dataset):
-    def __init__(self, size: int, seq_length: int):
-        """
-        Args:
-            size (int): Nums of datasets
-            seq_length (int, optional): seq_length
-        """
-        self.size = size
-        self.seq_length = seq_length
-        self.vocab_size = 32768
-
-    def __len__(self) -> int:
-        return self.size
-
-    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
-        attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
-        labels = input_ids.clone()
-        return [{"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}]
-
-
-class DummyQwenVLDataset(Dataset):
-    def __init__(self, size: int, seq_length: int):
-        """
-        Args:
-            size (int): Nums of datasets
-            seq_length (int, optional): seq_length
-        """
-        self.size = size
-        self.seq_length = seq_length
-        self.vocab_size = 32768
-
-        image_token_num = 81
-        image_t = 2
-
-        self.text_seqlen = seq_length // 4
-        video_seq_length = self.seq_length - self.text_seqlen - image_t * image_token_num
-        video_t = video_seq_length // image_token_num
-
-        self.image_size = [324 * image_t, 1176]
-        self.image_grid_thw = torch.tensor([[1, 18, 18]] * image_t, dtype=torch.long)
-        self.image_seqlen = image_t * image_token_num
-
-        self.video_size = [324 * video_t, 1176]
-        self.video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
-        self.video_seqlen = video_t * image_token_num
-
-        self.seq_length = self.text_seqlen + self.image_seqlen + self.video_seqlen
-        mask = torch.zeros((self.seq_length,), dtype=torch.bool)
-        self.image_mask = mask.clone()
-        self.image_mask[: self.image_seqlen] = 1
-        self.video_mask = mask.clone()
-        self.video_mask[-self.video_seqlen :] = 1
-
-    def __len__(self) -> int:
-        return self.size
-
-    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
-        attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
-        labels = input_ids.clone()
-        position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
-        pixel_values = torch.rand(self.image_size, dtype=torch.float32)
-        pixel_values_videos = torch.rand(self.video_size, dtype=torch.float32)
-        return [
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "position_ids": position_ids,
-                "pixel_values": pixel_values,
-                "pixel_values_videos": pixel_values_videos,
-                "image_mask": self.image_mask,
-                "video_mask": self.video_mask,
-                "image_grid_thw": self.image_grid_thw,
-                "video_grid_thw": self.video_grid_thw,
-            }
-        ]
-
-
-class DummyOmniDataset(Dataset):
-    def __init__(self, size: int, seq_length: int):
-        """
-        Args:
-            size (int): Nums of datasets
-            seq_length (int, optional): seq_length
-            dummy_data:
-            [input_ids, input_image_token, input_audio_token, input_video_token, output_image_token]
-        """
-        self.size = size
-        self.seq_length = seq_length
-        self.vocab_size = 32768
-
-        input_image_token_num = 81
-        input_image_t = 2
-        self.input_image_size = [324 * input_image_t, 1176]
-        self.input_image_grid_thw = torch.tensor([[1, 18, 18]] * input_image_t, dtype=torch.long)
-        self.input_image_seq_length = input_image_t * input_image_token_num
-
-        audio_token_num = 100
-        audio_num = 2
-        self.input_audio_size = [4 * audio_token_num * audio_num, 128]
-        self.input_audio_feature_lengths = torch.tensor([4 * audio_token_num] * audio_num, dtype=torch.long)
-        self.input_audio_seq_length = audio_num * audio_token_num
-
-        output_image_token_num = 1024
-        output_image_num = 1
-        self.output_image_size = [output_image_num, 3, 256, 256]
-        self.output_image_seq_length = output_image_num * output_image_token_num
-
-        rest_seq_length = self.seq_length - (
-            self.input_image_seq_length + self.input_audio_seq_length + self.output_image_seq_length
-        )
-
-        self.text_seq_length = rest_seq_length // 4
-        self.video_seq_length = rest_seq_length - self.text_seq_length
-        video_t = self.video_seq_length // input_image_token_num
-        self.input_video_size = [324 * video_t, 1176]
-        self.input_video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
-
-        self.seq_length = (
-            self.text_seq_length
-            + self.input_image_seq_length
-            + self.input_audio_seq_length
-            + self.video_seq_length
-            + self.output_image_seq_length
-        )
-        mask = torch.zeros((self.seq_length,), dtype=torch.bool)
-        start_index = self.text_seq_length
-        self.image_input_mask = mask.clone()
-        self.image_input_mask[start_index : start_index + self.input_image_seq_length] = 1
-        self.audio_input_mask = mask.clone()
-        start_index += self.input_image_seq_length
-        self.audio_input_mask[start_index : start_index + self.input_audio_seq_length] = 1
-        self.video_input_mask = mask.clone()
-        start_index += self.input_audio_seq_length
-        self.video_input_mask[start_index : start_index + self.video_seq_length] = 1
-        self.image_output_mask = mask.clone()
-        start_index += self.video_seq_length
-        self.image_output_mask[start_index : start_index + self.output_image_seq_length] = 1
-
-    def __len__(self) -> int:
-        return self.size
-
-    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
-        attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
-        labels = input_ids.clone()
-        position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
-        image_input_features = torch.rand(self.input_image_size, dtype=torch.float32)
-        audio_input_features = torch.rand(self.input_audio_size, dtype=torch.float32)
-        video_input_features = torch.rand(self.input_video_size, dtype=torch.float32)
-        image_output_features = torch.rand(self.output_image_size, dtype=torch.float32)
-        return [
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "position_ids": position_ids,
-                "image_input_features": image_input_features,
-                "audio_input_features": audio_input_features,
-                "video_input_features": video_input_features,
-                "image_output_features": image_output_features,
-                "image_input_mask": self.image_input_mask,
-                "audio_input_mask": self.audio_input_mask,
-                "video_input_mask": self.video_input_mask,
-                "image_output_mask": self.image_output_mask,
-                "image_input_grid_thw": self.input_image_grid_thw,
-                "video_input_grid_thw": self.input_video_grid_thw,
-                "audio_input_feature_lengths": self.input_audio_feature_lengths,
-            }
-        ]
 
 
 class MappingDataset(Dataset):
@@ -226,7 +55,7 @@ class MappingDataset(Dataset):
 
 
 class IterativeDataset(IterableDataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
+    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
         self._data = data
         self._transform = transform
 
@@ -247,15 +76,45 @@ class IterativeDataset(IterableDataset):
         self._data.set_epoch(epoch)
 
 
-def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset":
-    if task_type == "text":
-        return DummyTextDataset(size=size, seq_length=max_seq_len)
-    elif task_type == "qwenvl":
-        return DummyQwenVLDataset(size=size, seq_length=max_seq_len)
-    elif task_type == "omni":
-        return DummyOmniDataset(size=size, seq_length=max_seq_len)
-    else:
-        raise ValueError(f"Dummy dataset type ({task_type}) is not supported.")
+class InterleavedIterableDataset(IterativeDataset):
+    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
+        self._data = data
+        self._transform = transform
+
+    def __iter__(self):
+        for sample in self._data:
+            if self._transform is not None:
+                ds_idx = sample["ds_idx"]
+                transformed_sample = self._transform(sample)
+                if isinstance(transformed_sample, List):
+                    for idx in range(len(transformed_sample)):
+                        transformed_sample[idx]["ds_idx"] = ds_idx
+                    yield transformed_sample
+                else:
+                    transformed_sample["ds_idx"] = ds_idx
+                    yield transformed_sample
+            else:
+                yield sample
+
+
+class InterleavedMappingDataset(MappingDataset):
+    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
+        self._data = data
+        self._transform = transform
+
+    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
+        if self._transform is not None:
+            sample = self._data[index]
+            ds_idx = sample["ds_idx"]
+            transformed_sample = self._transform(sample)
+            if isinstance(transformed_sample, List):
+                for idx in range(len(transformed_sample)):
+                    transformed_sample[idx]["ds_idx"] = ds_idx
+            else:
+                transformed_sample["ds_idx"] = ds_idx
+            return transformed_sample
+        else:
+            return self._data[index]
 
 
 class EnergonDataset(IterativeDataset):
@@ -374,6 +233,7 @@ def build_mapping_dataset(
     data_path: str,
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
+    source_name: Optional[str] = None,
 ) -> "Dataset":
     """
     Build mapping dataset.
@@ -410,6 +270,8 @@ def build_mapping_dataset(
     with main_process_first():
         dataset = load_dataset(file_extenstion, data_files=data_files, split=namespace)
 
+    if transform:
+        transform = partial(transform, source_name=source_name)
     return MappingDataset(data=dataset, transform=transform)
 
 
@@ -418,6 +280,7 @@ def build_iterative_dataset(
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
     seed: int = 42,
+    source_name: Optional[str] = None,
 ) -> "IterableDataset":
     """
     Build iterative dataset.
@@ -459,6 +322,64 @@ def build_iterative_dataset(
     dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
     dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
 
+    if transform:
+        transform = partial(transform, source_name=source_name)
+    return IterativeDataset(dataset, transform=transform)
+
+
+def build_interleave_dataset(
+    data_path: str,
+    datasets_type: str = "mapping",
+    namespace: Literal["train", "test"] = "train",
+    transform: Optional[Callable] = None,
+    seed: int = 42,
+):
+    multisource_config = parse_multisource_config(data_path)
+    logger.info_rank0(f"multisource_config: {multisource_config}")
+    sources = multisource_config["sources"]
+    schedule = multisource_config["schedule"]
+    source_names = multisource_config["names"]
+
+    if len(schedule) > 1 or schedule[0]["schedule_type"] != "const":
+        logger.info_rank0("Interleaved dataset only supports const schedule type.")
+
+    weights = schedule[0]["weights"]
+
+    datasets = []
+    if datasets_type == "iterable":
+        logger.info_rank0("Start building iterable multisource dataset")
+
+        def add_ds_idx_to_iterable(dataset, ds_idx, source_name):
+            def gen():
+                for x in dataset:
+                    yield {**x, "ds_idx": ds_idx, "source_name": source_name}
+
+            return HFIterableDataset.from_generator(gen)
+
+        for idx, source in enumerate(sources):
+            dataset = build_iterative_dataset(source, namespace=namespace, seed=seed)
+            ds = dataset._data
+            ds = add_ds_idx_to_iterable(ds, idx, source_names[idx])
+            datasets.append(ds)
+
+        return InterleavedIterableDataset(
+            interleave_datasets(datasets=datasets, probabilities=weights, seed=seed + get_parallel_state().dp_rank),
+            transform=transform,
+        )
+
+    elif datasets_type == "mapping":
+        logger.info_rank0("Start building mapping multisource dataset")
+
+        for idx, source in enumerate(sources):
+            dataset = build_mapping_dataset(source, namespace=namespace)
+            ds = dataset._data
+            ds = ds.add_column("ds_idx", [idx] * len(ds))
+            ds = ds.add_column("source_name", [source_names[idx]] * len(ds))
+            datasets.append(ds)
+        return InterleavedMappingDataset(
+            interleave_datasets(datasets=datasets, probabilities=weights, seed=seed),
+            transform=transform,
+        )
     return IterativeDataset(dataset, transform)
 
 
@@ -522,7 +443,7 @@ def build_energon_dataset(
             if os.path.exists(meta_path):
                 import json
 
-                with open(meta_path, "r") as f:
+                with open(meta_path) as f:
                     info = json.load(f)
                     if "splits" in info and "train" in info["splits"]:
                         virtual_epoch_length = info["splits"]["train"].get("num_samples", 1000000)

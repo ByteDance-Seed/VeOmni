@@ -15,6 +15,7 @@ from veomni.data import (
     build_chat_template,
     build_dataloader,
     build_energon_dataset,
+    build_interleave_dataset,
     build_iterative_dataset,
     build_mapping_dataset,
 )
@@ -93,14 +94,17 @@ def main():
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
     if args.data.dataloader_type == "native":
-        if args.data.datasets_type == "iterable":
+        if args.data.enable_multisource:
+            logger.info_rank0("Start building interleave dataset")
+            train_dataset = build_interleave_dataset(
+                args.data.train_path, args.data.datasets_type, transform=transform, seed=args.train.seed
+            )
+        elif args.data.datasets_type == "iterable":
             logger.info_rank0("Start building iterative dataset")
             train_dataset = build_iterative_dataset(args.data.train_path, transform=transform, seed=args.train.seed)
-            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
         elif args.data.datasets_type == "mapping":
             logger.info_rank0("Start building mapping dataset")
             train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
-            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
         elif args.data.datasets_type == "energon":
             logger.info_rank0("Start building Megatron-Energon native dataset")
             train_dataset = build_energon_dataset(
@@ -117,7 +121,10 @@ def main():
                 else None,
                 num_workers=args.data.num_workers,
             )
-            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
+        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+        if args.data.datasets_type == "mapping":
+            dataset_length = dataset_length / args.train.data_parallel_size
+        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
         train_dataloader = build_dataloader(
             dataset=train_dataset,
@@ -221,6 +228,9 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
+        enable_multisource=args.data.enable_multisource,
+        dataloader=train_dataloader,
+        data_path=args.data.train_path,
     )
 
     if args.train.load_checkpoint_path:
@@ -276,6 +286,9 @@ def main():
             start_time = time.time()
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
+                if args.data.enable_multisource:
+                    micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("source_name", None)
 
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v

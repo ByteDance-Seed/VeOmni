@@ -18,6 +18,7 @@ from veomni.data import (
     OmniDataCollatorWithPadding,
     OmniSequenceShardCollator,
     build_dataloader,
+    build_interleave_dataset,
     build_iterative_dataset,
     build_mapping_dataset,
     build_multimodal_chat_template,
@@ -66,15 +67,13 @@ def process_sample(
     """
     Processes multimodal example with qwen2vl's pre-processor.
     """
-    source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
-    )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
-    conversations = conv_preprocess(source, conversations, **kwargs)
+    source_name = sample["source_name"] if "source_name" in sample else kwargs["source_name"]
+    conversations = sample["text"] if source_name == "fineweb_100BT" else sample["conversations"]  # text-only data
+    conversations = conv_preprocess(source_name, conversations, **kwargs)
 
     token_num_inputs, image_inputs = {}, {}
     image_grid_thw = None
-    if "images" in sample:
+    if "images" in sample and sample["images"]:
         images = []
         for image in sample["images"]:
             images.append(Image.open(BytesIO(image)).convert("RGB"))
@@ -94,7 +93,9 @@ def process_sample(
         image_grid_thw=image_grid_thw,
         attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
     )["position_ids"]
-    tokenized_example["position_ids"] = position_ids.squeeze()  # (dim, l)
+
+    tokenized_example["position_ids"] = position_ids.squeeze().clone()  # (dim, l)
+    # clone here as text_only data is (1, l).expand(dim, -1),
 
     tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
     tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
@@ -127,17 +128,9 @@ class MyTrainingArguments(TrainingArguments):
 
 
 @dataclass
-class MyDataArguments(DataArguments):
-    source_name: str = field(
-        default=None,
-        metadata={"help": "Source name of dataset."},
-    )
-
-
-@dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "MyDataArguments" = field(default_factory=MyDataArguments)
+    data: "DataArguments" = field(default_factory=DataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
 
@@ -189,7 +182,6 @@ def main():
         processor=processor,
         chat_template=chat_template,
         position_id_func=position_id_func,
-        source_name=args.data.source_name,
     )
 
     if args.train.rmpad:
@@ -211,14 +203,26 @@ def main():
         )
 
     if args.data.dataloader_type == "native":
-        if args.data.datasets_type == "iterable":
+        if args.data.enable_multisource:
+            logger.info_rank0("Start building interleave dataset")
+            train_dataset = build_interleave_dataset(
+                args.data.train_path, args.data.datasets_type, transform=transform, seed=args.train.seed
+            )
+        elif args.data.datasets_type == "iterable":
             logger.info_rank0("Start building iterative dataset")
-            train_dataset = build_iterative_dataset(args.data.train_path, transform=transform, seed=args.train.seed)
-            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
+            train_dataset = build_iterative_dataset(
+                args.data.train_path, transform=transform, seed=args.train.seed, source_name=args.data.source_name
+            )
         elif args.data.datasets_type == "mapping":
             logger.info_rank0("Start building mapping dataset")
-            train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
-            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
+            train_dataset = build_mapping_dataset(
+                args.data.train_path, transform=transform, source_name=args.data.source_name
+            )
+
+        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+        if args.data.datasets_type == "mapping":
+            dataset_length = dataset_length / args.train.data_parallel_size
+        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
         train_dataloader = build_dataloader(
             dataset=train_dataset,
@@ -309,6 +313,9 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
+        enable_multisource=args.data.enable_multisource,
+        dataloader=train_dataloader,
+        data_path=args.data.train_path,
     )
 
     if args.train.load_checkpoint_path:
@@ -363,6 +370,9 @@ def main():
             start_time = time.time()
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
+                if args.data.enable_multisource:
+                    micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("source_name", None)
 
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v

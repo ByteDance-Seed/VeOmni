@@ -346,7 +346,9 @@ class MultiSourceInfoTracker:
         step_consumed_samples = sum([item.num_samples for item in global_counter.values()])
         global_comsumed_samples = sum([item.num_samples for item in self.accumulate_counter.values()])
 
-        if not get_parallel_state().tp_enabled or get_parallel_state().tp_rank == 0:  # update at every dp rank
+        if hasattr(self.dataloader, "update_consumed_tokens") and (
+            not get_parallel_state().tp_enabled or get_parallel_state().tp_rank == 0
+        ):  # update at every dp rank
             if self.boundary_type == "token":
                 self.dataloader.update_consumed_tokens((self.batch_idx, global_consumed_tokens))
             elif self.boundary_type == "sample":

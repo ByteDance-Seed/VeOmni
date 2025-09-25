@@ -8,8 +8,7 @@ import torch.distributed as dist
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer
-from veomni.data import build_streaming_dataloader
-from veomni.data.dataset import build_dummy_dataset
+from veomni.data import build_dummy_dataset, build_streaming_dataloader
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
