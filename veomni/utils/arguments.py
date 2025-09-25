@@ -553,9 +553,13 @@ class TrainingArguments:
         if self.rmpad and self.rmpad_with_pos_ids:
             raise ValueError("`rmpad` and `rmpad_with_pos_ids` cannot be both True.")
 
-        assert int(os.getenv("GROUP_WORLD_SIZE", 1)) == 1 or helper.is_remote_path(self.output_dir), (
-            f"Number of distribute nodes is {int(os.getenv('GROUP_WORLD_SIZE'))}, `train.output_dir` requires a remote path, should use hdfs, fuse or nas path, but got {self.output_dir}."
-        )
+        num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
+        if num_nodes > 1:
+            logger.warning_rank0(
+                f"Detected {num_nodes} nodes. "
+                "Make sure that `train.output_dir` is shared by all nodes. "
+                "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
+            )
 
         # init method check
         # TODO: remove `enable_rank0_init`
