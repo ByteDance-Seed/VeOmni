@@ -1,0 +1,121 @@
+
+# # Tests layout
+
+# Each folder under tests/ corresponds to a test category for a sub-namespace in Vemni. For instance:
+# - `tests/data` for testing functionality related to `veomni/data`
+# - `tests/models` for testing functionality related to `veomni/model`
+# - ...
+
+# There are a few folders with `special_` prefix, created for special purposes:
+# - `special_distributed`: unit tests that must run with multiple GPUs
+# - `special_e2e`: end-to-end tests with training/generation scripts
+# - `special_npu`: tests for NPUs
+# - `special_sanity`: a suite of quick sanity tests
+# - `special_standalone`: a set of test that are designed to run in dedicated environments
+
+# Accelerators for tests
+# - By default tests are run with GPU available, except for the ones under `special_npu`, and any test script whose name ends with `on_cpu.py`.
+# - For test scripts with `on_cpu.py` name suffix would be tested on CPU resources in linux environment.
+
+# # Workflow layout
+
+# All CI tests are configured by yaml files in `.github/workflows/`. Here's an overview of all test configs:
+# 1. A list of always triggered CPU sanity tests: `check-pr-title.yml`, `secrets_scan.yml`, `check-pr-title,yml`, `pre-commit.yml`, `doc.yml`
+# 2. Some heavy multi-GPU unit tests, such as `model.yml`, `vllm.yml`, `sgl.yml`
+# 3. End-to-end tests: `e2e_*.yml`
+# 4. Unit tests
+#   - `cpu_unit_tests.yml`, run pytest on all scripts with file name pattern `tests/**/test_*_on_cpu.py`
+#   - `gpu_unit_tests.yml`, run pytest on all scripts with file without the `on_cpu.py` suffix.
+#   - Since cpu/gpu unit tests by default runs all tests under `tests`, please make sure tests are manually excluded in them when
+#     - new workflow yaml is added to `.github/workflows`
+#     - new tests are added to workflow mentioned in 2.
+
+name: GPU unit tests
+
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.py"
+      - .github/workflows/gpu_unit_tests.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      # The order that you define paths patterns matters:
+      # A matching negative pattern (prefixed with !) after a positive match will exclude the path.
+      # A matching positive pattern after a negative match will include the path again.
+      - "**/*.py"
+      # Other entrypoints
+      - "!docs/**"
+      # Entrypoints
+      - .github/workflows/gpu_unit_tests.yml
+      - "tests/**test_*.py"
+      # Ignore CPU tests
+      - "!tests/*_on_cpu.py"
+
+# Cancel jobs on the same ref if a new one is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Declare permissions just read content.
+permissions:
+  contents: read
+
+jobs:
+  gpu_unit_tests:
+    runs-on: [L20x8]
+    timeout-minutes: 60 # Increase this timeout value as needed
+    env:
+      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
+      HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
+      NO_PROXY: "localhost,127.0.0.1"
+      HF_HUB_ENABLE_HF_TRANSFER: 1
+    container:
+      image:
+      options: --gpus all --shm-size=10g
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+            fetch-depth: 0
+      - name: Install the current repository
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install poetry
+          python3 -m pip install -e ".[dev]"
+          python3 -m pip install -e ".[dist]"
+          python3 -m pip install -e ".[test]"
+      # - name: Download Model to Use
+      #   run: |
+      #     huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct
+      #     huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct
+      #     export HF_HUB_OFFLINE=1
+        # Disable requests to avoid network errors
+      - name: Run model test
+        run: |
+          pytest -s -vvv tests/models/test_models.py
+      - name: Run ulysses test
+        run: |
+          pytest -s -vvv tests/ulysses/test_ulysses.py
+          pytest -s -vvv tests/ulysses/test_all_gather.py
+      - name: Run distributed test
+        run: |
+          export NCCL_SHM_DISABLE=1
+          pytest -s -vvv tests/distributed/test_init_distributed.py
+          pytest -s -vvv tests/distributed/test_save_load.py
+          pytest -s -vvv tests/distributed/test_resharding.py
+      - name: Run datasets test
+        run: |
+          pytest -s -vvv tests/datasets/test_datasets.py
+      - name: Run chat template test
+        run: |
+          pytest -s -vvv tests/data/test_chat_template.py
+          pytest -s -vvv tests/data/test_mm_chat_template.py
+      - name: Run utils test
+        run: |
+          pytest -s -vvv tests/utils/test_checkpointer.py
+          pytest -s -vvv tests/utils/test_helper.py
