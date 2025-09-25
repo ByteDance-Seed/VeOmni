@@ -28,6 +28,6 @@ train:
   lr_decay_ratio: 1.0
   weight_decay: 0.01
   max_grad_norm: 1.0
-  ckpt_manager: bytecheckpoint
+  ckpt_manager: dcp
   wandb_project: seed_oss
   wandb_name: seed_oss_sft

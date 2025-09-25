@@ -49,7 +49,7 @@ train:
   init_device: cuda
   enable_full_determinism: false
   empty_cache_steps: 500
-  ckpt_manager: bytecheckpoint
+  ckpt_manager: dcp
   load_checkpoint_path: ""
   save_steps: 100
   max_steps: 500
