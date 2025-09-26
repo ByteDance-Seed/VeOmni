@@ -26,7 +26,7 @@ class AllToAllCommTest(SequenceParallelTest):
     def _get_even_input_data():
         S = 20
         H = 8
-        input_ = torch.randn(S, H).to(get_device_type())
+        input_ = torch.randn(S, H).to(get_device_type())()
         dist.broadcast(input_, src=0)
         return input_
 
@@ -35,7 +35,7 @@ class AllToAllCommTest(SequenceParallelTest):
         B = 2
         S = 20
         H = 80
-        input_ = torch.randn(B, S, H).to(get_device_type())
+        input_ = torch.randn(B, S, H).to(get_device_type())()
         dist.broadcast(input_, src=0)
         dim_size_list = list(range(1, dist.get_world_size()))
         dim_size_list.append(S - sum(dim_size_list))
@@ -66,7 +66,6 @@ if __name__ == "__main__":
     assert not get_torch_device()._initialized, (
         "test_distributed must not have initialized CUDA context on main process"
     )
-
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()
     run_tests()

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import pytest
 import torch
 import torch.distributed as dist
-from transformers import Qwen2Config
+from transformers import Qwen3Config
 
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
@@ -39,7 +39,7 @@ def run_environ_meter(args):
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_nccl_backend(), world_size=world_size, rank=rank)
 
-    config = Qwen2Config()
+    config = Qwen3Config()
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
         dp_replicate_size=args.train.data_parallel_replicate_size,
@@ -70,6 +70,8 @@ def run_environ_meter(args):
         global_batch_size=args.train.global_batch_size,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        enable_multisource=args.data.enable_multisource,
+        dataloader=None,
     )
 
     micro_batches = [micro_batch] * 10
