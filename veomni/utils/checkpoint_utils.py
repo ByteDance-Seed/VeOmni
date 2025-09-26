@@ -31,7 +31,7 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
     """Return the checkpoint step if the entry is a valid DCP checkpoint, otherwise None."""
     if not entry.startswith(_GLOBAL_STEP_PREFIX):
         return None
-
+    # get the letters after "global_step_" in the given path, which should be numbers
     step_str = entry[len(_GLOBAL_STEP_PREFIX) :]
     try:
         step = int(step_str)
@@ -44,7 +44,7 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
 
     model_metadata_path = os.path.join(checkpoint_path, "model/.metadata")
     optim_metadata_path = os.path.join(checkpoint_path, "optimizer/.metadata")
-    if not exists(model_metadata_path) or not optim_metadata_path:
+    if not exists(model_metadata_path) or not exists(optim_metadata_path):
         return None
 
     return step
