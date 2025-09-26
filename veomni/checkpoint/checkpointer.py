@@ -22,6 +22,7 @@ import torch.distributed as dist
 from torch.distributed._tensor import DeviceMesh, DTensor, Shard
 
 from ..distributed.parallel_state import get_parallel_state
+from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.import_utils import is_torch_version_greater_than
 from ..utils.logging import get_logger
 
@@ -318,7 +319,7 @@ class DistributedCheckpointer(CheckpointerBase):
             None
         """
 
-        checkpoint_dir = f"{path}/global_step_{global_steps}" if global_steps else path
+        checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         if "model" not in state:

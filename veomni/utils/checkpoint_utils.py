@@ -23,6 +23,10 @@ try:
 except ImportError:
     from .hdfs_io import copy, exists, isdir, listdir
 
+from .logging import get_logger
+
+
+logger = get_logger(__name__)
 
 _GLOBAL_STEP_PREFIX = "global_step_"
 
@@ -86,6 +90,8 @@ def dcp_get_last_iteration(output_dir):
 
     if not valid_steps:
         return None
+
+    logger.info_rank0(f"found valid previously saved checkpointed steps: {checkpoints_dir}/global_step_{valid_steps}")
 
     return max(valid_steps)
 
