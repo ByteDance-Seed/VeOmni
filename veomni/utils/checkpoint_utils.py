@@ -19,9 +19,35 @@ import torch.distributed as dist
 
 
 try:
-    from hdfs_io import copy, exists
+    from hdfs_io import copy, exists, isdir, listdir
 except ImportError:
-    from .hdfs_io import copy, exists
+    from .hdfs_io import copy, exists, isdir, listdir
+
+
+_GLOBAL_STEP_PREFIX = "global_step_"
+
+
+def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
+    """Return the checkpoint step if the entry is a valid DCP checkpoint, otherwise None."""
+    if not entry.startswith(_GLOBAL_STEP_PREFIX):
+        return None
+
+    step_str = entry[len(_GLOBAL_STEP_PREFIX) :]
+    try:
+        step = int(step_str)
+    except ValueError:
+        return None
+
+    checkpoint_path = os.path.join(checkpoints_dir, entry)
+    if not isdir(checkpoint_path):
+        return None
+
+    model_metadata_path = os.path.join(checkpoint_path, "model/.metadata")
+    optim_metadata_path = os.path.join(checkpoint_path, "optimizer/.metadata")
+    if not exists(model_metadata_path) or not optim_metadata_path:
+        return None
+
+    return step
 
 
 def get_last_iteration(output_dir, is_rank0: bool):
@@ -46,7 +72,33 @@ def get_last_iteration(output_dir, is_rank0: bool):
     return iteration
 
 
-def get_checkpoint_path(output_dir, is_rank0: bool):
-    iteration = get_last_iteration(output_dir, is_rank0)
-    if iteration:
-        return os.path.join(output_dir, "checkpoints", f"global_step_{iteration}")
+def dcp_get_last_iteration(output_dir):
+    checkpoints_dir = os.path.join(output_dir, "checkpoints")
+    if not exists(checkpoints_dir):
+        return None
+
+    entries = listdir(checkpoints_dir)
+    valid_steps = []
+    for entry in entries:
+        step = _validate_dcp_checkpoint_entry(checkpoints_dir, entry)
+        if step is not None:
+            valid_steps.append(step)
+
+    if not valid_steps:
+        return None
+
+    return max(valid_steps)
+
+
+def get_checkpoint_path(output_dir, is_rank0: bool, ckpt_manager: str):
+    if ckpt_manager == "dcp":
+        iteration = dcp_get_last_iteration(output_dir)
+    else:  # OmniStore or BCP
+        iteration = get_last_iteration(output_dir, is_rank0)
+
+    if not iteration:
+        return None
+
+    checkpoint_path = os.path.join(output_dir, "checkpoints", f"global_step_{iteration}")
+
+    return checkpoint_path

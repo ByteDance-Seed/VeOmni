@@ -604,7 +604,9 @@ class TrainingArguments:
         if self.load_checkpoint_path == "auto":
             from .checkpoint_utils import get_checkpoint_path
 
-            self.load_checkpoint_path = get_checkpoint_path(self.output_dir, is_rank0=self.global_rank == 0)
+            self.load_checkpoint_path = get_checkpoint_path(
+                output_dir=self.output_dir, is_rank0=self.global_rank == 0, ckpt_manager=self.ckpt_manager
+            )
 
         # save paths
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
