@@ -46,9 +46,8 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
     if not isdir(checkpoint_path):
         return None
 
-    model_metadata_path = os.path.join(checkpoint_path, "model/.metadata")
-    optim_metadata_path = os.path.join(checkpoint_path, "optimizer/.metadata")
-    if not exists(model_metadata_path) or not exists(optim_metadata_path):
+    metadata_path = os.path.join(checkpoint_path, ".metadata")
+    if not exists(metadata_path):
         return None
 
     return step
@@ -79,6 +78,7 @@ def get_last_iteration(output_dir, is_rank0: bool):
 def dcp_get_last_iteration(output_dir):
     checkpoints_dir = os.path.join(output_dir, "checkpoints")
     if not exists(checkpoints_dir):
+        logger.warning_rank0("Provided checkpoint path does not exist!")
         return None
 
     entries = listdir(checkpoints_dir)
@@ -89,6 +89,7 @@ def dcp_get_last_iteration(output_dir):
             valid_steps.append(step)
 
     if not valid_steps:
+        logger.warning_rank0("Provided checkpoint path exists but there are no valid DCP .metadata")
         return None
 
     logger.info_rank0(f"found valid previously saved checkpointed steps: {checkpoints_dir}/global_step_{valid_steps}")
@@ -103,8 +104,10 @@ def get_checkpoint_path(output_dir, is_rank0: bool, ckpt_manager: str):
         iteration = get_last_iteration(output_dir, is_rank0)
 
     if not iteration:
+        logger.warning_rank0("Failed to find latest checkpoint path, will start training from step 0...")
         return None
 
     checkpoint_path = os.path.join(output_dir, "checkpoints", f"global_step_{iteration}")
+    logger.info_rank0(f"Sucessfully get the latest checkpoint path: {checkpoint_path}")
 
     return checkpoint_path

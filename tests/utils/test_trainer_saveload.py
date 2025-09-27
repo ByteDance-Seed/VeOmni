@@ -332,12 +332,9 @@ def main():
     else:
         load_path = save_checkpoint_path
     # wait saving to finish
-    if Checkpointer.save_model_future is not None:
+    if Checkpointer.dcp_save_future is not None:
         logger.info_rank0("Waiting model saving to finish...")
-        Checkpointer.save_model_future.result()
-    if Checkpointer.save_optim_future is not None:
-        logger.info_rank0("Waiting optimizer saving to finish...")
-        Checkpointer.save_optim_future.result()
+        Checkpointer.dcp_save_future.result()
 
     Checkpointer.load(load_path, state)
     dist.barrier()

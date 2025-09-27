@@ -46,8 +46,6 @@ else:
 logger = get_logger(__name__)
 
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
-_MODEL_DIR = "model"
-_OPTIMIZER_DIR = "optimizer"
 _EXTRA_STATE_DIR = "extra_state"
 
 
@@ -295,8 +293,7 @@ class DistributedCheckpointer(CheckpointerBase):
     Distributed checkpointer for torch.distributed.checkpoint
     """
 
-    save_model_future: Optional[Any] = None
-    save_optim_future: Optional[Any] = None
+    dcp_save_future: Optional[Any] = None
     # Dedicated process group for async saves (created on first use)
     _async_process_group: Optional[Any] = None
 
@@ -325,67 +322,40 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
+        save_state = {"model": ModelState(state["model"])}
+        if "optimizer" in state:
+            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+
         if save_async:
             # Lazily create a dedicated Gloo process group for async DCP saves
             if cls._async_process_group is None:
                 cls._async_process_group = dist.new_group(backend="gloo")
 
-            if cls.save_model_future is not None:
-                logger.info_rank0("waiting for previous DCP model saving session to end...")
-                cls.save_model_future.result()
-                cls.save_model_future = None
+            if cls.dcp_save_future is not None:
+                logger.info_rank0("waiting for previous DCP saving session to end...")
+                cls.dcp_save_future.result()
+                cls.dcp_save_future = None
 
-            model_dir = os.path.join(checkpoint_dir, _MODEL_DIR)
-            cls.save_model_future = dcp.async_save(
-                state_dict={"state": ModelState(state["model"])},
+            cls.dcp_save_future = dcp.async_save(
+                state_dict=save_state,
                 storage_writer=FileSystemWriter(
-                    model_dir,
+                    checkpoint_dir,
                     thread_count=16,
                     single_file_per_rank=True,
                     sync_files=False,
                 ),
                 process_group=cls._async_process_group,
             )
-            if "optimizer" in state:
-                if cls.save_optim_future is not None:
-                    logger.info_rank0("waiting for previous DCP optimizer saving session to end...")
-                    cls.save_optim_future.result()
-                    cls.save_optim_future = None
-
-                optimizer_dir = os.path.join(checkpoint_dir, _OPTIMIZER_DIR)
-                cls.save_optim_future = dcp.async_save(
-                    state_dict={"state": OptimizerState(model=state["model"], optimizer=state["optimizer"])},
-                    storage_writer=FileSystemWriter(
-                        optimizer_dir,
-                        thread_count=16,
-                        single_file_per_rank=True,
-                        sync_files=False,
-                    ),
-                    process_group=cls._async_process_group,
-                )
         else:
-            model_dir = os.path.join(checkpoint_dir, _MODEL_DIR)
-
             dcp.save(
-                state_dict={"state": ModelState(state["model"])},
+                state_dict=save_state,
                 storage_writer=FileSystemWriter(
-                    model_dir,
+                    checkpoint_dir,
                     thread_count=16,
                     single_file_per_rank=True,
                     sync_files=False,
                 ),
             )
-            if "optimizer" in state:
-                optimizer_dir = os.path.join(checkpoint_dir, _OPTIMIZER_DIR)
-                dcp.save(
-                    state_dict={"state": OptimizerState(model=state["model"], optimizer=state["optimizer"])},
-                    storage_writer=FileSystemWriter(
-                        optimizer_dir,
-                        thread_count=16,
-                        single_file_per_rank=True,
-                        sync_files=False,
-                    ),
-                )
 
         if "extra_state" in state:
             extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
@@ -422,28 +392,16 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
+        load_state = {"model": ModelState(state["model"])}
         if "optimizer" in state:
-            model_dir = os.path.join(checkpoint_dir, _MODEL_DIR)
-            dcp.load(
-                state_dict={"state": ModelState(state["model"])},
-                storage_reader=FileSystemReader(model_dir),
-                process_group=process_group,
-            )
+            load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
-            optimizer_dir = os.path.join(checkpoint_dir, _OPTIMIZER_DIR)
-            dcp.load(
-                state_dict={"state": OptimizerState(model=state["model"], optimizer=state["optimizer"])},
-                storage_reader=FileSystemReader(optimizer_dir),
-                process_group=process_group,
-            )
-            # Note: further per-param DTensor alignment and device fixes happen inside OptimizerState.load_state_dict
-        else:
-            model_dir = os.path.join(checkpoint_dir, _MODEL_DIR)
-            dcp.load(
-                state_dict={"state": ModelState(state["model"])},
-                storage_reader=FileSystemReader(model_dir),
-                process_group=process_group,
-            )
+        dcp.load(
+            state_dict=load_state,
+            storage_reader=FileSystemReader(checkpoint_dir),
+            process_group=process_group,
+        )
+        # Note: further per-param DTensor alignment and device fixes happen inside OptimizerState.load_state_dict
 
         if "extra_state" in state:
             extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
