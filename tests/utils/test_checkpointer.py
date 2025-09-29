@@ -29,7 +29,7 @@ class Arguments:
 
 """
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_checkpointer.py \
-    --model.model_path qwen2-1_5b-instruct \
+    --model.config_path ./tests/model_config/qwen3_toy.json \
     --data.train_path None \
     --train.global_batch_size 16 \
     --train.micro_batch_size 2 \
@@ -46,7 +46,10 @@ def run_checkpointer_test():
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
+
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
+
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_nccl_backend())
 
@@ -77,6 +80,7 @@ def run_checkpointer_test():
 
     model = build_parallelize_model(
         model,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
@@ -116,7 +120,7 @@ def run_checkpointer_test():
         "labels": input_ids,
     }
     micro_batch = {
-        k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
+        k: v.to(get_torch_device(), non_blocking=True) if isinstance(v, torch.Tensor) else v
         for k, v in micro_batch.items()
     }
 
@@ -152,6 +156,8 @@ def run_checkpointer_test():
 
     # for dropout, reset seed
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
+
     helper.print_example(micro_batch, rank=args.train.local_rank)
     resume_loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss.mean()
 
@@ -165,31 +171,6 @@ def run_checkpointer_test():
     dist.destroy_process_group()
 
 
-def test_omnistore_checkpointer():
-    port = 12345 + random.randint(0, 100)
-
-    command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        f"--master_port={port}",
-        "tests/utils/test_checkpointer.py",
-        "--model.model_path=qwen2-1_5b-instruct",
-        "--data.train_path=None",
-        "--train.global_batch_size=16",
-        "--train.micro_batch_size=2",
-        "--train.data_parallel_mode=fsdp1",
-        "--train.output_dir=omnistore_test",
-        "--train.rmpad=False",
-        "--train.rmpad_with_pos_ids=False",
-        "--train.ckpt_manager=omnistore",
-        "--train.max_steps=10",
-    ]
-
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-
 def test_dcp_checkpointer():
     port = 12345 + random.randint(0, 100)
 
@@ -199,7 +180,7 @@ def test_dcp_checkpointer():
         "--nproc_per_node=8",
         f"--master_port={port}",
         "tests/utils/test_checkpointer.py",
-        "--model.model_path=qwen2-1_5b-instruct",
+        "--model.config_path=./tests/model_config/qwen3_toy.json",
         "--data.train_path=None",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=2",

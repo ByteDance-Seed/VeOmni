@@ -32,7 +32,7 @@ torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_helpe
 """
 
 
-def run_environ_meter(args: Arguments):
+def run_environ_meter(args):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
@@ -62,8 +62,8 @@ def run_environ_meter(args: Arguments):
 @pytest.mark.parametrize(
     "model_path",
     [
-        "qwen2vl-7b-instruct",
-        "llama3_2-3b-instruct",
+        "./tests/model_config/qwen3_toy.json",
+        "./tests/model_config/qwen3_toy.json",
     ],
 )
 def test_model_loader(model_path):

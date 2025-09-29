@@ -35,7 +35,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         hidden_dim = 64 * heads
         batch_size = 2
         seq_len = 8192
-        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())
+        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())()
         dist.broadcast(input_, src=0)
 
         return input_
@@ -46,7 +46,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         hidden_dim = 64 * heads
         batch_size = 2
         seq_len = 8191
-        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())
+        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())()
         dist.broadcast(input_, src=0)
 
         return input_
@@ -74,10 +74,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         # initialize attn module
         attn_dp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
+        ).to(get_device_type())()
         attn_sp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
+        ).to(get_device_type())()
         attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
         attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
@@ -126,10 +126,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         # initialize attn module
         attn_dp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
+        ).to(get_device_type())()
         attn_sp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
+        ).to(get_device_type())()
         attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
         attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
@@ -167,9 +167,8 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
 if __name__ == "__main__":
     assert not get_torch_device()._initialized, (
-        "test_distributed must not have initialized CUDA context on main process"
+        "test_distributed must not have initialized to(get_device_type()) context on main process"
     )
-
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()
     run_tests()
