@@ -594,7 +594,13 @@ class ProfilerWithMem:
 
 
 def create_profiler(
-    start_step: int, end_step: int, trace_dir: str, record_shapes: bool, profile_memory: bool, with_stack: bool
+    start_step: int,
+    end_step: int,
+    trace_dir: str,
+    record_shapes: bool,
+    profile_memory: bool,
+    with_stack: bool,
+    global_rank: int,
 ):
     """
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
@@ -622,14 +628,18 @@ def create_profiler(
         if trace_dir.startswith("hdfs://"):
             hdfs_io.makedirs(trace_dir, exist_ok=True)
             os.makedirs(CACHE_DIR, exist_ok=True)
-            trace_file = os.path.join(CACHE_DIR, f"veomni_rank0_{time}.{trace_file_extention}")
-            memory_timeline_file = os.path.join(CACHE_DIR, f"veomni_rank0_{time}.{memory_timeline_file_extention}")
-            gpu_memory_file = os.path.join(CACHE_DIR, f"veomni_rank0_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
+            memory_timeline_file = os.path.join(
+                CACHE_DIR, f"veomni_rank{global_rank}_{time}.{memory_timeline_file_extention}"
+            )
+            gpu_memory_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
         else:
             os.makedirs(trace_dir, exist_ok=True)
-            trace_file = os.path.join(trace_dir, f"veomni_rank0_{time}.{trace_file_extention}")
-            memory_timeline_file = os.path.join(trace_dir, f"veomni_rank0_{time}.{memory_timeline_file_extention}")
-            gpu_memory_file = os.path.join(trace_dir, f"veomni_rank0_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
+            memory_timeline_file = os.path.join(
+                trace_dir, f"veomni_rank{global_rank}_{time}.{memory_timeline_file_extention}"
+            )
+            gpu_memory_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
 
         p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
@@ -693,7 +703,7 @@ def create_profiler(
         with_modules=True,
         with_stack=with_stack,
     )
-    if IS_CUDA_AVAILABLE:
+    if IS_CUDA_AVAILABLE and profile_memory:
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler
