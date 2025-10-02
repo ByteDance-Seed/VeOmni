@@ -357,16 +357,17 @@ def main():
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
-        if args.train.enable_profiling:
-            profiler = helper.create_profiler(
-                start_step=args.train.profile_start_step,
-                end_step=args.train.profile_end_step,
-                trace_dir=args.train.profile_trace_dir,
-                record_shapes=args.train.profile_record_shapes,
-                profile_memory=args.train.profile_profile_memory,
-                with_stack=args.train.profile_with_stack,
-            )
-            profiler.start()
+    if args.train.profile_this_rank:
+        profiler = helper.create_profiler(
+            start_step=args.train.profile_start_step,
+            end_step=args.train.profile_end_step,
+            trace_dir=args.train.profile_trace_dir,
+            record_shapes=args.train.profile_record_shapes,
+            profile_memory=args.train.profile_profile_memory,
+            with_stack=args.train.profile_with_stack,
+            global_rank=args.train.global_rank,
+        )
+        profiler.start()
 
         model_assets = [model_config, processor]
         save_model_assets(args.train.model_assets_dir, model_assets)
@@ -499,13 +500,11 @@ def main():
                     train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
                     wandb.log(train_metrics, step=global_step)
 
-                if args.train.enable_profiling and global_step <= args.train.profile_end_step:
-                    profiler.step()
-                    if global_step == args.train.profile_end_step:
-                        profiler.stop()
-                        helper.upload_trace(
-                            args.train.wandb_project, args.train.wandb_name, args.train.profile_trace_dir
-                        )
+            if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
+                profiler.step()
+                if global_step == args.train.profile_end_step:
+                    profiler.stop()
+                    helper.upload_trace(args.train.wandb_project, args.train.wandb_name, args.train.profile_trace_dir)
 
             if args.train.save_steps and global_step % args.train.save_steps == 0:
                 helper.empty_cache()
