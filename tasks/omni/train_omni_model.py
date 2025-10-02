@@ -357,6 +357,9 @@ def main():
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
+        model_assets = [model_config, processor]
+        save_model_assets(args.train.model_assets_dir, model_assets)
+
     if args.train.profile_this_rank:
         profiler = helper.create_profiler(
             start_step=args.train.profile_start_step,
@@ -368,9 +371,6 @@ def main():
             global_rank=args.train.global_rank,
         )
         profiler.start()
-
-        model_assets = [model_config, processor]
-        save_model_assets(args.train.model_assets_dir, model_assets)
 
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
