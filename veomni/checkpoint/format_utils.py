@@ -118,6 +118,7 @@ def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> ST
         no_dist=True,
     )
     if "state" in state_dict:
+        # this happens when the model state dicts are flatten during saving
         state_dict = state_dict["state"]
 
     return state_dict["model"]
