@@ -108,10 +108,6 @@ def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> ST
         To avoid OOM, it's recommended to only run this function on a single rank.
     """
 
-    model_dir = os.path.join(save_checkpoint_path, _MODEL_DIR)
-    if os.path.exists(model_dir):
-        save_checkpoint_path = model_dir
-
     # Load the state_dict from the DCP checkpoint
     state_dict: STATE_DICT_TYPE = {}
 
