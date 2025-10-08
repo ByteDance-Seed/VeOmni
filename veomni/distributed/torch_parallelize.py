@@ -388,8 +388,10 @@ def parallelize_model_fsdp2(
 
         logger.info_rank0("starting to load model weights...")
         if kwargs.get("load_dist_model_weights"):
+            logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
             load_dist_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
         else:
+            logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
             load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
 
     # Register grad norm clipping method for FSDP2
