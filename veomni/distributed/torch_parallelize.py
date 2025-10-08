@@ -27,7 +27,7 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
-from ..models import load_dist_model_weights
+from ..models import load_dist_model_weights, load_model_weights
 from ..utils import logging
 from ..utils.device import get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
@@ -387,8 +387,10 @@ def parallelize_model_fsdp2(
         from torch.distributed.tensor import distribute_tensor
 
         logger.info_rank0("starting to load model weights...")
-        # load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
-        load_dist_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+        if kwargs.get("load_dist_model_weights"):
+            load_dist_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+        else:
+            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn

@@ -40,7 +40,7 @@ from transformers.utils.import_utils import is_safetensors_available
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from ..utils.device import get_device_type, synchronize
+from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 
 
@@ -334,15 +334,7 @@ def load_dist_model_weights(
         parallel_plan = model.get_parallel_plan()
 
     global_rank = get_parallel_state().global_rank
-    device_type = init_device
-    if device_type == "meta":
-        device_type = get_device_type()
-    elif device_type == "cpu":
-        inferred_device = get_device_type()
-        if inferred_device != "cpu":
-            device_type = inferred_device
-
-    torch_device = torch.device(device_type)
+    torch_device = torch.device(init_device)
 
     # get the safetensor file iterator
     state_dict_iterators = _load_state_dict(weights_path)
