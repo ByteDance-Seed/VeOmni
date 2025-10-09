@@ -337,10 +337,29 @@ def load_dist_model_weights(
     torch_device = torch.device(init_device)
 
     # get the safetensor file iterator
-    state_dict_iterators = _load_state_dict(weights_path)
-    for state_dict_iterator in tqdm(
-        state_dict_iterators, desc="Loading checkpoint shards", disable=int(os.getenv("LOCAL_RANK", "-1")) > 0
-    ):
+    state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
+    shard_count = len(state_dict_iterators) if global_rank == 0 else 0
+    shard_count_tensor = torch.tensor(
+        [shard_count],
+        dtype=torch.int64,
+        device=torch_device if torch_device.type != "cpu" else torch.device("cpu"),
+    )
+    dist.broadcast(shard_count_tensor, src=0)
+    shard_count = int(shard_count_tensor.item())
+
+    if global_rank == 0:
+        shard_iterable = enumerate(
+            tqdm(
+                state_dict_iterators,
+                desc="Loading checkpoint shards",
+                disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
+            )
+        )
+    else:
+        shard_iterable = enumerate(range(shard_count))
+
+    for shard_idx, shard_payload in shard_iterable:
+        state_dict_iterator = shard_payload if global_rank == 0 else None
         iterator = iter(state_dict_iterator) if global_rank == 0 else None
 
         while True:
