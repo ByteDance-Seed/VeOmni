@@ -39,7 +39,7 @@ from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
-
+from veomni.dit_trainer import DiTTrainerRegistry
 
 logger = helper.create_logger(__name__)
 tasks = ["t2v", "i2v", "v2v", "i2v_last"]
