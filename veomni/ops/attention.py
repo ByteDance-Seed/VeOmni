@@ -146,6 +146,7 @@ def flash_attention_forward(
             sliding_window=sliding_window,
             softcap=softcap,
             use_top_left_mask=False,
+            implementation="flash_attention_2",
             **kwargs,
         )
 
