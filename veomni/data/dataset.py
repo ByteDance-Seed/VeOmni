@@ -251,7 +251,7 @@ def build_mapping_dataset(
             if not isdir(data_path):
                 raise FileNotFoundError(f"Dataset {data_path} not exists.")
 
-            for filename in listdir(folders=[data_path]):
+            for filename in listdir(data_path):
                 from ..utils.helper import get_cache_dir
 
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
@@ -300,7 +300,7 @@ def build_iterative_dataset(
             if not isdir(data_path):
                 raise FileNotFoundError(f"Dataset {data_path} not exists.")
 
-            for filename in listdir(folders=[data_path]):
+            for filename in listdir(data_path):
                 from ..utils.helper import get_cache_dir
 
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
