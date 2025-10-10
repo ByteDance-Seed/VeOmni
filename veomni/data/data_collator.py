@@ -145,8 +145,10 @@ class DataCollatorWithPositionIDs(DataCollator):
         # HF model code would handle the pass down of those kwargs for us.
         # Note that the recomputation would cause host->device sync which hurts performance and
         # stability due to CPU instability.
-        batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seqlens
-        batch["max_length_q"] = batch["max_length_k"] = cu_seqlens.diff().max().item()
+
+        # TO DO: nan when ulysess>1, to fix
+        # batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seqlens
+        # batch["max_length_q"] = batch["max_length_k"] = cu_seqlens.diff().max().item()
 
         if "labels" in batch:
             batch["labels"][:, cu_seqlens[1:-1]] = IGNORE_INDEX
