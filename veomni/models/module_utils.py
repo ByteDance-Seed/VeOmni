@@ -16,6 +16,7 @@
 import json
 import os
 import re
+import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -337,8 +338,13 @@ def load_dist_model_weights(
     torch_device = torch.device(init_device)
 
     # get the safetensor file iterator
+    get_stat_dict_iterators_start = time.perf_counter()
     state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
+    get_stat_dict_iterators_elasped_in_ms = 1000 * (time.perf_counter() - get_stat_dict_iterators_start)
+    logger.info_rank0(f"{get_stat_dict_iterators_elasped_in_ms=}")
+
     shard_count = len(state_dict_iterators) if global_rank == 0 else 0
+    logger.info_rank0(f"load_dist_model_weights: {shard_count=} ")
     shard_count_tensor = torch.tensor(
         [shard_count],
         dtype=torch.int64,
@@ -386,13 +392,17 @@ def load_dist_model_weights(
             name = metadata[1]
             shape = metadata[2]
             dtype = metadata[3]
-
+            logger.info_rank0(f"load_dist_model_weights: broadcasting {name=}")
             if global_rank != 0:
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
             else:
                 tensor = tensor.to(torch_device, non_blocking=True)  # type: ignore[assignment]
 
+            start_time = time.perf_counter()
             dist.broadcast(tensor, src=0)
+            logger.info_rank0(
+                f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
+            )
 
             if name in buffer_dict:
                 buffer_dict[name] = tensor.detach().clone()
