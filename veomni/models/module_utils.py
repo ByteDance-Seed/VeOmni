@@ -16,6 +16,7 @@
 import json
 import os
 import re
+import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGH
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from transformers.utils.import_utils import is_safetensors_available
 
+from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
@@ -287,6 +289,135 @@ def load_model_weights(
                 logger.info_rank0(f"Unexpected key in state dict: {name}.")
 
         del state_dict_iterator
+        empty_cache()
+
+    for name, buffer in buffer_dict.items():
+        _dispatch_buffer(model, name, buffer)
+
+    if len(parameter_names) > 0:
+        logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names}, initialize them.")
+        for name in parameter_names:
+            _init_parameter(model, name)
+
+    # we should tie embeddings after loading weights because to_empty() leads to untied weights,
+    # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
+    if getattr(model.config, "tie_word_embeddings", True):
+        try:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+        except Exception as e:
+            logger.info_rank0(f"Failed to tie embeddings: {e}")
+
+
+@torch.no_grad()
+def load_dist_model_weights(
+    model: Union["nn.Module", "PreTrainedModel"],
+    weights_path: str,
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+):
+    """
+    Loads pre-trained model states in transformers' format for distributed training.
+    This function intends to implement only rank0 reading safetensors from disk then other ranks get their weights from rank0 by properly dispatching
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        logger.warning_once("Distributed environment not initialized, falling back to load_model_weights.")
+        return load_model_weights(model, weights_path, init_device, dtensor_factory)
+
+    buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
+    parameter_names = {name for name, _ in model.named_parameters()}
+    model.to_empty(device=init_device)
+
+    # Get parallel plan if available
+    parallel_plan = None
+    if hasattr(model, "get_parallel_plan"):
+        parallel_plan = model.get_parallel_plan()
+
+    global_rank = get_parallel_state().global_rank
+    torch_device = torch.device(init_device)
+
+    # get the safetensor file iterator
+    get_stat_dict_iterators_start = time.perf_counter()
+    state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
+    get_stat_dict_iterators_elasped_in_ms = 1000 * (time.perf_counter() - get_stat_dict_iterators_start)
+    logger.info_rank0(f"{get_stat_dict_iterators_elasped_in_ms=}")
+
+    shard_count = len(state_dict_iterators) if global_rank == 0 else 0
+    logger.info_rank0(f"load_dist_model_weights: {shard_count=} ")
+    shard_count_tensor = torch.tensor(
+        [shard_count],
+        dtype=torch.int64,
+        device=torch_device if torch_device.type != "cpu" else torch.device("cpu"),
+    )
+    dist.broadcast(shard_count_tensor, src=0)
+    shard_count = int(shard_count_tensor.item())
+
+    if global_rank == 0:
+        shard_iterable = enumerate(
+            tqdm(
+                state_dict_iterators,
+                desc="Loading checkpoint shards",
+                disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
+            )
+        )
+    else:
+        shard_iterable = enumerate(range(shard_count))
+
+    for shard_idx, shard_payload in shard_iterable:
+        state_dict_iterator = shard_payload if global_rank == 0 else None
+        iterator = iter(state_dict_iterator) if global_rank == 0 else None
+
+        while True:
+            metadata: List[Any]
+            tensor: Optional["torch.Tensor"] = None
+
+            if global_rank == 0:
+                try:
+                    key, tensor = next(iterator)  # type: ignore[arg-type]
+                    key = _convert_weight_key(key, model)
+                    logger.info_rank0(f"loading {key=}")
+                    metadata = [False, key, tensor.shape, tensor.dtype]
+                except StopIteration:
+                    metadata = [True, None, None, None]
+            else:
+                metadata = [None, None, None, None]
+
+            dist.broadcast_object_list(metadata, src=0)
+
+            done = bool(metadata[0])
+            if done:
+                break
+
+            name = metadata[1]
+            shape = metadata[2]
+            dtype = metadata[3]
+            logger.info_rank0(f"load_dist_model_weights: broadcasting {name=}")
+            if global_rank != 0:
+                tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+            else:
+                tensor = tensor.to(torch_device, non_blocking=True)  # type: ignore[assignment]
+
+            start_time = time.perf_counter()
+            dist.broadcast(tensor, src=0)
+            logger.info_rank0(
+                f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
+            )
+
+            if name in buffer_dict:
+                buffer_dict[name] = tensor.detach().clone()
+            elif name in parameter_names:
+                parameter_names.discard(name)
+                _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+            else:
+                if global_rank == 0:
+                    logger.info_rank0(f"Unexpected key in state dict: {name}.")
+
+            del tensor
+
+        if global_rank == 0:
+            del state_dict_iterator
+
         empty_cache()
 
     for name, buffer in buffer_dict.items():
