@@ -5,7 +5,7 @@ import random
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Literal
 
 import torch
 import torch.distributed as dist
@@ -25,7 +25,7 @@ from veomni.data.data_collator import DataCollator
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model, save_model_assets, save_model_weights
+from veomni.models import build_foundation_model
 from veomni_patch.models.seedream.dit.modules import na
 from veomni_patch.models.seedream.dit.modules.config import (
     create_sampler_from_config,
@@ -39,7 +39,7 @@ from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
-from veomni.dit_trainer import DiTTrainerRegistry
+from veomni.dit_trainer import DiTTrainerRegistry, DiTBaseTrainer
 
 logger = helper.create_logger(__name__)
 tasks = ["t2v", "i2v", "v2v", "i2v_last"]
@@ -76,6 +76,10 @@ class MyTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Path to hf weights."},
     )
+    training_task: Literal["offline_training", "online_training", "offline_embedding"] = field(
+        default="online_training",
+        metadata={"help": "Training task. Offline_training: training offline_embeded data. Online training: training raw data online. Offline_embedding: embedding raw data for offline training."},
+    )
 
 
 @dataclass
@@ -84,111 +88,131 @@ class Arguments:
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
+def process_online_example(example, **kwargs):
+    raise NotImplementedError
 
-def process_seedream_offline_example(example, text_null_embedding: torch.Tensor, text_dropout: float = 0.0):
-    def _dropout_or_not(emb):
-        return emb if random.random() >= text_dropout else text_null_embedding + emb * 0.0
+def process_offline_example(example, **kwargs):
+    
+#     def _dropout_or_not(emb):
+#         return emb if random.random() >= text_dropout else text_null_embedding + emb * 0.0
 
-    def get_condition(latent: torch.Tensor, task: str, latent_last: torch.Tensor = None) -> torch.Tensor:
-        t, h, w, c = latent.shape
-        cond = torch.zeros([t, h, w, c + 1], device=latent.device, dtype=latent.dtype)
-        if task == "t2v" or t == 1:
-            # t2i or t2v generation.
-            return cond
-        if task == "i2v" or task == "i2v_last":
-            # i2v generation.
-            cond[:1, ..., :-1] = latent[:1]
-            cond[:1, ..., -1:] = 1.0
-            if task == "i2v_last":
-                # i2v generation conditioned on last frame.
-                cond[-1:, ..., :-1] = latent_last
-                cond[-1:, ..., -1:] = 1.0
-            return cond
-        if task == "v2v":
-            # v2v frame extension.
-            cond[:2, ..., :-1] = latent[:2]
-            cond[:2, ..., -1:] = 1.0
-            return cond
-        raise NotImplementedError
+#     def get_condition(latent: torch.Tensor, task: str, latent_last: torch.Tensor = None) -> torch.Tensor:
+#         t, h, w, c = latent.shape
+#         cond = torch.zeros([t, h, w, c + 1], device=latent.device, dtype=latent.dtype)
+#         if task == "t2v" or t == 1:
+#             # t2i or t2v generation.
+#             return cond
+#         if task == "i2v" or task == "i2v_last":
+#             # i2v generation.
+#             cond[:1, ..., :-1] = latent[:1]
+#             cond[:1, ..., -1:] = 1.0
+#             if task == "i2v_last":
+#                 # i2v generation conditioned on last frame.
+#                 cond[-1:, ..., :-1] = latent_last
+#                 cond[-1:, ..., -1:] = 1.0
+#             return cond
+#         if task == "v2v":
+#             # v2v frame extension.
+#             cond[:2, ..., :-1] = latent[:2]
+#             cond[:2, ..., -1:] = 1.0
+#             return cond
+#         raise NotImplementedError
 
-    def sample_conditions(latents: List[torch.Tensor], latents_last: List[torch.Tensor] = None) -> List[torch.Tensor]:
-        task_ids = random.choices(range(len(tasks)), tasks_prob, k=len(latents))
-        if latents_last is None:
-            latents_last = [None] * len(latents)
+#     def sample_conditions(latents: List[torch.Tensor], latents_last: List[torch.Tensor] = None) -> List[torch.Tensor]:
+#         task_ids = random.choices(range(len(tasks)), tasks_prob, k=len(latents))
+#         if latents_last is None:
+#             latents_last = [None] * len(latents)
 
-        # Rollback to i2v if there is no latent_last
-        for i in range(len(task_ids)):
-            if tasks[task_ids[i]] == "i2v_last" and latents_last[i] is None:
-                task_ids[i] = tasks.index("i2v")
+#         # Rollback to i2v if there is no latent_last
+#         for i in range(len(task_ids)):
+#             if tasks[task_ids[i]] == "i2v_last" and latents_last[i] is None:
+#                 task_ids[i] = tasks.index("i2v")
 
-        conds = [
-            get_condition(latent, tasks[task_id], latent_last)
-            for latent, latent_last, task_id in zip(latents, latents_last, task_ids)
-        ]
-        return conds, torch.tensor(task_ids)
-
-    assert example.get("is_valid", True)
+#         conds = [
+#             get_condition(latent, tasks[task_id], latent_last)
+#             for latent, latent_last, task_id in zip(latents, latents_last, task_ids)
+#         ]
+#         return conds, torch.tensor(task_ids)
 
     processed_example = {}
 
     latent = pk.loads(example["latent"])
-    latent = latent[list(latent.keys())[0]]  # 数据定义好后优化这个 # c, f, h, w
-
-    # TODO: move this to modeling
-    latent = rearrange(latent, "c f h w -> f c h w")
-    dist = DiagonalGaussianDistribution(latent)
-    latent = dist.sample()
-    latent = rearrange(latent, "f c h w -> f h w c")
-    latent = (latent - torch.tensor(0.012)) * torch.tensor(1.0)
-    f, h, w = latent.shape[:3]
-
-    latents = [latent]  # wrap batch size
-    latents_cond, task_ids = sample_conditions(latents, None)
-    latents, latents_shapes = na.flatten(latents)
-    latents_cond, _ = na.flatten(latents_cond)
-
-    # Cast latents to fp32 to avoid error.
-    latents = latents.float()
-    latents_cond = latents_cond.float()
+    latent = latent['']
+    latent = rearrange(latent, "c f h w -> f h w c") # TODO: vae输出就转好，外面不用转
+    latents, latents_shapes = na.flatten([latent]) # TODO: move this to condition_model.get_condition
     processed_example.update(
         {
             "latents": latents,  # (f h w) c
             "latents_shapes": latents_shapes,  # 1, 3
-            "latents_cond": latents_cond,  # (f h w) c+1
-            "video_task_ids": task_ids,  # 1
         }
     )
-
     text_emb_dict = pk.loads(example["text_emb"])
-    text_key = random.choice(list(text_emb_dict.keys()))
-    text_embs, shot_latents_shapes, shot_text_shapes, num_shots = [], [], [], []
 
-    for item in text_emb_dict[text_key]:
-        text_emb = item["text_embeds"]
-        n_latent_frames = item["n_latent_frames"]
-        assert n_latent_frames > 0, f"Invalid shot with n_latent_frames: {n_latent_frames}."
-        if len(text_emb) == 1:
-            repeats = [n_latent_frames]  # t2v
-        else:
-            repeats = [1, n_latent_frames - 1]  # i2v
-        text_embs.append(torch.cat([_dropout_or_not(item) for item in text_emb]))
-        shot_text_shapes.append([len(item) for item in text_emb])
-        shot_latents_shapes.extend([[f, h, w] for f in repeats])
-        num_shots.append(len(text_emb))
-    text_embeds, text_shapes = na.flatten(text_embs)
-    num_shots = torch.tensor(num_shots)
-    shot_text_shapes = torch.tensor(shot_text_shapes).transpose(0, 1)
-    shot_latents_shapes = torch.tensor(shot_latents_shapes)
+    processed_emb_dict = {}
+    for key in text_emb_dict:
+        text_embeds = text_emb_dict[key][0]['text_embeds']
+        text_embeds, text_shapes = na.flatten(text_embeds)
+        processed_emb_dict[f'{key}_shape'] = text_shapes
+        processed_emb_dict[key] = text_embeds
+     
+    processed_example.update(processed_emb_dict)
+#     latent = latent[list(latent.keys())[0]]  # 数据定义好后优化这个 # c, f, h, w
 
-    processed_example.update(
-        {
-            "text_embeds": text_embeds,  # l, 3584
-            "num_shots": num_shots,  # 1
-            "text_shapes": text_shapes,  # 1, 1
-            "shot_text_shapes": shot_text_shapes,  # num_shot, 1 (这个有点抽象，在rope里取的是txt_shape[:, 0])
-            "shot_latents_shapes": shot_latents_shapes,  # 1, num_shot, 3
-        }
-    )
+#     # TODO: move this to modeling
+#     latent = rearrange(latent, "c f h w -> f c h w")
+#     dist = DiagonalGaussianDistribution(latent)
+#     latent = dist.sample()
+#     latent = rearrange(latent, "f c h w -> f h w c")
+#     latent = (latent - torch.tensor(0.012)) * torch.tensor(1.0)
+#     f, h, w = latent.shape[:3]
+
+#     latents = [latent]  # wrap batch size
+#     latents_cond, task_ids = sample_conditions(latents, None)
+#     latents, latents_shapes = na.flatten(latents)
+#     latents_cond, _ = na.flatten(latents_cond)
+
+#     # Cast latents to fp32 to avoid error.
+#     latents = latents.float()
+#     latents_cond = latents_cond.float()
+#     processed_example.update(
+#         {
+#             "latents": latents,  # (f h w) c
+#             "latents_shapes": latents_shapes,  # 1, 3
+#             "latents_cond": latents_cond,  # (f h w) c+1
+#             "video_task_ids": task_ids,  # 1
+#         }
+#     )
+
+#     text_emb_dict = pk.loads(example["text_emb"])
+#     text_key = random.choice(list(text_emb_dict.keys()))
+#     text_embs, shot_latents_shapes, shot_text_shapes, num_shots = [], [], [], []
+
+#     for item in text_emb_dict[text_key]:
+#         text_emb = item["text_embeds"]
+#         n_latent_frames = item["n_latent_frames"]
+#         assert n_latent_frames > 0, f"Invalid shot with n_latent_frames: {n_latent_frames}."
+#         if len(text_emb) == 1:
+#             repeats = [n_latent_frames]  # t2v
+#         else:
+#             repeats = [1, n_latent_frames - 1]  # i2v
+#         text_embs.append(torch.cat([_dropout_or_not(item) for item in text_emb]))
+#         shot_text_shapes.append([len(item) for item in text_emb])
+#         shot_latents_shapes.extend([[f, h, w] for f in repeats])
+#         num_shots.append(len(text_emb))
+#     text_embeds, text_shapes = na.flatten(text_embs)
+#     num_shots = torch.tensor(num_shots)
+#     shot_text_shapes = torch.tensor(shot_text_shapes).transpose(0, 1) # TODO: mind this
+#     shot_latents_shapes = torch.tensor(shot_latents_shapes)
+
+#     processed_example.update(
+#         {
+#             "text_embeds": text_embeds,  # l, 3584
+#             "num_shots": num_shots,  # 1
+#             "text_shapes": text_shapes,  # 1, 1
+#             "shot_text_shapes": shot_text_shapes,  # num_shot, 1 (这个有点抽象，在rope里取的是txt_shape[:, 0])
+#             "shot_latents_shapes": shot_latents_shapes,  # 1, num_shot, 3
+#         }
+#     )
 
     # TODO: latent_last
 
@@ -222,7 +246,7 @@ def timestep_transform(schedule, timesteps: torch.Tensor, latents_shapes: torch.
     return timesteps
 
 @dataclass
-class SeedreamDataCollator(DataCollator):
+class DiTDataCollator(DataCollator):
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = defaultdict(list)
 
@@ -291,22 +315,21 @@ def main():
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
 
-    trainer = DiTTrainerRegistry.create(
+    trainer: DiTBaseTrainer = DiTTrainerRegistry.create(
         model_path=args.model.model_path,
+        lora_config=args.model.lora_config,
         build_foundation_model_func=build_foundation_model_func,
         build_parallelize_model_func=build_parallelize_model_func,
+        training_task=args.train.training_task,
         **trainer_config,
     )
 
-    import ipdb;ipdb.set_trace()
     # model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
     logger.info_rank0("Prepare data")
-    transform = partial(
-        process_seedream_offline_example,
-        text_dropout=args.data.text_dropout,
-    )
+    transform = process_offline_example if trainer.training_task == "offline_training" \
+        else partial(process_online_example, processor=trainer.processor)
     train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
     dataset_length = len(train_dataset) / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
@@ -329,50 +352,17 @@ def main():
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
-        collate_fn=[SeedreamDataCollator()],
+        collate_fn=[DiTDataCollator()],
     )
-
-    
-        
-
-    
 
     if args.train.save_initial_model:
         if args.train.global_rank == 0:
-            if args.model.lora_config is not None:
-                if args.model.lora_config.get("save_merge", False):
-                    logger.info_rank0(f"Save initial lora_adapter to {args.train.output_dir}.")
-                    model.save_pretrained(args.train.output_dir)
-                else:
-                    logger.info_rank0(f"Save initial lora merged model to {args.train.output_dir}.")
-                    model = model.merge_and_unload()
-                    model.save_pretrained(args.train.output_dir)
-            else:
-                save_model_weights(args.train.output_dir, model.state_dict(), model_assets=[model_config])
+            trainer.save_model_weights(args.train.output_dir)
         dist.barrier()
         return
-    # TODO: ema now oom
-    # ema = deepcopy(model)
-    # ema.requires_grad_(False)
-    # pretty_print_trainable_parameters(ema)
-
-    
-
-    # ema = build_parallelize_model(
-    #     model,
-    #     init_device=args.train.init_device,
-    #     weights_path=args.model.model_path,
-    #     enable_full_shard=args.train.enable_full_shard,
-    #     enable_mixed_precision=args.train.enable_mixed_precision,
-    #     enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
-    #     enable_fsdp_offload=args.train.enable_fsdp_offload,
-    #     fsdp_kwargs=fsdp_kwargs,
-    #     basic_modules=model._no_split_modules + args.model.basic_modules,
-    #     enable_reentrant=args.train.enable_reentrant,
-    #     enable_forward_prefetch=args.train.enable_forward_prefetch,
-    # )
 
     # a pre_hook which calls update_gate_ema of M8 has been registered on the optimizer
+    model = trainer.get_model_for_training()
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
@@ -392,27 +382,6 @@ def main():
         lr_decay_ratio=args.train.lr_decay_ratio,
         lr_warmup_ratio=args.train.lr_warmup_ratio,
         lr_start=args.train.lr_start,
-    )
-
-    schedule = create_schedule_from_config(
-        config=OmegaConf.create(args.model.schedule_config),
-        device="cuda",
-    )
-    training_timesteps = create_training_timesteps_from_config(
-        config=OmegaConf.create(args.model.training_timesteps_config),
-        schedule=schedule,
-        device="cuda",
-    )
-    sampling_timesteps = create_sampling_timesteps_from_config(
-        config=OmegaConf.create(args.model.sampling_timesteps_config),
-        schedule=schedule,
-        device="cuda",
-    )
-
-    sampler = create_sampler_from_config(
-        config=OmegaConf.create(args.model.sampler_config),
-        schedule=schedule,
-        timesteps=sampling_timesteps,
     )
 
     if args.train.global_rank == 0:
@@ -435,8 +404,7 @@ def main():
             profiler.start()
 
         # save model_assets before training
-        model_assets = [model_config]
-        save_model_assets(args.train.model_assets_dir, model_assets)
+        trainer.save_model_assets(args.train.model_assets_dir)
 
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
@@ -489,8 +457,10 @@ def main():
                 micro_batch = {
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
-                # helper.print_example(example=micro_batch, rank=args.train.local_rank, print_tensor=False)
+
                 with model_fwd_context:
+                    output = trainer.forward(**micro_batch)
+
                     noises = torch.randn_like(micro_batch["latents"])
                     batch_size = micro_batch["text_shapes"].shape[0]
                     timesteps = training_timesteps.sample([batch_size], device="cuda")

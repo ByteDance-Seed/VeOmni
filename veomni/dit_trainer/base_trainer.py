@@ -5,6 +5,9 @@ from transformers.modeling_utils import init_empty_weights
 import torch
 from ..utils import logging
 from ..utils.model_utils import pretty_print_trainable_parameters
+from ..models import save_model_weights, save_model_assets
+
+
 logger = logging.get_logger(__name__)
 
 class DiTTrainerRegistry:
@@ -44,6 +47,7 @@ class DiTBaseTrainer:
         **kwargs,
     ):
         logger.info_rank0("Prepare condition model.")
+        self.training_task = training_task
         if training_task == "offline_training":
             logger.info_rank0(f"Task: {training_task}, prepare condition model with empty weights.")
             with init_empty_weights():
@@ -61,23 +65,28 @@ class DiTBaseTrainer:
             )
         self.processor = build_processor(condition_model_path)
 
-        logger.info_rank0("Prepare dit model.")
-        self.dit_model = build_foundation_model_func(config_path=model_path, weights_path=model_path)
-        fsdp_kwargs = self.configure_lora_model(lora_config)
-        pretty_print_trainable_parameters(self.dit_model)
-        self.dit_model = build_parallelize_model_func(
-            model=self.dit_model,
-            fsdp_kwargs=fsdp_kwargs,
-            basic_modules=self.dit_model._no_split_modules
-        )
-        
+        if training_task != "offline_embedding":
+            logger.info_rank0("Prepare dit model.")
+            self.dit_model = build_foundation_model_func(config_path=model_path, weights_path=model_path)
+
+            self.lora_config = lora_config
+            fsdp_kwargs = self.configure_lora_model()
+            pretty_print_trainable_parameters(self.dit_model)
+            self.dit_model = build_parallelize_model_func(
+                model=self.dit_model,
+                fsdp_kwargs=fsdp_kwargs,
+                basic_modules=self.dit_model._no_split_modules
+            )
     
-    def configure_lora_model(self, lora_config: dict = None):
+    def get_model_for_training(self):
+        return self.dit_model
+    
+    def configure_lora_model(self):
         fsdp_kwargs = {}
-        if lora_config is None:
+        if self.lora_config is None:
             self.lora = False
         else:
-            lora_adapter_path = lora_config.get("lora_adapter", None)
+            lora_adapter_path = self.lora_config.get("lora_adapter", None)
             if lora_adapter_path is not None:
                 logger.info_rank0(f"Load lora_adapter from {lora_adapter_path}.")
                 from peft import PeftModel
@@ -87,9 +96,9 @@ class DiTBaseTrainer:
                 from peft import LoraConfig, get_peft_model
 
                 lora_config: LoraConfig = LoraConfig(
-                    r=lora_config["rank"],
-                    lora_alpha=lora_config["alpha"],
-                    target_modules=lora_config["lora_modules"],
+                    r=self.lora_config["rank"],
+                    lora_alpha=self.lora_config["alpha"],
+                    target_modules=self.lora_config["lora_modules"],
                 )
                 logger.info_rank0(f"Init lora: {lora_config.to_dict()}.")
                 self.dit_model = get_peft_model(self.dit_model, lora_config)
@@ -99,3 +108,23 @@ class DiTBaseTrainer:
             fsdp_kwargs["use_orig_params"] = True
         return fsdp_kwargs
         
+    def save_model_weights(self, save_path: str):
+        # TODO: ema model save
+        if self.lora:
+            if self.lora_config.get("save_merge", False):
+                logger.info_rank0(f"Save initial lora_adapter to {save_path}.")
+                self.dit_model.save_pretrained(save_path)
+            else:
+                logger.info_rank0(f"Save initial lora merged model to {save_path}.")
+                self.dit_model = self.dit_model.merge_and_unload()
+                self.dit_model.save_pretrained(save_path)
+        else:
+            save_model_weights(save_path, self.dit_model.state_dict(), model_assets=[self.dit_model.config])
+
+    def save_model_assets(self, save_path: str):
+        model_assets = [self.dit_model.config]
+        save_model_assets(save_path, model_assets)
+
+    
+    def forward(self, **kwargs):
+        import ipdb;ipdb.set_trace()
