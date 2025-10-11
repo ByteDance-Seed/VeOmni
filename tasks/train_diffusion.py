@@ -48,10 +48,6 @@ tasks_prob = [0.05, 0.95, 0.0, 0.0]
 
 @dataclass
 class MyDataArguments(DataArguments):
-    null_text_embedding: Optional[str] = field(
-        default="",
-        metadata={"help": "Path to null text embedding."},
-    )
     text_dropout: Optional[float] = field(
         default=0.0,
         metadata={"help": "Dropout rate for text."},
@@ -64,25 +60,9 @@ class MyModelArguments(ModelArguments):
         default_factory=dict,
         metadata={"help": "Config for lora."},
     )
-    sampler_config: Optional[Dict] = field(
-        default=None,
-        metadata={"help": "Config for sampler."},
-    )
-    schedule_config: Optional[Dict] = field(
-        default=None,
-        metadata={"help": "Config for schedule."},
-    )
-    training_timesteps_config: Optional[Dict] = field(
-        default=None,
-        metadata={"help": "Config for training timesteps."},
-    )
-    sampling_timesteps_config: Optional[Dict] = field(
-        default=None,
-        metadata={"help": "Config for sampling timesteps."},
-    )
-    loss: Optional[Dict] = field(
-        default=None,
-        metadata={"help": "Loss config."},
+    trainer_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for trainer."},
     )
 
 
@@ -241,29 +221,6 @@ def timestep_transform(schedule, timesteps: torch.Tensor, latents_shapes: torch.
     timesteps = timesteps * schedule.T
     return timesteps
 
-
-def build_lora_model(model: torch.nn.Module, lora_config: Dict):
-    lora_adapter_path = lora_config.get("lora_adapter", None)
-    if lora_adapter_path is not None:
-        logger.info_rank0(f"Load lora_adapter from {lora_adapter_path}.")
-        from peft import PeftModel
-
-        model = PeftModel.from_pretrained(model, lora_adapter_path)
-    else:
-        from peft import LoraConfig, get_peft_model
-
-        lora_config = LoraConfig(
-            r=lora_config["rank"],
-            lora_alpha=lora_config["alpha"],
-            target_modules=lora_config["lora_modules"],
-        )
-        logger.info_rank0(f"Init lora: {lora_config.to_dict()}.")
-        model = get_peft_model(model, lora_config)
-
-    model.print_trainable_parameters()
-    return model
-
-
 @dataclass
 class SeedreamDataCollator(DataCollator):
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
@@ -310,14 +267,44 @@ def main():
         ep_outside=args.train.ep_outside,
     )
 
-    logger.info_rank0("Prepare data")
+    logger.info_rank0("Prepare trainier")
+    trainer_config = args.model.trainer_config
 
-    text_null_embedding_path = args.data.null_text_embedding
-    text_null_embedding = torch.load(text_null_embedding_path, map_location="cpu", weights_only=True).detach()
-    assert text_null_embedding.dtype == torch.bfloat16
+    build_foundation_model_func = partial(
+        build_foundation_model,
+        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        attn_implementation=args.model.attn_implementation,
+        moe_implementation=args.model.moe_implementation,
+        init_device=args.train.init_device,
+        force_use_huggingface=args.model.force_use_huggingface,
+    )
+
+    build_parallelize_model_func = partial(
+        build_parallelize_model,
+        init_device=args.train.init_device,
+        weights_path=args.model.model_path,
+        enable_full_shard=args.train.enable_full_shard,
+        enable_mixed_precision=args.train.enable_mixed_precision,
+        enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
+        enable_fsdp_offload=args.train.enable_fsdp_offload,
+        enable_reentrant=args.train.enable_reentrant,
+        enable_forward_prefetch=args.train.enable_forward_prefetch,
+    )
+
+    trainer = DiTTrainerRegistry.create(
+        model_path=args.model.model_path,
+        build_foundation_model_func=build_foundation_model_func,
+        build_parallelize_model_func=build_parallelize_model_func,
+        **trainer_config,
+    )
+
+    import ipdb;ipdb.set_trace()
+    # model_config = model.config
+    helper.print_device_mem_info("VRAM usage after building model")
+
+    logger.info_rank0("Prepare data")
     transform = partial(
         process_seedream_offline_example,
-        text_null_embedding=text_null_embedding,
         text_dropout=args.data.text_dropout,
     )
     train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
@@ -345,26 +332,10 @@ def main():
         collate_fn=[SeedreamDataCollator()],
     )
 
-    logger.info_rank0("Prepare model")
-    model: MultiShotNaDiT = build_foundation_model(
-        config_path=args.model.config_path,
-        weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-        attn_implementation=args.model.attn_implementation,
-        moe_implementation=args.model.moe_implementation,
-        init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
-    )
+    
+        
 
-    model_config = model.config
-    helper.print_device_mem_info("VRAM usage after building model")
-
-    fsdp_kwargs = {}
-    if args.model.lora_config:
-        model = build_lora_model(model, args.model.lora_config)
-        fsdp_kwargs["use_orig_params"] = True
-
-    pretty_print_trainable_parameters(model)
+    
 
     if args.train.save_initial_model:
         if args.train.global_rank == 0:
@@ -385,19 +356,7 @@ def main():
     # ema.requires_grad_(False)
     # pretty_print_trainable_parameters(ema)
 
-    model = build_parallelize_model(
-        model,
-        init_device=args.train.init_device,
-        weights_path=args.model.model_path,
-        enable_full_shard=args.train.enable_full_shard,
-        enable_mixed_precision=args.train.enable_mixed_precision,
-        enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
-        enable_fsdp_offload=args.train.enable_fsdp_offload,
-        fsdp_kwargs=fsdp_kwargs,
-        basic_modules=model._no_split_modules + args.model.basic_modules,
-        enable_reentrant=args.train.enable_reentrant,
-        enable_forward_prefetch=args.train.enable_forward_prefetch,
-    )
+    
 
     # ema = build_parallelize_model(
     #     model,
