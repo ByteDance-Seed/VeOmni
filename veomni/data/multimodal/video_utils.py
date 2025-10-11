@@ -123,7 +123,7 @@ def smart_resize(
             w_bar = math.ceil(width * beta)
     video = functional.resize(
         video,
-        [h_bar, w_bar],
+        [w_bar, h_bar],
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
     ).float()
@@ -216,3 +216,35 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
         smart_audio_nframes(audio, audio_fps, **kwargs) for audio, audio_fps in zip(audio_inputs, audio_fps_list)
     ]
     return video_inputs, audio_inputs
+
+
+def images_to_video(image_list, output_file: str, fps: int = 6):
+    # image_list: list of numpy_arrays
+    import av
+
+    # record the encoding time
+    av.logging.set_level(av.logging.INFO)
+    height, width, channels = image_list[0].shape
+    container = av.open(output_file, mode="w")
+    stream = container.add_stream("libx264", rate=fps)
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = "yuv420p"
+    codec_context = stream.codec_context
+    codec_context.options["crf"] = "22"
+    codec_context.options["threads"] = "0"
+    codec_context.options["preset"] = "ultrafast"
+
+    for frame in image_list:
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)  # 强制转换为 C 连续
+        frame = av.VideoFrame.from_numpy_buffer(frame, format="rgb24")
+        packet = stream.encode(frame)
+        container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+
+
+def save_video_tensors_to_file(video: torch.Tensor, output_path):
+    images_to_video(video, output_path, fps=24)
