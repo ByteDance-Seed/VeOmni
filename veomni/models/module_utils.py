@@ -111,6 +111,14 @@ class StateDictIterator:
                 yield key, state_dict[key]
 
 
+@dataclass
+class BroadcastMetadata:
+    done: bool
+    name: Optional[str]
+    shape: Optional["torch.Size"]
+    dtype: Optional["torch.dtype"]
+
+
 def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     """
     Loads (sharded) state dict in transformers' format.
@@ -291,23 +299,7 @@ def load_model_weights(
         del state_dict_iterator
         empty_cache()
 
-    for name, buffer in buffer_dict.items():
-        _dispatch_buffer(model, name, buffer)
-
-    if len(parameter_names) > 0:
-        logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names}, initialize them.")
-        for name in parameter_names:
-            _init_parameter(model, name)
-
-    # we should tie embeddings after loading weights because to_empty() leads to untied weights,
-    # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
-    if getattr(model.config, "tie_word_embeddings", True):
-        try:
-            input_embeddings = model.get_input_embeddings()
-            output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
-        except Exception as e:
-            logger.info_rank0(f"Failed to tie embeddings: {e}")
+    post_process_after_weight_loading(model)
 
 
 @torch.no_grad()
@@ -369,7 +361,6 @@ def rank0_load_and_broadcast_weights(
         iterator = iter(state_dict_iterator) if global_rank == 0 else None
 
         while True:
-            metadata: List[Any]
             tensor: Optional["torch.Tensor"] = None
 
             if global_rank == 0:
@@ -377,21 +368,24 @@ def rank0_load_and_broadcast_weights(
                     key, tensor = next(iterator)  # type: ignore[arg-type]
                     key = _convert_weight_key(key, model)
                     logger.info_rank0(f"loading {key=}")
-                    metadata = [False, key, tensor.shape, tensor.dtype]
+                    metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
                 except StopIteration:
-                    metadata = [True, None, None, None]
+                    metadata = BroadcastMetadata(True, None, None, None)
             else:
-                metadata = [None, None, None, None]
+                metadata = BroadcastMetadata(False, None, None, None)
 
-            dist.broadcast_object_list(metadata, src=0)
+            metadata_list = [metadata]
+            dist.broadcast_object_list(metadata_list, src=0)
+            metadata = metadata_list[0]
 
-            done = bool(metadata[0])
-            if done:
+            if metadata.done:
                 break
 
-            name = metadata[1]
-            shape = metadata[2]
-            dtype = metadata[3]
+            name = metadata.name
+            shape = metadata.shape
+            dtype = metadata.dtype
+            if name is None or shape is None or dtype is None:
+                raise RuntimeError("Received incomplete broadcast metadata.")
             logger.info_rank0(f"load_dist_model_weights: broadcasting {name=}")
             if global_rank != 0:
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
@@ -419,6 +413,16 @@ def rank0_load_and_broadcast_weights(
             del state_dict_iterator
 
         empty_cache()
+
+    post_process_after_weight_loading(model)
+
+
+def post_process_after_weight_loading(model: Union["nn.Module", "PreTrainedModel"]):
+    """
+    shared logic that handles buffer, missing weight keys and tied embedding after weight loading
+    """
+    buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
+    parameter_names = {name for name, _ in model.named_parameters()}
 
     for name, buffer in buffer_dict.items():
         _dispatch_buffer(model, name, buffer)
