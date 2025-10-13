@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Sequence, Literal
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
+
 import wandb
 from einops import rearrange
 from tqdm import trange
@@ -32,9 +32,6 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.dit_trainer import DiTTrainerRegistry, DiTBaseTrainer
 
 logger = helper.create_logger(__name__)
-tasks = ["t2v", "i2v", "v2v", "i2v_last"]
-tasks_prob = [0.05, 0.95, 0.0, 0.0]
-
 
 @dataclass
 class MyModelArguments(ModelArguments):
@@ -97,94 +94,7 @@ def process_offline_example(example, **kwargs):
         processed_emb_dict[f'{key}_shots'] = torch.tensor([len(text_shapes)])
      
     processed_example.update(processed_emb_dict)
-#     latent = latent[list(latent.keys())[0]]  # 数据定义好后优化这个 # c, f, h, w
-
-#     # TODO: move this to modeling
-#     latent = rearrange(latent, "c f h w -> f c h w")
-#     dist = DiagonalGaussianDistribution(latent)
-#     latent = dist.sample()
-#     latent = rearrange(latent, "f c h w -> f h w c")
-#     latent = (latent - torch.tensor(0.012)) * torch.tensor(1.0)
-#     f, h, w = latent.shape[:3]
-
-#     latents = [latent]  # wrap batch size
-#     latents_cond, task_ids = sample_conditions(latents, None)
-#     latents, latents_shapes = na.flatten(latents)
-#     latents_cond, _ = na.flatten(latents_cond)
-
-#     # Cast latents to fp32 to avoid error.
-#     latents = latents.float()
-#     latents_cond = latents_cond.float()
-#     processed_example.update(
-#         {
-#             "latents": latents,  # (f h w) c
-#             "latents_shapes": latents_shapes,  # 1, 3
-#             "latents_cond": latents_cond,  # (f h w) c+1
-#             "video_task_ids": task_ids,  # 1
-#         }
-#     )
-
-#     text_emb_dict = pk.loads(example["text_emb"])
-#     text_key = random.choice(list(text_emb_dict.keys()))
-#     text_embs, shot_latents_shapes, shot_text_shapes, num_shots = [], [], [], []
-
-#     for item in text_emb_dict[text_key]:
-#         text_emb = item["text_embeds"]
-#         n_latent_frames = item["n_latent_frames"]
-#         assert n_latent_frames > 0, f"Invalid shot with n_latent_frames: {n_latent_frames}."
-#         if len(text_emb) == 1:
-#             repeats = [n_latent_frames]  # t2v
-#         else:
-#             repeats = [1, n_latent_frames - 1]  # i2v
-#         text_embs.append(torch.cat([_dropout_or_not(item) for item in text_emb]))
-#         shot_text_shapes.append([len(item) for item in text_emb])
-#         shot_latents_shapes.extend([[f, h, w] for f in repeats])
-#         num_shots.append(len(text_emb))
-#     text_embeds, text_shapes = na.flatten(text_embs)
-#     num_shots = torch.tensor(num_shots)
-#     shot_text_shapes = torch.tensor(shot_text_shapes).transpose(0, 1) # TODO: mind this
-#     shot_latents_shapes = torch.tensor(shot_latents_shapes)
-
-#     processed_example.update(
-#         {
-#             "text_embeds": text_embeds,  # l, 3584
-#             "num_shots": num_shots,  # 1
-#             "text_shapes": text_shapes,  # 1, 1
-#             "shot_text_shapes": shot_text_shapes,  # num_shot, 1 (这个有点抽象，在rope里取的是txt_shape[:, 0])
-#             "shot_latents_shapes": shot_latents_shapes,  # 1, num_shot, 3
-#         }
-#     )
-
-    # TODO: latent_last
-
     return [processed_example]
-
-
-def timestep_transform(schedule, timesteps: torch.Tensor, latents_shapes: torch.Tensor):
-    # Compute resolution.
-    # TODO: move to modeling dit, config vae configs
-    vt = 4
-    vs = 16
-    frames = (latents_shapes[:, 0] - 1) * vt + 1
-    heights = latents_shapes[:, 1] * vs
-    widths = latents_shapes[:, 2] * vs
-
-    # Compute shift factor.
-    def get_lin_function(x1, y1, x2, y2):
-        m = (y2 - y1) / (x2 - x1)
-        b = y1 - m * x1
-        return lambda x: m * x + b
-
-    space_shift_fn = get_lin_function(x1=256 * 256, y1=0.5, x2=1024 * 1024, y2=1.15)
-    temp_shift_fn = get_lin_function(x1=1, y1=0, x2=121, y2=1.64)
-    shift = torch.exp(space_shift_fn(heights * widths) + temp_shift_fn(frames))
-    # Shift timesteps.
-    # math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
-    # shift / (shift + 1 / t - 1) = shift * t / (1 + (shift - 1) * t)
-    timesteps = timesteps / schedule.T
-    timesteps = shift * timesteps / (1 + (shift - 1) * timesteps)
-    timesteps = timesteps * schedule.T
-    return timesteps
 
 @dataclass
 class DiTDataCollator(DataCollator):
@@ -400,50 +310,7 @@ def main():
                 }
 
                 with model_fwd_context:
-                    output = trainer.forward(**micro_batch)
-
-                    noises = torch.randn_like(micro_batch["latents"])
-                    batch_size = micro_batch["text_shapes"].shape[0]
-                    timesteps = training_timesteps.sample([batch_size], device="cuda")
-                    timesteps = timestep_transform(schedule, timesteps, micro_batch["latents_shapes"])
-                    timesteps_repeated = timesteps.repeat_interleave(micro_batch["latents_shapes"].prod(-1))
-                    latents_noised = schedule.forward(micro_batch["latents"], noises, timesteps_repeated)
-
-                    pred = model(
-                        vid=torch.cat([latents_noised, micro_batch["latents_cond"]], dim=-1),
-                        txt=micro_batch["text_embeds"],
-                        vid_shape=micro_batch["latents_shapes"],
-                        shot_vid_shape=micro_batch["shot_latents_shapes"],
-                        txt_shape=micro_batch["text_shapes"],
-                        shot_txt_shape=micro_batch["shot_text_shapes"],
-                        timestep=timesteps,
-                        num_shots=micro_batch["num_shots"],
-                    ).vid_sample
-                    latents_pred, noises_pred = schedule.convert_from_pred(
-                        pred=pred,
-                        pred_type=sampler.prediction_type,
-                        x_t=latents_noised,
-                        t=timesteps_repeated,
-                    )
-
-                    # Compute mse per sample loss
-                    loss = F.mse_loss(
-                        input=schedule.convert_to_pred(
-                            x_0=latents_pred,
-                            x_T=noises_pred,
-                            t=timesteps_repeated,
-                            pred_type=args.model.loss["type"],
-                        ),
-                        target=schedule.convert_to_pred(
-                            x_0=micro_batch["latents"],
-                            x_T=noises,
-                            t=timesteps_repeated,
-                            pred_type=args.model.loss["type"],
-                        ),
-                        reduction="none",
-                    )
-                    loss = na.unflatten(loss, micro_batch["latents_shapes"])
-                    loss = torch.stack([x.mean() for x in loss])
+                    loss = trainer.forward(**micro_batch)
                 loss = loss / len(micro_batches)
                 with model_bwd_context:
                     loss.backward()

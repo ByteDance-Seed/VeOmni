@@ -137,6 +137,5 @@ class DiTBaseTrainer:
             return condition_dict
         with torch.no_grad():
             condition_dict = self.condition_model.process_condition(**condition_dict)
-    
         output = self.dit_model(**condition_dict)
         return output
