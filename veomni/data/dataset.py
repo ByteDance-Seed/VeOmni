@@ -125,7 +125,7 @@ def build_mapping_dataset(
         if os.path.isdir(data_path):
             data_files.extend([os.path.join(data_path, fn) for fn in os.listdir(data_path)])
         elif os.path.isfile(data_path):
-            data_files.append(data_files)
+            data_files.append(data_path) # fixed typo
         else:
             raise FileNotFoundError(f"Dataset {data_path} not exists.")
 
@@ -163,7 +163,7 @@ def build_iterative_dataset(
         if os.path.isdir(data_path):
             data_files.extend([os.path.join(data_path, fn) for fn in os.listdir(data_path)])
         elif os.path.isfile(data_path):
-            data_files.append(data_files)
+            data_files.append(data_path)
         else:
             raise FileNotFoundError(f"Dataset {data_path} not exists.")
 

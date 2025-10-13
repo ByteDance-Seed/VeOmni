@@ -368,6 +368,10 @@ class MoEGate(nn.Module):
                 tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
                 _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
             topk_weight = scores.gather(1, topk_idx)
+        elif self.topk_method == "greedy":
+             topk_weight, topk_idx = torch.topk(
+                scores, k=self.top_k, dim=-1, sorted=False
+            )
         else:
             raise NotImplementedError(f"insupportable TopK function for MoE gating: {self.topk_method}")
 
@@ -481,6 +485,7 @@ class DeepseekV3FusedMoE(DeepseekV3MoE):
         final_hidden_states = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
 
         if self.config.n_shared_experts is not None:
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             final_hidden_states = final_hidden_states + self.shared_experts(identity)
 
         return final_hidden_states

@@ -217,6 +217,11 @@ def load_model_weights(
         state_dict_iterators, desc="Loading checkpoint shards", disable=int(os.getenv("LOCAL_RANK", "-1")) > 0
     ):
         for name, tensor in state_dict_iterator:
+            # TODO
+            if 'inv_freq' in name:
+                print("inv_freq:")
+                print(tensor.shape)
+                continue
             if name in buffer_dict.keys():  # persistent buffers
                 buffer_dict[name] = tensor.clone()
             elif name in parameter_names:

@@ -1,0 +1,46 @@
+model:
+  model_path: ./Kimi-VL-A3B-Thinking-2506-merge
+  attn_implementation: flash_attention_2
+  moe_implementation: fused
+
+data:
+  train_path: ./data/flickr8k/data
+  chat_template: kimivl
+  max_seq_len: 8192
+  train_size: 80000000
+  source_name: flickr8k
+
+train:
+  output_dir: Kimi-VL-A3B-Thinking-2506_CT
+  data_parallel_mode: fsdp1
+  ulysses_parallel_size: 1
+  global_batch_size: 8
+  # micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: false
+  # bsz_warmup_ratio: 0.007
+  # dyn_bsz_margin: 0
+  # dyn_bsz_buffer_size: 200
+  # optimizer: adamw
+  freeze_vit: false
+  lr: 1.0e-5
+  # lr_warmup_ratio: 0.007
+  lr_decay_style: cosine
+  # lr_decay_ratio: 1.0
+  # weight_decay: 0.01
+  # max_grad_norm: 1.0
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: false # not supported
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cpu
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: bytecheckpoint
+  load_checkpoint_path: ""
+  save_hf_weights: true
+
+  num_train_epochs: 3
+  wandb_project: Kimi-VL-A3B-Thinking-2506
+  wandb_name: Kimi-VL-A3B-Thinking-2506_CT

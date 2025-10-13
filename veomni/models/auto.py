@@ -71,7 +71,10 @@ def build_foundation_model(
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "fused"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
-        config._moe_implementation = moe_implementation
+        if "text_config" in config.to_dict().keys():
+            config.text_config._moe_implementation = moe_implementation
+        else:
+            config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
     loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)

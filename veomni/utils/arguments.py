@@ -132,7 +132,7 @@ class DataArguments:
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
-    dataloader_type: Literal["native"] = field(
+    dataloader_type: Literal["native", "energon"] = field(
         default="native",
         metadata={"help": "Type of the dataloader."},
     )

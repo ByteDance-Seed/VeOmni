@@ -1,0 +1,26 @@
+model:
+  model_path: data/Qwen2.5-VL-7B-Instruct
+
+data:
+  train_path: ShareGPT4V/veomni_process/sharegpt4v_captioner_customer
+  chat_template: qwen2_5vl
+  max_seq_len: 2048
+  train_size: 80000000
+  source_name: sharegpt4v_pretrain_customer
+
+train:
+  output_dir: qwen2.5vl_sft
+  data_parallel_mode: fsdp1
+  wandb_project: qwen2_5vl
+  wandb_name: qwen2_5vl
+  rmpad: false
+  rmpad_with_pos_ids: true
+  ulysses_parallel_size: 1
+  freeze_vit: false
+  lr: 1.0e-5
+  lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_steps: 2000
+  use_wandb: false

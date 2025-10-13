@@ -165,6 +165,7 @@ class OmniDataCollatorWithPadding(DataCollator):
             "pixel_values": 0,
             "pixel_values_videos": 0,
             "image_grid_hw": 0,
+            "image_grid_hws": 0,
             "image_grid_thw": 0,
             "video_grid_thw": 0,
         },

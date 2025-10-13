@@ -318,7 +318,7 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
     template_type = "conversation"
 
     def encode_messages(
-        self, conversations: Sequence[Dict[str, str]], mm_num_tokens: Dict[str, List[int]]
+        self, conversations: Sequence[Dict[str, str]], mm_num_tokens: Dict[str, List[int]],loss_mask=None,
     ) -> Dict[str, List[int]]:
         image_index = 0
         messages = []
@@ -341,6 +341,11 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
                     "loss_mask": 1 if role == "assistant" else 0,
                 }
             )
+        # customize loss_mask for GUi training
+        if loss_mask is not None:
+            assert len(loss_mask) == len(messages)
+            for message, mask in zip(messages, loss_mask):
+                message["loss_mask"] = mask
 
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
@@ -463,6 +468,117 @@ class Qwen2_5VLChatTemplate(Qwen2_5VLTemplate):
 
         return tokenized_example
 
+class KimiVLTemplate(MultimodalChatTemplate):
+    def __init__(self, tokenizer: PreTrainedTokenizer, **kwargs) -> None:
+        super().__init__(tokenizer)
+        self.image_pad = "<|media_pad|>"
+        self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
+        self.image_start_id = self.tokenizer.convert_tokens_to_ids("<|media_start|>")
+        self.eos = self.tokenizer.encode("<|media_end|>\n", add_special_tokens=False)
+
+        logger.info_rank0("KimiVLTemplate will not truncate sequence when longer than [max_seq_lens].")
+
+    def image_pattern(self, token_num):
+        if self.template_type == "conversation":
+            return "<|media_start|>image<|media_content|>" + self.image_pad * token_num + "<|media_end|>"
+        else:
+            raise ValueError(f"Unknown template type: {self.template_type}")
+
+    @abstractmethod
+    def encode_messages(self, messages: Sequence[Dict[str, str]]) -> Dict[str, List[int]]:
+        pass
+
+class KimiVLChatTemplate(KimiVLTemplate):
+    template_type = "conversation"
+    system_prompt = "You are a helpful assistant."
+
+    def _set_system_prompt(self, system_prompt: str):
+        self.system_prompt = system_prompt
+
+    def _get_system_mesage(self):
+        system_message = {
+            "role": "system",
+            "content": self.system_prompt,
+            "loss_mask": 0,
+        }
+        return system_message
+
+    def encode_messages(
+        self,
+        conversations: Sequence[Dict[str, str]],
+        mm_num_tokens: Dict[str, List[int]],
+        max_seq_len: int,
+        loss_mask=None,
+    ) -> Dict[str, List[int]]:
+        image_index = 0
+        messages = []
+        token_num_list = mm_num_tokens.pop("image", [])
+        assert len(mm_num_tokens) == 0
+        # messages.append(self._get_system_mesage())
+        # print(conversations)
+        for message in conversations:
+            role = message[0]
+            content = ""
+            for value in message[1:]:
+                if value[0] == "text":
+                    content += value[1]
+                else:
+                    assert value[0] == "image"
+                    content += self.image_pattern(token_num_list[image_index])
+                    image_index += 1
+            messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "loss_mask": 1 if role == "assistant" else 0,
+                }
+            )
+        # customize loss_mask for GUi training
+        if loss_mask is not None:
+            assert len(loss_mask) == len(messages)
+            for message, mask in zip(messages, loss_mask):
+                message["loss_mask"] = mask
+
+        input_ids, attention_mask, labels = [], [], []
+        for message in messages:
+            if message["content"] == "":  # eval
+                content_str = "<|im_start|>" + message["role"] + "\n"
+            else:
+                if message["role"] == "system":
+                    content_str = "<|im_system|>system<|im_middle|>" + message["content"].strip() + "<|im_end|>\n"
+                elif message["role"] == "user":
+                    content_str = "<|im_user|>user<|im_middle|>" + message["content"].strip() + "<|im_end|>\n"
+                elif message["role"] == "assistant":
+                    content_str = "<|im_assistant|>assistant<|im_middle|>" + message["content"].strip() + "<|im_end|>\n"
+                else:
+                    raise ValueError(f"Unknown role: {message['role']}")
+            content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
+            # if len(input_ids) + len(content_ids) > max_seq_len:  # truncate
+            #     break
+            input_ids += content_ids
+            attention_mask += [1] * len(content_ids)
+            if message["loss_mask"] == 1:
+                beg_tok_len = len(self.tokenizer.encode("<|im_assistant|>assistant<|im_middle|>", add_special_tokens=False))
+                labels += [IGNORE_INDEX] * beg_tok_len
+                labels += content_ids[beg_tok_len:-1]
+                labels += [IGNORE_INDEX]
+            else:
+                labels += [IGNORE_INDEX] * len(content_ids)
+
+        tokenized_example = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+
+        # change qwen2vl_tokenized_image_id to seedomni_image_id
+        image_mask = tokenized_example["input_ids"] == self.image_token_id
+        input_mask = tokenized_example["labels"] == IGNORE_INDEX
+        input_image_mask = image_mask & input_mask
+        output_image_mask = image_mask & ~input_mask
+        tokenized_example["input_ids"][input_image_mask] = TYPE2INDEX["input"]["image"]
+        tokenized_example["input_ids"][output_image_mask] = TYPE2INDEX["output"]["image"]
+        tokenized_example["labels"][output_image_mask] = IGNORE_INDEX  # the label will be filled in decoder.
+        tokenized_example = {k: v[-max_seq_len:] for k, v in tokenized_example.items()}
+
+        return tokenized_example
 
 class JanusChatTemplate(ChatmlTemplate):
     def __init__(self, tokenizer: PreTrainedTokenizer) -> None:
@@ -560,6 +676,7 @@ TEMPLATES = {
     "qwen2vl_pretrain_stg1": Qwen2VLPretrainSTG1Template,
     "qwen2vl_pretrain": Qwen2VLPretrainTemplate,
     "qwen2_5vl": Qwen2_5VLChatTemplate,
+    "kimivl": KimiVLChatTemplate,
     "janus": JanusChatTemplate,
 }
 

@@ -62,7 +62,11 @@ def unpermute(
     """
     tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
 
+    tokens_dtype = tokens.dtype
     tokens = tokens * tokens_weight.unsqueeze(-1)
+    # Some moegate is implemented with fp32, here convert dtype of tokens back
+    tokens = tokens.to(tokens_dtype)
+    
     hidden_dim = hidden_states_shape[-1]
 
     unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=tokens.dtype)

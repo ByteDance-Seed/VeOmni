@@ -62,6 +62,34 @@ def sharegpt4v_sft_preprocess(conversations, **kwargs):
                 constructed_conversation.append([role, ("text", value)])
     return constructed_conversation
 
+def agentnet_preprocess(metas, level=1, img_window=3, **kwargs):
+    system_prompt = {1:"""You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task. For each step, provide your response in this format: Action: Provide clear, concise, and actionable instructions: - If the action involves interacting with a specific target: - Describe target explicitly without using coordinates - Specify element names when possible (use original language if non - English) - Describe features (shape , color , position) if name unavailable - For window control buttons , identify correctly (minimize , maximize , close) - if the action involves keyboard actions like ’press’, ’write’, ’hotkey’: - Consolidate repetitive keypresses with count - Specify expected text outcome for typing actionsFinally, output the action as PyAutoGUI code or the following functions: - { "name" : "computer.triple_click" , "description" : "Triple click on the screen" , "parameters" : { "type" : "object" , "properties" : { "x" : { "type" : "number" , "description" : "The x coordinate of the triple click" } , "y" : { "type" : "number" , "description" : "The y coordinate of the triple click" }} , "required" : [ "x" , "y" ]}} - { "name" : " computer.terminate " , "description" : "Terminate the current task and report its completion status" , "parameters" : { "type" : "object" , "properties" : { "status" : { "type" : "string" , "enum" : [ "success" , "failure" ] , "description" : "The status of the task" }} , "required" : [ "status" ]}} """, 2:"""You are a GUI agent . You are given a task and a screenshot of the screen . You need to perform a series of pyautogui actions to complete the task . For each step , provide your response in this format : Thought : - Step by Step Progress Assessment : - Analyze completed task parts and their contribution to the overall goal - Reflect on potential errors , unexpected results , or obstacles - If previous action was incorrect , predict a logical recovery step - Next Action Analysis : - List possible next actions based on current state - Evaluate options considering current state and previous actions - Propose most logical next action - Anticipate consequences of the proposed action - For Text Input Actions : - Note current cursor position - Consolidate repetitive actions ( specify count for multiple keypresses ) - Describe expected final text outcome - Use first - person perspective in reasoning Action : Provide clear , concise , and actionable instructions : - If the action involves interacting with a specific target : - Describe target explicitly without using coordinates - Specify element names when possible ( use original language if non - English ) - Describe features ( shape , color , position ) if name unavailable - For window control buttons , identify correctly ( minimize , maximize , close ) - if the action involves keyboard actions like ’ press ’, ’ write ’, ’ hotkey ’: - Consolidate repetitive keypresses with count - Specify expected text outcome for typing actionsFinally , output the action as PyAutoGUI code or the following functions : - { " name " : " computer . triple_click " , " description " : " Triple click on the screen " , " parameters " : { " type " : " object " , " properties " : { " x " : { " type " : " number " , " description " : " The x coordinate of the triple click " } , " y " : { " type " : " number " , " description " : " The y coordinate of the triple click " }} , " required " : [ " x " , " y " ]}} - { " name " : " computer . terminate " , " description " : " Terminate the current task and report its completion status " , " parameters " : { " type " : " object " , " properties " : { " status " : { " type " : " string " , " enum " : [ " success " , " failure " ] , " description " : " The status of the task " }} , " required " : [ " status " ]}}"""}
+    constructed_conversation = []
+    constructed_conversation.append(["system", ("text", system_prompt[level])])
+    prompt = ""
+    for idx, step in enumerate(metas["traj"]):
+        step = step['value']
+        if idx >= len(metas["traj"])-img_window:
+            # only push text to constructed conversation before image and last step
+            constructed_conversation.append(["assistant", ("text", prompt)])
+            prompt = ""
+            constructed_conversation.append(["user", ("image", None)])
+        prompt += f"# Step {idx+1}\n"
+        if idx < len(metas["traj"])-1:
+            prompt += f"## Action: {step['action']}\n"
+        else: # last step (with loss)
+            if level>=3:
+                prompt += f"## Observation: {step['observation']}\n"
+            if level>=2:
+                prompt += f"## Thought: {step['thought']}\n"
+            prompt += f"## Action: {step['action']}\n"
+            prompt += f"## Code: {step['code']}\n"
+    constructed_conversation.append(["user", ("text", metas["instruction"])])
+    constructed_conversation.append(["assistant", ("text", prompt)])
+    return constructed_conversation
+
+
+
 
 def doom_preprocess(conversations, max_image_nums=None, **kwargs):
     """
@@ -133,6 +161,13 @@ def imagenet1k_caption_preprocess(conversations, **kwargs):
     constructed_conversation = [
         ["user", ("image", None), ("text", "Describe the image.")],
         ["assistant", ("text", class_label)],
+    ]
+    return constructed_conversation
+
+def flickr_preprocess(conversations, **kwargs):
+    constructed_conversation = [
+        ["user", ("image", None), ("text", "Describe the image.")],
+        ["assistant", ("text", conversations)],
     ]
     return constructed_conversation
 
@@ -320,6 +355,8 @@ DATASETS = {
     "megalith": megalith_preprocess,
     "journeydb": journeydb_preprocess,
     "dalle3_1m": dalle3_1m_preprocess,
+    "flickr8k": flickr_preprocess,
+    "agentnet": agentnet_preprocess,
 }
 
 
