@@ -158,8 +158,6 @@ class DeepseekV3Config(PretrainedConfig):
         first_k_dense_replace=3,
         norm_topk_prob=True,
         scoring_func="sigmoid",
-        aux_loss_alpha=0.001,
-        seq_aux=True,
         hidden_act="silu",
         max_position_embeddings=4096,
         initializer_range=0.02,
@@ -202,8 +200,6 @@ class DeepseekV3Config(PretrainedConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
         self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
