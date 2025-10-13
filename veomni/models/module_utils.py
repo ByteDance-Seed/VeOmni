@@ -271,7 +271,7 @@ def load_model_weights(
     Loads pre-trained model states in transformers' format.
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
-    parameter_names = {name for name, _ in model.named_parameters()}
+    parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
 
     # Get parallel plan if available
@@ -290,8 +290,8 @@ def load_model_weights(
 
             if name in buffer_dict.keys():  # persistent buffers
                 buffer_dict[name] = tensor.clone()
-            elif name in parameter_names:
-                parameter_names.remove(name)
+            elif name in parameter_names_to_load:
+                parameter_names_to_load.remove(name)
                 _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
             else:
                 logger.info_rank0(f"Unexpected key in state dict: {name}.")
@@ -299,7 +299,7 @@ def load_model_weights(
         del state_dict_iterator
         empty_cache()
 
-    post_process_after_weight_loading(model)
+    post_process_after_weight_loading(model, parameter_names_to_load)
 
 
 @torch.no_grad()
@@ -318,7 +318,7 @@ def rank0_load_and_broadcast_weights(
         return load_model_weights(model, weights_path, init_device, dtensor_factory)
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
-    parameter_names = {name for name, _ in model.named_parameters()}
+    parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
 
     # Get parallel plan if available
@@ -399,8 +399,8 @@ def rank0_load_and_broadcast_weights(
 
             if name in buffer_dict:
                 buffer_dict[name] = tensor.detach().clone()
-            elif name in parameter_names:
-                parameter_names.discard(name)
+            elif name in parameter_names_to_load:
+                parameter_names_to_load.discard(name)
                 _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
             else:
                 if global_rank == 0:
@@ -413,22 +413,21 @@ def rank0_load_and_broadcast_weights(
 
         empty_cache()
 
-    post_process_after_weight_loading(model)
+    post_process_after_weight_loading(model, parameter_names_to_load)
 
 
-def post_process_after_weight_loading(model: Union["nn.Module", "PreTrainedModel"]):
+def post_process_after_weight_loading(model: Union["nn.Module", "PreTrainedModel"], parameter_names_left):
     """
     shared logic that handles buffer, missing weight keys and tied embedding after weight loading
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
-    parameter_names = {name for name, _ in model.named_parameters()}
 
     for name, buffer in buffer_dict.items():
         _dispatch_buffer(model, name, buffer)
 
-    if len(parameter_names) > 0:
-        logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names}, initialize them.")
-        for name in parameter_names:
+    if len(parameter_names_left) > 0:
+        logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
+        for name in parameter_names_left:
             _init_parameter(model, name)
 
     # we should tie embeddings after loading weights because to_empty() leads to untied weights,
