@@ -11,9 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
-from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from einops import rearrange
-from omegaconf import OmegaConf
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
@@ -27,31 +25,15 @@ from veomni.distributed.parallel_state import get_parallel_state, init_parallel_
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model
 from veomni_patch.models.seedream.dit.modules import na
-from veomni_patch.models.seedream.dit.modules.config import (
-    create_sampler_from_config,
-    create_sampling_timesteps_from_config,
-    create_schedule_from_config,
-    create_training_timesteps_from_config,
-)
-from veomni_patch.models.seedream.dit.video_nadit import MultiShotNaDiT
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
-from veomni.utils.model_utils import pretty_print_trainable_parameters
 from veomni.dit_trainer import DiTTrainerRegistry, DiTBaseTrainer
 
 logger = helper.create_logger(__name__)
 tasks = ["t2v", "i2v", "v2v", "i2v_last"]
 tasks_prob = [0.05, 0.95, 0.0, 0.0]
-
-
-@dataclass
-class MyDataArguments(DataArguments):
-    text_dropout: Optional[float] = field(
-        default=0.0,
-        metadata={"help": "Dropout rate for text."},
-    )
 
 
 @dataclass
@@ -85,55 +67,13 @@ class MyTrainingArguments(TrainingArguments):
 @dataclass
 class Arguments:
     model: "MyModelArguments" = field(default_factory=MyModelArguments)
-    data: "MyDataArguments" = field(default_factory=MyDataArguments)
+    data: "DataArguments" = field(default_factory=DataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
 def process_online_example(example, **kwargs):
     raise NotImplementedError
 
 def process_offline_example(example, **kwargs):
-    
-#     def _dropout_or_not(emb):
-#         return emb if random.random() >= text_dropout else text_null_embedding + emb * 0.0
-
-#     def get_condition(latent: torch.Tensor, task: str, latent_last: torch.Tensor = None) -> torch.Tensor:
-#         t, h, w, c = latent.shape
-#         cond = torch.zeros([t, h, w, c + 1], device=latent.device, dtype=latent.dtype)
-#         if task == "t2v" or t == 1:
-#             # t2i or t2v generation.
-#             return cond
-#         if task == "i2v" or task == "i2v_last":
-#             # i2v generation.
-#             cond[:1, ..., :-1] = latent[:1]
-#             cond[:1, ..., -1:] = 1.0
-#             if task == "i2v_last":
-#                 # i2v generation conditioned on last frame.
-#                 cond[-1:, ..., :-1] = latent_last
-#                 cond[-1:, ..., -1:] = 1.0
-#             return cond
-#         if task == "v2v":
-#             # v2v frame extension.
-#             cond[:2, ..., :-1] = latent[:2]
-#             cond[:2, ..., -1:] = 1.0
-#             return cond
-#         raise NotImplementedError
-
-#     def sample_conditions(latents: List[torch.Tensor], latents_last: List[torch.Tensor] = None) -> List[torch.Tensor]:
-#         task_ids = random.choices(range(len(tasks)), tasks_prob, k=len(latents))
-#         if latents_last is None:
-#             latents_last = [None] * len(latents)
-
-#         # Rollback to i2v if there is no latent_last
-#         for i in range(len(task_ids)):
-#             if tasks[task_ids[i]] == "i2v_last" and latents_last[i] is None:
-#                 task_ids[i] = tasks.index("i2v")
-
-#         conds = [
-#             get_condition(latent, tasks[task_id], latent_last)
-#             for latent, latent_last, task_id in zip(latents, latents_last, task_ids)
-#         ]
-#         return conds, torch.tensor(task_ids)
-
     processed_example = {}
 
     latent = pk.loads(example["latent"])
@@ -153,7 +93,8 @@ def process_offline_example(example, **kwargs):
         text_embeds = text_emb_dict[key][0]['text_embeds']
         text_embeds, text_shapes = na.flatten(text_embeds)
         processed_emb_dict[f'{key}_shape'] = text_shapes
-        processed_emb_dict[key] = text_embeds
+        processed_emb_dict[f'{key}_embed'] = text_embeds
+        processed_emb_dict[f'{key}_shots'] = torch.tensor([len(text_shapes)])
      
     processed_example.update(processed_emb_dict)
 #     latent = latent[list(latent.keys())[0]]  # 数据定义好后优化这个 # c, f, h, w

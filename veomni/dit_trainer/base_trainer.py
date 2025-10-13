@@ -1,5 +1,5 @@
 from typing import Callable, Literal
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoModel, AutoProcessor, AutoConfig
 from ..models.auto import build_processor
 from transformers.modeling_utils import init_empty_weights
 import torch
@@ -43,25 +43,28 @@ class DiTBaseTrainer:
         build_parallelize_model_func: Callable,
         training_task: Literal["online_training", "offline_training", "offline_embedding"] = "online_training",
         condition_model_path: str = None,
+        condition_model_cfg: dict = {},
         lora_config: dict = None,
         **kwargs,
     ):
         logger.info_rank0("Prepare condition model.")
         self.training_task = training_task
+        
+        condition_model_config = AutoConfig.from_pretrained(condition_model_path, **condition_model_cfg)
         if training_task == "offline_training":
             logger.info_rank0(f"Task: {training_task}, prepare condition model with empty weights.")
             with init_empty_weights():
                 self.condition_model = AutoModel.from_pretrained(
                     condition_model_path,
                     torch_dtype=torch.bfloat16,
-                    
+                    config=condition_model_config,
                 )
         else:
             logger.info_rank0(f"Task: {training_task}, prepare condition model fully loaded.")
             self.condition_model = AutoModel.from_pretrained(
                 condition_model_path,
                 torch_dtype=torch.bfloat16,
-                
+                config=condition_model_config,
             )
         self.processor = build_processor(condition_model_path)
 
@@ -126,5 +129,14 @@ class DiTBaseTrainer:
         save_model_assets(save_path, model_assets)
 
     
-    def forward(self, **kwargs):
-        import ipdb;ipdb.set_trace()
+    def forward(self, **condition_dict):
+        if self.training_task != "offline_training":
+            with torch.no_grad():
+                condition_dict = self.condition_model.get_condition(**condition_dict)
+        if self.training_task == "offline_embedding":
+            return condition_dict
+        with torch.no_grad():
+            condition_dict = self.condition_model.process_condition(**condition_dict)
+    
+        output = self.dit_model(**condition_dict)
+        return output
