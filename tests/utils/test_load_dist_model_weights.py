@@ -11,7 +11,7 @@ from torch import nn
 from torch.multiprocessing import spawn
 
 from veomni.distributed.parallel_state import init_parallel_state
-from veomni.models.module_utils import _load_state_dict, load_dist_model_weights, load_model_weights
+from veomni.models.module_utils import _load_state_dict, load_model_weights, rank0_load_and_broadcast_weights
 
 
 class TinyModel(nn.Module):
@@ -58,7 +58,7 @@ def _dist_worker(
         dist.barrier()
 
         model_dist = TinyModel()
-        load_dist_model_weights(model_dist, weights_path, init_device=device_type)
+        rank0_load_and_broadcast_weights(model_dist, weights_path, init_device=device_type)
         dist_state = _extract_state(model_dist)
 
         model_ref = TinyModel()

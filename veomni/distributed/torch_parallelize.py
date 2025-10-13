@@ -27,7 +27,7 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
-from ..models import load_dist_model_weights, load_model_weights
+from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
@@ -387,9 +387,9 @@ def parallelize_model_fsdp2(
         from torch.distributed.tensor import distribute_tensor
 
         logger.info_rank0("starting to load model weights...")
-        if kwargs.get("load_dist_model_weights"):
+        if kwargs.get("broadcast_model_weights_from_rank0"):
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            load_dist_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
             load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)

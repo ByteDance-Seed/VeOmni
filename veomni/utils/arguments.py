@@ -379,7 +379,7 @@ class TrainingArguments:
             "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
-    load_dist_model_weights: bool = field(
+    broadcast_model_weights_from_rank0: bool = field(
         default=True,
         metadata={
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."

@@ -311,7 +311,7 @@ def load_model_weights(
 
 
 @torch.no_grad()
-def load_dist_model_weights(
+def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
