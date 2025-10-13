@@ -330,13 +330,9 @@ def rank0_load_and_broadcast_weights(
     torch_device = torch.device(init_device)
 
     # get the safetensor file iterator
-    get_stat_dict_iterators_start = time.perf_counter()
     state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
-    get_stat_dict_iterators_elasped_in_ms = 1000 * (time.perf_counter() - get_stat_dict_iterators_start)
-    logger.info_rank0(f"{get_stat_dict_iterators_elasped_in_ms=}")
-
     shard_count = len(state_dict_iterators) if global_rank == 0 else 0
-    logger.info_rank0(f"load_dist_model_weights: {shard_count=} ")
+    logger.info_rank0(f"rank0_load_and_broadcast_weights: {shard_count=} ")
     shard_count_tensor = torch.tensor(
         [shard_count],
         dtype=torch.int64,
@@ -350,17 +346,20 @@ def rank0_load_and_broadcast_weights(
             tqdm(
                 state_dict_iterators,
                 desc="Loading checkpoint shards",
+                # only rank0 displays tqdm pbar
                 disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
             )
         )
     else:
         shard_iterable = enumerate(range(shard_count))
 
+    # iterate safetensor files; each file would have a iterator to read weight keys and tensors
     for shard_idx, shard_payload in shard_iterable:
         state_dict_iterator = shard_payload if global_rank == 0 else None
         iterator = iter(state_dict_iterator) if global_rank == 0 else None
 
         while True:
+            # read tensors from safetensor
             tensor: Optional["torch.Tensor"] = None
 
             if global_rank == 0:
@@ -386,7 +385,7 @@ def rank0_load_and_broadcast_weights(
             dtype = metadata.dtype
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata.")
-            logger.info_rank0(f"load_dist_model_weights: broadcasting {name=}")
+            logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
             if global_rank != 0:
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
             else:

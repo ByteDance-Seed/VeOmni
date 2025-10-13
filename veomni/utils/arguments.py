@@ -595,6 +595,9 @@ class TrainingArguments:
             "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
         )
 
+        if self.data_parallel_mode == "fsdp2":
+            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
+
         # calculate gradient accumulation steps
         if self.global_batch_size is None:
             self.global_batch_size = self.micro_batch_size * self.data_parallel_size
