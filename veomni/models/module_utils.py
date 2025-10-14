@@ -204,13 +204,23 @@ def _dispatch_buffer(
     module: "nn.Module",
     name: str,
     buffer: "torch.Tensor",
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
 ) -> None:
     """
     Assigns buffer to an empty model.
     """
     module, name = _find_submodule(module, name)
-    orig_tensor = module._buffers[name].data
-    module._buffers[name] = buffer.to(orig_tensor)
+    orig_tensor = module._buffers[name]
+
+    if hasattr(orig_tensor, "device_mesh"):  # dtensor buffer
+        if dtensor_factory is None:
+            raise ValueError("dtensor buffer requires a dtensor_factory.")
+
+        device_mesh = getattr(orig_tensor, "device_mesh")
+        placements = getattr(orig_tensor, "placements")
+        module._buffers[name] = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
+    else:
+        module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
 
 
 def _init_parameter(
@@ -299,7 +309,7 @@ def load_model_weights(
         del state_dict_iterator
         empty_cache()
 
-    post_process_after_weight_loading(model, parameter_names_to_load)
+    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
 
 @torch.no_grad()
@@ -417,19 +427,24 @@ def rank0_load_and_broadcast_weights(
 
         empty_cache()
 
-    post_process_after_weight_loading(model, parameter_names_to_load)
+    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
 
-def post_process_after_weight_loading(model: Union["nn.Module", "PreTrainedModel"], parameter_names_left):
+def post_process_after_weight_loading(
+    model: Union["nn.Module", "PreTrainedModel"],
+    buffer_dict,
+    parameter_names_left: Optional[set[str]] = None,
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+):
     """
-    shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights
+    shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights.
     """
-    buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
+    parameter_names_left = parameter_names_left or set()
 
     for name, buffer in buffer_dict.items():
-        _dispatch_buffer(model, name, buffer)
+        _dispatch_buffer(model, name, buffer, dtensor_factory)
 
-    if len(parameter_names_left) > 0:
+    if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
         for name in parameter_names_left:
             _init_parameter(model, name)

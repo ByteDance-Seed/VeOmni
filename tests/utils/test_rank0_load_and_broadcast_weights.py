@@ -86,6 +86,7 @@ def _write_checkpoint(checkpoint_dir: Path) -> str:
     model = TinyModel().cpu()
     model.init_weights()
     model.output_embeddings.weight = model.input_embeddings.weight  # tie before saving
+    model.buffer.uniform_(-0.5, 0.5)
     state_dict = {name: tensor.detach().clone().cpu() for name, tensor in model.state_dict().items()}
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     save_file(state_dict, str(checkpoint_dir / "model.safetensors"))
