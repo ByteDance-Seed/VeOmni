@@ -74,12 +74,14 @@ class DiTBaseTrainer:
 
             self.lora_config = lora_config
             fsdp_kwargs = self.configure_lora_model()
-            pretty_print_trainable_parameters(self.dit_model)
+            
             self.dit_model = build_parallelize_model_func(
                 model=self.dit_model,
                 fsdp_kwargs=fsdp_kwargs,
                 basic_modules=self.dit_model._no_split_modules
             )
+            self.dit_model.train()
+            pretty_print_trainable_parameters(self.dit_model)
     
     def get_model_for_training(self):
         return self.dit_model
