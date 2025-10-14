@@ -181,6 +181,7 @@ def main():
     logger.info_rank0("Prepare data")
     transform = process_offline_example if trainer.training_task == "offline_training" \
         else partial(process_online_example, processor=trainer.processor)
+    
     train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
     dataset_length = len(train_dataset) / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
