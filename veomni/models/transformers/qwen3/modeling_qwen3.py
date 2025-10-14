@@ -877,17 +877,6 @@ if is_liger_kernel_available():
     Qwen3MLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Qwen3.")
 
-if is_torch_npu_available():
-    from veomni_kernels.rms_norm.npu_ttx_rmsnorm_kernel import triton_rmsnorm_npu
-    from veomni_kernels.rope.npu_ttx_rope_kernel import triton_rope_npu
-
-    from veomni.ops.attention import npu_flash_attention
-
-    apply_rotary_pos_emb = triton_rope_npu
-    rms_norm = triton_rmsnorm_npu
-    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", npu_flash_attention)
-    logger.info_rank0("Apply npu kernels to Qwen3.")
-
 ModelClass = Qwen3ForCausalLM
 
 __all__ = ["Qwen3ForCausalLM", "Qwen3Model", "Qwen3PreTrainedModel"]
