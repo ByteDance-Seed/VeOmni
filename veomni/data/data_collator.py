@@ -146,9 +146,11 @@ class DataCollatorWithPositionIDs(DataCollator):
         # Note that the recomputation would cause host->device sync which hurts performance and
         # stability due to CPU instability.
 
-        # TO DO: nan when ulysess>1, to fix
-        # batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seqlens
-        # batch["max_length_q"] = batch["max_length_k"] = cu_seqlens.diff().max().item()
+        # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
+        # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding.
+        if not get_parallel_state().sp_enabled:
+            batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seqlens
+            batch["max_length_q"] = batch["max_length_k"] = cu_seqlens.diff().max().item()
 
         if "labels" in batch:
             batch["labels"][:, cu_seqlens[1:-1]] = IGNORE_INDEX
@@ -224,7 +226,7 @@ class TextSequenceShardCollator(DataCollator):
         return tensor.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
 
     def sp_padding(
-        self, tensor: "torch.Tensor", dim: int = -1, pad_value: int = 0, pad_length: int = 0
+        self, tensor: "torch.Tensor", dim: int = -1, pad_value: int = 0, pad_length: int = 0, sequential: bool = False
     ) -> "torch.Tensor":
         """
         Pads a tensor with pad_length to aligns tensor with sp size.
@@ -234,7 +236,21 @@ class TextSequenceShardCollator(DataCollator):
 
         pad_shape = list(tensor.shape)
         pad_shape[dim] = pad_length
-        pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
+        # For position_ids to create one single sequence for all padded tokens
+        if sequential:
+            # seq: [pad_length]
+            seq = torch.arange(pad_length, device=tensor.device, dtype=tensor.dtype)
+
+            # We want to broadcast seq along every dimension except `dim`.
+            # view_shape: [1, 1, ..., pad_length(at dim), ..., 1]  (ndim entries)
+            view_shape = [1] * tensor.ndim
+            view_shape[dim] = pad_length
+
+            # seq.view(view_shape): [1, 1, ..., pad_length, ..., 1]
+            # expand to pad_shape:   [s0, s1, ..., pad_length, ..., s{n-1}]
+            pad = seq.view(view_shape).expand(pad_shape)
+        else:
+            pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
         return torch.cat((tensor, pad), dim=dim)
 
     def __call__(self, batch: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
@@ -275,10 +291,24 @@ class TextSequenceShardCollator(DataCollator):
                     batch["cu_seqlens"], (0, 1), "constant", batch["cu_seqlens"][-1].item() + pad_length
                 )
         else:
-            batch["position_ids"] = self.sp_padding(batch["position_ids"], dim=-1, pad_value=0, pad_length=pad_length)
+            # For position_ids to create one single sequence for all padded tokens by pass sequential=True
+            batch["position_ids"] = self.sp_padding(
+                batch["position_ids"], dim=-1, pad_value=0, pad_length=pad_length, sequential=True
+            )
 
         # sp slice
         batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
         batch["labels"] = self.sp_slice(labels, dim=-1)
+
+        # Calculate cu_seqlens using the after padding's position_ids
+        cu_seqlens = pos2culen(batch["position_ids"])
+
+        # Pass down already computed cu_seq_lens and max_length as the HF transformers
+        # FlashAttentionKwargs naming so that it can be used without recomputation every layer.
+        # HF model code would handle the pass down of those kwargs for us.
+        # Note that the recomputation would cause host->device sync which hurts performance and
+        # stability due to CPU instability.
+        batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seqlens
+        batch["max_length_q"] = batch["max_length_k"] = cu_seqlens.diff().max().item()
 
         return batch
