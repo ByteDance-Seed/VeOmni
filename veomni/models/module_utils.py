@@ -367,6 +367,8 @@ def rank0_load_and_broadcast_weights(
                     key, tensor = next(iterator)  # type: ignore[arg-type]
                     key = _convert_weight_key(key, model)
                     logger.info_rank0(f"loading {key=}")
+                    if torch.count_nonzero(tensor) == 0:
+                        logger.warning_rank0(f"Detected tensor with all-zero values when reading safetensor: {key=}")
                     metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
                 except StopIteration:
                     metadata = BroadcastMetadata(True, None, None, None)
