@@ -310,8 +310,9 @@ def rank0_load_and_broadcast_weights(
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
 ):
     """
-    Loads pre-trained model states in transformers' format for distributed training.
-    This function intends to implement only rank0 reading safetensors from disk then other ranks get their weights from rank0 by properly dispatching
+    This functions serves as the same purpose as `load_model_weights`
+    but reduces disk I/O by broadcasting weights from rank0.
+    In comparison, `load_model_weights` would require every GPU to go through the entire model weights on disk.
     """
     if not dist.is_available() or not dist.is_initialized():
         logger.warning_once("Distributed environment not initialized, falling back to load_model_weights.")
@@ -342,6 +343,7 @@ def rank0_load_and_broadcast_weights(
     shard_count = int(shard_count_tensor.item())
 
     if global_rank == 0:
+        # only rank0 would actual read weights from safetensor state_dict iterators
         shard_iterable = enumerate(
             tqdm(
                 state_dict_iterators,
@@ -420,7 +422,7 @@ def rank0_load_and_broadcast_weights(
 
 def post_process_after_weight_loading(model: Union["nn.Module", "PreTrainedModel"], parameter_names_left):
     """
-    shared logic that handles buffer, missing weight keys and tied embedding after weight loading
+    shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
 
@@ -441,6 +443,7 @@ def post_process_after_weight_loading(model: Union["nn.Module", "PreTrainedModel
             output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
         except Exception as e:
             logger.info_rank0(f"Failed to tie embeddings: {e}")
+            raise RuntimeError("Failed to tie input/output embeddings") from e
 
 
 def _get_shard_info(
