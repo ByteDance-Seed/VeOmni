@@ -107,7 +107,7 @@ class DiTBaseTrainer:
 
     
     def forward(self, **condition_dict):
-        if self.training_task != "offline_training":
+        if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
                 condition_dict = self.condition_model.get_condition(**condition_dict)
         if self.training_task == "offline_embedding":
