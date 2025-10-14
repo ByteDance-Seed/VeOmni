@@ -129,6 +129,26 @@ def smart_resize(
     ).float()
     return video
 
+def resample_video_frames(video: torch.Tensor, original_fps: float, target_fps: float = 24.0):
+    T, C, H, W = video.shape
+    duration_sec = T / original_fps
+    new_T = int(duration_sec * target_fps)
+
+    if new_T == T:
+        return video
+
+    new_indices = np.linspace(0, T - 1, new_T)
+    new_indices_floor = np.floor(new_indices).astype(int)
+    new_indices_ceil = np.ceil(new_indices).astype(int)
+    alpha = new_indices - new_indices_floor 
+
+    new_indices_ceil = np.clip(new_indices_ceil, 0, T - 1)
+
+    video_resampled = (1 - torch.from_numpy(alpha)[:, None, None, None]) * video[new_indices_floor] + torch.from_numpy(
+        alpha
+    )[:, None, None, None] * video[new_indices_ceil]
+
+    return video_resampled, target_fps
 
 def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs):
     if "http://" in video or "https://" in video:
@@ -202,6 +222,7 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
     video_inputs, video_fps_list, audio_inputs, audio_fps_list = [], [], [], []
     for video in videos:
         video, video_fps, audio, audio_fps = load_video(video, **kwargs)
+        video, video_fps = resample_video_frames(video, original_fps=video_fps, target_fps=kwargs["target_fps"])
         video_inputs.append(video)
         video_fps_list.append(video_fps)
         audio_inputs.append(audio)

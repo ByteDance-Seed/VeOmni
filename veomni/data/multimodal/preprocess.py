@@ -346,8 +346,8 @@ DATASETS = {
 }
 
 
-def conv_preprocess(source: str, converstation: List[Dict[str, Any]], **kwargs):
+def conv_preprocess(source: str, conversation: List[Dict[str, Any]], **kwargs):
     if source not in DATASETS:
         raise ValueError(f"Unknown dataset name: {source}")
 
-    return DATASETS[source](converstation, **kwargs)
+    return DATASETS[source](conversation, **kwargs)
