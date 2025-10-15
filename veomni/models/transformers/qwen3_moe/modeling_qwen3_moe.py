@@ -816,8 +816,12 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         if position_ids is not None and position_ids.shape[-1] != 1:
             # for bsh cases, cache_position.unsqueeze(0) will create a tensor of shape [1,max_seq_len]
             # we expand it to make it match the batch size otherwise the calculated cu_seq_len and max_length might be wrong
-            if position_ids.shape[0] != input_ids.shape[0]:
-                position_ids = position_ids.expand(input_ids.shape[0], -1)
+
+            # We should avoid using input_ids here because it might be None when it
+            # is used as the language model (LM) part of a vision-language model. In that case,
+            # inputs_embeds are already computed and input_ids are set to None.
+            if position_ids.shape[0] != inputs_embeds.shape[0]:
+                position_ids = position_ids.expand(inputs_embeds.shape[0], -1)
             _, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = self.prepare_fa2_from_position_ids(
                 position_ids
             )
