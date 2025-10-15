@@ -84,24 +84,7 @@ def process_online_example(example, processor, source_name, **kwargs):
     video_inputs, _ = fetch_videos([video_info["video_bytes"].encode("latin-1")], **kwargs)
 
     # TODO: move these to processor.preprocess
-    processed_example = {}
-    for prefix, prompt_list in prompts.items():
-        if prompt_list:
-            processed_example[f'{prefix}_shots'] = torch.tensor([len(prompt_list)])
-            text_inputs = processor.text_processor(prompt_list)
-            for key, value in text_inputs.items():
-                embed, shape = na.flatten([value])
-                processed_example[f'{prefix}_{key}_embed'] = embed
-                processed_example[f'{prefix}_{key}_shape'] = shape
-        else:
-            processed_example[f'{prefix}_shots'] = torch.tensor([0])
-
-    video_inputs = processor.vae_processor(video_inputs)
-    video_features = video_inputs['features']
-    video_features = rearrange(video_features, "b c f h w -> b f h w c")
-    video_features, video_features_shapes = na.flatten(video_features)
-    processed_example['video_features'] = video_features
-    processed_example['video_features_shapes'] = video_features_shapes
+    processed_example = processor.preprocess(prompts, video_inputs)
     return [processed_example]
 
 def process_offline_example(example, **kwargs):
