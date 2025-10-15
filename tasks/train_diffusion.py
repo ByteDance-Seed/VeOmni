@@ -253,7 +253,7 @@ def main():
     save_checkpoint_path = None
 
     # a pre_hook which calls update_gate_ema of M8 has been registered on the optimizer
-    if trainer.training_task != "offline_embedding":
+    if trainer.training_task != "offline_embedding" or True:
         model = trainer.get_model_for_training()
         optimizer = build_optimizer(
             model,
@@ -282,6 +282,7 @@ def main():
                     project=args.train.wandb_project,
                     name=args.train.wandb_name,
                     config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
+                    settings=wandb.Settings(init_timeout=120)
                 )
 
             if args.train.enable_profiling:
@@ -322,7 +323,7 @@ def main():
             f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
         )
     else:
-        args.train.num_train_epochs = 1
+        args.train.num_train_epochs = 3
         logger.info(f"rank{args.train.local_rank} Start offline embedding, data_len: {args.train.train_steps}")
 
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -355,8 +356,10 @@ def main():
 
                 with model_fwd_context:
                     loss = trainer.forward(**micro_batch)
+                
+                print("debug-wjc", loss)
 
-                if trainer.training_task != "offline_embedding":
+                if trainer.training_task != "offline_embedding" or True:
                     loss = loss / len(micro_batches)
                     with model_bwd_context:
                         loss.backward()
@@ -365,7 +368,7 @@ def main():
 
                 del micro_batch
 
-            if trainer.training_task != "offline_embedding":
+            if trainer.training_task != "offline_embedding" or True:
                 if args.train.data_parallel_mode == "fsdp1":
                     grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
                 else:
@@ -389,7 +392,7 @@ def main():
 
             data_loader_tqdm.update()
 
-            if trainer.training_task != "offline_embedding":
+            if trainer.training_task != "offline_embedding" or True:
                 if args.train.global_rank == 0:
                     if args.train.use_wandb:
                         train_metrics.update(
@@ -405,7 +408,7 @@ def main():
         data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-        if trainer.training_task != "offline_embedding":
+        if trainer.training_task != "offline_embedding" or True:
             if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
                 helper.empty_cache()
                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
@@ -421,7 +424,7 @@ def main():
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
-    if trainer.training_task != "offline_embedding":
+    if trainer.training_task != "offline_embedding" or True:
         torch.cuda.synchronize()
         # release memory
         del optimizer, lr_scheduler

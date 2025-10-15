@@ -46,7 +46,7 @@ class DiTBaseTrainer:
             )
         self.processor = build_processor(condition_model_path)
 
-        if training_task != "offline_embedding":
+        if training_task != "offline_embedding" or True:
             logger.info_rank0("Prepare dit model.")
             self.dit_model = build_foundation_model_func(config_path=model_path, weights_path=model_path)
 
@@ -110,8 +110,8 @@ class DiTBaseTrainer:
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
                 condition_dict = self.condition_model.get_condition(**condition_dict)
-        if self.training_task == "offline_embedding":
-            return condition_dict
+        # if self.training_task == "offline_embedding":
+        #     return condition_dict
         with torch.no_grad():
             condition_dict = self.condition_model.process_condition(**condition_dict)
         output = self.dit_model(**condition_dict)

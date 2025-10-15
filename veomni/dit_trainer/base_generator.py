@@ -30,9 +30,6 @@ class DiTBaseGenerator(DiTBaseTrainer):
             torch_dtype=torch.bfloat16,
             config=condition_model_config,
         )
-        self.condition_model.text_model.requires_grad_(False).eval().to("cuda")
-        self.condition_model.vae_model.requires_grad_(False).eval().to("cuda")
-        self.condition_model.vae_model.set_causal_slicing(split_size=4, memory_device="same")
         self.condition_processor = build_processor(condition_model_path)
 
         logger.info_rank0("Prepare dit model.")
