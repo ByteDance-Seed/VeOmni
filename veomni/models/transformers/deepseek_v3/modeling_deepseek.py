@@ -472,6 +472,7 @@ class DeepseekV3FusedMoE(DeepseekV3MoE):
     def forward(self, hidden_states):
         identity = hidden_states
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        orig_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
@@ -479,6 +480,9 @@ class DeepseekV3FusedMoE(DeepseekV3MoE):
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
         final_hidden_states = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
+
+        # Reshape back to 3D before adding shared experts
+        final_hidden_states = final_hidden_states.view(*orig_shape)
 
         if self.config.n_shared_experts is not None:
             final_hidden_states = final_hidden_states + self.shared_experts(identity)
@@ -941,9 +945,9 @@ class DeepseekV3PreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, DeepSeekV3Experts):
-            module.fc1_1.data.normal_(mean=0.0, std=std)
-            module.fc1_2.data.normal_(mean=0.0, std=std)
-            module.fc2.data.normal_(mean=0.0, std=std)
+            module.gate_proj.data.normal_(mean=0.0, std=std)
+            module.up_proj.data.normal_(mean=0.0, std=std)
+            module.down_proj.data.normal_(mean=0.0, std=std)
         elif isinstance(module, MoEGate):
             import torch.nn.init as init
 
