@@ -626,7 +626,7 @@ class TrainingArguments:
             from .checkpoint_utils import get_checkpoint_path
 
             self.load_checkpoint_path = get_checkpoint_path(
-                output_dir=self.output_dir, is_rank0=self.local_rank == 0, ckpt_manager=self.ckpt_manager
+                output_dir=self.output_dir, is_local_rank0=self.local_rank == 0, ckpt_manager=self.ckpt_manager
             )
 
         # save paths
