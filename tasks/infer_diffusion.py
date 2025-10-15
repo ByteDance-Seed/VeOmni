@@ -1,35 +1,25 @@
 import json
 import os
-from tqdm import tqdm
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Dict, List, Optional, Sequence, Literal
+from typing import Dict, Optional, Sequence
 
 import torch
-
-from einops import rearrange
-from tqdm import trange
-
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
-from veomni.data import (
-    build_dataloader,
-    build_mapping_dataset,
-)
-from veomni.data.multimodal.image_utils import load_image_from_bytes
-from veomni.data.multimodal.video_utils import load_video_from_bytes, save_video_tensors_to_file
-from veomni.data.data_collator import DataCollator
-from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model
-from veomni_patch.models.seedream.dit.modules import na
-from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
-from veomni.utils.dist_utils import all_reduce
-from veomni.dit_trainer import DiTTrainerRegistry
+from tqdm import tqdm
 from veomni_patch.dit_trainer import DiTSeedanceGenerator
+
+from veomni.data.data_collator import DataCollator
+from veomni.data.multimodal.image_utils import load_image_from_bytes
+from veomni.data.multimodal.video_utils import save_video_tensors_to_file
+from veomni.dit_trainer import DiTTrainerRegistry
+from veomni.models import build_foundation_model
+from veomni.utils import helper
+from veomni.utils.arguments import ModelArguments, parse_args, save_args
 
 
 logger = helper.create_logger(__name__)
+
 
 def read_raw_data(data_path: str, negative_prompts_path: str):
     with open(negative_prompts_path, encoding="utf-8") as f:
@@ -44,19 +34,20 @@ def read_raw_data(data_path: str, negative_prompts_path: str):
                 raw_data.append(
                     {
                         "prompt": data["prompt"],
-                        "image_bytes": data["image_bytes"], # convert to image
+                        "image_bytes": data["image_bytes"],  # convert to image
                         "negative_prompts": {
-                            "negative_text": negative_text, 
-                            "vid_negative_text": negative_text, 
-                            "sr_negative_text": negative_text, 
+                            "negative_text": negative_text,
+                            "vid_negative_text": negative_text,
+                            "sr_negative_text": negative_text,
                             "sr_vid_negative_text": negative_text,
-                        }, # TODO: negative_text, vid_negative_text, sr_negative_text, sr_vid_negative_text 可不同
+                        },  # TODO: negative_text, vid_negative_text, sr_negative_text, sr_vid_negative_text 可不同
                     }
                 )
     else:
         raise NotImplementedError(f"Not support reading data path: {data_path}")
 
     return raw_data
+
 
 @dataclass
 class MyModelArguments(ModelArguments):
@@ -72,6 +63,7 @@ class MyModelArguments(ModelArguments):
         default_factory=dict,
         metadata={"help": "Config for trainer."},
     )
+
 
 @dataclass
 class MyDataArguments:
@@ -132,7 +124,7 @@ def main():
     helper.enable_third_party_logging()
     save_args(args, args.generate.output_dir)
 
-    raw_data_list = read_raw_data(args.data.generate_path, args.data.negative_prompts_path) 
+    raw_data_list = read_raw_data(args.data.generate_path, args.data.negative_prompts_path)
 
     logger.info_rank0("Prepare generator")
     build_foundation_model_func = partial(
@@ -156,10 +148,12 @@ def main():
         # 0. raw_data
         # 包含 prompt (image_prompt, video_promt)，image，negative_prompts（image, video）x（origin，sr）
         if "image_bytes" in raw_data:
-            raw_data["image"] = load_image_from_bytes(raw_data["image_bytes"].encode("latin-1")) 
+            raw_data["image"] = load_image_from_bytes(raw_data["image_bytes"].encode("latin-1"))
             del raw_data["image_bytes"]
 
-        videos = generator.forward(raw_data, num_samples_per_prompt=args.model.generator_config["num_samples_per_prompt"])
+        videos = generator.forward(
+            raw_data, num_samples_per_prompt=args.model.generator_config["num_samples_per_prompt"]
+        )
 
         os.makedirs("output", exist_ok=True)
         for j, video in enumerate(videos):

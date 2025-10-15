@@ -1,28 +1,15 @@
 import argparse
 import json
 import os
-from copy import deepcopy
-from typing import List, Optional, Tuple, Union
 
 import torch
-from einops import rearrange
 from omegaconf import OmegaConf
 from tqdm import tqdm
-
 from transformers import AutoModel, AutoProcessor
-
-from veomni.data.multimodal.image_utils import load_image_bytes_from_path, load_image_from_bytes
-from veomni.data.multimodal.video_utils import load_video_from_bytes, save_video_tensors_to_file
-from veomni.models import build_foundation_model, build_processor
-from veomni_patch.models.seed.seedance.condition.text import SeedanceTextEncoder, SeedanceTextEncoderProcessor
 from veomni_patch.models.seed.seedance.dit import SeedanceDiT
-from veomni_patch.models.seedream.data.transforms.bucket_resize import (
-    BUCKET_MAPPINGS,
-    BaseSRBucketResize,
-)
-from veomni_patch.models.seedream.dit.modules import na
-from veomni_patch.models.seedream.vae.video_vae.modeling_video_vae import VideoAutoencoderKL
-from veomni_patch.models.seedream.vae.video_vae.processing_video_vae import VideoVAEProcessor
+
+from veomni.data.multimodal.image_utils import load_image_from_bytes
+from veomni.data.multimodal.video_utils import load_video_from_bytes, save_video_tensors_to_file
 from veomni.utils import helper
 
 
@@ -106,13 +93,13 @@ def read_raw_data(data_path: str, negative_prompts_path: str):
                 raw_data.append(
                     {
                         "prompt": data["prompt"],
-                        "image_bytes": data["image_bytes"], # convert to image
+                        "image_bytes": data["image_bytes"],  # convert to image
                         "negative_prompts": {
-                            "negative_text": negative_text, 
-                            "vid_negative_text": negative_text, 
-                            "sr_negative_text": negative_text, 
+                            "negative_text": negative_text,
+                            "vid_negative_text": negative_text,
+                            "sr_negative_text": negative_text,
                             "sr_vid_negative_text": negative_text,
-                        }, # TODO: negative_text, vid_negative_text, sr_negative_text, sr_vid_negative_text 可不同
+                        },  # TODO: negative_text, vid_negative_text, sr_negative_text, sr_vid_negative_text 可不同
                     }
                 )
     else:
@@ -120,38 +107,42 @@ def read_raw_data(data_path: str, negative_prompts_path: str):
 
     return raw_data
 
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data_path", type=str, 
-        default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/origin/7B_0403/i2v_prompt.jsonl"
+        "--data_path",
+        type=str,
+        default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/origin/7B_0403/i2v_prompt.jsonl",
         # default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/dataset/seedance_v1_offline"
     )
     parser.add_argument(
-        "--negative_prompts", type=str, 
-        default="/opt/tiger/VeOmni/tasks/multimodal/seedance/configs/negative_prompt.txt"
+        "--negative_prompts",
+        type=str,
+        default="/opt/tiger/VeOmni/tasks/multimodal/seedance/configs/negative_prompt.txt",
     )
     parser.add_argument(
-        "--dit_model_path", type=str,
+        "--dit_model_path",
+        type=str,
         # default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_24fps_480p_i2v_rlhf_v2_dit",
         # default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_0403/i2v_dit",
         default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_0403/i2v_dit_12nfe",
-        
     )
     parser.add_argument("--lora_model_path", type=str, default=None)
     parser.add_argument("--use_offline_embedding", type=bool, default=False)
     parser.add_argument("--num_samples_per_prompt", type=int, default=1)
     parser.add_argument(
-        "--condition_model_path", type=str,
+        "--condition_model_path",
+        type=str,
         default="/mnt/hdfs/__MERLIN_USER_DIR__/seedance/ckpt/veomni_hf/7B_0403/condition",
     )
-    args = parser.parse_args() 
+    args = parser.parse_args()
 
     helper.enable_third_party_logging()
 
     enable_torch_deterministic_mode()
 
-    raw_data_list = read_raw_data(args.data_path, args.negative_prompts) 
+    raw_data_list = read_raw_data(args.data_path, args.negative_prompts)
 
     dit_model_path = args.dit_model_path
     dit: SeedanceDiT = SeedanceDiT.from_pretrained(
@@ -159,9 +150,10 @@ def main() -> None:
     ).eval()
     if args.lora_model_path is not None:
         from peft import PeftModel
+
         dit = PeftModel.from_pretrained(dit, args.lora_model_path)
 
-    condition_model = AutoModel.from_pretrained(args.condition_model_path, torch_dtype="bfloat16") 
+    condition_model = AutoModel.from_pretrained(args.condition_model_path, torch_dtype="bfloat16")
     condition_model.text_model.requires_grad_(False).eval().to("cuda")
     condition_model.vae_model.requires_grad_(False).eval().to("cuda")
     condition_model.vae_model.set_causal_slicing(split_size=4, memory_device="same")
@@ -172,14 +164,14 @@ def main() -> None:
         # 0. raw_data
         # 包含 prompt (image_prompt, video_promt)，image，negative_prompts（image, video）x（origin，sr）
         if "image_bytes" in raw_data:
-            raw_data["image"] = load_image_from_bytes(raw_data["image_bytes"].encode("latin-1")) 
+            raw_data["image"] = load_image_from_bytes(raw_data["image_bytes"].encode("latin-1"))
             del raw_data["image_bytes"]
 
         # 1. processed_data
         # 包含 clip_n_frames，neg_clip_n_frames，
         #     text_inputs（tokenize and attention mask），text_neg_inputs，text_sr_neg_inputs，
         #     image（image transform + stack），image_sr，image_index
-        processed_data = condition_processor.preprocess_infer(raw_data) 
+        processed_data = condition_processor.preprocess_infer(raw_data)
 
         # 2. cond_embed
         # image -> vae latent，text -> text embed
@@ -190,7 +182,7 @@ def main() -> None:
 
         # 3. processed_cond
         # 如果是训练，就 latents 进行 sample_conditions+get_condition, 如果是 infer 就 noise get_condition
-        processed_cond = condition_model.process_condition_infer(cond_embed) 
+        processed_cond = condition_model.process_condition_infer(cond_embed)
 
         # 4. dit generate，return unflatten latents
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):

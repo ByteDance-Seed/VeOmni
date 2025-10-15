@@ -1,38 +1,39 @@
 import json
 import os
 import pickle as pk
-import random
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Dict, List, Optional, Sequence, Literal
+from typing import Dict, Literal, Optional, Sequence
 
 import torch
 import torch.distributed as dist
-
 import wandb
 from einops import rearrange
 from tqdm import trange
+from veomni_patch.models.seedream.dit.modules import na
 
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_dataloader,
     build_mapping_dataset,
 )
 from veomni.data.data_collator import DataCollator
+from veomni.data.multimodal.preprocess import conv_preprocess
+from veomni.data.multimodal.video_utils import fetch_videos
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
+from veomni.dit_trainer import DiTBaseTrainer, DiTTrainerRegistry
 from veomni.models import build_foundation_model
-from veomni_patch.models.seedream.dit.modules import na
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
-from veomni.dit_trainer import DiTTrainerRegistry, DiTBaseTrainer
-from veomni.data.multimodal.preprocess import conv_preprocess
-from veomni.data.multimodal.video_utils import fetch_videos
+
+
 logger = helper.create_logger(__name__)
+
 
 @dataclass
 class MyModelArguments(ModelArguments):
@@ -45,12 +46,14 @@ class MyModelArguments(ModelArguments):
         metadata={"help": "Config for trainer."},
     )
 
+
 @dataclass
 class MyDataArguments(DataArguments):
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
     )
+
 
 @dataclass
 class MyTrainingArguments(TrainingArguments):
@@ -64,7 +67,9 @@ class MyTrainingArguments(TrainingArguments):
     )
     training_task: Literal["offline_training", "online_training", "offline_embedding"] = field(
         default="online_training",
-        metadata={"help": "Training task. Offline_training: training offline_embeded data. Online training: training raw data online. Offline_embedding: embedding raw data for offline training."},
+        metadata={
+            "help": "Training task. Offline_training: training offline_embeded data. Online training: training raw data online. Offline_embedding: embedding raw data for offline training."
+        },
     )
 
 
@@ -74,12 +79,13 @@ class Arguments:
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
+
 def process_online_example(example, processor, source_name, **kwargs):
-    prompts = example["inputs"] # TODO: maybe image in inputs
+    prompts = example["inputs"]  # TODO: maybe image in inputs
     prompts = conv_preprocess(source=source_name, conversation=prompts, **kwargs)
-    video_info = example['outputs'][0] # TODO: multi video or sth else
-    
-    if kwargs.get("use_audio_in_video", True) == True:
+    video_info = example["outputs"][0]  # TODO: multi video or sth else
+
+    if kwargs.get("use_audio_in_video", True):
         raise NotImplementedError("Audio in video is not supported yet for dit training.")
     video_inputs, _ = fetch_videos([video_info["video_bytes"].encode("latin-1")], **kwargs)
 
@@ -87,13 +93,14 @@ def process_online_example(example, processor, source_name, **kwargs):
     processed_example = processor.preprocess(prompts, video_inputs)
     return [processed_example]
 
+
 def process_offline_example(example, **kwargs):
     processed_example = {}
 
     latent = pk.loads(example["latent"])
-    latent = latent['']
-    latent = rearrange(latent, "c f h w -> f h w c") # TODO: vae输出就转好，外面不用转
-    latents, latents_shapes = na.flatten([latent]) # TODO: move this to condition_model.get_condition
+    latent = latent[""]
+    latent = rearrange(latent, "c f h w -> f h w c")  # TODO: vae输出就转好，外面不用转
+    latents, latents_shapes = na.flatten([latent])  # TODO: move this to condition_model.get_condition
     processed_example.update(
         {
             "latents": latents,  # (f h w) c
@@ -104,14 +111,15 @@ def process_offline_example(example, **kwargs):
 
     processed_emb_dict = {}
     for key in text_emb_dict:
-        text_embeds = text_emb_dict[key][0]['text_embeds']
+        text_embeds = text_emb_dict[key][0]["text_embeds"]
         text_embeds, text_shapes = na.flatten(text_embeds)
-        processed_emb_dict[f'{key}_shape'] = text_shapes
-        processed_emb_dict[f'{key}_embed'] = text_embeds
-        processed_emb_dict[f'{key}_shots'] = torch.tensor([len(text_shapes)])
-     
+        processed_emb_dict[f"{key}_shape"] = text_shapes
+        processed_emb_dict[f"{key}_embed"] = text_embeds
+        processed_emb_dict[f"{key}_shots"] = torch.tensor([len(text_shapes)])
+
     processed_example.update(processed_emb_dict)
     return [processed_example]
+
 
 @dataclass
 class DiTDataCollator(DataCollator):
@@ -206,11 +214,10 @@ def main():
     else:
         transform = partial(
             process_online_example,
-            processor = trainer.processor,
+            processor=trainer.processor,
             **args.data.mm_configs,
         )
-   
-    
+
     train_dataset = build_mapping_dataset(args.data.train_path, transform=transform, source_name=args.data.source_name)
     dataset_length = len(train_dataset) / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
@@ -230,7 +237,7 @@ def main():
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
-        drop_last=args.data.drop_last, # TODO: offline embedding 不 droplast
+        drop_last=args.data.drop_last,  # TODO: offline embedding 不 droplast
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
         collate_fn=[DiTDataCollator()],
@@ -244,7 +251,7 @@ def main():
 
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
-    
+
     # a pre_hook which calls update_gate_ema of M8 has been registered on the optimizer
     if trainer.training_task != "offline_embedding":
         model = trainer.get_model_for_training()
@@ -309,16 +316,14 @@ def main():
             logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
 
         helper.empty_cache()
-    
+
         model.train()
         logger.info(
             f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
         )
     else:
         args.train.num_train_epochs = 1
-        logger.info(
-            f"rank{args.train.local_rank} Start offline embedding, data_len: {args.train.train_steps}"
-        )
+        logger.info(f"rank{args.train.local_rank} Start offline embedding, data_len: {args.train.train_steps}")
 
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
         args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit
@@ -350,7 +355,7 @@ def main():
 
                 with model_fwd_context:
                     loss = trainer.forward(**micro_batch)
-                
+
                 if trainer.training_task != "offline_embedding":
                     loss = loss / len(micro_batches)
                     with model_bwd_context:
@@ -364,7 +369,9 @@ def main():
                 if args.train.data_parallel_mode == "fsdp1":
                     grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
                 else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.train.max_grad_norm, foreach=True
+                    )
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -397,7 +404,7 @@ def main():
 
         data_loader_tqdm.close()
         start_step = 0
-        helper.print_device_mem_info(f"VRAM usage after epoch {epoch+1}")
+        helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if trainer.training_task != "offline_embedding":
             if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
                 helper.empty_cache()
@@ -413,7 +420,6 @@ def main():
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
-    
 
     if trainer.training_task != "offline_embedding":
         torch.cuda.synchronize()
@@ -422,46 +428,48 @@ def main():
         helper.empty_cache()
         # save model in huggingface's format
         if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
-            if args.train.hf_weights_path:
-                hf_weights_path = args.train.hf_weights_path
-            else:
-                hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-            model_state_dict = ckpt_to_state_dict(
-                save_checkpoint_path=save_checkpoint_path,
-                output_dir=args.train.output_dir,
-                ckpt_manager=args.train.ckpt_manager,
-            )
-            if args.model.lora_config:
-                from peft import get_peft_model_state_dict
+            pass
+            # TODO: trainer.save_hf_weights
+            # if args.train.hf_weights_path:
+            #     hf_weights_path = args.train.hf_weights_path
+            # else:
+            #     hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+            # model_state_dict = ckpt_to_state_dict(
+            #     save_checkpoint_path=save_checkpoint_path,
+            #     output_dir=args.train.output_dir,
+            #     ckpt_manager=args.train.ckpt_manager,
+            # )
+            # if args.model.lora_config:
+            #     from peft import get_peft_model_state_dict
 
-                from veomni.models.module_utils import _save_state_dict
+            #     from veomni.models.module_utils import _save_state_dict
 
-                model_state_dict = get_peft_model_state_dict(model, model_state_dict)
-                lora_adapter_save_path = os.path.join(hf_weights_path, "adapter_model.bin")
-                os.makedirs(hf_weights_path, exist_ok=True)
-                _save_state_dict(model_state_dict, lora_adapter_save_path, safe_serialization=False)
-                model.peft_config["default"].save_pretrained(hf_weights_path)
-                logger.info_rank0(f"Lora adapter saved at {hf_weights_path} successfully!")
+            #     model_state_dict = get_peft_model_state_dict(model, model_state_dict)
+            #     lora_adapter_save_path = os.path.join(hf_weights_path, "adapter_model.bin")
+            #     os.makedirs(hf_weights_path, exist_ok=True)
+            #     _save_state_dict(model_state_dict, lora_adapter_save_path, safe_serialization=False)
+            #     model.peft_config["default"].save_pretrained(hf_weights_path)
+            #     logger.info_rank0(f"Lora adapter saved at {hf_weights_path} successfully!")
 
-                if args.model.lora_config.get("save_merge", False):
-                    from peft import PeftModel
+            #     if args.model.lora_config.get("save_merge", False):
+            #         from peft import PeftModel
 
-                    model = build_foundation_model(
-                        config_path=args.model.config_path,
-                        weights_path=args.model.model_path,
-                        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                        attn_implementation=args.model.attn_implementation,
-                        moe_implementation=args.model.moe_implementation,
-                        init_device=args.train.init_device,
-                        force_use_huggingface=args.model.force_use_huggingface,
-                    )
-                    model = PeftModel.from_pretrained(model, hf_weights_path)
-                    model = model.merge_and_unload()  # 合并 LoRA 权重到 base_model
-                    model.save_pretrained(hf_weights_path)
-                    logger.info_rank0(f"Lora merged model adapter saved at {hf_weights_path} successfully!")
-            else:
-                save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-                logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+            #         model = build_foundation_model(
+            #             config_path=args.model.config_path,
+            #             weights_path=args.model.model_path,
+            #             torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+            #             attn_implementation=args.model.attn_implementation,
+            #             moe_implementation=args.model.moe_implementation,
+            #             init_device=args.train.init_device,
+            #             force_use_huggingface=args.model.force_use_huggingface,
+            #         )
+            #         model = PeftModel.from_pretrained(model, hf_weights_path)
+            #         model = model.merge_and_unload()  # 合并 LoRA 权重到 base_model
+            #         model.save_pretrained(hf_weights_path)
+            #         logger.info_rank0(f"Lora merged model adapter saved at {hf_weights_path} successfully!")
+            # else:
+            #     save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+            #     logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

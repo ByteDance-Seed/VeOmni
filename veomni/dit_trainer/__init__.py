@@ -1,6 +1,8 @@
 from typing import Callable
-from .base_trainer import DiTBaseTrainer
+
 from .base_generator import DiTBaseGenerator
+from .base_trainer import DiTBaseTrainer
+
 
 class DiTTrainerRegistry:
     _registry = {}
@@ -25,6 +27,7 @@ class DiTTrainerRegistry:
     @classmethod
     def available_trainers(cls):
         return list(cls._registry.keys())
+
 
 DiTTrainerRegistry.register("base", DiTBaseTrainer)
 DiTTrainerRegistry.register("base_generator", DiTBaseGenerator)

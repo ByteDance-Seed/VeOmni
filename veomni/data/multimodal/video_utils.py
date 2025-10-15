@@ -129,6 +129,7 @@ def smart_resize(
     ).float()
     return video
 
+
 def resample_video_frames(video: torch.Tensor, original_fps: float, target_fps: float = 24.0):
     T, C, H, W = video.shape
     duration_sec = T / original_fps
@@ -140,7 +141,7 @@ def resample_video_frames(video: torch.Tensor, original_fps: float, target_fps: 
     new_indices = np.linspace(0, T - 1, new_T)
     new_indices_floor = np.floor(new_indices).astype(int)
     new_indices_ceil = np.ceil(new_indices).astype(int)
-    alpha = new_indices - new_indices_floor 
+    alpha = new_indices - new_indices_floor
 
     new_indices_ceil = np.clip(new_indices_ceil, 0, T - 1)
 
@@ -149,6 +150,7 @@ def resample_video_frames(video: torch.Tensor, original_fps: float, target_fps: 
     )[:, None, None, None] * video[new_indices_ceil]
 
     return video_resampled, target_fps
+
 
 def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs):
     if "http://" in video or "https://" in video:

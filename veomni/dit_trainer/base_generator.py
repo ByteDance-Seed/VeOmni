@@ -1,14 +1,16 @@
-from .base_trainer import DiTBaseTrainer
-from typing import Callable, Literal
-from transformers import AutoModel, AutoProcessor, AutoConfig
-from ..models.auto import build_processor
-from transformers.modeling_utils import init_empty_weights
+from typing import Callable
+
 import torch
+from transformers import AutoConfig, AutoModel
+
+from ..models.auto import build_processor
 from ..utils import logging
 from ..utils.model_utils import pretty_print_trainable_parameters
-from ..models import save_model_weights, save_model_assets
+from .base_trainer import DiTBaseTrainer
+
 
 logger = logging.get_logger(__name__)
+
 
 class DiTBaseGenerator(DiTBaseTrainer):
     def __init__(
@@ -36,17 +38,19 @@ class DiTBaseGenerator(DiTBaseTrainer):
         self.dit_model = build_foundation_model_func(config_path=model_path, weights_path=model_path)
 
         self.lora_config = lora_config
-        fsdp_kwargs = self.configure_lora_model()
-        
+        # TODO: lora model from pretrained
+
         self.dit_model.eval()
         pretty_print_trainable_parameters(self.dit_model)
 
     def forward(self, raw_data, num_samples_per_prompt=1):
         # only support online embedding for generation
-        processed_data = self.condition_processor.preprocess_infer(raw_data) 
+        processed_data = self.condition_processor.preprocess_infer(raw_data)
 
         with torch.no_grad():
-            condition_embed = self.condition_model.get_condition(processed_data, num_samples_per_prompt=num_samples_per_prompt)
+            condition_embed = self.condition_model.get_condition(
+                processed_data, num_samples_per_prompt=num_samples_per_prompt
+            )
             processed_cond = self.condition_model.process_condition_infer(condition_embed)
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
             latents = self.dit_model.generate(**processed_cond, cfg_scale=3.5, ada_precompute=False)

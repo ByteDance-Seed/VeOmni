@@ -1,14 +1,17 @@
 from typing import Callable, Literal
-from transformers import AutoModel, AutoProcessor, AutoConfig
-from ..models.auto import build_processor
-from transformers.modeling_utils import init_empty_weights
+
 import torch
+from transformers import AutoConfig, AutoModel
+from transformers.modeling_utils import init_empty_weights
+
+from ..models import save_model_assets, save_model_weights
+from ..models.auto import build_processor
 from ..utils import logging
 from ..utils.model_utils import pretty_print_trainable_parameters
-from ..models import save_model_weights, save_model_assets
 
 
 logger = logging.get_logger(__name__)
+
 
 class DiTBaseTrainer:
     def __init__(
@@ -24,7 +27,7 @@ class DiTBaseTrainer:
     ):
         logger.info_rank0("Prepare condition model.")
         self.training_task = training_task
-        
+
         condition_model_config = AutoConfig.from_pretrained(condition_model_path, **condition_model_cfg)
         if training_task == "offline_training":
             logger.info_rank0(f"Task: {training_task}, prepare condition model with empty weights.")
@@ -49,18 +52,16 @@ class DiTBaseTrainer:
 
             self.lora_config = lora_config
             fsdp_kwargs = self.configure_lora_model()
-            
+
             self.dit_model = build_parallelize_model_func(
-                model=self.dit_model,
-                fsdp_kwargs=fsdp_kwargs,
-                basic_modules=self.dit_model._no_split_modules
+                model=self.dit_model, fsdp_kwargs=fsdp_kwargs, basic_modules=self.dit_model._no_split_modules
             )
             self.dit_model.train()
             pretty_print_trainable_parameters(self.dit_model)
-    
+
     def get_model_for_training(self):
         return self.dit_model
-    
+
     def configure_lora_model(self):
         fsdp_kwargs = {}
         if self.lora_config is None:
@@ -87,7 +88,7 @@ class DiTBaseTrainer:
             self.lora = True
             fsdp_kwargs["use_orig_params"] = True
         return fsdp_kwargs
-        
+
     def save_model_weights(self, save_path: str):
         # TODO: ema model save
         if self.lora:
@@ -105,7 +106,6 @@ class DiTBaseTrainer:
         model_assets = [self.dit_model.config]
         save_model_assets(save_path, model_assets)
 
-    
     def forward(self, **condition_dict):
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():

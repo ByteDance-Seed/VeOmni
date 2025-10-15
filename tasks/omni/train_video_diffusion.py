@@ -15,6 +15,14 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from einops import rearrange
 from omegaconf import OmegaConf
 from tqdm import trange
+from veomni_patch.models.seedream.dit.modules import na
+from veomni_patch.models.seedream.dit.modules.config import (
+    create_sampler_from_config,
+    create_sampling_timesteps_from_config,
+    create_schedule_from_config,
+    create_training_timesteps_from_config,
+)
+from veomni_patch.models.seedream.dit.video_nadit import MultiShotNaDiT
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
@@ -26,20 +34,12 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, save_model_assets, save_model_weights
-from veomni_patch.models.seedream.dit.modules import na
-from veomni_patch.models.seedream.dit.modules.config import (
-    create_sampler_from_config,
-    create_sampling_timesteps_from_config,
-    create_schedule_from_config,
-    create_training_timesteps_from_config,
-)
-from veomni_patch.models.seedream.dit.video_nadit import MultiShotNaDiT
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
-from veomni.dit_trainer import DiTTrainerRegistry
+
 
 logger = helper.create_logger(__name__)
 tasks = ["t2v", "i2v", "v2v", "i2v_last"]
@@ -616,7 +616,7 @@ def main():
 
         data_loader_tqdm.close()
         start_step = 0
-        helper.print_device_mem_info(f"VRAM usage after epoch {epoch+1}")
+        helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
