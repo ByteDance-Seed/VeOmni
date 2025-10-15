@@ -7,7 +7,7 @@ from typing import Dict, Optional, Sequence
 
 import torch
 from tqdm import tqdm
-from veomni_patch.dit_trainer import DiTSeedanceGenerator
+from veomni.dit_trainer import DiTBaseGenerator
 
 from veomni.data.data_collator import DataCollator
 from veomni.data.multimodal.image_utils import fetch_images
@@ -130,7 +130,7 @@ def main():
         force_use_huggingface=args.model.force_use_huggingface,
     )
 
-    generator: DiTSeedanceGenerator = DiTTrainerRegistry.create(
+    generator: DiTBaseGenerator = DiTTrainerRegistry.create(
         model_path=args.model.model_path,
         build_foundation_model_func=build_foundation_model_func,
         lora_config=args.model.lora_config,

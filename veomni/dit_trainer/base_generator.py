@@ -51,12 +51,12 @@ class DiTBaseGenerator(DiTBaseTrainer):
         processed_data = self.condition_processor.preprocess_infer(raw_data)
 
         with torch.no_grad():
-            condition_embed = self.condition_model.get_condition(
+            condition_embed = self.condition_model.get_condition_infer(
                 processed_data, num_samples_per_prompt=self.num_samples_per_prompt
             )
             processed_cond = self.condition_model.process_condition_infer(condition_embed)
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
             latents = self.dit_model.generate(**processed_cond, cfg_scale=3.5, ada_precompute=False)
-        decoded_latents = self.condition_model.postprocess(latents)
+            decoded_latents = self.condition_model.postprocess(latents)
         videos = self.condition_processor.postprocess(decoded_latents)
         return videos
