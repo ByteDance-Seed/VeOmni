@@ -20,6 +20,7 @@ class DiTBaseGenerator(DiTBaseTrainer):
         condition_model_path: str = None,
         condition_model_cfg: dict = {},
         lora_config: dict = None,
+        num_samples_per_prompt: int = 1
     ):
         logger.info_rank0("Prepare condition model.")
         condition_model_config = AutoConfig.from_pretrained(condition_model_path, **condition_model_cfg)
@@ -40,16 +41,18 @@ class DiTBaseGenerator(DiTBaseTrainer):
         self.lora_config = lora_config
         # TODO: lora model from pretrained
 
+        self.num_samples_per_prompt = num_samples_per_prompt
+
         self.dit_model.eval()
         pretty_print_trainable_parameters(self.dit_model)
 
-    def forward(self, raw_data, num_samples_per_prompt=1):
+    def forward(self, raw_data):
         # only support online embedding for generation
         processed_data = self.condition_processor.preprocess_infer(raw_data)
 
         with torch.no_grad():
             condition_embed = self.condition_model.get_condition(
-                processed_data, num_samples_per_prompt=num_samples_per_prompt
+                processed_data, num_samples_per_prompt=self.num_samples_per_prompt
             )
             processed_cond = self.condition_model.process_condition_infer(condition_embed)
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):

@@ -10,7 +10,7 @@ from tqdm import tqdm
 from veomni_patch.dit_trainer import DiTSeedanceGenerator
 
 from veomni.data.data_collator import DataCollator
-from veomni.data.multimodal.image_utils import load_image_from_bytes
+from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.video_utils import save_video_tensors_to_file
 from veomni.dit_trainer import DiTTrainerRegistry
 from veomni.models import build_foundation_model
@@ -34,13 +34,8 @@ def read_raw_data(data_path: str, negative_prompts_path: str):
                 raw_data.append(
                     {
                         "prompt": data["prompt"],
-                        "image_bytes": data["image_bytes"],  # convert to image
-                        "negative_prompts": {
-                            "negative_text": negative_text,
-                            "vid_negative_text": negative_text,
-                            "sr_negative_text": negative_text,
-                            "sr_vid_negative_text": negative_text,
-                        },  # TODO: negative_text, vid_negative_text, sr_negative_text, sr_vid_negative_text 可不同
+                        "image": fetch_images([data["image_bytes"].encode("latin-1")])[0],  # convert to image
+                        "negative_prompts": negative_text
                     }
                 )
     else:
@@ -145,15 +140,7 @@ def main():
     )
 
     for i, raw_data in enumerate(tqdm(raw_data_list)):
-        # 0. raw_data
-        # 包含 prompt (image_prompt, video_promt)，image，negative_prompts（image, video）x（origin，sr）
-        if "image_bytes" in raw_data:
-            raw_data["image"] = load_image_from_bytes(raw_data["image_bytes"].encode("latin-1"))
-            del raw_data["image_bytes"]
-
-        videos = generator.forward(
-            raw_data, num_samples_per_prompt=args.model.generator_config["num_samples_per_prompt"]
-        )
+        videos = generator.forward(raw_data)
 
         os.makedirs("output", exist_ok=True)
         for j, video in enumerate(videos):
