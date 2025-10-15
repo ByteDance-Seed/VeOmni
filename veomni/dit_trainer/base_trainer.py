@@ -16,15 +16,15 @@ logger = logging.get_logger(__name__)
 
 
 class OfflineEmbeddingSaver:
-    def __init__(self, num_shard: int = 1, max_shard=1000):
+    def __init__(self, shard_num: int = 1, max_shard=1000):
         from ..distributed.parallel_state import get_parallel_state
 
         self.dp_rank = get_parallel_state().dp_rank
         dp_size = get_parallel_state().dp_size
-        if dp_size * num_shard > max_shard:
-            num_shard = max_shard // dp_size
-            logger.info_rank0(f"num_shard * dp_size must be smaller than max_shard, set num_shard = {num_shard}")
-        self.num_shard = num_shard
+        if dp_size * shard_num > max_shard:
+            shard_num = max_shard // dp_size
+            logger.info_rank0(f"shard_num * dp_size must be smaller than max_shard, set shard_num = {shard_num}")
+        self.shard_num = shard_num
         self.max_shard = max_shard
         self.index = 0
         self.buffer = []
@@ -42,7 +42,7 @@ class OfflineEmbeddingSaver:
 
         self.save_path = save_path
         self.dataset_length = dataset_length
-        self.batch_len = math.ceil(dataset_length / self.num_shard)
+        self.batch_len = math.ceil(dataset_length / self.shard_num)
 
 
 class DiTBaseTrainer:
