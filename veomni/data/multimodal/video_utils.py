@@ -135,7 +135,7 @@ def resample_video_frames(video: torch.Tensor, original_fps: float, target_fps: 
     new_T = int(duration_sec * target_fps)
 
     if new_T == T:
-        return video
+        return video, original_fps
 
     new_indices = np.linspace(0, T - 1, new_T)
     new_indices_floor = np.floor(new_indices).astype(int)
