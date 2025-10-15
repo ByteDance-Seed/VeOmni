@@ -13,7 +13,7 @@ from einops import rearrange
 from tqdm import trange
 from veomni_patch.models.seedream.dit.modules import na
 
-from veomni.checkpoint import build_checkpointer
+from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     build_dataloader,
     build_mapping_dataset,
@@ -53,6 +53,10 @@ class MyDataArguments(DataArguments):
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
     )
+    offline_embedding_save_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to save offline embeddings."},
+    )
 
 
 @dataclass
@@ -89,7 +93,6 @@ def process_online_example(example, processor, source_name, **kwargs):
         raise NotImplementedError("Audio in video is not supported yet for dit training.")
     video_inputs, _ = fetch_videos([video_info["video_bytes"].encode("latin-1")], **kwargs)
 
-    # TODO: move these to processor.preprocess
     processed_example = processor.preprocess(prompts, video_inputs)
     return [processed_example]
 
@@ -192,7 +195,7 @@ def main():
     )
 
     if args.train.training_task == "offline_embedding":
-        # assert args.train.micro_batch_size == 1, "Micro batch size must be 1 for offline embedding."
+        assert args.train.micro_batch_size == 1, "Micro batch size must be 1 for offline embedding."
         assert args.train.ulysses_parallel_size == 1, "Ulysses parallel size must be 1 for offline embedding."
 
     trainer: DiTBaseTrainer = DiTTrainerRegistry.create(
@@ -221,6 +224,20 @@ def main():
     train_dataset = build_mapping_dataset(args.data.train_path, transform=transform, source_name=args.data.source_name)
     dataset_length = len(train_dataset) / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+
+    if trainer.training_task == "offline_embedding":
+        assert args.train.micro_batch_size == 1, "Micro batch size must be 1 for offline embedding."
+        assert args.train.ulysses_parallel_size == 1, "Ulysses parallel size must be 1 for offline embedding."
+
+        if args.data.offline_embedding_save_dir is None:
+            offline_embedding_save_dir = f"{args.train.output_dir}_offline"
+        else:
+            offline_embedding_save_dir = args.data.offline_embedding_save_dir
+
+        trainer.offline_embedding_saver.lazy_init(
+            save_path=offline_embedding_save_dir,
+            dataset_length=dataset_length,
+        )
 
     train_dataloader = build_dataloader(
         dataset=train_dataset,
@@ -433,46 +450,16 @@ def main():
         if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
             pass
             # TODO: trainer.save_hf_weights
-            # if args.train.hf_weights_path:
-            #     hf_weights_path = args.train.hf_weights_path
-            # else:
-            #     hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-            # model_state_dict = ckpt_to_state_dict(
-            #     save_checkpoint_path=save_checkpoint_path,
-            #     output_dir=args.train.output_dir,
-            #     ckpt_manager=args.train.ckpt_manager,
-            # )
-            # if args.model.lora_config:
-            #     from peft import get_peft_model_state_dict
-
-            #     from veomni.models.module_utils import _save_state_dict
-
-            #     model_state_dict = get_peft_model_state_dict(model, model_state_dict)
-            #     lora_adapter_save_path = os.path.join(hf_weights_path, "adapter_model.bin")
-            #     os.makedirs(hf_weights_path, exist_ok=True)
-            #     _save_state_dict(model_state_dict, lora_adapter_save_path, safe_serialization=False)
-            #     model.peft_config["default"].save_pretrained(hf_weights_path)
-            #     logger.info_rank0(f"Lora adapter saved at {hf_weights_path} successfully!")
-
-            #     if args.model.lora_config.get("save_merge", False):
-            #         from peft import PeftModel
-
-            #         model = build_foundation_model(
-            #             config_path=args.model.config_path,
-            #             weights_path=args.model.model_path,
-            #             torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-            #             attn_implementation=args.model.attn_implementation,
-            #             moe_implementation=args.model.moe_implementation,
-            #             init_device=args.train.init_device,
-            #             force_use_huggingface=args.model.force_use_huggingface,
-            #         )
-            #         model = PeftModel.from_pretrained(model, hf_weights_path)
-            #         model = model.merge_and_unload()  # 合并 LoRA 权重到 base_model
-            #         model.save_pretrained(hf_weights_path)
-            #         logger.info_rank0(f"Lora merged model adapter saved at {hf_weights_path} successfully!")
-            # else:
-            #     save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-            #     logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+            if args.train.hf_weights_path:
+                hf_weights_path = args.train.hf_weights_path
+            else:
+                hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+            model_state_dict = ckpt_to_state_dict(
+                save_checkpoint_path=save_checkpoint_path,
+                output_dir=args.train.output_dir,
+                ckpt_manager=args.train.ckpt_manager,
+            )
+            trainer.save_hf_model_weights(model_state_dict, hf_weights_path)
 
     dist.barrier()
     dist.destroy_process_group()

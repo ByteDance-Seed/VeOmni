@@ -20,7 +20,7 @@ class DiTBaseGenerator(DiTBaseTrainer):
         condition_model_path: str = None,
         condition_model_cfg: dict = {},
         lora_config: dict = None,
-        num_samples_per_prompt: int = 1
+        num_samples_per_prompt: int = 1,
     ):
         logger.info_rank0("Prepare condition model.")
         condition_model_config = AutoConfig.from_pretrained(condition_model_path, **condition_model_cfg)
