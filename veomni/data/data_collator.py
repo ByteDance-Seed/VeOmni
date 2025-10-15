@@ -22,10 +22,42 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data._utils.collate import default_collate
+from transformers.modeling_flash_attention_utils import prepare_fa_kwargs_from_position_ids
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils.seqlen_pos_transform_utils import len2culen, pos2culen
 from .constants import IGNORE_INDEX
+
+
+def add_flash_attention_kwargs_from_position_ids(
+    batch: Dict[str, "torch.Tensor"],
+) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """
+    Calculate and add Flash Attention kwargs (cu_seq_lens and max_length) from position_ids.
+
+    Pass down already computed cu_seq_lens and max_length as the HF transformers
+    FlashAttentionKwargs naming so that it can be used without recomputation every layer.
+    HF model code would handle the pass down of those kwargs for us.
+    Note that the recomputation would cause host->device sync which hurts performance and
+    stability due to CPU instability.
+
+    Args:
+        batch: The batch dictionary containing position_ids. Will be modified in-place to add
+               cu_seq_lens_q, cu_seq_lens_k, max_length_q, and max_length_k.
+
+    Returns:
+        Tuple of (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k) for additional use.
+    """
+    (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+        batch["position_ids"]
+    )
+
+    batch["cu_seq_lens_q"] = cu_seq_lens_q
+    batch["cu_seq_lens_k"] = cu_seq_lens_k
+    batch["max_length_q"] = max_length_q
+    batch["max_length_k"] = max_length_k
+
+    return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 
 
 @dataclass
@@ -138,22 +170,17 @@ class DataCollatorWithPositionIDs(DataCollator):
                 [torch.arange(len(feature["input_ids"])) for feature in features]
             ).unsqueeze(0)
 
-        cu_seqlens = pos2culen(batch["position_ids"])
-
-        # Pass down already computed cu_seq_lens and max_length as the HF transformers
-        # FlashAttentionKwargs naming so that it can be used without recomputation every layer.
-        # HF model code would handle the pass down of those kwargs for us.
-        # Note that the recomputation would cause host->device sync which hurts performance and
-        # stability due to CPU instability.
-
-        # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
-        # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding.
+        # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
         if not get_parallel_state().sp_enabled:
-            batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seqlens
-            batch["max_length_q"] = batch["max_length_k"] = cu_seqlens.diff().max().item()
+            # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
+            # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
+            cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
+        else:
+            # Still need cu_seq_lens_q for label masking even when sp_enabled
+            (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
 
         if "labels" in batch:
-            batch["labels"][:, cu_seqlens[1:-1]] = IGNORE_INDEX
+            batch["labels"][:, cu_seq_lens_q[1:-1]] = IGNORE_INDEX
 
         return batch
 
@@ -300,15 +327,7 @@ class TextSequenceShardCollator(DataCollator):
         batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
         batch["labels"] = self.sp_slice(labels, dim=-1)
 
-        # Calculate cu_seqlens using the after padding's position_ids
-        cu_seqlens = pos2culen(batch["position_ids"])
-
-        # Pass down already computed cu_seq_lens and max_length as the HF transformers
-        # FlashAttentionKwargs naming so that it can be used without recomputation every layer.
-        # HF model code would handle the pass down of those kwargs for us.
-        # Note that the recomputation would cause host->device sync which hurts performance and
-        # stability due to CPU instability.
-        batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seqlens
-        batch["max_length_q"] = batch["max_length_k"] = cu_seqlens.diff().max().item()
+        # Calculate these info from position_ids here when SP_enable to use padded position_ids
+        add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch
