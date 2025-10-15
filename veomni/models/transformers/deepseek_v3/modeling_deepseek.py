@@ -47,19 +47,13 @@ from transformers.utils import (
     TransformersKwargs,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
     logging,
     replace_return_docstrings,
 )
 
 from ....ops import fused_moe_forward
-from .configuration_deepseek import DeepseekV3Config
-
-
-if is_flash_attn_2_available():
-    pass
-
 from ....utils.import_utils import is_liger_kernel_available
+from .configuration_deepseek import DeepseekV3Config
 
 
 if is_liger_kernel_available():

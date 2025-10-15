@@ -1,4 +1,7 @@
 """
+This script trims hidden layer number for a given safetensor dir
+so that we can test weight loading against large models like deepseek conveniently
+
 Example usage:
 python scripts/trim_safetensor_layers.py \
   --model_dir /mnt/hdfs/tianle.zhong/models/unsloth-deepseek-v3.1-bf16-merged \
