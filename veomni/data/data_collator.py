@@ -22,10 +22,9 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data._utils.collate import default_collate
-from transformers.modeling_flash_attention_utils import prepare_fa_kwargs_from_position_ids
 
 from ..distributed.parallel_state import get_parallel_state
-from ..utils.seqlen_pos_transform_utils import len2culen, pos2culen
+from ..utils.seqlen_pos_transform_utils import len2culen, pos2culen, prepare_fa_kwargs_from_position_ids
 from .constants import IGNORE_INDEX
 
 
