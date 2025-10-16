@@ -1,14 +1,15 @@
+import io
 import math
-from io import BytesIO
-from typing import ByteString, Dict, List, Union
+from typing import ByteString, Dict, List, Literal, Union
 
 import av
 import librosa
 import numpy as np
 import PIL
 import torch
+import torchaudio
 import torchvision
-from torchvision.io.video import _read_from_stream
+from decord import VideoReader, cpu
 from torchvision.transforms import InterpolationMode, functional
 
 from ...utils import logging
@@ -47,6 +48,7 @@ def smart_video_nframes(
     frame_factor: int = None,
     min_frames: int = None,
     max_frames: int = None,
+    video_frame_sample_func: Literal["interpolate", "nearest"] = "nearest",
     **kwargs,
 ) -> torch.Tensor:
     total_frames = video.shape[0]
@@ -67,14 +69,24 @@ def smart_video_nframes(
         nframes = math.floor(nframes / frame_factor) * frame_factor
         nframes = max(nframes, frame_factor)
 
-    if nframes > total_frames:
-        pad_count = nframes - total_frames
-        last_frame = video[-1:].expand(pad_count, -1, -1, -1)  # shape: (pad_count, C, H, W)
-        video = torch.cat([video, last_frame], dim=0)
-        total_frames = video.shape[0]
+    if int(nframes) == total_frames:
+        return video
 
-    idx = torch.linspace(0, total_frames - 1, int(nframes)).round().long()
-    video = video[idx]
+    if video_frame_sample_func == "nearest":
+        if nframes > total_frames:
+            pad_count = nframes - total_frames
+            last_frame = video[-1:].expand(pad_count, -1, -1, -1)  # shape: (pad_count, C, H, W)
+            video = torch.cat([video, last_frame], dim=0)
+            total_frames = video.shape[0]
+
+        idx = torch.linspace(0, total_frames - 1, int(nframes)).round().long()
+        video = video[idx]
+    elif video_frame_sample_func == "interpolate":
+        new_indices = torch.linspace(0, total_frames - 1, int(nframes))
+        idx0 = torch.floor(new_indices).long()
+        idx1 = torch.clamp(idx0 + 1, max=total_frames - 1)
+        alpha = (new_indices - idx0).view(-1, 1, 1, 1)
+        video = torch.lerp(video[idx0], video[idx1], alpha)
     return video
 
 
@@ -89,6 +101,7 @@ def smart_resize(
     scale_factor: int = None,
     video_min_pixels: int = None,
     video_max_pixels: int = None,
+    video_max_min_size: int = None,
     max_ratio: int = None,
     **kwargs,
 ):
@@ -101,55 +114,32 @@ def smart_resize(
     if scale_factor is not None:
         h_bar = max(scale_factor, round(height / scale_factor) * scale_factor)
         w_bar = max(scale_factor, round(width / scale_factor) * scale_factor)
-    else:
-        h_bar = height
-        w_bar = width
-
-    if video_max_pixels is not None and h_bar * w_bar > video_max_pixels:
-        beta = math.sqrt((height * width) / video_max_pixels)
-        if scale_factor is not None:
-            h_bar = math.floor(height / beta / scale_factor) * scale_factor
-            w_bar = math.floor(width / beta / scale_factor) * scale_factor
-        else:
-            h_bar = math.floor(height / beta)
-            w_bar = math.floor(width / beta)
-    if video_min_pixels is not None and h_bar * w_bar < video_min_pixels:
-        beta = math.sqrt(video_min_pixels / (height * width))
-        if scale_factor is not None:
-            h_bar = math.ceil(height * beta / scale_factor) * scale_factor
-            w_bar = math.ceil(width * beta / scale_factor) * scale_factor
-        else:
-            h_bar = math.ceil(height * beta)
-            w_bar = math.ceil(width * beta)
-    video = functional.resize(
-        video,
-        [w_bar, h_bar],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).float()
+        if video_max_pixels is not None and h_bar * w_bar > video_max_pixels:
+            beta = math.sqrt((height * width) / video_max_pixels)
+            if scale_factor is not None:
+                h_bar = math.floor(height / beta / scale_factor) * scale_factor
+                w_bar = math.floor(width / beta / scale_factor) * scale_factor
+            else:
+                h_bar = math.floor(height / beta)
+                w_bar = math.floor(width / beta)
+        if video_min_pixels is not None and h_bar * w_bar < video_min_pixels:
+            beta = math.sqrt(video_min_pixels / (height * width))
+            if scale_factor is not None:
+                h_bar = math.ceil(height * beta / scale_factor) * scale_factor
+                w_bar = math.ceil(width * beta / scale_factor) * scale_factor
+            else:
+                h_bar = math.ceil(height * beta)
+                w_bar = math.ceil(width * beta)
+        video = functional.resize(
+            video,
+            [w_bar, h_bar],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ).float()
+    if video_max_min_size is not None:
+        size = min(video_max_min_size, min(width, height))
+        video = functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float()
     return video
-
-
-def resample_video_frames(video: torch.Tensor, original_fps: float, target_fps: float = 24.0):
-    T, C, H, W = video.shape
-    duration_sec = T / original_fps
-    new_T = int(duration_sec * target_fps)
-
-    if new_T == T:
-        return video, original_fps
-
-    new_indices = np.linspace(0, T - 1, new_T)
-    new_indices_floor = np.floor(new_indices).astype(int)
-    new_indices_ceil = np.ceil(new_indices).astype(int)
-    alpha = new_indices - new_indices_floor
-
-    new_indices_ceil = np.clip(new_indices_ceil, 0, T - 1)
-
-    video_resampled = (1 - torch.from_numpy(alpha)[:, None, None, None]) * video[new_indices_floor] + torch.from_numpy(
-        alpha
-    )[:, None, None, None] * video[new_indices_ceil]
-
-    return video_resampled, target_fps
 
 
 def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs):
@@ -176,37 +166,17 @@ def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs):
 
 
 def load_video_from_bytes(video: bytes, use_audio_in_video: bool = True, **kwargs):
-    container = av.open(BytesIO(video))
-    video_frames = _read_from_stream(
-        container,
-        0.0,
-        float("inf"),
-        "sec",
-        container.streams.video[0],
-        {"video": 0},
-    )
-    video_fps = container.streams.video[0].average_rate
-    vframes_list = [frame.to_rgb().to_ndarray() for frame in video_frames]
-    video = torch.as_tensor(np.stack(vframes_list)).permute(0, 3, 1, 2)  # t,c,h,w
+    video_bytes = io.BytesIO(video)
+    vr = VideoReader(video_bytes, ctx=cpu(0))
+    video_fps = vr.get_avg_fps()
+    frames = vr.get_batch(list(range(len(vr)))).asnumpy()  # [T, H, W, 3]
+    video = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous()  # [T, C, H, W]
 
     audio, audio_fps = None, None
-    if use_audio_in_video and len(container.streams.audio) > 0:
-        audio_frames = _read_from_stream(
-            container,
-            0.0,
-            float("inf"),
-            "sec",
-            container.streams.audio[0],
-            {"audio": 0},
-        )
-
-        aframes_list = [frame.to_ndarray() for frame in audio_frames]
-
-        if len(aframes_list) > 0:
-            aframes = np.concatenate(aframes_list, 1)
-            aframes = np.mean(aframes, axis=0)
-            audio_fps = container.streams.audio[0].rate
-            audio = aframes
+    if use_audio_in_video:
+        audio, audio_fps = torchaudio.load(video_bytes)
+        if audio.size(0) > 1:
+            audio = audio.mean(0, keepdim=True)  # 转单声道
 
     return video, video_fps, audio, audio_fps
 
@@ -224,7 +194,6 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
     video_inputs, video_fps_list, audio_inputs, audio_fps_list = [], [], [], []
     for video in videos:
         video, video_fps, audio, audio_fps = load_video(video, **kwargs)
-        video, video_fps = resample_video_frames(video, original_fps=video_fps, target_fps=kwargs["target_fps"])
         video_inputs.append(video)
         video_fps_list.append(video_fps)
         audio_inputs.append(audio)

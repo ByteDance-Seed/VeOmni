@@ -213,6 +213,7 @@ def main():
     logger.info_rank0("Prepare data")
 
     if trainer.training_task == "offline_training":
+        # TODO: do not drop last
         transform = process_offline_example
     else:
         transform = partial(
@@ -230,7 +231,7 @@ def main():
         assert args.train.ulysses_parallel_size == 1, "Ulysses parallel size must be 1 for offline embedding."
 
         if args.data.offline_embedding_save_dir is None:
-            offline_embedding_save_dir = f"{args.train.output_dir}_offline"
+            offline_embedding_save_dir = f"{args.data.train_path}_offline"
         else:
             offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
@@ -339,6 +340,7 @@ def main():
         )
     else:
         args.train.num_train_epochs = 1
+        # TODO: refine this log
         logger.info(f"rank{args.train.local_rank} Start offline embedding, data_len: {args.train.train_steps}")
 
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -456,7 +458,8 @@ def main():
                 ckpt_manager=args.train.ckpt_manager,
             )
             trainer.save_hf_model_weights(model_state_dict, hf_weights_path)
-
+    else:
+        trainer.offline_embedding_saver.save_last()
     dist.barrier()
     dist.destroy_process_group()
 

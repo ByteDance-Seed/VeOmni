@@ -37,6 +37,13 @@ class OfflineEmbeddingSaver:
             self.buffer = []
             self.index += 1
 
+    def save_last(self):
+        if len(self.buffer) > 0:
+            ds = Dataset.from_list(self.buffer)
+            ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
+            self.buffer = []
+            self.index += 1
+
     def lazy_init(self, save_path: str = None, dataset_length: int = 0):
         import math
 
