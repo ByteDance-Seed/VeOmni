@@ -19,7 +19,6 @@ class DiTBaseGenerator(DiTBaseTrainer):
         build_foundation_model_func: Callable,
         condition_model_path: str = None,
         condition_model_cfg: dict = {},
-        lora_config: dict = None,
         num_samples_per_prompt: int = 1,
     ):
         logger.info_rank0("Prepare condition model.")
@@ -29,14 +28,11 @@ class DiTBaseGenerator(DiTBaseTrainer):
             condition_model_path,
             torch_dtype=torch.bfloat16,
             config=condition_model_config,
-        )
+        ).cuda()
         self.condition_processor = build_processor(condition_model_path)
 
         logger.info_rank0("Prepare dit model.")
         self.dit_model = build_foundation_model_func(config_path=model_path, weights_path=model_path)
-
-        self.lora_config = lora_config
-        # TODO: lora model from pretrained
 
         self.num_samples_per_prompt = num_samples_per_prompt
 

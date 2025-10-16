@@ -91,7 +91,8 @@ class DiTBaseTrainer:
                 condition_model_path,
                 torch_dtype=torch.bfloat16,
                 config=condition_model_config,
-            ).cuda()
+            )
+            self.condition_model.cuda()
         self.processor = build_processor(condition_model_path)
 
         if training_task == "offline_training" or training_task == "online_training":
