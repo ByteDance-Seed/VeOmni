@@ -9,9 +9,7 @@ from typing import Dict, Literal, Optional, Sequence
 import torch
 import torch.distributed as dist
 import wandb
-from einops import rearrange
 from tqdm import trange
-from veomni_patch.models.seedream.dit.modules import na
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
@@ -98,30 +96,8 @@ def process_online_example(example, processor, source_name, **kwargs):
 
 
 def process_offline_example(example, **kwargs):
-    processed_example = {}
-
-    latent = pk.loads(example["latent"])
-    latent = latent[""]
-    latent = rearrange(latent, "c f h w -> f h w c")  # TODO: vae输出就转好，外面不用转
-    latents, latents_shapes = na.flatten([latent])  # TODO: move this to condition_model.get_condition
-    processed_example.update(
-        {
-            "latents": latents,  # (f h w) c
-            "latents_shapes": latents_shapes,  # 1, 3
-        }
-    )
-    text_emb_dict = pk.loads(example["text_emb"])
-
-    processed_emb_dict = {}
-    for key in text_emb_dict:
-        text_embeds = text_emb_dict[key][0]["text_embeds"]
-        text_embeds, text_shapes = na.flatten(text_embeds)
-        processed_emb_dict[f"{key}_shape"] = text_shapes
-        processed_emb_dict[f"{key}_embed"] = text_embeds
-        processed_emb_dict[f"{key}_shots"] = torch.tensor([len(text_shapes)])
-
-    processed_example.update(processed_emb_dict)
-    return [processed_example]
+    example = {key: pk.loads(value) for key, value in example.items()}
+    return [example]
 
 
 @dataclass

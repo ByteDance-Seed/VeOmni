@@ -1,5 +1,6 @@
 import os
-from typing import Callable, Literal
+import pickle as pk
+from typing import Callable, Dict, Literal
 
 import torch
 from datasets import Dataset
@@ -29,8 +30,15 @@ class OfflineEmbeddingSaver:
         self.index = 0
         self.buffer = []
 
+    def to_save_bytes(self, save_item: Dict[str, torch.Tensor]):
+        converted_dict = {}
+        for key in list(save_item.keys()):
+            converted_dict[key] = pk.dumps(save_item[key].cpu())
+            del save_item[key]
+        return converted_dict
+
     def save(self, save_item):
-        self.buffer.append(save_item)
+        self.buffer.append(self.to_save_bytes(save_item))
         if len(self.buffer) >= self.batch_len:
             ds = Dataset.from_list(self.buffer)
             ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
@@ -83,7 +91,7 @@ class DiTBaseTrainer:
                 condition_model_path,
                 torch_dtype=torch.bfloat16,
                 config=condition_model_config,
-            )
+            ).cuda()
         self.processor = build_processor(condition_model_path)
 
         if training_task == "offline_training" or training_task == "online_training":
@@ -187,7 +195,7 @@ class DiTBaseTrainer:
                 condition_dict = self.condition_model.get_condition(**condition_dict)
         if self.training_task == "offline_embedding":
             self.offline_embedding_saver.save(condition_dict)
-            return condition_dict
+            return None
         with torch.no_grad():
             condition_dict = self.condition_model.process_condition(**condition_dict)
         output = self.dit_model(**condition_dict)
