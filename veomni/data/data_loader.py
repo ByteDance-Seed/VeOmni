@@ -70,6 +70,7 @@ def build_dataloader(
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
+    shuffle: bool = True,
     seed: int = 0,
 ) -> "DistributedDataloader":
     parallel_state = get_parallel_state()
@@ -122,7 +123,7 @@ def build_dataloader(
             dataset,
             num_replicas=parallel_state.dp_size,
             rank=parallel_state.dp_rank,
-            shuffle=True,
+            shuffle=shuffle,
             seed=seed,
         )
 

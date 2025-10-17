@@ -37,8 +37,13 @@ class OfflineEmbeddingSaver:
             del save_item[key]
         return converted_dict
 
+    def _append_item(self, save_item: Dict[str, torch.Tensor]):
+        if self.rest_len > 0:  # 多余的dummy data buffer 不保存
+            self.buffer.append(self.to_save_bytes(save_item))
+            self.rest_len -= 1
+
     def save(self, save_item):
-        self.buffer.append(self.to_save_bytes(save_item))
+        self._append_item(save_item)
         if len(self.buffer) >= self.batch_len:
             ds = Dataset.from_list(self.buffer)
             ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
@@ -58,6 +63,8 @@ class OfflineEmbeddingSaver:
         self.save_path = save_path
         self.dataset_length = dataset_length
         self.batch_len = math.ceil(dataset_length / self.shard_num)
+        logger.info(f"Rank [{self.dp_rank}] save to [{self.save_path}] each batch_len [{self.batch_len}].")
+        self.rest_len = self.dataset_length
 
 
 class DiTBaseTrainer:

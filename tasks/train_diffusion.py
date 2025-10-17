@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import pickle as pk
 from collections import defaultdict
@@ -55,6 +56,10 @@ class MyDataArguments(DataArguments):
         default=None,
         metadata={"help": "Path to save offline embeddings."},
     )
+    shuffle: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to shuffle the dataset."},
+    )
 
 
 @dataclass
@@ -96,8 +101,8 @@ def process_online_example(example, processor, source_name, **kwargs):
 
 
 def process_offline_example(example, **kwargs):
-    example = {key: pk.loads(value) for key, value in example.items()}
-    return [example]
+    processed_example = {key: pk.loads(value) for key, value in example.items()}
+    return [processed_example]
 
 
 @dataclass
@@ -198,8 +203,22 @@ def main():
             **args.data.mm_configs,
         )
 
+    if trainer.training_task == "offline_embedding":
+        drop_last = False
+        shuffle = False
+        logger.info_rank0(f"Task offline_embedding. Drop last: {drop_last}, shuffle: {shuffle}")
+    else:
+        drop_last = args.data.drop_last
+        shuffle = args.data.shuffle
+
     train_dataset = build_mapping_dataset(args.data.train_path, transform=transform, source_name=args.data.source_name)
-    dataset_length = len(train_dataset) / args.train.data_parallel_size
+    if not drop_last:
+        dataset_length = (
+            math.ceil(len(train_dataset) / (args.train.dataloader_batch_size * args.train.data_parallel_size))
+            * args.train.dataloader_batch_size
+        )
+    else:
+        dataset_length = len(train_dataset) / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
     if trainer.training_task == "offline_embedding":
@@ -211,9 +230,22 @@ def main():
         else:
             offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
+        assert not drop_last
+        assert not shuffle
+
+        base = len(train_dataset) / args.train.data_parallel_size
+        extra = len(train_dataset) % args.train.data_parallel_size
+        extra_for_rank = max(0, min(1, extra - args.train.local_rank))  # unshuffled distributed sampler
+        valid_data_length = base + extra_for_rank
+        logger.info(f"Rank {args.train.global_rank} data length to save: {valid_data_length}")
         trainer.offline_embedding_saver.lazy_init(
             save_path=offline_embedding_save_dir,
-            dataset_length=dataset_length,
+            dataset_length=valid_data_length,
+        )
+
+        # pad dataset_len
+        train_dataset.data_len = (
+            math.ceil(train_dataset.data_len / (args.train.global_batch_size)) * args.train.global_batch_size
         )
 
     train_dataloader = build_dataloader(
@@ -231,12 +263,12 @@ def main():
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
-        drop_last=args.data.drop_last,  # TODO: offline embedding 不 droplast
+        drop_last=drop_last,  # TODO: offline embedding 不 droplast
+        shuffle=shuffle,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
         collate_fn=[DiTDataCollator()],
     )
-
     if args.train.save_initial_model:
         if args.train.global_rank == 0:
             trainer.save_model_weights(args.train.output_dir)
@@ -316,8 +348,9 @@ def main():
         )
     else:
         args.train.num_train_epochs = 1
-        # TODO: refine this log
-        logger.info(f"rank{args.train.local_rank} Start offline embedding, data_len: {args.train.train_steps}")
+        logger.info(
+            f"rank{args.train.local_rank} Start offline embedding, steps with dummy data: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
+        )
 
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
         args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit
@@ -334,9 +367,15 @@ def main():
             initial=start_step,
             disable=args.train.local_rank != 0,
         )
-        for step, micro_batches in enumerate(train_dataloader):
+        data_iterator = iter(train_dataloader)
+        for _ in range(start_step, args.train.train_steps):
             global_step += 1
 
+            try:
+                micro_batches = next(data_iterator)
+            except StopIteration:
+                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                break
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
