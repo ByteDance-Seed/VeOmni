@@ -19,8 +19,9 @@ import torch.distributed as dist
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, async_op):
         ctx.group = group
+        ctx.async_op = async_op
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
 
@@ -35,24 +36,31 @@ class _AllToAll(torch.autograd.Function):
             output = torch.empty_like(input)
         else:
             output = torch.empty(size=(sum(output_split_sizes), input.size(1)), dtype=input.dtype, device=input.device)
-        dist.all_to_all_single(
+        ret = dist.all_to_all_single(
             output,
             input,
             output_split_sizes=output_split_sizes,
             input_split_sizes=input_split_sizes,
             group=group,
+            async_op=async_op,
         )
-        return output
+        if async_op:
+            return output, ret
+        else:
+            return output
 
     @staticmethod
     def backward(ctx, *grad_output):
         return (
             None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
+            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes, ctx.async_op),
             None,
             None,
         )
 
 
 def all_to_all(group, input, output_split_size=None, input_split_size=None):
-    return _AllToAll.apply(group, input, output_split_size, input_split_size)
+    return _AllToAll.apply(group, input, output_split_size, input_split_size, False)
+
+def all_to_all_async(group, input, output_split_size=None, input_split_size=None):
+    return _AllToAll.apply(group, input, output_split_size, input_split_size, True)
