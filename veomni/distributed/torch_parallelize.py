@@ -27,7 +27,7 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
-from ..models import load_model_weights, rank0_load_and_broadcast_weights
+from ..models import load_model_weights, rank0_load_and_broadcast_weights, load_model_weights_from_shard_state
 from ..utils import logging
 from ..utils.device import get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
@@ -77,7 +77,6 @@ def parallelize_model_fsdp1(
     basic_modules: Optional[List[str]] = None,
     fsdp_no_shard_states=None,
     fsdp_no_shard_states_fqn=None,
-    ep_param_suffix=None,
     fqn2spec_info=None,
     **kwargs,
 ) -> "nn.Module":
@@ -380,19 +379,25 @@ def parallelize_model_fsdp2(
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
 
-    if weights_path is None:
-        model.to_empty(device="cuda")
-        model.init_weights()
-    else:
-        from torch.distributed.tensor import distribute_tensor
-
+    if kwargs.get("shard_states"):
+        logger.info_rank0("starting to load model weights from shard_states...")
+        load_model_weights_from_shard_state(
+            model,
+            shard_state=kwargs.get("shard_states"),
+            init_device=get_device_type(),
+        )
+    elif weights_path:
         logger.info_rank0("starting to load model weights...")
         if kwargs.get("broadcast_model_weights_from_rank0"):
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            rank0_load_and_broadcast_weights(model, weights_path, get_device_type())
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            load_model_weights(model, weights_path, get_device_type())
+    else:
+        logger.info_rank0("starting to init model weights...")
+        model.to_empty(device="cuda")
+        model.init_weights()
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn

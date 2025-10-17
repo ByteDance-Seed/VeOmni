@@ -18,6 +18,7 @@ from .module_utils import (
     init_empty_weights,
     load_model_weights,
     rank0_load_and_broadcast_weights,
+    load_model_weights_from_shard_state,
     save_model_assets,
     save_model_weights,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "init_empty_weights",
     "load_model_weights",
     "rank0_load_and_broadcast_weights",
+    "load_model_weights_from_shard_state",
     "save_model_assets",
     "save_model_weights",
     "transformers",

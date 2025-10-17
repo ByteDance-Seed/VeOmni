@@ -172,7 +172,6 @@ def _dispatch_parameter(
     module: "nn.Module",
     name: str,
     tensor: "torch.Tensor",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     parallel_plan: Optional["ParallelPlan"] = None,
 ) -> None:
     """
@@ -190,12 +189,13 @@ def _dispatch_parameter(
 
     tensor = tensor.to(orig_tensor)
     if hasattr(orig_tensor, "device_mesh"):  # dtensor
+        from torch.distributed.tensor import distribute_tensor
         if orig_tensor.device.type == "cpu":
             raise ValueError("Cannot load dtensor on CPU.")
 
         device_mesh = getattr(orig_tensor, "device_mesh")
         placements = getattr(orig_tensor, "placements")
-        module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+        module._parameters[local_name].data.copy_(distribute_tensor(tensor, device_mesh, placements, src_data_rank=None))
     else:  # not dtensor
         module._parameters[local_name].data.copy_(tensor)
 
@@ -204,7 +204,6 @@ def _dispatch_buffer(
     module: "nn.Module",
     name: str,
     buffer: "torch.Tensor",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
 ) -> None:
     """
     Assigns buffer to an empty model.
@@ -213,12 +212,11 @@ def _dispatch_buffer(
     orig_tensor = module._buffers[name]
 
     if hasattr(orig_tensor, "device_mesh"):  # dtensor buffer
-        if dtensor_factory is None:
-            raise ValueError("dtensor buffer requires a dtensor_factory.")
+        from torch.distributed.tensor import distribute_tensor
 
         device_mesh = getattr(orig_tensor, "device_mesh")
         placements = getattr(orig_tensor, "placements")
-        module._buffers[name] = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        module._buffers[name] = distribute_tensor(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements, src_data_rank=None)
     else:
         module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
 
@@ -271,11 +269,65 @@ def _convert_weight_key(key: str, model: "PreTrainedModel") -> str:
 
 
 @torch.no_grad()
+def load_model_weights_from_shard_state(
+    model: Union["nn.Module", "PreTrainedModel"],
+    shard_state: Dict[str, Union[torch.Tensor, int]],
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+) -> None:
+    buffer_keys = {name for name, _ in model.named_buffers()}
+    parameter_keys = {name for name, _ in model.named_parameters()}
+    model.to_empty(device=init_device)
+
+    # Get parallel plan if available
+    parallel_plan = None
+    if hasattr(model, "get_parallel_plan"):
+        parallel_plan = model.get_parallel_plan()
+
+    global_rank = get_parallel_state().global_rank
+    torch_device = torch.device(init_device)
+    unexcepted_keys = []
+    for key, value in shard_state.items():
+        key = _convert_weight_key(key, model)
+        if isinstance(value, torch.Tensor):
+            tensor = value.to(torch_device)
+            src_rank = global_rank
+            metadata = [(tensor.shape, tensor.dtype)]
+            dist.broadcast_object_list(metadata, src=src_rank)
+        else:
+            assert isinstance(value, int), f"Invalid value type: {type(value)}, value: {value}"
+            src_rank = value
+            metadata = [(None, None)]
+            dist.broadcast_object_list(metadata, src=src_rank)
+            shape, dtype = metadata[0]
+            tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+
+        dist.broadcast(tensor, src=src_rank)
+
+        if key in parameter_keys:
+            parameter_keys.remove(key)
+            _dispatch_parameter(model, key, tensor, parallel_plan)
+        elif key in buffer_keys:
+            buffer_keys.remove(key)
+            _dispatch_buffer(model, key, tensor)
+        else:
+            unexcepted_keys.append(key)
+
+    missing_keys = parameter_keys | buffer_keys
+    if missing_keys:
+        logger.warning_rank0(f"Find missing key(s) in state dict: {missing_keys}, initialize them.")
+        # init parameter only
+        for name in parameter_keys:
+            _init_parameter(model, name)
+
+    if unexcepted_keys:
+        logger.warning_rank0(f"Find unexcepted key(s) in state dict: {unexcepted_keys}, initialize them.")
+
+
+@torch.no_grad()
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
 ) -> None:
     """
     Loads pre-trained model states in transformers' format.
@@ -302,14 +354,14 @@ def load_model_weights(
                 buffer_dict[name] = tensor.clone()
             elif name in parameter_names_to_load:
                 parameter_names_to_load.remove(name)
-                _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+                _dispatch_parameter(model, name, tensor, parallel_plan)
             else:
                 logger.info_rank0(f"Unexpected key in state dict: {name}.")
 
         del state_dict_iterator
         empty_cache()
 
-    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
+    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load)
 
 
 @torch.no_grad()
@@ -317,7 +369,6 @@ def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
 ):
     """
     This functions serves as the same purpose as `load_model_weights`
@@ -326,7 +377,7 @@ def rank0_load_and_broadcast_weights(
     """
     if not dist.is_available() or not dist.is_initialized():
         logger.warning_once("Distributed environment not initialized, falling back to load_model_weights.")
-        return load_model_weights(model, weights_path, init_device, dtensor_factory)
+        return load_model_weights(model, weights_path, init_device)
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
@@ -415,7 +466,7 @@ def rank0_load_and_broadcast_weights(
                 buffer_dict[name] = tensor.detach().clone()
             elif name in parameter_names_to_load:
                 parameter_names_to_load.discard(name)
-                _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+                _dispatch_parameter(model, name, tensor, parallel_plan)
             else:
                 if global_rank == 0:
                     logger.info_rank0(f"Unexpected key in state dict: {name}.")
@@ -427,14 +478,13 @@ def rank0_load_and_broadcast_weights(
 
         empty_cache()
 
-    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
+    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load)
 
 
 def post_process_after_weight_loading(
     model: Union["nn.Module", "PreTrainedModel"],
     buffer_dict,
     parameter_names_left: Optional[set[str]] = None,
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
 ):
     """
     shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights.
@@ -442,7 +492,7 @@ def post_process_after_weight_loading(
     parameter_names_left = parameter_names_left or set()
 
     for name, buffer in buffer_dict.items():
-        _dispatch_buffer(model, name, buffer, dtensor_factory)
+        _dispatch_buffer(model, name, buffer)
 
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")

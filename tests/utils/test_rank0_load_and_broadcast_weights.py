@@ -140,13 +140,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
             broadcast_model_weights_from_rank0=True,
         )
 
-        dtensor_factory = distribute_tensor if distribute_tensor is not None else None
-        if dtensor_factory is None:
-            raise RuntimeError("torch.distributed.tensor.distribute_tensor is required for fsdp2 weight loading test")
-
-        rank0_load_and_broadcast_weights(
-            fsdp_model, str(weights_path), init_device="cuda", dtensor_factory=dtensor_factory
-        )
+        rank0_load_and_broadcast_weights(fsdp_model, str(weights_path), init_device="cuda")
 
         reference_model = TinyModel().cuda()
         load_model_weights(reference_model, str(weights_path), init_device="cuda")
