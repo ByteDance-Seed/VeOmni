@@ -1,3 +1,4 @@
+import contextlib
 from typing import Callable
 
 import torch
@@ -11,6 +12,9 @@ from .base_trainer import DiTBaseTrainer
 
 logger = logging.get_logger(__name__)
 
+@contextlib.contextmanager
+def null_inference_context(model, scale: float):
+    yield
 
 class DiTBaseGenerator(DiTBaseTrainer):
     def __init__(
@@ -29,14 +33,11 @@ class DiTBaseGenerator(DiTBaseTrainer):
             condition_model_path,
             torch_dtype=torch.bfloat16,
             config=condition_model_config,
-        )
+        ).cuda()
         self.condition_processor = build_processor(condition_model_path)
 
         logger.info_rank0("Prepare dit model.")
         self.dit_model = build_foundation_model_func(config_path=model_path, weights_path=model_path)
-
-        self.lora_config = lora_config
-        # TODO: lora model from pretrained
 
         self.num_samples_per_prompt = num_samples_per_prompt
 
