@@ -9,7 +9,7 @@ import torch
 from tqdm import tqdm
 
 from veomni.data.data_collator import DataCollator
-from veomni.data.multimodal.image_utils import fetch_images
+from veomni.data.multimodal.image_utils import fetch_images, load_image_bytes_from_path
 from veomni.data.multimodal.video_utils import save_video_tensors_to_file
 from veomni.dit_trainer import DiTBaseGenerator, DiTTrainerRegistry
 from veomni.models import build_foundation_model
@@ -34,6 +34,17 @@ def read_raw_data(data_path: str, negative_prompts_path: str):
                     {
                         "prompt": data["prompt"],
                         "image": fetch_images([data["image_bytes"].encode("latin-1")])[0],  # convert to image
+                        "negative_prompts": negative_text,
+                    }
+                )
+    elif data_path.endswith(".json"):
+        with open(data_path, encoding="utf-8") as f:
+            data = json.load(f)
+            for item in data:
+                raw_data.append(
+                    {
+                        "prompt": [item["user_prompt"]],
+                        "image": fetch_images([item["image_file"]])[0],  # convert to image
                         "negative_prompts": negative_text,
                     }
                 )

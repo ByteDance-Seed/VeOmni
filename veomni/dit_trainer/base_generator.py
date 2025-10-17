@@ -1,3 +1,4 @@
+import contextlib
 from typing import Callable
 
 import torch
@@ -11,6 +12,9 @@ from .base_trainer import DiTBaseTrainer
 
 logger = logging.get_logger(__name__)
 
+@contextlib.contextmanager
+def null_inference_context(model, scale: float):
+    yield
 
 class DiTBaseGenerator(DiTBaseTrainer):
     def __init__(
