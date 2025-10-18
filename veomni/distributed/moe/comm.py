@@ -19,9 +19,8 @@ import torch.distributed as dist
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes, async_op):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
         ctx.group = group
-        ctx.async_op = async_op
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
 
@@ -36,31 +35,66 @@ class _AllToAll(torch.autograd.Function):
             output = torch.empty_like(input)
         else:
             output = torch.empty(size=(sum(output_split_sizes), input.size(1)), dtype=input.dtype, device=input.device)
-        ret = dist.all_to_all_single(
+        dist.all_to_all_single(
             output,
             input,
             output_split_sizes=output_split_sizes,
             input_split_sizes=input_split_sizes,
             group=group,
-            async_op=async_op,
         )
-        if async_op:
-            return output, ret
-        else:
-            return output
+        return output
 
     @staticmethod
     def backward(ctx, *grad_output):
         return (
             None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes, ctx.async_op),
+            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
+            None,
+            None,
+        )
+
+
+class _AllToAll_Async(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+
+        world_size = dist.get_world_size(group=group)
+
+        if world_size == 1:
+            return input
+
+        input = input.contiguous()
+
+        if output_split_sizes is None:
+            output = torch.empty_like(input)
+        else:
+            output = torch.empty(size=(sum(output_split_sizes), input.size(1)), dtype=input.dtype, device=input.device)
+        async_handle = dist.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+            async_op=True,
+        )
+        return output, async_handle
+
+    @staticmethod
+    def backward(ctx, *grad_output, grad_async_handle):
+        return (
+            None,
+            _AllToAll_Async.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
             None,
             None,
         )
 
 
 def all_to_all(group, input, output_split_size=None, input_split_size=None):
-    return _AllToAll.apply(group, input, output_split_size, input_split_size, False)
+    return _AllToAll.apply(group, input, output_split_size, input_split_size)
 
-def all_to_all_async(group, input, output_split_size=None, input_split_size=None):
-    return _AllToAll.apply(group, input, output_split_size, input_split_size, True)
+
+def all_to_all_async(group, input, output_split_size, input_split_size):
+    return _AllToAll_Async.apply(group, input, output_split_size, input_split_size)
