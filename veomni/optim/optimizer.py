@@ -212,9 +212,6 @@ class MultiOptimizer(Optimizer, Stateful):
 
 
 def _should_build_ep_aware(model: "nn.Module", param_groups: Optional[Sequence[Dict[str, Any]]]) -> bool:
-    # Only auto-split when using FSDP2 with EP and no explicit param_groups
-    if param_groups is not None:
-        return False
     ps = get_parallel_state()
     if ps.dp_mode != "fsdp2" or not ps.ep_enabled:
         return False
@@ -332,10 +329,26 @@ def build_ep_fsdp2_optimizer(
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
+
+    param_groups is only provided for VLM (e.g., [{"params": vit_params, "lr": vit_lr}, {"params": other_params, "lr": default_lr}]):
+    - vit_params go directly to non_ep_groups with vit_lr
+    - other_params are split between ep_params and non_ep_params based on DTensor mesh
     """
+    # Determine which params to iterate over
+    if param_groups is not None:
+        vit_group = param_groups[0]  # {"params": vit_params, "lr": vit_lr}
+        other_group = param_groups[1]  # {"params": other_params, "lr": default_lr}
+        vit_params = [p for p in vit_group["params"] if p.requires_grad]
+        vit_lr = vit_group.get("lr", lr)
+        params_to_split = other_group["params"]
+    else:
+        vit_params = []
+        params_to_split = model.parameters()
+
+    # Split params into ep and non_ep
     ep_params: List[torch.nn.Parameter] = []
     non_ep_params: List[torch.nn.Parameter] = []
-    for p in model.parameters():
+    for p in params_to_split:
         if not p.requires_grad:
             continue
         if DTensor is not None and isinstance(p, DTensor):
@@ -346,12 +359,26 @@ def build_ep_fsdp2_optimizer(
                 continue
         non_ep_params.append(p)
 
-    logger.info_rank0(f"EP-aware optimizer: {len(ep_params)} EP params, {len(non_ep_params)} non-EP params")
+    logger.info_rank0(
+        f"EP-aware optimizer: {len(vit_params)} ViT params, {len(ep_params)} EP params, {len(non_ep_params)} non-EP params"
+        if vit_params
+        else f"EP-aware optimizer: {len(ep_params)} EP params, {len(non_ep_params)} non-EP params"
+    )
 
+    # Build param groups
     ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
     non_ep_groups = _make_param_groups_for_subset(
         model, non_ep_params, weight_decay, no_decay_modules, no_decay_params
     )
+
+    # Add vit_params to non_ep_groups with custom lr if provided
+    if vit_params:
+        vit_subgroups = _make_param_groups_for_subset(
+            model, vit_params, weight_decay, no_decay_modules, no_decay_params
+        )
+        for group in vit_subgroups:
+            group["lr"] = vit_lr
+        non_ep_groups.extend(vit_subgroups)
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
         foreach = False if is_torch_npu_available() else (not fused)
@@ -374,7 +401,10 @@ def build_ep_fsdp2_optimizer(
         "ep": [p for g in ep_groups for p in g.get("params", [])] if ep_groups else [],
         "non_ep": [p for g in non_ep_groups for p in g.get("params", [])] if non_ep_groups else [],
     }
+
+    key_names = list(optimizer_dict.keys())
+
     # Build MultiOptimizer and attach a pre-step hook to sanitize DTensor states
-    multi_opt = MultiOptimizer(model, optimizer_dict, key_names=["ep", "non_ep"])
+    multi_opt = MultiOptimizer(model, optimizer_dict, key_names=key_names)
 
     return multi_opt
