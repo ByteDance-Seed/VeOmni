@@ -338,6 +338,8 @@ def parallelize_model_fsdp2(
             if hasattr(experts_mod, "set_gradient_divide_factor"):
                 # average EP grads across EP ranks
                 experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
+            else: # torch < 2.8
+                experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:

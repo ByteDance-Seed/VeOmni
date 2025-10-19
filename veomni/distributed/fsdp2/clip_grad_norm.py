@@ -1,5 +1,6 @@
 import math
-from typing import List
+from collections import defaultdict
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
@@ -8,50 +9,49 @@ from torch.distributed._tensor import DTensor
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
 from ..parallel_state import get_parallel_state
+from torch.nn.utils import get_total_norm, clip_grads_with_norm_
 
 
 logger = get_logger(__name__)
 
 
+@torch.no_grad()
 def clip_grad_norm(
-    model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
+    model: torch.nn.Module, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
-    # EP-aware path (FSDP2 + EP): maintain mathematical parity with FSDP1 clipper
-    if hasattr(model, "_ep_param_groups"):
-        return ep_fsdp2_clip_grad_norm(
-            model,
-            max_norm,
-            norm_type=norm_type,
-            error_if_nonfinite=error_if_nonfinite,
-            foreach=foreach,
-        )
 
-    # FSDP2 without EP: still need distributed reductions across the FSDP group
-    ps = get_parallel_state()
-    fsdp_group = ps.fsdp_group
-    try:
-        world_size = dist.get_world_size(fsdp_group) if fsdp_group is not None else 1
-    except Exception:
-        world_size = 1
+    # 1. find all parameters and grouped by device_mesh
+    device_mesh_grouped_params = defaultdict(list)
+    grads = []
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        if isinstance(param, DTensor):
+            device_mesh = param.device_mesh
+            grads.append(param.grad.to_local())
+        else:
+            device_mesh = None
+            grads.append(param.grad)
+        device_mesh_grouped_params[device_mesh].append(param)
 
-    if world_size == 1:
-        # Default path (single-rank)
-        return torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm,
-            norm_type=norm_type,
-            error_if_nonfinite=error_if_nonfinite,
-            foreach=foreach,
-        )
+    # 2. get total norm
+    total_norm = get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
 
-    return _fsdp2_reduce_and_clip(
-        params=[p for p in model.parameters() if p.grad is not None],
-        max_norm=max_norm,
-        norm_type=norm_type,
-        foreach=foreach,
-        error_if_nonfinite=error_if_nonfinite,
-        reduce_groups=[("fsdp", fsdp_group)],
-    )
+    # 3. reduce total norm
+    fsdp_group: torch.distributed.ProcessGroup = get_parallel_state().fsdp_mesh.get_all_groups()[-1]
+    if fsdp_group.size() > 1:
+        if math.isinf(norm_type):
+            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=fsdp_group)
+        else:
+            total_norm.pow_(norm_type)
+            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=fsdp_group)
+            total_norm.pow_(1.0 / norm_type)
+
+    # 4. clip grads
+    for params in device_mesh_grouped_params.values():
+        clip_grads_with_norm_(params, max_norm, total_norm, foreach)
+
+    return total_norm
 
 
 @torch.no_grad()
