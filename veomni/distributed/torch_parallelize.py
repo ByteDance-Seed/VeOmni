@@ -360,21 +360,22 @@ def parallelize_model_fsdp2(
     fully_shard(model, **fsdp_kwargs)
 
     # configure manual prefetching
-    blocks = [pair[1] for pair in layer_pairs]
-    next_blocks = blocks[1:] + [None]
-    for current_block, next_block in zip(blocks, next_blocks):
-        if next_block is not None:
-            prefetch_modules = next_block._fsdp_modules
-            # prefetch in order of attn, gate, experts
-            current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+    if kwargs.get("enable_forward_prefetch", True):
+        blocks = [pair[1] for pair in layer_pairs]
+        next_blocks = blocks[1:] + [None]
+        for current_block, next_block in zip(blocks, next_blocks):
+            if next_block is not None:
+                prefetch_modules = next_block._fsdp_modules
+                # prefetch in order of attn, gate, experts
+                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
 
-    # configure backward prefetch
-    rev_blocks = list(reversed(blocks))
-    prev_blocks = rev_blocks[1:] + [None]
-    for current_block, prev_block in zip(rev_blocks, prev_blocks):
-        if prev_block is not None:
-            prefetch_modules = prev_block._fsdp_modules
-            current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+        # configure backward prefetch
+        rev_blocks = list(reversed(blocks))
+        prev_blocks = rev_blocks[1:] + [None]
+        for current_block, prev_block in zip(rev_blocks, prev_blocks):
+            if prev_block is not None:
+                prefetch_modules = prev_block._fsdp_modules
+                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
