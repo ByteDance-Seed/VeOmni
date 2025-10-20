@@ -211,7 +211,7 @@ class MultiOptimizer(Optimizer, Stateful):
         return len(self.optimizers_dict)
 
 
-def _should_build_ep_aware(model: "nn.Module", param_groups: Optional[Sequence[Dict[str, Any]]]) -> bool:
+def _should_build_ep_aware(model: "nn.Module") -> bool:
     ps = get_parallel_state()
     if ps.dp_mode != "fsdp2" or not ps.ep_enabled:
         return False
@@ -275,17 +275,22 @@ def build_optimizer(
     weight_decay: float = 1e-2,
     fused: bool = False,
     optimizer_type: str = "adamw",
-    param_groups: Optional[Sequence[Dict[str, Any]]] = None,
+    param_groups: Optional[Dict[str, Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
 ) -> "torch.optim.Optimizer":
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
-    if _should_build_ep_aware(model, param_groups):
+    if _should_build_ep_aware(model):
         return build_ep_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
-    # Other cases remain the same
-    if param_groups is None:
+
+    # For the non FSDP2+EP VLM case, convert dict to list format if needed (for backward compatibility with standard optimizers)
+    if param_groups is not None:
+        # Convert dict format to list format expected by standard PyTorch optimizers
+        param_groups = list(param_groups.values())
+    else:
+        # Other cases remain the same
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
         param_groups = [
             {
@@ -323,24 +328,31 @@ def build_ep_fsdp2_optimizer(
     weight_decay: float = 1e-2,
     fused: bool = False,
     optimizer_type: str = "adamw",
-    param_groups: Optional[Sequence[Dict[str, Any]]] = None,
+    param_groups: Optional[Dict[str, Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
 
-    param_groups is only provided for VLM (e.g., [{"params": vit_params, "lr": vit_lr}, {"params": other_params, "lr": default_lr}]):
+    param_groups is only provided for VLM and should be a dict with explicit keys:
+    - Example: {"vit_params": {"params": vit_params, "lr": vit_lr},
+                "lm_params": {"params": lm_params, "lr": default_lr}}
     - vit_params go directly to non_ep_groups with vit_lr
-    - other_params are split between ep_params and non_ep_params based on DTensor mesh
+    - lm_params are split between ep_params and non_ep_params based on DTensor mesh
     """
-    # Determine which params to iterate over
+    # Only VLM case should get non-none param_groups
     if param_groups is not None:
-        vit_group = param_groups[0]  # {"params": vit_params, "lr": vit_lr}
-        other_group = param_groups[1]  # {"params": other_params, "lr": default_lr}
+        # Validate param_groups structure
+        assert isinstance(param_groups, dict), "param_groups must be a dict"
+        assert "vit_params" in param_groups, "param_groups must contain 'vit_params' key"
+        assert "lm_params" in param_groups, "param_groups must contain 'lm_params' key"
+
+        vit_group = param_groups["vit_params"]  # {"params": vit_params, "lr": vit_lr}
+        lm_group = param_groups["lm_params"]  # {"params": lm_params, "lr": default_lr}
         vit_params = [p for p in vit_group["params"] if p.requires_grad]
         vit_lr = vit_group.get("lr", lr)
-        params_to_split = other_group["params"]
+        params_to_split = lm_group["params"]
     else:
         vit_params = []
         params_to_split = model.parameters()
