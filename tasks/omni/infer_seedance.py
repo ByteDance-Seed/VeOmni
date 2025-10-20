@@ -125,8 +125,8 @@ def main() -> None:
         "--dit_model_path",
         type=str,
         # default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_24fps_480p_i2v_rlhf_v2_dit",
-        # default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_0403/i2v_dit",
-        default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_0403/i2v_dit_12nfe",
+        # default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_0403/i2v_dit_7b",
+        default="/mnt/hdfs/_BYTE_DATA_SEED_/ssd_hldy/user/shizhelun/seedance/ckpt/veomni_hf/7B_0403/i2v_dit_7b_12nfe",
     )
     parser.add_argument("--lora_model_path", type=str, default=None)
     parser.add_argument("--use_offline_embedding", type=bool, default=False)

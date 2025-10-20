@@ -9,7 +9,7 @@ import torch
 from tqdm import tqdm
 
 from veomni.data.data_collator import DataCollator
-from veomni.data.multimodal.image_utils import fetch_images, load_image_bytes_from_path
+from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.video_utils import save_video_tensors_to_file
 from veomni.dit_trainer import DiTBaseGenerator, DiTTrainerRegistry
 from veomni.models import build_foundation_model
