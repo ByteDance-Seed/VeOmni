@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 from transformers import PretrainedConfig
 
 from . import logging
@@ -33,7 +34,15 @@ def get_device_flops(unit="T"):
             ptr += 1
         return number
 
-    device_name = get_device_name()
+    # Allow manual override via environment variable (for hacked GPU names)
+    override_gpu = os.environ.get("VEOMNI_GPU_TYPE", "")
+    if override_gpu:
+        device_name = override_gpu
+        if int(os.environ.get("RANK", "0")) == 0:
+            logger.info(f"Using manually specified GPU type: {device_name} (override VEOMNI_GPU_TYPE)")
+    else:
+        device_name = get_device_name()
+
     flops = float("inf")  # INF flops for unkown gpu type
     if "H100" in device_name or "H800" in device_name:
         flops = 989e12

@@ -327,7 +327,12 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            mfu_pct = train_metrics.get("mfu", 0) * 100
+            tflops_rank = train_metrics.get("flops_achieved_per_rank(T)", 0)
+            data_loader_tqdm.set_postfix_str(
+                f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, "
+                f"TFLOPS/rank: {tflops_rank:.1f}, MFU: {mfu_pct:.1f}%"
+            )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
