@@ -275,6 +275,7 @@ class AttentionModule(nn.Module):
         self.head_dim = head_dim
         self.attention_interface = WAN_ATTENTION_FUNCTIONS[config._attn_implementation]
         self.is_causal = False
+        self.config = config
 
     def forward(self, query_states, key_states, value_states, **kwargs):
         query_states = rearrange(query_states, "b s (n d) -> b n s d", d=self.head_dim)

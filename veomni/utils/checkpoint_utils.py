@@ -97,11 +97,11 @@ def dcp_get_last_iteration(output_dir):
     return max(valid_steps)
 
 
-def get_checkpoint_path(output_dir, is_rank0: bool, ckpt_manager: str):
+def get_checkpoint_path(output_dir, is_local_rank0: bool, ckpt_manager: str):
     if ckpt_manager == "dcp":
         iteration = dcp_get_last_iteration(output_dir)
     else:  # OmniStore or BCP
-        iteration = get_last_iteration(output_dir, is_rank0)
+        iteration = get_last_iteration(output_dir, is_local_rank0)
 
     if not iteration:
         logger.warning_rank0("Failed to find latest checkpoint path, will start training from step 0...")

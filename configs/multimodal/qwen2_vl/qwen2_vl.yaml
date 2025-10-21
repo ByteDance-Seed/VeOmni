@@ -1,5 +1,5 @@
 model:
-  model_path: qwen2vl-7b-instruct
+  model_path: Qwen/Qwen2-VL-7B-Instruct
 
 data:
   dataloader_type: native

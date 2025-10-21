@@ -53,6 +53,8 @@ Our guiding principles when building VeOmni are:
   - [🧪 Upcoming Features](#-upcoming-features)
 - [🎈 Getting Started](#-getting-started)
   - [🔧 Installation](#-installation)
+    - [(Recommended) Use `uv` Managed Virtual Environment](#recommended-use-uv-managed-virtual-environment)
+    - [`pip` Based Install](#pip-based-install)
   - [🚀 Quick Start](#-quick-start)
   - [🔒 Merge checkpoints](#-merge-checkpoints)
   - [📦 Build Docker](#-build-docker)
@@ -296,6 +298,7 @@ Thanks to the following projects for their excellent work:
 - [OpenHA: A Series of Open-Source Hierarchical
 Agentic Models in Minecraft](https://arxiv.org/pdf/2509.13347)
 - [UI-TARS-2 Technical Report: Advancing GUI Agent with Multi-Turn Reinforcement Learning](https://arxiv.org/abs/2509.02544)
+- [Open-dLLM: Open Diffusion Large Language Models](https://github.com/pengzhangzhi/Open-dLLM)
 
 ## 🎨 Contributing
 

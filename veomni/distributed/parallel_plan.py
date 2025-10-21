@@ -98,7 +98,7 @@ class ParallelPlan:
         """
         self.ep_plan = {prefix + "." + k: v for k, v in self.ep_plan.items()}
         self.ep_param_suffix = {k.split(".")[-1] for k in self.ep_plan.keys()}
-        self.fsdp_no_shard_module = {".".join(list(self.ep_plan.keys())[0].split(".")[:-1])}
+        self.fsdp_no_shard_module = {prefix + "." + k for k in self.fsdp_no_shard_module}
 
     def shard_tensor(self, tensor: "torch.Tensor", full_param_name: str, target_shape: tuple) -> "torch.Tensor":
         """
