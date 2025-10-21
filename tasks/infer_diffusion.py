@@ -1,8 +1,10 @@
 import json
 import os
+
+
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from functools import partial
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -12,9 +14,8 @@ from veomni.data.data_collator import DataCollator
 from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.video_utils import save_video_tensors_to_file
 from veomni.dit_trainer import DiTBaseGenerator, DiTTrainerRegistry
-from veomni.models import build_foundation_model
 from veomni.utils import helper
-from veomni.utils.arguments import ModelArguments, parse_args, save_args
+from veomni.utils.arguments import InferArguments, ModelArguments, parse_args, save_args
 
 
 logger = helper.create_logger(__name__)
@@ -71,8 +72,8 @@ class MyModelArguments(ModelArguments):
 
 
 @dataclass
-class MyDataArguments:
-    generate_path: str = field(
+class MyInferArguments(InferArguments):
+    data_path: str = field(
         default="",
         metadata={"help": "Path to the generate data."},
     )
@@ -80,10 +81,6 @@ class MyDataArguments:
         default="",
         metadata={"help": "Path to the negative prompts."},
     )
-
-
-@dataclass
-class MyGenerateArguments:
     output_dir: str = field(
         default="output",
         metadata={"help": "Output directory."},
@@ -96,13 +93,20 @@ class MyGenerateArguments:
         default=42,
         metadata={"help": "Seed for reproducibility."},
     )
+    lora_scale: float = field(
+        default=1.0,
+        metadata={"help": "LoRA scale"},
+    )
+    lora_model_path: str = field(
+        default=None,
+        metadata={"help": "LoRA model path"},
+    )
 
 
 @dataclass
 class Arguments:
     model: "MyModelArguments" = field(default_factory=MyModelArguments)
-    data: "MyDataArguments" = field(default_factory=MyDataArguments)
-    generate: "MyGenerateArguments" = field(default_factory=MyGenerateArguments)
+    infer: "MyInferArguments" = field(default_factory=MyInferArguments)
 
 
 @dataclass
@@ -124,28 +128,27 @@ class DiTDataCollator(DataCollator):
 def main():
     args = parse_args(Arguments)
     logger.info_rank0(json.dumps(asdict(args), indent=2))
-    helper.set_seed(args.generate.seed, args.generate.enable_full_determinism)
+    helper.set_seed(args.infer.seed, args.infer.enable_full_determinism)
     helper.enable_high_precision_for_bf16()
     helper.enable_third_party_logging()
-    save_args(args, args.generate.output_dir)
+    save_args(args, args.infer.output_dir)
 
-    raw_data_list = read_raw_data(args.data.generate_path, args.data.negative_prompts_path)
+    raw_data_list = read_raw_data(args.infer.data_path, args.infer.negative_prompts_path)
 
     logger.info_rank0("Prepare generator")
-    build_foundation_model_func = partial(
-        build_foundation_model,
-        torch_dtype="bfloat16",
-        attn_implementation=args.model.attn_implementation,
-        moe_implementation=args.model.moe_implementation,
-        force_use_huggingface=args.model.force_use_huggingface,
-    )
 
+    args.model.lora_config.update(
+        lora_scale=args.infer.lora_scale,
+        lora_model_path=args.infer.lora_model_path,
+    )
     generator: DiTBaseGenerator = DiTTrainerRegistry.create(
-        model_path=args.model.model_path,
-        build_foundation_model_func=build_foundation_model_func,
+        model_path=args.infer.model_path,
+        build_foundation_model_func=None,
         lora_config=args.model.lora_config,
         condition_model_path=args.model.trainer_config["condition_model_path"],
         condition_model_cfg=args.model.trainer_config["condition_model_cfg"],
+        attn_implementation=args.model.attn_implementation,
+        moe_implementation=args.model.moe_implementation,
         **args.model.generator_config,
     )
 
@@ -154,7 +157,7 @@ def main():
 
         os.makedirs("output", exist_ok=True)
         for j, video in enumerate(videos):
-            save_video_tensors_to_file(video.cpu().numpy(), f"{args.generate.output_dir}/pred_{i}_{j}.mp4")
+            save_video_tensors_to_file(video.cpu().numpy(), f"{args.infer.output_dir}/pred_{i}_{j}.mp4")
 
 
 if __name__ == "__main__":
