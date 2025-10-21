@@ -275,7 +275,7 @@ def build_optimizer(
     weight_decay: float = 1e-2,
     fused: bool = False,
     optimizer_type: str = "adamw",
-    param_groups: Optional[Dict[str, Dict[str, Any]]] = None,
+    param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
 ) -> "torch.optim.Optimizer":
@@ -284,13 +284,8 @@ def build_optimizer(
         return build_ep_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
-
-    # For the non FSDP2+EP VLM case, convert dict to list format if needed (for backward compatibility with standard optimizers)
-    if param_groups is not None:
-        # Convert dict format to list format expected by standard PyTorch optimizers
-        param_groups = list(param_groups.values())
-    else:
-        # Other cases remain the same
+    # Other cases remain the same
+    if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
         param_groups = [
             {
@@ -328,69 +323,99 @@ def build_ep_fsdp2_optimizer(
     weight_decay: float = 1e-2,
     fused: bool = False,
     optimizer_type: str = "adamw",
-    param_groups: Optional[Dict[str, Dict[str, Any]]] = None,
+    param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
 
-    param_groups is only provided for VLM and should be a dict with explicit keys:
-    - Example: {"vit_params": {"params": vit_params, "lr": vit_lr},
-                "lm_params": {"params": lm_params, "lr": default_lr}}
-    - vit_params go directly to non_ep_groups with vit_lr
-    - lm_params are split between ep_params and non_ep_params based on DTensor mesh
+    If param_groups provided, it can be a list of dicts with arbitrary parameter groups:
+    - Example: [{"params": params1, "lr": lr1},
+                {"params": params2, "lr": lr2},
+                {"params": params3, "lr": lr3}]
+    - Each group's params are automatically split into EP and non-EP based on DTensor mesh
+    - Custom learning rates and other optimizer settings are preserved per group
     """
-    # Only VLM case should get non-none param_groups
+    # Collect all EP and non-EP parameters across all groups
+    ep_groups: List[Dict[str, Any]] = []
+    non_ep_groups: List[Dict[str, Any]] = []
+
+    # Process custom param_groups if provided
     if param_groups is not None:
         # Validate param_groups structure
-        assert isinstance(param_groups, dict), "param_groups must be a dict"
-        assert "vit_params" in param_groups, "param_groups must contain 'vit_params' key"
-        assert "lm_params" in param_groups, "param_groups must contain 'lm_params' key"
+        assert isinstance(param_groups, list), "param_groups must be a list"
 
-        vit_group = param_groups["vit_params"]  # {"params": vit_params, "lr": vit_lr}
-        lm_group = param_groups["lm_params"]  # {"params": lm_params, "lr": default_lr}
-        vit_params = [p for p in vit_group["params"] if p.requires_grad]
-        vit_lr = vit_group.get("lr", lr)
-        params_to_split = lm_group["params"]
+        # Process each parameter group
+        for group_config in param_groups:
+            assert "params" in group_config, (
+                f"Each group in param_groups must contain 'params' key, got: {group_config}"
+            )
+
+            # Extract group-specific settings
+            group_lr = group_config.get("lr", lr)
+            group_params = group_config["params"]
+
+            # Split this group's params into EP and non-EP
+            group_ep_params: List[torch.nn.Parameter] = []
+            group_non_ep_params: List[torch.nn.Parameter] = []
+
+            for p in group_params:
+                if not p.requires_grad:
+                    continue
+                if DTensor is not None and isinstance(p, DTensor):
+                    mesh = getattr(p, "device_mesh", None)
+                    names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
+                    if "ep_fsdp" in names:
+                        group_ep_params.append(p)
+                        continue
+                group_non_ep_params.append(p)
+
+            # Create subgroups with weight decay handling
+            if group_ep_params:
+                group_ep_subgroups = _make_param_groups_for_subset(
+                    model, group_ep_params, weight_decay, no_decay_modules, no_decay_params
+                )
+                for subgroup in group_ep_subgroups:
+                    subgroup["lr"] = group_lr
+                    # Preserve other custom settings from original group
+                    for key, value in group_config.items():
+                        if key not in ["params", "lr", "weight_decay"]:
+                            subgroup[key] = value
+                ep_groups.extend(group_ep_subgroups)
+
+            if group_non_ep_params:
+                group_non_ep_subgroups = _make_param_groups_for_subset(
+                    model, group_non_ep_params, weight_decay, no_decay_modules, no_decay_params
+                )
+                for subgroup in group_non_ep_subgroups:
+                    subgroup["lr"] = group_lr
+                    # Preserve other custom settings from original group
+                    for key, value in group_config.items():
+                        if key not in ["params", "lr", "weight_decay"]:
+                            subgroup[key] = value
+                non_ep_groups.extend(group_non_ep_subgroups)
     else:
-        vit_params = []
-        params_to_split = model.parameters()
+        # Default case (param_groups is None): all model parameters with uniform settings(lr)
+        ep_params: List[torch.nn.Parameter] = []
+        non_ep_params: List[torch.nn.Parameter] = []
 
-    # Split params into ep and non_ep
-    ep_params: List[torch.nn.Parameter] = []
-    non_ep_params: List[torch.nn.Parameter] = []
-    for p in params_to_split:
-        if not p.requires_grad:
-            continue
-        if DTensor is not None and isinstance(p, DTensor):
-            mesh = getattr(p, "device_mesh", None)
-            names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-            if "ep_fsdp" in names:
-                ep_params.append(p)
+        for p in model.parameters():
+            if not p.requires_grad:
                 continue
-        non_ep_params.append(p)
+            if DTensor is not None and isinstance(p, DTensor):
+                mesh = getattr(p, "device_mesh", None)
+                names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
+                if "ep_fsdp" in names:
+                    ep_params.append(p)
+                    continue
+            non_ep_params.append(p)
 
-    logger.info_rank0(
-        f"EP-aware optimizer: {len(vit_params)} ViT params, {len(ep_params)} EP params, {len(non_ep_params)} non-EP params"
-        if vit_params
-        else f"EP-aware optimizer: {len(ep_params)} EP params, {len(non_ep_params)} non-EP params"
-    )
-
-    # Build param groups
-    ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
-    non_ep_groups = _make_param_groups_for_subset(
-        model, non_ep_params, weight_decay, no_decay_modules, no_decay_params
-    )
-
-    # Add vit_params to non_ep_groups with custom lr if provided
-    if vit_params:
-        vit_subgroups = _make_param_groups_for_subset(
-            model, vit_params, weight_decay, no_decay_modules, no_decay_params
+        # Build param groups with weight decay handling
+        ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
+        non_ep_groups = _make_param_groups_for_subset(
+            model, non_ep_params, weight_decay, no_decay_modules, no_decay_params
         )
-        for group in vit_subgroups:
-            group["lr"] = vit_lr
-        non_ep_groups.extend(vit_subgroups)
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
         foreach = False if is_torch_npu_available() else (not fused)

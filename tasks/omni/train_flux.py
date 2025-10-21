@@ -148,10 +148,10 @@ def get_param_groups(model: torch.nn.Module, default_lr: float, vit_lr: float):
             vit_params.append(param)
         else:
             other_params.append(param)
-    return {
-        "vit_params": {"params": vit_params, "lr": vit_lr},
-        "lm_params": {"params": other_params, "lr": default_lr},
-    }
+    return [
+        {"params": vit_params, "lr": vit_lr},
+        {"params": other_params, "lr": default_lr},
+    ]
 
 
 def main():
