@@ -636,9 +636,10 @@ class DeepseekV3Attention(nn.Module):
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        # we skip transpose here since we will perform them in the flash_attention_forward
+        # query_states = query_states.transpose(1, 2)
+        # key_states = key_states.transpose(1, 2)
+        # value_states = value_states.transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
