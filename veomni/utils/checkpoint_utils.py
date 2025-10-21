@@ -15,13 +15,11 @@
 
 import os
 
-import torch.distributed as dist
-
 
 try:
-    from hdfs_io import copy, exists, isdir, listdir
+    from hdfs_io import exists, isdir, listdir
 except ImportError:
-    from .hdfs_io import copy, exists, isdir, listdir
+    from .hdfs_io import exists, isdir, listdir
 
 from .logging import get_logger
 
@@ -55,23 +53,12 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
 
 def get_last_iteration(output_dir, is_rank0: bool):
     meta_file = "latest_checkpointed_iteration.txt"
-    if is_rank0:
-        latest_file = os.path.join(output_dir, "checkpoints", meta_file)
-        if exists(latest_file):
-            copy(latest_file, meta_file)
-
-    dist.barrier()
-    if os.path.exists(meta_file):
-        with open(meta_file) as f:
+    latest_file = os.path.join(output_dir, "checkpoints", meta_file)
+    if exists(latest_file):
+        with open(latest_file) as f:
             iteration = int(f.readline())
     else:
         iteration = 0
-
-    dist.barrier()
-    if is_rank0:
-        if os.path.exists(meta_file):
-            os.remove(meta_file)
-
     return iteration
 
 

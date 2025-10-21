@@ -233,7 +233,7 @@ def main():
         assert not drop_last
         assert not shuffle
 
-        base = len(train_dataset) / args.train.data_parallel_size
+        base = len(train_dataset) // args.train.data_parallel_size
         extra = len(train_dataset) % args.train.data_parallel_size
         extra_for_rank = max(0, min(1, extra - args.train.local_rank))  # unshuffled distributed sampler
         valid_data_length = base + extra_for_rank
