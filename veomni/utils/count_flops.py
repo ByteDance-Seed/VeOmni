@@ -38,8 +38,6 @@ def get_device_flops(unit="T"):
     override_gpu = os.environ.get("VEOMNI_GPU_TYPE", "")
     if override_gpu:
         device_name = override_gpu
-        if int(os.environ.get("RANK", "0")) == 0:
-            logger.info(f"Using manually specified GPU type: {device_name} (override VEOMNI_GPU_TYPE)")
     else:
         device_name = get_device_name()
 
