@@ -51,14 +51,13 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 
-from ....ops import fused_moe_forward
+from ....ops import causallm_loss_function, fused_moe_forward
 from ....utils.import_utils import is_liger_kernel_available
 from .configuration_deepseek import DeepseekV3Config
 
 
 if is_liger_kernel_available():
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction
-    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss  # type: ignore
     from liger_kernel.transformers.rms_norm import LigerRMSNorm
     from liger_kernel.transformers.rope import liger_rotary_pos_emb
 
@@ -1133,6 +1132,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
+        self.loss_function = causallm_loss_function
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -1214,25 +1214,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         logits = None
         loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_labels = labels[..., 1:].contiguous()
-            shift_labels = shift_labels.view(-1)
-            if is_liger_kernel_available():
-                loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="mean")
-                hidden_states = hidden_states[..., :-1, :].contiguous()
-                hidden_states = hidden_states.view(-1, self.config.hidden_size)
-                loss = loss_fct(self.lm_head.weight, hidden_states, shift_labels)
-            else:
-                logits = self.lm_head(hidden_states)
-                logits = logits.float()
-                shift_logits = logits[..., :-1, :].contiguous()
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
+        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
