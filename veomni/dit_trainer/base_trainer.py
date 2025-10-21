@@ -111,6 +111,32 @@ class DiTBaseTrainer:
             self.lora_config = lora_config
             fsdp_kwargs = self.configure_lora_model()
 
+            if build_parallelize_model_func.keywords["init_device"] == "meta":
+                from functools import partial
+
+                def patch_parallel_load_safetensors(weights_path, func, model):
+                    shard_states = func(weights_path)
+                    parameter_name = next(model.named_parameters())[0]
+                    if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
+                        shard_states = {"base_model.model." + k: v for k, v in shard_states.items()}
+                    for fqn, module in model.named_modules():
+                        fqn = fqn + ("." if fqn else "")
+                        if hasattr(module, "base_layer"):  # using lora peft will insert "base_layer"
+                            for pname, _ in module.base_layer.named_parameters():
+                                old_name = fqn + pname
+                                if old_name in shard_states:
+                                    wrap_name = fqn + "base_layer." + pname
+                                    shard_states[wrap_name] = shard_states.pop(old_name)
+                    return shard_states
+
+                from veomni.distributed import torch_parallelize
+
+                torch_parallelize.parallel_load_safetensors = partial(
+                    patch_parallel_load_safetensors,
+                    func=torch_parallelize.parallel_load_safetensors,
+                    model=self.dit_model,
+                )
+
             self.dit_model = build_parallelize_model_func(
                 model=self.dit_model, fsdp_kwargs=fsdp_kwargs, basic_modules=self.dit_model._no_split_modules
             )

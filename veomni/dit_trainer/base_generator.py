@@ -22,10 +22,12 @@ class DiTBaseGenerator(DiTBaseTrainer):
     def __init__(
         self,
         model_path: str,
-        build_foundation_model_func: Callable,
+        build_foundation_model_func: Callable = None,
         condition_model_path: str = None,
         condition_model_cfg: dict = {},
         num_samples_per_prompt: int = 1,
+        attn_implementation: str = "eager",
+        moe_implementation: str = "eager",
     ):
         logger.info_rank0("Prepare condition model.")
         condition_model_config = AutoConfig.from_pretrained(condition_model_path, **condition_model_cfg)
@@ -38,11 +40,15 @@ class DiTBaseGenerator(DiTBaseTrainer):
         self.condition_processor = build_processor(condition_model_path)
 
         logger.info_rank0("Prepare dit model.")
-        self.dit_model = build_foundation_model_func(config_path=model_path, weights_path=model_path)
+        self.dit_model = AutoModel.from_pretrained(
+            model_path,
+            torch_dtype="bfloat16",
+            device_map="auto",
+            attn_implementation=attn_implementation,
+        ).eval()
 
         self.num_samples_per_prompt = num_samples_per_prompt
 
-        self.dit_model.eval()
         pretty_print_trainable_parameters(self.dit_model)
 
     def forward(self, raw_data):
