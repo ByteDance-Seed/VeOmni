@@ -67,6 +67,33 @@ class OfflineEmbeddingSaver:
         self.rest_len = self.dataset_length
 
 
+def patch_parallel_load_safetensors(model: torch.nn.Module):
+    from functools import partial
+
+    def patch_parallel_load_safetensors(weights_path, func, model: torch.nn.Module):
+        shard_states = func(weights_path)
+        parameter_name = next(model.named_parameters())[0]
+        if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
+            shard_states = {"base_model.model." + k: v for k, v in shard_states.items()}
+        for fqn, module in model.named_modules():
+            fqn = fqn + ("." if fqn else "")
+            if hasattr(module, "base_layer"):  # using lora peft will insert "base_layer"
+                for pname, _ in module.base_layer.named_parameters():
+                    old_name = fqn + pname
+                    if old_name in shard_states:
+                        wrap_name = fqn + "base_layer." + pname
+                        shard_states[wrap_name] = shard_states.pop(old_name)
+        return shard_states
+
+    from veomni.distributed import torch_parallelize
+
+    torch_parallelize.parallel_load_safetensors = partial(
+        patch_parallel_load_safetensors,
+        func=torch_parallelize.parallel_load_safetensors,
+        model=model,
+    )
+
+
 class DiTBaseTrainer:
     def __init__(
         self,
@@ -80,70 +107,65 @@ class DiTBaseTrainer:
         offline_embedding_saver_cfg: dict = {},
         **kwargs,
     ):
-        logger.info_rank0("Prepare condition model.")
         self.training_task = training_task
+        self.condition_model_path = condition_model_path
+        self.condition_model_cfg = condition_model_cfg
+        self.configure_condition_model()
 
-        condition_model_config = AutoConfig.from_pretrained(condition_model_path, **condition_model_cfg)
-        if training_task == "offline_training":
-            logger.info_rank0(f"Task: {training_task}, prepare condition model with empty weights.")
-            with init_empty_weights():
-                self.condition_model = AutoModel.from_pretrained(
-                    condition_model_path,
-                    torch_dtype=torch.bfloat16,
-                    config=condition_model_config,
-                )
-        else:
-            logger.info_rank0(f"Task: {training_task}, prepare condition model fully loaded.")
-            self.condition_model = AutoModel.from_pretrained(
-                condition_model_path,
-                torch_dtype=torch.bfloat16,
-                config=condition_model_config,
+        self.build_foundation_model_func = build_foundation_model_func
+        self.build_parallelize_model_func = build_parallelize_model_func
+        self.model_path = model_path
+        self.lora_config = lora_config
+        self.configure_dit_model()
+
+        self.offline_embedding_saver_cfg = offline_embedding_saver_cfg
+        self.configure_offline_embedding()
+
+    def configure_dit_model(self):
+        if self.training_task == "offline_training" or self.training_task == "online_training":
+            logger.info_rank0(f"Task: {self.training_task}, prepare dit model.")
+
+            self.dit_model = self.build_foundation_model_func(
+                config_path=self.model_path, weights_path=self.model_path
             )
-            self.condition_model.cuda()
-        self.processor = build_processor(condition_model_path)
 
-        if training_task == "offline_training" or training_task == "online_training":
-            logger.info_rank0("Prepare dit model.")
-            self.build_foundation_model_func = build_foundation_model_func
-            self.model_path = model_path
-            self.dit_model = self.build_foundation_model_func(config_path=model_path, weights_path=model_path)
-
-            self.lora_config = lora_config
             fsdp_kwargs = self.configure_lora_model()
 
-            if build_parallelize_model_func.keywords["init_device"] == "meta":
-                from functools import partial
+            if self.build_parallelize_model_func.keywords["init_device"] == "meta" and self.lora:
+                logger.info_rank0("Lora model init with meta_deice, patch parallel_load_safetensors func.")
+                patch_parallel_load_safetensors(self.dit_model)
 
-                def patch_parallel_load_safetensors(weights_path, func, model):
-                    shard_states = func(weights_path)
-                    parameter_name = next(model.named_parameters())[0]
-                    if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
-                        shard_states = {"base_model.model." + k: v for k, v in shard_states.items()}
-                    for fqn, module in model.named_modules():
-                        fqn = fqn + ("." if fqn else "")
-                        if hasattr(module, "base_layer"):  # using lora peft will insert "base_layer"
-                            for pname, _ in module.base_layer.named_parameters():
-                                old_name = fqn + pname
-                                if old_name in shard_states:
-                                    wrap_name = fqn + "base_layer." + pname
-                                    shard_states[wrap_name] = shard_states.pop(old_name)
-                    return shard_states
-
-                from veomni.distributed import torch_parallelize
-
-                torch_parallelize.parallel_load_safetensors = partial(
-                    patch_parallel_load_safetensors,
-                    func=torch_parallelize.parallel_load_safetensors,
-                    model=self.dit_model,
-                )
-
-            self.dit_model = build_parallelize_model_func(
+            self.dit_model = self.build_parallelize_model_func(
                 model=self.dit_model, fsdp_kwargs=fsdp_kwargs, basic_modules=self.dit_model._no_split_modules
             )
             self.dit_model.train()
             pretty_print_trainable_parameters(self.dit_model)
+
+    def configure_offline_embedding(self):
+        if self.training_task == "offline_embedding":
+            logger.info_rank0(f"Task: {self.training_task}, prepare offline embedding saver.")
+            self.offline_embedding_saver = OfflineEmbeddingSaver(**self.offline_embedding_saver_cfg)
+
+    def configure_condition_model(self):
+        logger.info_rank0("Prepare condition model.")
+        condition_model_config = AutoConfig.from_pretrained(self.condition_model_path, **self.condition_model_cfg)
+        if self.training_task == "offline_training":
+            logger.info_rank0(f"Task: {self.training_task}, prepare condition model with empty weights.")
+            with init_empty_weights():
+                self.condition_model = AutoModel.from_pretrained(
+                    self.condition_model_path,
+                    torch_dtype=torch.bfloat16,
+                    config=condition_model_config,
+                )
         else:
-            self.offline_embedding_saver = OfflineEmbeddingSaver(**offline_embedding_saver_cfg)
+            logger.info_rank0(f"Task: {self.training_task}, prepare condition model fully loaded.")
+            self.condition_model = AutoModel.from_pretrained(
+                self.condition_model_path,
+                torch_dtype=torch.bfloat16,
+                config=condition_model_config,
+            )
+            self.condition_model.cuda()
+        self.processor = build_processor(self.condition_model_path)
 
     def get_model_for_training(self):
         return self.dit_model

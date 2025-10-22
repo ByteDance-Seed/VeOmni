@@ -3,14 +3,11 @@ import os
 
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional
 
-import torch
 from tqdm import tqdm
 
-from veomni.data.data_collator import DataCollator
 from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.video_utils import save_video_tensors_to_file
 from veomni.dit_trainer import DiTBaseGenerator, DiTTrainerRegistry
@@ -109,22 +106,6 @@ class Arguments:
     infer: "MyInferArguments" = field(default_factory=MyInferArguments)
 
 
-@dataclass
-class DiTDataCollator(DataCollator):
-    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
-        batch = defaultdict(list)
-
-        # batching features
-        for feature in features:
-            for key in feature.keys():
-                batch[key].append(feature[key])
-
-        for key in batch.keys():
-            batch[key] = torch.cat(batch[key], dim=0)
-
-        return batch
-
-
 def main():
     args = parse_args(Arguments)
     logger.info_rank0(json.dumps(asdict(args), indent=2))
@@ -139,11 +120,10 @@ def main():
 
     args.model.lora_config.update(
         lora_scale=args.infer.lora_scale,
-        lora_model_path=args.infer.lora_model_path,
+        lora_adapter=args.infer.lora_model_path,
     )
     generator: DiTBaseGenerator = DiTTrainerRegistry.create(
         model_path=args.infer.model_path,
-        build_foundation_model_func=None,
         lora_config=args.model.lora_config,
         condition_model_path=args.model.trainer_config["condition_model_path"],
         condition_model_cfg=args.model.trainer_config["condition_model_cfg"],
@@ -152,8 +132,10 @@ def main():
         **args.model.generator_config,
     )
 
+    processor = generator.processor
     for i, raw_data in enumerate(tqdm(raw_data_list)):
-        videos = generator.forward(raw_data)
+        processed_data = processor.preprocess_infer(raw_data)
+        videos = generator.forward(processed_data)
 
         os.makedirs("output", exist_ok=True)
         for j, video in enumerate(videos):

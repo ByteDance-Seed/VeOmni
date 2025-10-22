@@ -1,43 +1,28 @@
-import contextlib
-from typing import Callable
-
 import torch
-from transformers import AutoConfig, AutoModel
+from transformers import AutoModel
 
-from ..models.auto import build_processor
 from ..utils import logging
-from ..utils.model_utils import pretty_print_trainable_parameters
 from .base_trainer import DiTBaseTrainer
 
 
 logger = logging.get_logger(__name__)
 
 
-@contextlib.contextmanager
-def null_inference_context(model, scale: float):
-    yield
-
-
 class DiTBaseGenerator(DiTBaseTrainer):
     def __init__(
         self,
         model_path: str,
-        build_foundation_model_func: Callable = None,
         condition_model_path: str = None,
         condition_model_cfg: dict = {},
-        num_samples_per_prompt: int = 1,
+        lora_config: dict = None,
         attn_implementation: str = "eager",
-        moe_implementation: str = "eager",
+        **kwargs,
     ):
+        self.training_task = "offline_embedding"
+        self.condition_model_path = condition_model_path
+        self.condition_model_cfg = condition_model_cfg
         logger.info_rank0("Prepare condition model.")
-        condition_model_config = AutoConfig.from_pretrained(condition_model_path, **condition_model_cfg)
-
-        self.condition_model = AutoModel.from_pretrained(
-            condition_model_path,
-            torch_dtype=torch.bfloat16,
-            config=condition_model_config,
-        ).cuda()
-        self.condition_processor = build_processor(condition_model_path)
+        self.configure_condition_model()
 
         logger.info_rank0("Prepare dit model.")
         self.dit_model = AutoModel.from_pretrained(
@@ -46,22 +31,15 @@ class DiTBaseGenerator(DiTBaseTrainer):
             device_map="auto",
             attn_implementation=attn_implementation,
         ).eval()
+        self.lora_config = lora_config
+        self.configure_lora_model()
 
-        self.num_samples_per_prompt = num_samples_per_prompt
-
-        pretty_print_trainable_parameters(self.dit_model)
-
-    def forward(self, raw_data):
-        # only support online embedding for generation
-        processed_data = self.condition_processor.preprocess_infer(raw_data)
-
+    def forward(self, processed_data):
         with torch.no_grad():
-            condition_embed = self.condition_model.get_condition_infer(
-                processed_data, num_samples_per_prompt=self.num_samples_per_prompt
-            )
+            condition_embed = self.condition_model.get_condition_infer(processed_data)
             processed_cond = self.condition_model.process_condition_infer(condition_embed)
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
-            latents = self.dit_model.generate(**processed_cond, cfg_scale=3.5, ada_precompute=False)
+            latents = self.dit_model.generate(**processed_cond)
             decoded_latents = self.condition_model.postprocess(latents)
-        videos = self.condition_processor.postprocess(decoded_latents)
+        videos = self.processor.postprocess(decoded_latents)
         return videos
