@@ -1,5 +1,5 @@
-import io
 import math
+from io import BytesIO
 from typing import ByteString, Dict, List, Literal, Union
 
 import av
@@ -7,9 +7,8 @@ import librosa
 import numpy as np
 import PIL
 import torch
-import torchaudio
 import torchvision
-from decord import VideoReader, cpu
+from torchvision.io.video import _read_from_stream
 from torchvision.transforms import InterpolationMode, functional
 
 from ...utils import logging
@@ -166,17 +165,37 @@ def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs):
 
 
 def load_video_from_bytes(video: bytes, use_audio_in_video: bool = True, **kwargs):
-    video_bytes = io.BytesIO(video)
-    vr = VideoReader(video_bytes, ctx=cpu(0))
-    video_fps = vr.get_avg_fps()
-    frames = vr.get_batch(list(range(len(vr)))).asnumpy()  # [T, H, W, 3]
-    video = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous()  # [T, C, H, W]
+    container = av.open(BytesIO(video))
+    video_frames = _read_from_stream(
+        container,
+        0.0,
+        float("inf"),
+        "sec",
+        container.streams.video[0],
+        {"video": 0},
+    )
+    video_fps = container.streams.video[0].average_rate
+    vframes_list = [frame.to_rgb().to_ndarray() for frame in video_frames]
+    video = torch.as_tensor(np.stack(vframes_list)).permute(0, 3, 1, 2)  # t,c,h,w
 
     audio, audio_fps = None, None
-    if use_audio_in_video:
-        audio, audio_fps = torchaudio.load(video_bytes)
-        if audio.size(0) > 1:
-            audio = audio.mean(0, keepdim=True)  # 转单声道
+    if use_audio_in_video and len(container.streams.audio) > 0:
+        audio_frames = _read_from_stream(
+            container,
+            0.0,
+            float("inf"),
+            "sec",
+            container.streams.audio[0],
+            {"audio": 0},
+        )
+
+        aframes_list = [frame.to_ndarray() for frame in audio_frames]
+
+        if len(aframes_list) > 0:
+            aframes = np.concatenate(aframes_list, 1)
+            aframes = np.mean(aframes, axis=0)
+            audio_fps = container.streams.audio[0].rate
+            audio = aframes
 
     return video, video_fps, audio, audio_fps
 
@@ -199,9 +218,9 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
         audio_inputs.append(audio)
         audio_fps_list.append(audio_fps)
 
+    video_inputs = [smart_resize(video, **kwargs) for video in video_inputs]
     video_inputs = [
-        smart_video_nframes(smart_resize(video, **kwargs), video_fps, **kwargs)
-        for video, video_fps in zip(video_inputs, video_fps_list)
+        smart_video_nframes(video, video_fps, **kwargs) for video, video_fps in zip(video_inputs, video_fps_list)
     ]
 
     audio_inputs = [
