@@ -122,11 +122,11 @@ class DiTDataCollator(DataCollator):
 
 
 def main():
+    dist.init_process_group(backend="nccl")
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-    dist.init_process_group(backend="nccl")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     helper.enable_high_precision_for_bf16()
 
