@@ -150,7 +150,6 @@ def main():
         dp_mode=args.train.data_parallel_mode,
         ep_outside=args.train.ep_outside,
     )
-
     logger.info_rank0("Prepare trainier")
     trainer_config = args.model.trainer_config
 
@@ -248,27 +247,30 @@ def main():
             math.ceil(train_dataset.data_len / (args.train.global_batch_size)) * args.train.global_batch_size
         )
 
-    train_dataloader = build_dataloader(
-        dataset=train_dataset,
-        micro_batch_size=args.train.micro_batch_size,
-        global_batch_size=args.train.global_batch_size,
-        dataloader_batch_size=args.train.dataloader_batch_size,
-        seed=args.train.seed,
-        max_seq_len=args.data.max_seq_len,
-        train_steps=args.train.train_steps,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        dyn_bsz_margin=args.train.dyn_bsz_margin,
-        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
-        num_workers=args.data.num_workers,
-        drop_last=drop_last,  # TODO: offline embedding 不 droplast
-        shuffle=shuffle,
-        pin_memory=args.data.pin_memory,
-        prefetch_factor=args.data.prefetch_factor,
-        collate_fn=[DiTDataCollator()],
-    )
+    if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
+        train_dataloader = build_dataloader(
+            dataset=train_dataset,
+            micro_batch_size=args.train.micro_batch_size,
+            global_batch_size=args.train.global_batch_size,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            seed=args.train.seed,
+            max_seq_len=args.data.max_seq_len,
+            train_steps=args.train.train_steps,
+            rmpad=args.train.rmpad,
+            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+            bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+            dyn_bsz_margin=args.train.dyn_bsz_margin,
+            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+            num_workers=args.data.num_workers,
+            drop_last=drop_last,
+            shuffle=shuffle,
+            pin_memory=args.data.pin_memory,
+            prefetch_factor=args.data.prefetch_factor,
+            collate_fn=[DiTDataCollator()],
+        )
+    else:
+        train_dataloader = None
     if args.train.save_initial_model:
         if args.train.global_rank == 0:
             trainer.save_model_weights(args.train.output_dir)
@@ -331,10 +333,10 @@ def main():
             start_step = global_step % args.train.train_steps
             lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
 
-            if state["extra_state"].get("train_dataloader", None) is not None:
+            if train_dataloader is not None and state["extra_state"].get("train_dataloader", None) is not None:
                 train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
 
-            if start_step == 0:  # resume at the end of epoch
+            if train_dataloader is not None and start_step == 0:  # resume at the end of epoch
                 iter(train_dataloader)  # clear resume state and prefetch data
 
             dist.barrier()
@@ -357,7 +359,7 @@ def main():
     )
 
     for epoch in range(start_epoch, args.train.num_train_epochs):
-        if hasattr(train_dataloader, "set_epoch"):
+        if train_dataloader is not None and hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
         data_loader_tqdm = trange(
@@ -367,12 +369,30 @@ def main():
             initial=start_step,
             disable=args.train.local_rank != 0,
         )
-        data_iterator = iter(train_dataloader)
+        if train_dataloader is not None:
+            data_iterator = iter(train_dataloader)
+        else:
+            data_iterator = None
         for _ in range(start_step, args.train.train_steps):
             global_step += 1
 
             try:
-                micro_batches = next(data_iterator)
+                if get_parallel_state().sp_enabled:
+                    if get_parallel_state().sp_rank == 0:
+                        micro_batches = next(data_iterator)
+                    else:
+                        micro_batches = None
+
+                    obj_list = [micro_batches]
+                    torch.distributed.broadcast_object_list(
+                        obj_list,
+                        src=dist.get_global_rank(get_parallel_state().sp_group, 0),
+                        group=get_parallel_state().sp_group,
+                    )
+                    micro_batches = obj_list[0]
+                else:
+                    micro_batches = next(data_iterator)
+
             except StopIteration:
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
