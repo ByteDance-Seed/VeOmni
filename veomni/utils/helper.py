@@ -230,6 +230,8 @@ class EnvironMeter:
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
 
+        # Store per-rank flops before all_reduce
+        flops_achieved_per_rank = flops_achieved
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
@@ -257,6 +259,7 @@ class EnvironMeter:
 
         metrics = {
             "flops_achieved(T)": flops_achieved,
+            "flops_achieved_per_rank(T)": flops_achieved_per_rank,
             "flops_promised(T)": flops_promised,
             "mfu": mfu,
             "training/avg_effective_len": avg_effective_len,
