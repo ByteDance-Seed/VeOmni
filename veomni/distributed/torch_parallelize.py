@@ -364,18 +364,24 @@ def parallelize_model_fsdp2(
         blocks = [pair[1] for pair in layer_pairs]
         next_blocks = blocks[1:] + [None]
         for current_block, next_block in zip(blocks, next_blocks):
-            if next_block is not None:
-                prefetch_modules = next_block._fsdp_modules
-                # prefetch in order of attn, gate, experts
-                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+            # prefetch in order of attn, gate, experts
+            if next_block:
+                prefetch_modules = list(reversed(next_block._fsdp_modules))
+            else:
+                prefetch_modules = [model]
+            for curr_module in current_block._fsdp_modules:
+                curr_module.set_modules_to_backward_prefetch(prefetch_modules)
 
         # configure backward prefetch
         rev_blocks = list(reversed(blocks))
         prev_blocks = rev_blocks[1:] + [None]
         for current_block, prev_block in zip(rev_blocks, prev_blocks):
-            if prev_block is not None:
-                prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+            if prev_block:
+                prefetch_modules = list(reversed(prev_block._fsdp_modules))
+            else:
+                prefetch_modules = [model]
+            for curr_module in current_block._fsdp_modules:
+                curr_module.set_modules_to_backward_prefetch(prefetch_modules)
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
