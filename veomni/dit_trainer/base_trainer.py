@@ -219,6 +219,8 @@ class DiTBaseTrainer:
             from veomni.models.module_utils import _save_state_dict
 
             model_state_dict = get_peft_model_state_dict(self.dit_model, model_state_dict)
+            # save bf16 lora
+            model_state_dict = {k: v.to(torch.bfloat16) for k, v in model_state_dict.items()}
             lora_adapter_save_path = os.path.join(save_path, "adapter_model.bin")
             os.makedirs(save_path, exist_ok=True)
             _save_state_dict(model_state_dict, lora_adapter_save_path, safe_serialization=False)

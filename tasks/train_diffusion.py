@@ -341,7 +341,7 @@ def main():
 
             dist.barrier()
             logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
-
+            save_checkpoint_path = args.train.load_checkpoint_path
         helper.empty_cache()
 
         model.train()
