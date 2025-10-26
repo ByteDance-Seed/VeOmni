@@ -28,6 +28,8 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from .loader import BaseModelLoader, get_loader
+from ..utils.device import is_torch_npu_available
+import functools
 
 
 if TYPE_CHECKING:
@@ -123,5 +125,19 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
+
+    if is_torch_npu_available():
+        # for npu, set cu_seq_lens_q & cu_seq_lens_k to cpu
+        original_forward = model.forward
+        
+        @functools.wraps(original_forward)
+        def wrapped_forward(*args, **kwargs):
+            if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
+                kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_q"].cpu()
+            if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
+                kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_k"].cpu()
+            return original_forward(*args, **kwargs)
+        
+        model.forward = wrapped_forward
 
     return model
