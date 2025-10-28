@@ -127,7 +127,11 @@ def build_foundation_model(
     )
 
     if is_torch_npu_available():
-        # for npu, set cu_seq_lens_q & cu_seq_lens_k to cpu
+        # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
+        # due to the behavior in https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/fsdp/_fully_shard/_fsdp_state.py#L130
+        logger.info_rank0(
+            "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"
+        )
         original_forward = model.forward
 
         @functools.wraps(original_forward)
