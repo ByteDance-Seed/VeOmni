@@ -3,15 +3,18 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
-from PIL import Image
 from tqdm import trange
 
+from tasks.data.vlm_data_process import (
+    prepare_fa_kwargs_from_position_ids,
+    process_sample_qwen2_5_vl,
+    process_sample_qwen3_vl,
+)
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     OmniDataCollatorWithPacking,
@@ -37,17 +40,10 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
-from tasks.data.vlm_data_process import (
-    prepare_fa_kwargs_from_position_ids,
-    process_sample_qwen2_5_vl,
-    process_sample_qwen3_vl,
-)
 
 
 if TYPE_CHECKING:
-    from transformers import ProcessorMixin
-
-    from veomni.data.chat_template import ChatTemplate
+    pass
 
 
 logger = helper.create_logger(__name__)
@@ -83,12 +79,14 @@ class MyTrainingArguments(TrainingArguments):
         metadata={"help": "Maximum learning rate for vit parameters."},
     )
 
+
 @dataclass
 class MyDataArguments(DataArguments):
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
     )
+
 
 @dataclass
 class Arguments:
@@ -140,7 +138,7 @@ def main():
     processor.image_processor.max_pixels = MAX_PIXELS
     position_id_func = model.get_position_id_func()
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
-    
+
     if model_config.model_type == "qwen2_5_vl":
         transform = partial(
             process_sample_qwen2_5_vl,
@@ -159,7 +157,7 @@ def main():
         )
     else:
         raise ValueError(f"Unsupported model type: {model_config.model_type}")
-    
+
     if args.train.rmpad:
         raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
 
@@ -173,7 +171,12 @@ def main():
             OmniSequenceShardCollator(
                 padding_scale={
                     "pixel_values": processor.image_processor.merge_size**2,
-                    "pixel_values_videos": (processor.video_processor if hasattr(processor, 'video_processor') else processor.image_processor).merge_size**2,
+                    "pixel_values_videos": (
+                        processor.video_processor
+                        if hasattr(processor, "video_processor")
+                        else processor.image_processor
+                    ).merge_size
+                    ** 2,
                 },
                 rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
             )
@@ -361,7 +364,7 @@ def main():
                 # transpose back to (dim, 1, seq_len) for QwenVL compatibility
                 if micro_batch["position_ids"].shape[1] == 3:
                     micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
-                
+
                 # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
                 fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
                 micro_batch.update(

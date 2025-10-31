@@ -20,6 +20,7 @@ from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.data.multimodal.video_utils import fetch_videos
 
+
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
 

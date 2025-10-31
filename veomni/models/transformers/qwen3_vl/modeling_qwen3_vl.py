@@ -18,14 +18,13 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional, Union
 from functools import partial
 from types import SimpleNamespace
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -36,28 +35,33 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling, logging, replace_return_docstrings
-from transformers.utils.deprecation import deprecate_kwarg
-
-from transformers.utils.generic import check_model_inputs
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
+from transformers.processing_utils import Unpack
+from transformers.utils import (
+    TransformersKwargs,
+    auto_docstring,
+    is_torchdynamo_compiling,
+    replace_return_docstrings,
+)
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.generic import check_model_inputs
 
-
-from ....utils import helper
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
-    slice_position_embedding, 
-    sp_pad_and_slice,
-    gather_heads_scatter_seq, 
+    gather_heads_scatter_seq,
     gather_seq_scatter_heads,
+    slice_position_embedding,
+    sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops.loss import causallm_loss_function
+from ....utils import helper
+
 
 logger = helper.create_logger(__name__)
 
 _CONFIG_FOR_DOC = "Qwen3VLConfig"
+
 
 # Modification: wrapped Qwen3VLModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 def get_position_id(main_func, self, **kwargs):
@@ -743,7 +747,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
         if sp_group is not None:
             # We need to do padding here because of hidden_states did padding with pad_scale=4
-            pos_embeds =  sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale = 4)
+            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
         hidden_states = hidden_states + pos_embeds
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
@@ -768,8 +772,8 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos embedding
         if sp_group is not None:
             cos, sin = position_embeddings
-            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale = 4)
-            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale = 4)
+            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
+            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
             position_embeddings = (cos, sin)
 
         # Modification: pad cu_seqlens when using SP to match the padded hidden_states
@@ -782,7 +786,6 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                 # Add this extra sequence to cu_seqlens with the padding length
                 new_cumsum = cu_seqlens[-1] + pad_seq_len
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
-
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
@@ -1137,7 +1140,6 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds, deepstack_image_embeds
 
-
     # We don't use this but compute the image and video masks in advance in process_sample
     # def get_placeholder_mask(
     #     self,
@@ -1235,20 +1237,17 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             if self.training and get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 image_embeds = gather_seq_scatter_heads(
-                        image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                    )
+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
             # Original: We calcuated the special_image_mask in the forward pass,
             # but now we pre-compute it and pass it in as image_mask to avoid
             # all-gather to get complete image_mask info when using sequence parallel
             # special_image_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_features)
 
-
             # Modification: Get the num of image tokens from the pre-computed image_mask
             # And reshape the masks to match the shape of inputs_embeds
             n_image_tokens = image_mask.sum().long().item()
-            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
-                    inputs_embeds.device, non_blocking=True
-                )
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             # Modification: Slice tensor to drop any padded image tokens
             image_embeds = image_embeds[:n_image_tokens]
             deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
@@ -1269,15 +1268,14 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
 
-
         if pixel_values_videos is not None:
             video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
             # Modification: sequence parallel patch for video embeds
             if self.training and get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 video_embeds = gather_seq_scatter_heads(
-                        video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                    )
+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
             # _, video_mask = self.get_placeholder_mask(
             #     input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             # )
@@ -1285,9 +1283,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # Modification: Get the num of video tokens from the pre-computed video_mask
             # And reshape the masks to match the shape of inputs_embeds
             n_video_tokens = video_mask.sum().long().item()
-            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(
-                    inputs_embeds.device, non_blocking=True
-                )
+            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             # Modification: Slice tensor to drop any padded video tokens
             video_embeds = video_embeds[:n_video_tokens]
             deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
@@ -1313,78 +1309,74 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
         # Modification: Enable sequence parallel
         if self.training and get_parallel_state().sp_enabled:
-                # (batch_size, seq_len, hidden_size // sp_size) back to (batch_size, seq_len // sp_size, hidden_size)
-                inputs_embeds = gather_heads_scatter_seq(
-                    inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-                )
+            # (batch_size, seq_len, hidden_size // sp_size) back to (batch_size, seq_len // sp_size, hidden_size)
+            inputs_embeds = gather_heads_scatter_seq(
+                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+            )
 
-                # After sequence is scattered, do all_gather on deepstack embeddings
-                # and use masks to select the corresponding visual tokens for this rank
-                sp_size = get_parallel_state().sp_size
-                sp_rank = get_parallel_state().sp_rank
+            # After sequence is scattered, do all_gather on deepstack embeddings
+            # and use masks to select the corresponding visual tokens for this rank
+            sp_size = get_parallel_state().sp_size
+            sp_rank = get_parallel_state().sp_rank
 
-                if pixel_values is not None:
-                    # Do all_gather on deepstack_image_embeds
-                    # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
-                    deepstack_image_embeds = [
-                        _Gather.apply(get_parallel_state().sp_group, embed, 0, False)
-                        for embed in deepstack_image_embeds
-                    ]
+            if pixel_values is not None:
+                # Do all_gather on deepstack_image_embeds
+                # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
+                deepstack_image_embeds = [
+                    _Gather.apply(get_parallel_state().sp_group, embed, 0, False) for embed in deepstack_image_embeds
+                ]
 
-                    # Now use image_mask to select visual tokens for this rank's sequence slice
-                    # image_mask is (batch_size, seq_len, hidden_size // sp_size) before gather_heads_scatter_seq
-                    image_mask_1d = image_mask[..., 0]  # (batch_size, seq_len)
+                # Now use image_mask to select visual tokens for this rank's sequence slice
+                # image_mask is (batch_size, seq_len, hidden_size // sp_size) before gather_heads_scatter_seq
+                image_mask_1d = image_mask[..., 0]  # (batch_size, seq_len)
 
-                    # Determine which sequence positions belong to this rank
-                    seq_len = image_mask_1d.shape[1]
-                    seq_per_rank = seq_len // sp_size
-                    rank_start = sp_rank * seq_per_rank
-                    rank_end = rank_start + seq_per_rank
+                # Determine which sequence positions belong to this rank
+                seq_len = image_mask_1d.shape[1]
+                seq_per_rank = seq_len // sp_size
+                rank_start = sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
 
-                    # Get the mask for this rank's sequence slice and save it for later
-                    rank_image_mask = image_mask_1d[:, rank_start:rank_end]  # (batch_size, seq_len // sp_size)
+                # Get the mask for this rank's sequence slice and save it for later
+                rank_image_mask = image_mask_1d[:, rank_start:rank_end]  # (batch_size, seq_len // sp_size)
 
-                    # Count how many visual tokens are before this rank's slice
-                    before_rank_mask = image_mask_1d[:, :rank_start]
-                    offset = before_rank_mask.sum().item()
+                # Count how many visual tokens are before this rank's slice
+                before_rank_mask = image_mask_1d[:, :rank_start]
+                offset = before_rank_mask.sum().item()
 
-                    # Count how many visual tokens are in this rank's slice
-                    num_visual_tokens = rank_image_mask.sum().item()
+                # Count how many visual tokens are in this rank's slice
+                num_visual_tokens = rank_image_mask.sum().item()
 
-                    # Slice the all-gathered deepstack embeddings
-                    deepstack_image_embeds = [
-                        embed[offset:offset+num_visual_tokens]
-                        for embed in deepstack_image_embeds
-                    ]
+                # Slice the all-gathered deepstack embeddings
+                deepstack_image_embeds = [
+                    embed[offset : offset + num_visual_tokens] for embed in deepstack_image_embeds
+                ]
 
-                if pixel_values_videos is not None:
-                    # Do all_gather on deepstack_video_embeds
-                    # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
-                    deepstack_video_embeds = [
-                        _Gather.apply(get_parallel_state().sp_group, embed, 0, False)
-                        for embed in deepstack_video_embeds
-                    ]
+            if pixel_values_videos is not None:
+                # Do all_gather on deepstack_video_embeds
+                # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
+                deepstack_video_embeds = [
+                    _Gather.apply(get_parallel_state().sp_group, embed, 0, False) for embed in deepstack_video_embeds
+                ]
 
-                    # Same logic for video embeddings
-                    video_mask_1d = video_mask[..., 0]  # (batch_size, seq_len)
+                # Same logic for video embeddings
+                video_mask_1d = video_mask[..., 0]  # (batch_size, seq_len)
 
-                    seq_len = video_mask_1d.shape[1]
-                    seq_per_rank = seq_len // sp_size
-                    rank_start = sp_rank * seq_per_rank
-                    rank_end = rank_start + seq_per_rank
+                seq_len = video_mask_1d.shape[1]
+                seq_per_rank = seq_len // sp_size
+                rank_start = sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
 
-                    # Get the mask for this rank's sequence slice and save it for later
-                    rank_video_mask = video_mask_1d[:, rank_start:rank_end]
+                # Get the mask for this rank's sequence slice and save it for later
+                rank_video_mask = video_mask_1d[:, rank_start:rank_end]
 
-                    before_rank_mask = video_mask_1d[:, :rank_start]
-                    offset = before_rank_mask.sum().item()
+                before_rank_mask = video_mask_1d[:, :rank_start]
+                offset = before_rank_mask.sum().item()
 
-                    num_visual_tokens = rank_video_mask.sum().item()
+                num_visual_tokens = rank_video_mask.sum().item()
 
-                    deepstack_video_embeds = [
-                        embed[offset:offset+num_visual_tokens]
-                        for embed in deepstack_video_embeds
-                    ]
+                deepstack_video_embeds = [
+                    embed[offset : offset + num_visual_tokens] for embed in deepstack_video_embeds
+                ]
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
@@ -1829,6 +1821,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             model_kwargs["encoder_outputs"] = _expand_dict_for_generation(model_kwargs["encoder_outputs"])
 
         return input_ids, model_kwargs
+
 
 # Modification:
 # Register the ModelClass which is used by veOmni to tell which class to match the config.json architecture
