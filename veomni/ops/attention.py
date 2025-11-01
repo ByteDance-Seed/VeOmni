@@ -81,8 +81,8 @@ def flash_attention_forward(
                 f"ulysses_size ({ulysses_size}) must be divisible by num_key_value_heads ({kv_head_num})"
             )
             n_repeat = ulysses_size // kv_head_num
-            key = repeat_kv(key, n_repeat)
-            value = repeat_kv(value, n_repeat)
+            key = torch.repeat_interleave(key, dim=2, repeats=n_repeat)
+            value = torch.repeat_interleave(value, dim=2, repeats=n_repeat)
 
         if query.ndim == 4 and query.size(0) == 1:
             query, key, value = query.squeeze(0), key.squeeze(0), value.squeeze(0)
