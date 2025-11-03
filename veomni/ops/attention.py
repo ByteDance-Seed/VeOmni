@@ -18,18 +18,6 @@ if is_seed_kernels_available():
 logger = logging.get_logger(__name__)
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
 def flash_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -81,6 +69,10 @@ def flash_attention_forward(
                 f"ulysses_size ({ulysses_size}) must be divisible by num_key_value_heads ({kv_head_num})"
             )
             n_repeat = ulysses_size // kv_head_num
+            # Shape before: (batch_size, seq_len, kv_head_num, head_dim)
+            # This repeats the K/V heads (dim 2) to match the ulysses_size (SP world size).
+            # Shape after: (batch_size, seq_len, kv_head_num * n_repeat, head_dim),
+E           # where (kv_head_num * n_repeat) == ulysses_size. 
             key = torch.repeat_interleave(key, dim=2, repeats=n_repeat)
             value = torch.repeat_interleave(value, dim=2, repeats=n_repeat)
 
