@@ -70,9 +70,9 @@ def flash_attention_forward(
             )
             n_repeat = ulysses_size // kv_head_num
             # Shape before: (batch_size, seq_len, kv_head_num, head_dim)
-            # This repeats the K/V heads (dim 2) to match the ulysses_size (SP world size).
-            # Shape after: (batch_size, seq_len, kv_head_num * n_repeat, head_dim),
-E           # where (kv_head_num * n_repeat) == ulysses_size. 
+            # This repeats the K/V heads (dim 2) to match the ulysses_size (SP world size)
+            # Shape after: (batch_size, seq_len, kv_head_num * n_repeat, head_dim)
+            # where (kv_head_num * n_repeat) == ulysses_size
             key = torch.repeat_interleave(key, dim=2, repeats=n_repeat)
             value = torch.repeat_interleave(value, dim=2, repeats=n_repeat)
 
