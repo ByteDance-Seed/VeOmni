@@ -3,15 +3,18 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from io import BytesIO
-from typing import TYPE_CHECKING, Any, Callable, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
-from PIL import Image
 from tqdm import trange
 
+from tasks.data.vlm_data_process import (
+    prepare_fa_kwargs_from_position_ids,
+    process_sample_qwen2_5_vl,
+    process_sample_qwen3_vl,
+)
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     OmniDataCollatorWithPacking,
@@ -23,8 +26,6 @@ from veomni.data import (
     build_mapping_dataset,
     build_multimodal_chat_template,
 )
-from veomni.data.constants import IMAGE_INPUT_INDEX
-from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -42,9 +43,7 @@ from veomni.utils.dist_utils import all_reduce
 
 
 if TYPE_CHECKING:
-    from transformers import ProcessorMixin
-
-    from veomni.data.chat_template import ChatTemplate
+    pass
 
 
 logger = helper.create_logger(__name__)
@@ -55,51 +54,6 @@ ROLE_MAPPING = {
     "human": "user",
     "gpt": "assistant",
 }
-
-
-def process_sample(
-    sample: Dict[str, Any],
-    processor: "ProcessorMixin",
-    chat_template: "ChatTemplate",
-    position_id_func: "Callable",
-    **kwargs,
-):
-    """
-    Processes multimodal example with qwen2_5_vl's pre-processor.
-    """
-    source_name = sample["source_name"] if "source_name" in sample else kwargs["source_name"]
-    conversations = sample["text"] if source_name == "fineweb_100BT" else sample["conversations"]  # text-only data
-    conversations = conv_preprocess(source_name, conversations, **kwargs)
-
-    token_num_inputs, image_inputs = {}, {}
-    image_grid_thw = None
-
-    if "images" in sample and sample["images"]:
-        images = []
-        for image in sample["images"]:
-            images.append(Image.open(BytesIO(image)).convert("RGB"))
-
-        image_inputs = processor.image_processor(images=images, return_tensors="pt")
-        image_grid_thw = image_inputs["image_grid_thw"]
-        merge_length = processor.image_processor.merge_size**2
-        image_token_num = image_grid_thw.prod(dim=-1) // merge_length
-        token_num_inputs["image"] = image_token_num
-
-    tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
-    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
-    input_ids = tokenized_example["input_ids"]
-
-    position_ids = position_id_func(
-        input_ids=input_ids.unsqueeze(0),
-        image_grid_thw=image_grid_thw,
-        attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
-    )["position_ids"]
-    tokenized_example["position_ids"] = position_ids.squeeze().clone()  # (dim, l)
-
-    tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
-    tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
-    tokenized_example.update(image_inputs)
-    return [tokenized_example]
 
 
 def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
@@ -123,6 +77,14 @@ class MyTrainingArguments(TrainingArguments):
     vit_lr: float = field(
         default=1e-6,
         metadata={"help": "Maximum learning rate for vit parameters."},
+    )
+
+
+@dataclass
+class MyDataArguments(DataArguments):
+    mm_configs: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for multimodal input."},
     )
 
 
@@ -176,15 +138,28 @@ def main():
     processor.image_processor.max_pixels = MAX_PIXELS
     position_id_func = model.get_position_id_func()
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
-    transform = partial(
-        process_sample,
-        processor=processor,
-        chat_template=chat_template,
-        position_id_func=position_id_func,
-    )
+
+    if model_config.model_type == "qwen2_5_vl":
+        transform = partial(
+            process_sample_qwen2_5_vl,
+            processor=processor,
+            chat_template=chat_template,
+            position_id_func=position_id_func,
+            **args.data.mm_configs,
+        )
+    elif model_config.model_type == "qwen3_vl":
+        transform = partial(
+            process_sample_qwen3_vl,
+            processor=processor,
+            chat_template=chat_template,
+            position_id_func=position_id_func,
+            **args.data.mm_configs,
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model_config.model_type}")
 
     if args.train.rmpad:
-        raise ValueError("Qwen2-VL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
+        raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
 
     data_collate_fn = []
     if args.train.rmpad_with_pos_ids:
@@ -196,6 +171,12 @@ def main():
             OmniSequenceShardCollator(
                 padding_scale={
                     "pixel_values": processor.image_processor.merge_size**2,
+                    "pixel_values_videos": (
+                        processor.video_processor
+                        if hasattr(processor, "video_processor")
+                        else processor.image_processor
+                    ).merge_size
+                    ** 2,
                 },
                 rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
             )
@@ -377,6 +358,24 @@ def main():
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
                     for k, v in micro_batch.items()
                 }
+
+                # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)
+                # data collator adds batch dim -> (1, dim, seq_len) for unified SP slicing
+                # transpose back to (dim, 1, seq_len) for QwenVL compatibility
+                if micro_batch["position_ids"].shape[1] == 3:
+                    micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
+
+                # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
+                fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
+                micro_batch.update(
+                    dict(
+                        cu_seq_lens_q=fa_kwargs["cu_seq_lens_q"],
+                        cu_seq_lens_k=fa_kwargs["cu_seq_lens_k"],
+                        max_length_q=fa_kwargs["max_length_q"],
+                        max_length_k=fa_kwargs["max_length_k"],
+                    )
+                )
+
                 with model_fwd_context:
                     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss / len(micro_batches)
 

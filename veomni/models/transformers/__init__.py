@@ -24,6 +24,7 @@ from . import (
     qwen2_vl,
     qwen3,
     qwen3_moe,
+    qwen3_vl,
     seed_oss,
     wan,
 )
@@ -43,4 +44,5 @@ __all__ = [
     "qwen3_moe",
     "seed_oss",
     "wan",
+    "qwen3_vl",
 ]
