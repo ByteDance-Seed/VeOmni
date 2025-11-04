@@ -354,11 +354,6 @@ def main():
                     micro_batch.pop("ds_idx", None)
                     micro_batch.pop("source_name", None)
 
-                micro_batch = {
-                    k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
-                    for k, v in micro_batch.items()
-                }
-
                 # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)
                 # data collator adds batch dim -> (1, dim, seq_len) for unified SP slicing
                 # transpose back to (dim, 1, seq_len) for QwenVL compatibility
@@ -375,6 +370,11 @@ def main():
                         max_length_k=fa_kwargs["max_length_k"],
                     )
                 )
+
+                micro_batch = {
+                    k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in micro_batch.items()
+                }
 
                 with model_fwd_context:
                     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss / len(micro_batches)
