@@ -18,6 +18,7 @@ from veomni.data import (
     build_mapping_dataset,
 )
 from veomni.data.data_collator import DataCollator
+from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.data.multimodal.video_utils import fetch_videos
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -88,15 +89,19 @@ class Arguments:
 
 
 def process_online_example(example, processor, source_name, **kwargs):
-    prompts = example["inputs"]  # TODO: maybe image in inputs
-    prompts = conv_preprocess(source=source_name, conversation=prompts, **kwargs)
-    video_info = example["outputs"][0]  # TODO: multi video or sth else
+    inputs, outputs, images, videos = conv_preprocess(source=source_name, conversation=example, **kwargs)
 
     if kwargs.get("use_audio_in_video", True):
         raise NotImplementedError("Audio in video is not supported yet for dit training.")
-    video_inputs, _ = fetch_videos([video_info["video_bytes"].encode("latin-1")], **kwargs)
+    videos, _ = fetch_videos(videos, **kwargs)
+    images = fetch_images(images, **kwargs)
 
-    processed_example = processor.preprocess(prompts, video_inputs)
+    processed_example = processor.preprocess(
+        inputs=inputs,
+        outputs=outputs,
+        images=images,
+        videos=videos,
+    )
     return [processed_example]
 
 
