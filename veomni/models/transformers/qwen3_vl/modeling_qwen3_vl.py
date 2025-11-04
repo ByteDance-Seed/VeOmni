@@ -1046,10 +1046,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             past_key_values=past_key_values,
         )
 
+        # Treat any non-CPU device as an accelerator without hardcoding backend strings
+        is_accel_device = input_tensor.device.type != "cpu"
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
-            and attention_mask.device.type in ["cuda", "xpu", "npu"]
+            and is_accel_device
             and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
