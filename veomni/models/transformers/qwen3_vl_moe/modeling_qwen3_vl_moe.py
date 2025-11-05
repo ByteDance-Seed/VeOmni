@@ -16,13 +16,15 @@
 # as of commit https://github.com/huggingface/transformers/commit/8cb5963cc22174954e7dca2c0a3320b7dc2f4edc
 
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from functools import partial
+from types import SimpleNamespace
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -33,11 +35,38 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
+    Qwen3VLMoeConfig,
+    Qwen3VLMoeTextConfig,
+    Qwen3VLMoeVisionConfig,
+)
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling
+from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling, replace_return_docstrings
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import OutputRecorder, check_model_inputs
-from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig, Qwen3VLMoeVisionConfig
+
+from ....distributed.parallel_state import get_parallel_state
+from ....distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
+    slice_position_embedding,
+    sp_pad_and_slice,
+)
+from ....distributed.sequence_parallel.ulysses import _Gather
+from ....ops import causallm_loss_function, fused_moe_forward
+from ....utils import helper
+
+
+logger = helper.create_logger(__name__)
+
+_CONFIG_FOR_DOC = "Qwen3VLMoeConfig"
+
+
+# Modification: wrapped Qwen3VLMoeModel.get_rope_index to use in process_sample for obtaining position_ids in advance
+def get_position_id(main_func, self, **kwargs):
+    # must be a global func for multiproceesing serialize
+    position_ids, rope_deltas = main_func(self, **kwargs)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -71,9 +100,14 @@ class Qwen3VLMoeTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim))
         self.down_proj = nn.Parameter(torch.empty((self.num_experts, self.expert_dim, self.hidden_size)))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.moe_implementation = config._moe_implementation
 
     def forward(
-        self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, router_indices: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        router_indices: torch.Tensor,
+        routing_weights_topk: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         When training it is more efficient to just loop over the experts and compute the output for each expert
@@ -82,15 +116,17 @@ class Qwen3VLMoeTextExperts(nn.Module):
         For inference we can sacrifice some memory and compute the output for all experts at once. By repeating the inputs.
 
         Args:
-            hidden_states (torch.Tensor): (batch_size * token_num, hidden_size)
-            routing_weights (torch.Tensor): (batch_size * token_num, num_experts)
+            hidden_states (torch.Tensor): (batch_size, seq_len, hidden_size)
+            routing_weights (torch.Tensor): (batch_size * token_num, num_experts) - full scattered weights
             router_indices (torch.Tensor): (batch_size * token_num, top_k)
+            routing_weights_topk (torch.Tensor): (batch_size * token_num, top_k) - compact top-k weights for fused mode
         Returns:
             torch.Tensor
         """
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
-        if self.training:
+        if self.training and self.moe_implementation == "eager":
+            assert not get_parallel_state().ep_enabled, "_moe_implementation=`eager` does not support EP"
             next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
             with torch.no_grad():
                 expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=self.num_experts)
@@ -108,6 +144,36 @@ class Qwen3VLMoeTextExperts(nn.Module):
                 out = gated_output @ self.down_proj[expert_idx]
                 weighted_output = out[0] * routing_weights[token_idx, expert_idx, None]
                 next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
+            next_states = next_states.view(batch_size, -1, self.hidden_size)
+
+        # Modification: fused MoE forward for better performance and enable EP
+        elif self.training and self.moe_implementation == "fused":
+            # we need compact top-k routing weights for fused implementation
+            assert routing_weights_topk is not None, "routing_weights_topk must be provided for fused implementation"
+
+            # Split gate_up_proj into gate_proj and up_proj
+            gate_proj = self.gate_up_proj[..., : self.expert_dim]
+            up_proj = self.gate_up_proj[..., self.expert_dim :]
+            # Transpose weights to match expected shape for fused_moe_forward
+            # Expected: fc1_1/fc1_2: (num_experts, intermediate_size, hidden_dim)
+            #          fc2: (num_experts, hidden_dim, intermediate_size)
+            # Current: gate_proj/up_proj: (num_experts, hidden_size, expert_dim)
+            #         down_proj: (num_experts, expert_dim, hidden_size)
+            gate_proj_t = gate_proj.transpose(1, 2).contiguous()  # (num_experts, expert_dim, hidden_size)
+            up_proj_t = up_proj.transpose(1, 2).contiguous()  # (num_experts, expert_dim, hidden_size)
+            down_proj_t = self.down_proj.transpose(1, 2).contiguous()  # (num_experts, hidden_size, expert_dim)
+
+            next_states = fused_moe_forward(
+                module=self,
+                num_experts=self.num_experts,
+                routing_weights=routing_weights_topk,  # Use compact top-k weights
+                selected_experts=router_indices,
+                hidden_states=hidden_states,
+                fc1_1_weight=gate_proj_t,
+                fc1_2_weight=up_proj_t,
+                fc2_weight=down_proj_t,
+            )
+            # Reshape output to match eager mode: (batch_size, seq_len, hidden_size)
             next_states = next_states.view(batch_size, -1, self.hidden_size)
         else:
             hidden_states = hidden_states.repeat(self.num_experts, 1)
@@ -140,12 +206,12 @@ class Qwen3VLMoeTextSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         router_logits = self.gate(hidden_states)
         routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
-        routing_weights, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
-        router_weights = torch.zeros_like(router_logits).scatter_(1, router_indices, routing_weights)
+        routing_weights_topk, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights_topk = routing_weights_topk / routing_weights_topk.sum(dim=-1, keepdim=True)
+        routing_weights_topk = routing_weights_topk.to(hidden_states.dtype)
+        router_weights = torch.zeros_like(router_logits).scatter_(1, router_indices, routing_weights_topk)
         hidden_states = hidden_states.reshape(batch_size, -1, self.hidden_size)
-        routed_out = self.experts(hidden_states, router_weights, router_indices)
+        routed_out = self.experts(hidden_states, router_weights, router_indices, routing_weights_topk)
         return routed_out, router_logits
 
 
@@ -423,6 +489,12 @@ class Qwen3VLMoePreTrainedModel(PreTrainedModel):
             module.gate_up_proj.data.normal_(mean=0.0, std=std)
             module.down_proj.data.normal_(mean=0.0, std=std)
 
+    # Add EP parallel plan
+    def get_parallel_plan(self):
+        from .parallel_plan import get_parallel_plan
+
+        return get_parallel_plan()
+
 
 class Qwen3VLMoeVisionMLP(nn.Module):
     def __init__(self, config):
@@ -519,6 +591,7 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
@@ -540,7 +613,8 @@ class Qwen3VLMoeVisionAttention(nn.Module):
 
         if self.config._attn_implementation == "flash_attention_2":
             # Flash Attention 2: Use cu_seqlens for variable length attention
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            # Modifaction: we should compute max_seqlen once in advance to avoid per-layer cpu-gpu sync
+            # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -596,6 +670,7 @@ class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
@@ -603,6 +678,7 @@ class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -764,15 +840,13 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+        # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos embedding
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        if sp_group is not None:
+            # We need to do padding here because of hidden_states did padding with pad_scale=4
+            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
         hidden_states = hidden_states + pos_embeds
-
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -784,11 +858,42 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # Modifcation: Get before-sliced full seq from cu_seqlens
+        # total_seq_len should equal to seq_len when not using SP
+        total_seq_len = cu_seqlens[-1]
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        # Modifcation: slice pos embedding when using sp to let sp-sliced hidden_states get its corresponding pos embedding
+        if sp_group is not None:
+            cos, sin = position_embeddings
+            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
+            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
+            position_embeddings = (cos, sin)
+
+        # Modification: pad cu_seqlens when using SP to match the padded hidden_states
+        if sp_group is not None:
+            ps = get_parallel_state()
+            sp_size = getattr(ps, "sp_size", 1)
+            # Calculate the last one padding seq_len : seq_len*sp_size - total_seq_len
+            pad_seq_len = seq_len * sp_size - total_seq_len.item()
+            if pad_seq_len > 0:
+                # Add this extra sequence to cu_seqlens with the padding length
+                new_cumsum = cu_seqlens[-1] + pad_seq_len
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+
         deepstack_feature_lists = []
+        # Modification: calculate max_seqlen from cu_seqlens here to avoid per layer CPU-GPU sync
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
@@ -801,6 +906,21 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         hidden_states = self.merger(hidden_states)
 
         return hidden_states, deepstack_feature_lists
+
+    # Modification: add dummy_forward to avoid FSDP reduce-scatter hang
+    # when some ranks get None pixel_values while others get valid pixel_values
+    def dummy_forward(self):
+        if get_parallel_state().sp_enabled:
+            sp_size = get_parallel_state().sp_size
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            # If using SP, pixel_values is sliced but grid_thw is not
+            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        else:
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        return self(**dummy_data)
 
 
 class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
@@ -953,6 +1073,10 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # Modifcation: slice pos embedding when using sp to let sp-sliced hidden_states get its corresponding pos_embedding
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        if sp_group is not None:
+            position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
@@ -985,6 +1109,13 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
     ):
+        # Handle case when visual_pos_masks is None (both image and video pixel_values are None)
+        # Still call this operation but just add 0.0 to hidden_states to avoid FSDP reduce scatter stuck
+        if visual_pos_masks is None:
+            visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+            hidden_states = hidden_states + visual_embeds.mean() * 0.0
+            return hidden_states
+
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
         local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
@@ -1058,6 +1189,9 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
+        moe_implementation = getattr(config, "_moe_implementation", "eager")
+        # Modification: set _moe_implementation on text_config so it can be accessed by the model
+        config.text_config._moe_implementation = moe_implementation
         self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
 
@@ -1222,49 +1356,48 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds, deepstack_image_embeds
 
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: Optional[torch.FloatTensor] = None,
-        video_features: Optional[torch.FloatTensor] = None,
-    ):
-        """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
-        """
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_image_mask = special_image_mask.all(-1)
-            special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_video_mask = special_video_mask.all(-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
+    # We don't use this but compute the image and video masks in advance in process_sample
+    # def get_placeholder_mask(
+    #     self,
+    #     input_ids: torch.LongTensor,
+    #     inputs_embeds: torch.FloatTensor,
+    #     image_features: Optional[torch.FloatTensor] = None,
+    #     video_features: Optional[torch.FloatTensor] = None,
+    # ):
+    #     """
+    #     Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
+    #     equal to the length of multimodal features. If the lengths are different, an error is raised.
+    #     """
+    #     if input_ids is None:
+    #         special_image_mask = inputs_embeds == self.get_input_embeddings()(
+    #             torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+    #         )
+    #         special_image_mask = special_image_mask.all(-1)
+    #         special_video_mask = inputs_embeds == self.get_input_embeddings()(
+    #             torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+    #         )
+    #         special_video_mask = special_video_mask.all(-1)
+    #     else:
+    #         special_image_mask = input_ids == self.config.image_token_id
+    #         special_video_mask = input_ids == self.config.video_token_id
 
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
-            )
+    #     n_image_tokens = special_image_mask.sum()
+    #     special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    #     if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
+    #         raise ValueError(
+    #             f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+    #         )
 
-        n_video_tokens = special_video_mask.sum()
-        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
-            raise ValueError(
-                f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
-            )
+    #     n_video_tokens = special_video_mask.sum()
+    #     special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    #     if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
+    #         raise ValueError(
+    #             f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+    #         )
 
-        return special_image_mask, special_video_mask
+    #     return special_image_mask, special_video_mask
 
     @auto_docstring
     @check_model_inputs
@@ -1294,31 +1427,182 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        image_mask = None
-        video_mask = None
+        # Modification: we use the pre-computed image and video mask to support ulysses
+        assert "image_mask" in kwargs, "image_mask should have already been computed in process_sample"
+        assert "video_mask" in kwargs, "video_mask should have already been computed in process_sample"
+        image_mask = kwargs["image_mask"]
+        video_mask = kwargs["video_mask"]
+
+        # Modification: Pop flash attention kwargs for ViT, they should only be used for language model
+        # Qwen3L ViT input images seq lens should be computed during ViT forward using grid_thw
+        # https://github.com/huggingface/transformers/blob/94df0e65602922be2831b3faa457a2bde78b936b/src/transformers/modeling_flash_attention_utils.py#L432-L450
+        flash_attn_kwargs = {}
+        for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+            if key in kwargs:
+                flash_attn_kwargs[key] = kwargs.pop(key)
+
+        if self.training and get_parallel_state().sp_enabled:
+            # (batch_size, seq_len // sp_size, hidden_size) to  (batch_size, seq_len, hidden_size // sp_size)
+            inputs_embeds = gather_seq_scatter_heads(
+                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
+            )
+
+        # Initialize fake_deepstack to None
+        fake_deepstack = None
 
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-            )
+            if self.training and get_parallel_state().sp_enabled:
+                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+                image_embeds = gather_seq_scatter_heads(
+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
+            # Original: We calcuated the special_image_mask in the forward pass,
+            # but now we pre-compute it and pass it in as image_mask to avoid
+            # all-gather to get complete image_mask info when using sequence parallel
+            # special_image_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_features)
+
+            # Modification: Get the num of image tokens from the pre-computed image_mask
+            # And reshape the masks to match the shape of inputs_embeds
+            n_image_tokens = image_mask.sum().long().item()
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+
+            # Modification: Slice tensor to drop any padded image tokens
+            image_embeds = image_embeds[:n_image_tokens]
+            deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
+            n_image_features = image_embeds.shape[0]
+            if n_image_tokens != n_image_features:
+                raise ValueError(
+                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                )
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        elif get_parallel_state().fsdp_enabled:
+            # Modification: add dummy ViT forward to avoid FSDP reduce-scatter hang
+            # when some ranks get None pixel_values while others get valid pixel_values
+            fake_embeds, fake_deepstack = self.visual.dummy_forward()
+            fake_embeds = fake_embeds.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
 
         if pixel_values_videos is not None:
             video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
+            # Modification: sequence parallel patch for video embeds
+            if self.training and get_parallel_state().sp_enabled:
+                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+                video_embeds = gather_seq_scatter_heads(
+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
+            # _, video_mask = self.get_placeholder_mask(
+            #     input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            # )
+
+            # Modification: Get the num of video tokens from the pre-computed video_mask
+            # And reshape the masks to match the shape of inputs_embeds
+            n_video_tokens = video_mask.sum().long().item()
+            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+
+            # Modification: Slice tensor to drop any padded video tokens
+            video_embeds = video_embeds[:n_video_tokens]
+            deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
+            n_video_features = video_embeds.shape[0]
+            if n_video_tokens != n_video_features:
+                raise ValueError(
+                    f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                )
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        elif get_parallel_state().fsdp_enabled:
+            # Modification: add dummy ViT forward to avoid FSDP reduce-scatter hang
+            # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
+            fake_embeds, fake_deepstack = self.visual.dummy_forward()
+            fake_embeds = fake_embeds.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
+
+        # Prepare sliced masks for deepstack use
+        rank_image_mask = None
+        rank_video_mask = None
+
+        # Modification: sequence parallel patch
+        if self.training and get_parallel_state().sp_enabled:
+            # (batch_size, seq_len, hidden_size // sp_size) back to (batch_size, seq_len // sp_size, hidden_size)
+            inputs_embeds = gather_heads_scatter_seq(
+                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+            )
+
+            # After sequence is scattered, do all_gather on deepstack embeddings
+            # and use masks to select the corresponding visual tokens for this rank
+            sp_size = get_parallel_state().sp_size
+            sp_rank = get_parallel_state().sp_rank
+
+            if pixel_values is not None:
+                # Do all_gather on deepstack_image_embeds
+                # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
+                deepstack_image_embeds = [
+                    _Gather.apply(get_parallel_state().sp_group, embed, 0, False) for embed in deepstack_image_embeds
+                ]
+
+                # Now use image_mask to select visual tokens for this rank's sequence slice
+                # image_mask is (batch_size, seq_len, hidden_size // sp_size) before gather_heads_scatter_seq
+                image_mask_1d = image_mask[..., 0]  # (batch_size, seq_len)
+
+                # Determine which sequence positions belong to this rank
+                seq_len = image_mask_1d.shape[1]
+                seq_per_rank = seq_len // sp_size
+                rank_start = sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
+
+                # Get the mask for this rank's sequence slice and save it for later
+                rank_image_mask = image_mask_1d[:, rank_start:rank_end]  # (batch_size, seq_len // sp_size)
+                # Count how many visual tokens are before this rank's slice
+                before_rank_mask = image_mask_1d[:, :rank_start]
+                offset = before_rank_mask.sum().item()
+                # Count how many visual tokens are in this rank's slice
+                num_visual_tokens = rank_image_mask.sum().item()
+                # Slice the all-gathered deepstack embeddings
+                deepstack_image_embeds = [
+                    embed[offset : offset + num_visual_tokens] for embed in deepstack_image_embeds
+                ]
+
+            if pixel_values_videos is not None:
+                # Do all_gather on deepstack_video_embeds
+                # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
+                deepstack_video_embeds = [
+                    _Gather.apply(get_parallel_state().sp_group, embed, 0, False) for embed in deepstack_video_embeds
+                ]
+
+                # Same logic for video embeddings
+                video_mask_1d = video_mask[..., 0]  # (batch_size, seq_len)
+                seq_len = video_mask_1d.shape[1]
+                seq_per_rank = seq_len // sp_size
+                rank_start = sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
+
+                # Get the mask for this rank's sequence slice and save it for later
+                rank_video_mask = video_mask_1d[:, rank_start:rank_end]
+                before_rank_mask = video_mask_1d[:, :rank_start]
+                offset = before_rank_mask.sum().item()
+                num_visual_tokens = rank_video_mask.sum().item()
+                deepstack_video_embeds = [
+                    embed[offset : offset + num_visual_tokens] for embed in deepstack_video_embeds
+                ]
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
-        if image_mask is not None and video_mask is not None:
+
+        # Modification: use pixel_values and pixel_values_videos instead of masks
+        if pixel_values is not None and pixel_values_videos is not None:
             # aggregate visual_pos_masks and deepstack_visual_embeds
-            image_mask = image_mask[..., 0]
-            video_mask = video_mask[..., 0]
+            # reuse the sliced masks if SP is enabled
+            if rank_image_mask is not None:
+                image_mask = rank_image_mask
+            else:
+                image_mask = image_mask[..., 0]
+            if rank_video_mask is not None:
+                video_mask = rank_video_mask
+            else:
+                video_mask = video_mask[..., 0]
             visual_pos_masks = image_mask | video_mask
             deepstack_visual_embeds = []
             image_mask_joint = image_mask[visual_pos_masks]
@@ -1328,14 +1612,31 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                 embed_joint[image_mask_joint, :] = img_embed
                 embed_joint[video_mask_joint, :] = vid_embed
                 deepstack_visual_embeds.append(embed_joint)
-        elif image_mask is not None:
-            image_mask = image_mask[..., 0]
+        elif pixel_values is not None:
+            # Modification: Reuse the sliced mask if SP is enabled
+            if rank_image_mask is not None:
+                image_mask = rank_image_mask
+            else:
+                image_mask = image_mask[..., 0]
             visual_pos_masks = image_mask
             deepstack_visual_embeds = deepstack_image_embeds
-        elif video_mask is not None:
-            video_mask = video_mask[..., 0]
+        elif pixel_values_videos is not None:
+            # Modification: Reuse the sliced mask if SP is enabled
+            if rank_video_mask is not None:
+                video_mask = rank_video_mask
+            else:
+                video_mask = video_mask[..., 0]
             visual_pos_masks = video_mask
             deepstack_visual_embeds = deepstack_video_embeds
+        else:
+            # Both pixel_values and pixel_values_videos are None
+            # still pass fake_deepstack to language_model to trigger _deepstack_process
+            # to avoid FSDP backward reduce scatter stuck
+            # visual_pos_masks remains None, so _deepstack_process will just add 0.0
+            if fake_deepstack is not None:
+                deepstack_visual_embeds = fake_deepstack
+            else:
+                deepstack_visual_embeds = None
 
         if position_ids is None:
             attention_mask_tensor = (
@@ -1382,6 +1683,9 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                     delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        # Modification: Restore flash attention kwargs for language model to avoid CPU-GPU sync
+        kwargs.update(flash_attn_kwargs)
 
         outputs = self.language_model(
             input_ids=None,
@@ -1496,6 +1800,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         self.model = Qwen3VLMoeModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
+        # Modification: Use the VeOmni custom loss function to handle Ulysses internally in a unified interface
+        self.loss_function = causallm_loss_function
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1527,7 +1834,13 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
     def visual(self):
         return self.model.visual
 
+    # Modification: add the get_position_id_func to be used in data_transform
+    def get_position_id_func(self):
+        fake_model = SimpleNamespace(config=self.config)
+        return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
+
     @check_model_inputs
+    @replace_return_docstrings(output_type=Qwen3VLMoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1553,6 +1866,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+
+        Returns:
 
         Example:
         ```python
@@ -1613,11 +1928,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
 
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        # Modification: use the unified loss function to handle Ulysses internally to reduce redudnecy code
+        hidden_states = hidden_states[:, slice_indices, :]
         loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+        logits = None
+        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
         aux_loss = None
         if kwargs.get("output_router_logits", False):
@@ -1819,6 +2135,10 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
 
         return input_ids, model_kwargs
 
+
+# Modification:
+# Register the ModelClass which is used by veOmni to tell which class to match the config.json architecture
+ModelClass = Qwen3VLMoeForConditionalGeneration
 
 __all__ = [
     "Qwen3VLMoeVisionModel",
