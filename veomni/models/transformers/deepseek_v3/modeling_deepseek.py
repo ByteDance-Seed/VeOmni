@@ -370,6 +370,8 @@ class MoEGate(nn.Module):
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
         topk_weight = topk_weight * self.routed_scaling_factor  # must multiply the scaling factor
+        # Ensure routing weights keep the same dtype as hidden states so checkpoint recomputations stay consistent.
+        topk_weight = topk_weight.to(hidden_states.dtype)
 
         return topk_idx, topk_weight
 
@@ -472,10 +474,12 @@ class DeepseekV3FusedMoE(DeepseekV3MoE):
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
-        final_hidden_states = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
-
+        # we compute shared expert first to workaround the duplicated AllGather issue when using EP+FSDP2
+        # which seems to be a bug of fsdp2 fully_shard
         if self.config.n_shared_experts is not None:
             final_hidden_states = final_hidden_states + self.shared_experts(identity)
+
+        final_hidden_states = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
 
         return final_hidden_states
 
