@@ -471,15 +471,19 @@ class DeepseekV3FusedMoE(DeepseekV3MoE):
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
         # we compute shared expert first to workaround the duplicated AllGather issue when using EP+FSDP2
         # which seems to be a bug of fsdp2 fully_shard
         if self.config.n_shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(identity)
+            shared_expert_outputs = self.shared_experts(identity)
+        else:
+            shared_expert_outputs = None
 
-        final_hidden_states = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
+        moe_outputs = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
+
+        if shared_expert_outputs is not None:
+            final_hidden_states = moe_outputs + shared_expert_outputs
+        else:
+            final_hidden_states = moe_outputs
 
         return final_hidden_states
 
