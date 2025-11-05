@@ -51,6 +51,13 @@ if is_torch_version_greater_than("2.4"):
 logger = logging.get_logger(__name__)
 
 
+def _reset_hf_initialized_flag(module: nn.Module) -> None:
+    if hasattr(module, "_is_hf_initialized"):
+        module._is_hf_initialized = False
+    for child in module.children():
+        _reset_hf_initialized_flag(child)
+
+
 def verbose_fsdp_grouping(model, prefix="", depth=0):
     indent = "    " * depth
 
@@ -382,6 +389,7 @@ def parallelize_model_fsdp2(
 
     if weights_path is None:
         model.to_empty(device="cuda")
+        _reset_hf_initialized_flag(model)
         model.init_weights()
     else:
         from torch.distributed.tensor import distribute_tensor
