@@ -128,6 +128,7 @@ def main():
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
         force_use_huggingface=args.model.force_use_huggingface,
+        moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
     )
     model_config = model.config
@@ -147,7 +148,7 @@ def main():
             position_id_func=position_id_func,
             **args.data.mm_configs,
         )
-    elif model_config.model_type == "qwen3_vl":
+    elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
         transform = partial(
             process_sample_qwen3_vl,
             processor=processor,
