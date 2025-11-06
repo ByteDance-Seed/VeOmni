@@ -307,6 +307,7 @@ def parallelize_model_fsdp2(
         fsdp_kwargs_without_mp = dict(fsdp_kwargs)
         fsdp_kwargs_without_mp.pop("mp_policy", None)
         # for high-precision modules, we do not reshard them after forward to avoid all-gather them in backward
+        # these modules will stay in GPU memory so please ensure high-precision modules do not contain too many parameters
         fsdp_kwargs_without_mp["reshard_after_forward"] = False
     else:
         mp_ignored_classes = None
