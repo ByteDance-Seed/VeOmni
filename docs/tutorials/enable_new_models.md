@@ -24,7 +24,7 @@ FSDP support in VeOmni is straightforward thanks to PyTorch's native FSDP implem
 
 This is **only required for VLM (Vision-Language Models)** and **only for the ViT (Vision Transformer) component**. The dummy forward is needed for **both image and video inputs** to prevent FSDP reduce-scatter hangs.
 
-When using FSDP, if some ranks in the same FSDP group receive `None` for `pixel_values` (images) or `pixel_values_videos` (videos) while others receive valid inputs, the backward reduce-scatter operation will hang. 
+When using FSDP, if some ranks in the same FSDP group receive `None` for `pixel_values` (images) or `pixel_values_videos` (videos) while others receive valid inputs, the backward reduce-scatter operation will hang.
 
 #### Reference Implementation in Vision Model
 ```python
@@ -203,13 +203,13 @@ Instead of keeping deepstack embeddings distributed and requiring All2All commun
 3. Each rank gets its local deepstack embeddings and masks
 4. In later LM parts, **no extra communication is needed**
 
-#### Reference SP Processing for Image Deepstack 
+#### Reference SP Processing for Image Deepstack
 ```python
 if pixel_values is not None:
     # Do all_gather on deepstack_image_embeds
     # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
     deepstack_image_embeds = [
-        _Gather.apply(get_parallel_state().sp_group, embed, 0, False) 
+        _Gather.apply(get_parallel_state().sp_group, embed, 0, False)
         for embed in deepstack_image_embeds
     ]
 
@@ -224,17 +224,17 @@ if pixel_values is not None:
 
     # Get the mask for this rank's sequence slice and save it for later
     rank_image_mask = image_mask_1d[:, rank_start:rank_end]  # (batch_size, seq_len // sp_size)
-    
+
     # Count how many visual tokens are before this rank's slice
     before_rank_mask = image_mask_1d[:, :rank_start]
     offset = before_rank_mask.sum().item()
-    
+
     # Count how many visual tokens are in this rank's slice
     num_visual_tokens = rank_image_mask.sum().item()
-    
+
     # Slice the all-gathered deepstack embeddings
     deepstack_image_embeds = [
-        embed[offset : offset + num_visual_tokens] 
+        embed[offset : offset + num_visual_tokens]
         for embed in deepstack_image_embeds
     ]
 ```
@@ -279,21 +279,21 @@ if self.training and self.moe_implementation == "eager":
     with torch.no_grad():
         expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=self.num_experts)
     # ... standard implementation
-    
+
 elif self.training and self.moe_implementation == "fused":
 
-    
+
     # Qwen3-VL MoE combines gate and up into gate_up_proj
     # Split gate_up_proj into gate_proj and up_proj to match fused_moe_forward interface
     # Current: gate_up_proj shape is (num_experts, hidden_size, 2 * expert_dim)
     gate_proj = self.gate_up_proj[..., : self.expert_dim]
     up_proj = self.gate_up_proj[..., self.expert_dim :]
-    
+
     # Transpose weights to match expected shape for fused_moe_forward
     gate_proj_t = gate_proj.transpose(1, 2).contiguous()
     up_proj_t = up_proj.transpose(1, 2).contiguous()
     down_proj_t = self.down_proj.transpose(1, 2).contiguous()
-    
+
     next_states = fused_moe_forward(
         module=self,
         num_experts=self.num_experts,
@@ -304,7 +304,7 @@ elif self.training and self.moe_implementation == "fused":
         fc1_2_weight=up_proj_t,    # Separated up projection
         fc2_weight=down_proj_t,
     )
-    
+
     # ...
 ```
 
