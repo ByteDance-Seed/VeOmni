@@ -5,6 +5,7 @@ from typing import ByteString, List, Union
 
 import numpy as np
 import requests
+import torch
 from PIL import Image
 
 
@@ -98,3 +99,11 @@ def fetch_images(images: List[ImageInput], **kwargs):
     images = images[:max_image_nums]
     images = [smart_resize(image, **kwargs) for image in images]
     return images
+
+
+def save_image_tensors_to_file(image_tensors: torch.Tensor, output_path: str):
+    image_tensors = image_tensors * 255.0
+    image_tensors = image_tensors.clamp(0, 255)
+    image_tensors = image_tensors.cpu().to(torch.uint8).numpy()
+    image = Image.fromarray(image_tensors)
+    image.save(output_path)
