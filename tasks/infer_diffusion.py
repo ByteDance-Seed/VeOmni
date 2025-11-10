@@ -28,7 +28,7 @@ def read_raw_data(data_path: str, negative_prompts_path: str):
         for item in data:
             raw_data.append(
                 {
-                    "prompt": [item["user_prompt"]],
+                    "prompt": item["user_prompt"],
                     "image": fetch_images(item["image_file"]),  # convert to image
                     "negative_prompts": negative_text,
                 }
