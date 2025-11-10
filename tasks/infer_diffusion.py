@@ -9,7 +9,6 @@ from typing import Dict, Optional
 from tqdm import tqdm
 
 from veomni.data.multimodal.image_utils import fetch_images
-from veomni.data.multimodal.video_utils import save_video_tensors_to_file
 from veomni.dit_trainer import DiTBaseGenerator, DiTTrainerRegistry
 from veomni.utils import helper
 from veomni.utils.arguments import InferArguments, ModelArguments, parse_args, save_args
@@ -23,32 +22,17 @@ def read_raw_data(data_path: str, negative_prompts_path: str):
         negative_text = f.readline().strip()
     raw_data = []
 
-    if data_path.endswith(".jsonl"):
-        with open(data_path, encoding="utf-8") as f:
-            for line in f.readlines():
-                data = json.loads(line)
-                data["negative_prompts"] = negative_text
-                raw_data.append(
-                    {
-                        "prompt": data["prompt"],
-                        "image": fetch_images([data["image_bytes"].encode("latin-1")])[0],  # convert to image
-                        "negative_prompts": negative_text,
-                    }
-                )
-    elif data_path.endswith(".json"):
-        with open(data_path, encoding="utf-8") as f:
-            data = json.load(f)
-            for item in data:
-                raw_data.append(
-                    {
-                        "prompt": [item["user_prompt"]],
-                        "image": fetch_images([item["image_file"]])[0],  # convert to image
-                        "negative_prompts": negative_text,
-                    }
-                )
-    else:
-        raise NotImplementedError(f"Not support reading data path: {data_path}")
-
+    assert data_path.endswith(".json"), f"Not support reading data path: {data_path}"
+    with open(data_path, encoding="utf-8") as f:
+        data = json.load(f)
+        for item in data:
+            raw_data.append(
+                {
+                    "prompt": [item["user_prompt"]],
+                    "image": fetch_images(item["image_file"]),  # convert to image
+                    "negative_prompts": negative_text,
+                }
+            )
     return raw_data
 
 
@@ -118,28 +102,32 @@ def main():
 
     logger.info_rank0("Prepare generator")
 
-    args.model.lora_config.update(
-        lora_scale=args.infer.lora_scale,
-        lora_adapter=args.infer.lora_model_path,
-    )
+    if args.model.lora_config and args.infer.lora_model_path:
+        lora_config = args.model.lora_config
+        lora_config.update(
+            lora_scale=args.infer.lora_scale,
+            lora_adapter=args.infer.lora_model_path,
+        )
+    else:
+        lora_config = None
     generator: DiTBaseGenerator = DiTTrainerRegistry.create(
         model_path=args.infer.model_path,
-        lora_config=args.model.lora_config,
+        lora_config=lora_config,
         condition_model_path=args.model.trainer_config["condition_model_path"],
-        condition_model_cfg=args.model.trainer_config["condition_model_cfg"],
+        condition_model_cfg=args.model.trainer_config.get("condition_model_cfg", {}),
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         **args.model.generator_config,
     )
 
     processor = generator.processor
+
+    os.makedirs(args.infer.output_dir, exist_ok=True)
     for i, raw_data in enumerate(tqdm(raw_data_list)):
         processed_data = processor.preprocess_infer(raw_data)
-        videos = generator.forward(processed_data)
-
-        os.makedirs("output", exist_ok=True)
-        for j, video in enumerate(videos):
-            save_video_tensors_to_file(video.cpu().numpy(), f"{args.infer.output_dir}/pred_{i}_{j}.mp4")
+        outputs = generator.forward(processed_data)
+        sample_output_dir = os.path.join(args.infer.output_dir, f"sample_{i}")
+        processor.save_outputs(outputs, sample_output_dir)
 
 
 if __name__ == "__main__":
