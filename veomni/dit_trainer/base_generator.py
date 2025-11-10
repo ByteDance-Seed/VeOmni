@@ -41,5 +41,5 @@ class DiTBaseGenerator(DiTBaseTrainer):
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
             latents = self.dit_model.generate(**processed_cond)
             decoded_latents = self.condition_model.postprocess(latents)
-        videos = self.processor.postprocess(decoded_latents)
-        return videos
+        outputs = self.processor.postprocess(decoded_latents)
+        return outputs
