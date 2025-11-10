@@ -67,15 +67,6 @@ def ep_fsdp2_clip_grad_norm(
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
 
-    # Match FSDP1 gradient averaging for EP params by dividing grads by ep_size
-    # TODO: replace this by set_gradient_divide_factor
-    # now it is not taking effect
-    if ps.ep_enabled and ps.ep_size > 1 and ep_params:
-        scale = 1.0 / float(ps.ep_size)
-        for q in ep_params:
-            if q.grad is not None:
-                q.grad.detach().mul_(scale)
-
     # Compute and reduce non-EP
     non_ep_total = _fsdp2_reduce_group(
         params=non_ep_params,
