@@ -538,8 +538,15 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
+    dcp_backend: str = field(
+        default="default",
+        metadata={"help": "Backend for distributed checkpointing. Uses FileSystemWriter/FileSystemReader by default."},
+    )
 
     def __post_init__(self):
+        if self.dcp_backend != "default":
+            raise ValueError(f"`dcp_backend` must be 'default', but got '{self.dcp_backend}'.")
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK"))
         self.global_rank = int(os.getenv("RANK"))
