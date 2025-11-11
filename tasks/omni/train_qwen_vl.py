@@ -438,13 +438,6 @@ def main():
                     },
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-                if args.train.global_rank == 0:
-                    helper.save_step2token(
-                        args.train.step2token_path,
-                        consumed_tokens=train_metrics["consume_tokens(B)"],
-                        global_step=global_step,
-                        save_checkpoint_path=save_checkpoint_path,
-                    )
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
@@ -465,13 +458,6 @@ def main():
                 },
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-            if args.train.global_rank == 0:
-                helper.save_step2token(
-                    args.train.step2token_path,
-                    consumed_tokens=train_metrics["consume_tokens(B)"],
-                    global_step=global_step,
-                    save_checkpoint_path=save_checkpoint_path,
-                )
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
