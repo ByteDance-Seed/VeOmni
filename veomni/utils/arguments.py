@@ -544,9 +544,6 @@ class TrainingArguments:
     )
 
     def __post_init__(self):
-        if self.dcp_backend != "default":
-            raise ValueError(f"`dcp_backend` must be 'default', but got '{self.dcp_backend}'.")
-
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK"))
         self.global_rank = int(os.getenv("RANK"))
