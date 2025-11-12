@@ -127,6 +127,7 @@ def main():
         processed_data = processor.preprocess_infer(raw_data)
         outputs = generator.forward(processed_data)
         sample_output_dir = os.path.join(args.infer.output_dir, f"sample_{i}")
+        os.makedirs(sample_output_dir, exist_ok=True)
         processor.save_outputs(outputs, sample_output_dir)
 
 
