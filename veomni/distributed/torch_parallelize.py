@@ -339,6 +339,7 @@ def parallelize_model_fsdp2(
         if parallel_state.ep_enabled and experts_mod is not None:
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
+            # average EP grads across EP ranks
             experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
