@@ -7,7 +7,6 @@ from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
-import wandb
 from torch import distributed as dist
 from tqdm import trange
 
@@ -32,6 +31,7 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.metric_logger import Logger
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
@@ -350,13 +350,18 @@ def main():
     )
 
     if args.train.global_rank == 0:
-        if args.train.use_wandb:
-            wandb.init(
-                project=args.train.wandb_project,
-                name=args.train.wandb_name,
-                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
-            )
+        metric_logger = Logger(
+            use_wandb=args.train.use_wandb,
+            wandb_project=args.train.wandb_project,
+            wandb_name=args.train.wandb_name,
+            use_tensorboard=args.train.use_tensorboard,
+            tensorboard_dir=args.train.tensorboard_dir,
+            config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
+        )
+    else:
+        metric_logger = None
 
+    if args.train.global_rank == 0:
         model_assets = [model_config, processor]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
@@ -495,10 +500,9 @@ def main():
             data_loader_tqdm.set_postfix_str({k: f"{v:.2f}" for k, v in step_info.items() if k != "lr"})
             data_loader_tqdm.update()
 
-            if args.train.global_rank == 0:
-                if args.train.use_wandb:
-                    train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
-                    wandb.log(train_metrics, step=global_step)
+            if args.train.global_rank == 0 and metric_logger:
+                train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
+                metric_logger.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()
