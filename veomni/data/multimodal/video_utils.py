@@ -12,6 +12,7 @@ from torchvision.io.video import _read_from_stream
 from torchvision.transforms import InterpolationMode, functional
 
 from ...utils import logging
+from .file_utils import resolve_relative_path
 
 
 logger = logging.get_logger(__name__)
@@ -138,6 +139,8 @@ def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs):
             logger.warning_once(
                 "torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0."
             )
+    else:
+        video = resolve_relative_path(video, kwargs.get("train_path"))
     video, _audio, info = torchvision.io.read_video(
         video,
         0.0,

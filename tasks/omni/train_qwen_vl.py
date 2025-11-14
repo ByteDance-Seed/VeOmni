@@ -91,7 +91,7 @@ class MyDataArguments(DataArguments):
 @dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
+    data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
 
@@ -146,6 +146,7 @@ def main():
             processor=processor,
             chat_template=chat_template,
             position_id_func=position_id_func,
+            train_path=args.data.train_path,
             **args.data.mm_configs,
         )
     elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
@@ -154,6 +155,7 @@ def main():
             processor=processor,
             chat_template=chat_template,
             position_id_func=position_id_func,
+            train_path=args.data.train_path,
             **args.data.mm_configs,
         )
     else:
