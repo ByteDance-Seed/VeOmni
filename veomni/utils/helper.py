@@ -76,16 +76,22 @@ if is_veomni_patch_available():
 else:
 
     def load_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, load_step2token will be skipped")
+        pass
 
     def save_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, save_step2token will be skipped")
+        pass
 
     def is_remote_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, is_remote_path returning False")
+        return False
 
     def convert_hdfs_fuse_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, convert_hdfs_fuse_path returning path as-is")
+        if len(args) > 0:
+            return args[0]
+        return kwargs.get('path', None)
 
     VALID_CONFIG_TYPE = None
     VEOMNI_UPLOAD_CMD = None
