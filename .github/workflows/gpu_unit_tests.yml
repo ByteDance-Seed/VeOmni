@@ -1,0 +1,87 @@
+# # Tests layout
+
+name: GPU unit tests
+
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - main
+      - v0.*
+    paths:
+      - "**/*.py"
+      - .github/workflows/gpu_unit_tests.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**/*.py"
+
+# Cancel jobs on the same ref if a new one is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Declare permissions just read content.
+permissions:
+  contents: read
+
+env:
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:sgl055.dev2"
+  DYNAMIC_RUNNER_ENDPOINT: "https://sd10g3clalm04ug7alq90.apigateway-cn-beijing.volceapi.com/runner"
+
+jobs:
+  setup:
+    if: github.repository_owner == 'volcengine'
+    runs-on: ubuntu-latest
+    outputs:
+      runner-label: ${{ steps.create-runner.outputs.runner-label }}
+      mlp-task-id: ${{ steps.create-runner.outputs.mlp-task-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: create-runner
+        uses: volcengine/vemlp-github-runner@v1
+        with:
+          mode: "create"
+          faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
+          mlp-image: "${{ env.IMAGE }}"
+
+  gpu_unit_tests:
+    if: github.repository_owner == 'volcengine'
+    needs: setup
+    runs-on: [ "${{ needs.setup.outputs.runner-label || 'L20x8' }}" ]
+    timeout-minutes: 60 # Increase this timeout value as needed
+    env:
+      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
+      HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
+      NO_PROXY: "localhost,127.0.0.1"
+      HF_HUB_ENABLE_HF_TRANSFER: 1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+            fetch-depth: 0
+      - name: Install the current repository
+        run: |
+          pip3 install --no-deps -e .[test]
+          pip3 install diffusers
+      - name: Run parallel unit tests
+        run: |
+          pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          pytest -s -x tests/parallel/ulysses/test_all_gather.py
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs:
+      [
+        setup,
+        gpu_unit_tests,
+      ]
+    if: always()
+    steps:
+      - id: destroy-runner
+        uses: volcengine/vemlp-github-runner@v1
+        with:
+          mode: "destroy"
+          faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
+          mlp-task-id: "${{ needs.setup.outputs.mlp-task-id }}"
