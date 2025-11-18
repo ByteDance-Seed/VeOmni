@@ -33,7 +33,7 @@ env:
 
 jobs:
   setup:
-    if: github.repository_owner == 'volcengine'
+    if: github.repository_owner == 'ByteDance-Seed'
     runs-on: ubuntu-latest
     outputs:
       runner-label: ${{ steps.create-runner.outputs.runner-label }}
@@ -48,7 +48,7 @@ jobs:
           mlp-image: "${{ env.IMAGE }}"
 
   gpu_unit_tests:
-    if: github.repository_owner == 'volcengine'
+    if: github.repository_owner == 'ByteDance-Seed'
     needs: setup
     runs-on: [ "${{ needs.setup.outputs.runner-label || 'L20x8' }}" ]
     timeout-minutes: 60 # Increase this timeout value as needed
@@ -63,7 +63,7 @@ jobs:
             fetch-depth: 0
       - name: Install the current repository
         run: |
-          pip3 install --no-deps -e .[test]
+          pip3 install --no-deps -e .[dev]
           pip3 install diffusers
       - name: Run parallel unit tests
         run: |
