@@ -103,7 +103,7 @@ class DiTBaseTrainer:
         training_task: Literal["online_training", "offline_training", "offline_embedding"] = "online_training",
         condition_model_path: str = None,
         condition_model_cfg: dict = {},
-        lora_config: dict = None,
+        lora_config: dict = {},
         offline_embedding_saver_cfg: dict = {},
         **kwargs,
     ):
@@ -172,7 +172,7 @@ class DiTBaseTrainer:
 
     def configure_lora_model(self):
         fsdp_kwargs = {}
-        if self.lora_config is None:
+        if not self.lora_config:
             self.lora = False
         else:
             lora_adapter_path = self.lora_config.get("lora_adapter", None)

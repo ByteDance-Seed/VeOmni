@@ -14,7 +14,7 @@ class DiTBaseGenerator(DiTBaseTrainer):
         model_path: str,
         condition_model_path: str = None,
         condition_model_cfg: dict = {},
-        lora_config: dict = None,
+        lora_config: dict = {},
         attn_implementation: str = "eager",
         **kwargs,
     ):
