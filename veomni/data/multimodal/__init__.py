@@ -11,3 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Export dataset registry functions for easy access
+from .dataset_registry import get_custom_datasets, register_all_datasets, register_dataset
+
+
+__all__ = [
+    "register_dataset",
+    "register_all_datasets",
+    "get_custom_datasets",
+]
