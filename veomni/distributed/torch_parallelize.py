@@ -347,7 +347,10 @@ def parallelize_model_fsdp2(
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
             # average EP grads across EP ranks
-            experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
+            # NOTE: in torch 2.8 and later we should use
+            # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
+            # but now for torch 2.7 compatability we still use this legacy API
+            experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
