@@ -38,6 +38,7 @@ Our guiding principles when building VeOmni are:
 </div>
 
 ### 🔥 Latest News
+- [2025/1/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo]() was accepted by AAAI 2026
 - [2025/09/19] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
 - [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./assets/wechat.png). Feel free to join us!
 - [2025/04/03] We release VeOmni!
@@ -263,15 +264,16 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 ## ✏️ Supported Models
 
-| Model                                                    | Model size                    | Example config File                                       |
-| -------------------------------------------------------- | ----------------------------- | --------------------------------------------------------- |
-| [DeepSeek 2.5/3/R1](https://huggingface.co/deepseek-ai)  | 236B/671B                     | [deepseek.yaml](configs/pretrain/deepseek.yaml)           |
-| [Llama 3-3.3](https://huggingface.co/meta-llama)         | 1B/3B/8B/70B                  | [llama3.yaml](configs/pretrain/llama3.yaml)               |
-| [Qwen 2-3](https://huggingface.co/Qwen)                  | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/pretrain/qwen2_5.yaml)             |
-| [Qwen2-VL/Qwen2.5-VL/QVQ](https://huggingface.co/Qwen)   | 2B/3B/7B/32B/72B              | [qwen2_vl.yaml](configs/multimodal/qwen2_vl/qwen2_vl.yaml)|
-| [Qwen3-MoE](https://huggingface.co/Qwen)                 | A330B/A22B235B                | [qwen3-moe.yaml](configs/pretrain/qwen3-moe.yaml)         |
-| [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                  |
-| Omni Model                                               | Any Modality Training         | [seed_omni.yaml](configs/multimodal/omni/seed_omni.yaml)  |
+| Model                                                    | Model size                    | Example config File                                                   |
+| -------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------|
+| [DeepSeek 2.5/3/R1](https://huggingface.co/deepseek-ai)  | 236B/671B                     | [deepseek.yaml](configs/pretrain/deepseek.yaml)                       |
+| [Llama 3-3.3](https://huggingface.co/meta-llama)         | 1B/3B/8B/70B                  | [llama3.yaml](configs/pretrain/llama3.yaml)                           |
+| [Qwen 2-3](https://huggingface.co/Qwen)                  | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/pretrain/qwen2_5.yaml)                         |
+| [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B              | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml)|
+| [Qwen3-VL MoE](https://huggingface.co/Qwen)              | 30BA3B/235BA22B               | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml)    |
+| [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/pretrain/qwen3-moe.yaml)                     |
+| [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
+| Omni Model                                               | Any Modality Training         | [seed_omni.yaml](configs/multimodal/omni/seed_omni.yaml)              |
 
 
 > VeOmni Support all [transformers](https://github.com/huggingface/transformers) models if you don't need sequence parallelism or experts parallelism or other parallelism and cuda kernal optimize in VeOmni. We design a [model registry mechanism](veomni/models/registry.py). When the model is registered in veomni, we will automatically load the model and optimizer in VeOmni. Otherwise, it will default to load the modeling file in transformers.
@@ -294,6 +296,8 @@ Thanks to the following projects for their excellent work:
 - [torchtune](https://github.com/pytorch/torchtune)
 
 ## 💡 Awesome work using VeOmni
+- [dFactory: Easy and Efficient dLLM Fine-Tuning](https://github.com/inclusionAI/dFactory)
+- [LMMs-Engine](https://github.com/EvolvingLMMs-Lab/lmms-engine)
 - [UI-TARS: Pioneering Automated GUI Interaction with Native Agents](https://github.com/bytedance/UI-TARS)
 - [OpenHA: A Series of Open-Source Hierarchical
 Agentic Models in Minecraft](https://arxiv.org/pdf/2509.13347)

@@ -2011,6 +2011,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            elif get_parallel_state().fsdp_enabled:
+                fake_embeds = self.visual.dummy_forward().mean() * 0.0
+                fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds + fake_embeds
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
@@ -2029,6 +2033,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            elif get_parallel_state().fsdp_enabled:
+                fake_embeds = self.visual.dummy_forward().mean() * 0.0
+                fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds + fake_embeds
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
@@ -2037,10 +2045,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 inputs_embeds = gather_heads_scatter_seq(
                     inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
                 )
-
-            if self.training and get_parallel_state().fsdp_enabled and pixel_values is None:
-                fake_embeds = self.visual.dummy_forward().mean() * 0.0
-                inputs_embeds = inputs_embeds + fake_embeds
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):

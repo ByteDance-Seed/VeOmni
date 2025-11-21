@@ -26,32 +26,16 @@ def clip_grad_norm(
             foreach=foreach,
         )
 
-    # FSDP2 without EP: still need distributed reductions across the FSDP group
-    ps = get_parallel_state()
-    fsdp_group = ps.fsdp_group
-    try:
-        world_size = dist.get_world_size(fsdp_group) if fsdp_group is not None else 1
-    except Exception:
-        world_size = 1
-
-    if world_size == 1:
-        # Default path (single-rank)
-        return torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm,
-            norm_type=norm_type,
-            error_if_nonfinite=error_if_nonfinite,
-            foreach=foreach,
-        )
-
-    return _fsdp2_reduce_and_clip(
-        params=[p for p in model.parameters() if p.grad is not None],
-        max_norm=max_norm,
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm,
         norm_type=norm_type,
-        foreach=foreach,
         error_if_nonfinite=error_if_nonfinite,
-        reduce_groups=[("fsdp", fsdp_group)],
+        foreach=foreach,
     )
+    if isinstance(grad_norm, DTensor):
+        grad_norm = grad_norm.full_tensor()
+    return grad_norm
 
 
 @torch.no_grad()
@@ -82,13 +66,6 @@ def ep_fsdp2_clip_grad_norm(
     non_ep_params: List[torch.nn.Parameter] = [
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
-
-    # Match FSDP1 gradient averaging for EP params by dividing grads by ep_size
-    if ps.ep_enabled and ps.ep_size > 1 and ep_params:
-        scale = 1.0 / float(ps.ep_size)
-        for q in ep_params:
-            if q.grad is not None:
-                q.grad.detach().mul_(scale)
 
     # Compute and reduce non-EP
     non_ep_total = _fsdp2_reduce_group(
@@ -185,21 +162,3 @@ def _fsdp2_reduce_group(
             if group is not None:
                 dist.all_reduce(val, op=dist.ReduceOp.SUM, group=group)
         return val
-
-
-def _fsdp2_reduce_and_clip(
-    params: List[torch.nn.Parameter],
-    max_norm: float,
-    norm_type: float,
-    foreach: bool | None,
-    error_if_nonfinite: bool,
-    reduce_groups: List[tuple[str, dist.ProcessGroup | None]],
-) -> torch.Tensor:
-    if math.isinf(norm_type):
-        total_norm = _fsdp2_reduce_group(params, norm_type, reduce_groups)
-    else:
-        total_p = _fsdp2_reduce_group(params, norm_type, reduce_groups)
-        total_norm = total_p ** (1.0 / float(norm_type))
-
-    torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=foreach)
-    return total_norm

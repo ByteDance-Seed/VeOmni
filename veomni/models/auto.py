@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import functools
 import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
@@ -27,6 +28,7 @@ from transformers import (
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.device import is_torch_npu_available
 from .loader import BaseModelLoader, get_loader
 
 
@@ -123,5 +125,23 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
+
+    if is_torch_npu_available():
+        # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
+        # due to the behavior in https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/fsdp/_fully_shard/_fsdp_state.py#L130
+        logger.info_rank0(
+            "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"
+        )
+        original_forward = model.forward
+
+        @functools.wraps(original_forward)
+        def wrapped_forward(*args, **kwargs):
+            if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
+                kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_q"].cpu()
+            if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
+                kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_k"].cpu()
+            return original_forward(*args, **kwargs)
+
+        model.forward = wrapped_forward
 
     return model

@@ -104,7 +104,7 @@ override-dependencies = [
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
     # byted pypi without using the cu126 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
-    "torch==2.7.1+cu128; (extra == 'gpu')",
+    "torch==2.8.0+cu128; (extra == 'gpu')",
     "torchaudio==2.7.1+cu128; (extra == 'gpu')",
     "torchvision==0.22.1+cu128; (extra == 'gpu')",
     # Adding explicit override for other backends as well. Otherwise these libraries

@@ -1,0 +1,35 @@
+model:
+  model_path: Qwen/Qwen3-VL-8B-Instruct
+  attn_implementation: flash_attention_2
+
+data:
+  train_path: sharegpt4v_pretrain
+  data_type: conversation
+  chat_template: qwen2_5vl
+  max_seq_len: 4096
+  train_size: 80000000
+
+train:
+  output_dir: qwen3_vl_dense_sft
+  data_parallel_mode: fsdp2
+  enable_reentrant: false
+  use_wandb: true
+  wandb_project: qwen3_vl_dense
+  wandb_name: qwen3_vl_dense
+  rmpad: false
+  rmpad_with_pos_ids: true
+  ulysses_parallel_size: 1
+  freeze_vit: false
+  lr: 1.0e-5
+  lr_decay_style: cosine
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: 16
+  max_steps: 500
+  init_device: meta
+  enable_profiling: true
+  profile_start_step: 20
+  profile_end_step: 21
+  profile_record_shapes: true
+  ckpt_manager: dcp
+  save_hf_weights: false

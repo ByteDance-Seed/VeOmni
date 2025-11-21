@@ -178,7 +178,7 @@ class VeomniFlopsCounter:
         moe_num_expert = self.config.num_experts
         moe_topk = self.config.num_experts_per_tok
 
-        head_dim = hidden_size // num_attention_heads
+        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         q_size = num_attention_heads * head_dim
         k_size = num_key_value_heads * head_dim
         v_size = num_key_value_heads * head_dim
