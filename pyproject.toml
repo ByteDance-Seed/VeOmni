@@ -68,6 +68,7 @@ gpu = [
   "liger-kernel",
   "flash-attn",
   "hf_transfer",
+  "dion",
 ]
 megatron = [
   "megatron-energon>=7.2.1"
