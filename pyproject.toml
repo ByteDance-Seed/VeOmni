@@ -66,6 +66,7 @@ gpu = [
   "nvidia-nccl-cu12",
   "liger-kernel",
   "flash-attn",
+  "dion",
 ]
 megatron = [
   "megatron-energon>=7.2.1"
