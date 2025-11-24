@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
+import gc
 
 import torch
 import torch.distributed as dist
@@ -368,6 +368,11 @@ class DistributedCheckpointer(CheckpointerBase):
                     sync_files=False,
                 ),
             )
+            if dist.is_initialized():
+                dist.barrier()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
