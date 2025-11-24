@@ -16,7 +16,7 @@ from veomni.models import build_foundation_model
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 
 
@@ -258,7 +258,7 @@ def main():
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0
-            get_torch_device().synchronize()
+            synchronize()
 
             for micro_batch in micro_batches:
                 micro_batch = {
@@ -286,7 +286,7 @@ def main():
 
             # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
-            get_torch_device().synchronize()
+            synchronize()
 
             lr = max(lr_scheduler.get_last_lr())
 
@@ -348,7 +348,7 @@ def main():
     check_state_dict(golden_model_sd, model.state_dict(), tied_weights_keys)
     check_state_dict(golden_optim_sd, optimizer.state_dict(), need_flatten=True)
 
-    get_torch_device().synchronize()
+    synchronize()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()
