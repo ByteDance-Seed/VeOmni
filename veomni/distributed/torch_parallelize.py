@@ -386,7 +386,7 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
 
     if weights_path is None:
-        model.to_empty(device="cuda")
+        model.to_empty(device=get_device_type())
         _reset_hf_initialized_flag(model)
         model.init_weights()
     else:

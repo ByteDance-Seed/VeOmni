@@ -200,7 +200,6 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
 def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
-
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir)
 
