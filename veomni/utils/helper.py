@@ -667,9 +667,11 @@ def create_profiler(
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
+        trace_handler_fn = torch_npu.profiler.tensorboard_trace_handler(trace_dir)
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
+        trace_handler_fn = handler_fn
 
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
@@ -685,7 +687,7 @@ def create_profiler(
     base_profiler = profiler_module.profile(
         activities=activities,
         schedule=schedule,
-        on_trace_ready=handler_fn,
+        on_trace_ready=trace_handler_fn,
         record_shapes=record_shapes,
         profile_memory=profile_memory,
         with_modules=True,
