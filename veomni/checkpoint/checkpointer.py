@@ -25,7 +25,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.import_utils import is_torch_version_greater_than
 from ..utils.logging import get_logger
-
+from ..utils.device import synchronize, empty_cache
 
 if is_torch_version_greater_than("2.4"):
     import torch.distributed.checkpoint as dcp
@@ -371,8 +371,9 @@ class DistributedCheckpointer(CheckpointerBase):
             if dist.is_initialized():
                 dist.barrier()
             gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            empty_cache()
+            synchronize()
+
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
