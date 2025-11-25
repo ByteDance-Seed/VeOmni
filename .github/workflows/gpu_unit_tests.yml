@@ -17,6 +17,7 @@ on:
       - main
     paths:
       - "**/*.py"
+      - .github/workflows/gpu_unit_tests.yml
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
