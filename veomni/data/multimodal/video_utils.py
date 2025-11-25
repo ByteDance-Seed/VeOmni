@@ -229,11 +229,9 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
     return video_inputs, audio_inputs
 
 
-def images_to_video(image_list, output_file: str, fps: int = 6):
-    # image_list: list of numpy_arrays
-    import av
-
+def images_to_video(image_list: torch.Tensor, output_file: str, fps: int = 6):
     # record the encoding time
+    image_list = image_list.cpu().numpy()
     av.logging.set_level(av.logging.INFO)
     height, width, channels = image_list[0].shape
     container = av.open(output_file, mode="w")
