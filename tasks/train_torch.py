@@ -4,6 +4,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any, Dict, List
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -44,7 +45,13 @@ class Arguments:
 
 
 def main():
-    dist.init_process_group(backend=get_nccl_backend())
+    nccl_timeout = os.getenv("NCCL_TIMEOUT", None)
+    pg_nccl_timeout = None
+    if nccl_timeout is not None and get_nccl_backend() == "nccl":
+        pg_nccl_timeout = timedelta(seconds=int(nccl_timeout))
+    logger.info(f"Process_group timeout: {nccl_timeout}")
+    dist.init_process_group(backend=get_nccl_backend(), timeout=pg_nccl_timeout)
+
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
