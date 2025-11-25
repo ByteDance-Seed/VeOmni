@@ -76,7 +76,7 @@ jobs:
           clean: true
       - name: Install the current repository
         run: |
-          pip install -e .[cpu,npu]
+          pip install -e .[dev]
       - name: Check final pip list
         run: |
           pip list
