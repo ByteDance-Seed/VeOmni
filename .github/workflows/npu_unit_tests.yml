@@ -74,9 +74,13 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
+      - name: Install ffmpeg
+        run: |
+          apt-get update
+          apt-get install -y ffmpeg
       - name: Install the current repository
         run: |
-          pip install -e .[dev]
+          pip install -e .[dev,npu] --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Check final pip list
         run: |
           pip list

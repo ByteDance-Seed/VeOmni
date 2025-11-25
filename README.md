@@ -127,7 +127,9 @@ to run VeOmni.
 uv sync --extra gpu
 # For Ascend NPU
 uv sync --extra npu
-# You can install other optional deps by adding --extra like --extra dit
+# You can install other optional deps by adding --extra like --extra dit or --extra video
+# For video data training, `torchcodec` and `ffmpeg` are required.
+# `torchcodec` can be installed via the `video` extra. `ffmpeg` must be installed separately (e.g. `sudo apt-get install ffmpeg`).
 
 # Activate the uv managed virtual environment
 source .venv/bin/activate

@@ -63,10 +63,21 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
             fetch-depth: 0
+      - name: Setup Python 3.11
+        run: |
+          apt-get update
+          apt-get install -y python3.11 python3.11-dev python3.11-venv python3-pip
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+          update-alternatives --set python3 /usr/bin/python3.11
+      - name: Install ffmpeg
+        run: |
+          apt-get install -y ffmpeg
       - name: Install the current repository
         run: |
-          pip3 install -e .[dev]
-          pip3 install diffusers
+          python3 --version
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .[dev,gpu]
+          python3 -m pip install diffusers
       - name: Run parallel tests
         run: |
           pytest -s -x tests/parallel/ulysses/test_ulysses.py
