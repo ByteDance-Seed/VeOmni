@@ -5,7 +5,7 @@ import sys
 import torch
 import torch.distributed as c10d
 
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_id, get_nccl_backend, get_torch_device
 
 if not c10d.is_available() or not c10d.is_backend_available(get_nccl_backend()):
     logging.error("c10d NCCL not available, skipping tests", file=sys.stderr)
