@@ -13,13 +13,13 @@ def get_package_version(package_name):
 
 def check_env():
     torch_version = get_package_version("torch")
-    assert torch_version == "2.6.0+cpu"
+    assert torch_version == "2.7.1+cpu"
 
     torchvision_version = get_package_version("torchvision")
-    assert torchvision_version == "0.21.0"
+    assert torchvision_version == "0.22.1"
 
     torch_npu_version = get_package_version("torch-npu")
-    assert torch_npu_version == "2.6.0"
+    assert torch_npu_version == "2.7.1"
 
     triton_version = get_package_version("triton")
     assert triton_version is None
