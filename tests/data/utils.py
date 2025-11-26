@@ -86,7 +86,7 @@ class FakeModel:
 
 
 def compare_items(item, rank, group_size, group):
-    item = item.to(get_device_type())
+    item = item.to("cuda")
     item_list = [torch.empty_like(item) for _ in range(group_size)]
 
     dist.all_gather(item_list, item, group=group)
