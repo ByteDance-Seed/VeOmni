@@ -51,14 +51,13 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 
-from ....ops import fused_moe_forward
+from ....ops import causallm_loss_function, fused_moe_forward
 from ....utils.import_utils import is_liger_kernel_available
 from .configuration_deepseek import DeepseekV3Config
 
 
 if is_liger_kernel_available():
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction
-    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss  # type: ignore
     from liger_kernel.transformers.rms_norm import LigerRMSNorm
     from liger_kernel.transformers.rope import liger_rotary_pos_emb
 
@@ -371,6 +370,8 @@ class MoEGate(nn.Module):
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
         topk_weight = topk_weight * self.routed_scaling_factor  # must multiply the scaling factor
+        # Ensure routing weights keep the same dtype as hidden states so checkpoint recomputations stay consistent.
+        topk_weight = topk_weight.to(hidden_states.dtype)
 
         return topk_idx, topk_weight
 
@@ -470,13 +471,19 @@ class DeepseekV3FusedMoE(DeepseekV3MoE):
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        final_hidden_states = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
-
+        # we compute shared expert first to workaround the duplicated AllGather issue when using EP+FSDP2
+        # which seems to be a bug of fsdp2 fully_shard
         if self.config.n_shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(identity)
+            shared_expert_outputs = self.shared_experts(identity)
+        else:
+            shared_expert_outputs = None
+
+        moe_outputs = self.experts(hidden_states, routing_weights=topk_weight, selected_experts=topk_idx)
+
+        if shared_expert_outputs is not None:
+            final_hidden_states = moe_outputs + shared_expert_outputs
+        else:
+            final_hidden_states = moe_outputs
 
         return final_hidden_states
 
@@ -637,9 +644,10 @@ class DeepseekV3Attention(nn.Module):
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        # we skip transpose here since we will perform them in the flash_attention_forward
+        # query_states = query_states.transpose(1, 2)
+        # key_states = key_states.transpose(1, 2)
+        # value_states = value_states.transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -1133,6 +1141,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
+        self.loss_function = causallm_loss_function
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -1214,25 +1223,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         logits = None
         loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_labels = labels[..., 1:].contiguous()
-            shift_labels = shift_labels.view(-1)
-            if is_liger_kernel_available():
-                loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="mean")
-                hidden_states = hidden_states[..., :-1, :].contiguous()
-                hidden_states = hidden_states.view(-1, self.config.hidden_size)
-                loss = loss_fct(self.lm_head.weight, hidden_states, shift_labels)
-            else:
-                logits = self.lm_head(hidden_states)
-                logits = logits.float()
-                shift_logits = logits[..., :-1, :].contiguous()
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
+        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

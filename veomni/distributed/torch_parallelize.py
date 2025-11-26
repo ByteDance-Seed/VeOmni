@@ -51,6 +51,13 @@ if is_torch_version_greater_than("2.4"):
 logger = logging.get_logger(__name__)
 
 
+def _reset_hf_initialized_flag(module: nn.Module) -> None:
+    if hasattr(module, "_is_hf_initialized"):
+        module._is_hf_initialized = False
+    for child in module.children():
+        _reset_hf_initialized_flag(child)
+
+
 def verbose_fsdp_grouping(model, prefix="", depth=0):
     indent = "    " * depth
 
@@ -306,6 +313,9 @@ def parallelize_model_fsdp2(
         mp_ignored_classes = modules_to_ignore_in_mixed_precision
         fsdp_kwargs_without_mp = dict(fsdp_kwargs)
         fsdp_kwargs_without_mp.pop("mp_policy", None)
+        # for high-precision modules, we do not reshard them after forward to avoid all-gather them in backward
+        # these modules will stay in GPU memory so please ensure high-precision modules do not contain too many parameters
+        fsdp_kwargs_without_mp["reshard_after_forward"] = False
     else:
         mp_ignored_classes = None
         fsdp_kwargs_without_mp = fsdp_kwargs
@@ -336,18 +346,13 @@ def parallelize_model_fsdp2(
         if parallel_state.ep_enabled and experts_mod is not None:
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
-            if hasattr(experts_mod, "set_gradient_divide_factor"):
-                # average EP grads across EP ranks
-                experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
+            # average EP grads across EP ranks
+            experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
-                    # this will also create a AllGather communication group
-                    # when modules here are small (like gating), this would slightly impacts the peformance
-                    # a better method might be adding them to ignored_params of fully_shard
-                    # but then they will need to be initialized separately
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     layer_mod._fsdp_modules.append(sub_mod)
 
@@ -382,6 +387,7 @@ def parallelize_model_fsdp2(
 
     if weights_path is None:
         model.to_empty(device="cuda")
+        _reset_hf_initialized_flag(model)
         model.init_weights()
     else:
         from torch.distributed.tensor import distribute_tensor

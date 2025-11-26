@@ -21,9 +21,9 @@ def merge_to_hf_pt(load_dir: str, save_path: str, model_assets_dir: str = None):
         config = AutoConfig.from_pretrained(model_assets_dir)
         processor = AutoProcessor.from_pretrained(model_assets_dir, trust_remote_code=True)
 
-        save_model_weights(save_path, state_dict["model"], model_assets=[config, processor])
+        save_model_weights(save_path, state_dict, model_assets=[config, processor])
     else:
-        save_model_weights(save_path, state_dict["model"])
+        save_model_weights(save_path, state_dict)
 
 
 if __name__ == "__main__":

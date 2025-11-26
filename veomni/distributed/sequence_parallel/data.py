@@ -7,9 +7,58 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 
 from ...data.constants import IGNORE_INDEX
+from ...distributed.parallel_state import get_parallel_state
 from .comm import get_ulysses_sequence_parallel_group, get_unified_sequence_parallel_group
 from .ulysses import _Gather, _Slice
 from .utils import pad_tensor, unpadding_tensor_for_seqeunce_parallel
+
+
+def sp_pad_and_slice(
+    tensor: torch.Tensor,
+    dim: int = -1,
+    pad_value: int = 0,
+    pad_scale: int = 1,
+) -> torch.Tensor:
+    """
+    Pads and slices a tensor for sequence parallelism (SP) distribution.
+    This function ensures the tensor can be evenly distributed across SP ranks by:
+    1. Padding the tensor to make its length divisible by (sp_size * pad_scale)
+    2. Slicing the padded tensor to extract the chunk for the current SP rank
+    Args:
+        tensor: Input tensor to pad and slice
+        dim: Dimension along which to pad and slice (default: -1)
+        pad_value: Value to use for padding (default: 0)
+        pad_scale: Scaling factor for SP size during padding (default: 1).
+                   This is needed for some VLMs that perform token merging to ensure
+                   padding is handled correctly before the merge operation
+    Returns:
+        The sliced tensor chunk for the current SP rank
+    """
+    # Get sequence parallelism configuration
+    sp_size = get_parallel_state().sp_size
+    sp_rank = get_parallel_state().sp_rank
+    # Phase 1: Pad the tensor to align with (sp_size * pad_scale)
+    # This ensures the tensor can be evenly split across all SP ranks
+    seq_length = tensor.size(dim)
+    scale_sp_size = sp_size * pad_scale
+    # Calculate the chunk size after scaling, rounding up to ensure full coverage
+    sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
+    # Calculate how much padding is needed to reach the target length
+    pad_size = sp_chunk_size * scale_sp_size - seq_length
+    if pad_size != 0:
+        # Create padding tensor with the same shape except for the target dimension
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_size
+        pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
+        # Concatenate padding to the end of the tensor
+        tensor = torch.cat((tensor, pad), dim=dim)
+    # Phase 2: Slice the padded tensor for the current SP rank
+    # After padding, recalculate the chunk size based on the actual sp_size
+    seq_length = tensor.size(dim)
+    sp_chunk_size = (seq_length + sp_size - 1) // sp_size
+    # Extract the chunk for this rank: each rank gets a contiguous slice
+    # narrow(dim, start, length) extracts tensor[start:start+length] along dim
+    return tensor.narrow(dim, sp_rank * sp_chunk_size, sp_chunk_size)
 
 
 def slice_input_tensor(

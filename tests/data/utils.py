@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from datasets import Dataset
 
 from veomni.utils import helper
@@ -62,6 +63,7 @@ class DummyDataset:
 def process_dummy_example(
     example: Dict[str, Any],
     max_seq_len: int,
+    rmpad_with_pos_ids: bool = False,
     source_name: str = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
     tokenized_example = {}
@@ -70,18 +72,15 @@ def process_dummy_example(
             continue
         else:
             tokenized_example[k] = torch.tensor(v[:max_seq_len], dtype=torch.long)
+    if rmpad_with_pos_ids:  # precompute position_ids
+        tokenized_example["position_ids"] = torch.arange(0, len(tokenized_example["input_ids"]), dtype=torch.long)
     return [tokenized_example]
 
 
-class FakeModel:
+class FakeModel(nn.Module):
     def __init__(self) -> None:
-        pass
-
-    def state_dict(self):
-        return {}
-
-    def load_state_dict(self, *args, **kwargs):
-        pass
+        super().__init__()
+        self.ffn = nn.Linear(1, 1)
 
 
 def compare_items(item, rank, group_size, group):
