@@ -459,7 +459,7 @@ def init_parallel_state(
         dp_shard_size = dp_size
 
     logger.info_rank0(
-        f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, cp_size {cp_size}, ulysses_size {ulysses_size}"
+        f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, ep_size {ep_size}, cp_size {cp_size}, ulysses_size {ulysses_size}"
     )
 
     device_mesh, ep_fsdp_device_mesh = None, None
