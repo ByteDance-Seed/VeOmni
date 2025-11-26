@@ -50,10 +50,15 @@ dit = [
   "bitsandbytes>=0.46.0,<=0.47.0"
 ]
 npu = [
-  "torch==2.6.0+cpu",
-  "torchvision==0.21.0+cpu",
-  "torchaudio==2.6.0+cpu",
-  "torch-npu==2.6.0",
+  "torch==2.7.1+cpu",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1; platform_machine == 'aarch64'",
+  "torchaudio==2.7.1; platform_machine == 'aarch64'",
+  "torchvision==0.22.1+cpu; platform_machine != 'aarch64'",
+  "torchaudio==2.7.1+cpu; platform_machine != 'aarch64'",
+  "decorator>=5.2.1",
+  "einops>=0.8.1",
+  "scipy>=1.16.2"
 ]
 gpu =[
   "torch==2.7.1+cu128",
@@ -103,9 +108,11 @@ override-dependencies = [
     "torchvision==0.22.1+cu128; (extra == 'gpu')",
     # Adding explicit override for other backends as well. Otherwise these libraries
     # will be excluded for other backends.
-    "torch==2.6.0+cpu; (extra == 'npu')",
-    "torchaudio==2.6.0+cpu; (extra == 'npu')",
-    "torchvision==0.21.0+cpu; (extra == 'npu')",
+    "torch==2.7.1+cpu; extra == 'npu'",
+    "torchaudio==2.7.1; (extra == 'npu') and (platform_machine == 'aarch64')",
+    "torchvision==0.22.1; (extra == 'npu') and (platform_machine == 'aarch64')",
+    "torchaudio==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
+    "torchvision==0.22.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
     # Fixate to a specific transformers version since upgrading transformers is a large task.
     "transformers==4.56.2",
 ]
@@ -119,7 +126,12 @@ conflicts = [
 [tool.uv.sources]
 # Download torch packages from the official index to ensure we get the proper CUDA built version.
 torch = {index = "pytorch"}
-torchvision = {index = "pytorch"}
+torchvision = [
+  # npu aarch64 need install torchvison from pytorch-cpu
+  { index = "pytorch-cpu", marker = "extra == 'npu' and platform_machine == 'aarch64'" },
+  { index = "pytorch", marker = "extra == 'npu' and platform_machine != 'aarch64'" },
+  { index = "pytorch", marker = "extra != 'npu'"},
+]
 torchaudio = {index = "pytorch"}
 # Currently flash-attn is limited by diffusers (<=2.7.4).
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"}
@@ -127,6 +139,11 @@ flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/down
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu/"
 explicit = true
 
 [tool.setuptools.dynamic]

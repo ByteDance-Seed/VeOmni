@@ -21,6 +21,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.device import get_device_type
 from .batching_strategy import TextBatchingStrategy
 from .data_collator import (
     CollatePipeline,
@@ -133,6 +134,7 @@ def build_dataloader(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
+        pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
     )

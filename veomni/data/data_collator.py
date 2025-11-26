@@ -106,12 +106,6 @@ class DataCollatorWithPadding(DataCollator):
     Data collator with padding.
     """
 
-    pad_token_id: int = 0
-
-    def __post_init__(self):
-        self.sp_size = get_parallel_state().sp_size
-        self.sp_enabled = get_parallel_state().sp_enabled
-
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = defaultdict(list)
 
@@ -327,6 +321,7 @@ class TextSequenceShardCollator(DataCollator):
         batch["labels"] = self.sp_slice(labels, dim=-1)
 
         # Calculate these info from position_ids here when SP_enable to use padded position_ids
-        add_flash_attention_kwargs_from_position_ids(batch)
+        if not self.rmpad:
+            add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch
