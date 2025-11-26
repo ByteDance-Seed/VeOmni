@@ -56,6 +56,7 @@ def run_data_test():
     transform = partial(
         process_dummy_example,
         max_seq_len=args.data.max_seq_len,
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
     )
 
     # build dummy data
@@ -110,6 +111,7 @@ def run_data_test():
     start_epoch, start_step, global_step = 0, 0, 0
     save_step = int(args.train.train_steps * 2)  # due to dataset.buffer, cannot resume from mid_step
 
+    fake_model = FakeModel().cuda()
     for epoch in range(start_epoch, epoch_num):
         dataloader.set_epoch(epoch)
         data_iterator = iter(dataloader)
@@ -164,7 +166,7 @@ def run_data_test():
             metrics = environ_meter.step(delta_time, global_step=global_step)
             if global_step == save_step:
                 state = {
-                    "model": FakeModel(),
+                    "model": fake_model,
                     "extra_state": {
                         "global_step": global_step,
                         "train_dataloader": dataloader.state_dict(),
@@ -176,7 +178,7 @@ def run_data_test():
                 dist.barrier()
 
     # resume
-    state = {"model": FakeModel(), "extra_state": {}}  # cannot be None
+    state = {"model": fake_model, "extra_state": {}}  # cannot be None
     Checkpointer.load(save_checkpoint_path, state)
     dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
     environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
@@ -244,6 +246,7 @@ def build_command(dataset_type, dataloader_type):
         "--train.global_batch_size=16",
         "--train.micro_batch_size=2",
         "--train.data_parallel_mode=ddp",
+        "--train.ckpt_manager=dcp",
         f"--data.datasets_type={dataset_type}",
         "--train.ulysses_parallel_size=2",
         "--train.bsz_warmup_ratio=0",
