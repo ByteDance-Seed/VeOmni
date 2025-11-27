@@ -6,7 +6,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from veomni.utils.device import get_nccl_backend, get_torch_device, get_device_type
+from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
 
 
 def find_free_port():
