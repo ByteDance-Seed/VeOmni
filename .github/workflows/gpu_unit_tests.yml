@@ -17,6 +17,7 @@ on:
       - main
     paths:
       - "**/*.py"
+      - .github/workflows/gpu_unit_tests.yml
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
@@ -66,15 +67,17 @@ jobs:
         run: |
           pip3 install -e .[dev]
           pip3 install diffusers
-      - name: Run parallel unit tests
+      - name: Run parallel tests
         run: |
           pytest -s -x tests/parallel/ulysses/test_ulysses.py
           pytest -s -x tests/parallel/ulysses/test_all_gather.py
       - name: Run data tests
         run: |
-          pytest -s -x tests/data/test_native_datasets.py
-          pytest -s -x tests/data/test_multisource_datasets.py
-          pytest -s -x tests/data/test_prepare_fa_kwargs.py
+          pytest -s -x tests/data
+      - name: Run models tests
+        run: |
+          pytest -s -x tests/models/test_models_patch.py
+
 
   cleanup:
     runs-on: ubuntu-latest

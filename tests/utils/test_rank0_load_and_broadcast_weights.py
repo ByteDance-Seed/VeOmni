@@ -15,6 +15,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.module_utils import load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
 
 
 try:
@@ -31,8 +32,8 @@ logger = helper.create_logger(__name__)
 @dataclass
 class BroadcastTestArguments:
     weights_path: str = ""
-    device_type: str = "cuda"
-    backend: str = "nccl"
+    device_type: str = get_device_type()
+    backend: str = get_nccl_backend()
 
 
 @dataclass
@@ -106,13 +107,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
     if not weights_path.exists():
         raise ValueError("`--test.weights_path` must point to an existing directory.")
 
-    if args.test.device_type != "cuda":
-        raise ValueError("This test expects --test.device_type=cuda")
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to run the fsdp2 broadcast weight loading test.")
-
-    torch.cuda.set_device(args.train.local_rank)
+    get_torch_device().set_device(args.train.local_rank)
     dist.init_process_group(backend=args.test.backend)
 
     init_parallel_state(
@@ -145,11 +140,11 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
             raise RuntimeError("torch.distributed.tensor.distribute_tensor is required for fsdp2 weight loading test")
 
         rank0_load_and_broadcast_weights(
-            fsdp_model, str(weights_path), init_device="cuda", dtensor_factory=dtensor_factory
+            fsdp_model, str(weights_path), init_device=get_device_type(), dtensor_factory=dtensor_factory
         )
 
-        reference_model = TinyModel().cuda()
-        load_model_weights(reference_model, str(weights_path), init_device="cuda")
+        reference_model = TinyModel().to(get_device_type())
+        load_model_weights(reference_model, str(weights_path), init_device=get_device_type())
         reference_model = reference_model.cpu()
 
         torch.testing.assert_close(
@@ -205,9 +200,6 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
 def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required to run fsdp2 broadcast weight loading test")
-
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir)
 
@@ -227,8 +219,8 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
         "--train.enable_gradient_checkpointing=False",
         "--train.broadcast_model_weights_from_rank0=True",
         f"--test.weights_path={weights_path}",
-        "--test.device_type=cuda",
-        "--test.backend=nccl",
+        f"--test.device_type={get_device_type()}",
+        f"--test.backend={get_nccl_backend()}",
     ]
 
     result = subprocess.run(command, check=True)

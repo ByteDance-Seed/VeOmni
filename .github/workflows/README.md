@@ -32,7 +32,7 @@ permissions:
 
 env:
   IMAGE: "your vemlp image" # e.g. "verl-ci-cn-beijing.cr.volces.com/verlai/verl:sgl055.dev2"
-  DYNAMIC_RUNNER_URL: "https://sd10g3clalm04ug7alq90.apigateway-cn-beijing.volceapi.com/runner" # public veFaas api
+  DYNAMIC_RUNNER_URL: "https://sd4hav466omp034ocfn0g.apigateway-cn-beijing.volceapi.com/veomni/runner" # public veFaas api
 
 jobs:
   setup:

@@ -5,6 +5,8 @@ import pytest
 import torch
 from transformers import AutoConfig
 
+from veomni.utils.device import get_torch_device
+
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
     build_base_model_optim,
@@ -24,7 +26,7 @@ test_cases = [
 
 @pytest.mark.parametrize("config_path, model_modes", test_cases)
 def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
-    dummy_data = prepare_data(bsz=2, max_seq_len=128, seq_lens=torch.tensor([128, 128]))
+    dummy_data = prepare_data(bsz=2, max_seq_len=1024, seq_lens=torch.tensor([1024, 1024]))
     assert len(model_modes) >= 2
     config = AutoConfig.from_pretrained(config_path)
     print_device_mem_info("[Memory Info] start train_compare_models:")
@@ -77,7 +79,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     compare_multi_items(res, rtol=rtol, atol=atol)
 
     gc.collect()
-    torch.cuda.empty_cache()
+    get_torch_device().empty_cache()
 
     print_device_mem_info("[Memory Info] after running train_compare_models:")
     return res
