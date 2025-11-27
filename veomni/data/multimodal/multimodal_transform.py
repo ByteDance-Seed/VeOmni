@@ -22,7 +22,7 @@ import torch
 from ...utils.import_utils import is_video_audio_available
 from ..constants import TYPE2INDEX
 from .image_utils import fetch_images
-from .preprocess import conv_preprocess
+from .preprocessor_registry import conv_preprocess
 
 
 if is_video_audio_available():
