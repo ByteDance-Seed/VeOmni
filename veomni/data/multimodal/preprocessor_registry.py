@@ -80,7 +80,9 @@ def register_preprocessor(name: str) -> Callable:
 
     def decorator(func: Callable) -> Callable:
         if name in _PREPROCESSOR_REGISTRY:
-            raise ValueError(f"Preprocessor for '{name}' is already registered. Cannot register duplicate preprocessor.")
+            raise ValueError(
+                f"Preprocessor for '{name}' is already registered. Cannot register duplicate preprocessor."
+            )
         _PREPROCESSOR_REGISTRY[name] = func
         return func
 
