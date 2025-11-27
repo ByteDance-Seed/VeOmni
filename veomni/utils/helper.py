@@ -679,7 +679,7 @@ def create_profiler(
     base_profiler = profiler_module.profile(
         activities=activities,
         schedule=schedule,
-        on_trace_ready=handler_fn(),
+        on_trace_ready=handler_fn,
         record_shapes=record_shapes,
         profile_memory=profile_memory,
         with_modules=True,
