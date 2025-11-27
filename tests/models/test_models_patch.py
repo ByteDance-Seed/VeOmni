@@ -5,6 +5,8 @@ import pytest
 import torch
 from transformers import AutoConfig
 
+from veomni.utils.device import get_torch_device
+
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
     build_base_model_optim,
@@ -14,7 +16,6 @@ from .utils import (
     print_all_values,
     train_one_step,
 )
-from veomni.utils.device import get_torch_device
 
 
 test_cases = [

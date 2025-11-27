@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 
-import torch
 import torch.distributed as dist
 from transformers import PretrainedConfig
 from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example

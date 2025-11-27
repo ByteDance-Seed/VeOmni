@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 
-import torch
 import torch.distributed as dist
 import yaml
 from transformers import PretrainedConfig
