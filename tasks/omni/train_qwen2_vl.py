@@ -24,7 +24,7 @@ from veomni.data import (
     build_multimodal_chat_template,
 )
 from veomni.data.constants import IMAGE_INPUT_INDEX
-from veomni.data.multimodal.preprocess import conv_preprocess
+from veomni.data.multimodal.preprocessor_registry import conv_preprocess
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model

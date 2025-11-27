@@ -19,12 +19,6 @@ This module contains both built-in and custom dataset preprocessors.
 All preprocessors are registered using the @register_preprocessor decorator.
 
 To add custom preprocessors, simply define a function and decorate it with @register_preprocessor.
-
-Usage:
-    from veomni.data.multimodal import get_dataset
-
-    preprocessor = get_dataset("sharegpt4v_pretrain")
-    result = preprocessor(conversations)
 """
 
 import random
@@ -362,79 +356,6 @@ def voice_assistant_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-# ============================================================================
-# Custom Dataset Preprocessors (Examples and User Extensions)
-# ============================================================================
-
-
-# Example: Internal VQA dataset
-@register_preprocessor("internal_vqa")
-def internal_vqa_preprocess(conversations, **kwargs):
-    """
-    Preprocessor for internal VQA dataset
-
-    Expected format:
-        conversations = [
-            {"from": "human", "value": "<image> What is shown in the image?"},
-            {"from": "gpt", "value": "A detailed answer..."}
-        ]
-    """
-    role_mapping = {"human": "user", "gpt": "assistant"}
-    constructed_conversation = []
-
-    if not conversations or conversations[0]["from"] != "human":
-        conversations = conversations[1:]
-
-    for message in conversations:
-        role = role_mapping[message["from"]]
-        value = message["value"]
-
-        if "<image>" in value:
-            value = value.replace("<image>", "").strip()
-            constructed_conversation.append([role, ("image", None), ("text", value)])
-        else:
-            constructed_conversation.append([role, ("text", value)])
-
-    return constructed_conversation
-
-
-# Add more custom datasets below as needed
 # @register_preprocessor("your_dataset_name")
 # def your_dataset_preprocess(conversations, **kwargs):
 #     ...
-
-
-# ============================================================================
-# Convenience Functions
-# ============================================================================
-
-
-def conv_preprocess(source: str, conversations, **kwargs):
-    """
-    Convenience function to preprocess conversations for a specific dataset.
-
-    This is a wrapper around the dataset registry that provides backward compatibility
-    with the original API.
-
-    Args:
-        source: Dataset name (e.g., "sharegpt4v_pretrain", "doom", etc.)
-        conversations: Conversation data in the format expected by the dataset preprocessor
-        **kwargs: Additional arguments passed to the preprocessor
-
-    Returns:
-        Preprocessed conversation in the format expected by the model
-
-    Raises:
-        ValueError: If dataset name is not registered
-
-    Example:
-        >>> conversations = [
-        ...     {"from": "human", "value": "<image> What is in the image?"},
-        ...     {"from": "gpt", "value": "A cat"}
-        ... ]
-        >>> result = conv_preprocess("sharegpt4v_sft", conversations)
-    """
-    from .preprocessor_registry import get_preprocessor
-
-    preprocessor = get_preprocessor(source)
-    return preprocessor(conversations, **kwargs)

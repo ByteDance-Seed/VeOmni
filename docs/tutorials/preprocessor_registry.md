@@ -57,8 +57,8 @@ def my_custom_source_preprocessor(conversations, **kwargs):
 Once registered, your preprocessor is immediately available:
 
 ```python
-# Use the convenience function from preprocess.py
-from veomni.data.multimodal.preprocess import conv_preprocess
+# Use the convenience function from preprocessor_registry.py
+from veomni.data.multimodal.preprocessor_registry import conv_preprocess
 
 # Or get the preprocessor function directly from the registry
 from veomni.data.multimodal import get_preprocessor
@@ -143,86 +143,21 @@ constructed_conversation = [
 
 ### Example 1: VQA Preprocessor
 
-```python
-@register_preprocessor("custom_vqa")
-def custom_vqa_preprocessor(conversations, **kwargs):
-    """Visual Question Answering preprocessor"""
-    question = conversations[0]["value"].replace("<image>", "").strip()
-    answer = conversations[1]["value"]
-
-    return [
-        ["user", ("image", None), ("text", question)],
-        ["assistant", ("text", answer)]
-    ]
-```
+For an example of a VQA preprocessor, see [`custom_vqa_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L225).
 
 ### Example 2: Multi-turn Conversation Preprocessor
 
 ```python
-@register_preprocessor("multi_turn_chat")
-def multi_turn_chat_preprocessor(conversations, **kwargs):
-    """Multi-turn conversation preprocessor"""
-    role_mapping = {"human": "user", "gpt": "assistant"}
-    constructed = []
-
-    for msg in conversations:
-        role = role_mapping[msg["from"]]
-        value = msg["value"]
-
-        if "<image>" in value:
-            value = value.replace("<image>", "").strip()
-            constructed.append([role, ("image", None), ("text", value)])
-        else:
-            constructed.append([role, ("text", value)])
-
-    return constructed
+For an example of a multi-turn conversation preprocessor, see [`sharegpt4v_sft_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L58).
 ```
 
 ### Example 3: OCR Preprocessor
 
-```python
-@register_preprocessor("custom_ocr")
-def custom_ocr_preprocessor(conversations, **kwargs):
-    """OCR preprocessor - extract text from images"""
-    if isinstance(conversations, str):
-        text = conversations
-    else:
-        text = conversations[-1]["value"]
-
-    return [
-        ["user", ("image", None), ("text", "Extract all text from this image.")],
-        ["assistant", ("text", text)]
-    ]
-```
+For an example of a preprocessor that handles image and text, similar to an OCR preprocessor, see [`doom_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L76).
 
 ### Example 4: Registering Multiple Names
 
-You can register the same preprocessor under multiple names:
-
-```python
-@register_preprocessor("chart_understanding")
-@register_preprocessor("chart_analysis")
-@register_preprocessor("chart_qa")
-def chart_preprocessor(conversations, **kwargs):
-    """Chart understanding preprocessor with multiple aliases"""
-    role_mapping = {"human": "user", "gpt": "assistant"}
-    constructed = []
-
-    for msg in conversations:
-        role = role_mapping[msg["from"]]
-        value = msg["value"]
-
-        if "<image>" in value:
-            value = value.replace("<image>", "").strip()
-            if value:
-                constructed.append([role, ("image", None), ("text", value)])
-            else:
-                constructed.append([role, ("image", None)])
-        else:
-            constructed.append([role, ("text", value)])
-
-    return constructed
-```
+For an example of a preprocessor registered under multiple names, see [`sharegpt4v_pretrain_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L38).
 
 ## Advanced Usage
 
@@ -379,10 +314,10 @@ if is_preprocessor_registered("my_source"):
 
 #### `conv_preprocess(source: str, conversations, **kwargs)`
 
-This convenience function, located in `veomni.data.multimodal.preprocess`, wraps `get_preprocessor()` for easier use.
+This convenience function, located in `veomni.data.multimodal.preprocessor_registry`, wraps `get_preprocessor()` for easier use.
 
 ```python
-from veomni.data.multimodal.preprocess import conv_preprocess
+from veomni.data.multimodal.preprocessor_registry import conv_preprocess
 
 result = conv_preprocess("sharegpt4v_pretrain", conversations)
 ```
@@ -497,6 +432,41 @@ dataset = build_multisource_dataset(config)
 ```
 
 The preprocessor becomes available as soon as `veomni.data.multimodal` is imported anywhere in your project—no manual registration calls are needed!
+
+### End-to-End Example: Qwen2-VL Training Pipeline
+
+For a complete working example of how preprocessors integrate into the training pipeline, see the Qwen2-VL training setup:
+
+**1. Training Entry Point**: [train.sh](../../train.sh)
+   - Launches distributed training with torchrun
+
+**2. Training Script**: [tasks/omni/train_qwen2_vl.py](../../tasks/omni/train_qwen2_vl.py)
+   - **Line 27**: Imports `conv_preprocess` from the preprocessor registry
+   - **Lines 60-103**: Defines `process_sample()` function that:
+     - Calls `conv_preprocess()` at line 72 to apply the registered preprocessor
+     - Handles image processing and tokenization
+     - Returns the processed example ready for training
+
+**3. Configuration**: [configs/multimodal/qwen2_vl/qwen2_vl.yaml](../../configs/multimodal/qwen2_vl/qwen2_vl.yaml)
+   - **Line 11**: Specifies `source_name: sharegpt4v_pretrain` which matches the preprocessor name
+
+**4. Preprocessor Definition**: [veomni/data/multimodal/preprocess.py](../../veomni/data/multimodal/preprocess.py)
+   - **Lines 41-61**: Defines `sharegpt4v_pretrain_preprocess()` decorated with `@register_preprocessor("sharegpt4v_pretrain")`
+   - This preprocessor converts ShareGPT4V data format into VeOmni's standardized conversation format
+
+**5. Registry System**: [veomni/data/multimodal/preprocessor_registry.py](../../veomni/data/multimodal/preprocessor_registry.py)
+   - Provides the registration decorator and lookup functions
+
+**Flow Summary**:
+```
+Config (qwen2_vl.yaml)
+  └─> source_name: sharegpt4v_pretrain
+       └─> Training Script (train_qwen2_vl.py)
+            └─> process_sample() calls conv_preprocess("sharegpt4v_pretrain", ...)
+                 └─> Registry looks up sharegpt4v_pretrain_preprocess()
+                      └─> Preprocessor (preprocess.py) transforms raw data
+                           └─> Returns standardized conversation format
+```
 
 ## See Also
 

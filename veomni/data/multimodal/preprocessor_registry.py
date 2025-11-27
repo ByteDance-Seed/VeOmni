@@ -80,9 +80,7 @@ def register_preprocessor(name: str) -> Callable:
 
     def decorator(func: Callable) -> Callable:
         if name in _PREPROCESSOR_REGISTRY:
-            import warnings
-
-            warnings.warn(f"Preprocessor for '{name}' is already registered. Overwriting with new preprocessor.")
+            raise ValueError(f"Preprocessor for '{name}' is already registered. Cannot register duplicate preprocessor.")
         _PREPROCESSOR_REGISTRY[name] = func
         return func
 
@@ -151,3 +149,32 @@ def is_preprocessor_registered(name: str) -> bool:
     """
     get_all_preprocessors()
     return name in _PREPROCESSOR_REGISTRY
+
+
+def conv_preprocess(source: str, conversations, **kwargs):
+    """
+    Convenience function to preprocess conversations for a specific dataset.
+
+    This is a wrapper around the dataset registry that provides backward compatibility
+    with the original API.
+
+    Args:
+        source: Dataset name (e.g., "sharegpt4v_pretrain", "doom", etc.)
+        conversations: Conversation data in the format expected by the dataset preprocessor
+        **kwargs: Additional arguments passed to the preprocessor
+
+    Returns:
+        Preprocessed conversation in the format expected by the model
+
+    Raises:
+        ValueError: If dataset name is not registered
+
+    Example:
+        >>> conversations = [
+        ...     {"from": "human", "value": "<image> What is in the image?"},
+        ...     {"from": "gpt", "value": "A cat"}
+        ... ]
+        >>> result = conv_preprocess("sharegpt4v_sft", conversations)
+    """
+    preprocessor = get_preprocessor(source)
+    return preprocessor(conversations, **kwargs)
