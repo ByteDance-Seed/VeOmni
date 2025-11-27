@@ -7,6 +7,7 @@ from transformers import set_seed
 
 from veomni.models import build_foundation_model
 from veomni.optim import build_optimizer
+from veomni.utils.device import get_device_type
 
 
 def build_base_model_optim(
@@ -21,7 +22,7 @@ def build_base_model_optim(
         torch_dtype="bfloat16",
         attn_implementation=attn_implementation,
         moe_implementation=moe_implementation,
-        init_device="cuda",
+        init_device=get_device_type(),
         force_use_huggingface=force_use_huggingface,
     )
 
@@ -153,7 +154,7 @@ def prepare_data(bsz, max_seq_len, seq_lens):
 
 def train_one_step(model, optimizer, inputs):
     for k, v in inputs.items():
-        inputs[k] = v.to("cuda")
+        inputs[k] = v.to(get_device_type())
 
     optimizer.zero_grad()
     loss = model(**inputs).loss.mean()
