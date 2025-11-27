@@ -212,7 +212,7 @@ def test_dcp_checkpointer():
         "--train.rmpad_with_pos_ids=False",
         "--train.ckpt_manager=dcp",
         "--train.max_steps=10",
-        f"--train.init_device={get_device_type()}"
+        f"--train.init_device={get_device_type()}",
     ]
 
     result = subprocess.run(command, check=True)
