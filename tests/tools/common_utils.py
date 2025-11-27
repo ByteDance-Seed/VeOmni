@@ -1,4 +1,3 @@
-import torch
 import torch.distributed as dist
 
 from veomni.utils.device import get_device_type, get_torch_device

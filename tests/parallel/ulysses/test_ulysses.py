@@ -11,7 +11,6 @@ if not c10d.is_available() or not c10d.is_backend_available(get_nccl_backend()):
 
 import pytest
 import torch.distributed as dist
-from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.comm import (
