@@ -660,7 +660,9 @@ def create_profiler(
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
-        npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir)
+        npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
+        )
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
