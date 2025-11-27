@@ -44,8 +44,8 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
 
-        self.q_norm = get_layernorm(self.head_dim, fused=False) if qk_norm else nn.Identity()
-        self.k_norm = get_layernorm(self.head_dim, fused=False) if qk_norm else nn.Identity()
+        self.q_norm = get_layernorm(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = get_layernorm(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_o = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
