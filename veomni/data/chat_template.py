@@ -35,9 +35,6 @@ CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 
 def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
-    if template_name not in CHAT_TEMPLATE_REGISTRY.valid_keys():
-        raise ValueError(f"Unknown chat template: {template_name}")
-
     return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
 
 

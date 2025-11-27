@@ -28,8 +28,6 @@ CHECKPOINT_TO_STATE_DICT_REGISTRY = Registry("checkpoint_to_state_dict")
 
 
 def build_checkpointer(ckpt_manager: str, dist_backend: str):
-    if ckpt_manager not in CHECKPOINTER_REGISTRY.valid_keys():
-        raise ValueError(f"Unknown checkpointer: {ckpt_manager}")
     return CHECKPOINTER_REGISTRY[ckpt_manager](dist_backend)
 
 

@@ -14,6 +14,8 @@ class Registry(MutableMapping):
 
     def __getitem__(self, key):
         # First check if instance has a local override
+        if key not in self.valid_keys():
+            raise ValueError(f"Unknown {self._name} name: {key}. No preprocessor registered for this source.")
         if key in self._local_mapping:
             return self._local_mapping[key]
         return self._global_mapping[key]
@@ -38,6 +40,10 @@ class Registry(MutableMapping):
             return cls_or_func
 
         def decorator(cls_or_func):
+            if key in self._global_mapping:
+                raise ValueError(
+                    f"{self._name} for '{key}' is already registered. Cannot register duplicate preprocessor."
+                )
             self._global_mapping.update({key: cls_or_func})
             return cls_or_func
 
