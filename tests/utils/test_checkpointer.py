@@ -4,6 +4,7 @@ import random
 import subprocess
 from dataclasses import asdict, dataclass, field
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -15,7 +16,7 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
-
+from veomni.utils.import_utils import is_torch_npu_available
 
 logger = helper.create_logger(__name__)
 
@@ -165,6 +166,7 @@ def run_checkpointer_test():
     dist.destroy_process_group()
 
 
+@pytest.mark.skipif(is_torch_npu_available(), reason="npu skip omnistore")
 def test_omnistore_checkpointer():
     port = 12345 + random.randint(0, 100)
 
