@@ -73,9 +73,7 @@ jobs:
           pytest -s -x tests/parallel/ulysses/test_all_gather.py
       - name: Run data tests
         run: |
-          pytest -s -x tests/data/test_native_datasets.py
-          pytest -s -x tests/data/test_multisource_datasets.py
-          pytest -s -x tests/data/test_prepare_fa_kwargs.py
+          pytest -s -x tests/data
       - name: Run models tests
         run: |
           pytest -s -x tests/models/test_models_patch.py

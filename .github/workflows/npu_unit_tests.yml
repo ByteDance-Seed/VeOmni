@@ -80,6 +80,9 @@ jobs:
       - name: Check final pip list
         run: |
           pip list
+      - name: Run data tests
+        run: |
+          pytest -s -x tests/data
       - name: Run models tests
         run: |
           pytest -s -x tests/models/test_models_patch.py
