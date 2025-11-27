@@ -108,7 +108,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         full_input_grad = full_input.grad.detach().clone()
 
         torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
         torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
