@@ -18,6 +18,7 @@ from veomni.distributed.sequence_parallel.comm import set_ulysses_sequence_paral
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
+from veomni.utils.import_utils import is_torch_npu_available
 
 from .attention import Attention
 from .utils import (
@@ -59,6 +60,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         return torch.sum(output * t)
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(is_torch_npu_available, reason="npu skip async ulysses")
     def test_self_attn(self):
         self._get_process_group()
         full_input = self._get_input_data()
@@ -107,6 +109,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(is_torch_npu_available, reason="npu skip async ulysses")
     def test_self_attn_padding(self):
         self._get_process_group()
         full_input = self._get_input_data_for_padding()
