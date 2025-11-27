@@ -3,6 +3,7 @@ from torch import nn
 
 from veomni.utils.import_utils import is_torch_npu_available
 
+
 """
 This function is adapted from an open-source project, OpenDiT
 For more details, see: https://github.com/NUS-HPC-AI-Lab/OpenDiT/blob/master/opendit/modules/layers.py
