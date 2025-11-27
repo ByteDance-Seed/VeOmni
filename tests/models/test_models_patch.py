@@ -14,6 +14,7 @@ from .utils import (
     print_all_values,
     train_one_step,
 )
+from veomni.utils.device import get_torch_device
 
 
 test_cases = [
@@ -77,7 +78,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     compare_multi_items(res, rtol=rtol, atol=atol)
 
     gc.collect()
-    torch.cuda.empty_cache()
+    get_torch_device().empty_cache()
 
     print_device_mem_info("[Memory Info] after running train_compare_models:")
     return res
