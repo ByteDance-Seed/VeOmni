@@ -1,4 +1,7 @@
 import pkg_resources
+import pytest
+
+from veomni.utils.import_utils import is_torch_npu_available
 
 
 def get_package_version(package_name):
@@ -25,5 +28,6 @@ def check_env():
     assert triton_version is None
 
 
+@pytest.mark.skipif(not is_torch_npu_available(), reason="only npu check test_npu_setup")
 def test_veomni_setup():
     check_env()
