@@ -49,8 +49,6 @@ def ckpt_to_state_dict(
     Returns:
         state_dict: State dict.
     """
-    if ckpt_manager not in CHECKPOINT_TO_STATE_DICT_REGISTRY.valid_keys():
-        raise ValueError(f"Unknown checkpoint_to_state_dict function: {ckpt_manager}")
     return CHECKPOINT_TO_STATE_DICT_REGISTRY[ckpt_manager](save_checkpoint_path, output_dir)
 
 
@@ -131,7 +129,7 @@ def dcp_checkpointer(dist_backend: str):
 
 
 @CHECKPOINT_TO_STATE_DICT_REGISTRY.register("dcp")
-def dcp_ckpt_to_state_dict(save_checkpoint_path: Union[str, os.PathLike], output_dir: Union[str, os.PathLike]):
+def dcp_ckpt_to_state_dict(save_checkpoint_path: Union[str, os.PathLike], **kwargs):
     from ..utils.import_utils import is_torch_version_greater_than
 
     if not is_torch_version_greater_than("2.4"):
