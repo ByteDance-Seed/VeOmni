@@ -15,18 +15,11 @@ Last updated: 11/28/2025
 
 基础环境准备请参照这份 [文档](https://gitcode.com/Ascend/pytorch) 。
 
-### 安装VeOmni
-
-```bash
-git clone https://github.com/ByteDance-Seed/VeOmni.git
-cd VeOmni
-pip install -e .[npu]
-````
-
 ### 使用uv安装依赖环境
 
 #### 1. 进入VeOmni仓的根目录
 
+    git clone https://github.com/ByteDance-Seed/VeOmni.git
     cd VeOmni
 
 #### 2. 固定python版本
@@ -38,6 +31,7 @@ pip install -e .[npu]
 如果网络不稳定，可以设置超时时间防止下载超时。设置环境变量 UV_HTTP_TIMEOUT 来调整超时时间：
 
     export UV_HTTP_TIMEOUT=60
+
 #### 4. 执行 uv 环境安装
 
     uv sync --extra npu --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
@@ -65,6 +59,7 @@ pip install -e .[npu]
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export MULTI_STREAM_MEMORY_REUSE=2
+
 bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml
 ```
 
