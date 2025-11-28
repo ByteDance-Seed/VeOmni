@@ -5,6 +5,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_optimizer_state_dict,
+)
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer
@@ -37,7 +41,9 @@ torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_train
 --train.ckpt_manager "dcp"
 
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
---model.model_path /path/to/Qwen3-30B-A3B-Instruct-2507-merge \
+--model.config_path configs/model_configs/qwen/Qwen3Moe_4_layers.json \
+--model.weight_path None \
+--model.tokenizer_path Qwen/Qwen3-30B-A3B \
 --model.moe_implementation fused \
 --model.attn_implementation flash_attention_2 \
 --train.expert_parallel_size 4 \
@@ -51,7 +57,7 @@ torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_train
 --train.rmpad_with_pos_ids true \
 --train.data_parallel_mode "fsdp2" \
 --train.init_device "meta" \
---train.ckpt_manager "dcp"
+--train.ckpt_manager "dcp" $@ 2>&1 | tee test_saveload_ep4_fix.log
 """
 
 # To prevent DCP from complaining "too many open files"
@@ -314,6 +320,41 @@ def main():
                     "train_dataloader": train_dataloader.state_dict(),
                 },
             }
+            if getattr(optimizer, "_is_multi_optimizer", False):
+                ep_param_optimizer = optimizer.optimizers_dict["ep"]
+                non_ep_param_optimizer = optimizer.optimizers_dict["non_ep"]
+
+                flatten_ep_optim_sd = get_optimizer_state_dict(
+                    model,
+                    ep_param_optimizer,
+                    options=StateDictOptions(flatten_optimizer_state_dict=True),
+                )
+                flatten_non_ep_optim_sd = get_optimizer_state_dict(
+                    model,
+                    non_ep_param_optimizer,
+                    options=StateDictOptions(flatten_optimizer_state_dict=True),
+                )
+
+                logger.info_rank0(f"{flatten_ep_optim_sd.keys()=}")
+                logger.info_rank0(f"{flatten_non_ep_optim_sd.keys()=}")
+                logger.info_rank0(f"{optimizer.state_dict().keys()=}")
+
+                ep_keys = set(flatten_ep_optim_sd.keys())
+                non_ep_keys = set(flatten_non_ep_optim_sd.keys())
+                merged_keys = set(optimizer.state_dict().keys())
+
+                # Optional sanity check: EP and non-EP partitions are disjoint
+                overlap = ep_keys & non_ep_keys
+                assert not overlap, f"EP and non-EP optimizers share keys: {sorted(overlap)}"
+
+                # The MultiOptimizer should cover exactly the union
+                expected_keys = ep_keys | non_ep_keys
+                assert merged_keys == expected_keys, (
+                    f"Mismatch in merged optimizer keys: "
+                    f"merged={len(merged_keys)}, expected={len(expected_keys)}; "
+                    f"missing={sorted(expected_keys - merged_keys)}, "
+                    f"extra={sorted(merged_keys - expected_keys)}"
+                )
 
             logger.info_rank0("testing DCP async saving")
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step, save_async=True)

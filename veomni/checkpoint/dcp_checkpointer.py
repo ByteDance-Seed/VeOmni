@@ -172,31 +172,186 @@ class OptimizerState(Stateful):
     def __init__(self, model, optimizer):
         self.model = model
         self.optimizer = optimizer
+        # Similar to ModelState, OptimizerState also need to be EP+FSDP2 aware
+        self.parallel_state = get_parallel_state()
+        self.ep_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
+        self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
 
     def state_dict(self):
-        # MultiOptimizer is only used for EP+FSDP2 case for now,
-        # and it knows how to produce a merged, flattened dict already
-        if getattr(self.optimizer, "_is_multi_optimizer", False):
-            return self.optimizer.state_dict()
+        if self.should_ep_aware:
+            logger.info_rank0(
+                "Getting optimizer state_dict from OptimizerState wrapper, would restore EP dim for Experts module"
+            )
+            # MultiOptimizer is only used for EP+FSDP2 case for now,
+            # and it knows how to produce a merged, flattened dict already
+            assert self.optimizer._is_multi_optimizer, "EP is enabled but optimizer is not a MultiOptimizer instance"
+            vanilla_optim_sd = self.optimizer.state_dict()
+            optim_sd_with_ep_dim = self.get_state_dict_with_ep_dim(vanilla_optim_sd)
+            return optim_sd_with_ep_dim
 
         # Single torch optimizer
         sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
         return sd
 
-    def load_state_dict(self, state_dict):
-        optim_state = state_dict
+    def get_state_dict_with_ep_dim(self, state_dict):
+        ep_fqn2spec_info = self.ep_fqn2spec_info
+        assert ep_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
 
-        # Delegate to MultiOptimizer (it will split/filter correctly)
-        if getattr(self.optimizer, "_is_multi_optimizer", False):
-            self.optimizer.load_state_dict(optim_state)
+        ep_mesh = self.parallel_state.ep_fsdp_device_mesh["ep"]
+        assert ep_mesh is not None
+
+        global_device_mesh = self.parallel_state.ep_fsdp_device_mesh
+        assert global_device_mesh.ndim == 2
+        keys = list(state_dict.keys())
+        ep_keys = list(ep_fqn2spec_info.keys())
+        logger.info_rank0(f"Vanilla OptimizerState keys: {keys}")
+        logger.info_rank0(f"EP keys: {ep_keys}")
+
+        for name in sorted(keys):
+            # Find EP spec whose FQN appears in the state_dict key
+            # e.g. name = "state.model.layers.0.mlp.experts.gate_proj.step"
+            #      ep_key = "model.layers.0.mlp.experts.gate_proj"
+            matches = [ep_key for ep_key in ep_keys if ep_key in name]
+            if not matches:
+                # ignore non-ep tensor
+                continue
+
+            # each tensor in the state dict should only belong to one EP entry
+            if len(matches) > 1:
+                raise RuntimeError(f"Ambiguous EP spec match for state key '{name}': {matches}")
+
+            ep_key = matches[0]
+            cur_spec_info = ep_fqn2spec_info[ep_key]
+
+            if not isinstance(cur_spec_info.placement, Shard):
+                logger.info_rank0(
+                    f"OptimizerState key - {name} belongs to the EP entry {ep_key} but placement is not Shard but {cur_spec_info.placement} "
+                )
+                continue
+
+            tensor = state_dict[name]
+            if not torch.is_tensor(tensor):
+                # we skip param-group hyperparams like `param_groups.model.layers.0.mlp.experts.down_proj.amsgrad`
+                continue
+            # Skip scalars (0-D tensors) – cannot be sharded on dim 0
+            if tensor.ndim == 0:
+                continue
+            logger.info_rank0(
+                f"Trying to restore ep dim for OptimizerState name: {name}, tensor {tensor} with fqn entry {ep_key} and placement {cur_spec_info.placement} "
+            )
+            tensor = self._restore_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+            state_dict[name] = tensor
+
+        return state_dict
+
+    def _restore_ep_dim(self, orgin_tensor: torch.Tensor, device_mesh: DeviceMesh):
+        """
+        Restore EP dim so that DCP can be aware about EP ranks
+
+        args:
+            orgin_tensor (torch.Tensor): The orgin tensor.
+            device_mesh (DeviceMesh): The ep device mesh.
+            shard (Shard): The shard info, default Shard(0).
+
+        """
+        assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
+        ep_mesh = device_mesh["ep"]
+
+        if isinstance(orgin_tensor, DTensor):
+            # EP+FSDP2
+            dtensor = DTensor.from_local(
+                orgin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
+            )
+        elif torch.is_tensor(orgin_tensor):
+            # If there is no FSDP but only EP
+            dtensor = DTensor.from_local(orgin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
+        else:
+            raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
+
+        return dtensor
+
+    def load_state_dict(self, state_dict):
+        optim_state_from_dcp_load = state_dict
+        if self.should_ep_aware:
+            # we need to drop EP dim before loading them into optimizers
+            optim_state_without_ep_dim = self.get_state_dict_without_ep_dim(optim_state_from_dcp_load)
+            # Delegate to MultiOptimizer (it will split/filter correctly)
+            self.optimizer.load_state_dict(optim_state_without_ep_dim)
             return
 
         # Single torch optimizer
         set_optimizer_state_dict(
             model=self.model,
             optimizers=self.optimizer,
-            optim_state_dict=optim_state,
+            optim_state_dict=optim_state_from_dcp_load,
         )
+
+    def get_state_dict_without_ep_dim(self, state_dict):
+        ep_fqn2spec_info = self.ep_fqn2spec_info
+        assert ep_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
+
+        ep_mesh = self.parallel_state.ep_fsdp_device_mesh["ep"]
+        assert ep_mesh is not None
+
+        global_device_mesh = self.parallel_state.ep_fsdp_device_mesh
+        assert global_device_mesh.ndim == 2
+
+        keys = list(state_dict.keys())
+        ep_keys = list(ep_fqn2spec_info.keys())
+
+        for name in sorted(keys):
+            # Find EP spec whose FQN appears in the state_dict key
+            # e.g. name = "state.model.layers.0.mlp.experts.gate_proj.step"
+            #      ep_key = "model.layers.0.mlp.experts.gate_proj"
+            matches = [ep_key for ep_key in ep_keys if ep_key in name]
+            if not matches:
+                # ignore non-ep tensor
+                continue
+
+            # each tensor in the state dict should only belong to one EP entry
+            if len(matches) > 1:
+                raise RuntimeError(f"Ambiguous EP spec match for state key '{name}': {matches}")
+
+            ep_key = matches[0]
+            cur_spec_info = ep_fqn2spec_info[ep_key]
+
+            if not isinstance(cur_spec_info.placement, Shard):
+                logger.info_rank0(
+                    f"OptimizerState key - {name} belongs to the EP entry {ep_key} but placement is not Shard but {cur_spec_info.placement} "
+                )
+                continue
+
+            tensor = state_dict[name]
+            if not torch.is_tensor(tensor):
+                # we skip param-group hyperparams like `param_groups.model.layers.0.mlp.experts.down_proj.amsgrad`
+                continue
+            # Skip scalars (0-D tensors) – cannot be sharded on dim 0
+            if tensor.ndim == 0:
+                continue
+            tensor = self._drop_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+            state_dict[name] = tensor
+
+        return state_dict
+
+    def _drop_ep_dim(self, loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
+        """
+        Drop EP dims after loading from DCP so that EP-FSDP would not be confused
+        """
+        assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
+        ep_fsdp_mesh = device_mesh["ep_fsdp"]
+
+        if len(loaded_tensor.placements) == 2:
+            tensor_to_put = DTensor.from_local(
+                loaded_tensor._local_tensor, device_mesh=ep_fsdp_mesh, placements=[Shard(1)]
+            )
+        elif len(loaded_tensor.placements) == 1:
+            tensor_to_put = loaded_tensor.to_local()
+        else:
+            raise RuntimeError(
+                f"Expect EP paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
+            )
+
+        return tensor_to_put
 
 
 class DistributedCheckpointer(CheckpointerBase):
