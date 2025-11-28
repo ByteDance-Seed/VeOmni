@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 
-import torch
 import torch.distributed as dist
 from transformers import PretrainedConfig
 from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
@@ -20,6 +19,7 @@ from veomni.data import (
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
@@ -36,8 +36,8 @@ def run_data_test():
     args = parse_args(Arguments)
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
-    torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-    dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    dist.init_process_group(backend=get_nccl_backend(), world_size=world_size, rank=rank)
 
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
@@ -111,7 +111,7 @@ def run_data_test():
     start_epoch, start_step, global_step = 0, 0, 0
     save_step = int(args.train.train_steps * 2)  # due to dataset.buffer, cannot resume from mid_step
 
-    fake_model = FakeModel().cuda()
+    fake_model = FakeModel().to(get_device_type())
     for epoch in range(start_epoch, epoch_num):
         dataloader.set_epoch(epoch)
         data_iterator = iter(dataloader)

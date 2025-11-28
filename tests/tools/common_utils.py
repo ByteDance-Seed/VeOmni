@@ -1,7 +1,6 @@
-import torch
 import torch.distributed as dist
 
-from veomni.utils.device import get_device_type
+from veomni.utils.device import get_device_type, get_torch_device
 
 
 def get_world_size():
@@ -13,14 +12,10 @@ def get_rank():
 
 
 def print_device_mem_info(prefix_info=""):
-    if get_device_type() == "cuda":
-        current_memory_allocated = torch.cuda.memory_allocated() / (1024**2)
-        memory_reserved = torch.cuda.memory_reserved() / (1024**2)
-        max_memory_allocated = torch.cuda.max_memory_allocated() / (1024**2)
-    elif get_device_type() == "npu":
-        current_memory_allocated = torch.npu.memory_allocated() / (1024**2)
-        memory_reserved = torch.npu.memory_reserved() / (1024**2)
-        max_memory_allocated = torch.npu.max_memory_allocated() / (1024**2)
+    if get_device_type() == "cuda" or get_device_type() == "npu":
+        current_memory_allocated = get_torch_device().memory_allocated() / (1024**2)
+        memory_reserved = get_torch_device().memory_reserved() / (1024**2)
+        max_memory_allocated = get_torch_device().max_memory_allocated() / (1024**2)
     else:
         current_memory_allocated = 0.0
         memory_reserved = 0.0
