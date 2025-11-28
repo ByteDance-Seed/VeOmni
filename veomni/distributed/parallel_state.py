@@ -18,7 +18,7 @@
 import math
 import os
 from dataclasses import dataclass
-from functools import wraps
+from functools import wraps, lru_cache
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
@@ -328,6 +328,7 @@ class ParallelState:
 
     @property
     @requires_mesh
+    @lru_cache()
     def ep_group(self) -> "ProcessGroup":
         return self.ep_mesh.get_group()
 
