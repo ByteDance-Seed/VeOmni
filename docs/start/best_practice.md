@@ -115,7 +115,13 @@ VeOmni default supports two types of datasets(source code: [veomni/data/dataset.
 
 ```python
 from veomni.data import build_dataset
-train_dataset = build_dataset(transform=transform, seed=args.train.seed, **asdict(args.data))
+train_dataset = build_dataset(
+    dataset_name=args.data.dataset_name,
+    transform=transform,
+    dataloader_batch_size=args.train.dataloader_batch_size,
+    seed=args.train.seed,
+    **asdict(args.data)
+)
 ```
 
 > **Note**:
