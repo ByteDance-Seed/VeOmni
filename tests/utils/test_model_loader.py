@@ -77,6 +77,7 @@ def test_model_loader(model_path):
         f"--model.config_path={model_path}",
         "--data.train_path=tests",
         "--train.output_dir=.tests/cache",
+        f"--train.init_device={get_device_type()}",
     ]
 
     result = subprocess.run(command, check=True)

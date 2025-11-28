@@ -3,20 +3,22 @@ import sys
 import torch
 import torch.distributed as c10d
 
+from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
 
-if not c10d.is_available() or not c10d.is_nccl_available():
+
+if not c10d.is_available() or not c10d.is_backend_available(get_nccl_backend()):
     print("c10d NCCL not available, skipping tests", file=sys.stderr)
     sys.exit(0)
 
+import pytest
 import torch.distributed as dist
-from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.comm import set_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
-from veomni.utils.device import get_device_type, get_torch_device
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
+from veomni.utils.import_utils import is_torch_npu_available
 
 from .attention import Attention
 from .utils import (
@@ -57,8 +59,8 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @requires_nccl()
-    @skip_if_lt_x_gpu(4)
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(is_torch_npu_available, reason="npu skip async ulysses")
     def test_self_attn(self):
         self._get_process_group()
         full_input = self._get_input_data()
@@ -106,8 +108,8 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
-    @requires_nccl()
-    @skip_if_lt_x_gpu(4)
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(is_torch_npu_available, reason="npu skip async ulysses")
     def test_self_attn_padding(self):
         self._get_process_group()
         full_input = self._get_input_data_for_padding()

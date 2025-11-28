@@ -8,6 +8,7 @@ import torch.nn as nn
 from datasets import Dataset
 
 from veomni.utils import helper
+from veomni.utils.device import get_device_type
 from veomni.utils.helper import get_cache_dir
 
 
@@ -84,7 +85,7 @@ class FakeModel(nn.Module):
 
 
 def compare_items(item, rank, group_size, group):
-    item = item.to("cuda")
+    item = item.to(get_device_type())
     item_list = [torch.empty_like(item) for _ in range(group_size)]
 
     dist.all_gather(item_list, item, group=group)

@@ -5,8 +5,10 @@ import sys
 import torch
 import torch.distributed as c10d
 
+from veomni.utils.device import get_device_id, get_nccl_backend, get_torch_device
 
-if not c10d.is_available() or not c10d.is_nccl_available():
+
+if not c10d.is_available() or not c10d.is_backend_available(get_nccl_backend()):
     logging.error("c10d NCCL not available, skipping tests", file=sys.stderr)
     sys.exit(0)
 
@@ -14,7 +16,6 @@ import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
 from veomni.distributed.sequence_parallel import set_ulysses_sequence_parallel_group
-from veomni.utils.device import get_device_id, get_nccl_backend, get_torch_device
 
 
 def sync_tensor(variable, dim=1):
