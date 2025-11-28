@@ -321,25 +321,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bytecheckpoint"
-version = "0.0.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cachetools" },
-    { name = "grpcio" },
-    { name = "mmh3" },
-    { name = "numpy" },
-    { name = "protobuf" },
-    { name = "safetensors" },
-    { name = "typing-extensions" },
-    { name = "universal-pathlib" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/3a/cb/22f0840c3a42a3ddc668616f1df0860e68e6f197475b601a4764aa9a06ec/bytecheckpoint-0.0.2.tar.gz", hash = "sha256:2bf703dbff7167a213457bf2696b6eb4e0eb0ad08ba550871450051b204e3bae", size = 346357, upload-time = "2025-07-10T10:00:39.137Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/3f/7de34f041007873bbcac4008063755db62a8b7763a12166034a56221bc78/bytecheckpoint-0.0.2-py3-none-any.whl", hash = "sha256:4f77de8f979bf1c1c589718bd6938cde0549a15ab1071762654f4855c9a262f9", size = 498142, upload-time = "2025-07-10T10:00:37.302Z" },
-]
-
-[[package]]
 name = "cachetools"
 version = "6.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3238,9 +3219,6 @@ audio = [
     { name = "librosa" },
     { name = "soundfile" },
 ]
-bytecheckpoint = [
-    { name = "bytecheckpoint" },
-]
 dev = [
     { name = "expecttest" },
     { name = "pre-commit" },
@@ -3289,7 +3267,6 @@ requires-dist = [
     { name = "av", marker = "extra == 'audio'", specifier = ">=14.3.0,<15.0" },
     { name = "bitsandbytes", marker = "extra == 'dit'", specifier = ">=0.46.0,<=0.47.0" },
     { name = "blobfile", specifier = ">=3.0.0" },
-    { name = "bytecheckpoint", marker = "extra == 'bytecheckpoint'" },
     { name = "datasets", specifier = ">=2.16.0,<=2.21.0" },
     { name = "diffusers", specifier = ">=0.30.0,<=0.31.0" },
     { name = "diffusers", marker = "extra == 'dit'", specifier = ">=0.30.0,<=0.31.0" },
@@ -3317,7 +3294,7 @@ requires-dist = [
     { name = "transformers", extras = ["torch"], specifier = ">=4.51.3,<4.57.0" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "bytecheckpoint", "audio", "dit", "npu", "gpu", "megatron"]
+provides-extras = ["dev", "audio", "dit", "npu", "gpu", "megatron"]
 
 [package.metadata.requires-dev]
 dev = [

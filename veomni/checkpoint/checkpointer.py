@@ -40,7 +40,6 @@ def ckpt_to_state_dict(
     Interface to convert a checkpoint to a state_dict.
     Supported checkpoint managers:
         - dcp
-        - bytecheckpoint
 
     Args:
         save_checkpoint_path: Path to the checkpoint.
@@ -72,45 +71,6 @@ class CheckpointerBase(ABC):
         state: Dict[str, Any],
     ):
         return
-
-
-@CHECKPOINTER_REGISTRY.register("bytecheckpoint")
-def byte_checkpointer(dist_backend: str):
-    from ..utils.import_utils import is_bytecheckpoint_available
-
-    if not is_bytecheckpoint_available():
-        raise ValueError("Byte checkpoint manager requires bytecheckpoint package")
-    if dist_backend not in ["ddp", "fsdp1", "fsdp2"]:
-        raise ValueError(
-            f"Unsupported distributed backend: {dist_backend} for bytecheckpoint manager, supported modes are: ddp, fsdp1, fsdp2"
-        )
-    if dist_backend == "ddp":
-        from bytecheckpoint import DDPCheckpointer as Checkpointer
-    elif dist_backend == "fsdp1":
-        from bytecheckpoint import FSDPCheckpointer as Checkpointer
-    elif dist_backend == "fsdp2":
-        from bytecheckpoint import FSDP2Checkpointer as Checkpointer
-    return Checkpointer
-
-
-@CHECKPOINT_TO_STATE_DICT_REGISTRY.register("bytecheckpoint")
-def bytecheckpoint_ckpt_to_state_dict(
-    save_checkpoint_path: Union[str, os.PathLike], output_dir: Union[str, os.PathLike]
-):
-    from ..utils.import_utils import is_bytecheckpoint_available
-
-    if not is_bytecheckpoint_available():
-        raise ValueError("Byte checkpoint manager requires bytecheckpoint package")
-    from bytecheckpoint.utilities.ckpt_format.merge_tool import bytecheckpoint_ckpt_to_pytorch_ckpt
-
-    state_dict = bytecheckpoint_ckpt_to_pytorch_ckpt(
-        save_path=save_checkpoint_path,
-        output_path=output_dir,
-        framework="fsdp",
-        model_only=True,
-        return_dict=True,
-    )
-    return state_dict["model"]
 
 
 @CHECKPOINTER_REGISTRY.register("dcp")

@@ -128,7 +128,7 @@ model.safetensors.index.json
 veomni_cli.yaml
 demo.parquet
 
-# bytecheckpoint
+# checkpoint
 *.metadata
 *.distcp
 *.pt

@@ -37,9 +37,6 @@ dev = [
   "pytest>=6.0.0,<8.0",
   "expecttest>=0.3.0,<0.4"
 ]
-bytecheckpoint = [
-  "bytecheckpoint",
-]
 audio = [
   "av>=14.3.0,<15.0",
   "librosa>=0.11.0,<0.12",

@@ -456,8 +456,8 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Ring-attn context parallel size."},
     )
-    ckpt_manager: Literal["omnistore", "dcp", "bytecheckpoint"] = field(
-        default="omnistore",
+    ckpt_manager: str = field(
+        default="dcp",
         metadata={"help": "Checkpoint manager."},
     )
     save_async: bool = field(
@@ -672,6 +672,10 @@ class TrainingArguments:
             assert cuda_launch_blocking_val != "1", (
                 "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
             )
+
+        from ..checkpoint import CHECKPOINTER_REGISTRY
+
+        assert self.ckpt_manager in CHECKPOINTER_REGISTRY.valid_keys(), f"Unknown ckpt_manager: {self.ckpt_manager}"
 
     def compute_train_steps(
         self, max_seq_len: Optional[int] = None, train_size: Optional[int] = None, dataset_length: Optional[int] = None
