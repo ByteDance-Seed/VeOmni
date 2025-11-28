@@ -340,6 +340,7 @@ def main():
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
                 # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)

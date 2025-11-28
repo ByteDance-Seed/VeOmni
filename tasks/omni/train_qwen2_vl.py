@@ -360,6 +360,7 @@ def main():
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
                 micro_batch = {
