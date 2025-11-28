@@ -62,7 +62,7 @@ pip install -e .[npu]
 
 ```bash
 # 设置环境变量
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 # 设置可见卡
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export MULTI_STREAM_MEMORY_REUSE=2
 bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml
