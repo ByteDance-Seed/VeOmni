@@ -77,6 +77,9 @@ jobs:
       - name: Run models tests
         run: |
           pytest -s -x tests/models/test_models_patch.py
+      - name: Run e2e dcp save and load test
+        run: |
+          pytest -s -x tests/checkpoints/test_trainer_saveload.py
 
 
   cleanup:

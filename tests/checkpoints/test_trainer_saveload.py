@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -25,7 +26,7 @@ from veomni.utils.dist_utils import all_reduce
 
 
 """
-torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
+torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/checkpoints/test_trainer_saveload.py \
 --model.model_path /model-b/Qwen/Qwen3-4B \
 --train.expert_parallel_size 1 \
 --train.global_batch_size 8 \
@@ -40,7 +41,7 @@ torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_train
 --train.init_device "meta" \
 --train.ckpt_manager "dcp"
 
-torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
+torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/checkpoints/test_trainer_saveload.py \
 --model.config_path configs/model_configs/qwen/Qwen3Moe_4_layers.json \
 --model.weight_path None \
 --model.tokenizer_path /model-b/Qwen/Qwen3-30B-A3B \
@@ -395,6 +396,62 @@ def main():
     helper.empty_cache()
     dist.barrier()
     dist.destroy_process_group()
+
+
+def test_trainer_saveload():
+    ep8_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "--model.config_path=configs/model_configs/qwen/Qwen3Moe_4_layers.json",
+        "--model.weight_path=None",
+        "--model.tokenizer_path=/model-b/Qwen/Qwen3-30B-A3B",
+        "--model.moe_implementation=fused",
+        "--model.attn_implementation=flash_attention_2",
+        "--train.expert_parallel_size=8",
+        "--train.global_batch_size=8",
+        "--train.micro_batch_size=1",
+        "--data.max_seq_len=128",
+        "--data.train_path=dummy",
+        "--train.output_dir=./test_trainer_saveload_ep8",
+        "--train.max_steps=5",
+        "--train.rmpad=false",
+        "--train.rmpad_with_pos_ids=true",
+        "--train.data_parallel_mode=fsdp2",
+        "--train.init_device=meta",
+        "--train.ckpt_manager=dcp",
+    ]
+    result = subprocess.run(ep8_command, check=True)
+    assert result.returncode == 0
+
+    ep4_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "--model.config_path=configs/model_configs/qwen/Qwen3Moe_4_layers.json",
+        "--model.weight_path=None",
+        "--model.tokenizer_path=/model-b/Qwen/Qwen3-30B-A3B",
+        "--model.moe_implementation=fused",
+        "--model.attn_implementation=flash_attention_2",
+        "--train.expert_parallel_size=4",
+        "--train.global_batch_size=8",
+        "--train.micro_batch_size=1",
+        "--data.max_seq_len=128",
+        "--data.train_path=dummy",
+        "--train.output_dir=./test_trainer_saveload_ep4",
+        "--train.max_steps=5",
+        "--train.rmpad=false",
+        "--train.rmpad_with_pos_ids=true",
+        "--train.data_parallel_mode=fsdp2",
+        "--train.init_device=meta",
+        "--train.ckpt_manager=dcp",
+    ]
+    result = subprocess.run(ep4_command, check=True)
+    assert result.returncode == 0
 
 
 if __name__ == "__main__":
