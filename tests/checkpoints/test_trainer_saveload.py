@@ -26,7 +26,7 @@ from veomni.utils.dist_utils import all_reduce
 
 """
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
---model.model_path Qwen/Qwen3-4B \
+--model.model_path /model-b/Qwen/Qwen3-4B \
 --train.expert_parallel_size 1 \
 --train.global_batch_size 8 \
 --train.micro_batch_size 1 \
@@ -43,21 +43,21 @@ torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_train
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
 --model.config_path configs/model_configs/qwen/Qwen3Moe_4_layers.json \
 --model.weight_path None \
---model.tokenizer_path Qwen/Qwen3-30B-A3B \
+--model.tokenizer_path /model-b/Qwen/Qwen3-30B-A3B \
 --model.moe_implementation fused \
 --model.attn_implementation flash_attention_2 \
---train.expert_parallel_size 4 \
+--train.expert_parallel_size 8 \
 --train.global_batch_size 8 \
 --train.micro_batch_size 1 \
 --data.max_seq_len 128 \
 --data.train_path "dummy" \
---train.output_dir ./test_trainer_saveload \
+--train.output_dir ./test_trainer_saveload_ep8 \
 --train.max_steps 5 \
 --train.rmpad false \
 --train.rmpad_with_pos_ids true \
 --train.data_parallel_mode "fsdp2" \
 --train.init_device "meta" \
---train.ckpt_manager "dcp" $@ 2>&1 | tee test_saveload_ep4_fix.log
+--train.ckpt_manager "dcp" $@ 2>&1 | tee test_saveload_ep8.log
 """
 
 # To prevent DCP from complaining "too many open files"
