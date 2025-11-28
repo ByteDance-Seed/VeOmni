@@ -148,13 +148,17 @@ class DataArguments:
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
-    dataloader_type: Literal["native", "streaming"] = field(
-        default="streaming",
+    dataloader_type: Literal["native"] = field(
+        default="native",
         metadata={"help": "Type of the dataloader."},
     )
-    datasets_type: Literal["byted", "mapping", "iterable", "energon"] = field(
-        default="byted",
+    datasets_type: Literal["mapping", "iterable", "energon"] = field(
+        default="mapping",
         metadata={"help": "Type of the datasets."},
+    )
+    multisource_datasets_type: Literal["interleave"] = field(
+        default="interleave",
+        metadata={"help": "Type of the datasets for multisource training."},
     )
     enable_multisource: bool = field(
         default=False,
@@ -226,6 +230,11 @@ class DataArguments:
         if self.enable_multisource and self.shuffle_shard_nums != 1:
             self.shuffle_shard_nums = 1
             logger.info_rank0("`shuffle_shard_nums` is set to 1 when using multisource dataset.")
+
+        if self.enable_multisource:
+            self.dataset_name = self.multisource_datasets_type
+        else:
+            self.dataset_name = self.datasets_type
 
         if self.text_keys is None:
             if self.data_type == "plaintext":

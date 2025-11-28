@@ -13,7 +13,7 @@ from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, 
 from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_dataloader,
-    build_interleave_dataset,
+    build_dataset,
 )
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.utils import helper
@@ -86,8 +86,12 @@ def run_data_test():
 
     args.data.enable_multisource = True
     logger.info_rank0("Start building interleave dataset")
-    train_dataset = build_interleave_dataset(
-        tmp_yaml_path, args.data.datasets_type, transform=transform, seed=args.train.seed
+    train_dataset = build_dataset(
+        dataset_name="interleave",
+        train_path=tmp_yaml_path,
+        datasets_type=args.data.datasets_type,
+        transform=transform,
+        seed=args.train.seed,
     )
 
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
@@ -96,6 +100,7 @@ def run_data_test():
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
     dataloader = build_dataloader(
+        dataloader_type="native",
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,

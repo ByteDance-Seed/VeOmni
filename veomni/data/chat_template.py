@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Dict, List, Sequence
 import torch
 
 from veomni.utils import logging
-from veomni.utils.registry import Registry
 
+from ..utils.registry import Registry
 from .constants import IGNORE_INDEX
 
 
