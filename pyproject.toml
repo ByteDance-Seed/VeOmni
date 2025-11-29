@@ -13,7 +13,7 @@ description = "VeOmni: Scaling any Modality Model Training to any Accelerators w
 authors = [
   { name="Fazzie", email="maqianli.fazzie@bytedance.com" },
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 license = { file = "LICENSE" }
 
 dependencies = [
@@ -61,6 +61,8 @@ gpu =[
   "torch==2.8.0+cu128",
   "torchvision==0.23.0+cu128",
   "torchaudio==2.8.0+cu128",
+  "nvidia-cusparselt-cu12",
+  "nvidia-nccl-cu12",
   "liger-kernel",
   "flash-attn",
 ]
@@ -82,7 +84,8 @@ lint = [
 ]
 test = [
   "pytest",
-  "expecttest"
+  "expecttest",
+  "setuptools"
 ]
 
 
@@ -98,14 +101,14 @@ required-version = "==0.9.8"
 override-dependencies = [
     # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
-    # byted pypi without using the cu126 versions.
+    # byted pypi without using the cu128 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
     "torch==2.8.0+cu128; (extra == 'gpu')",
     "torchaudio==2.8.0+cu128; (extra == 'gpu')",
     "torchvision==0.23.0+cu128; (extra == 'gpu')",
     # Adding explicit override for other backends as well. Otherwise these libraries
     # will be excluded for other backends.
-    "torch==2.7.1+cpu; extra == 'npu'",
+    "torch==2.7.1+cpu; (extra == 'npu')",
     "torchaudio==2.7.1; (extra == 'npu') and (platform_machine == 'aarch64')",
     "torchvision==0.22.1; (extra == 'npu') and (platform_machine == 'aarch64')",
     "torchaudio==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
