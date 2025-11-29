@@ -663,9 +663,15 @@ def create_profiler(
         npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
             CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
         )
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            data_simplification=False,
+        )
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
+        experimental_config = None
 
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
@@ -686,6 +692,7 @@ def create_profiler(
         profile_memory=profile_memory,
         with_modules=True,
         with_stack=with_stack,
+        experimental_config=experimental_config,
     )
     if IS_CUDA_AVAILABLE and profile_memory:
         return ProfilerWithMem(base_profiler)
