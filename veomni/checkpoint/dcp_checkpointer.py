@@ -175,8 +175,7 @@ class OptimizerState(Stateful):
                 continue
 
             # each tensor in the state dict should only belong to one EP entry
-            if len(matches) > 1:
-                raise RuntimeError(f"Ambiguous EP spec match for state key '{name}': {matches}")
+            assert len(matches) == 1, f"Ambiguous EP spec match for state key '{name}': {matches}"
 
             ep_key = matches[0]
             cur_spec_info = ep_fqn2spec_info[ep_key]

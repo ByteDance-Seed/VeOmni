@@ -133,7 +133,7 @@ def main():
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
     train_dataloader = build_dataloader(
         dataset=train_dataset,
-        dataloader_type="streaming",
+        dataloader_type="native",
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
