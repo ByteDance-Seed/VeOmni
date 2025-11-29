@@ -6,14 +6,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_optimizer_state_dict,
-)
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer
-from veomni.data import build_dummy_dataset, build_streaming_dataloader
+from veomni.data import build_dataloader, build_dummy_dataset
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -27,24 +23,9 @@ from veomni.utils.dist_utils import all_reduce
 
 """
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/checkpoints/test_trainer_saveload.py \
---model.model_path /model-b/Qwen/Qwen3-4B \
---train.expert_parallel_size 1 \
---train.global_batch_size 8 \
---train.micro_batch_size 1 \
---data.max_seq_len 128 \
---data.train_path "dummy" \
---train.output_dir ./test_trainer_saveload \
---train.max_steps 5 \
---train.rmpad false \
---train.rmpad_with_pos_ids true \
---train.data_parallel_mode "fsdp2" \
---train.init_device "meta" \
---train.ckpt_manager "dcp"
-
-torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/checkpoints/test_trainer_saveload.py \
---model.config_path configs/model_configs/qwen/Qwen3Moe_4_layers.json \
+--model.config_path configs/model_configs/qwen/qwen3_moe_30a3b_4_layers.json \
 --model.weight_path None \
---model.tokenizer_path /model-b/Qwen/Qwen3-30B-A3B \
+--model.tokenizer_path /mnt/hdfs/models/Qwen3-30B-A3B \
 --model.moe_implementation fused \
 --model.attn_implementation flash_attention_2 \
 --train.expert_parallel_size 8 \
@@ -150,8 +131,9 @@ def main():
     train_dataset = build_dummy_dataset(task_type="text", size=train_data_size, max_seq_len=args.data.max_seq_len)
 
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
-    train_dataloader = build_streaming_dataloader(
+    train_dataloader = build_dataloader(
         dataset=train_dataset,
+        dataloader_type="streaming",
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
@@ -321,41 +303,6 @@ def main():
                     "train_dataloader": train_dataloader.state_dict(),
                 },
             }
-            if getattr(optimizer, "_is_multi_optimizer", False):
-                ep_param_optimizer = optimizer.optimizers_dict["ep"]
-                non_ep_param_optimizer = optimizer.optimizers_dict["non_ep"]
-
-                flatten_ep_optim_sd = get_optimizer_state_dict(
-                    model,
-                    ep_param_optimizer,
-                    options=StateDictOptions(flatten_optimizer_state_dict=True),
-                )
-                flatten_non_ep_optim_sd = get_optimizer_state_dict(
-                    model,
-                    non_ep_param_optimizer,
-                    options=StateDictOptions(flatten_optimizer_state_dict=True),
-                )
-
-                logger.info_rank0(f"{flatten_ep_optim_sd.keys()=}")
-                logger.info_rank0(f"{flatten_non_ep_optim_sd.keys()=}")
-                logger.info_rank0(f"{optimizer.state_dict().keys()=}")
-
-                ep_keys = set(flatten_ep_optim_sd.keys())
-                non_ep_keys = set(flatten_non_ep_optim_sd.keys())
-                merged_keys = set(optimizer.state_dict().keys())
-
-                # Optional sanity check: EP and non-EP partitions are disjoint
-                overlap = ep_keys & non_ep_keys
-                assert not overlap, f"EP and non-EP optimizers share keys: {sorted(overlap)}"
-
-                # The MultiOptimizer should cover exactly the union
-                expected_keys = ep_keys | non_ep_keys
-                assert merged_keys == expected_keys, (
-                    f"Mismatch in merged optimizer keys: "
-                    f"merged={len(merged_keys)}, expected={len(expected_keys)}; "
-                    f"missing={sorted(expected_keys - merged_keys)}, "
-                    f"extra={sorted(merged_keys - expected_keys)}"
-                )
 
             logger.info_rank0("testing DCP async saving")
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step, save_async=True)
@@ -398,60 +345,43 @@ def main():
     dist.destroy_process_group()
 
 
-def test_trainer_saveload():
+def test_trainer_saveload_ep8():
     ep8_command = [
         "torchrun",
         "--nnodes=1",
         "--nproc_per_node=8",
         "--master_port=4321",
-        "tests/checkpoints/test_trainer_saveload.py",
-        "--model.config_path=configs/model_configs/qwen/Qwen3Moe_4_layers.json",
-        "--model.weight_path=None",
-        "--model.tokenizer_path=/model-b/Qwen/Qwen3-30B-A3B",
-        "--model.moe_implementation=fused",
-        "--model.attn_implementation=flash_attention_2",
-        "--train.expert_parallel_size=8",
-        "--train.global_batch_size=8",
-        "--train.micro_batch_size=1",
-        "--data.max_seq_len=128",
-        "--data.train_path=dummy",
-        "--train.output_dir=./test_trainer_saveload_ep8",
-        "--train.max_steps=5",
-        "--train.rmpad=false",
-        "--train.rmpad_with_pos_ids=true",
-        "--train.data_parallel_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.ckpt_manager=dcp",
+        "tests/utils/test_trainer_saveload.py",
+        "tests/checkpoints/ep8.yaml",
     ]
-    result = subprocess.run(ep8_command, check=True)
-    assert result.returncode == 0
+    ep8_result = subprocess.run(ep8_command, check=True)
+    assert ep8_result.returncode == 0
 
+
+def test_trainer_saveload_ep4():
     ep4_command = [
         "torchrun",
         "--nnodes=1",
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/checkpoints/test_trainer_saveload.py",
-        "--model.config_path=configs/model_configs/qwen/Qwen3Moe_4_layers.json",
-        "--model.weight_path=None",
-        "--model.tokenizer_path=/model-b/Qwen/Qwen3-30B-A3B",
-        "--model.moe_implementation=fused",
-        "--model.attn_implementation=flash_attention_2",
-        "--train.expert_parallel_size=4",
-        "--train.global_batch_size=8",
-        "--train.micro_batch_size=1",
-        "--data.max_seq_len=128",
-        "--data.train_path=dummy",
-        "--train.output_dir=./test_trainer_saveload_ep4",
-        "--train.max_steps=5",
-        "--train.rmpad=false",
-        "--train.rmpad_with_pos_ids=true",
-        "--train.data_parallel_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.ckpt_manager=dcp",
+        "tests/checkpoints/ep4.yaml",
     ]
-    result = subprocess.run(ep4_command, check=True)
-    assert result.returncode == 0
+    ep4_result = subprocess.run(ep4_command, check=True)
+    assert ep4_result.returncode == 0
+
+
+def test_trainer_saveload_no_ep():
+    no_ep_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "tests/checkpoints/no_ep.yaml",
+    ]
+    no_ep_result = subprocess.run(no_ep_command, check=True)
+    assert no_ep_result.returncode == 0
 
 
 if __name__ == "__main__":

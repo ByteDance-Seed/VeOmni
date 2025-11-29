@@ -1,0 +1,34 @@
+model:
+  # model_path: ./qwen3moe_4layers_merged
+  config_path: configs/model_configs/qwen/qwen3_moe_30a3b_4_layers.json
+  tokenizer_path: Qwen/Qwen3-30B-A3B
+  weight_path: None
+  moe_implementation: fused
+  attn_implementation: flash_attention_2
+
+data:
+  train_path: dummy
+  max_seq_len: 128
+
+train:
+  output_dir: ./test_trainer_saveload_no_ep
+  data_parallel_mode: fsdp2
+  expert_parallel_size: 1
+  enable_full_shard: true
+  init_device: meta
+  global_batch_size: 8
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: true
+  dyn_bsz_margin: 0
+  lr: 3.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  use_wandb: false
+  enable_profiling: false
+  max_steps: 5
+  ckpt_manager: dcp
+  save_async: true
