@@ -351,7 +351,7 @@ def test_trainer_saveload_ep8():
         "--nnodes=1",
         "--nproc_per_node=8",
         "--master_port=4321",
-        "tests/utils/test_trainer_saveload.py",
+        "tests/checkpoints/test_trainer_saveload.py",
         "tests/checkpoints/ep8.yaml",
     ]
     ep8_result = subprocess.run(ep8_command, check=True)
