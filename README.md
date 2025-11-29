@@ -119,33 +119,63 @@ Read the [VeOmni Best Practice](docs/start/best_practice.md) for more details.
 
 #### (Recommended) Use `uv` Managed Virtual Environment
 
-We recommend to use [`uv`](https://docs.astral.sh/uv/) managed virtual environment
-to run VeOmni.
+We recommend using [`uv`](https://docs.astral.sh/uv/) managed virtual environment to run VeOmni.
+
+**Install uv** (if not already installed):
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**Install VeOmni with uv**:
 
 ```shell
-# For GPU
+# For GPU (CUDA 12.8)
 uv sync --extra gpu
+
 # For Ascend NPU
 uv sync --extra npu
-# You can install other optional deps by adding --extra like --extra dit
+
+# Install multiple extras (e.g., GPU + audio + DiT support)
+uv sync --extra gpu --extra audio --extra dit
 
 # Activate the uv managed virtual environment
 source .venv/bin/activate
 ```
 
+**Available extras**:
+- `gpu`: CUDA 12.8 support with torch 2.8.0, flash-attention, liger-kernel
+- `npu`: Ascend NPU support with torch-npu
+- `audio`: Audio processing libraries (av, librosa, soundfile)
+- `dit`: Diffusion model support (diffusers, bitsandbytes)
+- `megatron`: Megatron-Energon support
+- `trl`: Transformer Reinforcement Learning support
+
 #### `pip` Based Install
 
-Install using PyPI:
+Install from PyPI (requires manually installing PyTorch first):
 
 ```shell
+# Install PyTorch first (choose based on your hardware)
+# For GPU with CUDA 12.8:
+pip3 install torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+# For CPU:
+pip3 install torch==2.8.0+cpu torchvision==0.23.0+cpu torchaudio==2.8.0+cpu \
+  --index-url https://download.pytorch.org/whl/cpu
+
+# Then install VeOmni
 pip3 install veomni
 ```
 
 Install from source code:
 
 ```shell
+# Install PyTorch first (see above), then:
 pip3 install -e .
 ```
+
+**Note**: Using `uv` is recommended as it handles PyTorch version management and CUDA compatibility automatically. With `pip`, you need to manually ensure PyTorch versions match your CUDA installation.
 
 ### 🚀 Quick Start
 

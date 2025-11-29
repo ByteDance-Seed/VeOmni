@@ -29,6 +29,7 @@ dependencies = [
   "timm",
   "wandb",
   "setuptools",
+  "einops>=0.8.1",
 ]
 
 [project.optional-dependencies]
@@ -48,14 +49,14 @@ dit = [
   "bitsandbytes>=0.46.0,<=0.47.0"
 ]
 npu = [
-  "torch==2.7.1+cpu",
+  "torch==2.7.1; platform_machine == 'aarch64'",
+  "torch==2.7.1+cpu; platform_machine != 'aarch64'",
   "torch-npu==2.7.1",
   "torchvision==0.22.1; platform_machine == 'aarch64'",
   "torchaudio==2.7.1; platform_machine == 'aarch64'",
   "torchvision==0.22.1+cpu; platform_machine != 'aarch64'",
   "torchaudio==2.7.1+cpu; platform_machine != 'aarch64'",
   "decorator>=5.2.1",
-  "einops>=0.8.1",
   "scipy>=1.16.2"
 ]
 gpu = [
@@ -66,9 +67,13 @@ gpu = [
   "nvidia-nccl-cu12",
   "liger-kernel",
   "flash-attn",
+  "hf_transfer",
 ]
 megatron = [
   "megatron-energon>=7.2.1"
+]
+trl = [
+  "trl<=0.9.6"
 ]
 
 [dependency-groups]
@@ -137,7 +142,7 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "gpu" },
+  { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
 ]
 torchvision = [ # npu aarch64 need install torchvison from pytorch-cpu
   { index = "pytorch-cpu", marker = "(extra == 'npu') and (platform_machine == 'aarch64') and (extra != 'gpu')" },
@@ -145,7 +150,7 @@ torchvision = [ # npu aarch64 need install torchvison from pytorch-cpu
 ]
 torchaudio = { index = "pytorch" }
 # Download flash-attn wheel directly to avoid build issues.
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'" }
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' or extra == 'sglang'" }
 
 [[tool.uv.index]]
 name = "pytorch"

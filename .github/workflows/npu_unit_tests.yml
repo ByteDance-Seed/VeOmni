@@ -74,24 +74,28 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
-      - name: Install the current repository
+      - name: Install uv
         run: |
-          pip install -e .[dev]
+          curl -LsSf https://astral.sh/uv/0.9.8/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Setup environment with uv
+        run: |
+          uv sync --extra npu  --group dev
       - name: Check final pip list
         run: |
-          pip list
+          uv pip list
       - name: Run models tests
         run: |
-          pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_models_patch.py
       - name: Run parallel tests
         run: |
-          pytest -s -x tests/parallel
+          uv run --frozen pytest -s -x tests/parallel
       - name: Run fsdp2/ep+fsdp2 clip grad norm test
         run: |
-          pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+          uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
       - name: Run e2e dcp save and load test
         run: |
-          pytest -s -x tests/checkpoints/test_trainer_saveload.py
+          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run data tests
         run: |
-          pytest -s -x tests/data
+          uv run --frozen pytest -s -x tests/data
