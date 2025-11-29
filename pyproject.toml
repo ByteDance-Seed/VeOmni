@@ -29,6 +29,7 @@ dependencies = [
   "timm",
   "wandb",
   "setuptools",
+  "einops>=0.8.1",
 ]
 
 [project.optional-dependencies]
@@ -55,7 +56,6 @@ npu = [
   "torchvision==0.22.1+cpu; platform_machine != 'aarch64'",
   "torchaudio==2.7.1+cpu; platform_machine != 'aarch64'",
   "decorator>=5.2.1",
-  "einops>=0.8.1",
   "scipy>=1.16.2"
 ]
 gpu = [
@@ -66,6 +66,7 @@ gpu = [
   "nvidia-nccl-cu12",
   "liger-kernel",
   "flash-attn",
+  "apex",
 ]
 megatron = [
   "megatron-energon>=7.2.1"
