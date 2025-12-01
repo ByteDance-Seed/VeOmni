@@ -19,111 +19,72 @@ import pytest
 
 def test_preprocessor_registration():
     """Test that custom preprocessors can be registered"""
-    from veomni.data.multimodal.preprocessor_registry import get_all_preprocessors, register_preprocessor
+    from veomni.data.multimodal import PREPROCESSOR_REGISTRY
 
     # Define a test preprocessor
-    @register_preprocessor("test_preprocessor_new")
+    @PREPROCESSOR_REGISTRY.register("test_preprocessor_new")
     def test_preprocess(conversations, **kwargs):
         return [["user", ("text", "test")]]
 
-    preprocessors = get_all_preprocessors()
-    assert "test_preprocessor_new" in preprocessors
-    assert preprocessors["test_preprocessor_new"] == test_preprocess
+    assert "test_preprocessor_new" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert PREPROCESSOR_REGISTRY["test_preprocessor_new"] == test_preprocess
 
 
 def test_builtin_preprocessors_registered():
     """Test that built-in preprocessors from preprocess.py are automatically registered"""
-    from veomni.data.multimodal.preprocessor_registry import get_all_preprocessors
-
-    preprocessors = get_all_preprocessors()
+    from veomni.data.multimodal import PREPROCESSOR_REGISTRY
 
     # Check that some built-in preprocessors are present
-    assert "sharegpt4v_pretrain" in preprocessors
-    assert "sharegpt4v_sft" in preprocessors
-    assert "doom" in preprocessors
-    assert "seed_edit" in preprocessors
-    assert "imagenet1k" in preprocessors
-    assert "fineweb_100BT" in preprocessors
-
-
-def test_list_preprocessors():
-    """Test listing all registered preprocessors"""
-    from veomni.data.multimodal.preprocessor_registry import list_preprocessors
-
-    preprocessor_names = list_preprocessors()
-    assert isinstance(preprocessor_names, list)
-    assert len(preprocessor_names) > 0
-    assert "sharegpt4v_pretrain" in preprocessor_names
-    assert "doom" in preprocessor_names
-
-
-def test_is_preprocessor_registered():
-    """Test checking if a preprocessor is registered"""
-    from veomni.data.multimodal.preprocessor_registry import is_preprocessor_registered
-
-    assert is_preprocessor_registered("sharegpt4v_pretrain") is True
-    assert is_preprocessor_registered("nonexistent_preprocessor_xyz") is False
+    assert "sharegpt4v_pretrain" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert "sharegpt4v_sft" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert "doom" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert "seed_edit" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert "imagenet1k" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert "fineweb_100BT" in PREPROCESSOR_REGISTRY.valid_keys()
 
 
 def test_get_preprocessor():
     """Test getting a preprocessor by name"""
-    from veomni.data.multimodal.preprocessor_registry import get_preprocessor
+    from veomni.data.multimodal import PREPROCESSOR_REGISTRY
 
     # Get a built-in preprocessor
-    preprocessor = get_preprocessor("sharegpt4v_pretrain")
+    preprocessor = PREPROCESSOR_REGISTRY["sharegpt4v_pretrain"]
     assert callable(preprocessor)
 
     # Test with unknown preprocessor - should raise ValueError
-    with pytest.raises(ValueError, match="Unknown dataset name"):
-        get_preprocessor("nonexistent_preprocessor_xyz")
+    with pytest.raises(ValueError, match="Unknown preprocessor name: nonexistent_preprocessor_xyz"):
+        PREPROCESSOR_REGISTRY["nonexistent_preprocessor_xyz"]
 
 
 def test_multiple_names_same_function():
     """Test that the same preprocessor can be registered under multiple names"""
-    from veomni.data.multimodal.preprocessor_registry import get_all_preprocessors
-
-    preprocessors = get_all_preprocessors()
+    from veomni.data.multimodal import PREPROCESSOR_REGISTRY
 
     # sharegpt4v_pretrain_preprocess is registered as both "sharegpt4v_pretrain" and "sharegpt4v_captioner"
-    assert "sharegpt4v_pretrain" in preprocessors
-    assert "sharegpt4v_captioner" in preprocessors
-    assert preprocessors["sharegpt4v_pretrain"] == preprocessors["sharegpt4v_captioner"]
+    assert "sharegpt4v_pretrain" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert "sharegpt4v_captioner" in PREPROCESSOR_REGISTRY.valid_keys()
+    assert PREPROCESSOR_REGISTRY["sharegpt4v_pretrain"] == PREPROCESSOR_REGISTRY["sharegpt4v_captioner"]
 
 
 def test_duplicate_registration_error():
     """Test that duplicate registration raises an exception"""
-    from veomni.data.multimodal.preprocessor_registry import register_preprocessor
+    from veomni.data.multimodal import PREPROCESSOR_REGISTRY
 
-    @register_preprocessor("test_dup_preprocessor_1")
+    @PREPROCESSOR_REGISTRY.register("test_dup_preprocessor_1")
     def test_preprocess1(conversations, **kwargs):
         return [["first"]]
 
     # Second registration should raise ValueError
     with pytest.raises(ValueError, match="already registered"):
 
-        @register_preprocessor("test_dup_preprocessor_1")
+        @PREPROCESSOR_REGISTRY.register("test_dup_preprocessor_1")
         def test_preprocess2(conversations, **kwargs):
             return [["second"]]
 
 
-def test_preprocessor_execution():
-    """Test that preprocessors execute correctly"""
-    from veomni.data.multimodal.preprocessor_registry import get_preprocessor
-
-    # Test with a built-in preprocessor
-    test_conversations = [
-        {"from": "human", "value": "<image>"},
-        {"from": "gpt", "value": "A beautiful sunset."},
-    ]
-    preprocessor = get_preprocessor("sharegpt4v_pretrain")
-    result = preprocessor(test_conversations)
-    assert isinstance(result, list)
-    assert len(result) > 0
-
-
 def test_conv_preprocess():
     """Test that conv_preprocess convenience function works"""
-    from veomni.data.multimodal.preprocessor_registry import conv_preprocess
+    from veomni.data.multimodal import conv_preprocess
 
     # Test with a built-in preprocessor
     test_conversations = [
@@ -135,7 +96,7 @@ def test_conv_preprocess():
     assert len(result) > 0
 
     # Test that it raises ValueError for unknown preprocessor
-    with pytest.raises(ValueError, match="Unknown dataset name"):
+    with pytest.raises(ValueError, match="Unknown preprocessor name: nonexistent_preprocessor_xyz"):
         conv_preprocess("nonexistent_preprocessor_xyz", test_conversations)
 
 
@@ -144,10 +105,10 @@ def test_e2e_custom_and_builtin_preprocessor_flow():
     E2E test: Register a custom preprocessor, process sample data with both
     builtin and custom preprocessors, and verify interleave structure.
     """
-    from veomni.data.multimodal.preprocessor_registry import conv_preprocess, register_preprocessor
+    from veomni.data.multimodal import PREPROCESSOR_REGISTRY, conv_preprocess
 
     # Step 1: Register a customized preprocessor
-    @register_preprocessor("custom_vqa_e2e")
+    @PREPROCESSOR_REGISTRY.register("custom_vqa_e2e")
     def custom_vqa_preprocess(conversations, **kwargs):
         """
         Custom preprocessor that converts VQA format to interleaved structure.
@@ -238,18 +199,3 @@ def test_e2e_custom_and_builtin_preprocessor_flow():
                 assert isinstance(item, tuple), "Content items should be tuples"
                 assert len(item) == 2, "Content tuple should have (modality, content)"
                 assert item[0] in ["text", "image"], "Modality should be text or image"
-
-
-if __name__ == "__main__":
-    # Run tests
-    test_preprocessor_registration()
-    test_builtin_preprocessors_registered()
-    test_list_preprocessors()
-    test_is_preprocessor_registered()
-    test_get_preprocessor()
-    test_multiple_names_same_function()
-    test_duplicate_registration_error()
-    test_preprocessor_execution()
-    test_conv_preprocess()
-    test_e2e_custom_and_builtin_preprocessor_flow()
-    print("✓ All tests passed!")

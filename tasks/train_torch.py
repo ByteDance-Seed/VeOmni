@@ -14,10 +14,7 @@ from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     build_chat_template,
     build_dataloader,
-    build_energon_dataset,
-    build_interleave_dataset,
-    build_iterative_dataset,
-    build_mapping_dataset,
+    build_dataset,
 )
 from veomni.data.data_transform import process_pretrain_example, process_sft_example
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -93,60 +90,38 @@ def main():
     else:
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
-    if args.data.dataloader_type == "native":
-        if args.data.enable_multisource:
-            logger.info_rank0("Start building interleave dataset")
-            train_dataset = build_interleave_dataset(
-                args.data.train_path, args.data.datasets_type, transform=transform, seed=args.train.seed
-            )
-        elif args.data.datasets_type == "iterable":
-            logger.info_rank0("Start building iterative dataset")
-            train_dataset = build_iterative_dataset(args.data.train_path, transform=transform, seed=args.train.seed)
-        elif args.data.datasets_type == "mapping":
-            logger.info_rank0("Start building mapping dataset")
-            train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
-        elif args.data.datasets_type == "energon":
-            logger.info_rank0("Start building Megatron-Energon native dataset")
-            train_dataset = build_energon_dataset(
-                args.data.train_path,
-                transform=transform,
-                max_samples_per_sequence=args.data.max_samples_per_sequence
-                if hasattr(args.data, "max_samples_per_sequence")
-                else None,
-                virtual_epoch_length=args.data.virtual_epoch_length
-                if hasattr(args.data, "virtual_epoch_length")
-                else None,
-                shuffle_buffer_size=args.data.shuffle_buffer_size
-                if hasattr(args.data, "shuffle_buffer_size")
-                else None,
-                num_workers=args.data.num_workers,
-            )
-        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
-        if args.data.datasets_type == "mapping":
-            dataset_length = dataset_length / args.train.data_parallel_size
-        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    train_dataset = build_dataset(
+        dataset_name=args.data.dataset_name,
+        transform=transform,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        seed=args.train.seed,
+        **asdict(args.data),
+    )
+    dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+    if args.data.datasets_type == "mapping":
+        dataset_length = dataset_length / args.train.data_parallel_size
+    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
-        train_dataloader = build_dataloader(
-            dataset=train_dataset,
-            micro_batch_size=args.train.micro_batch_size,
-            global_batch_size=args.train.global_batch_size,
-            dataloader_batch_size=args.train.dataloader_batch_size,
-            seed=args.train.seed,
-            max_seq_len=args.data.max_seq_len,
-            train_steps=args.train.train_steps,
-            rmpad=args.train.rmpad,
-            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-            bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-            dyn_bsz_margin=args.train.dyn_bsz_margin,
-            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
-            num_workers=args.data.num_workers,
-            drop_last=args.data.drop_last,
-            pin_memory=args.data.pin_memory,
-            prefetch_factor=args.data.prefetch_factor,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported dataloader type: {args.data.dataloader_type}.")
+    train_dataloader = build_dataloader(
+        dataloader_type=args.data.dataloader_type,
+        dataset=train_dataset,
+        micro_batch_size=args.train.micro_batch_size,
+        global_batch_size=args.train.global_batch_size,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        seed=args.train.seed,
+        max_seq_len=args.data.max_seq_len,
+        train_steps=args.train.train_steps,
+        rmpad=args.train.rmpad,
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+        dyn_bsz_margin=args.train.dyn_bsz_margin,
+        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+        num_workers=args.data.num_workers,
+        drop_last=args.data.drop_last,
+        pin_memory=args.data.pin_memory,
+        prefetch_factor=args.data.prefetch_factor,
+    )
 
     logger.info_rank0("Prepare model")
     model = build_foundation_model(
@@ -289,6 +264,7 @@ def main():
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
                 micro_batch = {

@@ -148,13 +148,17 @@ class DataArguments:
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
-    dataloader_type: Literal["native", "streaming"] = field(
-        default="streaming",
+    dataloader_type: str = field(
+        default="native",
         metadata={"help": "Type of the dataloader."},
     )
-    datasets_type: Literal["byted", "mapping", "iterable", "energon"] = field(
-        default="byted",
+    datasets_type: str = field(
+        default="mapping",
         metadata={"help": "Type of the datasets."},
+    )
+    multisource_datasets_type: str = field(
+        default="interleave",
+        metadata={"help": "Type of the datasets for multisource training."},
     )
     enable_multisource: bool = field(
         default=False,
@@ -226,6 +230,19 @@ class DataArguments:
         if self.enable_multisource and self.shuffle_shard_nums != 1:
             self.shuffle_shard_nums = 1
             logger.info_rank0("`shuffle_shard_nums` is set to 1 when using multisource dataset.")
+
+        from ..data.data_loader import DATALOADER_REGISTRY
+        from ..data.dataset import DATASET_REGISTRY
+
+        assert self.datasets_type in DATASET_REGISTRY.valid_keys(), f"Unknown datasets type: {self.datasets_type}"
+        assert self.dataloader_type in DATALOADER_REGISTRY.valid_keys(), (
+            f"Unknown dataloader type: {self.dataloader_type}"
+        )
+
+        if self.enable_multisource:
+            self.dataset_name = self.multisource_datasets_type
+        else:
+            self.dataset_name = self.datasets_type
 
         if self.text_keys is None:
             if self.data_type == "plaintext":
@@ -439,8 +456,8 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Ring-attn context parallel size."},
     )
-    ckpt_manager: Literal["omnistore", "dcp", "bytecheckpoint"] = field(
-        default="omnistore",
+    ckpt_manager: str = field(
+        default="dcp",
         metadata={"help": "Checkpoint manager."},
     )
     save_async: bool = field(
@@ -655,6 +672,10 @@ class TrainingArguments:
             assert cuda_launch_blocking_val != "1", (
                 "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
             )
+
+        from ..checkpoint import CHECKPOINTER_REGISTRY
+
+        assert self.ckpt_manager in CHECKPOINTER_REGISTRY.valid_keys(), f"Unknown ckpt_manager: {self.ckpt_manager}"
 
     def compute_train_steps(
         self, max_seq_len: Optional[int] = None, train_size: Optional[int] = None, dataset_length: Optional[int] = None

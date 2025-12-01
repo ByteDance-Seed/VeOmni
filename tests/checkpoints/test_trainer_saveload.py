@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -8,7 +9,7 @@ import torch.distributed as dist
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer
-from veomni.data import build_dummy_dataset, build_streaming_dataloader
+from veomni.data import build_dataloader, build_dummy_dataset
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -21,37 +22,24 @@ from veomni.utils.dist_utils import all_reduce
 
 
 """
-torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
---model.model_path Qwen/Qwen3-4B \
---train.expert_parallel_size 1 \
---train.global_batch_size 8 \
---train.micro_batch_size 1 \
---data.max_seq_len 128 \
---data.train_path "dummy" \
---train.output_dir ./test_trainer_saveload \
---train.max_steps 5 \
---train.rmpad false \
---train.rmpad_with_pos_ids true \
---train.data_parallel_mode "fsdp2" \
---train.init_device "meta" \
---train.ckpt_manager "dcp"
-
-torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
---model.model_path /path/to/Qwen3-30B-A3B-Instruct-2507-merge \
+torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/checkpoints/test_trainer_saveload.py \
+--model.config_path configs/model_configs/qwen/qwen3_moe_30a3b_4_layers.json \
+--model.weight_path None \
+--model.tokenizer_path /mnt/hdfs/models/Qwen3-30B-A3B \
 --model.moe_implementation fused \
 --model.attn_implementation flash_attention_2 \
---train.expert_parallel_size 4 \
+--train.expert_parallel_size 8 \
 --train.global_batch_size 8 \
 --train.micro_batch_size 1 \
 --data.max_seq_len 128 \
 --data.train_path "dummy" \
---train.output_dir ./test_trainer_saveload \
+--train.output_dir ./test_trainer_saveload_ep8 \
 --train.max_steps 5 \
 --train.rmpad false \
 --train.rmpad_with_pos_ids true \
 --train.data_parallel_mode "fsdp2" \
 --train.init_device "meta" \
---train.ckpt_manager "dcp"
+--train.ckpt_manager "dcp" $@ 2>&1 | tee test_saveload_ep8.log
 """
 
 # To prevent DCP from complaining "too many open files"
@@ -143,8 +131,9 @@ def main():
     train_dataset = build_dummy_dataset(task_type="text", size=train_data_size, max_seq_len=args.data.max_seq_len)
 
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
-    train_dataloader = build_streaming_dataloader(
+    train_dataloader = build_dataloader(
         dataset=train_dataset,
+        dataloader_type="streaming",
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
@@ -354,6 +343,45 @@ def main():
     helper.empty_cache()
     dist.barrier()
     dist.destroy_process_group()
+
+
+def test_trainer_saveload_ep8():
+    ep8_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/utils/test_trainer_saveload.py",
+        "tests/checkpoints/ep8.yaml",
+    ]
+    ep8_result = subprocess.run(ep8_command, check=True)
+    assert ep8_result.returncode == 0
+
+
+def test_trainer_saveload_ep4():
+    ep4_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "tests/checkpoints/ep4.yaml",
+    ]
+    ep4_result = subprocess.run(ep4_command, check=True)
+    assert ep4_result.returncode == 0
+
+
+def test_trainer_saveload_no_ep():
+    no_ep_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "tests/checkpoints/no_ep.yaml",
+    ]
+    no_ep_result = subprocess.run(no_ep_command, check=True)
+    assert no_ep_result.returncode == 0
 
 
 if __name__ == "__main__":

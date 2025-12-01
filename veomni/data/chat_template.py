@@ -14,13 +14,13 @@
 
 
 from abc import ABC, abstractmethod
-from collections.abc import MutableMapping
-from typing import TYPE_CHECKING, Callable, Dict, List, Sequence
+from typing import TYPE_CHECKING, Dict, List, Sequence
 
 import torch
 
 from veomni.utils import logging
 
+from ..utils.registry import Registry
 from .constants import IGNORE_INDEX
 
 
@@ -31,6 +31,11 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
+CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
+
+
+def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
+    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
 
 
 class ChatTemplate(ABC):
@@ -63,6 +68,7 @@ class ChatTemplate(ABC):
         ...
 
 
+@CHAT_TEMPLATE_REGISTRY.register("default")
 class DefaultTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
@@ -90,6 +96,7 @@ class DefaultTemplate(ChatTemplate):
         )
 
 
+@CHAT_TEMPLATE_REGISTRY.register("llama2")
 class Llama2Template(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
@@ -140,6 +147,7 @@ class Llama2Template(ChatTemplate):
         )
 
 
+@CHAT_TEMPLATE_REGISTRY.register("Janus")
 class JanusTemplate(ChatTemplate):
     def encode_messages(
         self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192, task_type: str = ""
@@ -222,6 +230,7 @@ class JanusTemplate(ChatTemplate):
         )
 
 
+@CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
@@ -247,59 +256,3 @@ class ChatmlTemplate(ChatTemplate):
             "{% endfor %}"
             "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
         )
-
-
-class ChatTemplates(MutableMapping):
-    """ """
-
-    # Class instance object, so that a call to `register` can be reflected into all other files correctly, even if
-    # a new instance is created (in order to locally override a given function)
-    _global_mapping = {}
-
-    def __init__(self, templates: Dict[str, Callable] = {}):
-        self._local_mapping = {}
-        self._global_mapping.update(templates)
-
-    def __getitem__(self, key):
-        # First check if instance has a local override
-        if key in self._local_mapping:
-            return self._local_mapping[key]
-        return self._global_mapping[key]
-
-    def __setitem__(self, key, value):
-        # Allow local update of the default functions without impacting other instances
-        self._local_mapping.update({key: value})
-
-    def __delitem__(self, key):
-        del self._local_mapping[key]
-
-    def __iter__(self):
-        # Ensure we use all keys, with the overwritten ones on top
-        return iter({**self._global_mapping, **self._local_mapping})
-
-    def __len__(self):
-        return len(self._global_mapping.keys() | self._local_mapping.keys())
-
-    @classmethod
-    def register(cls, key: str, value: Callable):
-        cls._global_mapping.update({key: value})
-
-    def valid_keys(self) -> List[str]:
-        return list(self.keys())
-
-
-TEMPLATES = {
-    "default": DefaultTemplate,
-    "llama2": Llama2Template,
-    "chatml": ChatmlTemplate,
-    "Janus": JanusTemplate,
-}
-
-CHAT_TEMPLATES = ChatTemplates(TEMPLATES)
-
-
-def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
-    if template_name not in CHAT_TEMPLATES:
-        raise ValueError(f"Unknown chat template: {template_name}")
-
-    return CHAT_TEMPLATES[template_name](tokenizer)
