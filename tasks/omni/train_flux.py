@@ -35,7 +35,7 @@ from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
-    get_nccl_backend,
+    get_dist_comm_backend,
     get_torch_device,
     synchronize,
 )
@@ -157,7 +157,7 @@ def get_param_groups(model: torch.nn.Module, default_lr: float, vit_lr: float):
 def main():
     args = parse_args(Arguments)
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_nccl_backend())
+    dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)

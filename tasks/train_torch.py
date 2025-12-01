@@ -27,7 +27,8 @@ from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
-    get_nccl_backend,
+    get_dist_comm_backend,
+    is_nccl_backend,
     get_torch_device,
     synchronize,
 )
@@ -47,10 +48,10 @@ class Arguments:
 def main():
     nccl_timeout = os.getenv("NCCL_TIMEOUT", None)
     pg_nccl_timeout = None
-    if nccl_timeout is not None and get_nccl_backend() == "nccl":
+    if nccl_timeout is not None and is_nccl_backend():
         pg_nccl_timeout = timedelta(seconds=int(nccl_timeout))
     logger.info(f"Process_group timeout: {nccl_timeout}")
-    dist.init_process_group(backend=get_nccl_backend(), timeout=pg_nccl_timeout)
+    dist.init_process_group(backend=get_dist_comm_backend(), timeout=pg_nccl_timeout)
 
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")

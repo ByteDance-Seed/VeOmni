@@ -15,7 +15,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.module_utils import load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 try:
@@ -33,7 +33,7 @@ logger = helper.create_logger(__name__)
 class BroadcastTestArguments:
     weights_path: str = ""
     device_type: str = get_device_type()
-    backend: str = get_nccl_backend()
+    backend: str = get_dist_comm_backend()
 
 
 @dataclass
@@ -220,7 +220,7 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
         "--train.broadcast_model_weights_from_rank0=True",
         f"--test.weights_path={weights_path}",
         f"--test.device_type={get_device_type()}",
-        f"--test.backend={get_nccl_backend()}",
+        f"--test.backend={get_dist_comm_backend()}",
     ]
 
     result = subprocess.run(command, check=True)
