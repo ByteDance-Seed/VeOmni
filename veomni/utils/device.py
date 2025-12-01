@@ -65,7 +65,7 @@ def get_device_id() -> int:
     return get_torch_device().current_device()
 
 
-def get_nccl_backend() -> str:
+def get_dist_comm_backend() -> str:
     """Return distributed communication backend type based on device type."""
     if IS_CUDA_AVAILABLE:
         return "nccl"
@@ -86,5 +86,15 @@ def empty_cache() -> None:
 
 
 def set_device(device: torch.types.Device) -> None:
-    """Execute torch empty cache operation."""
+    """Execute set device operation."""
     get_torch_device().set_device(device)
+
+
+def is_nccl_backend(self) -> bool:
+    """Check if the distributed communication backend is NCCL."""
+    return self.get_dist_comm_backend() == "nccl"
+
+
+def is_hccl_backend(self) -> bool:
+    """Check if the distributed communication backend is HCCL."""
+    return self.get_dist_comm_backend() == "hccl"

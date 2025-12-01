@@ -2,6 +2,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from functools import partial
 from typing import Any, Dict, List
 
@@ -26,8 +27,9 @@ from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
-    get_nccl_backend,
+    get_dist_comm_backend,
     get_torch_device,
+    is_nccl_backend,
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
@@ -44,7 +46,13 @@ class Arguments:
 
 
 def main():
-    dist.init_process_group(backend=get_nccl_backend())
+    nccl_timeout = os.getenv("NCCL_TIMEOUT", None)
+    pg_nccl_timeout = None
+    if nccl_timeout is not None and is_nccl_backend():
+        pg_nccl_timeout = timedelta(seconds=int(nccl_timeout))
+    logger.info(f"Process_group timeout: {nccl_timeout}")
+    dist.init_process_group(backend=get_dist_comm_backend(), timeout=pg_nccl_timeout)
+
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))

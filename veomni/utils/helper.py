@@ -76,16 +76,22 @@ if is_veomni_patch_available():
 else:
 
     def load_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, load_step2token will be skipped")
+        pass
 
     def save_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, save_step2token will be skipped")
+        pass
 
     def is_remote_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, is_remote_path returning False")
+        return False
 
     def convert_hdfs_fuse_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+        logger.warning("veomni_patch is not available, convert_hdfs_fuse_path returning path as-is")
+        if len(args) > 0:
+            return args[0]
+        return kwargs.get("path", None)
 
     VALID_CONFIG_TYPE = None
     VEOMNI_UPLOAD_CMD = None
@@ -620,8 +626,7 @@ def create_profiler(
     def handler_fn(p):
         time = int(datetime.datetime.now().timestamp())
 
-        # torch_npu does not support export gzip trace json directly
-        trace_file_extention = "pt.trace.json" if IS_NPU_AVAILABLE else "pt.trace.json.gz"
+        trace_file_extention = "pt.trace.json.gz"
         gpu_memory_file_extension = "pkl"
 
         if trace_dir.startswith("hdfs://"):
@@ -634,23 +639,17 @@ def create_profiler(
             trace_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
             gpu_memory_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
 
-        p.export_chrome_trace(trace_file)
+        if IS_NPU_AVAILABLE:
+            nonlocal npu_trace_handler
+            npu_trace_handler(p)
+            trace_file = p.prof_if.prof_path
+        elif IS_CUDA_AVAILABLE:
+            p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
         if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
             get_torch_device().memory._dump_snapshot(gpu_memory_file)
             logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
-
-        # In NPU, compress the trace file to .gz format ourselves.
-        if IS_NPU_AVAILABLE:
-            gz_path = trace_file + ".gz"
-            import gzip
-
-            with open(trace_file, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
-                f_out.write(f_in.read())
-            os.remove(trace_file)
-            trace_file = gz_path
-            logger.info(f"Profiling result compressed to {trace_file}.")
 
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)
@@ -667,9 +666,18 @@ def create_profiler(
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
+        npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
+        )
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            data_simplification=False,
+        )
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
+        experimental_config = None
 
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
@@ -690,6 +698,7 @@ def create_profiler(
         profile_memory=profile_memory,
         with_modules=True,
         with_stack=with_stack,
+        experimental_config=experimental_config,
     )
     if IS_CUDA_AVAILABLE and profile_memory:
         return ProfilerWithMem(base_profiler)

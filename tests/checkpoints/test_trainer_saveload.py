@@ -17,7 +17,7 @@ from veomni.models import build_foundation_model
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device, synchronize
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 
 
@@ -100,7 +100,7 @@ def main():
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_nccl_backend())
+    dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     helper.enable_high_precision_for_bf16()
 
@@ -133,7 +133,7 @@ def main():
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
     train_dataloader = build_dataloader(
         dataset=train_dataset,
-        dataloader_type="streaming",
+        dataloader_type="native",
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
@@ -142,17 +142,14 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         collate_fn=None,
-        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        infinity=True,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
-        drop_resume_buffer=args.data.drop_resume_buffer,
     )
 
     logger.info_rank0("Prepare model")
@@ -351,7 +348,7 @@ def test_trainer_saveload_ep8():
         "--nnodes=1",
         "--nproc_per_node=8",
         "--master_port=4321",
-        "tests/utils/test_trainer_saveload.py",
+        "tests/checkpoints/test_trainer_saveload.py",
         "tests/checkpoints/ep8.yaml",
     ]
     ep8_result = subprocess.run(ep8_command, check=True)
