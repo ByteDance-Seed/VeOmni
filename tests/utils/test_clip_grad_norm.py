@@ -9,7 +9,7 @@ from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
-from veomni.utils.device import get_device_id, get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_id, get_device_type, get_dist_comm_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
@@ -34,7 +34,7 @@ class Model(torch.nn.Module):
 
 
 def main():
-    dist.init_process_group(backend=get_nccl_backend())
+    dist.init_process_group(backend=get_dist_comm_backend())
     args = parse_args(Argument)
 
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
