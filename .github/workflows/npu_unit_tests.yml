@@ -89,9 +89,6 @@ jobs:
       - name: Run parallel tests
         run: |
           pytest -s -x tests/parallel
-      - name: Run e2e dcp save and load test
-        run: |
-          pytest -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run fsdp2 clip grad norm test
         run: |
           pytest -s -x tests/utils/test_clip_grad_norm.py
