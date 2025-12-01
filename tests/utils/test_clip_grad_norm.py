@@ -9,7 +9,7 @@ from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_id, get_device_type, get_nccl_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
@@ -38,6 +38,7 @@ def main():
     args = parse_args(Argument)
 
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    device = get_device_id()
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
         dp_replicate_size=args.train.data_parallel_replicate_size,
@@ -65,7 +66,7 @@ def main():
     )
 
     for step in range(10):
-        inputs = torch.randn(1, 16).to(get_torch_device())
+        inputs = torch.randn(1, 16).to(device)
         loss = model(inputs)
         loss.backward()
         grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
