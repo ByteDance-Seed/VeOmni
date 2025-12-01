@@ -27,6 +27,7 @@ train:
   dyn_bsz_margin: 0
   dyn_bsz_buffer_size: 200
   optimizer: adamw
+  vit_lr: 5.0e-5
   lr: 1.0e-4
   lr_warmup_ratio: 0.007
   lr_decay_style: constant
