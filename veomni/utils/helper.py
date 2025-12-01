@@ -91,7 +91,7 @@ else:
         logger.warning("veomni_patch is not available, convert_hdfs_fuse_path returning path as-is")
         if len(args) > 0:
             return args[0]
-        return kwargs.get('path', None)
+        return kwargs.get("path", None)
 
     VALID_CONFIG_TYPE = None
     VEOMNI_UPLOAD_CMD = None

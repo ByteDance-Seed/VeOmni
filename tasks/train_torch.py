@@ -2,9 +2,9 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from functools import partial
 from typing import Any, Dict, List
-from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -28,8 +28,8 @@ from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArgume
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
-    is_nccl_backend,
     get_torch_device,
+    is_nccl_backend,
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
