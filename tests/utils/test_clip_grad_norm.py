@@ -65,7 +65,7 @@ def main():
     )
 
     for step in range(10):
-        inputs = torch.randn(1, 16).cuda()
+        inputs = torch.randn(1, 16).to(get_torch_device())
         loss = model(inputs)
         loss.backward()
         grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
