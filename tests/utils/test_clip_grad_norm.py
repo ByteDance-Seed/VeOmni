@@ -65,15 +65,22 @@ def main():
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
 
+    max_grad_norm = args.train.max_grad_norm
     for step in range(10):
         inputs = torch.randn(1, 16).to(device)
         loss = model(inputs)
         loss.backward()
-        grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
-        logger.info_rank0(f"step: {step}, loss: {loss.item()}, grad_norm: {grad_norm}")
+        grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
+        # Run the clipper again to measure the norm after the first pass.
+        grad_norm_post_clip = veomni_clip_grad_norm(model, max_grad_norm)
+        logger.info_rank0(
+            f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {grad_norm_pre_clip}, "
+            f"grad_norm_post_clip: {grad_norm_post_clip}"
+        )
         model.zero_grad()
 
-    torch.testing.assert_close(grad_norm, 4.0)
+    torch.testing.assert_close(grad_norm_pre_clip, 4.0, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(grad_norm_post_clip, min(4.0, max_grad_norm), atol=1e-6, rtol=1e-6)
 
     dist.barrier()
     dist.destroy_process_group()
