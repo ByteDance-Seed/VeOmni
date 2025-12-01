@@ -241,6 +241,7 @@ def parallelize_model_fsdp2(
     3. Apply FSDP2 to regular modules: Standard dim-0 sharding
     4. Result: Expert params [32,H/fsdp_size,I], regular params use standard FSDP2
     """
+    device_type = get_device_type()
     parallel_state = get_parallel_state()
 
     # Step 0: Get target classes to shard later
@@ -350,7 +351,11 @@ def parallelize_model_fsdp2(
             # NOTE: in torch 2.8 and later we should use
             # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
             # but now for torch 2.7 compatability we still use this legacy API
-            experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_size)
+            # Note that NPU does not support PreSumMul so we skip this call
+            # see https://github.com/ByteDance-Seed/VeOmni/issues/241
+            # As a result, NPU grad norm clipping will fall back to manual clipping
+            if device_type != "npu":
+                experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:

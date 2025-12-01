@@ -144,21 +144,4 @@ def build_foundation_model(
 
         model.forward = wrapped_forward
 
-        # override fsdp2 set_reduce_scatter_divide_factor API since HCCL does not support PreSumMul yet.
-        logger.info("Overriding fsdp2 set_reduce_scatter_divide_factor API since HCCL does not support PreSumMul yet.")
-        logger.info("Due to this issue, NPU now does not support HSDP.")
-        from torch.distributed.fsdp._fully_shard import _fully_shard as fsdp_fully_shard
-
-        def _skip_set_reduce_scatter_divide_factor(*args, **kwargs):
-            # no-op: keep signature flexible so future changes don't crash
-            return
-
-        # monkey-patch the API used by FSDP2
-        if hasattr(fsdp_fully_shard, "set_reduce_scatter_divide_factor"):
-            fsdp_fully_shard.set_reduce_scatter_divide_factor = _skip_set_reduce_scatter_divide_factor
-        else:
-            logger.warning(
-                "fsdp_fully_shard has no attribute set_reduce_scatter_divide_factor; PyTorch version may have changed."
-            )
-
     return model
