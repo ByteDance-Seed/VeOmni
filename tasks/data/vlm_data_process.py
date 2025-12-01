@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict
 import torch
 
 from veomni.data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.data.multimodal import conv_preprocess
 from veomni.data.multimodal.image_utils import fetch_images
-from veomni.data.multimodal.preprocessor_registry import conv_preprocess
 from veomni.data.multimodal.video_utils import fetch_videos
 
 

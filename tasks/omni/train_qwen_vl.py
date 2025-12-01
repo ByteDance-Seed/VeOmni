@@ -21,9 +21,7 @@ from veomni.data import (
     OmniDataCollatorWithPadding,
     OmniSequenceShardCollator,
     build_dataloader,
-    build_interleave_dataset,
-    build_iterative_dataset,
-    build_mapping_dataset,
+    build_dataset,
     build_multimodal_chat_template,
 )
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -183,49 +181,38 @@ def main():
             )
         )
 
-    if args.data.dataloader_type == "native":
-        if args.data.enable_multisource:
-            logger.info_rank0("Start building interleave dataset")
-            train_dataset = build_interleave_dataset(
-                args.data.train_path, args.data.datasets_type, transform=transform, seed=args.train.seed
-            )
-        elif args.data.datasets_type == "iterable":
-            logger.info_rank0("Start building iterative dataset")
-            train_dataset = build_iterative_dataset(
-                args.data.train_path, transform=transform, seed=args.train.seed, source_name=args.data.source_name
-            )
-        elif args.data.datasets_type == "mapping":
-            logger.info_rank0("Start building mapping dataset")
-            train_dataset = build_mapping_dataset(
-                args.data.train_path, transform=transform, source_name=args.data.source_name
-            )
+    train_dataset = build_dataset(
+        dataset_name=args.data.dataset_name,
+        transform=transform,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        seed=args.train.seed,
+        **asdict(args.data),
+    )
+    dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+    if args.data.datasets_type == "mapping":
+        dataset_length = dataset_length / args.train.data_parallel_size
+    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
-        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
-        if args.data.datasets_type == "mapping":
-            dataset_length = dataset_length / args.train.data_parallel_size
-        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
-
-        train_dataloader = build_dataloader(
-            dataset=train_dataset,
-            micro_batch_size=args.train.micro_batch_size,
-            global_batch_size=args.train.global_batch_size,
-            dataloader_batch_size=args.train.dataloader_batch_size,
-            seed=args.train.seed,
-            collate_fn=data_collate_fn,
-            max_seq_len=args.data.max_seq_len,
-            train_steps=args.train.train_steps,
-            rmpad=args.train.rmpad,
-            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-            dyn_bsz_margin=args.train.dyn_bsz_margin,
-            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
-            num_workers=args.data.num_workers,
-            drop_last=args.data.drop_last,
-            pin_memory=args.data.pin_memory,
-            prefetch_factor=args.data.prefetch_factor,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported dataloader type: {args.data.dataloader_type}.")
+    train_dataloader = build_dataloader(
+        dataloader_type=args.data.dataloader_type,
+        dataset=train_dataset,
+        micro_batch_size=args.train.micro_batch_size,
+        global_batch_size=args.train.global_batch_size,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        seed=args.train.seed,
+        collate_fn=data_collate_fn,
+        max_seq_len=args.data.max_seq_len,
+        train_steps=args.train.train_steps,
+        rmpad=args.train.rmpad,
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+        dyn_bsz_margin=args.train.dyn_bsz_margin,
+        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+        num_workers=args.data.num_workers,
+        drop_last=args.data.drop_last,
+        pin_memory=args.data.pin_memory,
+        prefetch_factor=args.data.prefetch_factor,
+    )
 
     fsdp_kwargs = {}
     if args.train.freeze_vit:
@@ -353,6 +340,7 @@ def main():
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
                 # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)

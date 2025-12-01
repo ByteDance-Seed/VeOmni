@@ -133,7 +133,7 @@ def build_parallelize_model(
     # -) but next forward of root is already in unsharded state, so never allgather from updated sharded param, which is WRONG again!
 
     if not hasattr(mesh, "ndevice"):
-        # bytecheckpoint vescale ckpt use vescale device mesh, but here we have torch-native devicemesh, which does not have ndevice attribute
+        # vescale ckpt use vescale device mesh, but here we have torch-native devicemesh, which does not have ndevice attribute
         ndevice_func = lambda self: torch.numel(self.mesh)  # noqa: E731
         mesh.__class__.ndevice = property(ndevice_func)
 

@@ -86,3 +86,6 @@ jobs:
       - name: Run models tests
         run: |
           pytest -s -x tests/models/test_models_patch.py
+      - name: Run parallel tests
+        run: |
+          pytest -s -x tests/parallel

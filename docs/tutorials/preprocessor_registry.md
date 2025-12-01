@@ -24,9 +24,8 @@ This registry manages preprocessor functions, not dataset classes.
 Add your preprocessor to [`veomni/data/multimodal/preprocess.py`](../../veomni/data/multimodal/preprocess.py):
 
 ```python
-from .preprocessor_registry import register_preprocessor
 
-@register_preprocessor("my_custom_source")
+@PREPROCESSOR_REGISTRY.register("my_custom_source")
 def my_custom_source_preprocessor(conversations, **kwargs):
     """
     Preprocessor for a custom data source.
@@ -57,18 +56,11 @@ def my_custom_source_preprocessor(conversations, **kwargs):
 Once registered, your preprocessor is immediately available:
 
 ```python
-# Use the convenience function from preprocessor_registry.py
-from veomni.data.multimodal.preprocessor_registry import conv_preprocess
+# Use the convenience function from preprocess.py
+from veomni.data.multimodal import conv_preprocess
 
-# Or get the preprocessor function directly from the registry
-from veomni.data.multimodal import get_preprocessor
-
-# Option 1: Using conv_preprocess (convenience function)
+# Using conv_preprocess (convenience function)
 result = conv_preprocess("my_custom_source", conversations)
-
-# Option 2: Using get_preprocessor (direct access to preprocessor)
-preprocessor = get_preprocessor("my_custom_source")
-result = preprocessor(conversations)
 ```
 
 ### 3. Use in Your Config
@@ -77,7 +69,7 @@ result = preprocessor(conversations)
 data:
   datasets:
     - name: my_data
-      source_name: my_custom_source  # Matches @register_preprocessor name
+      source_name: my_custom_source  # Matches @PREPROCESSOR_REGISTRY name
       data_path: /path/to/my/dataset
       weight: 1.0
 ```
@@ -88,18 +80,17 @@ data:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. Define preprocessor with @register_preprocessor decorator│
+│ 1. Define preprocessor with @PREPROCESSOR_REGISTRY decorator│
 │    └─> Immediately adds to _PREPROCESSOR_REGISTRY          │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. Import veomni.data.multimodal module                     │
-│    └─> Automatically triggers all @register_preprocessor    │
+│    └─> Automatically triggers all @PREPROCESSOR_REGISTRY    │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ 3. Preprocessor is now available via get_preprocessor() or  │
-│    conv_preprocess()                                        │
+│ 3. Preprocessor is now available via conv_preprocess()      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -108,13 +99,12 @@ data:
 ```
 veomni/data/multimodal/
 ├── __init__.py                 # Exports registry functions
-├── preprocessor_registry.py    # Core registration system
-└── preprocess.py               # All preprocessors (built-in + custom)
+└── preprocess.py               # Registry and all preprocessors (built-in + custom)
 ```
 
 ## Preprocessor Format
 
-Your preprocessor must follow VeOmni's conversation format:
+Your preprocessor must follow VeOmni's interleaved conversation format:
 
 ```python
 # Input: Your data source's raw format (flexible)
@@ -141,30 +131,25 @@ constructed_conversation = [
 
 ## Examples
 
-### Example 1: VQA Preprocessor
+### Example 1: Multi-turn VQA Conversation Preprocessor
 
-For an example of a VQA preprocessor, see [`custom_vqa_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L225).
 
-### Example 2: Multi-turn Conversation Preprocessor
+For an example of a multi-turn conversation preprocessor, see [`sharegpt4v_pretrain` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L66).
 
-```python
-For an example of a multi-turn conversation preprocessor, see [`sharegpt4v_sft_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L58).
-```
+### Example 2: Image generation Preprocessor
 
-### Example 3: OCR Preprocessor
+For an example of a preprocessor that handles image generation, see [`imagenet1k` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L152).
 
-For an example of a preprocessor that handles image and text, similar to an OCR preprocessor, see [`doom_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L76).
+### Example 3: Registering Multiple Names
 
-### Example 4: Registering Multiple Names
-
-For an example of a preprocessor registered under multiple names, see [`sharegpt4v_pretrain_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L38).
+For an example of a preprocessor registered under multiple names, see [`sharegpt4v_pretrain_preprocess` in `preprocess.py`](../../veomni/data/multimodal/preprocess.py#L43).
 
 ## Advanced Usage
 
 ### Conditional Preprocessing
 
 ```python
-@register_preprocessor("adaptive_source")
+@PREPROCESSOR_REGISTRY.register("adaptive_source")
 def adaptive_preprocessor(conversations, mode="caption", **kwargs):
     """Preprocessor with different modes"""
     if mode == "caption":
@@ -195,7 +180,7 @@ data:
 ```python
 import random
 
-@register_preprocessor("random_prompt_source")
+@PREPROCESSOR_REGISTRY.register("random_prompt_source")
 def random_prompt_preprocessor(conversations, **kwargs):
     """Preprocessor with randomized prompts"""
     prompts = [
@@ -214,7 +199,7 @@ def random_prompt_preprocessor(conversations, **kwargs):
 ### Handling Multiple Formats
 
 ```python
-@register_preprocessor("flexible_source")
+@PREPROCESSOR_REGISTRY.register("flexible_source")
 def flexible_format_preprocessor(conversations, **kwargs):
     """Handle different input formats"""
     if isinstance(conversations, str):
@@ -252,82 +237,31 @@ The following functions are available directly from the `veomni.data.multimodal`
 
 ```python
 from veomni.data.multimodal import (
-    register_preprocessor,          # Decorator to register a preprocessor
-    get_preprocessor,               # Get a preprocessor by name
-    get_all_preprocessors,          # Get all registered preprocessors
-    list_preprocessors,             # List all preprocessor names
-    is_preprocessor_registered,     # Check if a preprocessor is registered
+    PREPROCESSOR_REGISTRY,          # Preprocessor registry
+    conv_preprocess,                # Preprocess function
 )
 ```
 
-#### `register_preprocessor(name: str)`
+#### `PREPROCESSOR_REGISTRY.register(name: str)`
 
 Decorator to register a preprocessor for a specific data source.
 
 ```python
-@register_preprocessor("my_source")
+@PREPROCESSOR_REGISTRY.register("my_source")
 def my_preprocessor(conversations, **kwargs):
     return [["user", ("text", "hello")]]
-```
-
-#### `get_preprocessor(name: str) -> Callable`
-
-Get a specific preprocessor by data source name.
-
-```python
-preprocessor = get_preprocessor("sharegpt4v_pretrain")
-result = preprocessor(conversations)
-```
-
-Raises `ValueError` if the preprocessor is not registered.
-
-#### `get_all_preprocessors() -> Dict[str, Callable]`
-
-Get all registered preprocessors as a dictionary.
-
-```python
-all_preprocessors = get_all_preprocessors()
-print(all_preprocessors.keys())
-# dict_keys(['sharegpt4v_pretrain', 'sharegpt4v_captioner', 'doom', ...])
-```
-
-#### `list_preprocessors() -> List[str]`
-
-List all registered preprocessor names (sorted).
-
-```python
-preprocessor_names = list_preprocessors()
-print(preprocessor_names)
-# ['ArxivQA', 'CHartQA', 'DenseFusion-1M', ...]
-```
-
-#### `is_preprocessor_registered(name: str) -> bool`
-
-Check if a preprocessor is registered for the given data source name.
-
-```python
-if is_preprocessor_registered("my_source"):
-    preprocessor = get_preprocessor("my_source")
 ```
 
 ### Convenience Functions
 
 #### `conv_preprocess(source: str, conversations, **kwargs)`
 
-This convenience function, located in `veomni.data.multimodal.preprocessor_registry`, wraps `get_preprocessor()` for easier use.
+This convenience function, located in `veomni.data.multimodal`.
 
 ```python
-from veomni.data.multimodal.preprocessor_registry import conv_preprocess
+from veomni.data.multimodal import conv_preprocess
 
 result = conv_preprocess("sharegpt4v_pretrain", conversations)
-```
-
-This is equivalent to:
-```python
-from veomni.data.multimodal import get_preprocessor
-
-preprocessor = get_preprocessor("sharegpt4v_pretrain")
-result = preprocessor(conversations)
 ```
 
 ## Testing
@@ -336,13 +270,7 @@ Example test for your custom preprocessor:
 
 ```python
 def test_custom_source_preprocessor():
-    from veomni.data.multimodal import get_preprocessor, is_preprocessor_registered
-
-    # Check if registered
-    assert is_preprocessor_registered("my_custom_source")
-
-    # Get preprocessor
-    preprocessor = get_preprocessor("my_custom_source")
+    from veomni.data.multimodal import conv_preprocess
 
     # Test your preprocessor
     test_conversations = [
@@ -350,7 +278,7 @@ def test_custom_source_preprocessor():
         {"from": "gpt", "value": "A cat."}
     ]
     # Assuming my_custom_source_preprocessor is defined as in the Quick Start
-    result = preprocessor(test_conversations)
+    result = conv_preprocess("my_custom_source", test_conversations)
 
     assert result == [
         ["user", ("image", None), ("text", "What is this?")],
@@ -367,7 +295,7 @@ ValueError: Unknown dataset name: my_source. No preprocessor registered for this
 ```
 
 **Solution**:
-1. Ensure your preprocessor is decorated with `@register_preprocessor("my_source")`.
+1. Ensure your preprocessor is decorated with `@PREPROCESSOR_REGISTRY.register("my_source")`.
 2. Check that the `source_name` in your config matches the registered name exactly.
 3. Verify the module containing your preprocessor is imported. If you add it to `veomni/data/multimodal/preprocess.py`, this is handled automatically.
 
@@ -394,21 +322,6 @@ return None
 return [["user", ("text", "hello")], ["assistant", ("text", "hi")]]
 ```
 
-### Import Error
-
-```
-ImportError: cannot import name 'get_preprocessor'
-```
-
-**Solution**: Make sure you're importing from the correct public API module:
-```python
-# ✅ Correct
-from veomni.data.multimodal import get_preprocessor
-
-# ❌ Wrong (accessing internal module)
-from veomni.data.multimodal.preprocessor_registry import get_preprocessor
-```
-
 ## Best Practices
 
 1. **Naming Convention**: Use descriptive, lowercase names for preprocessors (e.g., `internal_vqa`, `custom_ocr`).
@@ -416,7 +329,7 @@ from veomni.data.multimodal.preprocessor_registry import get_preprocessor
 3. **Error Handling**: Add validation for the input format if it's complex, and provide clear error messages.
 4. **Testing**: Write unit tests for your preprocessors.
 5. **Reusability**: Extract common logic into helper functions that are not decorated.
-6. **Multiple Aliases**: Use multiple `@register_preprocessor` decorators if a preprocessor can be used for different but compatible data sources.
+6. **Multiple Aliases**: Use multiple `@PREPROCESSOR_REGISTRY` decorators if a preprocessor can be used for different but compatible data sources.
 
 ## Usage in Training Scripts
 
@@ -454,7 +367,7 @@ For a complete working example of how preprocessors integrate into the training 
    - **Lines 41-61**: Defines `sharegpt4v_pretrain_preprocess()` decorated with `@register_preprocessor("sharegpt4v_pretrain")`
    - This preprocessor converts ShareGPT4V data format into VeOmni's standardized conversation format
 
-**5. Registry System**: [veomni/data/multimodal/preprocessor_registry.py](../../veomni/data/multimodal/preprocessor_registry.py)
+**5. Registry System**: [veomni/utils/registry.py](../../veomni/utils/registry.py)
    - Provides the registration decorator and lookup functions
 
 **Flow Summary**:
@@ -467,10 +380,3 @@ Config (qwen2_vl.yaml)
                       └─> Preprocessor (preprocess.py) transforms raw data
                            └─> Returns standardized conversation format
 ```
-
-## See Also
-
-- [VeOmni preprocess.py](../../veomni/data/multimodal/preprocess.py) - All built-in dataset preprocessors
-- [Preprocessor Registry](../../veomni/data/multimodal/preprocessor_registry.py) - The registration system implementation
-- [Enabling New Models](./enable_new_models.md) - Tutorial on adding new models
-- [Model Loader](./model_loader.md) - Understanding VeOmni's model loading system
