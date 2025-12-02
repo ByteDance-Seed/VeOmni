@@ -33,7 +33,6 @@ def build_checkpointer(ckpt_manager: str, dist_backend: str):
 
 def ckpt_to_state_dict(
     save_checkpoint_path: Union[str, os.PathLike],
-    output_dir: Union[str, os.PathLike],
     ckpt_manager: str = "dcp",
 ) -> Dict[str, Any]:
     """
@@ -43,12 +42,11 @@ def ckpt_to_state_dict(
 
     Args:
         save_checkpoint_path: Path to the checkpoint.
-        output_dir: Path to the output directory.
         ckpt_manager: Checkpoint manager.
     Returns:
         state_dict: State dict.
     """
-    return CHECKPOINT_TO_STATE_DICT_REGISTRY[ckpt_manager](save_checkpoint_path, output_dir)
+    return CHECKPOINT_TO_STATE_DICT_REGISTRY[ckpt_manager](save_checkpoint_path)
 
 
 class CheckpointerBase(ABC):
@@ -89,15 +87,11 @@ def dcp_checkpointer(dist_backend: str):
 
 
 @CHECKPOINT_TO_STATE_DICT_REGISTRY.register("dcp")
-def dcp_ckpt_to_state_dict(
-    save_checkpoint_path: Union[str, os.PathLike], output_dir: Union[str, os.PathLike], **kwargs
-):
+def dcp_ckpt_to_state_dict(save_checkpoint_path: Union[str, os.PathLike], **kwargs):
     from ..utils.import_utils import is_torch_version_greater_than
 
     if not is_torch_version_greater_than("2.4"):
         raise ValueError("DCP checkpoint manager requires torch version >= 2.4")
     from .dcp_checkpointer import dcp_to_torch_state_dict
 
-    # Note: output_dir is part of the interface but not used in DCP conversion
-    # as the state_dict is loaded directly into memory
     return dcp_to_torch_state_dict(save_checkpoint_path)

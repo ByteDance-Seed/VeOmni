@@ -375,7 +375,6 @@ def main():
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         model_state_dict = ckpt_to_state_dict(
             save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
             ckpt_manager=args.train.ckpt_manager,
         )
         save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
