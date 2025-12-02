@@ -18,9 +18,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
+from veomni.utils.device import get_device_type
+
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import logging
-from veomni.utils.device import get_device_type
 from ..data_collator import (
     CollatePipeline,
     DataCollatorWithPadding,
