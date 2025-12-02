@@ -23,7 +23,7 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   "diffusers>=0.30.0,<=0.31.0",
-  "transformers[torch]==4.57.0",
+  "transformers[torch]==4.57.3",
   "psutil",
   "timm",
   "wandb"
@@ -111,7 +111,7 @@ override-dependencies = [
     "torchaudio==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
     "torchvision==0.22.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
     # Fixate to a specific transformers version since upgrading transformers is a large task.
-    "transformers==4.57.0",
+    "transformers==4.57.3",
 ]
 conflicts = [
   [
