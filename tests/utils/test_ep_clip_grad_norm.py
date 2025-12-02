@@ -1,10 +1,9 @@
-import math
 import subprocess
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
-from torch.distributed._tensor import Shard
+from torch.distributed._tensor import DTensor, Shard
 
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
@@ -12,8 +11,10 @@ from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import get_device_id, get_device_type, get_dist_comm_backend, get_torch_device
 
+
+# from veomni.optim.optimizer import build_optimizer
 
 logger = helper.create_logger(__name__)
 
@@ -31,12 +32,9 @@ class ToyMoeModel(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.ones(16), requires_grad=True)
         self.decoder = ToyMoeDecoderLayer()
 
-    def set_grad(self):
-        for _, p in self.named_parameters(recurse=True):
-            p.grad = torch.ones_like(p)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         loss = (x + self.bias).sum()
+        loss = loss + self.decoder()
         return loss
 
     def init_weights(self):
@@ -57,6 +55,9 @@ class ToyMoeDecoderLayer(torch.nn.Module):
         super().__init__()
         self.regular_mlp = torch.nn.Parameter(torch.ones(64, 16), requires_grad=True)
         self.ep_layer = torch.nn.Parameter(torch.ones(64, 16, 32), requires_grad=True)
+
+    def forward(self) -> torch.Tensor:
+        return self.regular_mlp.sum() + self.ep_layer.sum()
 
 
 def main():
@@ -89,23 +90,90 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
+    # building a optimizer is necessary to register ep/non-ep params group
+    # _ = build_optimizer(model, fused=True)
 
-    max_grad_norm = 1.0
-    model.set_grad()
-    grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
-    # Run the clipper again to measure the norm after the first pass.
-    grad_norm_post_clip = veomni_clip_grad_norm(model, max_grad_norm)
-    logger.info_rank0(f"grad_norm_pre_clip: {grad_norm_pre_clip}, grad_norm_post_clip: {grad_norm_post_clip}")
+    from veomni.distributed.parallel_state import get_parallel_state
 
-    expected_grad_norm_pre_clip = math.sqrt(16 + 64 * 16 + 64 * 16 * 32)
-    torch.testing.assert_close(grad_norm_pre_clip, expected_grad_norm_pre_clip, atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(
-        grad_norm_post_clip, min(expected_grad_norm_pre_clip, max_grad_norm), atol=1e-6, rtol=1e-6
+    ps = get_parallel_state()
+    fsdp_group = ps.fsdp_group
+    ep_group = ps.ep_group if ps.ep_enabled else None
+    ep_fsdp_group = None
+    if ps.ep_enabled and ps.ep_fsdp_device_mesh is not None:
+        ep_fsdp_group = ps.ep_fsdp_device_mesh["ep_fsdp"].get_group()
+
+    ep_params = []
+    non_ep_params = []
+    for n, p in model.named_parameters():
+        entry = f"{n} (shape={tuple(p.shape)}, type={type(p)}, is_dtensor={isinstance(p, DTensor)})"
+        if "ep_layer" in n:
+            ep_params.append(p)
+            logger.info_rank0(f"Register EP param: {entry}")
+        else:
+            non_ep_params.append(p)
+            logger.info_rank0(f"Register non-EP param: {entry}")
+    model._ep_param_groups = {"ep": ep_params, "non_ep": non_ep_params}
+    logger.info_rank0(
+        "group sizes - fsdp: %s, ep: %s, ep_fsdp: %s",
+        dist.get_world_size(group=fsdp_group) if fsdp_group is not None else None,
+        dist.get_world_size(group=ep_group) if ep_group is not None else None,
+        dist.get_world_size(group=ep_fsdp_group) if ep_fsdp_group is not None else None,
     )
+    tensor_device = torch.device(f"{get_device_type()}:{get_device_id()}")
+    max_grad_norm = args.train.max_grad_norm
 
-    expected_clipped_grad = 1 / expected_grad_norm_pre_clip
-    for _, p in model.named_parameters():
-        torch.testing.assert_close(p.grad, torch.full_like(p, expected_clipped_grad), atol=1e-6, rtol=1e-6)
+    def compute_global_grad_norm() -> float:
+        """Reconstruct the optimizer-facing L2 norm from the current gradient shards."""
+        # local_sq accumulates the sum of squares for this rank only; we keep it on the same device
+        # as the gradients to avoid device synchronization.
+        local_sq = None
+        for p in model.parameters():
+            g = p.grad
+            if g is None:
+                continue
+            # FSDP2 + EP stores gradients as DTensors, so convert them to the local view before
+            # measuring. Non-DTensor grads (e.g., bias) are already local tensors.
+            if isinstance(g, DTensor):
+                g_local = g.to_local()
+            else:
+                g_local = g
+            # contrib is the squared L2 contribution of this parameter shard on this rank.
+            contrib = g_local.detach().float().pow(2).sum()
+            if local_sq is None:
+                # Initialize the accumulator lazily so we only allocate once we know the device.
+                local_sq = torch.zeros(1, device=g_local.device, dtype=torch.float32)
+            # Accumulate the per-parameter contribution into this rank's running total.
+            local_sq = local_sq + contrib
+        if local_sq is None:
+            # If every parameter had `grad=None`, fall back to a zero tensor on the current device.
+            local_sq = torch.zeros(1, device=torch.device(get_device_type()), dtype=torch.float32)
+        # Combine the per-rank totals so every rank sees the global sum of squares.
+        dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
+        # Final L2 norm is the square root of the summed squares.
+        return torch.sqrt(local_sq).item()
+
+    grad_norm_pre_clip = None
+    grad_norm_post_clip = None
+    for step in range(3):
+        inputs = torch.ones(1, 16, device=tensor_device)
+        loss = model(inputs)
+        loss.backward()
+
+        manual_pre = compute_global_grad_norm()
+        grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
+        # Clip API reports the norm before scaling, so compare against the pre-clip measurement.
+        torch.testing.assert_close(grad_norm_pre_clip, manual_pre, atol=1e-6, rtol=1e-6)
+
+        manual_post = compute_global_grad_norm()
+        grad_norm_post_clip = veomni_clip_grad_norm(model, max_grad_norm)
+        torch.testing.assert_close(grad_norm_post_clip, manual_post, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(grad_norm_post_clip, min(manual_pre, max_grad_norm), atol=1e-6, rtol=1e-6)
+
+        logger.info_rank0(
+            f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {grad_norm_pre_clip}, "
+            f"grad_norm_post_clip: {grad_norm_post_clip}"
+        )
+        model.zero_grad()
 
     dist.barrier()
     dist.destroy_process_group()

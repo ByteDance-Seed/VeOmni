@@ -92,3 +92,6 @@ jobs:
       - name: Run fsdp2 clip grad norm test
         run: |
           pytest -s -x tests/utils/test_clip_grad_norm.py
+      - name: Run ep+fsdp2 clip grad norm test
+        run: |
+          pytest -s -x tests/utils/test_ep_clip_grad_norm.py
