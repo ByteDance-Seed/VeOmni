@@ -169,6 +169,21 @@ def main():
         torch.testing.assert_close(grad_norm_post_clip, manual_post, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(grad_norm_post_clip, min(manual_pre, max_grad_norm), atol=1e-6, rtol=1e-6)
 
+        # The clipper scales every gradient by the same coefficient max_norm/manual_pre (capped at 1).
+        clip_coeff = min(max_grad_norm / manual_pre, 1.0)
+        for name, param in model.named_parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+            torch.testing.assert_close(
+                grad_local,
+                torch.full_like(grad_local, clip_coeff),
+                atol=1e-6,
+                rtol=1e-6,
+                msg=f"Gradient mismatch for {name}",
+            )
+
         logger.info_rank0(
             f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {grad_norm_pre_clip}, "
             f"grad_norm_post_clip: {grad_norm_post_clip}"
