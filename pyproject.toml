@@ -58,9 +58,9 @@ npu = [
   "scipy>=1.16.2"
 ]
 gpu =[
-  "torch==2.7.1+cu128",
-  "torchvision==0.22.1+cu128",
-  "torchaudio==2.7.1+cu128",
+  "torch==2.8.0+cu128",
+  "torchvision==0.23.0+cu128",
+  "torchaudio==2.8.0+cu128",
   "liger-kernel",
   "flash-attn",
 ]
@@ -101,8 +101,8 @@ override-dependencies = [
     # byted pypi without using the cu126 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
     "torch==2.8.0+cu128; (extra == 'gpu')",
-    "torchaudio==2.7.1+cu128; (extra == 'gpu')",
-    "torchvision==0.22.1+cu128; (extra == 'gpu')",
+    "torchaudio==2.8.0+cu128; (extra == 'gpu')",
+    "torchvision==0.23.0+cu128; (extra == 'gpu')",
     # Adding explicit override for other backends as well. Otherwise these libraries
     # will be excluded for other backends.
     "torch==2.7.1+cpu; extra == 'npu'",
@@ -130,8 +130,8 @@ torchvision = [
   { index = "pytorch", marker = "extra != 'npu'"},
 ]
 torchaudio = {index = "pytorch"}
-# Currently flash-attn is limited by diffusers (<=2.7.4).
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"}
+# Download flash-attn wheel directly to avoid build issues.
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"}
 
 [[tool.uv.index]]
 name = "pytorch"
