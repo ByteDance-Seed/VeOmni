@@ -12,7 +12,7 @@ def hccl_premul_sum_wrapper(op, output_name):
         if handle is not None:
             handle.wait()
         if factor is not None:
-            output = args[0] if len(args[0]) > 0 else kwargs[output_name]
+            output = args[0] if len(args) > 0 else kwargs[output_name]
             output.data.mul_(factor)
         return handle
 
