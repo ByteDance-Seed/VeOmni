@@ -18,7 +18,7 @@
 import math
 import os
 from dataclasses import dataclass
-from functools import wraps, cached_property
+from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
