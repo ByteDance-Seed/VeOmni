@@ -172,7 +172,7 @@ def main():
         # Clip API reports the norm before scaling, so compare against the pre-clip measurement.
         torch.testing.assert_close(grad_norm_pre_clip, manual_pre, atol=1e-6, rtol=1e-6)
 
-        manual_post = compute_global_grad_norm(apply_ep_scale=False)
+        manual_post = compute_global_grad_norm(apply_ep_scale=needs_npu_ep_scale)
         grad_norm_post_clip = veomni_clip_grad_norm(model, max_grad_norm)
         torch.testing.assert_close(grad_norm_post_clip, manual_post, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(grad_norm_post_clip, min(manual_pre, max_grad_norm), atol=1e-6, rtol=1e-6)
