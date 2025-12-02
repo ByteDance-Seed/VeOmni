@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -8,7 +9,7 @@ import torch.distributed as dist
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer
-from veomni.data import build_dummy_dataset, build_streaming_dataloader
+from veomni.data import build_dataloader, build_dummy_dataset
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -16,41 +17,29 @@ from veomni.models import build_foundation_model
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 
 
 """
-torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
---model.model_path Qwen/Qwen3-4B \
---train.expert_parallel_size 1 \
---train.global_batch_size 8 \
---train.micro_batch_size 1 \
---data.max_seq_len 128 \
---data.train_path "dummy" \
---train.output_dir ./test_trainer_saveload \
---train.max_steps 5 \
---train.rmpad false \
---train.rmpad_with_pos_ids true \
---train.data_parallel_mode "fsdp2" \
---train.init_device "meta" \
---train.ckpt_manager "dcp"
-
-torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_trainer_saveload.py \
---model.model_path /path/to/Qwen3-30B-A3B-Instruct-2507-merge \
+torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/checkpoints/test_trainer_saveload.py \
+--model.config_path configs/model_configs/qwen/qwen3_moe_30a3b_4_layers.json \
+--model.weight_path None \
+--model.tokenizer_path /mnt/hdfs/models/Qwen3-30B-A3B \
 --model.moe_implementation fused \
 --model.attn_implementation flash_attention_2 \
---train.expert_parallel_size 4 \
+--train.expert_parallel_size 8 \
 --train.global_batch_size 8 \
 --train.micro_batch_size 1 \
 --data.max_seq_len 128 \
 --data.train_path "dummy" \
---train.output_dir ./test_trainer_saveload \
+--train.output_dir ./test_trainer_saveload_ep8 \
 --train.max_steps 5 \
 --train.rmpad false \
 --train.rmpad_with_pos_ids true \
 --train.data_parallel_mode "fsdp2" \
 --train.init_device "meta" \
---train.ckpt_manager "dcp"
+--train.ckpt_manager "dcp" $@ 2>&1 | tee test_saveload_ep8.log
 """
 
 # To prevent DCP from complaining "too many open files"
@@ -61,8 +50,8 @@ logger = helper.create_logger(__name__)
 
 
 def print_device_mem_info():
-    current_memory_allocated = torch.cuda.memory_allocated() / (1024**2)
-    max_memory_allocated = torch.cuda.max_memory_allocated() / (1024**2)
+    current_memory_allocated = get_torch_device().memory_allocated() / (1024**2)
+    max_memory_allocated = get_torch_device().max_memory_allocated() / (1024**2)
 
     logger.info_rank0(f"current_memory:{current_memory_allocated:.2f} MB | max_memory:{max_memory_allocated:.2f} MB")
 
@@ -110,8 +99,8 @@ def main():
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
-    torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-    dist.init_process_group(backend="nccl")
+    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     helper.enable_high_precision_for_bf16()
 
@@ -142,8 +131,9 @@ def main():
     train_dataset = build_dummy_dataset(task_type="text", size=train_data_size, max_seq_len=args.data.max_seq_len)
 
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
-    train_dataloader = build_streaming_dataloader(
+    train_dataloader = build_dataloader(
         dataset=train_dataset,
+        dataloader_type="native",
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
@@ -152,17 +142,14 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         collate_fn=None,
-        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        infinity=True,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
-        drop_resume_buffer=args.data.drop_resume_buffer,
     )
 
     logger.info_rank0("Prepare model")
@@ -257,11 +244,12 @@ def main():
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0
-            torch.cuda.synchronize()
+            synchronize()
 
             for micro_batch in micro_batches:
                 micro_batch = {
-                    k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
+                    k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in micro_batch.items()
                 }
 
                 with model_fwd_context:
@@ -284,7 +272,7 @@ def main():
 
             # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
-            torch.cuda.synchronize()
+            synchronize()
 
             lr = max(lr_scheduler.get_last_lr())
 
@@ -346,12 +334,51 @@ def main():
     check_state_dict(golden_model_sd, model.state_dict(), tied_weights_keys)
     check_state_dict(golden_optim_sd, optimizer.state_dict(), need_flatten=True)
 
-    torch.cuda.synchronize()
+    synchronize()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()
     dist.barrier()
     dist.destroy_process_group()
+
+
+def test_trainer_saveload_ep8():
+    ep8_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "tests/checkpoints/ep8.yaml",
+    ]
+    ep8_result = subprocess.run(ep8_command, check=True)
+    assert ep8_result.returncode == 0
+
+
+def test_trainer_saveload_ep4():
+    ep4_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "tests/checkpoints/ep4.yaml",
+    ]
+    ep4_result = subprocess.run(ep4_command, check=True)
+    assert ep4_result.returncode == 0
+
+
+def test_trainer_saveload_no_ep():
+    no_ep_command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=8",
+        "--master_port=4321",
+        "tests/checkpoints/test_trainer_saveload.py",
+        "tests/checkpoints/no_ep.yaml",
+    ]
+    no_ep_result = subprocess.run(no_ep_command, check=True)
+    assert no_ep_result.returncode == 0
 
 
 if __name__ == "__main__":

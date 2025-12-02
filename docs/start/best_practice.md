@@ -114,17 +114,14 @@ VeOmni default supports two types of datasets(source code: [veomni/data/dataset.
 2. **MappingDataset** (default for small datasets)
 
 ```python
-from veomni.data import (
-    build_iterative_dataset,
-    build_mapping_dataset,
+from veomni.data import build_dataset
+train_dataset = build_dataset(
+    dataset_name=args.data.dataset_name,
+    transform=transform,
+    dataloader_batch_size=args.train.dataloader_batch_size,
+    seed=args.train.seed,
+    **asdict(args.data)
 )
-
-if args.data.datasets_type == "iterable":
-    train_dataset = build_iterative_dataset(args.data.train_path, transform=transform, seed=args.train.seed)
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
-elif args.data.datasets_type == "mapping":
-    train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
 ```
 
 > **Note**:

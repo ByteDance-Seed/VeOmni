@@ -5,21 +5,16 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 
-import torch
 import torch.distributed as dist
 from transformers import PretrainedConfig
 from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
 
 from veomni.checkpoint import build_checkpointer
-from veomni.data import (
-    build_dataloader,
-    build_interleave_dataset,
-    build_iterative_dataset,
-    build_mapping_dataset,
-)
+from veomni.data import build_dataloader, build_dataset
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
@@ -36,8 +31,8 @@ def run_data_test():
     args = parse_args(Arguments)
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
-    torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-    dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    dist.init_process_group(backend=get_dist_comm_backend(), world_size=world_size, rank=rank)
 
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
@@ -56,23 +51,20 @@ def run_data_test():
     transform = partial(
         process_dummy_example,
         max_seq_len=args.data.max_seq_len,
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
     )
 
     # build dummy data
     dummy_dataset = DummyDataset(size=20)
     train_path = dummy_dataset.save_path
 
-    if args.data.enable_multisource:
-        logger.info_rank0("Start building interleave dataset")
-        train_dataset = build_interleave_dataset(
-            train_path, args.data.datasets_type, transform=transform, seed=args.train.seed
-        )
-    elif args.data.datasets_type == "iterable":
-        logger.info_rank0("Start building iterative dataset")
-        train_dataset = build_iterative_dataset(train_path, transform=transform, seed=args.train.seed)
-    elif args.data.datasets_type == "mapping":
-        logger.info_rank0("Start building mapping dataset")
-        train_dataset = build_mapping_dataset(train_path, transform=transform)
+    train_dataset = build_dataset(
+        dataset_name=args.data.dataset_name,
+        train_path=train_path,
+        datasets_type=args.data.datasets_type,
+        transform=transform,
+        seed=args.train.seed,
+    )
 
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
@@ -80,6 +72,7 @@ def run_data_test():
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
     dataloader = build_dataloader(
+        dataloader_type="native",
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
@@ -110,6 +103,7 @@ def run_data_test():
     start_epoch, start_step, global_step = 0, 0, 0
     save_step = int(args.train.train_steps * 2)  # due to dataset.buffer, cannot resume from mid_step
 
+    fake_model = FakeModel().to(get_device_type())
     for epoch in range(start_epoch, epoch_num):
         dataloader.set_epoch(epoch)
         data_iterator = iter(dataloader)
@@ -164,7 +158,7 @@ def run_data_test():
             metrics = environ_meter.step(delta_time, global_step=global_step)
             if global_step == save_step:
                 state = {
-                    "model": FakeModel(),
+                    "model": fake_model,
                     "extra_state": {
                         "global_step": global_step,
                         "train_dataloader": dataloader.state_dict(),
@@ -176,7 +170,7 @@ def run_data_test():
                 dist.barrier()
 
     # resume
-    state = {"model": FakeModel(), "extra_state": {}}  # cannot be None
+    state = {"model": fake_model, "extra_state": {}}  # cannot be None
     Checkpointer.load(save_checkpoint_path, state)
     dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
     environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
@@ -244,6 +238,7 @@ def build_command(dataset_type, dataloader_type):
         "--train.global_batch_size=16",
         "--train.micro_batch_size=2",
         "--train.data_parallel_mode=ddp",
+        "--train.ckpt_manager=dcp",
         f"--data.datasets_type={dataset_type}",
         "--train.ulysses_parallel_size=2",
         "--train.bsz_warmup_ratio=0",

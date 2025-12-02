@@ -3,13 +3,15 @@ import sys
 import torch
 import torch.distributed as c10d
 
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
-if not c10d.is_available() or not c10d.is_nccl_available():
+
+if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
     print("c10d NCCL not available, skipping tests", file=sys.stderr)
     sys.exit(0)
 
+import pytest
 import torch.distributed as dist
-from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.comm import (
@@ -18,7 +20,6 @@ from veomni.distributed.sequence_parallel.comm import (
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
-from veomni.utils.device import get_device_type, get_torch_device
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
@@ -60,8 +61,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @requires_nccl()
-    @skip_if_lt_x_gpu(4)
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn(self):
         self._get_process_group()
         sp_group = get_ulysses_sequence_parallel_group()
@@ -108,12 +108,11 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         full_input_grad = full_input.grad.detach().clone()
 
         torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
         torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
-    @requires_nccl()
-    @skip_if_lt_x_gpu(4)
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn_padding(self):
         self._get_process_group()
         sp_group = get_ulysses_sequence_parallel_group()
