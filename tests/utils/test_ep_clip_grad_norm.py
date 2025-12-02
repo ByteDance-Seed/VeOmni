@@ -90,7 +90,7 @@ def main():
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
 
-    max_grad_norm = args.train.max_grad_norm
+    max_grad_norm = 1.0
     model.set_grad()
     grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
     # Run the clipper again to measure the norm after the first pass.
@@ -102,6 +102,10 @@ def main():
     torch.testing.assert_close(
         grad_norm_post_clip, min(expected_grad_norm_pre_clip, max_grad_norm), atol=1e-6, rtol=1e-6
     )
+
+    expected_clipped_grad = 1 / expected_grad_norm_pre_clip
+    for _, p in model.named_parameters():
+        torch.testing.assert_close(p.grad, torch.full_like(p, expected_clipped_grad), atol=1e-6, rtol=1e-6)
 
     dist.barrier()
     dist.destroy_process_group()
