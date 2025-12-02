@@ -119,10 +119,15 @@ def main():
         dist.get_world_size(group=ep_group) if ep_group is not None else None,
         dist.get_world_size(group=ep_fsdp_group) if ep_fsdp_group is not None else None,
     )
-    tensor_device = torch.device(f"{get_device_type()}:{get_device_id()}")
+    device_type = get_device_type()
+    tensor_device = torch.device(f"{device_type}:{get_device_id()}")
+    is_npu = device_type == "npu"
     max_grad_norm = args.train.max_grad_norm
+    ep_param_ids = {id(p) for p in ep_params}
+    needs_npu_ep_scale = is_npu and ps.ep_enabled and ps.ep_size > 1
+    ep_inv_size = 1.0 / float(ps.ep_size) if needs_npu_ep_scale else 1.0
 
-    def compute_global_grad_norm() -> float:
+    def compute_global_grad_norm(apply_ep_scale: bool = False) -> float:
         """Reconstruct the optimizer-facing L2 norm from the current gradient shards."""
         # local_sq accumulates the sum of squares for this rank only; we keep it on the same device
         # as the gradients to avoid device synchronization.
@@ -137,16 +142,19 @@ def main():
                 g_local = g.to_local()
             else:
                 g_local = g
+            g_fp32 = g_local.detach().float()
+            if apply_ep_scale and id(p) in ep_param_ids:
+                g_fp32 = g_fp32 * ep_inv_size
             # contrib is the squared L2 contribution of this parameter shard on this rank.
-            contrib = g_local.detach().float().pow(2).sum()
+            contrib = g_fp32.pow(2).sum()
             if local_sq is None:
                 # Initialize the accumulator lazily so we only allocate once we know the device.
-                local_sq = torch.zeros(1, device=g_local.device, dtype=torch.float32)
+                local_sq = torch.zeros(1, device=g_fp32.device, dtype=torch.float32)
             # Accumulate the per-parameter contribution into this rank's running total.
             local_sq = local_sq + contrib
         if local_sq is None:
             # If every parameter had `grad=None`, fall back to a zero tensor on the current device.
-            local_sq = torch.zeros(1, device=torch.device(get_device_type()), dtype=torch.float32)
+            local_sq = torch.zeros(1, device=torch.device(device_type), dtype=torch.float32)
         # Combine the per-rank totals so every rank sees the global sum of squares.
         dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
         # Final L2 norm is the square root of the summed squares.
@@ -159,12 +167,12 @@ def main():
         loss = model(inputs)
         loss.backward()
 
-        manual_pre = compute_global_grad_norm()
+        manual_pre = compute_global_grad_norm(apply_ep_scale=needs_npu_ep_scale)
         grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
         # Clip API reports the norm before scaling, so compare against the pre-clip measurement.
         torch.testing.assert_close(grad_norm_pre_clip, manual_pre, atol=1e-6, rtol=1e-6)
 
-        manual_post = compute_global_grad_norm()
+        manual_post = compute_global_grad_norm(apply_ep_scale=False)
         grad_norm_post_clip = veomni_clip_grad_norm(model, max_grad_norm)
         torch.testing.assert_close(grad_norm_post_clip, manual_post, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(grad_norm_post_clip, min(manual_pre, max_grad_norm), atol=1e-6, rtol=1e-6)
@@ -176,9 +184,12 @@ def main():
             if grad is None:
                 continue
             grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+            expected = clip_coeff
+            if needs_npu_ep_scale and id(param) in ep_param_ids:
+                expected = clip_coeff * ep_inv_size
             torch.testing.assert_close(
                 grad_local,
-                torch.full_like(grad_local, clip_coeff),
+                torch.full_like(grad_local, expected),
                 atol=1e-6,
                 rtol=1e-6,
                 msg=f"Gradient mismatch for {name}",
