@@ -80,7 +80,7 @@ jobs:
         env:
           UV_DEFAULT_INDEX: "https://mirrors.ivolces.com/pypi/simple/"
         run: |
-          uv pip install --python python3.11 --system --extra-index-url https://download.pytorch.org/whl/cu128 -e .[dev,gpu] 
+          uv pip install --python python3.11 --system --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu128 -e .[dev,gpu] 
           uv pip install --python python3.11 --system diffusers
       - name: Run parallel tests
         run: |

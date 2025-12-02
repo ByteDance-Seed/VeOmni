@@ -76,8 +76,10 @@ jobs:
           clean: true
       - name: Install ffmpeg
         run: |
-          apt-get update
-          apt-get install -y ffmpeg
+          rm -rf /var/lib/apt/lists/*
+          apt-get clean
+          apt-get update --allow-insecure-repositories
+          apt-get install -y ffmpe
       - name: Install the current repository
         run: |
           pip install -e .[dev,npu] --extra-index-url https://download.pytorch.org/whl/cpu
