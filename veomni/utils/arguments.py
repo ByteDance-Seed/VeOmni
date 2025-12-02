@@ -538,10 +538,6 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
-    dcp_storage_backend: str = field(
-        default="default",
-        metadata={"help": "Backend for distributed checkpointing. For now only the default FileSystemWriter/FileSystemReader is supported. We will add more storage backends like VolcEngine TOS in the future."},
-    )
 
     def __post_init__(self):
         self._train_steps = -1
