@@ -16,7 +16,8 @@ def veomni_clip_grad_norm(
         # fsdp2 on GPU
         grad_norm = fsdp2_clip_grad_norm(model, max_norm, norm_type, error_if_nonfinite, foreach)
     elif dp_mode == "fsdp2" and is_torch_npu_available():
-        # fsdp2 on NPU
+        # fsdp2 on NPU, where we have to manually reduce gradients
+        # context: https://github.com/ByteDance-Seed/VeOmni/issues/241
         grad_norm = npu_fsdp2_clip_grad_norm(model, max_norm, norm_type, error_if_nonfinite, foreach)
     else:
         raise RuntimeError(f"Unknown dp mode {dp_mode}")
