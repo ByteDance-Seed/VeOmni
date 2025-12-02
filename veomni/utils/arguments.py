@@ -267,7 +267,9 @@ class TrainingArguments:
     )
     train_architecture: Literal["full", "lora"] = field(
         default="full",
-        metadata={"help": "Specifies the parameter update strategy for training the multi-modal model. 'full' for Standard SFT, lora for LoRA."},
+        metadata={
+            "help": "Specifies the parameter update strategy for training the multi-modal model. 'full' for Standard SFT, lora for LoRA."
+        },
     )
     lr: float = field(
         default=5e-5,
