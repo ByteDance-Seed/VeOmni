@@ -132,7 +132,7 @@ def main():
         # local_sq accumulates the sum of squares for this rank only; we keep it on the same device
         # as the gradients to avoid device synchronization.
         local_sq = None
-        for p in model.parameters():
+        for name, p in model.named_parameters():
             g = p.grad
             if g is None:
                 continue
@@ -143,6 +143,7 @@ def main():
             else:
                 g_local = g
             g_fp32 = g_local.detach().float()
+            logger.info_rank0(f"param name {name} has grad {g_fp32}")
             if apply_ep_scale and id(p) in ep_param_ids:
                 g_fp32 = g_fp32 * ep_inv_size
             # contrib is the squared L2 contribution of this parameter shard on this rank.
