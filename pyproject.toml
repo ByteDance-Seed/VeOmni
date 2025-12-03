@@ -2,19 +2,16 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[project.urls]
-"Homepage" = "https://github.com/ByteDance-Seed/VeOmni"
-"Source Code" = "https://github.com/ByteDance-Seed/VeOmni"
-
 [project]
 name = "veomni"
-dynamic = ["version"]
+version = "0.1.0"
 description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
+readme = "README.md"
+requires-python = ">=3.11, <3.12"
+license = { file = "LICENSE" }
 authors = [
   { name="Fazzie", email="maqianli.fazzie@bytedance.com" },
 ]
-requires-python = ">=3.11,<3.12"
-license = { file = "LICENSE" }
 
 dependencies = [
   "blobfile>=3.0.0",
@@ -23,28 +20,26 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   "diffusers>=0.30.0,<=0.31.0",
-  "transformers[torch]==4.57.0",
+  "transformers[torch]",
   "psutil",
   "timm",
-  "wandb"
+  "wandb",
+  "setuptools",
 ]
 
+[project.urls]
+"Homepage" = "https://github.com/ByteDance-Seed/VeOmni"
+"Source Code" = "https://github.com/ByteDance-Seed/VeOmni"
+
 [project.optional-dependencies]
-# TODO: Delete this after we switch to uv to run CI tasks.
-dev = [
-  "pre-commit>=4.0.0,<5.0",
-  "ruff>=0.7.0,<1.0",
-  "pytest>=6.0.0,<8.0",
-  "expecttest>=0.3.0,<0.4"
-]
-audio = [
-  "av>=14.3.0,<15.0",
-  "librosa>=0.11.0,<0.12",
-  "soundfile>=0.13.1,<0.14"
-]
-dit = [
-  "diffusers>=0.30.0,<=0.31.0",
-  "bitsandbytes>=0.46.0,<=0.47.0"
+gpu = [
+  "torch==2.8.0+cu128",
+  "torchvision==0.23.0+cu128",
+  "torchaudio==2.8.0+cu128",
+  "nvidia-cusparselt-cu12",
+  "nvidia-nccl-cu12",
+  "liger-kernel",
+  "flash-attn",
 ]
 npu = [
   "torch==2.7.1+cpu",
@@ -57,14 +52,14 @@ npu = [
   "einops>=0.8.1",
   "scipy>=1.16.2"
 ]
-gpu =[
-  "torch==2.8.0+cu128",
-  "torchvision==0.23.0+cu128",
-  "torchaudio==2.8.0+cu128",
-  "nvidia-cusparselt-cu12",
-  "nvidia-nccl-cu12",
-  "liger-kernel",
-  "flash-attn",
+audio = [
+  "av>=14.3.0,<15.0",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14"
+]
+dit = [
+  "diffusers>=0.30.0,<=0.31.0",
+  "bitsandbytes>=0.46.0,<=0.47.0"
 ]
 megatron = [
   "megatron-energon>=7.2.1"
@@ -85,9 +80,7 @@ lint = [
 test = [
   "pytest",
   "expecttest",
-  "setuptools"
 ]
-
 
 [tool.uv]
 # This locks the uv version so that we have a consistent uv behavior across the board.
@@ -97,11 +90,16 @@ test = [
 # NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
 #         version and release new docker images.
 required-version = "==0.9.8"
-# This section is used to force version when two packages have non-overlapping dependencies.
+no-build-isolation-package = [
+    "flash-attn",
+]
+
 override-dependencies = [
+    # Fixate to a specific transformers version since upgrading transformers is a large task.
+    "transformers==4.57.0",
     # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
-    # byted pypi without using the cu128 versions.
+    # PyPI without using the cu128 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
     "torch==2.8.0+cu128; (extra == 'gpu')",
     "torchaudio==2.8.0+cu128; (extra == 'gpu')",
@@ -113,9 +111,8 @@ override-dependencies = [
     "torchvision==0.22.1; (extra == 'npu') and (platform_machine == 'aarch64')",
     "torchaudio==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
     "torchvision==0.22.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
-    # Fixate to a specific transformers version since upgrading transformers is a large task.
-    "transformers==4.57.0",
 ]
+
 conflicts = [
   [
     { extra = "gpu" },
@@ -124,27 +121,31 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-# Download torch packages from the official index to ensure we get the proper CUDA built version.
-torch = {index = "pytorch"}
-torchvision = [
-  # npu aarch64 need install torchvison from pytorch-cpu
-  { index = "pytorch-cpu", marker = "extra == 'npu' and platform_machine == 'aarch64'" },
-  { index = "pytorch", marker = "extra == 'npu' and platform_machine != 'aarch64'" },
-  { index = "pytorch", marker = "extra != 'npu'"},
+# To support override-dependencies for multiple extras, one package can only have one index.
+torch = [
+  { index = "pytorch", extra = "npu" },
+  # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
+  # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
+  # those nvidia packages.
+  #
+  # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
+  #
+  # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
+  { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "gpu" },
 ]
-torchaudio = {index = "pytorch"}
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
 # Download flash-attn wheel directly to avoid build issues.
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"}
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'" }
 
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/"
 explicit = true
 
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu/"
-explicit = true
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+requires-dist = ["torch"]
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni.__version__"}
@@ -154,7 +155,7 @@ where = ["."]
 exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts"]
 
 [tool.ruff]
-target-version = "py38"
+target-version = "py311"
 line-length = 119
 indent-width = 4
 
