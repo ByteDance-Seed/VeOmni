@@ -29,7 +29,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
-from ..utils.device import get_device_id, get_device_type
+from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
 from .checkpoint import CheckpointFunction
 from .fsdp import (
@@ -241,7 +241,6 @@ def parallelize_model_fsdp2(
     3. Apply FSDP2 to regular modules: Standard dim-0 sharding
     4. Result: Expert params [32,H/fsdp_size,I], regular params use standard FSDP2
     """
-    device_type = get_device_type()
     parallel_state = get_parallel_state()
 
     # Step 0: Get target classes to shard later
@@ -354,7 +353,7 @@ def parallelize_model_fsdp2(
             # Note that NPU does not support PreSumMul so we skip this call
             # see https://github.com/ByteDance-Seed/VeOmni/issues/241
             # As a result, NPU grad norm clipping will fall back to manual clipping
-            if device_type != "npu":
+            if not IS_NPU_AVAILABLE:
                 experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_fsdp_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
