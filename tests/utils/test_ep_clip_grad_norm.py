@@ -225,7 +225,7 @@ def test_clip_grad_norm_fsdp2_no_ep():
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=4",
+        "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
         "--train.expert_parallel_size=1",
@@ -241,7 +241,7 @@ def test_clip_grad_norm_fsdp2_ep4():
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=4",
+        "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
         "--train.expert_parallel_size=4",
@@ -257,7 +257,7 @@ def test_clip_grad_norm_fsdp2_ep8():
     command = [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=4",
+        "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
         "--train.expert_parallel_size=8",
