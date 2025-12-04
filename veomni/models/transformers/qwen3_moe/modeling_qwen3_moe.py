@@ -1507,9 +1507,6 @@ if is_liger_kernel_available():
     Qwen3MoeRMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to Qwen3_moe.")
 
-ModelClass = Qwen3MoeForCausalLM
-
-
 __all__ = [
     "Qwen3MoeForCausalLM",
     "Qwen3MoeForQuestionAnswering",

@@ -915,6 +915,4 @@ if is_liger_kernel_available():
     logger.info_rank0("Apply liger kernel to Qwen2.")
 
 
-ModelClass = Qwen2ForCausalLM
-
-__all__ = ["Qwen2ForCausalLM", "Qwen2Model", "Qwen2PreTrainedModel"]
+__all__ = ["Qwen2ForCausalLM", "Qwen2Model"]

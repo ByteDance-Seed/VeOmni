@@ -1444,7 +1444,4 @@ if is_liger_kernel_available():
     DeepseekV3RMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to Deepseek-V3.")
 
-
-ModelClass = DeepseekV3ForCausalLM
-
-__all__ = ["DeepseekV3ForCausalLM", "DeepseekV3Model"]
+__all__ = ["DeepseekV3Model", "DeepseekV3ForCausalLM", "DeepseekV3ForSequenceClassification"]

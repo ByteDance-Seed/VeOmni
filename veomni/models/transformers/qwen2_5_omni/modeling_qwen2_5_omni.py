@@ -5053,8 +5053,6 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         return thinker_outputs
 
 
-ModelClass = Qwen2_5OmniForConditionalGeneration
-
 __all__ = [
     "Qwen2_5OmniForConditionalGeneration",
     "Qwen2_5OmniThinkerTextModel",
@@ -5064,6 +5062,4 @@ __all__ = [
     "Qwen2_5OmniToken2WavDiTModel",
     "Qwen2_5OmniToken2WavBigVGANModel",
     "Qwen2_5OmniToken2WavModel",
-    "Qwen2_5OmniPreTrainedModel",
-    "Qwen2_5OmniPreTrainedModelForConditionalGeneration",
 ]

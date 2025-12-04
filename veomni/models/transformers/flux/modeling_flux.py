@@ -767,5 +767,3 @@ class FluxModel(PreTrainedModel):
 if is_liger_kernel_available():
     RMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to Flux.")
-
-ModelClass = FluxModel

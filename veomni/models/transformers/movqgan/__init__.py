@@ -11,14 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from transformers import Qwen2_5OmniConfig
 
-from transformers import AutoConfig, AutoModel, AutoProcessor
-
-from .configuration_movqgan import MoVQGANConfig
-from .modeling_movqgan import MoVQGAN
-from .processing_movqgan import MoVQGANProcessor
+from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 
-AutoConfig.register("movqgan", MoVQGANConfig)
-AutoModel.register(MoVQGANConfig, MoVQGAN)
-AutoProcessor.register(MoVQGANConfig, MoVQGANProcessor)
+@MODEL_CONFIG_REGISTRY.register("movqgan")
+def register_movqgan_config():
+    from .configuration_movqgan import MoVQGANConfig
+
+    return MoVQGANConfig
+
+
+@MODELING_REGISTRY.register("movqgan")
+def register_movqgan_modeling(architecture: str):
+    from .modeling_movqgan import MoVQGAN
+
+    return MoVQGAN
+
+
+@MODEL_PROCESSOR_REGISTRY.register("MoVQGANProcessor")
+def register_movqgan_processor():
+    from .processing_movqgan import MoVQGANProcessor
+
+    return MoVQGANProcessor

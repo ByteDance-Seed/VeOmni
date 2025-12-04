@@ -25,7 +25,7 @@ jobs:
               const owner = context.repo.owner;
               const repo = context.repo.repo;
               const issueNumber = context.issue.number;
-              
+
               let contentToCheck = '';
               if (eventName === 'issues') {
                 const title = context.payload.issue.title || '';
@@ -37,7 +37,7 @@ jobs:
                 console.log('Unsupported event type: ${eventName}. Skipping.');
                 return;
               }
-            
+
               // 2. Check if contentToCheck contains the keyword "ascend"
               if (!contentToCheck.toLowerCase().includes('ascend')) {
                 console.log('No "ascend" keyword found. Skipping.');
@@ -50,14 +50,14 @@ jobs:
                 repo: repo,
                 issue_number: issueNumber
               });
-                          
+
               // 4. Avoid duplicate label addition
               const existingLabels = labels?.map(label => label.name) || [];
               if (existingLabels.includes('ascend')) {
                 console.log('Label "ascend" already exists. Skipping.');
                 return;
               }
-            
+
               // 5. Add the "ascend" label
               await github.rest.issues.addLabels({
                 owner: owner,
@@ -66,7 +66,7 @@ jobs:
                 labels: ['ascend']
               });
               console.log(`Successfully added "ascend" label to #${issueNumber}.`);
-              
+
             } catch (error) {
                 console.error('Error adding label:', error);
                 core.setFailed(error.message);

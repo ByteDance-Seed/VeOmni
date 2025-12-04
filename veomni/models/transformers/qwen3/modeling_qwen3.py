@@ -877,6 +877,4 @@ if is_liger_kernel_available():
     Qwen3MLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Qwen3.")
 
-ModelClass = Qwen3ForCausalLM
-
 __all__ = ["Qwen3ForCausalLM", "Qwen3Model", "Qwen3PreTrainedModel"]
