@@ -71,11 +71,11 @@ def ep_fsdp2_clip_grad_norm(
         # Averaging gradients for EP params through dividing grads by ep_fsdp_size
         # this is to simulate fsdp2 set_gradient_divide_factor
         scale = 1.0 / float(ps.ep_fsdp_size)
-        for q in ep_params:
-            if q.grad is not None:
-                q.grad.detach().mul_(scale)
+        with torch.no_grad():
+            for q in ep_params:
+                if q.grad is not None:
+                    q.grad.mul_(scale)
     # Compute and reduce non-EP
-    logger.debug_rank0(f"non_ep_params reduce group is {fsdp_group=}")
     non_ep_total = _fsdp2_reduce_group(
         params=non_ep_params,
         norm_type=norm_type,
