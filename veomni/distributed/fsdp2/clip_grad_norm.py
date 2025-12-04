@@ -81,15 +81,15 @@ def ep_fsdp2_clip_grad_norm(
         norm_type=norm_type,
         reduce_groups=[("fsdp", fsdp_group)],
     )
-    logger.debug_rank0(f"non_ep total grad norm: {non_ep_total}")
-    logger.debug_rank0(f"ep_params reduces groups: {ep_fsdp_group=}, {ep_group=}")
+    logger.info_rank0(f"non_ep total grad norm: {non_ep_total}")
+    logger.info_rank0(f"ep_params reduces groups: {ep_fsdp_group=}, {ep_group=}")
     # Compute and reduce EP: first across ep_fsdp, then across ep
     ep_total = _fsdp2_reduce_group(
         params=ep_params,
         norm_type=norm_type,
         reduce_groups=[("ep_fsdp", ep_fsdp_group), ("ep", ep_group)],
     )
-    logger.debug_rank0(f"ep total grad norm: {ep_total}")
+    logger.info_rank0(f"ep total grad norm: {ep_total}")
 
     if math.isinf(norm_type):
         total_norm = torch.maximum(non_ep_total, ep_total)
@@ -169,9 +169,9 @@ def _fsdp2_reduce_group(
     else:
         p = float(norm_type)
         val = _local_pth_sum(params, p)
-        logger.debug_rank0(f"local total grad norm: {val}. ProcessGroups to sum {reduce_groups}")
+        logger.info_rank0(f"local total grad norm: {val}. ProcessGroups to sum {reduce_groups}")
         for name, group in reduce_groups:
             if group is not None:
                 dist.all_reduce(val, op=dist.ReduceOp.SUM, group=group)
-                logger.debug_rank0(f"After Sum of group {name} total grad norm is {val}")
+                logger.info_rank0(f"After Sum of group {name} total grad norm is {val}")
         return val
