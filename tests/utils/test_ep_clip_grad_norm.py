@@ -1,3 +1,4 @@
+import math
 import subprocess
 from dataclasses import dataclass, field
 
@@ -9,6 +10,7 @@ from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
+from veomni.optim import build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
 from veomni.utils.device import get_device_id, get_device_type, get_dist_comm_backend, get_torch_device
@@ -40,10 +42,10 @@ class ToyMoeModel(torch.nn.Module):
     def init_weights(self):
         self.bias.data.fill_(1.0)
         self.decoder.regular_mlp.data.fill_(1.0)
-        self.decoder.ep_layer.data.fill_(1.0)
+        self.decoder.moe.experts.data.fill_(1.0)
 
     def get_parallel_plan(self):
-        ep_plan = {"decoder.ep_layer": Shard(0)}
+        ep_plan = {"decoder.moe.experts": Shard(0)}
         parallel_plan = ParallelPlan(
             ep_plan=ep_plan,
         )
@@ -54,10 +56,19 @@ class ToyMoeDecoderLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.regular_mlp = torch.nn.Parameter(torch.ones(64, 16), requires_grad=True)
-        self.ep_layer = torch.nn.Parameter(torch.ones(64, 16, 32), requires_grad=True)
+        self.moe = ToyMoeExperts()
 
     def forward(self) -> torch.Tensor:
-        return self.regular_mlp.sum() + self.ep_layer.sum()
+        return self.regular_mlp.sum() + self.moe()
+
+
+class ToyMoeExperts(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = torch.nn.Parameter(torch.ones(64, 16, 32), requires_grad=True)
+
+    def forward(self) -> torch.Tensor:
+        return self.experts.sum()
 
 
 def main():
@@ -101,18 +112,16 @@ def main():
     ep_fsdp_group = None
     if ps.ep_enabled and ps.ep_fsdp_device_mesh is not None:
         ep_fsdp_group = ps.ep_fsdp_device_mesh["ep_fsdp"].get_group()
-
-    ep_params = []
-    non_ep_params = []
-    for n, p in model.named_parameters():
-        entry = f"{n} (shape={tuple(p.shape)}, type={type(p)}, is_dtensor={isinstance(p, DTensor)})"
-        if "ep_layer" in n:
-            ep_params.append(p)
-            logger.info_rank0(f"Register EP param: {entry}")
-        else:
-            non_ep_params.append(p)
-            logger.info_rank0(f"Register non-EP param: {entry}")
-    model._ep_param_groups = {"ep": ep_params, "non_ep": non_ep_params}
+    # build optimizer to register ep param groups when ep is enabled
+    _ = build_optimizer(
+        model,
+        lr=args.train.lr,
+        weight_decay=args.train.weight_decay,
+        fused=True,
+        optimizer_type=args.train.optimizer,
+        no_decay_modules=args.train.no_decay_modules,
+        no_decay_params=args.train.no_decay_params,
+    )
     logger.info_rank0(
         "group sizes - fsdp: %s, ep: %s, ep_fsdp: %s",
         dist.get_world_size(group=fsdp_group) if fsdp_group is not None else None,
@@ -121,13 +130,11 @@ def main():
     )
     device_type = get_device_type()
     tensor_device = torch.device(f"{device_type}:{get_device_id()}")
-    is_npu = device_type == "npu"
     max_grad_norm = args.train.max_grad_norm
-    ep_param_ids = {id(p) for p in ep_params}
-    needs_npu_ep_scale = is_npu and ps.ep_enabled and ps.ep_size > 1
-    ep_inv_size = 1.0 / float(ps.ep_size) if needs_npu_ep_scale else 1.0
 
-    def compute_global_grad_norm(apply_ep_scale: bool = False) -> float:
+    # this is wrong for ep because model is not aware of ep
+    # for ep=4, model's ep layer here becomes [16, 16, 32] instead of [64, 16, 32]
+    def compute_global_grad_norm_pure_fsdp2(apply_ep_scale: bool = False) -> float:
         """Reconstruct the optimizer-facing L2 norm from the current gradient shards."""
         # local_sq accumulates the sum of squares for this rank only; we keep it on the same device
         # as the gradients to avoid device synchronization.
@@ -144,8 +151,6 @@ def main():
                 g_local = g
             g_fp32 = g_local.detach().float()
             logger.info_rank0(f"param name {name} has grad {g_fp32}")
-            if apply_ep_scale and id(p) in ep_param_ids:
-                g_fp32 = g_fp32 * ep_inv_size
             # contrib is the squared L2 contribution of this parameter shard on this rank.
             contrib = g_fp32.pow(2).sum()
             if local_sq is None:
@@ -161,33 +166,28 @@ def main():
         # Final L2 norm is the square root of the summed squares.
         return torch.sqrt(local_sq).item()
 
-    grad_norm_pre_clip = None
+    total_grad_norm_pre_clip = None
     grad_norm_post_clip = None
     for step in range(3):
         inputs = torch.ones(1, 16, device=tensor_device)
         loss = model(inputs)
         loss.backward()
 
-        manual_pre = compute_global_grad_norm(apply_ep_scale=needs_npu_ep_scale)
-        grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
-        # Clip API reports the norm before scaling, so compare against the pre-clip measurement.
-        torch.testing.assert_close(grad_norm_pre_clip, manual_pre, atol=1e-6, rtol=1e-6)
+        logger.info_rank0("manually checking the initial param grads before any clipping")
+        expected_total_grad_norm = math.sqrt(16 + 64 * 16 + 64 * 16 * 32)
+        total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
+        # check whether total grad norm meets our expectation
+        torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
 
-        manual_post = compute_global_grad_norm(apply_ep_scale=needs_npu_ep_scale)
-        grad_norm_post_clip = veomni_clip_grad_norm(model, max_grad_norm)
-        torch.testing.assert_close(grad_norm_post_clip, manual_post, atol=1e-6, rtol=1e-6)
-        torch.testing.assert_close(grad_norm_post_clip, min(manual_pre, max_grad_norm), atol=1e-6, rtol=1e-6)
-
-        # The clipper scales every gradient by the same coefficient max_norm/manual_pre (capped at 1).
-        clip_coeff = min(max_grad_norm / manual_pre, 1.0)
+        # go through each param grad one-by-one to check whether their value meets our expectation
+        clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
         for name, param in model.named_parameters():
             grad = param.grad
             if grad is None:
                 continue
             grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+            logger.info_rank0(f"After clipping, the local grad for {name}: {grad_local}")
             expected = clip_coeff
-            if needs_npu_ep_scale and id(param) in ep_param_ids:
-                expected = clip_coeff * ep_inv_size
             torch.testing.assert_close(
                 grad_local,
                 torch.full_like(grad_local, expected),
@@ -197,13 +197,29 @@ def main():
             )
 
         logger.info_rank0(
-            f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {grad_norm_pre_clip}, "
+            f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {total_grad_norm_pre_clip}, "
             f"grad_norm_post_clip: {grad_norm_post_clip}"
         )
         model.zero_grad()
 
     dist.barrier()
     dist.destroy_process_group()
+
+
+def test_clip_grad_norm_fsdp2_no_ep():
+    command = [
+        "torchrun",
+        "--nnodes=1",
+        "--nproc_per_node=4",
+        "--master_port=4321",
+        "tests/utils/test_ep_clip_grad_norm.py",
+        "--train.expert_parallel_size=1",
+        "--train.data_parallel_mode=fsdp2",
+        "--train.init_device=meta",
+        "--train.output_dir='debug'",
+    ]
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
 
 
 def test_clip_grad_norm_fsdp2_ep4():
@@ -213,7 +229,7 @@ def test_clip_grad_norm_fsdp2_ep4():
         "--nproc_per_node=4",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
-        "--train.expert_parallel_size=2",
+        "--train.expert_parallel_size=4",
         "--train.data_parallel_mode=fsdp2",
         "--train.init_device=meta",
         "--train.output_dir='debug'",
@@ -229,7 +245,7 @@ def test_clip_grad_norm_fsdp2_ep8():
         "--nproc_per_node=4",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
-        "--train.expert_parallel_size=4",
+        "--train.expert_parallel_size=8",
         "--train.data_parallel_mode=fsdp2",
         "--train.init_device=meta",
         "--train.output_dir='debug'",

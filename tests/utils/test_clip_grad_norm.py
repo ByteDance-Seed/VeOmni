@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
+from torch.distributed._tensor import DTensor
 
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_state import init_parallel_state
@@ -81,6 +82,21 @@ def main():
 
     torch.testing.assert_close(grad_norm_pre_clip, 4.0, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(grad_norm_post_clip, min(4.0, max_grad_norm), atol=1e-6, rtol=1e-6)
+    clip_coeff = min(max_grad_norm / 4.0, 1.0)
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+        logger.info_rank0(f"After clipping, the local grad for {name}: {grad_local}")
+        expected = clip_coeff
+        torch.testing.assert_close(
+            grad_local,
+            torch.full_like(grad_local, expected),
+            atol=1e-6,
+            rtol=1e-6,
+            msg=f"Gradient mismatch for {name}",
+        )
 
     dist.barrier()
     dist.destroy_process_group()
