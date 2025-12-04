@@ -275,6 +275,10 @@ class ParallelState:
     def fsdp_size(self) -> int:
         return self.world_size // (self.pp_size * self.tp_size)
 
+    @property
+    def ep_fsdp_size(self) -> int:
+        return self.fsdp_size // self.ep_size
+
     # ------------------------------ TP ------------------------------ #
     @property
     @requires_mesh

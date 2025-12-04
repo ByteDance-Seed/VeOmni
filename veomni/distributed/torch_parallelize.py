@@ -355,7 +355,7 @@ def parallelize_model_fsdp2(
             # see https://github.com/ByteDance-Seed/VeOmni/issues/241
             # As a result, NPU grad norm clipping will fall back to manual clipping
             if device_type != "npu":
-                experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_size)
+                experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_fsdp_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
