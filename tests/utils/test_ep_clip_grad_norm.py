@@ -132,40 +132,6 @@ def main():
     tensor_device = torch.device(f"{device_type}:{get_device_id()}")
     max_grad_norm = args.train.max_grad_norm
 
-    # this is wrong for ep because model is not aware of ep
-    # for ep=4, model's ep layer here becomes [16, 16, 32] instead of [64, 16, 32]
-    def compute_global_grad_norm_pure_fsdp2(apply_ep_scale: bool = False) -> float:
-        """Reconstruct the optimizer-facing L2 norm from the current gradient shards."""
-        # local_sq accumulates the sum of squares for this rank only; we keep it on the same device
-        # as the gradients to avoid device synchronization.
-        local_sq = None
-        for name, p in model.named_parameters():
-            g = p.grad
-            if g is None:
-                continue
-            # FSDP2 + EP stores gradients as DTensors, so convert them to the local view before
-            # measuring. Non-DTensor grads (e.g., bias) are already local tensors.
-            if isinstance(g, DTensor):
-                g_local = g.to_local()
-            else:
-                g_local = g
-            g_fp32 = g_local.detach().float()
-            logger.info_rank0(f"param name {name} has grad {g_fp32}")
-            # contrib is the squared L2 contribution of this parameter shard on this rank.
-            contrib = g_fp32.pow(2).sum()
-            if local_sq is None:
-                # Initialize the accumulator lazily so we only allocate once we know the device.
-                local_sq = torch.zeros(1, device=g_fp32.device, dtype=torch.float32)
-            # Accumulate the per-parameter contribution into this rank's running total.
-            local_sq = local_sq + contrib
-        if local_sq is None:
-            # If every parameter had `grad=None`, fall back to a zero tensor on the current device.
-            local_sq = torch.zeros(1, device=torch.device(device_type), dtype=torch.float32)
-        # Combine the per-rank totals so every rank sees the global sum of squares.
-        dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
-        # Final L2 norm is the square root of the summed squares.
-        return torch.sqrt(local_sq).item()
-
     total_grad_norm_pre_clip = None
     grad_norm_post_clip = None
     for step in range(3):
@@ -192,7 +158,16 @@ def main():
         expected_total_grad_norm = math.sqrt(16 + 64 * 16 + 64 * 16 * 32)
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
         # check whether total grad norm meets our expectation
-        torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
+        if device_type != "npu":
+            torch.testing.assert_close(
+                total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6
+            )
+        else:
+            # on npu we manually divide grads by ep_fsdp size in place before reduce scatter
+            npu_expected_total_grad_norm = math.sqrt(16 + 64 * 16 + (64 * 16 * 32) / ps.ep_fsdp_size)
+            torch.testing.assert_close(
+                total_grad_norm_pre_clip, expected=npu_expected_total_grad_norm, atol=1e-6, rtol=1e-6
+            )
 
         # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
