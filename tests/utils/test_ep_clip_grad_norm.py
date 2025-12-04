@@ -174,12 +174,27 @@ def main():
         loss.backward()
 
         logger.info_rank0("manually checking the initial param grads before any clipping")
+        # check them one-by-one
+        for name, param in model.named_parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+            logger.info_rank0(f"Before clipping, the local grad for {name}: {grad_local}")
+            expected = 1.0
+            torch.testing.assert_close(
+                grad_local,
+                torch.full_like(grad_local, expected),
+                atol=1e-6,
+                rtol=1e-6,
+                msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}",
+            )
         expected_total_grad_norm = math.sqrt(16 + 64 * 16 + 64 * 16 * 32)
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
         # check whether total grad norm meets our expectation
         torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
 
-        # go through each param grad one-by-one to check whether their value meets our expectation
+        # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
         for name, param in model.named_parameters():
             grad = param.grad
