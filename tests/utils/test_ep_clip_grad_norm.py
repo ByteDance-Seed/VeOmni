@@ -164,7 +164,11 @@ def main():
             )
         else:
             # on npu we manually divide grads by ep_fsdp size in place before reduce scatter
-            npu_expected_total_grad_norm = math.sqrt(16 + 64 * 16 + (64 * 16 * 32) / ps.ep_fsdp_size)
+            npu_expected_total_grad_norm = (
+                math.sqrt(16 + 64 * 16 + (64 * 16 * 32) / ps.ep_fsdp_size)
+                if ps.ep_enabled
+                else expected_total_grad_norm
+            )
             torch.testing.assert_close(
                 total_grad_norm_pre_clip, expected=npu_expected_total_grad_norm, atol=1e-6, rtol=1e-6
             )
