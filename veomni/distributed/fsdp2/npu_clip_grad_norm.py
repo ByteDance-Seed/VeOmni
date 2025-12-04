@@ -83,9 +83,10 @@ def ep_fsdp2_clip_grad_norm(
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
 
-    # Match FSDP1 gradient averaging for EP params by dividing grads by ep_size
-    if ps.ep_enabled and ps.ep_size > 1 and ep_params:
-        scale = 1.0 / float(ps.ep_size)
+    # Averaging gradients for EP params through dividing grads by ep_fsdp_size
+    # this is to simulate fsdp2 set_gradient_divide_factor
+    if ps.ep_enabled and ps.ep_fsdp_size > 1 and ep_params:
+        scale = 1.0 / float(ps.ep_fsdp_size)
         for q in ep_params:
             if q.grad is not None:
                 q.grad.detach().mul_(scale)
