@@ -208,6 +208,14 @@ class DataArguments:
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
     )
+    shuffle: bool = field(
+        default=True,
+        metadata={"help": "Whether to shuffle the dataset for streaming datasets."},
+    )
+    shuffle_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Seed for shuffling in streaming datasets. Defaults to train.seed if not specified."},
+    )
     shuffle_shard_nums: int = field(
         default=1,
         metadata={"help": "Number of shards to shuffle in byted dataset."},
