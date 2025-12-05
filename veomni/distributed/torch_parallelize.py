@@ -29,7 +29,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
-from ..utils.device import get_device_id, get_device_type
+from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
 from .checkpoint import CheckpointFunction
 from .fsdp import (
@@ -339,6 +339,11 @@ def parallelize_model_fsdp2(
     # | -- experts layer (apply fully_shard separately in order to shard across EP groups on the same EP rank instead of sharding globally)
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
+    if IS_NPU_AVAILABLE:
+        from veomni.ops.patch.hccl_premul_sum import apply_hccl_premul_sum_patch
+
+        apply_hccl_premul_sum_patch()
+
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -347,7 +352,10 @@ def parallelize_model_fsdp2(
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
             # average EP grads across EP ranks
-            experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
+            if hasattr(experts_mod, "set_reduce_scatter_divide_factor"):
+                experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_size)
+            elif hasattr(experts_mod, "set_gradient_divide_factor"):
+                experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
