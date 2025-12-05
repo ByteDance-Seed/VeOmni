@@ -13,7 +13,13 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
-from veomni.utils.device import get_device_id, get_device_type, get_dist_comm_backend, get_torch_device, IS_NPU_AVAILABLE
+from veomni.utils.device import (
+    IS_NPU_AVAILABLE,
+    get_device_id,
+    get_device_type,
+    get_dist_comm_backend,
+    get_torch_device,
+)
 
 
 # from veomni.optim.optimizer import build_optimizer
@@ -143,7 +149,7 @@ def main():
                 torch.full_like(grad_local, expected_grad),
                 atol=1e-6,
                 rtol=1e-6,
-                msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}",
+                msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}, value {grad_local}, expected value {expected_grad} ",
             )
 
     total_grad_norm_pre_clip = None
@@ -174,18 +180,14 @@ def main():
         expected_total_grad_norm = math.sqrt(16 + 64 * 16 + 64 * 16 * 32)
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
         # check whether total grad norm meets our expectation
-        torch.testing.assert_close(
-            total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6
-        )
+        torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
 
         # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
         logger.info_rank0("Checking model param grad one-by-one after clipping")
         check_model_param_grad_one_by_one(clip_coeff, msg="After clipping")
 
-        logger.info_rank0(
-            f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {total_grad_norm_pre_clip}, "
-        )
+        logger.info_rank0(f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {total_grad_norm_pre_clip}, ")
         model.zero_grad()
 
     dist.barrier()
