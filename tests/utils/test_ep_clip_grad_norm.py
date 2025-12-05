@@ -135,7 +135,7 @@ def main():
     tensor_device = torch.device(f"{device_type}:{get_device_id()}")
     max_grad_norm = args.train.max_grad_norm
 
-    def check_model_param_grad_one_by_one(expected_grad, msg):
+    def check_model_param_grad_one_by_one(expected_grad, ep_expected_grad, msg):
         # check them one-by-one
         for name, param in model.named_parameters():
             grad = param.grad
@@ -143,13 +143,22 @@ def main():
                 continue
             grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
             logger.info_rank0(f"{msg}: the local grad for {name}: {grad_local}")
-            torch.testing.assert_close(
-                grad_local,
-                torch.full_like(grad_local, expected_grad),
-                atol=1e-6,
-                rtol=1e-6,
-                msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}, value {grad_local}, expected value {expected_grad} ",
-            )
+            if name == "decoder.moe.experts":
+                torch.testing.assert_close(
+                    grad_local,
+                    torch.full_like(grad_local, ep_expected_grad),
+                    atol=1e-6,
+                    rtol=1e-6,
+                    msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}, value {grad_local}, expected value {ep_expected_grad} ",
+                )
+            else:
+                torch.testing.assert_close(
+                    grad_local,
+                    torch.full_like(grad_local, expected_grad),
+                    atol=1e-6,
+                    rtol=1e-6,
+                    msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}, value {grad_local}, expected value {expected_grad} ",
+                )
 
     total_grad_norm_pre_clip = None
     for step in range(3):
@@ -167,6 +176,10 @@ def main():
         #   * by applying set_gradient_divide_factor(ep_fsdp_size) for EP modules in torch_parallelize
         # * In general, the divide factor for each param should be its num of different input data, which is its dp size
         #   EP params has different num of input data from fsdp-only params
+        # In this test specifically, model forward is unrelated to inputs and the local grad is always 1
+        # If there is no grad divide factor set, the default grad divide factor is ep_fsdp_size,
+        # Since we set grad divide factor to world_size (= fsdp_size = ep size * ep_fsdp_size), we expect grad here to be 1/ep_size
+
         # On NPU, we are missing PreSumMul ReduceOp for set_gradient_divide_factor, so the expected param grad here should have not been divided by ep_fsdp_size yet
         # * In this test, the expected grad norm is ep_fsdp_size then
         # * As a result, we need divide the ep_fsdp_size on local grad during clipping to calculate the total norm correctly
@@ -175,18 +188,20 @@ def main():
         # else:
         #     expected = 1.0
         expected = 1.0
-        check_model_param_grad_one_by_one(expected_grad=expected, msg="Before clipping")
+        ep_expected = 1.0 / ps.ep_size
+        check_model_param_grad_one_by_one(expected_grad=expected, ep_expected_grad=ep_expected, msg="Before clipping")
 
-        # Every local param grad is 1.0, model total norm should be sqrt(1^2 * total_param_num) which is sqrt(total_param_num)
-        expected_total_grad_norm = math.sqrt(16 + 64 * 16 + 64 * 16 * 32)
+        # Every local param grad is 1.0 / ps.ep_size, model total norm should be sqrt(1 * non_ep_param_num + 1/ep_size^2 * ep_param_num)
+        expected_total_grad_norm = math.sqrt(16 + 64 * 16 + (64 * 16 * 32) * (1 / ps.ep_size**2))
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
         # check whether total grad norm meets our expectation
         torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)
 
         # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
+        ep_clip_coeff = ep_expected * min(max_grad_norm / expected_total_grad_norm, 1.0)
         logger.info_rank0("Checking model param grad one-by-one after clipping")
-        check_model_param_grad_one_by_one(clip_coeff, msg="After clipping")
+        check_model_param_grad_one_by_one(clip_coeff, ep_clip_coeff, msg="After clipping")
 
         logger.info_rank0(f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {total_grad_norm_pre_clip}, ")
         model.zero_grad()

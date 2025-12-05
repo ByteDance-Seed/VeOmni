@@ -29,7 +29,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
-from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
+from ..utils.device import get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
 from .checkpoint import CheckpointFunction
 from .fsdp import (
@@ -353,8 +353,10 @@ def parallelize_model_fsdp2(
             # Note that NPU does not support PreSumMul so we skip this call
             # see https://github.com/ByteDance-Seed/VeOmni/issues/241
             # As a result, NPU grad norm clipping will fall back to manual clipping
-            if not IS_NPU_AVAILABLE:
-                experts_mod.set_reduce_scatter_divide_factor(parallel_state.ep_fsdp_size)
+            # if not IS_NPU_AVAILABLE:
+            gradient_divide_factor = parallel_state.world_size
+            logger.info(f"setting grad divide factor for ep module to {gradient_divide_factor}")
+            experts_mod.set_gradient_divide_factor(gradient_divide_factor)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
