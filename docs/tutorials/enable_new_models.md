@@ -392,11 +392,11 @@ def register_qwen3_vl_moe_config():
     return Qwen3VLMoeConfig
 
 @MODELING_REGISTRY.register("qwen3_vl_moe")
-def register_p6dense_modeling(architecture: str):
+def register_qwen3_vl_moe_modeling(architecture: str):
     from . import modeling_qwen3_vl_moe
     from .modeling_qwen3_vl_moe import Qwen3VLMoeForCausalLM, Qwen3VLMoeForSequenceClassification, Qwen3VLMoeForTokenClassification
     if "ForCausalLM" in architecture:
-        return P6DenseForCausalLM
+        return Qwen3VLMoeForCausalLM
     elif "ForSequenceClassification" in architecture:
         return Qwen3VLMoeForSequenceClassification
     elif "ForTokenClassification" in architecture:
