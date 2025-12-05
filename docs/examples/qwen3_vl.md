@@ -4,7 +4,7 @@
 
 1. Download the ShareGPT4V-small-coco-128.jsonl:  [ShareGPT4V-small-coco-128.jsonl](https://github.com/iqiancheng/ShareGPT4V-small/blob/main/ShareGPT4V-small-coco-128.jsonl)
 
-2. Download the COCO 2017 training images:  [COCO train2017 dataset](http://images.cocodataset.org/zips/train2017.zip)
+2. Download the COCO 2017 training images:  [COCO train2017 dataset](https://images.cocodataset.org/zips/train2017.zip)
 
 3. Final directory structure should be like this:
 > ```

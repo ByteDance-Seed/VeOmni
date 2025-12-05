@@ -15,7 +15,7 @@
 
 ### 2. Install the environment using uv
 
-    uv sync --extra npu --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
+    uv sync --extra npu
 
 ### 3. Using the environment
 
