@@ -76,6 +76,13 @@ def build_foundation_model(
         config = config_path
     else:
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True, **config_kwargs)
+        # For Qwen3-Embedding series, override architectures to "Qwen3Model"
+        # because their config.json incorrectly lists "Qwen3ForCausalLM", which would otherwise create a CausalLM model with lm_head.
+        name = str(config_path).lower()
+        if ("qwen3" in name) and ("embedding" in name):
+            config.architectures = ["Qwen3Model"]
+            config.tie_word_embeddings = False
+            logger.info_rank0("For Qwen3-Embedding series, override architectures to Qwen3Model. Because their config.json incorrectly lists Qwen3ForCausalLM, which would otherwise create a CausalLM model with lm_head.")
 
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "fused"]:
