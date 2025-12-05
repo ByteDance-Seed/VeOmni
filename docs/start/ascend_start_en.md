@@ -24,9 +24,9 @@ uv sync --extra npu
 ```
 
 ### 3. Using the environment
-
-    source .venv/bin/activate
-
+```shell
+source .venv/bin/activate
+```
 ## Ascend relevant Environment variables
 
 ```shell
@@ -41,6 +41,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 uv sync --extra npu
+source .venv/bin/activate
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 ```
