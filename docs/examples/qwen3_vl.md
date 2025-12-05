@@ -20,8 +20,8 @@
 ## Download qwen3vl model
 ```shell
 python3 scripts/download_hf_model.py \
-  --repo_id Qwen/Qwen3-VL-8B-Instruct \
-  --local_dir .
+    --repo_id Qwen/Qwen3-VL-8B-Instruct \
+    --local_dir .
 ```
 
 ## Start training on NPU
