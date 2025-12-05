@@ -22,6 +22,7 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoModelForSequenceClassification,
     AutoModelForVision2Seq,
     PreTrainedModel,
 )
@@ -55,6 +56,11 @@ class HuggingfaceLoader(BaseModelLoader):
             load_class = AutoModelForImageTextToText
         elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
             load_class = AutoModelForVision2Seq
+        elif (
+            "ForSequenceClassification" in architecture
+            and type(model_config) in AutoModelForSequenceClassification._model_mapping.keys()
+        ):
+            load_class = AutoModelForSequenceClassification
         elif "ForCausalLM" in architecture and type(model_config) in AutoModelForCausalLM._model_mapping.keys():
             load_class = AutoModelForCausalLM
         else:
