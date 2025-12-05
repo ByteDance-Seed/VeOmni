@@ -66,15 +66,6 @@ def ep_fsdp2_clip_grad_norm(
     non_ep_params: List[torch.nn.Parameter] = [
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
-    device_type = get_device_type()
-    if device_type == "npu" and ps.ep_enabled and ps.ep_fsdp_size > 1 and ep_params:
-        # Averaging gradients for EP params through dividing grads by ep_fsdp_size
-        # this is to simulate fsdp2 set_gradient_divide_factor
-        scale = 1.0 / float(ps.ep_fsdp_size)
-        with torch.no_grad():
-            for q in ep_params:
-                if q.grad is not None:
-                    q.grad.mul_(scale)
     # Compute and reduce non-EP
     non_ep_total = _fsdp2_reduce_group(
         params=non_ep_params,
