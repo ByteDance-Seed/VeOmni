@@ -14,6 +14,7 @@ from veomni.optim import build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
 from veomni.utils.device import (
+    IS_NPU_AVAILABLE,
     get_device_id,
     get_device_type,
     get_dist_comm_backend,
@@ -171,24 +172,22 @@ def main():
         # At loss.backward(), reduce scatter is triggered to **average** grad for the same param against different data input on each fsdp rank
         # By default, this is achieved by dividing sum of param grad on each rank by fsdp size
         # * For example, for pure FSDP2 on 8 GPUs,
-        #   the local grad of each param after backward is  1.0 x 8 (every rank every param local grad is 1.0) / 8 (fsdp size)
-        # * When ep is enabled, the divide factor for ep params should be ep_fsdp size (which is fsdp size / ep size)
-        #   * by applying set_gradient_divide_factor(ep_fsdp_size) for EP modules in torch_parallelize
-        # * In general, the divide factor for each param should be its num of different input data, which is its dp size
-        #   EP params has different num of input data from fsdp-only params
-        # In this test specifically, model forward is unrelated to inputs and the local grad is always 1
-        # If there is no grad divide factor set, the default grad divide factor is ep_fsdp_size,
-        # Since we set grad divide factor to world_size (= fsdp_size = ep size * ep_fsdp_size), we expect grad here to be 1/ep_size
+        #   * the local grad of each param after backward is  1.0 x 8 (every rank every param local grad is 1.0) / 8 (fsdp size)
+        #   * this is trasparent to dtensor, by inferring dtensor's fsdp size from its device mesh
+        # * When ep+fsdp2 is enabled, the divide factor for ep params should still be world size (num of data inputs)
+        #   * in implementation, since ep param in VeOmni can only see ep_fsdp dim, so we need to override its divide factor
+        #   * by applying set_gradient_divide_factor(world_size) for EP modules in torch_parallelize
+        # In general, the divide factor for each param should be its num of different input data, which is overall dp size
 
-        # On NPU, we are missing PreSumMul ReduceOp for set_gradient_divide_factor, so the expected param grad here should have not been divided by ep_fsdp_size yet
-        # * In this test, the expected grad norm is ep_fsdp_size then
+        # In this test specifically, model forward is unrelated to inputs and the local grad is always 1
+        # * If there is no grad divide factor set, the default grad divide factor is ep_fsdp_size,
+        # * Since we set grad divide factor to world_size (= fsdp_size = ep size * ep_fsdp_size), we expect grad here to be 1/ep_size
+
+        # On NPU, we are missing PreSumMul ReduceOp for set_gradient_divide_factor,
+        # * Now we skip this API so the expected param grad here should still be 1.0 for both ep and non-ep param
         # * As a result, we need divide the ep_fsdp_size on local grad during clipping to calculate the total norm correctly
-        # if IS_NPU_AVAILABLE and ps.ep_enabled:
-        #     expected = float(ps.ep_fsdp_size)
-        # else:
-        #     expected = 1.0
         expected = 1.0
-        ep_expected = 1.0 / ps.ep_size
+        ep_expected = 1.0 / ps.ep_size if not IS_NPU_AVAILABLE else 1.0
         check_model_param_grad_one_by_one(expected_grad=expected, ep_expected_grad=ep_expected, msg="Before clipping")
 
         # Every local param grad is 1.0 / ps.ep_size, model total norm should be sqrt(1 * non_ep_param_num + 1/ep_size^2 * ep_param_num)
