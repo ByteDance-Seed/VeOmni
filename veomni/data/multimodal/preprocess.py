@@ -24,7 +24,14 @@ To add custom preprocessors, simply define a function and decorate it with @regi
 import random
 import re
 
-from .preprocessor_registry import register_preprocessor
+from ...utils.registry import Registry
+
+
+PREPROCESSOR_REGISTRY = Registry("preprocessor")
+
+
+def conv_preprocess(source: str, conversations, **kwargs):
+    return PREPROCESSOR_REGISTRY[source](conversations, **kwargs)
 
 
 # ============================================================================
@@ -32,8 +39,8 @@ from .preprocessor_registry import register_preprocessor
 # ============================================================================
 
 
-@register_preprocessor("sharegpt4v_pretrain")
-@register_preprocessor("sharegpt4v_captioner")
+@PREPROCESSOR_REGISTRY.register("sharegpt4v_pretrain")
+@PREPROCESSOR_REGISTRY.register("sharegpt4v_captioner")
 def sharegpt4v_pretrain_preprocess(conversations, generation_ratio=0.0, **kwargs):
     constructed_conversation = []
     if conversations[0]["from"] != "human":  # Skip the first one if it is not from human
@@ -55,8 +62,8 @@ def sharegpt4v_pretrain_preprocess(conversations, generation_ratio=0.0, **kwargs
     return constructed_conversation
 
 
-@register_preprocessor("sharegpt4v_captioner_sft")
-@register_preprocessor("sharegpt4v_sft")
+@PREPROCESSOR_REGISTRY.register("sharegpt4v_captioner_sft")
+@PREPROCESSOR_REGISTRY.register("sharegpt4v_sft")
 def sharegpt4v_sft_preprocess(conversations, **kwargs):
     role_mapping = {"human": "user", "gpt": "assistant"}
     constructed_conversation = []
@@ -75,7 +82,7 @@ def sharegpt4v_sft_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("doom")
+@PREPROCESSOR_REGISTRY.register("doom")
 def doom_preprocess(conversations, max_image_nums=None, **kwargs):
     """
     merge the assistant output in a single message
@@ -111,7 +118,7 @@ def doom_preprocess(conversations, max_image_nums=None, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("seed_edit")
+@PREPROCESSOR_REGISTRY.register("seed_edit")
 def seed_edit_preprocess(conversations, **kwargs):
     constructed_conversation = []
     for message in conversations:
@@ -131,7 +138,7 @@ def seed_edit_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("imagenet1k")
+@PREPROCESSOR_REGISTRY.register("imagenet1k")
 def imagenet1k_preprocess(conversations, **kwargs):
     class_labels = [item.strip() for item in conversations.split(",")]
     class_label = random.choice(class_labels)
@@ -142,7 +149,7 @@ def imagenet1k_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("imagenet1k_caption")
+@PREPROCESSOR_REGISTRY.register("imagenet1k_caption")
 def imagenet1k_caption_preprocess(conversations, **kwargs):
     class_labels = [item.strip() for item in conversations.split(",")]
     class_label = random.choice(class_labels)
@@ -153,7 +160,7 @@ def imagenet1k_caption_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("fineweb_100BT")
+@PREPROCESSOR_REGISTRY.register("fineweb_100BT")
 def fineweb_preprocess(conversations, **kwargs):
     constructed_conversation = [
         ["assistant", ("text", conversations)],
@@ -161,7 +168,7 @@ def fineweb_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("wikihow_ct_0904")
+@PREPROCESSOR_REGISTRY.register("wikihow_ct_0904")
 def wikihow_preprocess(conversations, stage="pretrain", **kwargs):
     constructed_conversation = []
     role_mapping = {"human": "user", "gpt": "assistant"}
@@ -180,7 +187,7 @@ def wikihow_preprocess(conversations, stage="pretrain", **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("Detailed_Caption")
+@PREPROCESSOR_REGISTRY.register("Detailed_Caption")
 def detailed_caption_preprocess(conversations, **kwargs):
     constructed_conversation = []
     assert conversations[-1]["from"] == "gpt"
@@ -192,7 +199,7 @@ def detailed_caption_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("ArxivQA")
+@PREPROCESSOR_REGISTRY.register("ArxivQA")
 def arxivqa_preprocess(conversations, **kwargs):
     question = conversations[0]["value"].replace("<image>\n", "").strip()
     answer = conversations[1]["value"].strip()
@@ -200,7 +207,7 @@ def arxivqa_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("pixelprose")
+@PREPROCESSOR_REGISTRY.register("pixelprose")
 def pixelprose_preprocess(conversations, **kwargs):
     caption = conversations
     constructed_conversation = [
@@ -210,8 +217,8 @@ def pixelprose_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("DenseFusion-1M")
-@register_preprocessor("DenseFusion-4V-100k")
+@PREPROCESSOR_REGISTRY.register("DenseFusion-1M")
+@PREPROCESSOR_REGISTRY.register("DenseFusion-4V-100k")
 def densefusion_preprocess(conversations, **kwargs):
     caption = conversations[0]["value"]
     constructed_conversation = [
@@ -221,7 +228,7 @@ def densefusion_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("sam")
+@PREPROCESSOR_REGISTRY.register("sam")
 def sam_preprocess(conversations, **kwargs):
     caption = conversations
     constructed_conversation = [
@@ -231,7 +238,7 @@ def sam_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("sam_gen")
+@PREPROCESSOR_REGISTRY.register("sam_gen")
 def sam_gen_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     caption = conversations
     if random.random() < short_description_ratio:
@@ -240,7 +247,7 @@ def sam_gen_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("pixelprose_gen")
+@PREPROCESSOR_REGISTRY.register("pixelprose_gen")
 def pixelprose_gen_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     caption = conversations
     if random.random() < short_description_ratio:
@@ -249,7 +256,7 @@ def pixelprose_gen_preprocess(conversations, short_description_ratio=0.25, **kwa
     return constructed_conversation
 
 
-@register_preprocessor("chart_to_table")
+@PREPROCESSOR_REGISTRY.register("chart_to_table")
 def chart_to_table_preprocess(conversations, **kwargs):
     caption = conversations
     constructed_conversation = [
@@ -259,7 +266,7 @@ def chart_to_table_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("CHartQA")
+@PREPROCESSOR_REGISTRY.register("CHartQA")
 def chartqa_preprocess(conversations, **kwargs):
     question = conversations[0]["value"].replace("<image>\n", "").strip()
     answer = conversations[1]["value"].strip()
@@ -267,7 +274,7 @@ def chartqa_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("megalith")
+@PREPROCESSOR_REGISTRY.register("megalith")
 def megalith_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     caption = conversations
     if random.random() < short_description_ratio:
@@ -276,7 +283,7 @@ def megalith_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("journeydb")
+@PREPROCESSOR_REGISTRY.register("journeydb")
 def journeydb_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     caption = conversations
     if random.random() < short_description_ratio:
@@ -285,7 +292,7 @@ def journeydb_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("dalle3_1m")
+@PREPROCESSOR_REGISTRY.register("dalle3_1m")
 def dalle3_1m_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     caption = conversations
     if random.random() < short_description_ratio:
@@ -294,7 +301,7 @@ def dalle3_1m_preprocess(conversations, short_description_ratio=0.25, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("wit")
+@PREPROCESSOR_REGISTRY.register("wit")
 def wit_preprocess(conversations, **kwargs):
     text_content_1, text_content_2, text_content_3 = "", "", ""
     if conversations["page_title"]:
@@ -313,7 +320,7 @@ def wit_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("mmsci")
+@PREPROCESSOR_REGISTRY.register("mmsci")
 def mmsci_preprocess(conversations, **kwargs):
     caption = conversations[0]["value"]
 
@@ -328,7 +335,7 @@ def mmsci_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("LLaVA-Video-178K")
+@PREPROCESSOR_REGISTRY.register("LLaVA-Video-178K")
 def llava_video_preprocess(conversations, **kwargs):
     role_mapping = {"human": "user", "gpt": "assistant"}
     constructed_conversation = []
@@ -347,7 +354,7 @@ def llava_video_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@register_preprocessor("VoiceAssistant")
+@PREPROCESSOR_REGISTRY.register("VoiceAssistant")
 def voice_assistant_preprocess(conversations, **kwargs):
     constructed_conversation = [
         ["user", ("audio", None)],
@@ -356,6 +363,6 @@ def voice_assistant_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-# @register_preprocessor("your_dataset_name")
+# @PREPROCESSOR_REGISTRY.register("your_dataset_name")
 # def your_dataset_preprocess(conversations, **kwargs):
 #     ...

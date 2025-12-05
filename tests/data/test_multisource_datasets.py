@@ -13,12 +13,12 @@ from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, 
 from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_dataloader,
-    build_interleave_dataset,
+    build_dataset,
 )
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.helper import get_cache_dir
 
 
@@ -37,7 +37,7 @@ def run_data_test():
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_nccl_backend(), world_size=world_size, rank=rank)
+    dist.init_process_group(backend=get_dist_comm_backend(), world_size=world_size, rank=rank)
 
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
@@ -86,8 +86,12 @@ def run_data_test():
 
     args.data.enable_multisource = True
     logger.info_rank0("Start building interleave dataset")
-    train_dataset = build_interleave_dataset(
-        tmp_yaml_path, args.data.datasets_type, transform=transform, seed=args.train.seed
+    train_dataset = build_dataset(
+        dataset_name="interleave",
+        train_path=tmp_yaml_path,
+        datasets_type=args.data.datasets_type,
+        transform=transform,
+        seed=args.train.seed,
     )
 
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
@@ -96,6 +100,7 @@ def run_data_test():
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
     dataloader = build_dataloader(
+        dataloader_type="native",
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,

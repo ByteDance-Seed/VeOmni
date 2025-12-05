@@ -1,0 +1,73 @@
+name: Auto-Add "ascend" Label
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  add_ascend_label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check and Add Ascend Label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              // 1. Extract the event type and relevant data
+              const eventName = context.eventName;
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const issueNumber = context.issue.number;
+              
+              let contentToCheck = '';
+              if (eventName === 'issues') {
+                const title = context.payload.issue.title || '';
+                const body = context.payload.issue.body || '';
+                contentToCheck = `${title} ${body}`;
+              } else if (eventName === 'issue_comment' || eventName === 'pull_request_review_comment') {
+                contentToCheck = context.payload.comment.body || '';
+              } else {
+                console.log('Unsupported event type: ${eventName}. Skipping.');
+                return;
+              }
+            
+              // 2. Check if contentToCheck contains the keyword "ascend"
+              if (!contentToCheck.toLowerCase().includes('ascend')) {
+                console.log('No "ascend" keyword found. Skipping.');
+                return;
+              }
+
+              // 3. Fetch the current issue/pr to check existing lables
+              const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+                owner: owner,
+                repo: repo,
+                issue_number: issueNumber
+              });
+                          
+              // 4. Avoid duplicate label addition
+              const existingLabels = labels?.map(label => label.name) || [];
+              if (existingLabels.includes('ascend')) {
+                console.log('Label "ascend" already exists. Skipping.');
+                return;
+              }
+            
+              // 5. Add the "ascend" label
+              await github.rest.issues.addLabels({
+                owner: owner,
+                repo: repo,
+                issue_number: issueNumber,
+                labels: ['ascend']
+              });
+              console.log(`Successfully added "ascend" label to #${issueNumber}.`);
+              
+            } catch (error) {
+                console.error('Error adding label:', error);
+                core.setFailed(error.message);
+            }

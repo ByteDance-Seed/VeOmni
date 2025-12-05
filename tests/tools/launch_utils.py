@@ -6,7 +6,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 def find_free_port():
@@ -23,7 +23,7 @@ def _dist_worker_entry(rank, world_size, port, func, args, kwargs):
     os.environ["WORLD_SIZE"] = str(world_size)
 
     if get_torch_device().is_available() and get_torch_device().device_count() >= world_size:
-        backend = get_nccl_backend()
+        backend = get_dist_comm_backend()
         get_torch_device().set_device(rank)
     else:
         backend = "gloo"

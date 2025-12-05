@@ -12,23 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Import preprocess to ensure all built-in preprocessors are registered
-from . import preprocess  # noqa: F401
-
-# Export preprocessor registry functions for easy access
-from .preprocessor_registry import (
-    get_all_preprocessors,
-    get_preprocessor,
-    is_preprocessor_registered,
-    list_preprocessors,
-    register_preprocessor,
-)
+from .preprocess import PREPROCESSOR_REGISTRY, conv_preprocess  # noqa: F401
 
 
 __all__ = [
-    "register_preprocessor",
-    "get_all_preprocessors",
-    "get_preprocessor",
-    "list_preprocessors",
-    "is_preprocessor_registered",
+    "conv_preprocess",
+    "PREPROCESSOR_REGISTRY",
 ]

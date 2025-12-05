@@ -5,10 +5,10 @@ import sys
 import torch
 import torch.distributed as c10d
 
-from veomni.utils.device import get_device_id, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_id, get_dist_comm_backend, get_torch_device
 
 
-if not c10d.is_available() or not c10d.is_backend_available(get_nccl_backend()):
+if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
     logging.error("c10d NCCL not available, skipping tests", file=sys.stderr)
     sys.exit(0)
 
@@ -69,7 +69,7 @@ class SequenceParallelTest(CommonDistributedDataParallelTest, MultiProcessTestCa
     def _get_process_group(self):
         store = self._get_store()
         get_torch_device().set_device(self.rank)
-        c10d.init_process_group(get_nccl_backend(), store=store, rank=self.rank, world_size=self.world_size)
+        c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
         group = c10d.distributed_c10d._get_default_group()
         set_ulysses_sequence_parallel_group(group)
         self.rank = dist.get_rank(group)
