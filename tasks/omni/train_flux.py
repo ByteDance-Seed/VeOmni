@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
-import wandb
 from tqdm import trange
 from transformers import (
     AutoConfig,
@@ -32,6 +31,7 @@ from veomni.models.transformers.flux.utils_flux import FluxTextEncoder2, FluxVAE
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.schedulers.flow_match import FlowMatchScheduler
 from veomni.utils import helper
+from veomni.utils.metric_logger import Logger
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
@@ -320,13 +320,18 @@ def main():
     )
 
     if args.train.global_rank == 0:
-        if args.train.use_wandb:
-            wandb.init(
-                project=args.train.wandb_project,
-                name=args.train.wandb_name,
-                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
-            )
+        metric_logger = Logger(
+            use_wandb=args.train.use_wandb,
+            wandb_project=args.train.wandb_project,
+            wandb_name=args.train.wandb_name,
+            use_tensorboard=args.train.use_tensorboard,
+            tensorboard_dir=args.train.tensorboard_dir,
+            config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
+        )
+    else:
+        metric_logger = None
 
+    if args.train.global_rank == 0:
         model_assets = [model_config]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
@@ -495,12 +500,11 @@ def main():
             )
             data_loader_tqdm.update()
 
-            if args.train.global_rank == 0:
-                if args.train.use_wandb:
-                    train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
-                    )
-                    wandb.log(train_metrics, step=global_step)
+            if args.train.global_rank == 0 and metric_logger:
+                train_metrics.update(
+                    {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                )
+                metric_logger.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()
@@ -534,8 +538,8 @@ def main():
                 f"Epoch {epoch + 1} completed, epoch_time={epoch_time:.4f}s, epoch_loss={epoch_loss / args.train.train_steps:.4f}"
             )
         if args.train.global_rank == 0:
-            if args.train.use_wandb:
-                wandb.log({"training/loss_per_epoch": epoch_loss / args.train.train_steps}, step=global_step)
+            if metric_logger:
+                metric_logger.log({"training/loss_per_epoch": epoch_loss / args.train.train_steps}, step=global_step)
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
