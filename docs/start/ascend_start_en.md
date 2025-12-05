@@ -19,7 +19,7 @@ cd VeOmni
 
 ```shell
 uv sync --extra npu
-# If you encounter errors,try running the following command:
+# If you encounter errors, try running the following command:
 # uv sync --extra npu --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
 ```
 
