@@ -13,7 +13,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
-from veomni.utils.device import get_device_id, get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import get_device_id, get_device_type, get_dist_comm_backend, get_torch_device, IS_NPU_AVAILABLE
 
 
 # from veomni.optim.optimizer import build_optimizer
@@ -101,8 +101,6 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
-    # building a optimizer is necessary to register ep/non-ep params group
-    # _ = build_optimizer(model, fused=True)
 
     from veomni.distributed.parallel_state import get_parallel_state
 
@@ -132,6 +130,22 @@ def main():
     tensor_device = torch.device(f"{device_type}:{get_device_id()}")
     max_grad_norm = args.train.max_grad_norm
 
+    def check_model_param_grad_one_by_one(expected_grad, msg):
+        # check them one-by-one
+        for name, param in model.named_parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+            logger.info_rank0(f"{msg}: the local grad for {name}: {grad_local}")
+            torch.testing.assert_close(
+                grad_local,
+                torch.full_like(grad_local, expected_grad),
+                atol=1e-6,
+                rtol=1e-6,
+                msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}",
+            )
+
     total_grad_norm_pre_clip = None
     for step in range(3):
         inputs = torch.ones(1, 16, device=tensor_device)
@@ -139,21 +153,23 @@ def main():
         loss.backward()
 
         logger.info_rank0("manually checking the initial param grads before any clipping")
-        # check them one-by-one
-        for name, param in model.named_parameters():
-            grad = param.grad
-            if grad is None:
-                continue
-            grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
-            logger.info_rank0(f"Before clipping, the local grad for {name}: {grad_local}")
+        # On GPU, the local gard of each param after local backward is 1.0
+        # At loss.backward(), reduce scatter is triggered to **average** grad for the same param against different data input on each fsdp rank
+        # By default, this is achieved by dividing sum of param grad on each rank by fsdp size
+        # * For example, for pure FSDP2 on 8 GPUs,
+        #   the local grad of each param after backward is  1.0 x 8 (every rank every param local grad is 1.0) / 8 (fsdp size)
+        # * When ep is enabled, the divide factor for ep params should be ep_fsdp size (which is fsdp size / ep size)
+        #   * by applying set_gradient_divide_factor(ep_fsdp_size) for EP modules in torch_parallelize
+        # * In general, the divide factor for each param should be its num of different input data, which is its dp size
+        #   EP params has different num of input data from fsdp-only params
+        # On NPU, we are missing PreSumMul ReduceOp for set_gradient_divide_factor, so the expected param grad here should have not been divided by ep_fsdp_size yet
+        if IS_NPU_AVAILABLE and ps.ep_enabled:
+            expected = float(ps.ep_fsdp_size)
+        else:
             expected = 1.0
-            torch.testing.assert_close(
-                grad_local,
-                torch.full_like(grad_local, expected),
-                atol=1e-6,
-                rtol=1e-6,
-                msg=f"Gradient mismatch for {name}, which has local shape {grad_local.shape}",
-            )
+        check_model_param_grad_one_by_one(expected_grad=expected, msg="Before clipping")
+
+        # Every local param grad is 1.0, model total norm should be sqrt(1^2 * total_param_num) which is sqrt(total_param_num)
         expected_total_grad_norm = math.sqrt(16 + 64 * 16 + 64 * 16 * 32)
         total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
         # check whether total grad norm meets our expectation
@@ -175,20 +191,8 @@ def main():
 
         # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
-        for name, param in model.named_parameters():
-            grad = param.grad
-            if grad is None:
-                continue
-            grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
-            logger.info_rank0(f"After clipping, the local grad for {name}: {grad_local}")
-            expected = clip_coeff
-            torch.testing.assert_close(
-                grad_local,
-                torch.full_like(grad_local, expected),
-                atol=1e-6,
-                rtol=1e-6,
-                msg=f"Gradient mismatch for {name}",
-            )
+        logger.info_rank0("Checking model param grad one-by-one after clipping")
+        check_model_param_grad_one_by_one(clip_coeff, msg="After clipping")
 
         logger.info_rank0(
             f"step: {step}, loss: {loss.item()}, grad_norm_pre_clip: {total_grad_norm_pre_clip}, "

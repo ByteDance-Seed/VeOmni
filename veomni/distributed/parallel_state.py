@@ -277,6 +277,7 @@ class ParallelState:
 
     @property
     def ep_fsdp_size(self) -> int:
+        assert self.ep_enabled, "ep_fsdp_size is only available when ep is enabled (ep_size > 1)"
         return self.fsdp_size // self.ep_size
 
     # ------------------------------ TP ------------------------------ #
