@@ -33,5 +33,5 @@ bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_d
     --data.dataloader_type native \
     --data.dataset_type iterable \
     --data.sourcename sharegpt4v_sft \
-    --train.use_wandb fasle
+    --train.use_wandb false
 ```
