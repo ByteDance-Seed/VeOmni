@@ -1012,7 +1012,7 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @check_model_inputs()
     @auto_docstring
     def forward(
         self,
@@ -1404,7 +1404,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
     #     return special_image_mask, special_video_mask
 
     @auto_docstring
-    @check_model_inputs
+    @check_model_inputs()
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1843,7 +1843,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         fake_model = SimpleNamespace(config=self.config)
         return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
 
-    @check_model_inputs
+    @check_model_inputs()
     @replace_return_docstrings(output_type=Qwen3VLMoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
