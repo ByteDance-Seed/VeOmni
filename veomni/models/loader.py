@@ -45,15 +45,14 @@ logger = logging.get_logger(__name__)
 def get_model_config(config_path: str, force_use_huggingface: bool = False, **kwargs):
     if force_use_huggingface:
         logger.info_rank0("[CONFIG] Force loading model config from Huggingface.")
-        return AutoConfig.from_pretrained(config_path, trust_remote_code=True, **kwargs)
+        return AutoConfig.from_pretrained(config_path, **kwargs)
     else:
         try:  # first load from hf, then replace with veomni
-            config = AutoConfig.from_pretrained(config_path, trust_remote_code=True, **kwargs)
+            config = AutoConfig.from_pretrained(config_path, **kwargs)
             model_type = config.model_type
             if model_type in MODEL_CONFIG_REGISTRY.valid_keys():
-                config = MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(
-                    config_path, trust_remote_code=True, **kwargs
-                )
+                kwargs.pop("trust_remote_code", None)
+                config = MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
                 logger.info_rank0(
                     f"[CONFIG] Loading {model_type} from Huggingface and replaced with customized config."
                 )
@@ -67,21 +66,21 @@ def get_model_config(config_path: str, force_use_huggingface: bool = False, **kw
             config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
             model_type = config_dict["model_type"]
             logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
-            return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, trust_remote_code=True, **kwargs)
+            kwargs.pop("trust_remote_code", None)
+            return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
 
 
 def get_model_processor(processor_path: str, force_use_huggingface: bool = False, **kwargs):
     if force_use_huggingface:
         logger.info_rank0("[PROCESSOR] Force loading model processor from Huggingface.")
-        return AutoProcessor.from_pretrained(processor_path, trust_remote_code=True, **kwargs)
+        return AutoProcessor.from_pretrained(processor_path, **kwargs)
     else:
         try:  # first load from hf, then replace with veomni
-            processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True, **kwargs)
+            processor = AutoProcessor.from_pretrained(processor_path, **kwargs)
             processor_class_name = getattr(type(processor), "__name__", None)
             if processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys():
-                processor = MODEL_PROCESSOR_REGISTRY[processor_class_name]().from_pretrained(
-                    processor_path, trust_remote_code=True, **kwargs
-                )
+                kwargs.pop("trust_remote_code", None)
+                processor = MODEL_PROCESSOR_REGISTRY[processor_class_name]().from_pretrained(processor_path, **kwargs)
                 logger.info_rank0(
                     f"[PROCESSOR] Loading {processor_class_name} from Huggingface and replaced with customized processor."
                 )
@@ -99,9 +98,8 @@ def get_model_processor(processor_path: str, force_use_huggingface: bool = False
             config_dict, _ = ProcessorMixin.get_processor_dict(processor_config_file, **kwargs)
             processor_class_name = config_dict["processor_class"]
             logger.info_rank0(f"[PROCESSOR] Loading {processor_class_name} from custom processor.")
-            return MODEL_PROCESSOR_REGISTRY[processor_class_name]().from_pretrained(
-                processor_path, trust_remote_code=True, **kwargs
-            )
+            kwargs.pop("trust_remote_code", None)
+            return MODEL_PROCESSOR_REGISTRY[processor_class_name]().from_pretrained(processor_path, **kwargs)
 
 
 def get_model_class(model_config: PretrainedConfig, force_use_huggingface: bool = False):

@@ -29,8 +29,8 @@ def register_janus_modeling(architecture: str):
     return Janus
 
 
-@MODEL_PROCESSOR_REGISTRY.register("JanusChatProcessor")
+@MODEL_PROCESSOR_REGISTRY.register("JanusProcessor")
 def register_janus_processor():
-    from .processing_janus import JanusChatProcessor
+    from .processing_janus import JanusProcessor
 
-    return JanusChatProcessor
+    return JanusProcessor

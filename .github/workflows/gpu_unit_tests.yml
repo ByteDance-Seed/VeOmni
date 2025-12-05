@@ -76,6 +76,7 @@ jobs:
           pytest -s -x tests/data
       - name: Run models tests
         run: |
+          pytest -s -x tests/models/test_model_registry.py
           pytest -s -x tests/models/test_models_patch.py
       - name: Run e2e dcp save and load test
         run: |

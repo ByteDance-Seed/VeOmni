@@ -3,6 +3,8 @@ from typing import Any, Dict, Literal, Optional
 
 from transformers import AutoConfig, PretrainedConfig
 
+from ..loader import MODEL_CONFIG_REGISTRY
+
 
 def _init_config(config_dict: Optional[Dict[str, Any]]) -> Optional["PretrainedConfig"]:
     """
@@ -15,7 +17,7 @@ def _init_config(config_dict: Optional[Dict[str, Any]]) -> Optional["PretrainedC
     model_type = config_dict.pop("model_type")
     if model_type == "":
         return PretrainedConfig()
-    return AutoConfig.for_model(model_type, **config_dict)
+    return MODEL_CONFIG_REGISTRY[model_type]()(**config_dict)
 
 
 class SeedOmniEncoderConfig(PretrainedConfig):
