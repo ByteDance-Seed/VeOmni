@@ -280,6 +280,13 @@ class ParallelState:
         assert self.ep_enabled, "ep_fsdp_size is only available when ep is enabled (ep_size > 1)"
         return self.fsdp_size // self.ep_size
 
+    @property
+    def ep_gradient_divide_factor(self) -> int:
+        assert self.tp_size == 1
+        assert self.pp_size == 1
+        # for ep+fsdp2, the grad divide factor should alwasy be world size (no matter HSDP or not)
+        return self.world_size
+
     # ------------------------------ TP ------------------------------ #
     @property
     @requires_mesh
