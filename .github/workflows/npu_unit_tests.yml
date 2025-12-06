@@ -80,12 +80,15 @@ jobs:
       - name: Check final pip list
         run: |
           pip list
-      - name: Run data tests
-        run: |
-          pytest -s -x tests/data
       - name: Run models tests
         run: |
           pytest -s -x tests/models/test_models_patch.py
       - name: Run parallel tests
         run: |
           pytest -s -x tests/parallel
+      - name: Run fsdp2/ep+fsdp2 clip grad norm test
+        run: |
+          pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+      - name: Run data tests
+        run: |
+          pytest -s -x tests/data

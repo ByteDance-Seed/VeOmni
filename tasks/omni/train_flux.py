@@ -16,6 +16,7 @@ from transformers import (
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data.diffusion.data_loader import build_dit_dataloader
 from veomni.data.diffusion.dataset import build_text_image_dataset
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -472,10 +473,7 @@ def main():
                 total_loss += loss.item()
                 del batch
 
-            if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
