@@ -399,12 +399,12 @@ def build_ep_fsdp2_optimizer(
             if DTensor is not None and isinstance(p, DTensor):
                 mesh = getattr(p, "device_mesh", None)
                 names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-                logger.info_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
+                logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
                 if "ep_fsdp" in names:
-                    logger.info_rank0(f"Adding {name} to ep_params in ep+fsdp2 optimizer")
+                    logger.debug_rank0(f"Adding {name} to ep_params in ep+fsdp2 optimizer")
                     ep_params.append(p)
                     continue
-            logger.info_rank0(f"Adding {name} to non_ep_params in ep+fsdp2 optimizer")
+            logger.debug_rank0(f"Adding {name} to non_ep_params in ep+fsdp2 optimizer")
             non_ep_params.append(p)
 
         # Build param groups with weight decay handling

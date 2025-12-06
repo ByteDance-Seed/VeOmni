@@ -275,18 +275,6 @@ class ParallelState:
     def fsdp_size(self) -> int:
         return self.world_size // (self.pp_size * self.tp_size)
 
-    @property
-    def ep_fsdp_size(self) -> int:
-        assert self.ep_enabled, "ep_fsdp_size is only available when ep is enabled (ep_size > 1)"
-        return self.fsdp_size // self.ep_size
-
-    @property
-    def ep_gradient_divide_factor(self) -> int:
-        assert self.tp_size == 1
-        assert self.pp_size == 1
-        # for ep+fsdp2, the grad divide factor should alwasy be world size (no matter HSDP or not)
-        return self.world_size
-
     # ------------------------------ TP ------------------------------ #
     @property
     @requires_mesh
@@ -350,6 +338,18 @@ class ParallelState:
     @property
     def ep_rank(self) -> int:
         return self.ep_fsdp_device_mesh.get_local_rank("ep")
+
+    @property
+    def ep_fsdp_size(self) -> int:
+        assert self.ep_enabled, "ep_fsdp_size is only available when ep is enabled (ep_size > 1)"
+        return self.fsdp_size // self.ep_size
+
+    @property
+    def ep_gradient_divide_factor(self) -> int:
+        assert self.tp_size == 1
+        assert self.pp_size == 1
+        # for ep+fsdp2, the grad divide factor should alwasy be world size (no matter HSDP or not)
+        return self.world_size
 
     # ------------------------------ SP ------------------------------ #
     @property
