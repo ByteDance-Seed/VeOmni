@@ -18,7 +18,7 @@
 import math
 import os
 from dataclasses import dataclass
-from functools import wraps
+from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
@@ -326,7 +326,7 @@ class ParallelState:
     def ep_fsdp_mesh(self) -> "DeviceMesh":
         return self.ep_fsdp_device_mesh["ep", "ep_fsdp"]
 
-    @property
+    @cached_property
     @requires_mesh
     def ep_group(self) -> "ProcessGroup":
         return self.ep_mesh.get_group()
