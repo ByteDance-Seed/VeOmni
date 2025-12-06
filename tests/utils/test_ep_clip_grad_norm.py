@@ -198,7 +198,7 @@ def main():
 
         # go through each param grad one-by-one after clipping to check whether their value meets our expectation
         clip_coeff = min(max_grad_norm / expected_total_grad_norm, 1.0)
-        ep_clip_coeff = ep_expected * min(max_grad_norm / expected_total_grad_norm, 1.0)
+        ep_clip_coeff = 1.0 / ps.ep_size * min(max_grad_norm / expected_total_grad_norm, 1.0)
         logger.info_rank0("Checking model param grad one-by-one after clipping")
         check_model_param_grad_one_by_one(clip_coeff, ep_clip_coeff, msg="After clipping")
 
