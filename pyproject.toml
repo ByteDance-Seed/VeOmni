@@ -63,6 +63,7 @@ gpu =[
   "torchaudio==2.8.0+cu128",
   "liger-kernel",
   "flash-attn",
+  "dion",
 ]
 megatron = [
   "megatron-energon>=7.2.1"
