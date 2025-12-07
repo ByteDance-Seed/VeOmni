@@ -351,8 +351,10 @@ def parallelize_model_fsdp2(
             # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
             # but now for torch 2.7 compatability we still use this legacy API
             # Note that NPU does not support PreSumMul so we skip this call
-            # see https://github.com/ByteDance-Seed/VeOmni/issues/241
-            # As a result, NPU grad norm clipping will fall back to manual clipping
+            # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
+            # NPU is missing PreSumMul ReduceOp for `set_gradient_divide_factor` API
+            # As a result, we will handle the grad dividing inisde the grad norm clipping
+            # Need to remove this condition after the issue is resolved.
             if not IS_NPU_AVAILABLE:
                 gradient_divide_factor = parallel_state.ep_gradient_divide_factor
                 logger.info(f"setting grad divide factor for ep module to {gradient_divide_factor}")

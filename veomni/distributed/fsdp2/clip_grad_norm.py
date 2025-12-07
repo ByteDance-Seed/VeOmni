@@ -67,7 +67,9 @@ def ep_fsdp2_clip_grad_norm(
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
     if IS_NPU_AVAILABLE and ps.ep_enabled and ep_params:
-        # Averaging gradients for EP params through dividing grads by ep_fsdp_size
+        # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
+        # This is workaround for NPU. Need to remove this after PreSumMul is supported after NPU
+        # Averaging gradients for EP params through dividing grads by ep_size
         # this is to simulate fsdp2 set_gradient_divide_factor
         scale = 1.0 / float(ps.ep_size)
         with torch.no_grad():

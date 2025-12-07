@@ -33,6 +33,15 @@ class Argument:
 
 
 class ToyMoeModel(torch.nn.Module):
+    """
+    This toy model with MoE module has all param value set to 1
+    and all its submodules' forward only returns the sum of all its param
+    so whatever the input is, the grad of each param is always 1 after its local backward
+    As a result, the MoE forward in this model does not have all2all,
+    so EP param grad accumulation across ranks is not real,
+    where it only accumulates the ep_fsdp ranks, missing accumulation between ep ranks
+    """
+
     _no_split_modules = ["ToyMoeDecoderLayer"]
 
     def __init__(self):
@@ -180,9 +189,11 @@ def main():
         # In general, the divide factor for each param should be its num of different input data, which is overall dp size
 
         # In this test specifically, model forward is unrelated to inputs and the local grad is always 1
-        # * If there is no grad divide factor set, the default grad divide factor is ep_fsdp_size,
+        # Since the test toy MoE forward does not have all2all like real ones,
+        # the data of ep params would see have only ep_fsdp num
+        # * If there is no grad divide factor set, the default grad divide factor is ep_fsdp_size, the local grad after backward is still 1
         # * Since we set grad divide factor to world_size (= fsdp_size = ep size * ep_fsdp_size), we expect grad here to be 1/ep_size
-
+        # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
         # On NPU, we are missing PreSumMul ReduceOp for set_gradient_divide_factor,
         # * Now we skip this API so the expected param grad here should still be 1.0 for both ep and non-ep param
         # * As a result, we need divide the ep_fsdp_size on local grad during clipping to calculate the total norm correctly

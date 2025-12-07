@@ -346,9 +346,13 @@ class ParallelState:
 
     @property
     def ep_gradient_divide_factor(self) -> int:
+        # We assume the world size is the total dp size by now
+        # TP and PP would make this assumption not true
         assert self.tp_size == 1
         assert self.pp_size == 1
-        # for ep+fsdp2, the grad divide factor should alwasy be world size (no matter HSDP or not)
+        # For ep+fsdp2, the grad divide factor should alwasy be world size (no matter HSDP or not)
+        # SP does not affect this since SP groups still replicate params
+        # and their grads are all-reduced which would match grads for the same data without SP.
         return self.world_size
 
     # ------------------------------ SP ------------------------------ #
