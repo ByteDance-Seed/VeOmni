@@ -1,0 +1,105 @@
+name: Auto Label Everything
+
+on:
+  issues:
+    types: [opened, edited]
+  pull_request:
+    types: [opened, edited, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write        # Required to add labels to Issues
+  pull-requests: write # Required to add labels to PRs
+
+jobs:
+  auto-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Analyze content and label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // 1. Get Event Payload and Event Name
+            const payload = context.payload;
+            const eventName = context.eventName;
+
+            // Safety Check: Ignore comments from bots
+            // This prevents infinite loops where the bot labels -> comments -> triggers itself again.
+            if (eventName === 'issue_comment' && payload.comment.user.type === 'Bot') {
+              console.log('Comment from bot, skipping.');
+              return;
+            }
+
+            // 2. Determine text source and target number
+            let textToCheck = "";
+            let targetNumber = null;
+
+            if (eventName === 'issue_comment') {
+              // Case A: A new comment was created
+              // Check the comment body only.
+              textToCheck = payload.comment.body.toLowerCase();
+
+              // Note: GitHub API treats PR comments as 'issue_comment' events.
+              // 'payload.issue.number' works for both Issues and PRs here.
+              targetNumber = payload.issue.number;
+              console.log(`Checking comment on #${targetNumber}`);
+
+            } else {
+              // Case B: Issue/PR was opened or edited
+              // Check both the Title and the Body.
+              const target = payload.issue || payload.pull_request;
+
+              const title = target.title.toLowerCase();
+              // 'body' can be null if the description is empty, so we default to empty string
+              const body = (target.body || "").toLowerCase();
+
+              textToCheck = title + " " + body;
+              targetNumber = target.number;
+              console.log(`Checking title/body of #${targetNumber}`);
+            }
+
+            // 3. Define Rules: [Label Name, [List of Keywords]]
+            // Note: Since we converted textToCheck to lowercase, keep all keywords lowercase here.
+            // You can add "ChatOps" style commands (starting with /) to allow manual labeling via comments.
+            const rules = [
+              ['bug', ['bug', 'error', 'fail', 'crash', '/bug']],
+              ['enhancement', ['feature', 'idea', 'request', '/feat']],
+              ['misc', ['misc', 'other', 'chore', '/misc']],
+              ['fix', ['fix', 'hotfix', 'bugfix', '/fix']],
+              ['question', ['question', 'help', 'how to', '/help']],
+              ['wip', ['wip', 'work in progress', 'todo', '/wip']],
+              ['ascend', ['ascend', 'npu', 'huawei', '/ascend']],
+              ['ckpt', ['ckpt', 'checkpoint', '/ckpt']],
+              ['ci', ['ci', 'test', 'tests', 'github actions', '/ci']],
+              ['doc', ['doc', 'documentation', 'readme', '/doc']],
+              ['example', ['example', 'demo', 'tutorial', '/example']]
+              ['hf_v5', ['hf_v5', 'transformers v5', '/hf_v5']],
+              ['roadmap', ['roadmap', 'plan', '/roadmap']]
+            ];
+
+            const labelsToAdd = [];
+
+            // 4. Match keywords
+            // Iterate through rules and check if any keyword exists in the text
+            for (const [label, keywords] of rules) {
+              if (keywords.some(word => textToCheck.includes(word))) {
+                labelsToAdd.push(label);
+              }
+            }
+
+            // 5. Execute Labeling
+            if (labelsToAdd.length > 0) {
+              console.log(`Adding labels: ${labelsToAdd.join(', ')}`);
+
+              // Note: We use 'github.rest.issues.addLabels' for both Issues and PRs.
+              // In the GitHub API, PRs are technically a type of Issue, so this endpoint works for both.
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: targetNumber,
+                labels: labelsToAdd
+              });
+            } else {
+              console.log('No matching keywords found in this event.');
+            }

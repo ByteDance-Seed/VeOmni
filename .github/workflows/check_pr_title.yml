@@ -1,0 +1,44 @@
+name: Check PR Title Format
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check_pr_title:
+    name: Check PR Title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Title Regex
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            // Define allowed types
+            const types = ["feat", "fix", "docs", "misc", "test", "refactor", "style", "model", "ops"];
+
+            // Construct regex: ^\[(fix|feat|...)\]: .*
+            // Format requirement: [type]: description
+            const regex = new RegExp(`^\\[(${types.join('|')})\\]: .+$`);
+
+            console.log(`Checking PR Title: "${title}"`);
+
+            if (!regex.test(title)) {
+              core.setFailed(
+                `PR Title format error!\n\n` +
+                `Current: "${title}"\n` +
+                `Expected: "[type]: description"\n` +
+                `Allowed types: ${types.join(', ')}\n\n` +
+                `Example: "[feat]: add new login page"`
+              );
+            } else {
+              console.log("✅ PR Title format is valid.");
+            }
