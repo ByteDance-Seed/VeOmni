@@ -1,10 +1,10 @@
-name: Auto Label Everything
+name: Auto Label
 
 on:
   issues:
     types: [opened, edited]
   pull_request:
-    types: [opened, edited, ready_for_review]
+    types: [opened, edited, ready_for_review, synchronize]
   issue_comment:
     types: [created]
 
@@ -13,7 +13,7 @@ permissions:
   pull-requests: write # Required to add labels to PRs
 
 jobs:
-  auto-label:
+  auto_label:
     runs-on: ubuntu-latest
     steps:
       - name: Analyze content and label
@@ -64,10 +64,10 @@ jobs:
             // You can add "ChatOps" style commands (starting with /) to allow manual labeling via comments.
             const rules = [
               ['bug', ['bug', 'error', 'fail', 'crash', '/bug']],
-              ['enhancement', ['feature', 'idea', 'request', '/feat']],
+              ['enhancement', ['feature', 'idea', 'request', '/enhancement']],
               ['misc', ['misc', 'other', 'chore', '/misc']],
               ['fix', ['fix', 'hotfix', 'bugfix', '/fix']],
-              ['question', ['question', 'help', 'how to', '/help']],
+              ['question', ['question', 'help', 'how to', '/question']],
               ['wip', ['wip', 'work in progress', 'todo', '/wip']],
               ['ascend', ['ascend', 'npu', 'huawei', '/ascend']],
               ['ckpt', ['ckpt', 'checkpoint', '/ckpt']],
