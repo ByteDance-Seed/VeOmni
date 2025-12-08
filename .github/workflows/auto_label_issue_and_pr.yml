@@ -73,7 +73,7 @@ jobs:
               ['ckpt', ['ckpt', 'checkpoint', '/ckpt']],
               ['ci', ['ci', 'test', 'tests', 'github actions', '/ci']],
               ['doc', ['doc', 'documentation', 'readme', '/doc']],
-              ['example', ['example', 'demo', 'tutorial', '/example']]
+              ['example', ['example', 'demo', 'tutorial', '/example']],
               ['hf_v5', ['hf_v5', 'transformers v5', '/hf_v5']],
               ['roadmap', ['roadmap', 'plan', '/roadmap']]
             ];
