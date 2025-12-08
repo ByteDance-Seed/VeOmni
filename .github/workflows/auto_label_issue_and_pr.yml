@@ -45,15 +45,18 @@ jobs:
               targetNumber = payload.issue.number;
               console.log(`Checking comment on #${targetNumber}`);
 
+            } else if (eventName === 'pull_request') {
+              // Case B: PR was opened or edited, check title only
+              const target = payload.pull_request;
+              textToCheck = target.title.toLowerCase();
+              targetNumber = target.number;
+              console.log(`Checking PR title only for #${targetNumber}`);
+
             } else {
-              // Case B: Issue/PR was opened or edited
-              // Check both the Title and the Body.
-              const target = payload.issue || payload.pull_request;
-
+              // Case C: Issue was opened or edited, check title + body
+              const target = payload.issue;
               const title = target.title.toLowerCase();
-              // 'body' can be null if the description is empty, so we default to empty string
               const body = (target.body || "").toLowerCase();
-
               textToCheck = title + " " + body;
               targetNumber = target.number;
               console.log(`Checking title/body of #${targetNumber}`);
