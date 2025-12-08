@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
 
-from ...utils.device import IS_NPU_AVAILABLE, get_device_type
+from ...utils.device import get_device_type
 from ...utils.logging import get_logger
 from ..parallel_state import get_parallel_state
 
@@ -66,16 +66,6 @@ def ep_fsdp2_clip_grad_norm(
     non_ep_params: List[torch.nn.Parameter] = [
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
-    if IS_NPU_AVAILABLE and ps.ep_enabled and ep_params:
-        # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
-        # This is workaround for NPU. Need to remove this after PreSumMul is supported after NPU
-        # Averaging gradients for EP params through dividing grads by ep_size
-        # this is to simulate fsdp2 set_gradient_divide_factor
-        scale = 1.0 / float(ps.ep_size)
-        with torch.no_grad():
-            for q in ep_params:
-                if q.grad is not None:
-                    q.grad.mul_(scale)
     # Compute and reduce non-EP
     non_ep_total = _fsdp2_reduce_group(
         params=non_ep_params,
