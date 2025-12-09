@@ -1,0 +1,44 @@
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html
+from nvcr.io/nvidia/pytorch:25.03-py3
+
+# Define environments
+ENV MAX_JOBS=16
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_ROOT_USER_ACTION=ignore
+
+# Define installation arguments
+ARG APT_SOURCE=https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
+ARG PIP_INDEX=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# Set apt source
+# ubuntu 24.04
+RUN cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak && \
+    { \
+    echo "Types: deb"; \
+    echo "URIs: ${APT_SOURCE}"; \
+    echo "Suites: noble noble-updates noble-backports noble-security"; \
+    echo "Components: main restricted universe multiverse"; \
+    echo "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"; \
+    } > /etc/apt/sources.list.d/ubuntu.sources
+
+# Install apt packages.
+RUN apt-get update -y \
+    && apt-get install -y sudo ffmpeg curl wget vim \
+    && apt-get clean
+
+# Change pip source
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.extra-index-url "${PIP_INDEX}" && \
+    pip config set global.no-cache-dir "true" && \
+    python -m pip install --upgrade pip
+
+# Upgrade pip
+RUN pip3 install --no-cache-dir -U pip setuptools requests wheel --upgrade
+
+# Install uv
+RUN wget https://astral.sh/uv/0.9.8/install.sh
+RUN bash install.sh
+
+# uv sync
+WORKDIR .
+RUN uv sync --locked --all-packages --extra gpu --dev
