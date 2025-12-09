@@ -32,4 +32,4 @@ def _safe_apply_patches():
 
 _safe_apply_patches()
 
-__version__ = "v0.1.0"
+__version__ = "v0.1.4"
