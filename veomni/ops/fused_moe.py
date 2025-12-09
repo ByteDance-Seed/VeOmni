@@ -18,6 +18,7 @@ import torch
 
 from ..distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
 from ..distributed.parallel_state import get_parallel_state
+from ..utils.device import IS_NPU_AVAILABLE
 from ..utils.import_utils import is_fused_moe_available, is_seed_kernels_available
 
 
@@ -310,6 +311,20 @@ def fused_moe_forward(
                 ep_group=get_parallel_state().ep_group,
                 ep_implementation=seed_ep_implementation if seed_ep_implementation is not None else "bumi",
             )
+        # use npu ep fused moe
+        elif IS_NPU_AVAILABLE:
+            from .npu_fused_moe import npu_ep_fused_moe_forward
+
+            final_hidden_states = npu_ep_fused_moe_forward(
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
+                fc1_1_weight,
+                fc1_2_weight,
+                fc2_weight,
+                ep_group=get_parallel_state().ep_group,
+            )
         # use open source
         else:
             expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
@@ -375,6 +390,13 @@ def fused_moe_forward(
                 fc1_1_weight,
                 fc1_2_weight,
                 fc2_weight,
+            )
+        # use npu ep fused moe
+        elif IS_NPU_AVAILABLE:
+            from .npu_fused_moe import npu_fused_moe_forward
+
+            final_hidden_states = npu_fused_moe_forward(
+                num_experts, routing_weights, selected_experts, hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight
             )
         # use open source
         else:
