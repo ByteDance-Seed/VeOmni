@@ -18,6 +18,7 @@ from veomni.data import (
     build_dataset,
 )
 from veomni.data.data_transform import process_pretrain_example, process_sft_example
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -288,15 +289,7 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            # Prefer model-provided clip_grad_norm_ (now both FSDP1 and FSDP2 registers custom grad norm clipping)
-            if hasattr(model, "clip_grad_norm_"):
-                _gn = model.clip_grad_norm_(args.train.max_grad_norm)
-                grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
-            else:
-                logger.info_rank0(
-                    "Can NOT find regitsered clip_grad_norm_ method in the model, using PyTorch default implementation.."
-                )
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()

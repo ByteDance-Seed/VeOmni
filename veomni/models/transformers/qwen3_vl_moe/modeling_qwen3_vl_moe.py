@@ -2140,10 +2140,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         return input_ids, model_kwargs
 
 
-# Modification:
-# Register the ModelClass which is used by veOmni to tell which class to match the config.json architecture
-ModelClass = Qwen3VLMoeForConditionalGeneration
-
 __all__ = [
     "Qwen3VLMoeVisionModel",
     "Qwen3VLMoeForConditionalGeneration",

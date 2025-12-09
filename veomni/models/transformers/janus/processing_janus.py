@@ -26,7 +26,7 @@ from transformers import BatchFeature, LlamaTokenizerFast, ProcessorMixin
 from .image_processing_janus import JanusImageProcessor
 
 
-class JanusChatProcessor(ProcessorMixin):
+class JanusProcessor(ProcessorMixin):
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["image_processor", "tokenizer"]

@@ -8,7 +8,7 @@ from einops import pack, rearrange, unpack
 from transformers import PreTrainedModel
 
 from .....utils import logging
-from .configuring_cosmos import CosmosConfig
+from .configuration_cosmos import CosmosConfig
 
 
 _WAVELETS = {

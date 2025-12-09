@@ -146,7 +146,7 @@ class Qwen3MoeConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "veomni_qwen3_moe"
+    model_type = "qwen3_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # Default tensor parallel plan for base model `Qwen3Moe`

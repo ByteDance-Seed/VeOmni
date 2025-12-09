@@ -531,9 +531,6 @@ if is_liger_kernel_available():
     SeedOssMLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to seed-oss.")
 
-
-ModelClass = SeedOssForCausalLM
-
 __all__ = [
     "SeedOssForCausalLM",
     "SeedOssForQuestionAnswering",

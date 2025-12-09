@@ -11,3 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ...loader import MODELING_REGISTRY
+
+
+@MODELING_REGISTRY.register("llama")
+def register_llama_modeling(architecture: str):
+    from .modeling_llama import LlamaForCausalLM, LlamaModel
+
+    if "ForCausalLM" in architecture:
+        return LlamaForCausalLM
+    elif "Model" in architecture:
+        return LlamaModel
+    else:
+        return LlamaForCausalLM

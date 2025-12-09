@@ -11,7 +11,7 @@ from .....distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ....seed_omni.projector import build_feature_projector
 from ....transformers.janus.modeling_janus import MlpProjector, VQModel, vision_head
 from ..base import BaseDecoderModelMixin, BaseDecoderOutput
-from .configuring_janusvq16 import JanusVQ16DecoderConfig
+from .configuration_janusvq16 import JanusVQ16DecoderConfig
 
 
 def build_projector(config: JanusVQ16DecoderConfig, n_embed):

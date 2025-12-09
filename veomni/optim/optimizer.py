@@ -213,17 +213,9 @@ class MultiOptimizer(Optimizer, Stateful):
 
 def _should_build_ep_aware(model: "nn.Module") -> bool:
     ps = get_parallel_state()
-    if ps.dp_mode != "fsdp2" or not ps.ep_enabled:
-        return False
+    if ps.dp_mode == "fsdp2" and ps.ep_enabled:
+        return True
 
-    for p in model.parameters():
-        if not p.requires_grad:
-            continue
-        if isinstance(p, DTensor):
-            mesh = getattr(p, "device_mesh", None)
-            names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-            if "ep_fsdp" in names:
-                return True
     return False
 
 
@@ -281,6 +273,7 @@ def build_optimizer(
 ) -> "torch.optim.Optimizer":
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model):
+        logger.info_rank0("Building EP+FSDP2 optimizer")
         return build_ep_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
@@ -400,15 +393,18 @@ def build_ep_fsdp2_optimizer(
         ep_params: List[torch.nn.Parameter] = []
         non_ep_params: List[torch.nn.Parameter] = []
 
-        for p in model.parameters():
+        for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             if DTensor is not None and isinstance(p, DTensor):
                 mesh = getattr(p, "device_mesh", None)
                 names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
+                logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
                 if "ep_fsdp" in names:
+                    logger.debug_rank0(f"Adding {name} to ep_params in ep+fsdp2 optimizer")
                     ep_params.append(p)
                     continue
+            logger.debug_rank0(f"Adding {name} to non_ep_params in ep+fsdp2 optimizer")
             non_ep_params.append(p)
 
         # Build param groups with weight decay handling

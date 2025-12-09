@@ -889,7 +889,4 @@ if is_liger_kernel_available():
     LlamaMLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Llama.")
 
-
-ModelClass = LlamaForCausalLM
-
-__all__ = ["LlamaForCausalLM", "LlamaModel", "LlamaPreTrainedModel"]
+__all__ = ["LlamaForCausalLM", "LlamaModel"]

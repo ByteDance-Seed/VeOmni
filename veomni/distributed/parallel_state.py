@@ -18,7 +18,7 @@
 import math
 import os
 from dataclasses import dataclass
-from functools import wraps
+from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
@@ -326,7 +326,7 @@ class ParallelState:
     def ep_fsdp_mesh(self) -> "DeviceMesh":
         return self.ep_fsdp_device_mesh["ep", "ep_fsdp"]
 
-    @property
+    @cached_property
     @requires_mesh
     def ep_group(self) -> "ProcessGroup":
         return self.ep_mesh.get_group()
@@ -338,6 +338,22 @@ class ParallelState:
     @property
     def ep_rank(self) -> int:
         return self.ep_fsdp_device_mesh.get_local_rank("ep")
+
+    @property
+    def ep_fsdp_size(self) -> int:
+        assert self.ep_enabled, "ep_fsdp_size is only available when ep is enabled (ep_size > 1)"
+        return self.fsdp_size // self.ep_size
+
+    @property
+    def ep_gradient_divide_factor(self) -> int:
+        # We assume the world size is the total dp size by now
+        # TP and PP would make this assumption not true
+        assert self.tp_size == 1
+        assert self.pp_size == 1
+        # For ep+fsdp2, the grad divide factor should alwasy be world size (no matter HSDP or not)
+        # SP does not affect this since SP groups still replicate params
+        # and their grads are all-reduced which would match grads for the same data without SP.
+        return self.world_size
 
     # ------------------------------ SP ------------------------------ #
     @property

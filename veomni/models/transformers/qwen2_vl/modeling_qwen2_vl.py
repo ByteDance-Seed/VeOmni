@@ -1978,7 +1978,4 @@ if is_liger_kernel_available():
     Qwen2MLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Qwen2-VL.")
 
-
-ModelClass = Qwen2VLForConditionalGeneration
-
 __all__ = ["Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLPreTrainedModel"]
