@@ -1,7 +1,7 @@
 
 <div align="center">
 
-<img src="./assets/logo.png" width="50%">
+<img src="./docs/assets/logo.png" width="50%">
 
 ## VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
 
@@ -34,13 +34,13 @@ Our guiding principles when building VeOmni are:
 - **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
 
 <div align="center">
-<img src="./assets/system.png" width="100%">
+<img src="./docs/assets/system.png" width="100%">
 </div>
 
 ### 🔥 Latest News
 - [2025/1/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo]() was accepted by AAAI 2026
 - [2025/09/19] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
-- [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./assets/wechat.png). Feel free to join us!
+- [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
 - [2025/04/03] We release VeOmni!
 
 
@@ -278,7 +278,7 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 > VeOmni Support all [transformers](https://github.com/huggingface/transformers) models if you don't need sequence parallelism or experts parallelism or other parallelism and cuda kernal optimize in VeOmni. We design a [model registry mechanism](veomni/models/registry.py). When the model is registered in veomni, we will automatically load the model and optimizer in VeOmni. Otherwise, it will default to load the modeling file in transformers.
 
-> If you want to add a new model, you can add a new model in the model registry. See in [Support costom model](docs/tutorials/model_loader.md) docs.
+> If you want to add a new model, you can add a new model in the model registry. See in [Support costom model](docs/key_features/model_loader.md) docs.
 
 ## ⛰️ Performance
 
