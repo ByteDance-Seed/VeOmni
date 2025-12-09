@@ -340,6 +340,8 @@ def parallelize_model_fsdp2(
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
     # NPU currently does not support the PreSumMul operation, so this operation is supported through the apply_hccl_premul_sum_patch.
+    # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
+    # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
     if IS_NPU_AVAILABLE:
         from veomni.ops.patch.hccl_premul_sum import apply_hccl_premul_sum_patch
 
@@ -357,10 +359,12 @@ def parallelize_model_fsdp2(
             # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
             gradient_divide_factor = parallel_state.ep_gradient_divide_factor
             logger.info(f"setting grad divide factor for ep module to {gradient_divide_factor}")
-            if hasattr(experts_mod, "set_gradient_divide_factor"):
-                experts_mod.set_gradient_divide_factor(gradient_divide_factor)
-            elif hasattr(experts_mod, "set_reduce_scatter_divide_factor"):
+            if IS_NPU_AVAILABLE:
+                # NPU is using torch 2.7
                 experts_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
+            else:
+                # from torch 2.8
+                experts_mod.set_gradient_divide_factor(gradient_divide_factor)
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
