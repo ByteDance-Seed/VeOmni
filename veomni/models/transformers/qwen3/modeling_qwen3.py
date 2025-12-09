@@ -2,6 +2,7 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
 from transformers.generation import GenerationMixin
@@ -10,6 +11,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
@@ -871,10 +873,166 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
+class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
+    """
+    Adapted from transformers.models.qwen3.modeling_qwen3.Qwen3ForSequenceClassification.
+    Differences:
+    - Backbone uses our own Qwen3Model.
+    - Compatible with both varlen (cu_seqlens) and padding input formats.
+    - The current loss function directly uses single-label CrossEntropyLoss.
+    """
+
+    base_model_prefix = "model"
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        # we're not using AutoModel here, but our own Qwen3Model.
+        setattr(self, self.base_model_prefix, Qwen3Model(config))
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        self.loss_fct = CrossEntropyLoss()
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def _compute_last_token_index_varlen(
+        self,
+        cu_seqlens: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        In the variable-length sequence scenario, the index of the last token for each sample is calculated based on cu_seqlens.
+        cu_seqlens: [B+1], where cu_seqlens[i] is the starting offset of the i-th sample.
+        Therefore, the index of the last token of the i-th sample = cu_seqlens[i+1] - 1.
+        """
+        # [B]
+        last_idx = cu_seqlens[1:].to(device) - 1
+        return last_idx.long()
+
+    def _compute_last_token_index_padded(
+        self,
+        input_ids: Optional[torch.LongTensor],
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        In padding scenarios, we reuse the logic from Hugging Face:
+        If config.pad_token_id exists: take the rightmost non-padding position for each sample;
+        If pad_token_id does not exist:
+            - If batch_size == 1, use the last position directly;
+            - Otherwise, raise an error (consistent with Hugging Face).
+        """
+        if input_ids is None:
+            logger.warning_once(
+                f"{self.__class__.__name__} received no input_ids; "
+                "falling back to using the last position for all examples."
+            )
+            batch_size = 1
+            return torch.full((batch_size,), seq_len - 1, dtype=torch.long, device=device)
+
+        batch_size = input_ids.shape[0]
+
+        if self.config.pad_token_id is None and batch_size != 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+
+        if self.config.pad_token_id is None:
+            return torch.full((batch_size,), seq_len - 1, dtype=torch.long, device=device)
+
+        non_pad_mask = (input_ids != self.config.pad_token_id).to(device=device, dtype=torch.int32)
+        token_indices = torch.arange(seq_len, device=device, dtype=torch.int32)  # [L]
+        last_non_pad_token = (token_indices * non_pad_mask).argmax(dim=-1)
+
+        return last_non_pad_token.long()
+
+    @add_start_docstrings_to_model_forward(QWEN3_INPUTS_DOCSTRING)
+    @can_return_tuple
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> SequenceClassifierOutputWithPast:
+        transformer: Qwen3Model = getattr(self, self.base_model_prefix)
+
+        transformer_outputs: BaseModelOutputWithPast = transformer(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            **kwargs,
+        )
+        hidden_states = transformer_outputs.last_hidden_state
+        device = hidden_states.device
+        # Process logits and pooling separately for variable-length and padded sequences.
+        if cu_seqlens is not None:
+            # ---- varlen ----
+            flat_hidden = hidden_states.view(-1, hidden_states.size(-1))  # [T_total, H]
+            flat_logits = self.score(flat_hidden)  # [T_total, C]
+
+            # [B], each sample corresponds to the last token index in flat_logits.
+            last_token_idx = self._compute_last_token_index_varlen(
+                cu_seqlens=cu_seqlens,
+                device=device,
+            )  # [B]
+
+            pooled_logits = flat_logits[last_token_idx]  # [B, C]
+        else:
+            # ---- padding ----
+            if hidden_states.dim() != 3:
+                raise ValueError(
+                    f"Expected hidden_states with shape [batch, seq_len, hidden_size] for padded input, "
+                    f"but got shape {hidden_states.shape}."
+                )
+            batch_size, seq_len, _ = hidden_states.shape
+            logits = self.score(hidden_states)  # [B, L, C]
+
+            # [B], the position of the last token in the seq_len dimension for each sample.
+            last_token_pos = self._compute_last_token_index_padded(
+                input_ids=input_ids,
+                seq_len=seq_len,
+                device=device,
+            )  # [B]
+
+            batch_idx = torch.arange(batch_size, device=device)
+            pooled_logits = logits[batch_idx, last_token_pos]  # [B, C]
+
+        loss = None
+        if labels is not None:
+            if labels.ndim > 1:
+                labels = labels.view(-1)
+            loss = self.loss_fct(
+                pooled_logits.view(-1, self.num_labels),
+                labels.view(-1),
+            )
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=pooled_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+
 if is_liger_kernel_available():
     apply_rotary_pos_emb = liger_rotary_pos_emb
     Qwen3RMSNorm = LigerRMSNorm
     Qwen3MLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Qwen3.")
 
-__all__ = ["Qwen3ForCausalLM", "Qwen3Model", "Qwen3PreTrainedModel"]
+__all__ = [
+    "Qwen3ForCausalLM",
+    "Qwen3Model",
+    "Qwen3PreTrainedModel",
+    "Qwen3ForSequenceClassification",
+]
