@@ -21,7 +21,7 @@ import torch
 import torch.distributed.nn.functional as distF
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoModel, AutoModelForCausalLM, GenerationMixin, PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ...data.constants import IGNORE_INDEX
@@ -32,6 +32,7 @@ from ...distributed.sequence_parallel import (
     gather_seq_scatter_heads,
 )
 from ...utils import logging
+from ..loader import get_model_class
 from .configuration_seed_omni import SeedOmniConfig, SeedOmniDecoderConfig, SeedOmniEncoderConfig
 from .decoder import BaseDecoderModelMixin, BaseDecoderOutput
 from .encoder import BaseEncoderModelMixin
@@ -111,20 +112,23 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
         )
         self.modality = []
         if config.image_config.model_type:
-            self.image_encoder: BaseEncoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.image_config)
+            self.image_encoder: BaseEncoderModelMixin = model_cls._from_config(
                 config.image_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("image")
             self.modality.append("video")  # image encoder could be used for video embedding
 
         if config.video_config.model_type:
-            self.video_encoder: BaseEncoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.video_config)
+            self.video_encoder: BaseEncoderModelMixin = model_cls._from_config(
                 config.video_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("video") if "video" not in self.modality else None
 
         if config.audio_config.model_type:
-            self.audio_encoder: BaseEncoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.audio_config)
+            self.audio_encoder: BaseEncoderModelMixin = model_cls._from_config(
                 config.audio_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("audio")
@@ -263,24 +267,23 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         torch_dtype = torch.get_default_dtype()
         self.modality = []
         if config.image_config.model_type:
-            self.image_decoder: BaseDecoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.image_config)
+            self.image_decoder: BaseDecoderModelMixin = model_cls._from_config(
                 config.image_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("image")  # TODO: config keys for sp_slice
         if config.video_config.model_type:
-            self.video_decoder: BaseDecoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.video_config)
+            self.video_decoder: BaseDecoderModelMixin = model_cls._from_config(
                 config.video_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("video")
-        if config.video_config.model_type:
-            self.video_decoder: BaseDecoderModelMixin = AutoModel.from_config(
-                config.video_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
-            )
         if config.audio_config.model_type:
-            self.audio_decoder: BaseDecoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.audio_config)
+            self.audio_decoder: BaseDecoderModelMixin = model_cls._from_config(
                 config.audio_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
-            self.modality.append("video")
+            self.modality.append("audio")
 
         self.encode_input = config.encode_input
         self.encode_output = config.encode_output
@@ -428,7 +431,8 @@ class SeedOmniModel(SeedOmniPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.config = config
         torch_dtype = torch.get_default_dtype()
-        self.foundation: BaseFoundationModelMixin = AutoModelForCausalLM.from_config(
+        model_cls = get_model_class(config.foundation_config)
+        self.foundation: BaseFoundationModelMixin = model_cls._from_config(
             config.foundation_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
         )
         self.encoder = SeedOmniEncoderModel._from_config(

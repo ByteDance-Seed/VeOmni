@@ -659,10 +659,6 @@ try:
 except ImportError:
     pass
 
-
-ModelClass = WanModel
-
-
 WAN_ATTENTION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {}
 WAN_ATTENTION_FUNCTIONS.update(ALL_ATTENTION_FUNCTIONS)
 WAN_ATTENTION_FUNCTIONS.update(

@@ -383,9 +383,32 @@ __all__ = [
 
 Export the model class:
 ```python
-# Register the ModelClass so that VeOmni uses our custom modeling code instead of the Hugging Face version
-ModelClass = Qwen3VLMoeForConditionalGeneration
+# Register the cutomized model in __init__.py so that VeOmni uses our custom modeling/config/processor code instead of the Hugging Face version
+from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, MODEL_PROCESSOR_REGISTRY
 
+@MODEL_CONFIG_REGISTRY.register("qwen3_vl_moe")
+def register_qwen3_vl_moe_config():
+    from .configuration_qwen3_vl_moe import Qwen3VLMoeConfig
+    return Qwen3VLMoeConfig
+
+@MODELING_REGISTRY.register("qwen3_vl_moe")
+def register_qwen3_vl_moe_modeling(architecture: str):
+    from . import modeling_qwen3_vl_moe
+    from .modeling_qwen3_vl_moe import Qwen3VLMoeForCausalLM, Qwen3VLMoeForSequenceClassification, Qwen3VLMoeForTokenClassification
+    if "ForCausalLM" in architecture:
+        return Qwen3VLMoeForCausalLM
+    elif "ForSequenceClassification" in architecture:
+        return Qwen3VLMoeForSequenceClassification
+    elif "ForTokenClassification" in architecture:
+        return Qwen3VLMoeForTokenClassification
+    else: # None
+        return Qwen3VLMoeForCausalLM
+
+@MODEL_PROCESSOR_REGISTRY.register("Qwen3VLMoeProcessor")
+def register_qwen3_vl_moe_processor():
+    from . import processing_qwen3_vl_moe
+    from .processing_qwen3_vl_moe import Qwen3VLMoeProcessor
+    return Qwen3VLMoeProcessor
 ```
 
 ### Additional Helper Functions

@@ -11,7 +11,7 @@ from transformers import PreTrainedModel
 
 from .....utils import logging
 from ....seed_omni.projector import build_feature_projector
-from .configuring_instruct_pix2pix import InstructPix2PixConfig
+from .configuration_instruct_pix2pix import InstructPix2PixConfig
 
 
 logger = logging.get_logger(__name__)

@@ -1376,6 +1376,3 @@ class Janus(PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-
-ModelClass = Janus

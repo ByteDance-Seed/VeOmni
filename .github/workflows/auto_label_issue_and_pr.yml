@@ -1,0 +1,119 @@
+name: Auto Label
+
+on:
+  issues:
+    types: [opened, edited]
+  pull_request:
+    types: [opened, edited, ready_for_review, synchronize]
+  # Trigger on comments in the main conversation (Issues & PRs)
+  issue_comment:
+    types: [created]
+  # Trigger on code review comments (PRs specific lines)
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  issues: write        # Required to add labels to Issues
+  pull-requests: write # Required to add labels to PRs
+
+jobs:
+  auto_label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Analyze content and label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const payload = context.payload;
+            const eventName = context.eventName;
+
+            // --- 1. Safety Check: Ignore Bot Comments ---
+            // Determine if the actor is a bot to prevent infinite loops
+            let isBot = false;
+            if (eventName === 'issue_comment' || eventName === 'pull_request_review_comment') {
+              if (payload.comment.user.type === 'Bot') isBot = true;
+            } else if (payload.sender && payload.sender.type === 'Bot') {
+               // Catch-all for other events if triggered by a bot
+               isBot = true;
+            }
+
+            if (isBot) {
+              console.log('Event triggered by a Bot. Skipping to prevent loops.');
+              return;
+            }
+
+            // --- 2. Determine Text Source & Target Number ---
+            let textToCheck = "";
+            let targetNumber = null;
+
+            console.log(`Event triggered: ${eventName}`);
+
+            if (eventName === 'issue_comment' || eventName === 'pull_request_review_comment') {
+              // Case A: Comments (Issue conversation, PR conversation, or PR Code Review)
+              // We only check the *comment body* to allow "ChatOps" (manual triggering via comment)
+              textToCheck = payload.comment.body.toLowerCase();
+
+              // For 'issue_comment', payload.issue.number handles both Issues and PRs
+              // For 'pull_request_review_comment', use payload.pull_request.number
+              targetNumber = (payload.issue && payload.issue.number) || (payload.pull_request && payload.pull_request.number);
+
+              console.log(`Checking comment on #${targetNumber}`);
+
+            } else if (eventName === 'pull_request') {
+              // Case B: PR Opened/Edited
+              // Check Title only (standard practice to avoid noise from long descriptions)
+              const target = payload.pull_request;
+              textToCheck = target.title.toLowerCase();
+              targetNumber = target.number;
+              console.log(`Checking PR title for #${targetNumber}`);
+
+            } else {
+              // Case C: Issue Opened/Edited
+              // Check Title + Body
+              const target = payload.issue;
+              textToCheck = (target.title + " " + (target.body || "")).toLowerCase();
+              targetNumber = target.number;
+              console.log(`Checking Issue title/body for #${targetNumber}`);
+            }
+
+            // --- 3. Define Rules ---
+            // Format: [Label, [Keywords]]
+            const rules = [
+              ['bug', ['bug', 'error', 'fail', 'crash', '/bug']],
+              ['enhancement', ['feature', 'idea', 'request', '/enhancement']],
+              ['misc', ['misc', 'other', 'chore', '/misc']],
+              ['fix', ['fix', 'hotfix', 'bugfix', '/fix']],
+              ['question', ['question', 'help', 'how to', '/question']],
+              ['wip', ['wip', 'work in progress', 'todo', '/wip']],
+              ['ascend', ['ascend', 'npu', 'huawei', '/ascend']],
+              ['ckpt', ['ckpt', 'checkpoint', '/ckpt']],
+              ['ci', ['ci', 'test', 'tests', 'github actions', '/ci']],
+              ['doc', ['doc', 'documentation', 'readme', '/doc']],
+              ['example', ['example', 'demo', 'tutorial', '/example']],
+              ['hf_v5', ['hf_v5', 'transformers v5', '/hf_v5']],
+              ['roadmap', ['roadmap', 'plan', '/roadmap']]
+            ];
+
+            const labelsToAdd = new Set(); // Use Set to prevent duplicate labels
+
+            // --- 4. Match Keywords ---
+            for (const [label, keywords] of rules) {
+              if (keywords.some(word => textToCheck.includes(word))) {
+                labelsToAdd.add(label);
+              }
+            }
+
+            // --- 5. Execute Labeling ---
+            if (labelsToAdd.size > 0) {
+              const labelArray = Array.from(labelsToAdd);
+              console.log(`Adding labels: ${labelArray.join(', ')}`);
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: targetNumber,
+                labels: labelArray
+              });
+            } else {
+              console.log('No matching keywords found in this event.');
+            }

@@ -25,7 +25,7 @@ from torch.nn import CrossEntropyLoss
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ....seed_omni.projector import build_feature_projector, build_vit_decoder
-from ....transformers.movqgan import MoVQGAN
+from ....transformers.movqgan.modeling_movqgan import MoVQGAN
 from ..base import BaseDecoderModelMixin, BaseDecoderOutput
 from .configuration_movqgan import MoVQGANDecoderConfig
 

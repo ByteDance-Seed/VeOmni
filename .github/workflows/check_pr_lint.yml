@@ -1,19 +1,16 @@
-# c.f. https://github.com/pre-commit/action?tab=readme-ov-file#using-this-action
-name: pre-commit
+name: Check PR Code Format
 
-# No need to avoid / cancel lightweight pre-commit jobs
 on:
   pull_request:
   push:
     branches:
       - main
 
-# Declare permissions just read content.
 permissions:
   contents: read
 
 jobs:
-  pre-commit:
+  check_pr_lint:
     runs-on: ubuntu-latest
     strategy:
       matrix:

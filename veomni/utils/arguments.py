@@ -261,6 +261,16 @@ class TrainingArguments:
     output_dir: str = field(
         metadata={"help": "Path to save model checkpoints."},
     )
+    vit_lr: float = field(
+        default=5e-5,
+        metadata={"help": "Maximum learning rate specifically for the **Vision Transformer (ViT) encoder** weights."},
+    )
+    train_architecture: Literal["full", "lora"] = field(
+        default="full",
+        metadata={
+            "help": "Specifies the parameter update strategy for training the multi-modal model. 'full' for Standard SFT, lora for LoRA."
+        },
+    )
     lr: float = field(
         default=5e-5,
         metadata={"help": "Maximum learning rate or defult learning rate, or init learning rate for warmup."},
