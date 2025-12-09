@@ -23,6 +23,7 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoModelForSequenceClassification,
     AutoModelForVision2Seq,
     AutoProcessor,
     PretrainedConfig,
@@ -121,6 +122,12 @@ def get_model_class(model_config: PretrainedConfig, force_use_huggingface: bool 
         and type(model_config) in AutoModelForCausalLM._model_mapping.keys()
     ):
         load_class = AutoModelForCausalLM
+    elif (
+        arch_name is not None
+        and "ForSequenceClassification" in arch_name
+        and type(model_config) in AutoModelForSequenceClassification._model_mapping.keys()
+    ):
+        load_class = AutoModelForSequenceClassification
     else:
         load_class = AutoModel
     if force_use_huggingface:
