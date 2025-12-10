@@ -259,129 +259,6 @@ class DistributedCheckpointer(CheckpointerBase):
     _async_process_group: Optional[Any] = None
 
     @classmethod
-    def _create_checkpoint_dir(cls, checkpoint_dir: str) -> None:
-        """
-        Create checkpoint directory.
-
-        Args:
-            checkpoint_dir: checkpoint directory path
-        """
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-    @classmethod
-    def _create_storage_reader(cls, checkpoint_dir: str) -> FileSystemReader:
-        """
-        Create storage reader for DCP.
-
-        Args:
-            checkpoint_dir: checkpoint directory path
-
-        Returns:
-            storage_reader: FileSystemReader instance
-        """
-        return FileSystemReader(checkpoint_dir)
-
-    @classmethod
-    def _create_storage_writer(cls, checkpoint_dir: str) -> FileSystemWriter:
-        """
-        Create storage writer for DCP.
-
-        Args:
-            checkpoint_dir: checkpoint directory path
-
-        Returns:
-            storage_writer: FileSystemWriter instance
-        """
-        return FileSystemWriter(
-            checkpoint_dir,
-            thread_count=16,
-            single_file_per_rank=True,
-            sync_files=False,
-        )
-
-    @classmethod
-    def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """
-        Save extra_state to checkpoint directory.
-
-        Args:
-            checkpoint_dir: checkpoint directory path
-            state: state dict containing optional "extra_state" key
-        """
-        if "extra_state" not in state:
-            logger.warning_rank0("extra_state not found in state, skipping extra_state save")
-            return
-
-        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-        os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        torch.save(
-            state["extra_state"],
-            extra_state_path,
-        )
-
-    @classmethod
-    def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """
-        Load extra_state from checkpoint directory.
-
-        Args:
-            checkpoint_dir: checkpoint directory path
-            state: state dict to load extra_state into
-        """
-        if "extra_state" not in state:
-            logger.warning_rank0("extra_state not found in state, skipping extra_state load")
-            return
-
-        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-        os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        state["extra_state"] = torch.load(extra_state_path, weights_only=False)
-
-    @classmethod
-    def _execute_save(
-        cls,
-        save_state: Dict[str, Any],
-        storage_writer: FileSystemWriter,
-        save_async: bool,
-    ) -> None:
-        """
-        Execute DCP save with optional async support.
-
-        Args:
-            save_state: state dict to save
-            storage_writer: storage writer for DCP
-            save_async: whether to save asynchronously
-        """
-        if save_async:
-            # Lazily create a dedicated Gloo process group for async DCP saves
-            if cls._async_process_group is None:
-                cls._async_process_group = dist.new_group(backend="gloo")
-
-            if cls.dcp_save_future is not None:
-                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-                cls.dcp_save_future.result()
-                cls.dcp_save_future = None
-                # block until all the ranks resolve their previous dcp async saving
-                dist.barrier()
-
-            cls.dcp_save_future = dcp.async_save(
-                state_dict=save_state,
-                storage_writer=storage_writer,
-                process_group=cls._async_process_group,
-            )
-        else:
-            dcp.save(
-                state_dict=save_state,
-                storage_writer=storage_writer,
-            )
-            if dist.is_initialized():
-                dist.barrier()
-            gc.collect()
-            empty_cache()
-            synchronize()
-
-    @classmethod
     def save(
         cls,
         path: str,
@@ -468,6 +345,90 @@ class DistributedCheckpointer(CheckpointerBase):
         logger.info_rank0(f"Loaded checkpoint from {checkpoint_dir}")
 
         return state
+
+    # Private helper methods
+    @classmethod
+    def _create_checkpoint_dir(cls, checkpoint_dir: str) -> None:
+        """Create checkpoint directory."""
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    @classmethod
+    def _create_storage_reader(cls, checkpoint_dir: str) -> FileSystemReader:
+        """Create storage reader for DCP."""
+        return FileSystemReader(checkpoint_dir)
+
+    @classmethod
+    def _create_storage_writer(cls, checkpoint_dir: str) -> FileSystemWriter:
+        """Create storage writer for DCP."""
+        return FileSystemWriter(
+            checkpoint_dir,
+            thread_count=16,
+            single_file_per_rank=True,
+            sync_files=False,
+        )
+
+    @classmethod
+    def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Save extra_state to checkpoint directory."""
+        if "extra_state" not in state:
+            logger.warning_rank0("extra_state not found in state, skipping extra_state save")
+            return
+
+        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
+        os.makedirs(extra_state_dir, exist_ok=True)
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
+        torch.save(
+            state["extra_state"],
+            extra_state_path,
+        )
+
+    @classmethod
+    def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Load extra_state from checkpoint directory."""
+        if "extra_state" not in state:
+            logger.warning_rank0("extra_state not found in state, skipping extra_state load")
+            return
+
+        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
+        os.makedirs(extra_state_dir, exist_ok=True)
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
+        state["extra_state"] = torch.load(extra_state_path, weights_only=False)
+
+    @classmethod
+    def _execute_save(
+        cls,
+        save_state: Dict[str, Any],
+        storage_writer: FileSystemWriter,
+        save_async: bool,
+    ) -> None:
+        """Execute DCP save with optional async support."""
+        if save_async:
+            # Lazily create a dedicated Gloo process group for async DCP saves
+            if cls._async_process_group is None:
+                cls._async_process_group = dist.new_group(backend="gloo")
+
+            if cls.dcp_save_future is not None:
+                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
+                cls.dcp_save_future.result()
+                cls.dcp_save_future = None
+                # block until all the ranks resolve their previous dcp async saving
+                dist.barrier()
+
+            cls.dcp_save_future = dcp.async_save(
+                state_dict=save_state,
+                storage_writer=storage_writer,
+                process_group=cls._async_process_group,
+            )
+        else:
+            dcp.save(
+                state_dict=save_state,
+                storage_writer=storage_writer,
+            )
+            if dist.is_initialized():
+                dist.barrier()
+            gc.collect()
+            empty_cache()
+            synchronize()
 
 
 def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> STATE_DICT_TYPE:
