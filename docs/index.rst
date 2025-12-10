@@ -1,13 +1,9 @@
 Welcome to VeOmni
 =========================
 
-
-.. raw:: html
-
-   <div align="center">
-
 .. image:: ../assets/logo.png
    :width: 50%
+   :align: center
 
 VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
 =================================================================================================
@@ -30,10 +26,6 @@ VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recip
        <img src="https://img.shields.io/badge/License-Apache--2.0-blue"></a>
    </p>
 
-.. raw:: html
-
-   </div>
-
 Overview
 --------
 
@@ -46,16 +38,9 @@ Our guiding principles when building VeOmni are:
 - **Omni model native**: VeOmni enables users to effortlessly scale any omni-model across devices and accelerators.
 - **Torch native**: VeOmni is designed to leverage PyTorch's native functions to the fullest extent, ensuring maximum compatibility and performance.
 
-.. raw:: html
-
-   <div align="center">
-
 .. image:: ../assets/system.png
    :width: 100%
-
-.. raw:: html
-
-   </div>
+   :align: center
 
 ----------------------------------------------------------
 
@@ -151,9 +136,7 @@ You can get to know us better through the following channels👇
 
 **Collaborate with Ascend NPU Community**: Support with Ascend NPU backend
 
-.. raw:: html
-
-   <div align="center">
-
 .. image:: ../assets/ascend_logo.png
    :width: 40%
+   :target: https://www.hiascend.com/
+   :align: center
