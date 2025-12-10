@@ -4,6 +4,11 @@ from typing import List
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
+from torch.utils._foreach_utils import (
+    _device_has_foreach_support,
+    _group_tensors_by_device_and_dtype,
+    _has_foreach_support,
+)
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
@@ -96,27 +101,24 @@ def ep_fsdp2_clip_grad_norm(
 
 # compute local sum of param gard norm
 def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
-    dev = None
-    acc = None
-    for q in params:
-        g = q.grad
-        if g is None:
-            continue
-        if isinstance(g, DTensor):
-            g_local = g.to_local()
-        else:
-            g_local = g
-        if dev is None:
-            dev = g_local.device
-            acc = torch.tensor(0.0, device=dev, dtype=torch.float32)
-        # compute in FP32 for stability
-        gn = torch.norm(g_local.detach().to(torch.float32), p=p)
-        acc = acc + (gn**p)
-    if acc is None:
-        # no grads; choose a reasonable device
-        dev = torch.device(get_device_type())
-        acc = torch.tensor(0.0, device=dev, dtype=torch.float32)
-    return acc
+    grads = [p.grad for p in params if p.grad is not None]
+    grads_local = [
+        g.to_local().detach().to(torch.float32) if isinstance(g, DTensor) else g.detach().to(torch.float32)
+        for g in grads
+    ]
+    default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
+    res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
+    with torch.no_grad():
+        grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
+        for (device, _), ([device_grads_local], _) in grouped_grads_local.items():
+            if _has_foreach_support(device_grads_local, device) or _device_has_foreach_support(device):
+                out = torch._foreach_pow_(torch._foreach_norm(device_grads_local, p), p)
+                res += torch.sum(torch.stack(out)).to(default_device)
+            else:
+                for grad_local in device_grads_local:
+                    gn = torch.norm(grad_local, p=p)
+                    res = res + (gn**p).to(default_device)
+    return res
 
 
 def _local_max(params: List[torch.nn.Parameter]) -> torch.Tensor:
