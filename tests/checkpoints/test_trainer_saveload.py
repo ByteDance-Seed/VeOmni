@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+from torch.distributed.checkpoint import FileSystemReader
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer
@@ -65,6 +66,53 @@ def flatten_dict(d, parent_key="", sep="_"):
         else:
             items.append((new_key, v))
     return dict(items)
+
+
+def verify_saved_checkpoint_keys(checkpoint_path: str):
+    """
+    Verify and print the top-level keys saved in the DCP checkpoint.
+    This helps confirm what was actually saved (e.g., only model vs model+optimizer).
+    """
+    if not os.path.exists(checkpoint_path):
+        logger.warning_rank0(f"Checkpoint path does not exist: {checkpoint_path}")
+        return
+
+    try:
+        reader = FileSystemReader(checkpoint_path)
+        metadata = reader.read_metadata()
+
+        # Get all top-level keys from the checkpoint
+        all_keys = list(metadata.state_dict_metadata.keys())
+
+        # Organize keys by their top-level prefix
+        key_prefixes = {}
+        for key in all_keys:
+            prefix = key.split(".")[0] if "." in key else key
+            if prefix not in key_prefixes:
+                key_prefixes[prefix] = 0
+            key_prefixes[prefix] += 1
+
+        logger.info_rank0("=" * 80)
+        logger.info_rank0(f"Checkpoint saved at: {checkpoint_path}")
+        logger.info_rank0(f"Total keys in checkpoint: {len(all_keys)}")
+        logger.info_rank0("-" * 80)
+        logger.info_rank0("Top-level key distribution:")
+        for prefix, count in sorted(key_prefixes.items()):
+            logger.info_rank0(f"  {prefix}: {count} keys")
+        logger.info_rank0("-" * 80)
+
+        # Check if optimizer states are present
+        has_optimizer = any(key.startswith("optimizer") for key in all_keys)
+        has_model = any(key.startswith("model") for key in all_keys)
+        has_extra_state = any(key.startswith("extra_state") for key in all_keys)
+
+        logger.info_rank0(f"Contains model weights: {has_model}")
+        logger.info_rank0(f"Contains optimizer states: {has_optimizer}")
+        logger.info_rank0(f"Contains extra_state: {has_extra_state}")
+        logger.info_rank0("=" * 80)
+
+    except Exception as e:
+        logger.warning_rank0(f"Failed to read checkpoint metadata: {e}")
 
 
 def check_state_dict(lhs_dict, rhs_dict, need_flatten=False, tied_weight_key: Optional[list[str]] = None):
@@ -306,6 +354,15 @@ def main():
 
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+
+            # Wait for async save to complete before verifying
+            if Checkpointer.dcp_save_future is not None:
+                logger.info_rank0("Waiting for async save to complete before verification...")
+                Checkpointer.dcp_save_future.result()
+
+            # Verify what was actually saved in the checkpoint
+            verify_saved_checkpoint_keys(save_checkpoint_path)
+            dist.barrier()
 
     # resume states from checkpoints and compare them with the ones before saving
     state = {"model": model, "optimizer": optimizer, "extra_state": {}}

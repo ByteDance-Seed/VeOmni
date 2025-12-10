@@ -11,9 +11,9 @@ from veomni.utils import helper
 logger = helper.create_logger(__name__)
 
 
-def merge_to_hf_pt(load_dir: str, save_path: str, model_assets_dir: str = None, model_only: bool = True):
+def merge_to_hf_pt(load_dir: str, save_path: str, model_assets_dir: str = None, model_only: bool = False):
     # save model in huggingface's format
-    # Use model_only=True by default to save memory when handling large models (e.g., 235B)
+    # By default loads all checkpoint data; use model_only=True to load only model weights
     state_dict = dcp_to_torch_state_dict(
         save_checkpoint_path=load_dir,
         model_only=model_only,
@@ -36,14 +36,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-only",
         action="store_true",
-        default=True,
-        help="Only load model weights (ignore optimizer states). Saves memory for large models.",
-    )
-    parser.add_argument(
-        "--load-all",
-        action="store_false",
-        dest="model_only",
-        help="Load all checkpoint data including optimizer states (not recommended for large models).",
+        default=False,
+        help="Only load model weights (ignore optimizer states). By default, loads all checkpoint data.",
     )
     args = parser.parse_args()
     load_dir = args.load_dir
