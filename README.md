@@ -278,7 +278,7 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 > VeOmni Support all [transformers](https://github.com/huggingface/transformers) models if you don't need sequence parallelism or experts parallelism or other parallelism and cuda kernal optimize in VeOmni. We design a [model registry mechanism](veomni/models/registry.py). When the model is registered in veomni, we will automatically load the model and optimizer in VeOmni. Otherwise, it will default to load the modeling file in transformers.
 
-> If you want to add a new model, you can add a new model in the model registry. See in [Support costom model](docs/tutorials/model_loader.md) docs.
+> If you want to add a new model, you can add a new model in the model registry. See in [Support costom model](docs/key_features/model_loader.md) docs.
 
 ## ⛰️ Performance
 

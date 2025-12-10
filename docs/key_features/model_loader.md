@@ -41,7 +41,7 @@ First, create new modeling file for your model implementation. Note that the cus
 
 ### 2. Register Your Model
 
-See [enable_new_models.md](enable_new_models.md#in-your-model-file) for more details.
+See [enable_new_models.md](../enable_new_models/enable_new_models.md#in-your-model-file) for more details.
 
 
 ### 3. Model Configuration
