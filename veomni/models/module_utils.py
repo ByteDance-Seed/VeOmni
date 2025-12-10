@@ -98,17 +98,20 @@ def init_empty_weights():
 @dataclass
 class StateDictIterator:
     filepath: str
+    key_filter: Optional[Callable[[str], bool]] = None
 
     def __iter__(self) -> Generator[Tuple[str, "torch.Tensor"], None, None]:
         if self.filepath.endswith(".safetensors"):
             with safe_open(self.filepath, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    yield key, f.get_tensor(key)
+                    if self.key_filter is None or self.key_filter(key):
+                        yield key, f.get_tensor(key)
 
         else:
             state_dict = torch.load(self.filepath, map_location="cpu", weights_only=True, mmap=True)
             for key in state_dict.keys():
-                yield key, state_dict[key]
+                if self.key_filter is None or self.key_filter(key):
+                    yield key, state_dict[key]
 
 
 @dataclass
@@ -119,37 +122,45 @@ class BroadcastMetadata:
     dtype: Optional["torch.dtype"]
 
 
-def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
+def _load_state_dict(
+    weights_path: str, key_filter: Optional[Callable[[str], bool]] = None, **kwargs
+) -> List["StateDictIterator"]:
     """
     Loads (sharded) state dict in transformers' format.
+
+    Args:
+        weights_path: Path to the weights directory
+        key_filter: Optional callable to filter state dict keys. Only keys for which
+                   key_filter(key) returns True will be loaded.
+        **kwargs: Additional arguments passed to cached_file
     """
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
-        return [StateDictIterator(resolved_weight_file)]
+        return [StateDictIterator(resolved_weight_file, key_filter)]
 
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_weight_file:
         shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-        return [StateDictIterator(shard_file) for shard_file in shard_files]
+        return [StateDictIterator(shard_file, key_filter) for shard_file in shard_files]
 
     resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFETENSORS_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
-        return [StateDictIterator(resolved_weight_file)]
+        return [StateDictIterator(resolved_weight_file, key_filter)]
 
     resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_weight_file:
         shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-        return [StateDictIterator(shard_file) for shard_file in shard_files]
+        return [StateDictIterator(shard_file, key_filter) for shard_file in shard_files]
 
     resolved_weight_file = cached_file(weights_path, WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
-        return [StateDictIterator(resolved_weight_file)]
+        return [StateDictIterator(resolved_weight_file, key_filter)]
 
     resolved_weight_file = cached_file(weights_path, WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_weight_file:
         shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-        return [StateDictIterator(shard_file) for shard_file in shard_files]
+        return [StateDictIterator(shard_file, key_filter) for shard_file in shard_files]
 
     raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
 

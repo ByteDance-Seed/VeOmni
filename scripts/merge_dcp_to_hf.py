@@ -15,6 +15,7 @@ def merge_to_hf_pt(load_dir: str, save_path: str, model_assets_dir: str = None):
     # save model in huggingface's format
     state_dict = ckpt_to_state_dict(
         save_checkpoint_path=load_dir,
+        model_only=True,
     )
     # logger.info_rank0(f"Converting state_dict: {}")
     if model_assets_dir is not None:
