@@ -3,6 +3,8 @@ name: Auto Label
 on:
   issues:
     types: [opened, edited]
+  pull_request_target:
+    types: [opened, edited, ready_for_review, synchronize]
   pull_request:
     types: [opened, edited, ready_for_review, synchronize]
   # Trigger on comments in the main conversation (Issues & PRs)

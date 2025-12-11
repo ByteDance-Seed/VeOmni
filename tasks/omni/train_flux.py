@@ -299,6 +299,7 @@ def main():
     ops_to_save = convert_ops_to_objects(args.train.ops_to_save)
     model = build_parallelize_model(
         model,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
