@@ -4,9 +4,7 @@
 
 ### Usage
 1. **Install VeOmni**  
-    ```bash
-    pip3 install -e .
-    ```
+    Please refer to [Install](quick_start.md) for detailed instructions.
 
 2. **Run Example Script**  
    Verify training startup: (need download the dataset first)
