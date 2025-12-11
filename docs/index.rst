@@ -128,14 +128,3 @@ You can get to know us better through the following channels👇
      <a href="https://www.zhihu.com/org/dou-bao-da-mo-xing-tuan-dui/">
        <img src="https://img.shields.io/badge/zhihu-%230084FF?style=for-the-badge&logo=zhihu&logoColor=white"></a>
    </p>
-
-
-📚 Support
---------------------
-
-**Collaborate with Ascend NPU Community**: Support with Ascend NPU backend
-
-.. image:: ../assets/ascend_logo.png
-   :width: 40%
-   :target: https://www.hiascend.com/
-   :align: center
