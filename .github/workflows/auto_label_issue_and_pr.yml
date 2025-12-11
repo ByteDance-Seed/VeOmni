@@ -5,8 +5,6 @@ on:
     types: [opened, edited]
   pull_request_target:
     types: [opened, edited, ready_for_review, synchronize]
-  pull_request:
-    types: [opened, edited, ready_for_review, synchronize]
   # Trigger on comments in the main conversation (Issues & PRs)
   issue_comment:
     types: [created]
@@ -71,11 +69,15 @@ jobs:
 
             } else {
               // Case C: Issue Opened/Edited
-              // Check Title + Body
-              const target = payload.issue;
-              textToCheck = (target.title + " " + (target.body || "")).toLowerCase();
-              targetNumber = target.number;
-              console.log(`Checking Issue title/body for #${targetNumber}`);
+              if (action === 'opened') {
+                // Check Title + Body if issue newly opened
+                textToCheck = (target.title + " " + (target.body || "")).toLowerCase();
+                console.log(`Issue Opened: Checking Title + Body for #${targetNumber}`);
+              } else {
+                // Check Title only if issue edited
+                textToCheck = target.title.toLowerCase();
+                console.log(`Issue Edited: Checking Title ONLY for #${targetNumber}`);
+              }
             }
 
             // --- 3. Define Rules ---
@@ -90,7 +92,7 @@ jobs:
               ['ascend', ['ascend', 'npu', 'huawei', '/ascend']],
               ['ckpt', ['ckpt', 'checkpoint', '/ckpt']],
               ['ci', ['ci', 'test', 'tests', 'github actions', '/ci']],
-              ['doc', ['doc', 'documentation', 'readme', '/doc']],
+              ['doc', ['doc', 'documentation', 'readme', 'docs', '/doc']],
               ['example', ['example', 'demo', 'tutorial', '/example']],
               ['hf_v5', ['hf_v5', 'transformers v5', '/hf_v5']],
               ['roadmap', ['roadmap', 'plan', '/roadmap']]
@@ -100,7 +102,14 @@ jobs:
 
             // --- 4. Match Keywords ---
             for (const [label, keywords] of rules) {
-              if (keywords.some(word => textToCheck.includes(word))) {
+              let keywordsToMatch = keywords;
+
+              // Filter keywords if it's a comment event, only support /xxx keywords
+              if (isCommentEvent) {
+                keywordsToMatch = keywords.filter(k => k.startsWith('/'));
+              }
+
+              if (keywordsToMatch.some(word => textToCheck.includes(word))) {
                 labelsToAdd.add(label);
               }
             }
