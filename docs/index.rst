@@ -48,11 +48,19 @@ Our guiding principles when building VeOmni are:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Quick Start
+   :caption: Get Started
 
-   start/quick_start.md
-   start/best_practice.md
-   start/uv.md
+   get_started/installation/install.md
+   get_started/installation/install_ascend.md
+   get_started/quick_start/quick_start_qwen3.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Usage
+
+   usage/arguments.md
+   usage/best_practice.md
+   usage/enable_new_models.md
 
 .. toctree::
    :maxdepth: 1
@@ -62,13 +70,7 @@ Our guiding principles when building VeOmni are:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Config
-
-   config/config.md
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Supported Model Examples
+   :caption: Examples
 
    examples/qwen2vl
    examples/qwen3_moe.md
@@ -81,12 +83,6 @@ Our guiding principles when building VeOmni are:
    key_features/ep_fsdp2.md
    key_features/preprocessor_registry.md
    key_features/ulysses.md
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Enable New Models
-
-   enable_new_models/enable_new_models.md
 
 
 ---------------------------------------
