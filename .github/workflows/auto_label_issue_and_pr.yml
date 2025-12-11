@@ -101,6 +101,8 @@ jobs:
             const labelsToAdd = new Set(); // Use Set to prevent duplicate labels
 
             // --- 4. Match Keywords ---
+            const isCommentEvent = (eventName === 'issue_comment' || eventName === 'pull_request_review_comment');
+
             for (const [label, keywords] of rules) {
               let keywordsToMatch = keywords;
 
