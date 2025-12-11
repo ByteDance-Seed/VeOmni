@@ -61,7 +61,7 @@ jobs:
 
               console.log(`Checking comment on #${targetNumber}`);
 
-            } else if (eventName === 'pull_request') {
+            } else if (eventName === 'pull_request' || eventName === 'pull_request_target') {
               // Case B: PR Opened/Edited
               // Check Title only (standard practice to avoid noise from long descriptions)
               const target = payload.pull_request;
