@@ -1,4 +1,4 @@
-# VeOmni Long-Sequence Training Using Ulysses
+# Long-Sequence Training Using Ulysses
 
 ## Table of Contents
 
@@ -45,16 +45,20 @@ Sequence Parallel (SP) serves as a prevalent strategy to handle long sequences t
 
 Suppose we have P GPUs and a sequence whose shape is [S, H], where N denotes the sequence length and d represents the hidden size (head num \* head dim). Each GPU initially holds the sequence's [S/P, H] partition. After performing an all_to_all communication, each GPU will get a head-splitting sequence whose shape is [S, H/P]. An illustration figure when P = 4 is as follows:
 
-<div style="text-align: center;">
-    <img src="../../assets/all_2_all.jpg" alt="all_to_all communication" width="75%"/>
-</div>
+```{image} ../assets/all_2_all.jpg
+:alt: all_to_all communication
+:width: 75%
+:align: center
+```
 
 ### DeepSpeed-Ulysses
 We use the all_to_all based sequence parallelism which is proposed by DeepSpeed, named DeepSpeed-Ulysses.
 
-<div style="text-align: center;">
-    <img src="../../assets/ulysses.png" alt="DeepSpeed-Ulysses" width="75%"/>
-</div>
+```{image} ../assets/ulysses.png
+:alt: DeepSpeed-Ulysses
+:width: 75%
+:align: center
+```
 
 (Image source: [DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models](https://arxiv.org/abs/2309.14509))
 

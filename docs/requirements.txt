@@ -1,0 +1,11 @@
+# markdown suport
+myst-parser
+
+# theme default book
+sphinx-book-theme
+
+# markdown table suport
+sphinx-markdown-tables
+
+# crate-docs-theme
+sphinx-rtd-theme

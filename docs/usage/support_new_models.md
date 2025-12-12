@@ -1,4 +1,5 @@
-# How to Enable New Models in VeOmni
+# Support New Models
+
 **Author**: Juntian Liu
 
 **TLDR:** This tutorial demonstrates how to enable new models in VeOmni using a combination of FSDP, Expert Parallelism (EP), and Sequence Parallelism (SP/Ulysses), using Qwen3-VL MoE as a practical example. We'll modify the modeling code from HuggingFace directly to support distributed training at scale.
