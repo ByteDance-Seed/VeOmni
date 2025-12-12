@@ -342,7 +342,7 @@ def parallelize_model_fsdp2(
     # NPU currently does not support the PreSumMul operation, so this operation is supported through the apply_hccl_premul_sum_patch.
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
-    if IS_NPU_AVAILABLE:
+    if IS_NPU_AVAILABLE and parallel_state.ep_enabled:
         from veomni.ops.patch.hccl_premul_sum import apply_hccl_premul_sum_patch
 
         apply_hccl_premul_sum_patch()
