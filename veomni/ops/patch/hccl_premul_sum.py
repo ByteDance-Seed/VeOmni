@@ -13,7 +13,7 @@ def hccl_premul_sum_wrapper(op, output_name):
         # Note:Although the sequence of operations(ReduceOp.SUM followed by multiplication) may differ from semantics,
         # we have verified that there is no problem with the performance and accuracy of this sequence.
         factor = None
-        if kwargs["op"] == ReduceOp.PREMUL_SUM:
+        if "op" in kwargs and kwargs["op"] == ReduceOp.PREMUL_SUM:
             factor = kwargs["op"].__getstate__()[1]
             kwargs["op"] = ReduceOp.SUM
         handle = op(*args, **kwargs)
