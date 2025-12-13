@@ -22,7 +22,7 @@ jobs:
           path: .
       - uses: actions/setup-python@v3
       - name: Install ruff
-        run: pip install -e ".[dev]"
+        run: pip install ruff
 
       - name: Run ruff format and check
         run: |
