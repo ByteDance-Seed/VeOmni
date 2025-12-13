@@ -1,3 +1,4 @@
+
 # # Tests layout
 
 name: GPU unit tests
@@ -63,27 +64,46 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
             fetch-depth: 0
-      - name: Install the current repository
+      - name: Install uv and dependencies
+        env:
+          HTTP_PROXY: http://100.68.174.87:3128
+          HTTPS_PROXY: http://100.68.174.87:3128
+          HF_ENDPOINT: https://hf-mirror.com
+          HF_HUB_ENABLE_HF_TRANSFER: 0
+          PIP_INDEX_URL: https://mirrors.ivolces.com/pypi/simple/
+          no_proxy: localhost,127.0.0.1,ivolces.com,.volces.com,.volcengine.com,volceapi.com
+          UV_PYTHON_INSTALL_MIRROR: "https://python-standalone.org/mirror/astral-sh/python-build-standalone/"
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.9.8"
+      - name: Sync dependencies
+        env:
+          HTTP_PROXY: http://100.68.174.87:3128
+          HTTPS_PROXY: http://100.68.174.87:3128
+          HF_ENDPOINT: https://hf-mirror.com
+          HF_HUB_ENABLE_HF_TRANSFER: 0
+          PIP_INDEX_URL: https://mirrors.ivolces.com/pypi/simple/
+          no_proxy: localhost,127.0.0.1,ivolces.com,.volces.com,.volcengine.com,volceapi.com
+          UV_PYTHON_INSTALL_MIRROR: "https://python-standalone.org/mirror/astral-sh/python-build-standalone/"
         run: |
-          pip3 install -e .[dev] --index-url https://pypi.org/simple
-          pip3 install diffusers
+          uv sync --extra gpu --group dev
       - name: Run parallel tests
         run: |
-          pytest -s -x tests/parallel/ulysses/test_ulysses.py
-          pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
       - name: Run models tests
         run: |
-          pytest -s -x tests/models/test_model_registry.py
-          pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -s -x tests/models/test_models_patch.py
       - name: Run fsdp2/ep+fsdp2 clip grad norm test
         run: |
-          pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+          uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
       - name: Run e2e dcp save and load test
         run: |
-          pytest -s -x tests/checkpoints/test_trainer_saveload.py
+          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run data tests
         run: |
-          pytest -s -x tests/data
+          uv run --frozen pytest -s -x tests/data
 
 
   cleanup:
