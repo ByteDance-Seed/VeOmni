@@ -360,6 +360,42 @@ class DistributedCheckpointer(CheckpointerBase):
 
         return state
 
+    @classmethod
+    def execute_save(
+        cls,
+        save_state: Dict[str, Any],
+        storage_writer: FileSystemWriter,
+        save_async: bool,
+    ) -> None:
+        """Execute DCP save with optional async support."""
+        if save_async:
+            # Lazily create a dedicated Gloo process group for async DCP saves
+            if cls._async_process_group is None:
+                cls._async_process_group = dist.new_group(backend="gloo")
+
+            if cls.dcp_save_future is not None:
+                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
+                cls.dcp_save_future.result()
+                cls.dcp_save_future = None
+                # block until all the ranks resolve their previous dcp async saving
+                dist.barrier()
+
+            cls.dcp_save_future = dcp.async_save(
+                state_dict=save_state,
+                storage_writer=storage_writer,
+                process_group=cls._async_process_group,
+            )
+        else:
+            dcp.save(
+                state_dict=save_state,
+                storage_writer=storage_writer,
+            )
+            if dist.is_initialized():
+                dist.barrier()
+            gc.collect()
+            empty_cache()
+            synchronize()
+
     # Private helper methods
     @classmethod
     def _create_checkpoint_dir(cls, checkpoint_dir: str) -> None:
@@ -407,42 +443,6 @@ class DistributedCheckpointer(CheckpointerBase):
         os.makedirs(extra_state_dir, exist_ok=True)
         extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
         state["extra_state"] = torch.load(extra_state_path, weights_only=False)
-
-    @classmethod
-    def execute_save(
-        cls,
-        save_state: Dict[str, Any],
-        storage_writer: FileSystemWriter,
-        save_async: bool,
-    ) -> None:
-        """Execute DCP save with optional async support."""
-        if save_async:
-            # Lazily create a dedicated Gloo process group for async DCP saves
-            if cls._async_process_group is None:
-                cls._async_process_group = dist.new_group(backend="gloo")
-
-            if cls.dcp_save_future is not None:
-                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-                cls.dcp_save_future.result()
-                cls.dcp_save_future = None
-                # block until all the ranks resolve their previous dcp async saving
-                dist.barrier()
-
-            cls.dcp_save_future = dcp.async_save(
-                state_dict=save_state,
-                storage_writer=storage_writer,
-                process_group=cls._async_process_group,
-            )
-        else:
-            dcp.save(
-                state_dict=save_state,
-                storage_writer=storage_writer,
-            )
-            if dist.is_initialized():
-                dist.barrier()
-            gc.collect()
-            empty_cache()
-            synchronize()
 
 
 def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> STATE_DICT_TYPE:
