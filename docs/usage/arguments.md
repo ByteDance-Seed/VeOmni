@@ -1,5 +1,6 @@
-## Config arguments Explanation
-### Model configuration arguments
+# Arguments API Reference
+
+## Model configuration arguments
 | Name | Type | Description | Default Value |
 | --- | --- | --- | --- |
 | model.config_path | str | Path to the model huggingface configuration, like `config.json` | model.model_path |
@@ -11,7 +12,7 @@
 | model.output_encoder | str: {"encoder", "decoder"} | Use the encoder of the encoder or decoder to encode the output image | decoder |
 | model.encode_target | bool | Used to encode the training data for the diffusion model | False |
 
-### Data configuration arguments
+## Data configuration arguments
 
 | Name | Type | Description | Default Value |
 | --- | --- | --- | --- |
@@ -29,7 +30,7 @@
 | data.pin_memory | bool | Whether to pin the data in the CPU memory. | True |
 | data.prefetch_factor | int | Number of samples preprocessed by the dataloader. | 2 |
 
-#### Training configuration arguments
+### Training configuration arguments
 | Name | Type | Description                                                                                                                                                                    | Default Value |
 | --- | --- |--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------| --- |
 | train.output_dir | str | Path to save the model.                                                                                                                                                        | Required |
@@ -84,7 +85,7 @@
 | train.profile_with_stack | bool | Whether to record the stack information.                                                                                                                                       | True |
 | train.max_steps | int | Number of steps per training epoch (only used for debugging).                                                                                                                  | None |
 
-### Inference configuration arguments
+## Inference configuration arguments
 | Name | Type | Description | Default Value |
 | --- | --- | --- | --- |
 | infer.model_path | str | Path to the model parameter file. | Required |
