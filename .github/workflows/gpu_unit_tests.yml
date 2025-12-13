@@ -67,6 +67,7 @@ jobs:
         run: |
           pip3 install -e .[dev] --index-url https://pypi.org/simple
           pip3 install diffusers
+          pip3 list
       - name: Run parallel tests
         run: |
           pytest -s -x tests/parallel/ulysses/test_ulysses.py
