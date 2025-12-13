@@ -373,12 +373,8 @@ class DistributedCheckpointer(CheckpointerBase):
             if cls._async_process_group is None:
                 cls._async_process_group = dist.new_group(backend="gloo")
 
-            if cls.dcp_save_future is not None:
-                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-                cls.dcp_save_future.result()
-                cls.dcp_save_future = None
-                # block until all the ranks resolve their previous dcp async saving
-                dist.barrier()
+            # Wait for previous async save to complete before starting a new one
+            cls.wait_save_finish()
 
             cls.dcp_save_future = dcp.async_save(
                 state_dict=save_state,
