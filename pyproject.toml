@@ -11,7 +11,7 @@ name = "veomni"
 dynamic = ["version"]
 description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
 readme = "README.md"
-requires-python = ">=3.11, <3.12"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [
   { name="Fazzie", email="maqianli.fazzie@bytedance.com" },
