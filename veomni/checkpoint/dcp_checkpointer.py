@@ -295,9 +295,23 @@ class DistributedCheckpointer(CheckpointerBase):
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
 
-        cls._execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
+        cls.execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
+
+    @classmethod
+    def wait_save_finish(cls) -> None:
+        """
+        Wait for any pending async save operation to complete.
+        This is a no-op if there is no pending save.
+        """
+        if cls.dcp_save_future is not None:
+            logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
+            cls.dcp_save_future.result()
+            cls.dcp_save_future = None
+            # block until all the ranks resolve their previous dcp async saving
+            if dist.is_initialized():
+                dist.barrier()
 
     @classmethod
     def load(
@@ -395,7 +409,7 @@ class DistributedCheckpointer(CheckpointerBase):
         state["extra_state"] = torch.load(extra_state_path, weights_only=False)
 
     @classmethod
-    def _execute_save(
+    def execute_save(
         cls,
         save_state: Dict[str, Any],
         storage_writer: FileSystemWriter,
