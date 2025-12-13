@@ -16,10 +16,12 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen3")
 def register_qwen3_modeling(architecture: str):
-    from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3Model
+    from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
 
     if "ForCausalLM" in architecture:
         return Qwen3ForCausalLM
+    elif "ForSequenceClassification" in architecture:
+        return Qwen3ForSequenceClassification
     elif "Model" in architecture:
         return Qwen3Model
     else:
