@@ -152,6 +152,7 @@ torchvision = [ # npu aarch64 need install torchvison from pytorch-cpu
 torchaudio = { index = "pytorch" }
 # Download flash-attn wheel directly to avoid build issues.
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' or extra == 'sglang'" }
+dion = [{ git = "https://github.com/microsoft/dion.git", rev = "0360f9b" }]
 
 [[tool.uv.index]]
 name = "pytorch"
