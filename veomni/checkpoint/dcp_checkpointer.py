@@ -300,20 +300,6 @@ class DistributedCheckpointer(CheckpointerBase):
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
     @classmethod
-    def wait_save_finish(cls) -> None:
-        """
-        Wait for any pending async save operation to complete.
-        This is a no-op if there is no pending save.
-        """
-        if cls.dcp_save_future is not None:
-            logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-            cls.dcp_save_future.result()
-            cls.dcp_save_future = None
-            # block until all the ranks resolve their previous dcp async saving
-            if dist.is_initialized():
-                dist.barrier()
-
-    @classmethod
     def load(
         cls,
         path: str,
@@ -373,8 +359,12 @@ class DistributedCheckpointer(CheckpointerBase):
             if cls._async_process_group is None:
                 cls._async_process_group = dist.new_group(backend="gloo")
 
-            # Wait for previous async save to complete before starting a new one
-            cls.wait_save_finish()
+            if cls.dcp_save_future is not None:
+                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
+                cls.dcp_save_future.result()
+                cls.dcp_save_future = None
+                # block until all the ranks resolve their previous dcp async saving
+                dist.barrier()
 
             cls.dcp_save_future = dcp.async_save(
                 state_dict=save_state,
