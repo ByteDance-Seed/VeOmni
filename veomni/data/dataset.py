@@ -366,11 +366,10 @@ def build_interleave_dataset(
         logger.info_rank0("Start building iterable multisource dataset")
 
         def add_ds_idx_to_iterable(dataset, ds_idx, source_name):
-            def gen():
-                for x in dataset:
-                    yield {**x, "ds_idx": ds_idx, "source_name": source_name}
+            def trans_example(example):
+                return {**example, "ds_idx": ds_idx, "source_name": source_name}
 
-            return HFIterableDataset.from_generator(gen)
+            return dataset.map(trans_example)
 
         for idx, source in enumerate(sources):
             dataset = build_iterable_dataset(source, namespace=namespace, seed=seed)
