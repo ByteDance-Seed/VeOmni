@@ -463,7 +463,7 @@ def main():
                     "lr": lr,
                 }
             )
-            data_loader_tqdm.set_postfix_str({k: f"{v:.2f}" for k, v in step_info.items() if k != "lr"})
+            data_loader_tqdm.set_postfix_str({k: f"{v:.2f}" for k, v in step_info.items() if k != "lr"}, refresh=False)
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:

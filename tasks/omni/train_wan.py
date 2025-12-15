@@ -385,7 +385,8 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s"
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s",
+                refresh=False,
             )
             data_loader_tqdm.update()
 

@@ -44,9 +44,7 @@ from veomni.utils.dist_utils import all_reduce
 if TYPE_CHECKING:
     pass
 
-
 logger = helper.create_logger(__name__)
-
 
 MAX_PIXELS = 768 * 28 * 28
 ROLE_MAPPING = {
@@ -389,7 +387,9 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.set_postfix_str(
+                f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}", refresh=False
+            )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
