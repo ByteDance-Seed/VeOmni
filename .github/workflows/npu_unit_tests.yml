@@ -81,14 +81,6 @@ jobs:
         with:
           version: "0.9.8"
       - name: Sync dependencies
-        env:
-          HTTP_PROXY: http://100.68.174.87:3128
-          HTTPS_PROXY: http://100.68.174.87:3128
-          HF_ENDPOINT: https://hf-mirror.com
-          HF_HUB_ENABLE_HF_TRANSFER: 0
-          PIP_INDEX_URL: https://mirrors.ivolces.com/pypi/simple/
-          no_proxy: localhost,127.0.0.1,ivolces.com,.volces.com,.volcengine.com,volceapi.com
-          UV_PYTHON_INSTALL_MIRROR: "https://python-standalone.org/mirror/astral-sh/python-build-standalone/"
         run: |
           uv sync --extra npu --group dev
       - name: Check final pip list
