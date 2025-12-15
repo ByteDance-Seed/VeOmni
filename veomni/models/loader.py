@@ -109,6 +109,15 @@ def get_model_class(model_config: PretrainedConfig, force_use_huggingface: bool 
             arch_name = arch_name[0]
         return arch_name
 
+    def _init_modeling_register():
+        for model_name in MODELING_REGISTRY.valid_keys():
+            try:
+                # make veomni-patch take effect
+                MODELING_REGISTRY[model_name]("")
+            except Exception as e:
+                logger.info_rank0(f" MODELING_REGISTRY model_name: {model_name} error: {e}")
+
+    _init_modeling_register()
     arch_name = get_model_arch_from_config(model_config)
     model_type = model_config.model_type
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
