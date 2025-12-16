@@ -249,9 +249,10 @@ def build_mapping_dataset(
     """
     Build mapping dataset.
     Args:
-        data_path (str): data path
+        train_path (str): data path
         transform (Optional[Callable]): transform function
         namespace (Literal["train", "test"]): dataset namespace
+        source_name (Optional[str]): source name
     Returns:
         Dataset: mapping dataset
     """
@@ -298,10 +299,11 @@ def build_iterable_dataset(
     """
     Build iterative dataset.
     Args:
-        data_path (str): data path
+        train_path (str): data path
         transform (Optional[Callable]): transform function
         namespace (Literal["train", "test"]): dataset namespace
         seed (int): random seed
+        source_name (Optional[str]): source name
     Returns:
         IterableDataset: iterative dataset
     """
@@ -349,6 +351,17 @@ def build_interleave_dataset(
     seed: int = 42,
     **kwargs,
 ):
+    """
+    Build interleave dataset.
+    Args:
+        train_path (str): data path
+        datasets_type (str): datasets type
+        namespace (Literal["train", "test"]): dataset namespace
+        transform (Optional[Callable]): transform function
+        seed (int): random seed
+    Returns:
+        InterleavedIterableDataset: interleaved iterable dataset
+    """
     logger.info_rank0("Start building interleave dataset")
     multisource_config = parse_multisource_config(train_path)
     logger.info_rank0(f"multisource_config: {multisource_config}")
@@ -420,7 +433,7 @@ def build_energon_dataset(
     - Built-in error handling and performance optimizations
 
     Args:
-        data_path (str): Path to the energon dataset directory
+        train_path (str): Path to the energon dataset directory
         transform (Optional[Callable]): Transform function to apply to samples
         namespace (Literal["train", "test"]): Dataset namespace (not used for energon)
         max_samples_per_sequence (Optional[int]): Maximum samples per sequence
