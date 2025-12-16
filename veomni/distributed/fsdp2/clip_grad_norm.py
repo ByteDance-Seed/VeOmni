@@ -108,6 +108,11 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
     ]
     default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
     res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
+
+    # Early return if no gradients to process
+    if len(grads_local) == 0:
+        return res
+
     with torch.no_grad():
         grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
         for (device, _), ([device_grads_local], _) in grouped_grads_local.items():

@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed._tensor import DeviceMesh, DTensor, Shard
+from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -204,16 +204,24 @@ class OptimizerState(Stateful):
 def drop_ep_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
     """
     Drop EP dims after loading from DCP so that EP-FSDP would not be confused
+
+    The loaded tensor is on EP mesh (1D), but we need to return a tensor on the 2D mesh
+    matching the model's parameter mesh (ep x ep_fsdp).
     """
     assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-    ep_fsdp_mesh = device_mesh["ep_fsdp"]
 
     if len(loaded_tensor.placements) == 2:
+        # EP + FSDP on 2D mesh: Drop EP dimension, keep FSDP dimension
+        # Extract local tensor and redistribute on 2D mesh with Replicate for EP dim
         tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=ep_fsdp_mesh, placements=[Shard(1)]
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(1)]
         )
     elif len(loaded_tensor.placements) == 1:
-        tensor_to_put = loaded_tensor.to_local()
+        # Only EP on 1D mesh: Gather EP dimension, then redistribute on 2D mesh
+        # We gather the full tensor across EP dimension, then create DTensor on 2D mesh
+        # with Replicate() for EP dim and Replicate() for FSDP dim (FSDP will reshard later)
+        full_tensor = loaded_tensor.full_tensor()
+        tensor_to_put = DTensor.from_local(full_tensor, device_mesh=device_mesh, placements=[Replicate(), Replicate()])
     else:
         raise RuntimeError(
             f"Expect EP paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
@@ -236,10 +244,11 @@ def restore_ep_dim(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh):
     ep_mesh = device_mesh["ep"]
 
     if isinstance(orgin_tensor, DTensor):
-        # EP+FSDP2
-        dtensor = DTensor.from_local(
-            orgin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
-        )
+        # EP+FSDP2: tensor is DTensor with placements on 2D mesh (ep x ep_fsdp)
+        # We need to project it to the EP mesh only for saving
+        # Convert to local tensor first, then create DTensor on EP mesh
+        local_tensor = orgin_tensor.to_local()
+        dtensor = DTensor.from_local(local_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only EP
         dtensor = DTensor.from_local(orgin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
