@@ -11,7 +11,7 @@ ARG APT_SOURCE=https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
 ARG PIP_INDEX=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 # Set timezone
-echo "Setting timezone to CST (China Standard Time)..." && \
+RUN echo "Setting timezone to CST (China Standard Time)..." && \
     ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     echo "Asia/Shanghai" > /etc/timezone && \
     dpkg-reconfigure -f noninteractive tzdata
