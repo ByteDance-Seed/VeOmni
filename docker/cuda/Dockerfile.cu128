@@ -12,9 +12,9 @@ ARG PIP_INDEX=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 # Set timezone
 echo "Setting timezone to CST (China Standard Time)..." && \
-        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-        echo "Asia/Shanghai" > /etc/timezone && \
-        dpkg-reconfigure -f noninteractive tzdata; \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    dpkg-reconfigure -f noninteractive tzdata
 
 # Set apt source
 # ubuntu 24.04
