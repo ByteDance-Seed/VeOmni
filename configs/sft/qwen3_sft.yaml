@@ -1,17 +1,17 @@
 model:
-  model_path: /opt/tiger/Open-VeOmni/Qwen3-8B-Base/Qwen3-8B-Base
+  model_path: Qwen3-8B-Base
   attn_implementation: flash_attention_2
 
 data:
-  train_path: ./tulu-3-sft-mixture/mini_data
+  train_path: tulu-3-sft-mixture
   data_type: conversation
   chat_template: chatml
-  max_seq_len: 8192
-  train_size: 4000000
+  max_seq_len: 2048
+  train_size: 750000
   text_keys: messages
 
 train:
-  output_dir: Qwen3-8B-Instruct-tulu
+  output_dir: Qwen3-8B-Base-sft-tulu
   data_parallel_mode: fsdp1
   ulysses_parallel_size: 1
   global_batch_size: 8
@@ -37,6 +37,7 @@ train:
   ckpt_manager: dcp
   load_checkpoint_path: ""
   save_steps: 100
-  save_hf_weights: true
-  wandb_project: Jiabin-VeOmni
-  wandb_name: Qwen3-8B-Instruct-tulu
+  save_epochs: 1
+  save_hf_weights: false
+  wandb_project: VeOmni
+  wandb_name: Qwen3-8B-Base-sft-tulu

@@ -17,6 +17,7 @@ from veomni.data import (
     build_dataloader,
     build_dataset,
 )
+from veomni.data.constants import IGNORE_INDEX
 from veomni.data.data_transform import process_pretrain_example, process_sft_example
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -269,6 +270,12 @@ def main():
             total_loss = 0
             synchronize()
             start_time = time.time()
+
+            length_in_batch = torch.tensor(0, dtype=torch.int32, device=get_device_type())
+            for micro_batch in micro_batches:
+                length_in_batch += torch.sum(micro_batch["labels"] != IGNORE_INDEX)
+            length_in_batch = all_reduce(length_in_batch, op="sum", group=get_parallel_state().fsdp_group)
+
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
@@ -281,7 +288,12 @@ def main():
                     for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
-                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss.mean() / len(micro_batches)
+                    model_outputs = model(**micro_batch, use_cache=False)
+
+                length_in_micro_batch = torch.sum(micro_batch["labels"] != IGNORE_INDEX)
+                loss: "torch.Tensor" = (
+                    model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
+                )
 
                 with model_bwd_context:
                     loss.backward()
