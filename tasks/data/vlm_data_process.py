@@ -135,7 +135,7 @@ def process_sample_qwen2_5_vl(
 
     return [tokenized_example]
 
-def process_sample_qwen3_vl_video_r1(
+def process_sample_qwen3_vl(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
     chat_template: "ChatTemplate",
