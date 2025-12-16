@@ -226,7 +226,7 @@ def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: Proc
     if dim_size % sp_world != 0:
         padding_size = sp_world - (dim_size % sp_world)
         x = pad_tensor(x, seq_dim, padding_size)
-    return _SeqAllToAll.apply(group, x, seq_dim, head_dim, False)
+    return _SeqAllToAll.apply(group, x, seq_dim, head_dim)
 
 
 def gather_seq_scatter_heads(
