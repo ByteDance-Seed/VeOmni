@@ -48,7 +48,6 @@ from veomni.utils.device import (
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
 
-from .import_utils import is_veomni_patch_available
 from .multisource_utils import parse_multisource_config
 
 
@@ -63,42 +62,16 @@ if IS_NPU_AVAILABLE:
     import torch_npu
 
 
-if is_veomni_patch_available():
-    from veomni_patch.utils.helper import (
-        VALID_CONFIG_TYPE,
-        VEOMNI_UPLOAD_CMD,
-        FlopsCounter,
-        convert_hdfs_fuse_path,
-        is_remote_path,
-        load_step2token,
-        save_step2token,
-    )
-else:
+# internal use
+VALID_CONFIG_TYPE = None
+VEOMNI_UPLOAD_CMD = None
+FlopsCounter = None
 
-    def load_step2token(*args, **kwargs):
-        logger.warning("veomni_patch is not available, load_step2token will be skipped")
-        pass
 
-    def save_step2token(*args, **kwargs):
-        logger.warning("veomni_patch is not available, save_step2token will be skipped")
-        pass
-
-    def is_remote_path(*args, **kwargs):
-        logger.warning("veomni_patch is not available, is_remote_path returning False")
-        return False
-
-    def convert_hdfs_fuse_path(*args, **kwargs):
-        logger.warning("veomni_patch is not available, convert_hdfs_fuse_path returning path as-is")
-        if len(args) > 0:
-            return args[0]
-        return kwargs.get("path", None)
-
-    VALID_CONFIG_TYPE = None
-    VEOMNI_UPLOAD_CMD = None
-
-    class FlopsCounter:
-        def __init__(self):
-            raise ImportError("veomni_patch is not available, please install it first")
+def convert_hdfs_fuse_path(*args, **kwargs):
+    if len(args) > 0:
+        return args[0]
+    return kwargs.get("path", None)
 
 
 if TYPE_CHECKING:

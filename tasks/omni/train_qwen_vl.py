@@ -299,8 +299,6 @@ def main():
         if start_step == 0:  # resume at the end of epoch
             iter(train_dataloader)  # clear resume state and prefetch data
 
-        if args.train.global_rank == 0:
-            helper.load_step2token(args.train.load_checkpoint_path)
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
 
