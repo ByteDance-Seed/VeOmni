@@ -394,12 +394,6 @@ class TrainingArguments:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
-    enable_rank0_init: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable rank0-only initialization for FSDP1 training. Note: this argument will be deprecated in the future, please use `init_device=cpu` instead."
-        },
-    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
         metadata={
@@ -607,17 +601,6 @@ class TrainingArguments:
             )
 
         # init method check
-        # TODO: remove `enable_rank0_init`
-        logger.warning_rank0(
-            "`enable_rank0_init` will be deprecated in the future, please use `init_device=cpu` instead."
-        )
-        if self.enable_rank0_init:
-            if self.init_device != "cpu":
-                logger.warning_rank0(
-                    "`enable_rank0_init` is set to True, but `init_device` is not set to `cpu`. We change `init_device=cpu`."
-                    "If you try to init model in `cuda` or `meta`, please use `init_device = cuda` or `init_device = meta` instead."
-                )
-            self.init_device = "cpu"
         assert self.expert_parallel_size == 1 or self.init_device != "cpu", (
             "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
         )
