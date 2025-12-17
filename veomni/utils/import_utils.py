@@ -42,7 +42,6 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
     "flash_attn": _is_package_available("flash_attn"),
     "liger_kernel": _is_package_available("liger_kernel"),
     "torch_npu": _is_package_available("torch_npu"),
-    "vescale": _is_package_available("vescale"),
     "seed_kernels": _is_package_available("seed_kernels"),
     "diffusers": _is_package_available("diffusers"),
     "av": _is_package_available("av"),
@@ -63,10 +62,6 @@ def is_liger_kernel_available() -> bool:
 
 def is_torch_npu_available() -> bool:
     return _PACKAGE_FLAGS["torch_npu"]
-
-
-def is_vescale_available() -> bool:
-    return _PACKAGE_FLAGS["vescale"]
 
 
 def is_seed_kernels_available() -> bool:
