@@ -100,17 +100,22 @@ def build_foundation_model(
         seed_kernel_attn_implementation = os.getenv("SEED_KERNEL_ATTN_IMPLEMENTATION")
 
         if seed_kernel_attn_implementation == "fa3":
-            flash_attention_forward = partial(flash_attention_forward, implementation="fa3")
+            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="fa3")
         elif seed_kernel_attn_implementation == "fa2":
-            flash_attention_forward = partial(flash_attention_forward, implementation="fa2")
+            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="fa2")
         elif seed_kernel_attn_implementation == "lego":
-            flash_attention_forward = partial(flash_attention_forward, implementation="lego")
+            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="lego")
         else:
             assert seed_kernel_attn_implementation is None, (
                 f"seed_kernel_attn_implementation={seed_kernel_attn_implementation} is not supported"
             )
 
-        ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+        ALL_ATTENTION_FUNCTIONS.register(
+            "flash_attention_2", partial(flash_attention_forward, implementation="flash_attention_2")
+        )
+        ALL_ATTENTION_FUNCTIONS.register(
+            "flash_attention_3", partial(flash_attention_forward, implementation="flash_attention_3")
+        )
 
     init_kwargs = {
         "config": config,
