@@ -3,6 +3,8 @@
 
 In this section, we provide the installation guide for Nvidia GPU.
 
+VeOmni also supports other hardware platform, please refer to [Ascend](installation-install_ascend).
+
 ## Required Environment
 
 CUDA == 12.8

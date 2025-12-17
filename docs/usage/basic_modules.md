@@ -12,7 +12,7 @@
    ```
 
 3. **Create Custom Task Directory**  
-    [`train_torch.py`](../../tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, youcan just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](../../tasks/omni/train_qwen2_vl.py)
+    [`train_torch.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, youcan just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_qwen2_vl.py)
     ```bash
     mkdir tasks/your_task
     cp tasks/train_torch.py tasks/your_task/train.py
@@ -71,7 +71,7 @@ VeOmni use torch device mesh to manage all the parallel state, which is useful a
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
 
-- source code [veomni/distributed/parallel_state.py](../../veomni/distributed/parallel_state.py).
+- source code [veomni/distributed/parallel_state.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/distributed/parallel_state.py).
 
 ```python
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -104,7 +104,7 @@ tp_mesh = parallel_state.tp_mesh
 ```
 
 ## Dataset
-VeOmni default supports two types of datasets(source code: [veomni/data/dataset.py](../../veomni/data/dataset.py)):
+VeOmni default supports two types of datasets(source code: [veomni/data/dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dataset.py)):
 1. **IterativeDataset** (recommended for large datasets)  
 2. **MappingDataset** (default for small datasets)
 
@@ -142,7 +142,7 @@ elif args.data.datasets_type == "custom":
 ```
 
 ### Data Transform (Preprocess)
-VeOmni default supports two types of transform(source code: [veomni/data/data_transform.py](../../veomni/data/data_transform.py)):
+VeOmni default supports two types of transform(source code: [veomni/data/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py)):
 1. **process_pretrain_example** (recommended for pretrain task)
 2. **process_sft_example** (recommended for sft task)
 
@@ -176,7 +176,7 @@ transform = partial(
 ```
 
 ### Chat Template
-VeOmni default supports few chat template(source code: [veomni/data/chat_template.py](../../veomni/data/chat_template.py)):
+VeOmni default supports few chat template(source code: [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py)):
 you can add your custom chat template by implementing the `ChatTemplate` class.
 **Custom Template Implementation**:  
 ```python
@@ -197,7 +197,7 @@ VeOmni offered a flexible and powerful dataloader implementation, which supports
 - both padding and remove padding(packing) strategy
 - dynamic batching strategy
 -
-(source code: [veomni/data/data_loader.py](../../veomni/data/data_loader.py)):
+(source code: [veomni/data/data_loader.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_loader.py)):
 
 ```python
 from veomni.data import build_dataloader, build_mapping_dataset
@@ -234,7 +234,7 @@ train_dataloader = build_dataloader(
 ```
 
 ### Collate Function
-VeOmni default supports three types of collate function for text task(source code: [veomni/data/data_collator.py](../../veomni/data/data_collator.py):
+VeOmni default supports three types of collate function for text task(source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)):
 1. `DataCollatorWithPadding` (enable when `rmpad` is False and `rmpad_with_pos_ids` is False)
 2. `DataCollatorWithPacking` (enable when `rmpad` is True and `rmpad_with_pos_ids` is False)
 3. `DataCollatorWithPositionIDs` (enable when `rmpad` is False and `rmpad_with_pos_ids` is True)
@@ -243,7 +243,7 @@ For Omni model task:
 1. `OmniDataCollatorWithPacking` (for when `rmpad_with_pos_ids` is True)
 2. `OmniDataCollatorWithPadding` (for `rmpad` is False and `rmpad_with_pos_ids` is False)
 
-See detail in source code: [veomni/data/multimodal/data_collator.py](../../veomni/data/multimodal/data_collator.py)) and how to use it in the [train_omni_model.py](../../tasks/omni/train_omni_model.py)
+See detail in source code: [veomni/data/multimodal/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/data_collator.py) and how to use it in the [train_omni_model.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_omni_model.py)
 
 
 ## Model and Optimizer
@@ -252,7 +252,7 @@ See detail in source code: [veomni/data/multimodal/data_collator.py](../../veomn
 - meta device init
 - init model from model config or weights path
 
-- source code [veomni/models/auto.py](../../veomni/models/auto.py)
+- source code [veomni/models/auto.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/auto.py)
 
 ```python
 from veomni.models import build_foundation_model
