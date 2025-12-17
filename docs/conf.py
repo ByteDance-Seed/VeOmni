@@ -47,6 +47,7 @@ html_theme = "sphinx_book_theme"
 
 html_static_path = ["_static"]
 html_logo = "./assets/logo.png"
+html_favicon = "./assets/icon.ico"
 html_theme_options = {
     "repository_url": "https://github.com/ByteDance-Seed/VeOmni",
     "use_repository_button": True,

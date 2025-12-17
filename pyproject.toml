@@ -188,7 +188,7 @@ select = ["C", "E", "F", "I", "W"]
 [tool.ruff.lint.isort]
 lines-after-imports = 2
 known-first-party = ["veomni"]
-known-third-party = ["torch", "transformers", "vescale", "wandb"]
+known-third-party = ["torch", "transformers", "wandb"]
 
 [tool.ruff.format]
 quote-style = "double"
