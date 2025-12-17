@@ -28,7 +28,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.processing_utils import Unpack
 from transformers.utils import (
@@ -42,6 +42,7 @@ from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 
 if is_liger_kernel_available():

@@ -95,7 +95,7 @@ class ModelArguments:
     )
     force_use_huggingface: bool = field(
         default=False,
-        metadata={"help": "Force loading model from huggingface."},
+        metadata={"help": "Force loading model from huggingface without any patch or external ops."},
     )
 
     def __post_init__(self):

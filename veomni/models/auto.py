@@ -14,7 +14,6 @@
 
 
 import functools
-import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
@@ -89,28 +88,6 @@ def build_foundation_model(
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
     loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)
-
-    if not force_use_huggingface:
-        from functools import partial
-
-        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-        from ..ops.attention import flash_attention_forward
-
-        seed_kernel_attn_implementation = os.getenv("SEED_KERNEL_ATTN_IMPLEMENTATION")
-
-        if seed_kernel_attn_implementation == "fa3":
-            flash_attention_forward = partial(flash_attention_forward, implementation="fa3")
-        elif seed_kernel_attn_implementation == "fa2":
-            flash_attention_forward = partial(flash_attention_forward, implementation="fa2")
-        elif seed_kernel_attn_implementation == "lego":
-            flash_attention_forward = partial(flash_attention_forward, implementation="lego")
-        else:
-            assert seed_kernel_attn_implementation is None, (
-                f"seed_kernel_attn_implementation={seed_kernel_attn_implementation} is not supported"
-            )
-
-        ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
 
     init_kwargs = {
         "config": config,

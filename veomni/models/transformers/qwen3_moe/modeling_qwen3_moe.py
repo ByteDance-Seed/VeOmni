@@ -32,7 +32,7 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import (
     add_code_sample_docstrings,
@@ -47,6 +47,7 @@ from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops import causallm_loss_function, fused_moe_forward
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from .configuration_qwen3_moe import Qwen3MoeConfig
 
 

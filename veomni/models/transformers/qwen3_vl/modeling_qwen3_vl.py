@@ -34,7 +34,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import (
@@ -57,6 +57,7 @@ from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops.loss import causallm_loss_function
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 
 logger = helper.create_logger(__name__)
