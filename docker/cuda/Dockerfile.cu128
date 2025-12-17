@@ -77,4 +77,7 @@ ENV PATH="/bin/:$PATH"
 # uv sync
 WORKDIR /app
 COPY . ./
-RUN uv sync --locked --all-packages --extra gpu --dev
+RUN uv sync --locked --all-packages --extra gpu --dev && \
+    rm -rf /app
+
+USER root
