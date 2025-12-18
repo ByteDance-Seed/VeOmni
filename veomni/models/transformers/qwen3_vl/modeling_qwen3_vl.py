@@ -50,10 +50,16 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
+    get_ulysses_sequence_parallel_world_size,
     slice_position_embedding,
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
+from ....distributed.sequence_parallel.async_ulysses import (
+    async_ulysses_qkv_projection,
+    async_ulysses_output_projection,
+)
+from ....ops.loss import causallm_loss_function
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
 
@@ -423,6 +429,7 @@ class Qwen3VLTextAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.async_ulysses = True
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -454,36 +461,90 @@ class Qwen3VLTextAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        if self.async_ulysses:
+            unpadded_seq_len = hidden_states.size(1)
+            q, k, v = async_ulysses_qkv_projection(
+                hidden_states=hidden_states,
+                seq_dimension=1,
+                head_dimension=2,
+                q_weight=self.q_proj.weight,
+                q_bias=self.q_proj.bias,
+                k_weight=self.k_proj.weight,
+                k_bias=self.k_proj.bias,
+                v_weight=self.v_proj.weight,
+                v_bias=self.v_proj.bias,
+                norm_type="rmsnorm",
+                norm_q_weight=self.q_norm.weight,
+                norm_q_bias=None,
+                norm_k_weight=self.k_norm.weight,
+                norm_k_bias=None,
+                normalized_shape=self.head_dim,
+                eps=self.config.rms_norm_eps,
+                unpadded_dim_size=unpadded_seq_len * get_ulysses_sequence_parallel_world_size(),
+                head_dim=self.head_dim,
+            )
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            q = q.transpose(1,2)
+            k = k.transpose(1,2)
+            v = v.transpose(1,2)
 
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # FA kwargs should be included in kwargs implicitly
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+            # FA kwargs should be included in kwargs implicitly
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                v,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                skip_ulysses = True,
+                **kwargs,
+            )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+            attn_output = async_ulysses_output_projection(
+                hidden_states=attn_output,
+                seq_dimension=1,
+                head_dimension=2,
+                proj_weight=self.o_proj.weight,
+                proj_bias=self.o_proj.bias,
+                unpadded_dim_size=attn_output.shape[1],
+            )
+        else:
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            if past_key_values is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+            # FA kwargs should be included in kwargs implicitly
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
 
@@ -853,6 +914,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.async_ulysses = True
 
     @check_model_inputs()
     @auto_docstring
@@ -921,7 +983,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos_embedding
         sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-        if sp_group is not None:
+        if sp_group is not None and self.async_ulysses is False:
             position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
