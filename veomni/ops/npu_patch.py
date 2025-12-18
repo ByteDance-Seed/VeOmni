@@ -19,8 +19,10 @@ import torch.nn.functional as F
 import torch_npu
 
 from veomni.models.transformers.qwen3_moe import modeling_qwen3_moe
+from veomni.models.transformers.qwen3 import modeling_qwen3
 
 from .group_gemm.kernel.npu_group_gemm import GmmFunction
+from ..models.transformers import qwen3
 
 
 # This api can improve performance on ASCEND NPU
@@ -80,3 +82,7 @@ def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) ->
 modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = rms_norm_forward_npu
 modeling_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = qwen3_moe_sparse_moe_block_forward_npu
 modeling_qwen3_moe.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+
+# Patches for Qwen3 Model
+modeling_qwen3.Qwen3RMSNorm.forward = rms_norm_forward_npu
+modeling_qwen3.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
