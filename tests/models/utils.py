@@ -59,11 +59,17 @@ def prepare_models_modes(is_moe: bool = False):
         ),
     ]
     if not is_torch_npu_available():
-        base_model_modes.append(
-            ModelMode(force_use_huggingface=True, attn_implementation="flash_attention_3", attn_case="position_ids"),
-            ModelMode(
-                force_use_huggingface=False, attn_implementation="veomni_flash_attention_3", attn_case="position_ids"
-            ),
+        base_model_modes.extend(
+            [
+                ModelMode(
+                    force_use_huggingface=True, attn_implementation="flash_attention_3", attn_case="position_ids"
+                ),
+                ModelMode(
+                    force_use_huggingface=False,
+                    attn_implementation="veomni_flash_attention_3",
+                    attn_case="position_ids",
+                ),
+            ]
         )
 
     moe_model_modes = [
@@ -93,19 +99,21 @@ def prepare_models_modes(is_moe: bool = False):
         ),
     ]
     if not is_torch_npu_available():
-        moe_model_modes.append(
-            ModelMode(
-                force_use_huggingface=True,
-                attn_implementation="flash_attention_3",
-                attn_case="position_ids",
-                moe_implementation="fused",
-            ),
-            ModelMode(
-                force_use_huggingface=False,
-                attn_implementation="veomni_flash_attention_3",
-                attn_case="position_ids",
-                moe_implementation="fused",
-            ),
+        moe_model_modes.extend(
+            [
+                ModelMode(
+                    force_use_huggingface=True,
+                    attn_implementation="flash_attention_3",
+                    attn_case="position_ids",
+                    moe_implementation="fused",
+                ),
+                ModelMode(
+                    force_use_huggingface=False,
+                    attn_implementation="veomni_flash_attention_3",
+                    attn_case="position_ids",
+                    moe_implementation="fused",
+                ),
+            ]
         )
 
     return base_model_modes + moe_model_modes if is_moe else base_model_modes
