@@ -8,6 +8,7 @@ from transformers import set_seed
 from veomni.models import build_foundation_model
 from veomni.optim import build_optimizer
 from veomni.utils.device import get_device_type
+from veomni.utils.import_utils import is_torch_npu_available
 
 
 def build_base_model_optim(
@@ -56,11 +57,14 @@ def prepare_models_modes(is_moe: bool = False):
         ModelMode(
             force_use_huggingface=False, attn_implementation="veomni_flash_attention_2", attn_case="position_ids"
         ),
-        ModelMode(force_use_huggingface=True, attn_implementation="flash_attention_3", attn_case="position_ids"),
-        ModelMode(
-            force_use_huggingface=False, attn_implementation="veomni_flash_attention_3", attn_case="position_ids"
-        ),
     ]
+    if not is_torch_npu_available():
+        base_model_modes.append(
+            ModelMode(force_use_huggingface=True, attn_implementation="flash_attention_3", attn_case="position_ids"),
+            ModelMode(
+                force_use_huggingface=False, attn_implementation="veomni_flash_attention_3", attn_case="position_ids"
+            ),
+        )
 
     moe_model_modes = [
         ModelMode(
@@ -87,19 +91,22 @@ def prepare_models_modes(is_moe: bool = False):
             attn_case="position_ids",
             moe_implementation="fused",
         ),
-        ModelMode(
-            force_use_huggingface=True,
-            attn_implementation="flash_attention_3",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            force_use_huggingface=False,
-            attn_implementation="veomni_flash_attention_3",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
     ]
+    if not is_torch_npu_available():
+        moe_model_modes.append(
+            ModelMode(
+                force_use_huggingface=True,
+                attn_implementation="flash_attention_3",
+                attn_case="position_ids",
+                moe_implementation="fused",
+            ),
+            ModelMode(
+                force_use_huggingface=False,
+                attn_implementation="veomni_flash_attention_3",
+                attn_case="position_ids",
+                moe_implementation="fused",
+            ),
+        )
 
     return base_model_modes + moe_model_modes if is_moe else base_model_modes
 
