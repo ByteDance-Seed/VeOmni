@@ -178,7 +178,7 @@ class EnvironMeter:
         self.consume_tokens = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
-        self.image_seqlens = []
+        self.images_seqlens = []
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
