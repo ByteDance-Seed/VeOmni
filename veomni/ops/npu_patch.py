@@ -18,11 +18,10 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 
-from veomni.models.transformers.qwen3_moe import modeling_qwen3_moe
 from veomni.models.transformers.qwen3 import modeling_qwen3
+from veomni.models.transformers.qwen3_moe import modeling_qwen3_moe
 
 from .group_gemm.kernel.npu_group_gemm import GmmFunction
-from ..models.transformers import qwen3
 
 
 # This api can improve performance on ASCEND NPU
