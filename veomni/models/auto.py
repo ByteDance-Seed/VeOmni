@@ -61,7 +61,15 @@ def build_foundation_model(
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]
+        Literal[
+            "eager",
+            "sdpa",
+            "flash_attention_2",
+            "flash_attention_3",
+            "native-sparse",
+            "veomni_flash_attention_2",
+            "veomni_flash_attention_3",
+        ]
     ] = "flash_attention_2",
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",

@@ -16,6 +16,7 @@ from importlib.metadata import version as get_version
 
 from packaging.version import parse as parse_version
 
+from .ops import apply_ops_patch
 from .utils.import_utils import (
     is_torch_npu_available,
     is_veomni_patch_available,
@@ -27,6 +28,9 @@ logger = get_logger(__name__)
 
 
 def _safe_apply_patches():
+    apply_ops_patch()
+    logger.info_rank0("✅ veomni ops patched")
+
     if is_veomni_patch_available():
         from veomni_patch import apply_patch
 

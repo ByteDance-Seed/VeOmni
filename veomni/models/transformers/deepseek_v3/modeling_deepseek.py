@@ -40,7 +40,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
@@ -53,7 +53,6 @@ from transformers.utils import (
 
 from ....ops import causallm_loss_function, fused_moe_forward
 from ....utils.import_utils import is_liger_kernel_available
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from .configuration_deepseek import DeepseekV3Config
 
 
@@ -941,7 +940,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.layers = nn.ModuleList(
             [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self._use_flash_attention_2 = "flash_attention_2" in config._attn_implementation
         self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._init_rope(config)
 

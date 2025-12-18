@@ -40,7 +40,7 @@ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLVisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import (
@@ -64,7 +64,6 @@ from ....distributed.sequence_parallel import (
 )
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available, is_seed_kernels_available
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 
 if is_flash_attn_2_available():

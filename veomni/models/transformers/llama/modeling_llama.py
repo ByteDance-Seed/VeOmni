@@ -34,7 +34,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -49,7 +49,6 @@ from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 
 if is_liger_kernel_available():
@@ -641,7 +640,7 @@ class LlamaModel(LlamaPreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool,
     ):
-        if self.config._attn_implementation == "flash_attention_2":
+        if "flash_attention_2" in self.config._attn_implementation:
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask
             return None
