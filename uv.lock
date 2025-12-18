@@ -34,6 +34,10 @@ overrides = [
 name = "flash-attn"
 requires-dist = ["torch"]
 
+[[manifest.dependency-metadata]]
+name = "flash-attn-3"
+requires-dist = ["torch"]
+
 [[package]]
 name = "accelerate"
 version = "1.12.0"
@@ -446,6 +450,17 @@ version = "2.8.3+cu12torch2.8cxx11abitrue"
 source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" }
 wheels = [
     { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", hash = "sha256:3d41b2fc55753faa7f45d6568ea73a96b96afb48b82994ab9b49bcbcb6c87588" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "torch" }]
+
+[[package]]
+name = "flash-attn-3"
+version = "3.0.0b1+20251215.cu126torch280cxx11abitrue.bc0e4a"
+source = { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.12.15-c947cd1/flash_attn_3-3.0.0b1+20251215.cu126torch280cxx11abitrue.bc0e4a-cp39-abi3-linux_x86_64.whl" }
+wheels = [
+    { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.12.15-c947cd1/flash_attn_3-3.0.0b1+20251215.cu126torch280cxx11abitrue.bc0e4a-cp39-abi3-linux_x86_64.whl", hash = "sha256:51d1eeb51530721d01297b0d00fac1302a59ec2021ffbfb60fb26b2e67238f21" },
 ]
 
 [package.metadata]
@@ -2159,6 +2174,7 @@ dit = [
 ]
 gpu = [
     { name = "flash-attn" },
+    { name = "flash-attn-3" },
     { name = "hf-transfer" },
     { name = "liger-kernel" },
     { name = "nvidia-cusparselt-cu12" },
@@ -2212,6 +2228,7 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8.1" },
     { name = "expecttest", marker = "extra == 'dev'", specifier = ">=0.3.0,<0.4" },
     { name = "flash-attn", marker = "extra == 'gpu'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" },
+    { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.12.15-c947cd1/flash_attn_3-3.0.0b1+20251215.cu126torch280cxx11abitrue.bc0e4a-cp39-abi3-linux_x86_64.whl" },
     { name = "hf-transfer", marker = "extra == 'gpu'" },
     { name = "librosa", marker = "extra == 'audio'", specifier = ">=0.11.0,<0.12" },
     { name = "liger-kernel", marker = "extra == 'gpu'" },

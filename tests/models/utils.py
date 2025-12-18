@@ -60,8 +60,6 @@ def prepare_models_modes(is_moe: bool = False):
         ModelMode(
             force_use_huggingface=False, attn_implementation="veomni_flash_attention_3", attn_case="position_ids"
         ),
-        ModelMode(force_use_huggingface=False, attn_implementation="fa2", attn_case="position_ids"),
-        ModelMode(force_use_huggingface=False, attn_implementation="fa3", attn_case="position_ids"),
     ]
 
     moe_model_modes = [
@@ -98,18 +96,6 @@ def prepare_models_modes(is_moe: bool = False):
         ModelMode(
             force_use_huggingface=False,
             attn_implementation="veomni_flash_attention_3",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            force_use_huggingface=False,
-            attn_implementation="fa2",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            force_use_huggingface=False,
-            attn_implementation="fa3",
             attn_case="position_ids",
             moe_implementation="fused",
         ),
