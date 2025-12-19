@@ -144,7 +144,7 @@ conflicts = [
 # To support override-dependencies for multiple extras, one package can only have one index.
 # Using pytorch index for all variants since it has both regular and +cpu versions
 torch = [
-  { index = "pytorch", marker = "(extra != 'gpu')" },
+  { index = "pytorch", marker = "(extra == 'npu' or extra == 'npu_aarch64')" },
   # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
   # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
   # those nvidia packages.
