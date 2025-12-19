@@ -1,17 +1,19 @@
+import argparse
 import copy
 import gc
+import json
 import os
+import subprocess
+import tempfile
 
 import pytest
 import torch
 from transformers import AutoConfig
 
-from veomni.ops import apply_ops_patch
 from veomni.utils.device import get_torch_device
 
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
-    apply_ops_unpatch,
     build_base_model_optim,
     compare_multi_items,
     prepare_data,
@@ -34,6 +36,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     config = AutoConfig.from_pretrained(config_path)
     print_device_mem_info("[Memory Info] start train_compare_models:")
 
+    # 1. build base model once
     model_base, optim_base = build_base_model_optim(
         config_path,
         attn_implementation=model_modes[0].attn_implementation,
@@ -44,50 +47,105 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     del model_base, optim_base
     print_device_mem_info("[Memory Info] after building the base model and optimizer:")
 
-    res = {}
-    # train and compare models
-    for idx, model_mode_cur in enumerate(model_modes):
-        model_source = "veomni" if model_mode_cur.modeling_backend == "veomni" else "hf"
-        running_id = f"[{config.model_type}_{model_source}]-[attn-{model_mode_cur.attn_implementation}]_[moe-{model_mode_cur.moe_implementation}]_[{model_mode_cur.attn_case}]"
-        print(f"{'-' * 10} {running_id=} {'-' * 10}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "state_dict.pt")
+        data_path = os.path.join(tmpdir, "dummy_data.pt")
+        torch.save(state_dict, model_path)
+        torch.save(dummy_data, data_path)
 
-        if model_source == "veomni":  # patch the veomni flash attention forward
-            os.environ["MODELING_BACKEND"] = "veomni"
-            apply_ops_patch()
-        else:  # unpatch the veomni flash attention forward
-            apply_ops_unpatch()
-            os.environ["MODELING_BACKEND"] = "hf"
+        outputs = {}
 
-        model_cur, optim_cur = build_base_model_optim(
-            config_path,
-            attn_implementation=model_mode_cur.attn_implementation,
-            moe_implementation=model_mode_cur.moe_implementation,
-        )
+        for idx, model_mode in enumerate(model_modes):
+            output_path = os.path.join(tmpdir, f"result_{idx}.json")
 
-        print_device_mem_info(f"[Memory Info] after building the model and optimizer {idx}:")
+            running_id = (
+                f"[{config.model_type}_"
+                f"{model_mode.modeling_backend}]"
+                f"-[attn-{model_mode.attn_implementation}]"
+                f"_[moe-{model_mode.moe_implementation}]"
+                f"_[{model_mode.attn_case}]"
+            )
+            print(f"{'-' * 10} {running_id=} {'-' * 10}")
+            env = os.environ.copy()
+            env["MODELING_BACKEND"] = "hf" if model_mode.modeling_backend == "hf" else "veomni"
 
-        # apply sync weight so that the weight init is the same between models
-        if model_mode_cur.sync_weight_func is None:
-            model_cur.load_state_dict(state_dict)
-        else:
-            model_mode_cur.sync_weight_func(config, state_dict, model_cur)
+            cmd = [
+                "python",
+                "-m",
+                "tests.models.test_models_patch_new",
+                "--config_path",
+                config_path,
+                "--model_path",
+                model_path,
+                "--data_path",
+                data_path,
+                "--attn_impl",
+                model_mode.attn_implementation,
+                "--moe_impl",
+                model_mode.moe_implementation,
+                "--attn_case",
+                model_mode.attn_case,
+                "--output_path",
+                output_path,
+            ]
 
-        loss, gnorm = train_one_step(model_cur, optim_cur, dummy_data[model_mode_cur.attn_case])
-        res[running_id] = {
-            "loss": loss.item(),
-            "gnorm": gnorm.item(),
-        }
-        print_device_mem_info(f"[Memory Info] after model {idx} train_one_step:")
+            proc = subprocess.Popen(cmd, env=env)
 
-        del model_cur, optim_cur, loss, gnorm
+            ret = proc.wait()
+            assert ret == 0, f"{running_id} failed"
 
-    assert len(res) == len(model_modes)
-    print_all_values(res, "loss")
-    print_all_values(res, "gnorm")
-    compare_multi_items(res, rtol=rtol, atol=atol)
+            with open(output_path) as f:
+                outputs[running_id] = json.load(f)
+
+    # 3. compare
+    print_all_values(outputs, "loss")
+    print_all_values(outputs, "gnorm")
+    compare_multi_items(outputs, rtol=rtol, atol=atol)
 
     gc.collect()
     get_torch_device().empty_cache()
 
     print_device_mem_info("[Memory Info] after running train_compare_models:")
-    return res
+
+
+def main(args):
+    config_path = args.config_path
+    model_path = args.model_path
+    data_path = args.data_path
+    attn_impl = args.attn_impl
+    moe_impl = args.moe_impl
+    attn_case = args.attn_case
+    output_path = args.output_path
+    model_cur, optim_cur = build_base_model_optim(
+        config_path,
+        attn_implementation=attn_impl,
+        moe_implementation=moe_impl,
+    )
+
+    state_dict = torch.load(model_path)
+    dummy_data = torch.load(data_path)
+    model_cur.load_state_dict(state_dict)
+
+    loss, gnorm = train_one_step(model_cur, optim_cur, dummy_data[attn_case])
+    res = {
+        "loss": loss.item(),
+        "gnorm": gnorm.item(),
+    }
+
+    json.dump(res, open(output_path, "w"), indent=4)
+
+    del model_cur, optim_cur, loss, gnorm
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_path", type=str)
+    parser.add_argument("--model_path", type=str)
+    parser.add_argument("--data_path", type=str)
+    parser.add_argument("--attn_impl", type=str)
+    parser.add_argument("--moe_impl", type=str)
+    parser.add_argument("--attn_case", type=str)
+    parser.add_argument("--output_path", type=str)
+    args = parser.parse_args()
+
+    main(args)
