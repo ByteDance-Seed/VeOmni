@@ -48,6 +48,23 @@ dit = [
   "diffusers>=0.30.0,<=0.31.0",
   "bitsandbytes>=0.46.0,<=0.47.0"
 ]
+npu-aarch64 = [
+  "torch==2.7.1",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1",
+  "torchaudio==2.7.1",
+  "decorator>=5.2.1",
+  "scipy>=1.16.2"
+]
+npu-x86 = [
+  "torch==2.7.1+cpu",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1+cpu",
+  "torchaudio==2.7.1+cpu",
+  "decorator>=5.2.1",
+  "scipy>=1.16.2"
+]
+# Legacy alias for backward compatibility - uses platform detection
 npu = [
   "torch==2.7.1; platform_machine == 'aarch64'",
   "torch==2.7.1+cpu; platform_machine != 'aarch64'",
@@ -115,9 +132,17 @@ override-dependencies = [
     "torch==2.8.0+cu128; (extra == 'gpu')",
     "torchaudio==2.8.0+cu128; (extra == 'gpu')",
     "torchvision==0.23.0+cu128; (extra == 'gpu')",
-    # Adding explicit override for other backends as well. Otherwise these libraries
-    # will be excluded for other backends.
-    "torch==2.7.1+cpu; (extra == 'npu')",
+    # Adding explicit override for NPU backends - aarch64 variant
+    "torch==2.7.1; (extra == 'npu-aarch64')",
+    "torchaudio==2.7.1; (extra == 'npu-aarch64')",
+    "torchvision==0.22.1; (extra == 'npu-aarch64')",
+    # Adding explicit override for NPU backends - x86 variant
+    "torch==2.7.1+cpu; (extra == 'npu-x86')",
+    "torchaudio==2.7.1+cpu; (extra == 'npu-x86')",
+    "torchvision==0.22.1+cpu; (extra == 'npu-x86')",
+    # Legacy npu extra with platform detection
+    "torch==2.7.1; (extra == 'npu') and (platform_machine == 'aarch64')",
+    "torch==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
     "torchaudio==2.7.1; (extra == 'npu') and (platform_machine == 'aarch64')",
     "torchvision==0.22.1; (extra == 'npu') and (platform_machine == 'aarch64')",
     "torchaudio==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
@@ -130,13 +155,16 @@ conflicts = [
   [
     { extra = "gpu" },
     { extra = "npu" },
+    { extra = "npu-aarch64" },
+    { extra = "npu-x86" },
   ],
 ]
 
 [tool.uv.sources]
 # To support override-dependencies for multiple extras, one package can only have one index.
+# Using pytorch index for all variants since it has both regular and +cpu versions
 torch = [
-  { index = "pytorch", extra = "npu" },
+  { index = "pytorch", marker = "(extra != 'gpu')" },
   # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
   # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
   # those nvidia packages.
@@ -146,10 +174,7 @@ torch = [
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
   { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
 ]
-torchvision = [ # npu aarch64 need install torchvison from pytorch-cpu
-  { index = "pytorch-cpu", marker = "(extra == 'npu') and (platform_machine == 'aarch64') and (extra != 'gpu')" },
-  { index = "pytorch", marker = "(extra != 'npu') or (platform_machine != 'aarch64') or (extra == 'gpu')"},
-]
+torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Download flash-attn wheel directly to avoid build issues.
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' or extra == 'sglang'" }
