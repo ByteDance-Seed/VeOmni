@@ -27,7 +27,7 @@ from transformers.utils import (
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
-from ....ops.loss import causallm_loss_function, seqcls_last_token_loss_and_logits
+from ....ops.loss import causallm_loss_function, seqcls_token_loss_sp_aware
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
 from ...module_utils import GradientCheckpointingLayer
@@ -873,6 +873,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
+IGNORE_INDEX = -100
+
+
 class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
     """
     Adapted from transformers.models.qwen3.modeling_qwen3.Qwen3ForSequenceClassification.
@@ -890,7 +893,7 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
         # we're not using AutoModel here, but our own Qwen3Model.
         setattr(self, self.base_model_prefix, Qwen3Model(config))
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-        self.loss_fct = CrossEntropyLoss()
+        self.loss_fct = CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -910,7 +913,6 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> SequenceClassifierOutputWithPast:
         transformer: Qwen3Model = getattr(self, self.base_model_prefix)
-
         transformer_outputs: BaseModelOutputWithPast = transformer(
             input_ids,
             attention_mask=attention_mask,
@@ -922,21 +924,32 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
             max_seqlen=max_seqlen,
             **kwargs,
         )
-        hidden_states = transformer_outputs.last_hidden_state
 
-        loss, pooled_logits = seqcls_last_token_loss_and_logits(
-            hidden_states=hidden_states,
-            classifier=self.score,
-            labels=labels,
-            cu_seqlens=cu_seqlens,
-            input_ids=input_ids,
-            pad_token_id=self.config.pad_token_id,
-            loss_fct=self.loss_fct,
-        )
+        hidden_states = transformer_outputs.last_hidden_state
+        logits = self.score(hidden_states)
+
+        loss = None
+        if labels is not None:
+            # labels are token-level now, shape must match logits tokens
+            if logits.dim() == 3:
+                # [B, L, C] -> [B*L, C]
+                B, L, C = logits.shape
+                logits_2d = logits.view(B * L, C)
+                labels_1d = labels.view(B * L).to(logits.device)
+            elif logits.dim() == 2:
+                # [T, C] -> [T, C]
+                logits_2d = logits
+                labels_1d = labels.view(-1).to(logits.device)
+            else:
+                raise ValueError(f"Unexpected logits shape: {logits.shape}")
+
+            ps = get_parallel_state()
+            sp_group = ps.sp_group if ps.sp_enabled else None
+            loss = seqcls_token_loss_sp_aware(logits_2d, labels_1d, self.loss_fct, sp_group)
 
         return SequenceClassifierOutputWithPast(
             loss=loss,
-            logits=pooled_logits,
+            logits=logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
