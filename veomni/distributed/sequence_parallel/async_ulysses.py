@@ -134,6 +134,9 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         k = k_res()
         k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
 
+        q = q.contiguous()
+        k = k.contiguous()
+
         # qk normalization (if needed)
         if norm_type is not None:
             if isinstance(normalized_shape, numbers.Integral):
