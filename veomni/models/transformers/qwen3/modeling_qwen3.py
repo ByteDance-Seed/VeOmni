@@ -32,8 +32,7 @@ from ...module_utils import GradientCheckpointingLayer
 
 
 if is_torch_flex_attn_available():
-    from torch.nn.attention.flex_attention import BlockMask
-    from transformers.integrations.flex_attention import make_flex_block_causal_mask
+    pass
 
 
 if is_liger_kernel_available():

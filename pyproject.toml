@@ -14,7 +14,7 @@ readme = "README.md"
 requires-python = ">=3.11, <3.12"
 license = { file = "LICENSE" }
 authors = [
-  { name="Fazzie", email="maqianli.fazzie@bytedance.com" },
+  { name="ByteDance-Seed", email="doubao-llm@bytedance.com" },
 ]
 
 dependencies = [
