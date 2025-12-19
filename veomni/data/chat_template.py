@@ -239,7 +239,12 @@ class ChatmlTemplate(ChatTemplate):
             content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
             input_ids += content_ids
             attention_mask += [1] * len(content_ids)
-            if message["loss_mask"] == 1:
+
+            if hasattr(message, "loss_mask"):
+                loss_mask = message["loss_mask"]
+            else:
+                loss_mask = 1 if message["role"] == "assistant" else 0
+            if loss_mask == 1:
                 labels += content_ids
             else:
                 labels += [IGNORE_INDEX] * len(content_ids)
