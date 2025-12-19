@@ -1,20 +1,22 @@
 model:
-  model_path: /opt/tiger/Open-VeOmni/Qwen3-8B-Base/Qwen3-8B-Base
+  model_path: Qwen/Qwen2.5-7B-Instruct
   attn_implementation: flash_attention_2
 
 data:
-  train_path: ./tulu-3-sft-mixture/mini_data
-  data_type: conversation
-  chat_template: chatml
+  train_path: fineweb
+  train_size: 1000000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
   max_seq_len: 8192
-  train_size: 4000000
-  text_keys: messages
+  text_keys: text
+  drop_last: true
 
 train:
-  output_dir: Qwen3-8B-Instruct-tulu
+  output_dir: Qwen2.5-7B-Instruct_CT
   data_parallel_mode: fsdp1
   ulysses_parallel_size: 1
-  global_batch_size: 8
+  global_batch_size: 32
   micro_batch_size: 1
   rmpad: false
   rmpad_with_pos_ids: true
@@ -22,9 +24,11 @@ train:
   dyn_bsz_margin: 0
   dyn_bsz_buffer_size: 200
   optimizer: adamw
-  lr: 1.0e-4
-  lr_decay_style: cosine
-  num_train_epochs: 3
+  lr: 3.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
   max_grad_norm: 1.0
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
@@ -38,5 +42,5 @@ train:
   load_checkpoint_path: ""
   save_steps: 100
   save_hf_weights: true
-  wandb_project: Jiabin-VeOmni
-  wandb_name: Qwen3-8B-Instruct-tulu
+  wandb_project: Qwen2.5-7B-Instruct
+  wandb_name: Qwen2.5-7B-Instruct-CT
