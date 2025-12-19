@@ -1,5 +1,6 @@
 import copy
 import gc
+import os
 
 import pytest
 import torch
@@ -51,9 +52,11 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
         print(f"{'-' * 10} {running_id=} {'-' * 10}")
 
         if model_source == "veomni":  # patch the veomni flash attention forward
+            os.environ["MODELING_BACKEND"] = "veomni"
             apply_ops_patch()
         else:  # unpatch the veomni flash attention forward
             apply_ops_unpatch()
+            os.environ["MODELING_BACKEND"] = "hf"
 
         model_cur, optim_cur = build_base_model_optim(
             config_path,
