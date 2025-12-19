@@ -2,49 +2,36 @@ version = 1
 revision = 3
 requires-python = "==3.11.*"
 resolution-markers = [
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86'",
-    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86')",
-    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine == 'aarch64' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine != 'aarch64' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
 ]
 conflicts = [[
     { package = "veomni", extra = "gpu" },
     { package = "veomni", extra = "npu" },
     { package = "veomni", extra = "npu-aarch64" },
-    { package = "veomni", extra = "npu-x86" },
 ]]
 
 [manifest]
 overrides = [
-    { name = "torch", marker = "platform_machine == 'aarch64' and extra != 'gpu' and extra == 'npu'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torch", marker = "platform_machine == 'aarch64' and extra == 'gpu' and extra == 'npu'", specifier = "==2.7.1" },
-    { name = "torch", marker = "platform_machine != 'aarch64' and extra != 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
-    { name = "torch", marker = "platform_machine != 'aarch64' and extra == 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu" },
     { name = "torch", marker = "extra == 'gpu'", url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl" },
+    { name = "torch", marker = "extra != 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torch", marker = "extra != 'gpu' and extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torch", marker = "extra != 'gpu' and extra == 'npu-x86'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
+    { name = "torch", marker = "extra == 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu" },
     { name = "torch", marker = "extra == 'gpu' and extra == 'npu-aarch64'", specifier = "==2.7.1" },
-    { name = "torch", marker = "extra == 'gpu' and extra == 'npu-x86'", specifier = "==2.7.1+cpu" },
-    { name = "torchaudio", marker = "platform_machine == 'aarch64' and extra == 'npu'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchaudio", marker = "platform_machine != 'aarch64' and extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'gpu'", specifier = "==2.8.0+cu128", index = "https://download.pytorch.org/whl/" },
+    { name = "torchaudio", marker = "extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchaudio", marker = "extra == 'npu-x86'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
-    { name = "torchvision", marker = "platform_machine == 'aarch64' and extra == 'npu'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchvision", marker = "platform_machine != 'aarch64' and extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.23.0+cu128", index = "https://download.pytorch.org/whl/" },
+    { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchvision", marker = "extra == 'npu-x86'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "transformers", specifier = "==4.57.3" },
 ]
 
@@ -274,7 +261,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -327,7 +314,7 @@ name = "click"
 version = "8.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/46/61/de6cd827efad202d7057d93e0fed9294b96952e188f7384832791c7b2254/click-8.3.0.tar.gz", hash = "sha256:e7b8232224eba16f4ebe410c25ced9f7875cb5f3263ffc93cc3e8da705e229c4", size = 276943, upload-time = "2025-09-18T17:32:23.696Z" }
 wheels = [
@@ -591,7 +578,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
     { name = "fsspec" },
-    { name = "hf-xet", marker = "platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
+    { name = "hf-xet", marker = "platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "packaging" },
     { name = "pyyaml" },
     { name = "requests" },
@@ -1039,7 +1026,7 @@ name = "nvidia-cudnn-cu12"
 version = "9.10.2.21"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fa/41/e79269ce215c857c935fd86bcfe91a451a584dfc27f1e068f568b9ad1ab7/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:c9132cc3f8958447b4910a1720036d9eff5928cc3179b0a51fb6d167c6cc87d8", size = 705026878, upload-time = "2025-06-06T21:52:51.348Z" },
@@ -1052,7 +1039,7 @@ name = "nvidia-cufft-cu12"
 version = "11.3.3.83"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/bc/7771846d3a0272026c416fbb7e5f4c1f146d6d80704534d0b187dd6f4800/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:848ef7224d6305cdb2a4df928759dca7b1201874787083b6e7550dd6765ce69a", size = 193109211, upload-time = "2025-03-07T01:44:56.873Z" },
@@ -1084,9 +1071,9 @@ name = "nvidia-cusolver-cu12"
 version = "11.7.3.90"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparse-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cusparse-cu12" },
+    { name = "nvidia-nvjitlink-cu12" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/32/f7cd6ce8a7690544d084ea21c26e910a97e077c9b7f07bf5de623ee19981/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:db9ed69dbef9715071232caa9b69c52ac7de3a95773c2db65bdba85916e4e5c0", size = 267229841, upload-time = "2025-03-07T01:46:54.356Z" },
@@ -1099,7 +1086,7 @@ name = "nvidia-cusparse-cu12"
 version = "12.5.8.93"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/f7/cd777c4109681367721b00a106f491e0d0d15cfa1fd59672ce580ce42a97/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9b6c161cb130be1a07a27ea6923df8141f3c295852f4b260c65f18f3e0a091dc", size = 288117129, upload-time = "2025-03-07T01:47:40.407Z" },
@@ -1428,7 +1415,7 @@ name = "pytest"
 version = "7.4.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -1912,9 +1899,8 @@ name = "torchaudio"
 version = "2.7.1"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
+    "sys_platform == 'darwin'",
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torchaudio-2.7.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d5a62f88c629035913f506df03f710c48fc8bb9637191933f27c67088d5ca136" },
@@ -1927,10 +1913,8 @@ name = "torchaudio"
 version = "2.7.1+cpu"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86'",
-    "platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine != 'aarch64' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
+    "sys_platform == 'linux'",
+    "sys_platform != 'linux'",
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torchaudio-2.7.1%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:79b75d9f8dadad5da128fd6677fe717669ce580c0d54c8407792854ac8b97349" },
@@ -1942,9 +1926,8 @@ name = "torchaudio"
 version = "2.7.1+xpu"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86')",
-    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine == 'aarch64' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "sys_platform != 'darwin' and sys_platform != 'linux'",
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/xpu/torchaudio-2.7.1%2Bxpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:c9e17b884870f5e0ebc4d7322202629923ea28f0ca19d7fca5bb0a87aace8f56" },
@@ -1981,13 +1964,12 @@ name = "torchvision"
 version = "0.22.1"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
+    "sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (platform_python_implementation != 'CPython' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (platform_python_implementation != 'CPython' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86')" },
+    { name = "numpy", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or sys_platform == 'darwin'" },
+    { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:4addf626e2b57fc22fd6d329cf1346d474497672e6af8383b7b5b636fba94a53" },
@@ -2000,17 +1982,14 @@ name = "torchvision"
 version = "0.22.1+cpu"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86'",
-    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86')",
-    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine == 'aarch64' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
-    "platform_machine != 'aarch64' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-npu-x86'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
 ]
 dependencies = [
-    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "pillow", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "pillow", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:4e0cbc165a472605d0c13da68ae22e84b17a6b815d5e600834777823e1bcb658" },
@@ -2039,7 +2018,7 @@ name = "tqdm"
 version = "4.67.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a8/4b/29b4ef32e036bb34e4ab51796dd745cdba7ed47ad142a9f4a1eb8e0c744d/tqdm-4.67.1.tar.gz", hash = "sha256:f8aef9c52c08c13a65f30ea34f4e5aac3fd1a34959879d7e59e63027286627f2", size = 169737, upload-time = "2024-11-24T20:12:22.481Z" }
 wheels = [
@@ -2210,27 +2189,17 @@ npu = [
     { name = "decorator" },
     { name = "scipy" },
     { name = "torch-npu" },
-    { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "torchaudio", version = "2.7.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "torchaudio", version = "2.7.1+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86')" },
+    { name = "torchaudio", version = "2.7.1+cpu", source = { registry = "https://download.pytorch.org/whl/" } },
+    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" } },
 ]
 npu-aarch64 = [
     { name = "decorator" },
     { name = "scipy" },
     { name = "torch-npu" },
-    { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "torchaudio", version = "2.7.1+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86')" },
-    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-x86') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-x86')" },
-]
-npu-x86 = [
-    { name = "decorator" },
-    { name = "scipy" },
-    { name = "torch-npu" },
-    { name = "torchaudio", version = "2.7.1+cpu", source = { registry = "https://download.pytorch.org/whl/" } },
-    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" } },
+    { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchaudio", version = "2.7.1+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 trl = [
     { name = "trl" },
@@ -2260,7 +2229,6 @@ requires-dist = [
     { name = "datasets", specifier = ">=2.16.0,<=2.21.0" },
     { name = "decorator", marker = "extra == 'npu'", specifier = ">=5.2.1" },
     { name = "decorator", marker = "extra == 'npu-aarch64'", specifier = ">=5.2.1" },
-    { name = "decorator", marker = "extra == 'npu-x86'", specifier = ">=5.2.1" },
     { name = "diffusers", specifier = ">=0.30.0,<=0.31.0" },
     { name = "diffusers", marker = "extra == 'dit'", specifier = ">=0.30.0,<=0.31.0" },
     { name = "einops", specifier = ">=0.8.1" },
@@ -2280,39 +2248,29 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7.0,<1.0" },
     { name = "scipy", marker = "extra == 'npu'", specifier = ">=1.16.2" },
     { name = "scipy", marker = "extra == 'npu-aarch64'", specifier = ">=1.16.2" },
-    { name = "scipy", marker = "extra == 'npu-x86'", specifier = ">=1.16.2" },
     { name = "setuptools" },
     { name = "soundfile", marker = "extra == 'audio'", specifier = ">=0.13.1,<0.14" },
     { name = "tiktoken", specifier = ">=0.9.0" },
     { name = "timm" },
-    { name = "torch", marker = "platform_machine == 'aarch64' and extra != 'gpu' and extra == 'npu'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torch", marker = "platform_machine == 'aarch64' and extra == 'gpu' and extra == 'npu'", specifier = "==2.7.1" },
-    { name = "torch", marker = "platform_machine != 'aarch64' and extra != 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
-    { name = "torch", marker = "platform_machine != 'aarch64' and extra == 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu" },
     { name = "torch", marker = "extra == 'gpu'", url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl" },
+    { name = "torch", marker = "extra != 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torch", marker = "extra != 'gpu' and extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torch", marker = "extra != 'gpu' and extra == 'npu-x86'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
+    { name = "torch", marker = "extra == 'gpu' and extra == 'npu'", specifier = "==2.7.1+cpu" },
     { name = "torch", marker = "extra == 'gpu' and extra == 'npu-aarch64'", specifier = "==2.7.1" },
-    { name = "torch", marker = "extra == 'gpu' and extra == 'npu-x86'", specifier = "==2.7.1+cpu" },
     { name = "torch-npu", marker = "extra == 'npu'", specifier = "==2.7.1" },
     { name = "torch-npu", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1" },
-    { name = "torch-npu", marker = "extra == 'npu-x86'", specifier = "==2.7.1" },
-    { name = "torchaudio", marker = "platform_machine == 'aarch64' and extra == 'npu'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchaudio", marker = "platform_machine != 'aarch64' and extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'gpu'", specifier = "==2.8.0+cu128", index = "https://download.pytorch.org/whl/" },
+    { name = "torchaudio", marker = "extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchaudio", marker = "extra == 'npu-x86'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchdata", specifier = ">=0.8.0,<1.0" },
-    { name = "torchvision", marker = "platform_machine == 'aarch64' and extra == 'npu'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchvision", marker = "platform_machine != 'aarch64' and extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.23.0+cu128", index = "https://download.pytorch.org/whl/" },
+    { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchvision", marker = "extra == 'npu-x86'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "transformers", extras = ["torch"], specifier = "==4.57.3" },
     { name = "trl", marker = "extra == 'trl'", specifier = "<=0.9.6" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "audio", "dit", "npu-aarch64", "npu-x86", "npu", "gpu", "megatron", "trl"]
+provides-extras = ["dev", "audio", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl"]
 
 [package.metadata.requires-dev]
 dev = [

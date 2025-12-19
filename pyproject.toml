@@ -48,7 +48,7 @@ dit = [
   "diffusers>=0.30.0,<=0.31.0",
   "bitsandbytes>=0.46.0,<=0.47.0"
 ]
-npu-aarch64 = [
+npu_aarch64 = [
   "torch==2.7.1",
   "torch-npu==2.7.1",
   "torchvision==0.22.1",
@@ -56,23 +56,11 @@ npu-aarch64 = [
   "decorator>=5.2.1",
   "scipy>=1.16.2"
 ]
-npu-x86 = [
+npu = [
   "torch==2.7.1+cpu",
   "torch-npu==2.7.1",
   "torchvision==0.22.1+cpu",
   "torchaudio==2.7.1+cpu",
-  "decorator>=5.2.1",
-  "scipy>=1.16.2"
-]
-# Legacy alias for backward compatibility - uses platform detection
-npu = [
-  "torch==2.7.1; platform_machine == 'aarch64'",
-  "torch==2.7.1+cpu; platform_machine != 'aarch64'",
-  "torch-npu==2.7.1",
-  "torchvision==0.22.1; platform_machine == 'aarch64'",
-  "torchaudio==2.7.1; platform_machine == 'aarch64'",
-  "torchvision==0.22.1+cpu; platform_machine != 'aarch64'",
-  "torchaudio==2.7.1+cpu; platform_machine != 'aarch64'",
   "decorator>=5.2.1",
   "scipy>=1.16.2"
 ]
@@ -133,20 +121,13 @@ override-dependencies = [
     "torchaudio==2.8.0+cu128; (extra == 'gpu')",
     "torchvision==0.23.0+cu128; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
-    "torch==2.7.1; (extra == 'npu-aarch64')",
-    "torchaudio==2.7.1; (extra == 'npu-aarch64')",
-    "torchvision==0.22.1; (extra == 'npu-aarch64')",
-    # Adding explicit override for NPU backends - x86 variant
-    "torch==2.7.1+cpu; (extra == 'npu-x86')",
-    "torchaudio==2.7.1+cpu; (extra == 'npu-x86')",
-    "torchvision==0.22.1+cpu; (extra == 'npu-x86')",
-    # Legacy npu extra with platform detection
-    "torch==2.7.1; (extra == 'npu') and (platform_machine == 'aarch64')",
-    "torch==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
-    "torchaudio==2.7.1; (extra == 'npu') and (platform_machine == 'aarch64')",
-    "torchvision==0.22.1; (extra == 'npu') and (platform_machine == 'aarch64')",
-    "torchaudio==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
-    "torchvision==0.22.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
+    "torch==2.7.1; (extra == 'npu_aarch64')",
+    "torchaudio==2.7.1; (extra == 'npu_aarch64')",
+    "torchvision==0.22.1; (extra == 'npu_aarch64')",
+    # Adding explicit override for NPU backends - x86 variant (default npu)
+    "torch==2.7.1+cpu; (extra == 'npu')",
+    "torchaudio==2.7.1+cpu; (extra == 'npu')",
+    "torchvision==0.22.1+cpu; (extra == 'npu')",
     # Fixate to a specific transformers version since upgrading transformers is a large task.
     "transformers==4.57.3",
 ]
@@ -155,8 +136,7 @@ conflicts = [
   [
     { extra = "gpu" },
     { extra = "npu" },
-    { extra = "npu-aarch64" },
-    { extra = "npu-x86" },
+    { extra = "npu_aarch64" },
   ],
 ]
 
