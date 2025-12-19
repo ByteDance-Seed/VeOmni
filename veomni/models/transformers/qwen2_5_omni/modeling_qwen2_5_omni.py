@@ -3125,8 +3125,8 @@ class Qwen2_5OmniTalkerModel(Qwen2_5OmniPreTrainedModel):
         output_attentions: bool = False,
     ):
         if (
-            "flash_attention_2" in self.config._attn_implementation
-            or "flash_attention_3" in self.config._attn_implementation
+            self.config._attn_implementation == "flash_attention_2"
+            or self.config._attn_implementation == "flash_attention_3"
         ):
             if attention_mask is not None and past_key_values is not None:
                 is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]

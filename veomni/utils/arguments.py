@@ -87,12 +87,10 @@ class ModelArguments:
             "sdpa",
             "flash_attention_2",
             "flash_attention_3",
-            "veomni_flash_attention_2",
-            "veomni_flash_attention_3",
             "native-sparse",
         ]
     ] = field(
-        default="veomni_flash_attention_2",
+        default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
     moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(

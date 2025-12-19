@@ -641,8 +641,8 @@ class LlamaModel(LlamaPreTrainedModel):
         output_attentions: bool,
     ):
         if (
-            "flash_attention_2" in self.config._attn_implementation
-            or "flash_attention_3" in self.config._attn_implementation
+            self.config._attn_implementation == "flash_attention_2"
+            or self.config._attn_implementation == "flash_attention_3"
         ):
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask

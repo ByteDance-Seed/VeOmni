@@ -28,9 +28,6 @@ logger = get_logger(__name__)
 
 
 def _safe_apply_patches():
-    apply_ops_patch()
-    logger.info_rank0("✅ veomni ops patched")
-
     if is_veomni_patch_available():
         from veomni_patch import apply_patch
 

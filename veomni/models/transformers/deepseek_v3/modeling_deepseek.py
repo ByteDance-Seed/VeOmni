@@ -940,7 +940,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.layers = nn.ModuleList(
             [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self._use_flash_attention_2 = "flash_attention_2" in config._attn_implementation
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._init_rope(config)
 

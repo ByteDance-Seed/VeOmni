@@ -67,8 +67,6 @@ def build_foundation_model(
             "flash_attention_2",
             "flash_attention_3",
             "native-sparse",
-            "veomni_flash_attention_2",
-            "veomni_flash_attention_3",
         ]
     ] = "flash_attention_2",
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
@@ -96,6 +94,11 @@ def build_foundation_model(
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
     loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)
+
+    if not force_use_huggingface:
+        from ..ops import apply_ops_patch
+
+        apply_ops_patch()
 
     init_kwargs = {
         "config": config,

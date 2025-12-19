@@ -54,9 +54,7 @@ def prepare_models_modes(is_moe: bool = False):
         ModelMode(force_use_huggingface=True, attn_implementation="eager", attn_case="padded_bsh"),
         ModelMode(force_use_huggingface=False, attn_implementation="eager", attn_case="padded_bsh"),
         ModelMode(force_use_huggingface=True, attn_implementation="flash_attention_2", attn_case="position_ids"),
-        ModelMode(
-            force_use_huggingface=False, attn_implementation="veomni_flash_attention_2", attn_case="position_ids"
-        ),
+        ModelMode(force_use_huggingface=False, attn_implementation="flash_attention_2", attn_case="position_ids"),
     ]
     if not is_torch_npu_available():
         base_model_modes.extend(
@@ -66,7 +64,7 @@ def prepare_models_modes(is_moe: bool = False):
                 ),
                 ModelMode(
                     force_use_huggingface=False,
-                    attn_implementation="veomni_flash_attention_3",
+                    attn_implementation="flash_attention_3",
                     attn_case="position_ids",
                 ),
             ]
@@ -93,7 +91,7 @@ def prepare_models_modes(is_moe: bool = False):
         ),
         ModelMode(
             force_use_huggingface=False,
-            attn_implementation="veomni_flash_attention_2",
+            attn_implementation="flash_attention_2",
             attn_case="position_ids",
             moe_implementation="fused",
         ),
@@ -236,3 +234,11 @@ def compare_multi_items(outputs_dict: Dict, rtol=1e-3, atol=1e-5):
         except AssertionError:
             print_all_values(outputs_dict, "gnorm")
             raise AssertionError("Gnorm not match")
+
+
+def apply_veomni_attention_unpatch():
+    from transformers.integrations.flash_attention import flash_attention_forward
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)

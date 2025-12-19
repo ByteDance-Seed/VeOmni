@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, flash_attention_mask
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -188,12 +187,8 @@ def _veomni_flash_attention_forward(
 
 
 def apply_veomni_attention_patch():
-    ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2", flash_attention_forward)
-    ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3", flash_attention_forward)
-
-    ALL_FLASH_ATTENTION_FUNCTIONS["veomni_flash_attention_2"] = _flash_attention_forward
-    ALL_FLASH_ATTENTION_FUNCTIONS["veomni_flash_attention_3"] = _flash_attention_forward
-
-    ALL_MASK_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2", flash_attention_mask)
-    ALL_MASK_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3", flash_attention_mask)
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
+    ALL_FLASH_ATTENTION_FUNCTIONS["flash_attention_2"] = _flash_attention_forward
+    ALL_FLASH_ATTENTION_FUNCTIONS["flash_attention_3"] = _flash_attention_forward
     logger.info_rank0("✅ Transformers ALL_ATTENTION_FUNCTIONS patched with new flash_attention_forward in VeOmni")
