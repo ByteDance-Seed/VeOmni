@@ -107,7 +107,7 @@ def prepare_models_modes(is_moe: bool = False):
                 ),
                 ModelMode(
                     force_use_huggingface=False,
-                    attn_implementation="veomni_flash_attention_3",
+                    attn_implementation="flash_attention_3",
                     attn_case="position_ids",
                     moe_implementation="fused",
                 ),
