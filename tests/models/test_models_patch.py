@@ -46,7 +46,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     res = {}
     # train and compare models
     for idx, model_mode_cur in enumerate(model_modes):
-        model_source = "veomni" if model_mode_cur.modeling_backend else "hf"
+        model_source = "veomni" if model_mode_cur.modeling_backend == "veomni" else "hf"
         running_id = f"[{config.model_type}_{model_source}]-[attn-{model_mode_cur.attn_implementation}]_[moe-{model_mode_cur.moe_implementation}]_[{model_mode_cur.attn_case}]"
         print(f"{'-' * 10} {running_id=} {'-' * 10}")
 

@@ -72,8 +72,9 @@ def get_model_config(config_path: str, **kwargs):
             return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
 
 
-def get_model_processor(processor_path: str, force_use_huggingface: bool = False, **kwargs):
-    if force_use_huggingface:
+def get_model_processor(processor_path: str, **kwargs):
+    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    if modeling_backend == "hf":
         logger.info_rank0("[PROCESSOR] Force loading model processor from Huggingface.")
         return AutoProcessor.from_pretrained(processor_path, **kwargs)
     else:
@@ -104,7 +105,7 @@ def get_model_processor(processor_path: str, force_use_huggingface: bool = False
             return MODEL_PROCESSOR_REGISTRY[processor_class_name]().from_pretrained(processor_path, **kwargs)
 
 
-def get_model_class(model_config: PretrainedConfig, force_use_huggingface: bool = False):
+def get_model_class(model_config: PretrainedConfig):
     def get_model_arch_from_config(model_config):
         arch_name = model_config.architectures
         if isinstance(arch_name, list):
@@ -125,7 +126,9 @@ def get_model_class(model_config: PretrainedConfig, force_use_huggingface: bool 
         load_class = AutoModelForCausalLM
     else:
         load_class = AutoModel
-    if force_use_huggingface:
+
+    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    if modeling_backend == "hf":
         return load_class
     return MODELING_REGISTRY[model_type](arch_name)
 
@@ -222,9 +225,10 @@ class CustomizedModelingLoader(BaseModelLoader):
         return model
 
 
-def get_loader(model_config, force_use_huggingface):
-    model_cls = get_model_class(model_config, force_use_huggingface)
-    if force_use_huggingface:
+def get_loader(model_config):
+    model_cls = get_model_class(model_config)
+    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    if modeling_backend == "hf":
         loader = HuggingfaceLoader(model_cls=model_cls)
     else:
         loader = CustomizedModelingLoader(model_cls=model_cls)
