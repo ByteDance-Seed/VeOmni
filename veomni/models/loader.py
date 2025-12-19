@@ -15,6 +15,7 @@
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py
 
+import os
 from abc import ABC
 
 import torch
@@ -42,8 +43,9 @@ MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
 logger = logging.get_logger(__name__)
 
 
-def get_model_config(config_path: str, force_use_huggingface: bool = False, **kwargs):
-    if force_use_huggingface:
+def get_model_config(config_path: str, **kwargs):
+    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    if modeling_backend == "hf":
         logger.info_rank0("[CONFIG] Force loading model config from Huggingface.")
         return AutoConfig.from_pretrained(config_path, **kwargs)
     else:

@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ..utils import logging
 from .attention import flash_attention_forward
 from .fused_moe import fused_moe_forward
 from .loss import causallm_loss_function
 
+
+logger = logging.get_logger(__name__)
 
 __all__ = [
     "flash_attention_forward",
@@ -25,6 +28,13 @@ __all__ = [
 
 
 def apply_ops_patch():
-    from .attention import apply_veomni_attention_patch
+    import os
 
-    apply_veomni_attention_patch()
+    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    if modeling_backend == "hf":
+        logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
+    else:
+        from .attention import apply_veomni_attention_patch
+
+        apply_veomni_attention_patch()
+        logger.info_rank0("✅ VeOmni ops patch applied.")
