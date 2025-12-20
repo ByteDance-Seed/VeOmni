@@ -132,8 +132,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # For GPU (CUDA 12.8)
 uv sync --extra gpu
 
-# For Ascend NPU
+# For Ascend NPU (x86)
 uv sync --extra npu
+
+# For Ascend NPU (aarch64/ARM)
+uv sync --extra npu_aarch64
 
 # Install multiple extras (e.g., GPU + audio + DiT support)
 uv sync --extra gpu --extra audio --extra dit
@@ -144,7 +147,8 @@ source .venv/bin/activate
 
 **Available extras**:
 - `gpu`: CUDA 12.8 support with torch 2.8.0, flash-attention, liger-kernel
-- `npu`: Ascend NPU support with torch-npu
+- `npu`: Ascend NPU support for x86 with torch-npu
+- `npu_aarch64`: Ascend NPU support for aarch64/ARM with torch-npu
 - `audio`: Audio processing libraries (av, librosa, soundfile)
 - `dit`: Diffusion model support (diffusers, bitsandbytes)
 - `megatron`: Megatron-Energon support
