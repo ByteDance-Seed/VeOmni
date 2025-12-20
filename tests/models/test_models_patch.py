@@ -72,7 +72,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
             cmd = [
                 "python",
                 "-m",
-                "tests.models.test_models_patch_new",
+                "tests.models.test_models_patch",
                 "--config_path",
                 config_path,
                 "--model_path",

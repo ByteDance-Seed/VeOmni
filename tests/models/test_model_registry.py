@@ -1,5 +1,3 @@
-import os
-
 import pytest
 
 from veomni.models.loader import get_model_class, get_model_config, get_model_processor
@@ -15,8 +13,8 @@ local_test_cases = [
 @pytest.mark.parametrize(
     "config_path, is_hf_model, load_processor, hf_registered, veomni_registered", local_test_cases
 )
-def test_local_model_registry(config_path, is_hf_model, load_processor, hf_registered, veomni_registered):
-    os.environ["MODELING_BACKEND"] = "hf"
+def test_local_model_registry(monkeypatch, config_path, is_hf_model, load_processor, hf_registered, veomni_registered):
+    monkeypatch.setenv("MODELING_BACKEND", "hf")
     if is_hf_model:
         save_path = get_cache_dir(config_path)
         hf_config = get_model_config(config_path)
@@ -31,7 +29,7 @@ def test_local_model_registry(config_path, is_hf_model, load_processor, hf_regis
             )
             hf_processor.save_pretrained(save_path)
 
-    os.environ["MODELING_BACKEND"] = "veomni"
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     save_path = get_cache_dir(config_path)
     veomni_config = get_model_config(config_path)
     assert veomni_config.__class__.__module__.startswith(
@@ -57,8 +55,8 @@ remote_test_cases = [
 
 
 @pytest.mark.parametrize("config_path, hf_registered, veomni_registered", remote_test_cases)
-def test_remote_model_registry(config_path, hf_registered, veomni_registered):
-    os.environ["MODELING_BACKEND"] = "hf"
+def test_remote_model_registry(monkeypatch, config_path, hf_registered, veomni_registered):
+    monkeypatch.setenv("MODELING_BACKEND", "hf")
     save_path = get_cache_dir(config_path)
     hf_config = get_model_config(config_path)
     assert hf_config.__class__.__module__.startswith("transformers." if "config" in hf_registered else "veomni.")
@@ -69,7 +67,7 @@ def test_remote_model_registry(config_path, hf_registered, veomni_registered):
     assert hf_processor.__class__.__module__.startswith("transformers." if "processor" in hf_registered else "veomni.")
     hf_processor.save_pretrained(save_path)
 
-    os.environ["MODELING_BACKEND"] = "veomni"
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     veomni_config = get_model_config(config_path)
     assert veomni_config.__class__.__module__.startswith(
         "veomni." if "config" in veomni_registered else "transformers."
