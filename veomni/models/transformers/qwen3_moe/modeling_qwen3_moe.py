@@ -1365,7 +1365,7 @@ if is_liger_kernel_available():
     Qwen3MoeRMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to Qwen3_moe.")
 
-if is_torch_npu_available() and is_transformers_version_greater_or_equal_to("4.54.4"):
+if is_torch_npu_available() and is_transformers_version_greater_or_equal_to("4.50.4"):
     from .npu_patch import apply_qwen3moe_npu_patch
 
     apply_qwen3moe_npu_patch()
