@@ -242,8 +242,8 @@ def apply_veomni_attention_unpatch():
 
 
 def set_environ_param(model_mode: ModelMode):
+    apply_veomni_attention_unpatch()
     if model_mode.modeling_backend == "veomni":
         os.environ["MODELING_BACKEND"] = "veomni"
     else:
         os.environ["MODELING_BACKEND"] = "hf"
-        apply_veomni_attention_unpatch()
