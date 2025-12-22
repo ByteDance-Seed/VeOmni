@@ -1,4 +1,4 @@
-# VeOmni's EP+FSDP2 for Large-scale MoE Model Training
+# EP+FSDP2 for Large-scale MoE Model Training
 
 **Author**: Tianle Zhong
 
@@ -33,7 +33,7 @@ This is to enable more flexible parallelism setup. Otherwise, if we also choose 
 
 ### Parallelism Setup
 
-![ep_fsdp2](../../assets/ep_fsdp2.png)
+![ep_fsdp2](../assets/ep_fsdp2.png)
 
 Let's take Qwen3-MoE-30B-A3B model for example, which has 128 experts, hidden dim size of 2048, and intermediate size of 768. So, we can view expert weights as
 

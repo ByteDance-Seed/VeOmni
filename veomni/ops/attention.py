@@ -1,7 +1,10 @@
-from typing import Literal, Optional, Tuple
+from typing import Optional
 
 import torch
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from transformers.modeling_flash_attention_utils import (
+    _flash_attention_forward as _transformers_flash_attention_forward,
+)
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..distributed.parallel_state import get_parallel_state
 from ..distributed.sequence_parallel import (
@@ -9,15 +12,15 @@ from ..distributed.sequence_parallel import (
     gather_seq_scatter_heads,
 )
 from ..utils import logging
-from ..utils.import_utils import is_seed_kernels_available
 
-
-if is_seed_kernels_available():
-    from seed_kernels.transformers.functional import seed_flash_attention_forward
 
 logger = logging.get_logger(__name__)
 
 
+# patch transformers.integrations.flash_attention.py
+# 1. set use_top_left_mask always False
+# 2. optional ulysses sp patch
+# 3. external flash attention backends (for internal use)
 def flash_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -28,28 +31,56 @@ def flash_attention_forward(
     scaling: Optional[float] = None,
     sliding_window: Optional[int] = None,
     softcap: Optional[float] = None,
-    implementation: Optional[Literal["fa2", "lego", "fa3"]] = None,
     skip_ulysses: bool = False,  # Skip ulysses for some ViT cases like internvl3.5
     **kwargs,
-) -> Tuple[torch.Tensor, None]:
-    if kwargs.get("output_attentions", False) or kwargs.get("head_mask", None) is not None:
+) -> tuple[torch.Tensor, None]:
+    if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
             "`flash_attention_2` does not support `output_attentions=True` or `head_mask`."
             " Please set your attention to `eager` if you want any of these features."
         )
 
+    # This is before the transpose
+    seq_len = query.shape[2]
+
+    if any(dim == 0 for dim in query.shape):
+        raise ValueError(
+            "Tensor query has shape  with a zero dimension.\n"
+            "FlashAttention does not support inputs with dim=0.\n"
+            "Please check your input shapes or use SDPA instead."
+        )
     # FA2 uses non-transposed inputs
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
 
-    # FA2 always relies on the value set in the module, so remove it if present in kwargs to avoid passing it twice
-    kwargs.pop("is_causal", None)
+    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+    # therefore the input hidden states gets silently casted in float32. Hence, we need
+    # cast them back in the correct dtype just to be sure everything works as expected.
+    # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+    # in fp32. (usually our RMSNorm modules handle it correctly)
+    target_dtype = None
+    if query.dtype == torch.float32:
+        if torch.is_autocast_enabled():
+            target_dtype = torch.get_autocast_gpu_dtype()
+        # Handle the case where the model is quantized
+        elif hasattr(module.config, "_pre_quantization_dtype"):
+            target_dtype = module.config._pre_quantization_dtype
+        else:
+            target_dtype = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype
+
+    # Instead of relying on the value set in the module directly, we use the is_causal passed in kwargs if it is presented
+    is_causal = kwargs.pop("is_causal", None)
+    if is_causal is None:
+        is_causal = module.is_causal
 
     # This is for Qwen2VL's mrope
-    position_ids = kwargs.pop("position_ids", None)
+
+    # TODO(szl): mv this to qwen2vl modeling
+    position_ids = kwargs.get("position_ids", None)
     if position_ids is not None and position_ids.dim() == 3:
         position_ids = position_ids[0]
+        kwargs["position_ids"] = position_ids
 
     # Ulysses patch
     ulysses_enabled = get_parallel_state().ulysses_enabled
@@ -99,48 +130,26 @@ def flash_attention_forward(
                 value, seq_dim=1, head_dim=2, group=ulysses_group, unpadded_dim_size=unpadded_seq_len
             )
 
-    # Only after all_to_all we got the full seq_len
-    seq_len = query.shape[1]
+        # Only after all_to_all we got the full seq_len
+        seq_len = query.shape[1]
 
-    if is_seed_kernels_available() and implementation is not None:
-        attn_output: torch.Tensor = seed_flash_attention_forward(
-            query,
-            key,
-            value,
-            attention_mask,
-            query_length=seq_len,
-            is_causal=module.is_causal,
-            dropout=dropout,
-            position_ids=position_ids,
-            softmax_scale=scaling,
-            sliding_window=sliding_window,
-            softcap=softcap,
-            use_top_left_mask=False,
-            implementation=implementation,
-            cu_seqlens=kwargs.get("cu_seq_lens_q", None),
-            max_seqlen=kwargs.get("max_length_q", None),
-            **kwargs,
-        )
-    else:
-        assert implementation is None, (
-            f"You set {implementation=} but seed_kernels is not installed. Check --model.attn_implementation."
-        )
-        attn_output: torch.Tensor = _flash_attention_forward(
-            query,
-            key,
-            value,
-            attention_mask,
-            query_length=seq_len,
-            is_causal=module.is_causal,
-            dropout=dropout,
-            position_ids=position_ids,
-            softmax_scale=scaling,
-            sliding_window=sliding_window,
-            softcap=softcap,
-            use_top_left_mask=False,
-            implementation="flash_attention_2",
-            **kwargs,
-        )
+    attn_output = _flash_attention_forward(
+        query,
+        key,
+        value,
+        attention_mask,
+        query_length=seq_len,
+        is_causal=is_causal,
+        dropout=dropout,
+        softmax_scale=scaling,
+        sliding_window=sliding_window,
+        softcap=softcap,
+        use_top_left_mask=False,
+        target_dtype=target_dtype,
+        attn_implementation=module.config._attn_implementation,
+        layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
+        **kwargs,
+    )
 
     # Ulysses patch
     if ulysses_enabled and not skip_ulysses:
@@ -153,3 +162,27 @@ def flash_attention_forward(
             attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2, group=ulysses_group)
 
     return attn_output, None
+
+
+def _flash_attention_forward(
+    query,
+    key,
+    value,
+    attention_mask,
+    **kwargs,
+):
+    attn_implementation = kwargs.pop("attn_implementation")
+    return _transformers_flash_attention_forward(
+        query,
+        key,
+        value,
+        attention_mask,
+        implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 to remove this patch
+        **kwargs,
+    )
+
+
+def apply_veomni_attention_patch():
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
+    logger.info_rank0("✅ Transformers ALL_ATTENTION_FUNCTIONS patched with new flash_attention_forward in VeOmni")

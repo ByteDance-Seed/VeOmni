@@ -48,7 +48,6 @@ from veomni.utils.device import (
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
 
-from .import_utils import is_veomni_patch_available
 from .multisource_utils import parse_multisource_config
 
 
@@ -63,42 +62,16 @@ if IS_NPU_AVAILABLE:
     import torch_npu
 
 
-if is_veomni_patch_available():
-    from veomni_patch.utils.helper import (
-        VALID_CONFIG_TYPE,
-        VEOMNI_UPLOAD_CMD,
-        FlopsCounter,
-        convert_hdfs_fuse_path,
-        is_remote_path,
-        load_step2token,
-        save_step2token,
-    )
-else:
+# internal use
+VALID_CONFIG_TYPE = None
+VEOMNI_UPLOAD_CMD = None
+FlopsCounter = None
 
-    def load_step2token(*args, **kwargs):
-        logger.warning("veomni_patch is not available, load_step2token will be skipped")
-        pass
 
-    def save_step2token(*args, **kwargs):
-        logger.warning("veomni_patch is not available, save_step2token will be skipped")
-        pass
-
-    def is_remote_path(*args, **kwargs):
-        logger.warning("veomni_patch is not available, is_remote_path returning False")
-        return False
-
-    def convert_hdfs_fuse_path(*args, **kwargs):
-        logger.warning("veomni_patch is not available, convert_hdfs_fuse_path returning path as-is")
-        if len(args) > 0:
-            return args[0]
-        return kwargs.get("path", None)
-
-    VALID_CONFIG_TYPE = None
-    VEOMNI_UPLOAD_CMD = None
-
-    class FlopsCounter:
-        def __init__(self):
-            raise ImportError("veomni_patch is not available, please install it first")
+def convert_hdfs_fuse_path(*args, **kwargs):
+    if len(args) > 0:
+        return args[0]
+    return kwargs.get("path", None)
 
 
 if TYPE_CHECKING:
@@ -178,7 +151,7 @@ class EnvironMeter:
         self.consume_tokens = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
-        self.image_seqlens = []
+        self.images_seqlens = []
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -214,13 +187,18 @@ class EnvironMeter:
 
         if "image_grid_thw" in micro_batch:
             image_grid_thw = micro_batch["image_grid_thw"]
-            image_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
-            self.image_seqlens.extend(image_seqlens.tolist())
+            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
+            self.images_seqlens.extend(images_seqlens.tolist())
+
+        if "image_grid_hw" in micro_batch:
+            image_grid_hw = micro_batch["image_grid_hw"]
+            images_seqlens = torch.repeat_interleave(image_grid_hw[:, 1], image_grid_hw[:, 0])
+            self.images_seqlens.extend(images_seqlens.tolist())
 
         if "video_grid_thw" in micro_batch:
             video_grid_thw = micro_batch["video_grid_thw"]
             video_seqlens = torch.repeat_interleave(video_grid_thw[:, 1] * video_grid_thw[:, 2], video_grid_thw[:, 0])
-            self.image_seqlens.extend(video_seqlens.tolist())  # video equals to image
+            self.images_seqlens.extend(video_seqlens.tolist())  # video equals to image
 
         if self.enable_multisource:
             self.batch_seqlens.extend(seqlens[: len(ds_idx)])  # rmpad_with_pos_ids has a pad item
@@ -229,9 +207,9 @@ class EnvironMeter:
             self.batch_seqlens.extend(seqlens)
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
-        if len(self.image_seqlens) > 0:
+        if len(self.images_seqlens) > 0:
             flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, image_seqlens=self.image_seqlens
+                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens
             )
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
@@ -289,7 +267,7 @@ class EnvironMeter:
 
         self.batch_seqlens = []
         self.batch_ds_idx = []
-        self.image_seqlens = []
+        self.images_seqlens = []
 
         return metrics
 
@@ -418,7 +396,7 @@ def create_logger(name: Optional[str] = None) -> "logging._Logger":
     """
     logger = builtin_logging.getLogger(name)
     formatter = builtin_logging.Formatter(
-        fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S"
+        fmt="[%(levelname)s|%(pathname)s:%(lineno)s] %(asctime)s >> %(message)s", datefmt="%m/%d/%Y %H:%M:%S"
     )
     handler = builtin_logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)

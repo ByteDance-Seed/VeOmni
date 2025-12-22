@@ -9,6 +9,7 @@ from veomni.utils.device import get_torch_device
 
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
+    apply_veomni_attention_unpatch,
     build_base_model_optim,
     compare_multi_items,
     prepare_data,
@@ -48,6 +49,10 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
         model_source = "hf" if model_mode_cur.force_use_huggingface else "veomni"
         running_id = f"[{config.model_type}_{model_source}]-[attn-{model_mode_cur.attn_implementation}]_[moe-{model_mode_cur.moe_implementation}]_[{model_mode_cur.attn_case}]"
         print(f"{'-' * 10} {running_id=} {'-' * 10}")
+
+        # unpatch the veomni flash attention forward
+        if model_mode_cur.force_use_huggingface:
+            apply_veomni_attention_unpatch()
 
         model_cur, optim_cur = build_base_model_optim(
             config_path,

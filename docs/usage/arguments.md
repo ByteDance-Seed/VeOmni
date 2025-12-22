@@ -1,5 +1,7 @@
-## Config arguments Explanation
-### Model configuration arguments
+(arguments-api-reference)=
+# Arguments API Reference
+
+## Model configuration arguments
 | Name | Type | Description | Default Value |
 | --- | --- | --- | --- |
 | model.config_path | str | Path to the model huggingface configuration, like `config.json` | model.model_path |
@@ -11,7 +13,7 @@
 | model.output_encoder | str: {"encoder", "decoder"} | Use the encoder of the encoder or decoder to encode the output image | decoder |
 | model.encode_target | bool | Used to encode the training data for the diffusion model | False |
 
-### Data configuration arguments
+## Data configuration arguments
 
 | Name | Type | Description | Default Value |
 | --- | --- | --- | --- |
@@ -29,7 +31,7 @@
 | data.pin_memory | bool | Whether to pin the data in the CPU memory. | True |
 | data.prefetch_factor | int | Number of samples preprocessed by the dataloader. | 2 |
 
-#### Training configuration arguments
+### Training configuration arguments
 | Name | Type | Description                                                                                                                                                                    | Default Value |
 | --- | --- |--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------| --- |
 | train.output_dir | str | Path to save the model.                                                                                                                                                        | Required |
@@ -49,7 +51,6 @@
 | train.lr_warmup_ratio | float | Proportion of learning rate warmup in the total number of steps.                                                                                                               | 0 |
 | train.lr_decay_style | str: {"constant", "linear", "cosine"} | Name of the learning rate scheduler.                                                                                                                                           | cosine |
 | train.lr_decay_ratio | float | Proportion of learning rate decay in the total number of steps                                                                                                                 | 1.0 |
-| train.use_doptim | bool | Whether to use the distributed optimizer during Vescale training(no use for torch fsdp)                                                                                        | False |
 | train.enable_mixed_precision | bool | Whether to enable mixed precision training (higher memory usage but more stable)                                                                                               | True |
 | train.enable_gradient_checkpointing | bool | Whether to enable gradient checkpointing to reduce memory usage.                                                                                                               | True |
 | train.enable_reentrant | bool | Whether to enable reentrant in gradient checkpointing.                                                                                                                         | True |
@@ -57,12 +58,10 @@
 | train.enable_fsdp_offload | bool | Whether to enable FSDP CPU offloading (only supported for FSDP1).                                                                                                              | False |
 | train.enable_activation_offload | bool | Whether to enable activation value CPU offloading.                                                                                                                             | False |
 | train.activation_gpu_limit | float | Size of the activation values retained on the GPU (in GB).                                                                                                                     | 0.0 |
-| train.enable_manual_eager | bool | Whether to use manual eager during Vescale training.                                                                                                                           | False |
 | train.init_device: meta | str | "cpu", "cuda", "meta", "npu", init device for model initialization. use "meta" or cpu for large model(>30B)                                                                    | cuda |
 | train.enable_full_determinism | bool | Whether to enable deterministic mode (for bitwise alignment).                                                                                                                  | False |
 | train.empty_cache_steps | int | Number of steps between two cache clearings. -1 means not enabled.                                                                                                             | 500 |
 | train.data_parallel_mode | str: {"ddp", "fsdp1", "fsdp2"} | Data parallel algorithm.                                                                                                                                                       | ddp |
-| train.tensor_parallel_size | int | Tensor parallel size (currently only supported for vescale training).                                                                                                          | 1 |
 | train.pipeline_parallel_size | int | Pipeline parallel size (currently not supported).                                                                                                                              | 1 |
 | train.ulysses_parallel_size | int | Ulysses sequence parallel size (currently only supported for P6dense and Qwen2VL).                                                                                             | 1 |
 | train.context_parallel_size | int | Ring sequence parallel size (currently not supported)                                                                                                                          | 1 |
@@ -84,7 +83,7 @@
 | train.profile_with_stack | bool | Whether to record the stack information.                                                                                                                                       | True |
 | train.max_steps | int | Number of steps per training epoch (only used for debugging).                                                                                                                  | None |
 
-### Inference configuration arguments
+## Inference configuration arguments
 | Name | Type | Description | Default Value |
 | --- | --- | --- | --- |
 | infer.model_path | str | Path to the model parameter file. | Required |

@@ -3,9 +3,6 @@ name: Check PR Title Format
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
-  push:
-    branches:
-      - main
 
 permissions:
   pull-requests: read

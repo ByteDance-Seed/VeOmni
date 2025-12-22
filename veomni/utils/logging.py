@@ -79,7 +79,7 @@ def _configure_library_root_logger() -> None:
             return
 
         formatter = logging.Formatter(
-            fmt="[%(levelname)s][%(name)s:%(lineno)s] %(asctime)s >> %(message)s",
+            fmt="[%(levelname)s|%(pathname)s:%(lineno)s] %(asctime)s >> %(message)s",
             datefmt="%m/%d/%Y %H:%M:%S",
         )
         _default_handler = logging.StreamHandler(sys.stdout)

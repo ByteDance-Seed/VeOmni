@@ -1,12 +1,8 @@
+# Basic Modules
 
-## VeOmni Best Practice
-
-
-### Usage
+## Usage
 1. **Install VeOmni**  
-    ```bash
-    pip3 install -e .
-    ```
+    Please refer to [Install](install-guide) for detailed instructions.
 
 2. **Run Example Script**  
    Verify training startup: (need download the dataset first)
@@ -16,7 +12,7 @@
    ```
 
 3. **Create Custom Task Directory**  
-    [`train_torch.py`](../../tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, youcan just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](../../tasks/omni/train_qwen2_vl.py)
+    [`train_torch.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, youcan just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_qwen2_vl.py)
     ```bash
     mkdir tasks/your_task
     cp tasks/train_torch.py tasks/your_task/train.py
@@ -34,10 +30,9 @@
         --train.wandb_name your_experiment_name
     ```
 
-### Arguments
+## Arguments
 **Default Parameter Access**:  
-veomni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](../config/config.md)
-- source code [veomni/utils/arguments.py](../../veomni/utils/arguments.py).
+veomni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments-api-reference).
 
 ```python
 from dataclasses import dataclass, field
@@ -71,12 +66,12 @@ class Arguments:
     train: "CustomTrainingArguments" = field(default_factory=CustomTrainingArguments)
 ```
 
-### Parallel State
+## Parallel State
 VeOmni use torch device mesh to manage all the parallel state, which is useful and concise when working with multi-dimensional parallelism (i.e. 3-D parallel) where parallelism composability is required. You can create the parallel state by calling the `init_parallel_state` function. and get the parallel state by calling the `get_parallel_state` function.
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
 
-- source code [veomni/distributed/parallel_state.py](../../veomni/distributed/parallel_state.py).
+- source code [veomni/distributed/parallel_state.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/distributed/parallel_state.py).
 
 ```python
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -108,8 +103,8 @@ tp_group = parallel_state.tp_group
 tp_mesh = parallel_state.tp_mesh
 ```
 
-### Dataset
-VeOmni default supports two types of datasets(source code: [veomni/data/dataset.py](../../veomni/data/dataset.py)):
+## Dataset
+VeOmni default supports two types of datasets(source code: [veomni/data/dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dataset.py)):
 1. **IterativeDataset** (recommended for large datasets)  
 2. **MappingDataset** (default for small datasets)
 
@@ -132,7 +127,7 @@ train_dataset = build_dataset(
 >
 > if you dataset is mapping, you are recommended to add pass the len(train_dataset) to the `train_steps` to compute the correct train steps.
 
-#### Custom Datasets
+### Custom Datasets
 VeOmni is a flexible framework that supports custom datasets. You can implement your own dataset function and use it with VeOmni.
 
 ```python
@@ -146,8 +141,8 @@ elif args.data.datasets_type == "custom":
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset)) # compute train steps, remove the len(train_dataset) if you dataset is iterable
 ```
 
-#### Data Transform (Preprocess)
-VeOmni default supports two types of transform(source code: [veomni/data/data_transform.py](../../veomni/data/data_transform.py)):
+### Data Transform (Preprocess)
+VeOmni default supports two types of transform(source code: [veomni/data/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py)):
 1. **process_pretrain_example** (recommended for pretrain task)
 2. **process_sft_example** (recommended for sft task)
 
@@ -180,8 +175,8 @@ transform = partial(
 )
 ```
 
-#### Chat Template
-VeOmni default supports few chat template(source code: [veomni/data/chat_template.py](../../veomni/data/chat_template.py)):
+### Chat Template
+VeOmni default supports few chat template(source code: [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py)):
 you can add your custom chat template by implementing the `ChatTemplate` class.
 **Custom Template Implementation**:  
 ```python
@@ -197,12 +192,12 @@ class CustomTemplate(ChatTemplate):
 ```
 
 
-### DataLoader
+## DataLoader
 VeOmni offered a flexible and powerful dataloader implementation, which supports
 - both padding and remove padding(packing) strategy
 - dynamic batching strategy
 -
-(source code: [veomni/data/data_loader.py](../../veomni/data/data_loader.py)):
+(source code: [veomni/data/data_loader.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_loader.py)):
 
 ```python
 from veomni.data import build_dataloader, build_mapping_dataset
@@ -238,8 +233,8 @@ train_dataloader = build_dataloader(
 )
 ```
 
-#### Collate Function
-VeOmni default supports three types of collate function for text task(source code: [veomni/data/data_collator.py](../../veomni/data/data_collator.py):
+### Collate Function
+VeOmni default supports three types of collate function for text task(source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)):
 1. `DataCollatorWithPadding` (enable when `rmpad` is False and `rmpad_with_pos_ids` is False)
 2. `DataCollatorWithPacking` (enable when `rmpad` is True and `rmpad_with_pos_ids` is False)
 3. `DataCollatorWithPositionIDs` (enable when `rmpad` is False and `rmpad_with_pos_ids` is True)
@@ -248,16 +243,16 @@ For Omni model task:
 1. `OmniDataCollatorWithPacking` (for when `rmpad_with_pos_ids` is True)
 2. `OmniDataCollatorWithPadding` (for `rmpad` is False and `rmpad_with_pos_ids` is False)
 
-See detail in source code: [veomni/data/multimodal/data_collator.py](../../veomni/data/multimodal/data_collator.py)) and how to use it in the [train_omni_model.py](../../tasks/omni/train_omni_model.py)
+See detail in source code: [veomni/data/multimodal/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/data_collator.py) and how to use it in the [train_omni_model.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_omni_model.py)
 
 
-### Model and Optimizer
-#### Model Initialization
+## Model and Optimizer
+### Model Initialization
 `build_foundation_model` implement the model initialization with the config and weights path.
 - meta device init
 - init model from model config or weights path
 
-- source code [veomni/models/auto.py](../../veomni/models/auto.py)
+- source code [veomni/models/auto.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/auto.py)
 
 ```python
 from veomni.models import build_foundation_model
@@ -272,7 +267,7 @@ model = build_foundation_model(
 # model = AutoModelForCausalLM.from_pretrained(args.model.model_path)
 ```
 
-#### Parallelization your model
+### Parallelization your model
 ```python
 from veomni.distributed.torch_parallelize import build_parallelize_model
 
@@ -289,7 +284,7 @@ model = build_parallelize_model(
 )
 ```
 
-#### Optimizer and LR Scheduler
+### Optimizer and LR Scheduler
 ```python
 from veomni.optim import build_lr_scheduler, build_optimizer
 
@@ -308,7 +303,7 @@ lr_scheduler = build_lr_scheduler(
 ```
 
 
-### Train Loop
+## Train Loop
 After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop.
 
 ```python
@@ -326,7 +321,7 @@ for epoch in range(args.train.num_train_epochs):
 ```
 
 
-#### Custom Loss Function
+### Custom Loss Function
 ```python
 import torch
 
@@ -342,7 +337,7 @@ loss = loss_func(logits, labels) / len(micro_batches)
 ```
 
 
-### Profiler
+## Profiler
 VeOmni offers a profiler function for users to trace training, use like that.
 
 ```python
