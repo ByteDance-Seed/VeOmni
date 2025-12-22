@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
-import wandb
 from PIL import Image
 from tqdm import trange
 
@@ -30,6 +29,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.metric_logger import Logger
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
@@ -271,13 +271,18 @@ def main():
     )
 
     if args.train.global_rank == 0:
-        if args.train.use_wandb:
-            wandb.init(
-                project=args.train.wandb_project,
-                name=args.train.wandb_name,
-                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
-            )
+        metric_logger = Logger(
+            use_wandb=args.train.use_wandb,
+            wandb_project=args.train.wandb_project,
+            wandb_name=args.train.wandb_name,
+            use_tensorboard=args.train.use_tensorboard,
+            tensorboard_dir=args.train.tensorboard_dir,
+            config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
+        )
+    else:
+        metric_logger = None
 
+    if args.train.global_rank == 0:
         model_assets = [model_config, processor]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
@@ -396,12 +401,11 @@ def main():
             )
             data_loader_tqdm.update()
 
-            if args.train.global_rank == 0:
-                if args.train.use_wandb:
-                    train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
-                    )
-                    wandb.log(train_metrics, step=global_step)
+            if args.train.global_rank == 0 and metric_logger:
+                train_metrics.update(
+                    {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                )
+                metric_logger.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()

@@ -512,6 +512,14 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Wandb experiment name."},
     )
+    use_tensorboard: bool = field(
+        default=False,
+        metadata={"help": "Use tensorboard to log experiment."},
+    )
+    tensorboard_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to save tensorboard logs."},
+    )
     enable_profiling: bool = field(
         default=False,
         metadata={"help": "Enable profiling."},
