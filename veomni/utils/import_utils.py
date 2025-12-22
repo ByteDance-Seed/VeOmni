@@ -89,7 +89,7 @@ def is_torch_version_greater_than(value: str) -> bool:
 
 @lru_cache
 def is_transformers_version_greater_or_equal_to(value: str) -> bool:
-    return _get_package_version("transformers") > version.parse(value)
+    return _get_package_version("transformers") >= version.parse(value)
 
 
 def is_veomni_patch_available() -> bool:

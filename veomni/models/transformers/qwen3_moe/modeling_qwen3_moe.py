@@ -46,7 +46,11 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops import causallm_loss_function, fused_moe_forward
 from ....utils import logging
-from ....utils.import_utils import is_liger_kernel_available
+from ....utils.import_utils import (
+    is_liger_kernel_available,
+    is_torch_npu_available,
+    is_transformers_version_greater_or_equal_to,
+)
 from .configuration_qwen3_moe import Qwen3MoeConfig
 
 
@@ -1360,6 +1364,11 @@ if is_liger_kernel_available():
     apply_rotary_pos_emb = liger_rotary_pos_emb
     Qwen3MoeRMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to Qwen3_moe.")
+
+if is_torch_npu_available() and is_transformers_version_greater_or_equal_to("4.50.4"):
+    from .npu_patch import apply_qwen3moe_npu_patch
+
+    apply_qwen3moe_npu_patch()
 
 __all__ = [
     "Qwen3MoeForCausalLM",

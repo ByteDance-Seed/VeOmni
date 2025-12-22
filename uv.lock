@@ -2607,7 +2607,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.23.0+cu128", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
-    { name = "transformers", extras = ["torch"], specifier = "==4.57.3" },
+    { name = "transformers", specifier = "==4.57.3" },
     { name = "trl", marker = "extra == 'trl'", specifier = "<=0.9.6" },
     { name = "wandb" },
 ]
