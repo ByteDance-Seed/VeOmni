@@ -2,6 +2,7 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -10,6 +11,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
@@ -25,7 +27,7 @@ from transformers.utils import (
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
-from ....ops.loss import causallm_loss_function
+from ....ops.loss import causallm_loss_function, seqcls_last_token_loss_and_logits
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
 from ...module_utils import GradientCheckpointingLayer
@@ -725,10 +727,85 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
+class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
+    """
+    Adapted from transformers.models.qwen3.modeling_qwen3.Qwen3ForSequenceClassification.
+    Differences:
+    - Backbone uses our own Qwen3Model.
+    - Compatible with both varlen (cu_seqlens) and padding input formats.
+    - The current loss function directly uses single-label CrossEntropyLoss.
+    """
+
+    base_model_prefix = "model"
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        # we're not using AutoModel here, but our own Qwen3Model.
+        setattr(self, self.base_model_prefix, Qwen3Model(config))
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        self.loss_fct = CrossEntropyLoss()
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @add_start_docstrings_to_model_forward(QWEN3_INPUTS_DOCSTRING)
+    @can_return_tuple
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> SequenceClassifierOutputWithPast:
+        transformer: Qwen3Model = getattr(self, self.base_model_prefix)
+
+        transformer_outputs: BaseModelOutputWithPast = transformer(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            **kwargs,
+        )
+        hidden_states = transformer_outputs.last_hidden_state
+
+        loss, pooled_logits = seqcls_last_token_loss_and_logits(
+            hidden_states=hidden_states,
+            classifier=self.score,
+            labels=labels,
+            cu_seqlens=cu_seqlens,
+            input_ids=input_ids,
+            pad_token_id=self.config.pad_token_id,
+            loss_fct=self.loss_fct,
+        )
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=pooled_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+
 if is_liger_kernel_available():
     apply_rotary_pos_emb = liger_rotary_pos_emb
     Qwen3RMSNorm = LigerRMSNorm
     Qwen3MLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Qwen3.")
 
-__all__ = ["Qwen3ForCausalLM", "Qwen3Model", "Qwen3PreTrainedModel"]
+__all__ = [
+    "Qwen3ForCausalLM",
+    "Qwen3Model",
+    "Qwen3PreTrainedModel",
+    "Qwen3ForSequenceClassification",
+]
