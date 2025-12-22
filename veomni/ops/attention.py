@@ -1,7 +1,9 @@
 from typing import Optional
 
 import torch
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from transformers.modeling_flash_attention_utils import (
+    _flash_attention_forward as _transformers_flash_attention_forward,
+)
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..distributed.parallel_state import get_parallel_state
@@ -13,9 +15,6 @@ from ..utils import logging
 
 
 logger = logging.get_logger(__name__)
-
-
-ALL_FLASH_ATTENTION_FUNCTIONS = {}
 
 
 # patch transformers.integrations.flash_attention.py
@@ -134,7 +133,7 @@ def flash_attention_forward(
         # Only after all_to_all we got the full seq_len
         seq_len = query.shape[1]
 
-    attn_output = _veomni_flash_attention_forward(
+    attn_output = _flash_attention_forward(
         query,
         key,
         value,
@@ -165,7 +164,7 @@ def flash_attention_forward(
     return attn_output, None
 
 
-def _veomni_flash_attention_forward(
+def _flash_attention_forward(
     query,
     key,
     value,
@@ -173,22 +172,17 @@ def _veomni_flash_attention_forward(
     **kwargs,
 ):
     attn_implementation = kwargs.pop("attn_implementation")
-    if attn_implementation in ALL_FLASH_ATTENTION_FUNCTIONS:
-        return ALL_FLASH_ATTENTION_FUNCTIONS[attn_implementation](
-            query,
-            key,
-            value,
-            attention_mask,
-            implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 fix this
-            **kwargs,
-        )
-    else:
-        raise ValueError(f"Unknown attn_implementation: {attn_implementation}")
+    return _transformers_flash_attention_forward(
+        query,
+        key,
+        value,
+        attention_mask,
+        implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 to remove this patch
+        **kwargs,
+    )
 
 
 def apply_veomni_attention_patch():
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
-    ALL_FLASH_ATTENTION_FUNCTIONS["flash_attention_2"] = _flash_attention_forward
-    ALL_FLASH_ATTENTION_FUNCTIONS["flash_attention_3"] = _flash_attention_forward
     logger.info_rank0("✅ Transformers ALL_ATTENTION_FUNCTIONS patched with new flash_attention_forward in VeOmni")
