@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import Dict
 
@@ -230,3 +231,19 @@ def compare_multi_items(outputs_dict: Dict, rtol=1e-3, atol=1e-5):
         except AssertionError:
             print_all_values(outputs_dict, "gnorm")
             raise AssertionError("Gnorm not match")
+
+
+def apply_veomni_attention_unpatch():
+    from transformers.integrations.flash_attention import flash_attention_forward
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
+
+
+def set_environ_param(model_mode: ModelMode):
+    if model_mode.modeling_backend == "veomni":
+        os.environ["MODELING_BACKEND"] = "veomni"
+    else:
+        os.environ["MODELING_BACKEND"] = "hf"
+        apply_veomni_attention_unpatch()
