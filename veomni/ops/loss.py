@@ -98,13 +98,12 @@ def seqcls_token_loss_sp_aware(
     labels: torch.Tensor,  # [N]
     loss_fct: nn.Module,
     sp_group,
+    ignore_index: int = -100,
 ) -> torch.Tensor:
-    # todo move to input peremeters
-    IGNORE_INDEX = -100
     # local sum loss
     # CrossEntropyLoss(reduction="none") + mask + sum
     per = loss_fct(logits, labels)  # [N] if reduction="none"
-    valid = labels != IGNORE_INDEX
+    valid = labels != ignore_index
     loss_sum = (per * valid).sum()
     cnt = valid.sum().to(dtype=loss_sum.dtype)
 

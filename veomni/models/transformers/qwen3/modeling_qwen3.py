@@ -727,9 +727,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
-IGNORE_INDEX = -100
-
-
 class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
     """
     Adapted from transformers.models.qwen3.modeling_qwen3.Qwen3ForSequenceClassification.
@@ -747,7 +744,7 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
         # we're not using AutoModel here, but our own Qwen3Model.
         setattr(self, self.base_model_prefix, Qwen3Model(config))
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-        self.loss_fct = CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
+        self.loss_fct = CrossEntropyLoss(ignore_index=-100, reduction="none")
         # Initialize weights and apply final processing
         self.post_init()
 
