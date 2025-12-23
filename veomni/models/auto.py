@@ -14,7 +14,6 @@
 
 
 import functools
-import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
@@ -62,7 +61,13 @@ def build_foundation_model(
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]
+        Literal[
+            "eager",
+            "sdpa",
+            "flash_attention_2",
+            "flash_attention_3",
+            "native-sparse",
+        ]
     ] = "flash_attention_2",
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
@@ -91,31 +96,9 @@ def build_foundation_model(
     loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)
 
     if not force_use_huggingface:
-        from functools import partial
+        from ..ops import apply_ops_patch
 
-        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-        from ..ops.attention import flash_attention_forward
-
-        seed_kernel_attn_implementation = os.getenv("SEED_KERNEL_ATTN_IMPLEMENTATION")
-
-        if seed_kernel_attn_implementation == "fa3":
-            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="fa3")
-        elif seed_kernel_attn_implementation == "fa2":
-            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="fa2")
-        elif seed_kernel_attn_implementation == "lego":
-            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="lego")
-        else:
-            assert seed_kernel_attn_implementation is None, (
-                f"seed_kernel_attn_implementation={seed_kernel_attn_implementation} is not supported"
-            )
-
-        ALL_ATTENTION_FUNCTIONS.register(
-            "flash_attention_2", partial(flash_attention_forward, implementation="flash_attention_2")
-        )
-        ALL_ATTENTION_FUNCTIONS.register(
-            "flash_attention_3", partial(flash_attention_forward, implementation="flash_attention_3")
-        )
+        apply_ops_patch()
 
     init_kwargs = {
         "config": config,

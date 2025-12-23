@@ -22,3 +22,9 @@ __all__ = [
     "fused_moe_forward",
     "causallm_loss_function",
 ]
+
+
+def apply_ops_patch():
+    from .attention import apply_veomni_attention_patch
+
+    apply_veomni_attention_patch()

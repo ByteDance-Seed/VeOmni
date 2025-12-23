@@ -151,7 +151,7 @@ class EnvironMeter:
         self.consume_tokens = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
-        self.image_seqlens = []
+        self.images_seqlens = []
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -187,13 +187,18 @@ class EnvironMeter:
 
         if "image_grid_thw" in micro_batch:
             image_grid_thw = micro_batch["image_grid_thw"]
-            image_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
-            self.image_seqlens.extend(image_seqlens.tolist())
+            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
+            self.images_seqlens.extend(images_seqlens.tolist())
+
+        if "image_grid_hw" in micro_batch:
+            image_grid_hw = micro_batch["image_grid_hw"]
+            images_seqlens = torch.repeat_interleave(image_grid_hw[:, 1], image_grid_hw[:, 0])
+            self.images_seqlens.extend(images_seqlens.tolist())
 
         if "video_grid_thw" in micro_batch:
             video_grid_thw = micro_batch["video_grid_thw"]
             video_seqlens = torch.repeat_interleave(video_grid_thw[:, 1] * video_grid_thw[:, 2], video_grid_thw[:, 0])
-            self.image_seqlens.extend(video_seqlens.tolist())  # video equals to image
+            self.images_seqlens.extend(video_seqlens.tolist())  # video equals to image
 
         if self.enable_multisource:
             self.batch_seqlens.extend(seqlens[: len(ds_idx)])  # rmpad_with_pos_ids has a pad item
@@ -202,9 +207,9 @@ class EnvironMeter:
             self.batch_seqlens.extend(seqlens)
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
-        if len(self.image_seqlens) > 0:
+        if len(self.images_seqlens) > 0:
             flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, image_seqlens=self.image_seqlens
+                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens
             )
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
@@ -262,7 +267,7 @@ class EnvironMeter:
 
         self.batch_seqlens = []
         self.batch_ds_idx = []
-        self.image_seqlens = []
+        self.images_seqlens = []
 
         return metrics
 

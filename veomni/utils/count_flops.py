@@ -304,9 +304,9 @@ class VeomniFlopsCounter:
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # vit flops
-        image_seqlens = kargs.get("image_seqlens", None)
-        if image_seqlens is not None:
-            vit_flops = self._estimate_qwen_vit_flop(image_seqlens, self.config.vision_config)
+        images_seqlens = kargs.get("images_seqlens", None)
+        if images_seqlens is not None:
+            vit_flops = self._estimate_qwen_vit_flop(images_seqlens, self.config.vision_config)
         else:
             vit_flops = 0
 
@@ -347,9 +347,9 @@ class VeomniFlopsCounter:
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # vit flops
-        image_seqlens = kargs.get("image_seqlens", None)
-        if image_seqlens is not None:
-            vit_flops = self._estimate_qwen3_vit_flop(image_seqlens, self.config.vision_config)
+        images_seqlens = kargs.get("images_seqlens", None)
+        if images_seqlens is not None:
+            vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, self.config.vision_config)
         else:
             vit_flops = 0
 
@@ -358,14 +358,14 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_vit_flop(self, image_seqlens, config):
+    def _estimate_qwen3_vit_flop(self, images_seqlens, config):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
         """
 
         if config is None:
             return 0
-        tokens_sum = sum(image_seqlens)
+        tokens_sum = sum(images_seqlens)
 
         num_heads = config.num_heads
         depth = config.depth
@@ -398,7 +398,7 @@ class VeomniFlopsCounter:
 
         # full attn layer & all_token fwd & bwd flops
         seqlen_square_sum = 0
-        for seqlen in image_seqlens:
+        for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 
@@ -406,14 +406,14 @@ class VeomniFlopsCounter:
 
         return vit_flops
 
-    def _estimate_qwen_vit_flop(self, image_seqlens, config):
+    def _estimate_qwen_vit_flop(self, images_seqlens, config):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
         """
 
         if config is None:
             return 0
-        tokens_sum = sum(image_seqlens)
+        tokens_sum = sum(images_seqlens)
 
         num_heads = config.num_heads
         depth = config.depth
@@ -455,7 +455,7 @@ class VeomniFlopsCounter:
 
         # full attn layer & all_token fwd & bwd flops
         seqlen_square_sum = 0
-        for seqlen in image_seqlens:
+        for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 

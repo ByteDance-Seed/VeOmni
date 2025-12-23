@@ -24,7 +24,7 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   "diffusers>=0.30.0,<=0.31.0",
-  "transformers[torch]==4.57.3",
+  "transformers==4.57.3",
   "psutil",
   "timm",
   "wandb",
@@ -48,14 +48,19 @@ dit = [
   "diffusers>=0.30.0,<=0.31.0",
   "bitsandbytes>=0.46.0,<=0.47.0"
 ]
-npu = [
-  "torch==2.7.1; platform_machine == 'aarch64'",
-  "torch==2.7.1+cpu; platform_machine != 'aarch64'",
+npu_aarch64 = [
+  "torch==2.7.1",
   "torch-npu==2.7.1",
-  "torchvision==0.22.1; platform_machine == 'aarch64'",
-  "torchaudio==2.7.1; platform_machine == 'aarch64'",
-  "torchvision==0.22.1+cpu; platform_machine != 'aarch64'",
-  "torchaudio==2.7.1+cpu; platform_machine != 'aarch64'",
+  "torchvision==0.22.1",
+  "torchaudio==2.7.1",
+  "decorator>=5.2.1",
+  "scipy>=1.16.2"
+]
+npu = [
+  "torch==2.7.1+cpu",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1+cpu",
+  "torchaudio==2.7.1+cpu",
   "decorator>=5.2.1",
   "scipy>=1.16.2"
 ]
@@ -67,6 +72,7 @@ gpu = [
   "nvidia-nccl-cu12",
   "liger-kernel",
   "flash-attn",
+  "flash-attn-3",
   "hf_transfer",
 ]
 megatron = [
@@ -103,6 +109,7 @@ test = [
 required-version = "==0.9.8"
 no-build-isolation-package = [
     "flash-attn",
+    "flash-attn-3",
 ]
 
 override-dependencies = [
@@ -113,13 +120,14 @@ override-dependencies = [
     "torch==2.8.0+cu128; (extra == 'gpu')",
     "torchaudio==2.8.0+cu128; (extra == 'gpu')",
     "torchvision==0.23.0+cu128; (extra == 'gpu')",
-    # Adding explicit override for other backends as well. Otherwise these libraries
-    # will be excluded for other backends.
+    # Adding explicit override for NPU backends - aarch64 variant
+    "torch==2.7.1; (extra == 'npu_aarch64')",
+    "torchaudio==2.7.1; (extra == 'npu_aarch64')",
+    "torchvision==0.22.1; (extra == 'npu_aarch64')",
+    # Adding explicit override for NPU backends - x86 variant (default npu)
     "torch==2.7.1+cpu; (extra == 'npu')",
-    "torchaudio==2.7.1; (extra == 'npu') and (platform_machine == 'aarch64')",
-    "torchvision==0.22.1; (extra == 'npu') and (platform_machine == 'aarch64')",
-    "torchaudio==2.7.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
-    "torchvision==0.22.1+cpu; (extra == 'npu') and (platform_machine != 'aarch64')",
+    "torchaudio==2.7.1+cpu; (extra == 'npu')",
+    "torchvision==0.22.1+cpu; (extra == 'npu')",
     # Fixate to a specific transformers version since upgrading transformers is a large task.
     "transformers==4.57.3",
 ]
@@ -128,13 +136,15 @@ conflicts = [
   [
     { extra = "gpu" },
     { extra = "npu" },
+    { extra = "npu_aarch64" },
   ],
 ]
 
 [tool.uv.sources]
 # To support override-dependencies for multiple extras, one package can only have one index.
+# Using pytorch index for all variants since it has both regular and +cpu versions
 torch = [
-  { index = "pytorch", extra = "npu" },
+  { index = "pytorch", marker = "(extra == 'npu' or extra == 'npu_aarch64')" },
   # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
   # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
   # those nvidia packages.
@@ -144,13 +154,11 @@ torch = [
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
   { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
 ]
-torchvision = [ # npu aarch64 need install torchvison from pytorch-cpu
-  { index = "pytorch-cpu", marker = "(extra == 'npu') and (platform_machine == 'aarch64') and (extra != 'gpu')" },
-  { index = "pytorch", marker = "(extra != 'npu') or (platform_machine != 'aarch64') or (extra == 'gpu')"},
-]
+torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Download flash-attn wheel directly to avoid build issues.
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' or extra == 'sglang'" }
+flash-attn-3 = { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.09.28/flash_attn_3-3.0.0b1%2B20250928.cu128torch280cxx11abitrue.5059fd-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"}
 
 [[tool.uv.index]]
 name = "pytorch"
@@ -164,6 +172,10 @@ explicit = true
 
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
+requires-dist = ["torch"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn-3"
 requires-dist = ["torch"]
 
 [tool.setuptools.dynamic]

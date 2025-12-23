@@ -82,7 +82,13 @@ class ModelArguments:
         metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
     )
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "native-sparse"]
+        Literal[
+            "eager",
+            "sdpa",
+            "flash_attention_2",
+            "flash_attention_3",
+            "native-sparse",
+        ]
     ] = field(
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
@@ -97,7 +103,7 @@ class ModelArguments:
     )
     force_use_huggingface: bool = field(
         default=False,
-        metadata={"help": "Force loading model from huggingface."},
+        metadata={"help": "Force loading model from huggingface without any patch or external ops."},
     )
 
     def __post_init__(self):
