@@ -4,7 +4,7 @@
 
 ## Download dataset
 
-Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset and download the data annotation JSON file [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingfacce.co/datasets/Lin-Chen/ShareGPT4V/tree/main).
+Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset and download the data annotation JSON file [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main).
 
 Modify the sharegpt4v_instruct_gpt4-vision_cap100k.json
 
