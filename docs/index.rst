@@ -52,7 +52,6 @@ Our guiding principles when building VeOmni are:
 
    get_started/installation/install.md
    get_started/installation/install_ascend.md
-   get_started/quick_start/quick_start_qwen3.md
 
 .. toctree::
    :maxdepth: 1
@@ -66,14 +65,13 @@ Our guiding principles when building VeOmni are:
    :maxdepth: 1
    :caption: Hardware Support
 
-   hardware_support/ascend_environment_variables.md
+   hardware_support/get_started_npu.md
 
 .. toctree::
    :maxdepth: 1
    :caption: Examples
 
-   examples/qwen2vl
-   examples/qwen3_moe.md
+   examples/qwen3.md
    examples/qwen3_vl.md
 
 .. toctree::
