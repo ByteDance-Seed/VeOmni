@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -90,3 +91,23 @@ def causallm_loss_function(
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
 
     return loss, logits
+
+
+def seqcls_token_loss_sp_aware(
+    logits: torch.Tensor,  # [N, C]
+    labels: torch.Tensor,  # [N]
+    loss_fct: nn.Module,
+    sp_group,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    # local sum loss
+    # CrossEntropyLoss(reduction="none") + mask + sum
+    per = loss_fct(logits, labels)  # [N] if reduction="none"
+    valid = labels != ignore_index
+    loss_sum = (per * valid).sum()
+    cnt = valid.sum().to(dtype=loss_sum.dtype)
+
+    if sp_group is not None:
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=sp_group)
+        dist.all_reduce(cnt, op=dist.ReduceOp.SUM, group=sp_group)
+    return loss_sum / cnt.clamp_min(1.0)
