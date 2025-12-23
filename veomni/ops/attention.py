@@ -74,14 +74,6 @@ def flash_attention_forward(
     if is_causal is None:
         is_causal = module.is_causal
 
-    # This is for Qwen2VL's mrope
-
-    # TODO(szl): mv this to qwen2vl modeling
-    position_ids = kwargs.get("position_ids", None)
-    if position_ids is not None and position_ids.dim() == 3:
-        position_ids = position_ids[0]
-        kwargs["position_ids"] = position_ids
-
     # Ulysses patch
     ulysses_enabled = get_parallel_state().ulysses_enabled
     if ulysses_enabled and not skip_ulysses:
