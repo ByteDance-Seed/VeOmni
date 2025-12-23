@@ -416,7 +416,7 @@ def set_seed(seed: int, full_determinism: bool = False) -> None:
     Sets a manual seed on all devices.
     """
     if full_determinism:
-        enable_full_determinism(seed, warn_only=True)
+        enable_full_determinism(seed)
     else:
         set_seed_func(seed)
 
