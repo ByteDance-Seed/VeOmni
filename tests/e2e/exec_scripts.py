@@ -7,7 +7,8 @@ CI_DATASET_DIR = os.getenv("CI_DATASET_DIR", ".")
 
 def qwen3_0p6b_base_tulu_sft_script():
     params = [
-        "bash train.sh tasks/train_torch.py",
+        "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4321",
+        "tasks/train_torch.py",
         "configs/sft/qwen3_sft.yaml",
         f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
         f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
