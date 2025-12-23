@@ -1,5 +1,7 @@
 import torch_npu
+
 from . import modeling_qwen3
+
 
 def rms_norm_forward_npu(self, x):
     """NPU optimized implementation for RMSNorm."""
@@ -15,6 +17,7 @@ def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
     q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
     k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
+
 
 def apply_qwen3_npu_patch():
     # Patches for Qwen3 Model
