@@ -3,8 +3,14 @@
 # Qwen3 training guide
 
 ## Download dataset
-Download the [tulu-3-sft-mixture](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) dataset.
+Download the fineweb dataset.
 
+```shell
+python3 scripts/download_hf_data.py \
+  --repo_id HuggingFaceFW/fineweb \
+  --local_dir ./fineweb/ \
+  --allow_patterns sample/10BT/*
+```
 ## Download Qwen3 model
 
 ### Qwen3-8B
@@ -33,9 +39,9 @@ python3 scripts/moe_ckpt_merge/moe_merge.py --raw_hf_path Qwen3-30B-A3B-Instruct
 ### Qwen3-8B
 
 ```shell
-bash train.sh tasks/train_torch.pt configs/sft/qwen3_sft.yaml \
+bash train.sh tasks/train_torch.py configs/pretrain/qwen2_5.yaml \
     --model.model_path ./Qwen3-8B \
-    --data.train_path ./tulu-3-sft-mixture/data \
+    --data.train_path ./fineweb/sample/10BT \
     --train.data_parallel_mode fsdp2 \
     --train.init_device meta \
     --train.use_wandb false
@@ -44,12 +50,10 @@ bash train.sh tasks/train_torch.pt configs/sft/qwen3_sft.yaml \
 ### Qwen3-30B
 
 ```shell
-bash train.sh tasks/train_torch.pt configs/sft/qwen3_sft.yaml \
+bash train.sh tasks/train_torch.py configs/pretrain/qwen3_moe.yaml \
     --model.model_path ./Qwen3-30B-A3B-Instruct-2507-merge \
-    --model.moe_implementation fused \
-    --data.train_path ./tulu-3-sft-mixture/data \
+    --data.train_path ./fineweb/sample/10BT \
     --train.data_parallel_mode fsdp2 \
     --train.init_device meta \
-    --train.global_batch_size 16 \
     --train.use_wandb false
 ```
