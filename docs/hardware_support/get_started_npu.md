@@ -41,7 +41,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 ```
 
 `expandable_segments:<value>`: Enable the memory pool extension segment feature.  
-* `True`: This configuration instructs the cache allocator to create specific memory blocks with the capability to be extended later. This allows for more efficient handling of scenarios where the required memory size frequently changes during runtime.   
+* `True`: This configuration instructs the cache allocator to create specific memory blocks with the capability to be extended later. This allows for more efficient handling of scenarios where the required memory size frequently changes during runtime.  
 * `False`: The memory pool extension segment feature is disabled, and the original memory allocation method is used. Default is `False`.
 
 ## Declarations
