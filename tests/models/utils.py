@@ -46,6 +46,7 @@ class ModelMode:
     attn_case: str
     sync_weight_func: any = None
     moe_implementation: bool = "eager"
+    use_liger_kernel: bool = False
 
 
 def prepare_models_modes(is_moe: bool = False):
@@ -63,6 +64,13 @@ def prepare_models_modes(is_moe: bool = False):
                     modeling_backend="veomni",
                     attn_implementation="flash_attention_3",
                     attn_case="position_ids",
+                    use_liger_kernel=True,
+                ),
+                ModelMode(
+                    modeling_backend="veomni",
+                    attn_implementation="flash_attention_3",
+                    attn_case="position_ids",
+                    use_liger_kernel=False,
                 ),
             ]
         )
@@ -107,6 +115,14 @@ def prepare_models_modes(is_moe: bool = False):
                     attn_implementation="flash_attention_3",
                     attn_case="position_ids",
                     moe_implementation="fused",
+                    use_liger_kernel=True,
+                ),
+                ModelMode(
+                    modeling_backend="veomni",
+                    attn_implementation="flash_attention_3",
+                    attn_case="position_ids",
+                    moe_implementation="fused",
+                    use_liger_kernel=False,
                 ),
             ]
         )
@@ -241,9 +257,21 @@ def apply_veomni_attention_unpatch():
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
 
 
+def apply_veomni_loss_unpatch():
+    from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
+
+    LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
+
+
 def set_environ_param(model_mode: ModelMode):
     apply_veomni_attention_unpatch()
+    apply_veomni_loss_unpatch()
     if model_mode.modeling_backend == "veomni":
         os.environ["MODELING_BACKEND"] = "veomni"
     else:
         os.environ["MODELING_BACKEND"] = "hf"
+
+    if model_mode.use_liger_kernel:
+        os.environ["USE_LIGER_KERNEL"] = "1"
+    else:
+        os.environ["USE_LIGER_KERNEL"] = "0"

@@ -164,7 +164,7 @@ def flash_attention_forward(
     return attn_output, None
 
 
-def _flash_attention_forward(
+def transformers_flash_attention_forward(
     query,
     key,
     value,
@@ -182,7 +182,15 @@ def _flash_attention_forward(
     )
 
 
+_flash_attention_forward = transformers_flash_attention_forward
+
+
 def apply_veomni_attention_patch():
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
-    logger.info_rank0("✅ Transformers ALL_ATTENTION_FUNCTIONS patched with new flash_attention_forward in VeOmni")
+    global _flash_attention_forward
+    _flash_attention_forward = transformers_flash_attention_forward
+    logger.info_rank0(
+        "✅ Transformers ALL_ATTENTION_FUNCTIONS patched with new flash_attention_forward in VeOmni,"
+        f" using {_flash_attention_forward.__name__} for flash attention kernel"
+    )

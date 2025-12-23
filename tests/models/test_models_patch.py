@@ -47,7 +47,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     # train and compare models
     for idx, model_mode_cur in enumerate(model_modes):
         model_source = model_mode_cur.modeling_backend
-        running_id = f"[{config.model_type}_{model_source}]-[attn-{model_mode_cur.attn_implementation}]_[moe-{model_mode_cur.moe_implementation}]_[{model_mode_cur.attn_case}]"
+        running_id = f"[{config.model_type}_{model_source}]-[attn-{model_mode_cur.attn_implementation}]_[moe-{model_mode_cur.moe_implementation}]_[ligerkernel-{model_mode_cur.use_liger_kernel}]_[{model_mode_cur.attn_case}]"
         print(f"{'-' * 10} {running_id=} {'-' * 10}")
 
         set_environ_param(model_mode_cur)
