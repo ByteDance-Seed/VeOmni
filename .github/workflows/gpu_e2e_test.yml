@@ -1,7 +1,7 @@
 
 # # Tests layout
 
-name: GPU unit tests
+name: GPU e2e tests
 
 on:
   # Trigger the workflow on push or pull request,
@@ -12,13 +12,13 @@ on:
       - v0.*
     paths:
       - "**/*.py"
-      - .github/workflows/gpu_unit_tests.yml
+      - .github/workflows/gpu_e2e_test.yml
   pull_request:
     branches:
       - main
     paths:
       - "**/*.py"
-      - .github/workflows/gpu_unit_tests.yml
+      - .github/workflows/gpu_e2e_test.yml
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
