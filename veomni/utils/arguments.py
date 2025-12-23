@@ -414,12 +414,6 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable full determinism."},
     )
-    allow_cuda_launch_blocking: bool = field(
-        default=False,
-        metadata={
-            "help": "Set CUDA_LAUNCH_BLOCK=1 would degrade performance significantly. Leave this as False to prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled. DO NOT enable this unless you are debugging something"
-        },
-    )
     empty_cache_steps: int = field(
         default=500,
         metadata={"help": "Number of steps between two empty cache operations."},
@@ -659,16 +653,6 @@ class TrainingArguments:
                 self.profile_this_rank = True
         else:
             self.profile_this_rank = False
-
-        # Prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled
-        if not self.allow_cuda_launch_blocking:
-            assert not self.enable_full_determinism, (
-                "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LUANCH_BLOCKING to 1!"
-            )
-            cuda_launch_blocking_val = os.environ.get("CUDA_LAUNCH_BLOCKING", "").strip()
-            assert cuda_launch_blocking_val != "1", (
-                "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
-            )
 
         from ..checkpoint import CHECKPOINTER_REGISTRY
 
