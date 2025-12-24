@@ -16,7 +16,7 @@ def qwen3_0p6b_base_tulu_sft_script():
         "--train.enable_full_determinism true",
         "--train.num_train_epochs 1",
         "--train.max_steps 20",
-        "--train.use_wandb false",
+        "--train.use_wandb false $@ 2>&1",
     ]
 
     exec_script = " \\\n".join(params)

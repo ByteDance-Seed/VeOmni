@@ -23,11 +23,9 @@ def parse_training_log(log_content) -> pd.DataFrame:
 
     data = []
 
-    # 使用 finditer 直接在整个字符串中迭代查找所有匹配项
     for match in pattern.finditer(log_content):
         row = match.groupdict()
 
-        # 转换数据类型
         parsed_row = {
             "epoch": int(row["epoch"]),
             "total_epochs": int(row["total_epochs"]),
@@ -38,7 +36,6 @@ def parse_training_log(log_content) -> pd.DataFrame:
             "lr": float(row["lr"]),
         }
 
-        # 计算 global_step
         parsed_row["global_step"] = (parsed_row["epoch"] - 1) * parsed_row["total_steps"] + parsed_row["step"]
         data.append(parsed_row)
 

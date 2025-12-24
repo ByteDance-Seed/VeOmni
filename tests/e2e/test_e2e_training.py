@@ -17,7 +17,8 @@ test_cases = [
 @pytest.mark.parametrize("task_name", test_cases)
 def test_e2e_training(task_name):
     exec_script = E2E_TEST_SCRIPT[task_name]
-    e2e_test_res = subprocess.run(exec_script, shell=True, check=True, capture_output=False, text=True)
+    e2e_test_res = subprocess.run(exec_script, shell=True, check=True, capture_output=True, text=True)
+    print(e2e_test_res.stdout)
     exec_log_df = parse_training_log(e2e_test_res.stdout)
     base_log_df = pd.read_csv(os.path.join(CI_BASE_LOG_DIR, f"{task_name}_log.csv"))
     compare_log(base_log_df, exec_log_df)
