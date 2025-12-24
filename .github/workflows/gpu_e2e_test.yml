@@ -58,9 +58,9 @@ jobs:
     env:
       HF_HUB_ENABLE_HF_TRANSFER: 1
       NCCL_DEBUG: "WARN"
-      CI_MODEL_DIR: "/model-b/Qwen"
-      CI_DATASET_DIR: "/model-b/hf_data"
-      CI_BASE_LOG_DIR: "/model-b/veomni_ci/log"
+      CI_MODEL_DIR: "/root/model-b/Qwen"
+      CI_DATASET_DIR: "/root/model-b/hf_data"
+      CI_BASE_LOG_DIR: "/root/model-b/veomni_ci/log"
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
