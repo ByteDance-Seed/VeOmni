@@ -31,8 +31,10 @@ def apply_ops_patch():
         logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
     else:
         from .attention import apply_veomni_attention_patch
+        from .fused_moe import apply_veomni_fused_moe_patch
         from .loss import apply_veomni_loss_patch
 
         apply_veomni_attention_patch()
         apply_veomni_loss_patch()
+        apply_veomni_fused_moe_patch()
         logger.info_rank0("✅ VeOmni ops patch applied.")
