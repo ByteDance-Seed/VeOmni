@@ -90,7 +90,7 @@ class ParallelState:
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
     ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
-    async_ulysses: Optional[bool] = False
+    async_enabled: Optional[bool] = False
 
     def __post_init__(self):
         if not self.include_sp_in_fsdp:

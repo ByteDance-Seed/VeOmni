@@ -21,7 +21,10 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from .comm import get_ulysses_sequence_parallel_group
+from .comm import (
+    get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size
+)
 from .ulysses import all_to_all_tensor
 from .utils import padding_tensor_for_seqeunce_parallel, unpadding_tensor_for_seqeunce_parallel
 
@@ -73,7 +76,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         group: ProcessGroup,
     ):
         sp_group = get_ulysses_sequence_parallel_group() if group is None else group
-        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_size = get_ulysses_sequence_parallel_world_size()
 
         num_q_heads = q_weight.shape[0] // head_dim
         num_kv_heads = k_weight.shape[0] // head_dim

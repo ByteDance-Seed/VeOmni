@@ -540,7 +540,7 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
-    async_ulysses: Optional[bool] = field(
+    async_enabled: Optional[bool] = field(
         default=False,
         metadata={"help": "Whether or not to enable async ulysses."},
     )

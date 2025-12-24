@@ -530,8 +530,8 @@ class Qwen3VLTextAttention(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Modification: adds async Ulysses support for FA2 with sequence parallelism
-        use_async = get_parallel_state().async_ulysses
-        if use_async:
+        async_enabled = get_parallel_state().async_enabled
+        if async_enabled:
             return self._async_ulysses_attention_forward(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -1007,10 +1007,11 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos_embedding
         # Async Ulysses: No slicing needed - AllToAll gathers full sequence before position encoding
         sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-        async_ulysses = get_parallel_state().async_ulysses
-        if sp_group is not None and async_ulysses is False:
+        async_enabled = get_parallel_state().async_enabled
+        if sp_group is not None and async_enabled is False:
             position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
