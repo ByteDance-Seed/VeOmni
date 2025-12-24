@@ -5,16 +5,17 @@ import pytest
 import torch
 from transformers import AutoConfig
 
+from veomni.ops import apply_ops_patch
 from veomni.utils.device import get_torch_device
 
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
-    apply_veomni_attention_unpatch,
     build_base_model_optim,
     compare_multi_items,
     prepare_data,
     prepare_models_modes,
     print_all_values,
+    set_environ_param,
     train_one_step,
 )
 
@@ -34,7 +35,6 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
 
     model_base, optim_base = build_base_model_optim(
         config_path,
-        force_use_huggingface=model_modes[0].force_use_huggingface,
         attn_implementation=model_modes[0].attn_implementation,
         moe_implementation=model_modes[0].moe_implementation,
     )
@@ -46,17 +46,15 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     res = {}
     # train and compare models
     for idx, model_mode_cur in enumerate(model_modes):
-        model_source = "hf" if model_mode_cur.force_use_huggingface else "veomni"
-        running_id = f"[{config.model_type}_{model_source}]-[attn-{model_mode_cur.attn_implementation}]_[moe-{model_mode_cur.moe_implementation}]_[{model_mode_cur.attn_case}]"
+        model_source = model_mode_cur.modeling_backend
+        running_id = f"[{config.model_type}_{model_source}]-[attn-{model_mode_cur.attn_implementation}]_[moe-{model_mode_cur.moe_implementation}]_[ligerkernel-{model_mode_cur.use_liger_kernel}]_[{model_mode_cur.attn_case}]"
         print(f"{'-' * 10} {running_id=} {'-' * 10}")
 
-        # unpatch the veomni flash attention forward
-        if model_mode_cur.force_use_huggingface:
-            apply_veomni_attention_unpatch()
+        set_environ_param(model_mode_cur)
+        apply_ops_patch()
 
         model_cur, optim_cur = build_base_model_optim(
             config_path,
-            force_use_huggingface=model_mode_cur.force_use_huggingface,
             attn_implementation=model_mode_cur.attn_implementation,
             moe_implementation=model_mode_cur.moe_implementation,
         )

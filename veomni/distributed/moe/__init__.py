@@ -21,5 +21,4 @@ __all__ = [
     "token_pre_all2all",
     "tokens_post_all2all",
     "EPGroupGemm",
-    "fused_moe_forward",
 ]

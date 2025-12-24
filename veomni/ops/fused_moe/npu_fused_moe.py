@@ -19,13 +19,14 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from veomni.distributed.moe.comm import all_to_all
-from veomni.distributed.moe.moe_utils import sort_chunks_by_idxs
-from veomni.ops.group_gemm.kernel.npu_group_gemm import npu_group_gemm
-from veomni.utils.device import stream_synchronize
+from ...distributed.moe.comm import all_to_all
+from ...distributed.moe.moe_utils import sort_chunks_by_idxs
+from ...distributed.parallel_state import get_parallel_state
+from ...ops.group_gemm.kernel.npu_group_gemm import npu_group_gemm
+from ...utils.device import stream_synchronize
 
 
-def npu_fused_moe_forward(
+def _npu_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -184,3 +185,31 @@ def alltoall_combine(
     hidden_states = all_to_all(ep_group, hidden_states, input_splits, output_splits)
     hidden_states = torch_npu.npu_moe_token_unpermute(hidden_states, unpermute_indices, probs=routing_weights)
     return hidden_states
+
+
+def npu_fused_moe_forward(
+    module: torch.nn.Module,
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_1_weight: torch.Tensor,
+    fc1_2_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+):
+    if get_parallel_state().ep_enabled:
+        final_hidden_states = npu_ep_fused_moe_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            ep_group=get_parallel_state().ep_group,
+        )
+    else:
+        final_hidden_states = _npu_fused_moe_forward(
+            num_experts, routing_weights, selected_experts, hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight
+        )
+    return final_hidden_states

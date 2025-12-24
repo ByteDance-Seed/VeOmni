@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import torch
 
-from ..distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
-from ..distributed.parallel_state import get_parallel_state
-from ..utils.device import IS_NPU_AVAILABLE
-from ..utils.import_utils import is_fused_moe_available, is_seed_kernels_available
-
-
-if is_fused_moe_available():
-    from .group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
-    from .group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from ...distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
+from ...distributed.parallel_state import get_parallel_state
+from ..group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
+from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
 
 
 class FusedMoeExpertFunction(torch.autograd.Function):
@@ -273,7 +266,7 @@ class FusedMoeExpertFunction(torch.autograd.Function):
         )
 
 
-def fused_moe_forward(
+def group_gemm_fused_moe_forward(
     module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -284,130 +277,63 @@ def fused_moe_forward(
     fc2_weight: torch.Tensor,
 ):
     if get_parallel_state().ep_enabled:
-        # use seed kernels
-        if is_seed_kernels_available():
-            from seed_kernels.transformers.functional import seed_fused_moe
-
-            seed_ep_implementation = os.getenv("SEED_EP_IMPLEMENTATION")
-            if seed_ep_implementation is not None:
-                assert seed_ep_implementation in [
-                    "bumi",
-                    "flux",
-                    "ring_ep",
-                    "local_ep",
-                    "chunked_overlap",
-                    "agrs",
-                    "flux_gpu",
-                ]
-
-            final_hidden_states = seed_fused_moe(
-                num_experts,
-                routing_weights,
-                selected_experts,
-                hidden_states,
-                fc1_1_weight,
-                fc1_2_weight,
-                fc2_weight,
-                ep_group=get_parallel_state().ep_group,
-                ep_implementation=seed_ep_implementation if seed_ep_implementation is not None else "bumi",
-            )
-        # use npu ep fused moe
-        elif IS_NPU_AVAILABLE:
-            from .npu_fused_moe import npu_ep_fused_moe_forward
-
-            final_hidden_states = npu_ep_fused_moe_forward(
-                num_experts,
-                routing_weights,
-                selected_experts,
-                hidden_states,
-                fc1_1_weight,
-                fc1_2_weight,
-                fc2_weight,
-                ep_group=get_parallel_state().ep_group,
-            )
-        # use open source
-        else:
-            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-            # preprocess, permute token for ep
-            input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-                preprocess(
-                    expert_mask=expert_mask,
-                    num_experts=num_experts,
-                    ep_group=get_parallel_state().ep_group,
-                )
-            )
-            permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
-                hidden_states=hidden_states,
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+        # preprocess, permute token for ep
+        input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
+            preprocess(
                 expert_mask=expert_mask,
                 num_experts=num_experts,
-                input_splits=input_splits,
-                output_splits=output_splits,
-                num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
                 ep_group=get_parallel_state().ep_group,
             )
+        )
+        permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
+            hidden_states=hidden_states,
+            expert_mask=expert_mask,
+            num_experts=num_experts,
+            input_splits=input_splits,
+            output_splits=output_splits,
+            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
+            ep_group=get_parallel_state().ep_group,
+        )
 
-            final_permute_tokens = torch.zeros(
-                (permute_tokens.shape),
-                dtype=permute_tokens.dtype,
-                device=permute_tokens.device,
-            )
+        final_permute_tokens = torch.zeros(
+            (permute_tokens.shape),
+            dtype=permute_tokens.dtype,
+            device=permute_tokens.device,
+        )
 
-            cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
+        cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
-            final_permute_tokens = EPGroupGemm.apply(
-                permute_tokens,
-                cumsum,
-                fc1_1_weight,
-                fc1_2_weight,
-                fc2_weight,
-            )
+        final_permute_tokens = EPGroupGemm.apply(
+            permute_tokens,
+            cumsum,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+        )
 
-            # unpermute with routing_weight
-            final_hidden_states = tokens_post_all2all(
-                expert_outputs=final_permute_tokens,
-                routing_weights=routing_weights,
-                selected_experts=selected_experts,
-                num_experts=num_experts,
-                input_splits=input_splits,
-                output_splits=output_splits,
-                num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-                routing_map=routing_map,
-                local_input_permutation_mapping=local_input_permutation_mapping,
-                org_hidden_states_shape=org_hidden_states_shape,
-                ep_group=get_parallel_state().ep_group,
-            )
+        # unpermute with routing_weight
+        final_hidden_states = tokens_post_all2all(
+            expert_outputs=final_permute_tokens,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            num_experts=num_experts,
+            input_splits=input_splits,
+            output_splits=output_splits,
+            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
+            routing_map=routing_map,
+            local_input_permutation_mapping=local_input_permutation_mapping,
+            org_hidden_states_shape=org_hidden_states_shape,
+            ep_group=get_parallel_state().ep_group,
+        )
     else:
-        routing_weights = routing_weights.bfloat16()
-        hidden_states = hidden_states.bfloat16()
-        if is_seed_kernels_available():
-            from seed_kernels.transformers.functional import seed_fused_moe
-
-            final_hidden_states = seed_fused_moe(
-                num_experts,
-                routing_weights,
-                selected_experts,
-                hidden_states,
-                fc1_1_weight,
-                fc1_2_weight,
-                fc2_weight,
-            )
-        # use npu ep fused moe
-        elif IS_NPU_AVAILABLE:
-            from .npu_fused_moe import npu_fused_moe_forward
-
-            final_hidden_states = npu_fused_moe_forward(
-                num_experts, routing_weights, selected_experts, hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight
-            )
-        # use open source
-        else:
-            final_hidden_states = FusedMoeExpertFunction.apply(
-                num_experts,
-                routing_weights,
-                selected_experts,
-                hidden_states,
-                fc1_1_weight,
-                fc1_2_weight,
-                fc2_weight,
-            )
-
+        final_hidden_states = FusedMoeExpertFunction.apply(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+        )
     return final_hidden_states
