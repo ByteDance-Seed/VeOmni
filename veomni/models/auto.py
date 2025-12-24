@@ -42,18 +42,18 @@ def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
 
 
-def build_processor(processor_path: str, force_use_huggingface: bool = False) -> "ProcessorMixin":
+def build_processor(processor_path: str) -> "ProcessorMixin":
     """
     Builds the processor.
     """
-    return get_model_processor(processor_path, force_use_huggingface, padding_side="right", trust_remote_code=True)
+    return get_model_processor(processor_path, padding_side="right", trust_remote_code=True)
 
 
-def build_config(config_path: str, force_use_huggingface: bool = False, **config_kwargs) -> "PretrainedConfig":
+def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     """
     Builds the model config.
     """
-    return get_model_config(config_path, force_use_huggingface, trust_remote_code=True, **config_kwargs)
+    return get_model_config(config_path, trust_remote_code=True, **config_kwargs)
 
 
 def build_foundation_model(
@@ -72,7 +72,6 @@ def build_foundation_model(
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
-    force_use_huggingface: Optional[bool] = False,
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -85,7 +84,7 @@ def build_foundation_model(
     if isinstance(config_path, PretrainedConfig):
         config = config_path
     else:
-        config = build_config(config_path, force_use_huggingface, **config_kwargs)
+        config = build_config(config_path, **config_kwargs)
 
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "fused"]:
@@ -93,12 +92,7 @@ def build_foundation_model(
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
-    loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)
-
-    if not force_use_huggingface:
-        from ..ops import apply_ops_patch
-
-        apply_ops_patch()
+    loader: Optional[BaseModelLoader] = get_loader(config)
 
     init_kwargs = {
         "config": config,
