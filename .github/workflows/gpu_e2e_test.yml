@@ -71,7 +71,7 @@ jobs:
           uv sync --frozen --extra gpu --group dev
       - name: Run e2e training test
         run: |
-          ls -l /model-b
+          ls -l /root/model-b
           uv run pytest -s -x tests/e2e/test_e2e_training.py
 
 
