@@ -35,12 +35,14 @@ def fused_moe_forward(
     fc1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
 ):
-    # bf16/fp16 for triton
+    if _fused_moe_forward is None:
+        raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
+
     assert routing_weights.dtype in [torch.bfloat16, torch.float16], (
-        f"routing_weights dtype must be bfloat16 or float16, but got {routing_weights.dtype}"
+        f"routing_weights dtype must be bfloat16 or float16 for triton kernel, but got {routing_weights.dtype}"
     )
     assert hidden_states.dtype in [torch.bfloat16, torch.float16], (
-        f"hidden_states dtype must be bfloat16 or float16, but got {hidden_states.dtype}"
+        f"hidden_states dtype must be bfloat16 or float16 for triton kernel, but got {hidden_states.dtype}"
     )
 
     return _fused_moe_forward(
