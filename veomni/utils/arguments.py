@@ -491,7 +491,7 @@ class TrainingArguments:
         metadata={"help": "Enable torch compile."},
     )
     use_wandb: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Use wandb to log experiment."},
     )
     wandb_project: str = field(
