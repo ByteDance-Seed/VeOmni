@@ -70,7 +70,7 @@ def is_diffusers_available() -> bool:
 def is_fused_moe_available() -> bool:
     import torch
 
-    return torch.cuda.is_available() and _PACKAGE_FLAGS["triton"]
+    return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
 
 
 def is_video_audio_available() -> bool:
