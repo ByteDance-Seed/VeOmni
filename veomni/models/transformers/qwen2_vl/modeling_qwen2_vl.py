@@ -63,7 +63,7 @@ from ....distributed.sequence_parallel import (
     unpad_tensor,
 )
 from ....utils import logging
-from ....utils.import_utils import is_liger_kernel_available, is_seed_kernels_available
+from ....utils.import_utils import is_liger_kernel_available
 
 
 if is_flash_attn_2_available():
@@ -678,16 +678,10 @@ class Qwen2VLAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if not is_seed_kernels_available():
-            position_ids = kwargs.get("position_ids", None)
-            if position_ids is not None and position_ids.shape[-1] != 1:
-                _, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa2_from_position_ids(
-                    position_ids[0]
-                )
-                kwargs["cu_seq_lens_k"] = cu_seq_lens_k
-                kwargs["cu_seq_lens_q"] = cu_seq_lens_q
-                kwargs["max_length_q"] = max_length_q
-                kwargs["max_length_k"] = max_length_k
+        position_ids = kwargs.get("position_ids", None)
+        if position_ids is not None and position_ids.dim() == 3:  # 3, bs, seqlen
+            position_ids = position_ids[0]
+            kwargs["position_ids"] = position_ids  # bs, seq_len
 
         attn_output, attn_weights = attention_interface(
             self,

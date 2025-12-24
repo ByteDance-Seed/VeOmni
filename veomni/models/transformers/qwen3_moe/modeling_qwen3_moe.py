@@ -44,7 +44,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
-from ....ops import causallm_loss_function, fused_moe_forward
+from ....ops import fused_moe_forward
 from ....utils import logging
 from ....utils.import_utils import (
     is_liger_kernel_available,
@@ -937,7 +937,6 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         self.model = Qwen3MoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.loss_function = causallm_loss_function
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -1049,7 +1048,15 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
-        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+        if labels is not None:
+            loss, logits = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
 
         aux_loss = None
         if output_router_logits:

@@ -124,7 +124,6 @@ def main():
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
         moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
     )

@@ -51,7 +51,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 
-from ....ops import causallm_loss_function, fused_moe_forward
+from ....ops import fused_moe_forward
 from ....utils.import_utils import is_liger_kernel_available
 from .configuration_deepseek import DeepseekV3Config
 
@@ -1141,7 +1141,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.loss_function = causallm_loss_function
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -1223,7 +1222,15 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         logits = None
         loss = None
-        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+        if labels is not None:
+            loss, logits = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
 
         if not return_dict:
             output = (logits,) + outputs[1:]

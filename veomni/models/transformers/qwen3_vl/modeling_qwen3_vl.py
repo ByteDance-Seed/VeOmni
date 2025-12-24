@@ -54,7 +54,6 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
-from ....ops.loss import causallm_loss_function
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
 
@@ -1549,7 +1548,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         # Modification: Use the VeOmni custom loss function to handle Ulysses internally in a unified interface
-        self.loss_function = causallm_loss_function
 
         self.post_init()
 
@@ -1643,7 +1641,15 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         hidden_states = hidden_states[:, slice_indices, :]
         loss = None
         logits = None
-        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+        if labels is not None:
+            loss, logits = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
 
         return Qwen3VLCausalLMOutputWithPast(
             loss=loss,
