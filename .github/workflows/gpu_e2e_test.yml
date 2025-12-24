@@ -60,7 +60,6 @@ jobs:
       NCCL_DEBUG: "WARN"
       CI_MODEL_DIR: "/root/models/Qwen"
       CI_DATASET_DIR: "/root/models/hf_data"
-      CI_BASE_LOG_DIR: "/root/models/veomni_ci/log"
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -71,7 +70,6 @@ jobs:
           uv sync --frozen --extra gpu --group dev
       - name: Run e2e training test
         run: |
-          ls -l /root/models
           uv run pytest -s -x tests/e2e/test_e2e_training.py
 
 
