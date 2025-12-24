@@ -564,7 +564,7 @@ def init_parallel_state(
         include_sp_in_fsdp=include_sp_in_fsdp,
         device_mesh=device_mesh,
         ep_fsdp_device_mesh=ep_fsdp_device_mesh,
-        async_ulysses=async_ulysses
+        async_ulysses=async_ulysses,
     )
 
 

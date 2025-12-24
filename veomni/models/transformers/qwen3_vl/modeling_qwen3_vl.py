@@ -54,12 +54,11 @@ from ....distributed.sequence_parallel import (
     slice_position_embedding,
     sp_pad_and_slice,
 )
-from ....distributed.sequence_parallel.ulysses import _Gather
 from ....distributed.sequence_parallel.async_ulysses import (
-    async_ulysses_qkv_projection,
     async_ulysses_output_projection,
+    async_ulysses_qkv_projection,
 )
-from ....ops.loss import causallm_loss_function
+from ....distributed.sequence_parallel.ulysses import _Gather
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
 
@@ -466,7 +465,7 @@ class Qwen3VLTextAttention(nn.Module):
             )
 
         unpadded_seq_len = hidden_states.size(1)
-        
+
         q, k, v = async_ulysses_qkv_projection(
             hidden_states=hidden_states,
             seq_dimension=1,
@@ -516,7 +515,7 @@ class Qwen3VLTextAttention(nn.Module):
             proj_bias=self.o_proj.bias,
             unpadded_dim_size=attn_output.shape[1],
         )
-        
+
         return attn_output, attn_weights
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -552,7 +551,9 @@ class Qwen3VLTextAttention(nn.Module):
             if past_key_values is not None:
                 # sin and cos are specific to RoPE models; cache_position needed for the static cache
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
 
             attention_interface: Callable = eager_attention_forward
             if self.config._attn_implementation != "eager":
