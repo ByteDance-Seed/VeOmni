@@ -18,6 +18,9 @@ import torch
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
 
+liger_kernel_cross_entropy = LigerFusedLinearCrossEntropyLoss(reduction="mean")
+
+
 def fused_liger_kernel_cross_entropy(
     logits: torch.Tensor = None,
     labels: torch.Tensor = None,
@@ -27,7 +30,6 @@ def fused_liger_kernel_cross_entropy(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
-    liger_kernel_cross_entropy = LigerFusedLinearCrossEntropyLoss(reduction=kwargs.get("reduction", "mean"))
     weights = kwargs.pop("weights")
     hidden_states = kwargs.pop("hidden_states")
     return liger_kernel_cross_entropy(weights, hidden_states, labels), logits
