@@ -253,6 +253,10 @@ def apply_veomni_attention_unpatch():
     from transformers.integrations.flash_attention import flash_attention_forward
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+    from veomni.ops import flash_attn
+
+    flash_attn._flash_attention_forward = None
+
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
 
@@ -260,12 +264,23 @@ def apply_veomni_attention_unpatch():
 def apply_veomni_loss_unpatch():
     from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
 
+    from veomni.ops import fused_cross_entropy
+
+    fused_cross_entropy._cross_entropy = None
+
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
+
+
+def apply_veomni_moe_unpatch():
+    from veomni.ops import fused_moe
+
+    fused_moe._fused_moe_forward = None
 
 
 def set_environ_param(model_mode: ModelMode):
     apply_veomni_attention_unpatch()
     apply_veomni_loss_unpatch()
+    apply_veomni_moe_unpatch()
     if model_mode.modeling_backend == "veomni":
         os.environ["MODELING_BACKEND"] = "veomni"
     else:
