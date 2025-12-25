@@ -326,10 +326,6 @@ class SelfAttention(nn.Module):
             q = self.norm_q(self.q(x))
             k = self.norm_k(self.k(x))
             v = self.v(x)
-
-            if get_parallel_state().ulysses_enabled:
-                q, k, v = gather_seq_scatter_heads_qkv(q, k, v, seq_dim=1, head_dim=2)
-
         else:
             q, k, v = async_ulysses_qkv_projection(
                 hidden_states=x,
@@ -352,9 +348,6 @@ class SelfAttention(nn.Module):
         x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True)
 
         if not self.sp_async:
-            if get_parallel_state().ulysses_enabled:
-                x = gather_heads_scatter_seq(x, seq_dim=1, head_dim=2)
-
             x = self.o(x)
         else:
             x = async_ulysses_output_projection(
