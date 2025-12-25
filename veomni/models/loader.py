@@ -15,7 +15,6 @@
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py
 
-import os
 from abc import ABC
 
 import torch
@@ -32,6 +31,7 @@ from transformers import (
 from transformers.modeling_utils import no_init_weights
 
 from ..utils import logging
+from ..utils.env import get_env
 from ..utils.registry import Registry
 from .module_utils import init_empty_weights, load_model_weights
 
@@ -44,7 +44,7 @@ logger = logging.get_logger(__name__)
 
 
 def get_model_config(config_path: str, **kwargs):
-    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("[CONFIG] Force loading model config from Huggingface.")
         return AutoConfig.from_pretrained(config_path, **kwargs)
@@ -73,7 +73,7 @@ def get_model_config(config_path: str, **kwargs):
 
 
 def get_model_processor(processor_path: str, **kwargs):
-    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("[PROCESSOR] Force loading model processor from Huggingface.")
         return AutoProcessor.from_pretrained(processor_path, **kwargs)
@@ -126,8 +126,7 @@ def get_model_class(model_config: PretrainedConfig):
         load_class = AutoModelForCausalLM
     else:
         load_class = AutoModel
-
-    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         return load_class
     return MODELING_REGISTRY[model_type](arch_name)
@@ -227,7 +226,7 @@ class CustomizedModelingLoader(BaseModelLoader):
 
 def get_loader(model_config):
     model_cls = get_model_class(model_config)
-    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         loader = HuggingfaceLoader(model_cls=model_cls)
     else:

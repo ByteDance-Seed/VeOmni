@@ -20,15 +20,34 @@ from transformers.modeling_flash_attention_utils import (
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ..distributed.parallel_state import get_parallel_state
-from ..distributed.sequence_parallel import (
+from ...distributed.parallel_state import get_parallel_state
+from ...distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
 )
-from ..utils import logging
+from ...utils import logging
 
 
 logger = logging.get_logger(__name__)
+_flash_attention_forward = None
+
+
+def transformers_flash_attention_forward(
+    query,
+    key,
+    value,
+    attention_mask,
+    **kwargs,
+):
+    attn_implementation = kwargs.pop("attn_implementation")
+    return _transformers_flash_attention_forward(
+        query,
+        key,
+        value,
+        attention_mask,
+        implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 to remove this patch
+        **kwargs,
+    )
 
 
 # patch transformers.integrations.flash_attention.py
@@ -170,33 +189,8 @@ def flash_attention_forward(
     return attn_output, None
 
 
-def transformers_flash_attention_forward(
-    query,
-    key,
-    value,
-    attention_mask,
-    **kwargs,
-):
-    attn_implementation = kwargs.pop("attn_implementation")
-    return _transformers_flash_attention_forward(
-        query,
-        key,
-        value,
-        attention_mask,
-        implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 to remove this patch
-        **kwargs,
-    )
-
-
-_flash_attention_forward = transformers_flash_attention_forward
-
-
 def apply_veomni_attention_patch():
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
     global _flash_attention_forward
     _flash_attention_forward = transformers_flash_attention_forward
-    logger.info_rank0(
-        "✅ Transformers ALL_ATTENTION_FUNCTIONS patched with new flash_attention_forward in VeOmni,"
-        f" using {_flash_attention_forward.__name__} for flash attention kernel"
-    )
