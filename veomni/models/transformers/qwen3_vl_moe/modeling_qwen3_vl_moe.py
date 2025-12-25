@@ -1945,6 +1945,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+        else:
+            logits = self.lm_head(hidden_states)
 
         aux_loss = None
         if kwargs.get("output_router_logits", False):

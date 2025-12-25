@@ -1741,6 +1741,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+        else:
+            logits = self.lm_head(hidden_states)
 
         return Qwen3VLCausalLMOutputWithPast(
             loss=loss,

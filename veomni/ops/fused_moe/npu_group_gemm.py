@@ -22,8 +22,8 @@ import torch_npu
 from ...distributed.moe.comm import all_to_all
 from ...distributed.moe.moe_utils import sort_chunks_by_idxs
 from ...distributed.parallel_state import get_parallel_state
-from ...ops.group_gemm.kernel.npu_group_gemm import npu_group_gemm
 from ...utils.device import stream_synchronize
+from ..group_gemm.kernel.npu_group_gemm import npu_group_gemm
 
 
 def _npu_fused_moe_forward(

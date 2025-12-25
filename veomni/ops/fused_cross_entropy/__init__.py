@@ -17,56 +17,20 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from transformers.loss.loss_utils import LOSS_MAPPING, fixed_cross_entropy
+from transformers.loss.loss_utils import LOSS_MAPPING
 
-from ..data.constants import IGNORE_INDEX
-from ..distributed.parallel_state import get_parallel_state
-from ..distributed.sequence_parallel import reduce_sequence_parallel_loss
-from ..utils import logging
-from ..utils.import_utils import is_liger_kernel_available, is_torch_npu_available
-
-
-if is_liger_kernel_available():
-    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-
-    liger_kernel_cross_entropy = LigerFusedLinearCrossEntropyLoss(reduction="mean")
-
-    def fused_liger_kernel_cross_entropy(
-        logits: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        vocab_size: int = None,
-        num_items_in_batch: Optional[int] = None,
-        ignore_index: int = -100,
-        shift_labels: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        weights = kwargs.pop("weights")
-        hidden_states = kwargs.pop("hidden_states")
-        return liger_kernel_cross_entropy(weights, hidden_states, labels), logits
+from ...distributed.parallel_state import get_parallel_state
+from ...distributed.sequence_parallel import reduce_sequence_parallel_loss
+from ...utils import logging
+from ...utils.env import get_env
+from ...utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from .eager import eager_cross_entropy
 
 
 logger = logging.get_logger(__name__)
 
 
-def eager_cross_entropy(
-    logits: torch.Tensor = None,
-    labels: torch.Tensor = None,
-    vocab_size: int = None,
-    num_items_in_batch: Optional[int] = None,
-    ignore_index: int = -100,
-    shift_labels: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> torch.Tensor:
-    if logits is None:
-        hidden_states = kwargs.pop("hidden_states")
-        weights = kwargs.pop("weights")
-        logits = F.linear(hidden_states, weights).float()
-        logits = logits.view(-1, vocab_size)
-    return fixed_cross_entropy(logits, labels, num_items_in_batch, ignore_index, **kwargs), logits
-
-
-_cross_entropy = eager_cross_entropy
+_cross_entropy = None
 
 
 def ForCausalLMLoss(
@@ -134,7 +98,7 @@ def ForCausalLMLoss(
 
     # Reduce loss when using sp
     if sp_enabled:
-        num_valid_tokens = (labels != IGNORE_INDEX).sum()
+        num_valid_tokens = (labels != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
     return loss, logits
 
@@ -144,11 +108,9 @@ def apply_veomni_loss_patch():
     global _cross_entropy
     if is_torch_npu_available():
         _cross_entropy = eager_cross_entropy
-    elif is_liger_kernel_available() and os.environ.get("USE_LIGER_KERNEL", "1") == "1":
+    elif is_liger_kernel_available() and get_env("USE_LIGER_KERNEL") == "1":
+        from .liger_kernel import fused_liger_kernel_cross_entropy
+
         _cross_entropy = fused_liger_kernel_cross_entropy
     else:
         _cross_entropy = eager_cross_entropy
-
-    logger.info_rank0(
-        f"✅ Transformers LOSS_MAPPING['ForCausalLM'] patched with new ForCausalLM in VeOmni, using {_cross_entropy.__name__} for celoss kernel"
-    )

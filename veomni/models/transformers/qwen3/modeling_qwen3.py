@@ -721,6 +721,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+        else:
+            logits = self.lm_head(hidden_states)
 
         return CausalLMOutputWithPast(
             loss=loss,
