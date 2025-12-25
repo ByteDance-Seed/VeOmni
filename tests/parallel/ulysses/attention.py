@@ -104,9 +104,9 @@ class Attention(nn.Module):
             q, k, v, scale=self.scale, dropout_p=self.attn_drop.p if self.training else 0.0
         )
         x = x.transpose(1, 2)
-        x = rearrange(x, "B N h d -> B N (h d)", d=self.head_dim)
 
         if not self.sp_async:
+            x = rearrange(x, "B N h d -> B N (h d)", d=self.head_dim)
             x = gather_heads_scatter_seq(x, head_dim=2, seq_dim=1)
             x = self.proj_o(x)
         else:
