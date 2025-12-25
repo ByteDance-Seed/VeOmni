@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from ..utils import logging
+from ..utils.env import get_env
 from . import flash_attn, fused_cross_entropy, fused_moe
 from .fused_moe import fused_moe_forward
 
@@ -35,7 +36,7 @@ def build_ALL_OPS():
 def apply_ops_patch():
     import os
 
-    modeling_backend = os.environ.get("MODELING_BACKEND", "veomni")
+    modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
     else:

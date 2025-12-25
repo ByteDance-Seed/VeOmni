@@ -17,6 +17,7 @@ import os
 import torch
 
 from ...utils import logging
+from ...utils.env import get_env
 from ...utils.import_utils import is_fused_moe_available, is_torch_npu_available
 
 
@@ -63,7 +64,7 @@ def apply_veomni_fused_moe_patch():
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
-    elif is_fused_moe_available() and os.environ.get("USE_GROUP_GEMM", "1") == "1":
+    elif is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
