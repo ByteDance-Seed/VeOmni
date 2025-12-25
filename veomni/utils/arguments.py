@@ -540,6 +540,10 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
+    async_enabled: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to enable async ulysses."},
+    )
 
     def __post_init__(self):
         self._train_steps = -1

@@ -50,8 +50,13 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
+    get_ulysses_sequence_parallel_world_size,
     slice_position_embedding,
     sp_pad_and_slice,
+)
+from ....distributed.sequence_parallel.async_ulysses import (
+    async_ulysses_output_projection,
+    async_ulysses_qkv_projection,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....utils import helper
@@ -441,6 +446,78 @@ class Qwen3VLTextAttention(nn.Module):
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
 
+    # Modification: Add async Ulysses attention forward method
+    def _async_ulysses_attention_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass for asynchronous Ulysses attention implementation.
+        """
+        if self.config._attn_implementation != "flash_attention_2":
+            raise ValueError(
+                f"Async Ulysses attention only supports 'flash_attention_2' implementation. "
+                f"Current implementation: '{self.config._attn_implementation}'. "
+                f"Please set attn_implementation = 'flash_attention_2' or disable async Ulysses."
+            )
+
+        unpadded_seq_len = hidden_states.size(1)
+
+        q, k, v = async_ulysses_qkv_projection(
+            hidden_states=hidden_states,
+            seq_dimension=1,
+            head_dimension=2,
+            q_weight=self.q_proj.weight,
+            q_bias=self.q_proj.bias,
+            k_weight=self.k_proj.weight,
+            k_bias=self.k_proj.bias,
+            v_weight=self.v_proj.weight,
+            v_bias=self.v_proj.bias,
+            norm_type="rmsnorm",
+            norm_q_weight=self.q_norm.weight,
+            norm_q_bias=None,
+            norm_k_weight=self.k_norm.weight,
+            norm_k_bias=None,
+            normalized_shape=self.head_dim,
+            eps=self.config.rms_norm_eps,
+            unpadded_dim_size=unpadded_seq_len * get_ulysses_sequence_parallel_world_size(),
+            head_dim=self.head_dim,
+        )
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
+
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            v,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            skip_ulysses=True,
+            **kwargs,
+        )
+
+        attn_output = async_ulysses_output_projection(
+            hidden_states=attn_output,
+            seq_dimension=1,
+            head_dimension=2,
+            proj_weight=self.o_proj.weight,
+            proj_bias=self.o_proj.bias,
+            unpadded_dim_size=attn_output.shape[1],
+        )
+
+        return attn_output, attn_weights
+
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -451,39 +528,51 @@ class Qwen3VLTextAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        # Modification: adds async Ulysses support for FA2 with sequence parallelism
+        async_enabled = get_parallel_state().async_enabled
+        if async_enabled:
+            return self._async_ulysses_attention_forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        else:
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if past_key_values is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # FA kwargs should be included in kwargs implicitly
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+            # FA kwargs should be included in kwargs implicitly
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
 
@@ -920,8 +1009,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos_embedding
+        # Async Ulysses: No slicing needed - AllToAll gathers full sequence before position encoding
         sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-        if sp_group is not None:
+        async_enabled = get_parallel_state().async_enabled
+        if sp_group is not None and async_enabled is False:
             position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
