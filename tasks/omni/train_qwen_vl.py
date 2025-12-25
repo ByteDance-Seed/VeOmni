@@ -117,6 +117,7 @@ def main():
         cp_size=args.train.context_parallel_size,
         ulysses_size=args.train.ulysses_parallel_size,
         dp_mode=args.train.data_parallel_mode,
+        async_enabled=args.train.async_enabled,
     )
 
     logger.info_rank0("Prepare model")
