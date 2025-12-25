@@ -53,7 +53,7 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
-from ....ops import causallm_loss_function, fused_moe_forward
+from ....ops import fused_moe_forward
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
 
@@ -1012,7 +1012,7 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @check_model_inputs()
     @auto_docstring
     def forward(
         self,
@@ -1404,7 +1404,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
     #     return special_image_mask, special_video_mask
 
     @auto_docstring
-    @check_model_inputs
+    @check_model_inputs()
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1805,7 +1805,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         # Modification: Use the VeOmni custom loss function to handle Ulysses internally in a unified interface
-        self.loss_function = causallm_loss_function
 
         self.post_init()
 
@@ -1843,7 +1842,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         fake_model = SimpleNamespace(config=self.config)
         return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
 
-    @check_model_inputs
+    @check_model_inputs()
     @replace_return_docstrings(output_type=Qwen3VLMoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -1937,7 +1936,15 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         hidden_states = hidden_states[:, slice_indices, :]
         loss = None
         logits = None
-        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+        if labels is not None:
+            loss, logits = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
 
         aux_loss = None
         if kwargs.get("output_router_logits", False):
@@ -2139,10 +2146,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
 
         return input_ids, model_kwargs
 
-
-# Modification:
-# Register the ModelClass which is used by veOmni to tell which class to match the config.json architecture
-ModelClass = Qwen3VLMoeForConditionalGeneration
 
 __all__ = [
     "Qwen3VLMoeVisionModel",

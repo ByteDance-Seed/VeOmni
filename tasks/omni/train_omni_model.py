@@ -22,6 +22,7 @@ from veomni.data import (
 )
 from veomni.data.constants import IGNORE_INDEX
 from veomni.data.multimodal.multimodal_transform import encode_multimodal_sample
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -292,6 +293,7 @@ def main():
 
     model = build_parallelize_model(
         model,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
@@ -325,6 +327,7 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
@@ -436,10 +439,7 @@ def main():
 
                 del micro_batch
 
-            if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
@@ -464,7 +464,7 @@ def main():
                     "lr": lr,
                 }
             )
-            data_loader_tqdm.set_postfix_str({k: f"{v:.2f}" for k, v in step_info.items() if k != "lr"})
+            data_loader_tqdm.set_postfix_str({k: f"{v:.2f}" for k, v in step_info.items() if k != "lr"}, refresh=False)
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:

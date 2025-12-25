@@ -1,7 +1,7 @@
 
 <div align="center">
 
-<img src="./assets/logo.png" width="50%">
+<img src="./docs/assets/logo.png" width="50%">
 
 ## VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
 
@@ -34,13 +34,13 @@ Our guiding principles when building VeOmni are:
 - **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
 
 <div align="center">
-<img src="./assets/system.png" width="100%">
+<img src="./docs/assets/system.png" width="100%">
 </div>
 
 ### 🔥 Latest News
 - [2025/1/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo]() was accepted by AAAI 2026
 - [2025/09/19] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
-- [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./assets/wechat.png). Feel free to join us!
+- [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
 - [2025/04/03] We release VeOmni!
 
 
@@ -119,33 +119,67 @@ Read the [VeOmni Best Practice](docs/start/best_practice.md) for more details.
 
 #### (Recommended) Use `uv` Managed Virtual Environment
 
-We recommend to use [`uv`](https://docs.astral.sh/uv/) managed virtual environment
-to run VeOmni.
+We recommend using [`uv`](https://docs.astral.sh/uv/) managed virtual environment to run VeOmni.
+
+**Install uv** (if not already installed):
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**Install VeOmni with uv**:
 
 ```shell
-# For GPU
+# For GPU (CUDA 12.8)
 uv sync --extra gpu
-# For Ascend NPU
+
+# For Ascend NPU (x86)
 uv sync --extra npu
-# You can install other optional deps by adding --extra like --extra dit
+
+# For Ascend NPU (aarch64/ARM)
+uv sync --extra npu_aarch64
+
+# Install multiple extras (e.g., GPU + audio + DiT support)
+uv sync --extra gpu --extra audio --extra dit
 
 # Activate the uv managed virtual environment
 source .venv/bin/activate
 ```
 
+**Available extras**:
+- `gpu`: CUDA 12.8 support with torch 2.8.0, flash-attention, liger-kernel
+- `npu`: Ascend NPU support for x86 with torch-npu
+- `npu_aarch64`: Ascend NPU support for aarch64/ARM with torch-npu
+- `audio`: Audio processing libraries (av, librosa, soundfile)
+- `dit`: Diffusion model support (diffusers, bitsandbytes)
+- `megatron`: Megatron-Energon support
+- `trl`: Transformer Reinforcement Learning support
+
 #### `pip` Based Install
 
-Install using PyPI:
+Install from PyPI (requires manually installing PyTorch first):
 
 ```shell
+# Install PyTorch first (choose based on your hardware)
+# For GPU with CUDA 12.8:
+pip3 install torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+# For CPU:
+pip3 install torch==2.8.0+cpu torchvision==0.23.0+cpu torchaudio==2.8.0+cpu \
+  --index-url https://download.pytorch.org/whl/cpu
+
+# Then install VeOmni
 pip3 install veomni
 ```
 
 Install from source code:
 
 ```shell
+# Install PyTorch first (see above), then:
 pip3 install -e .
 ```
+
+**Note**: Using `uv` is recommended as it handles PyTorch version management and CUDA compatibility automatically. With `pip`, you need to manually ensure PyTorch versions match your CUDA installation.
 
 ### 🚀 Quick Start
 
@@ -278,7 +312,7 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 > VeOmni Support all [transformers](https://github.com/huggingface/transformers) models if you don't need sequence parallelism or experts parallelism or other parallelism and cuda kernal optimize in VeOmni. We design a [model registry mechanism](veomni/models/registry.py). When the model is registered in veomni, we will automatically load the model and optimizer in VeOmni. Otherwise, it will default to load the modeling file in transformers.
 
-> If you want to add a new model, you can add a new model in the model registry. See in [Support costom model](docs/tutorials/model_loader.md) docs.
+> If you want to add a new model, you can add a new model in the model registry. See in [Support costom model](docs/key_features/model_loader.md) docs.
 
 ## ⛰️ Performance
 

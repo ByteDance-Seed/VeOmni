@@ -54,7 +54,6 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
-from ....ops.loss import causallm_loss_function
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
 
@@ -855,7 +854,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @check_model_inputs()
     @auto_docstring
     def forward(
         self,
@@ -1191,7 +1190,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
     #     return special_image_mask, special_video_mask
 
     @auto_docstring
-    @check_model_inputs
+    @check_model_inputs()
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1549,7 +1548,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         # Modification: Use the VeOmni custom loss function to handle Ulysses internally in a unified interface
-        self.loss_function = causallm_loss_function
 
         self.post_init()
 
@@ -1587,7 +1585,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         fake_model = SimpleNamespace(config=self.config)
         return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)
 
-    @check_model_inputs
+    @check_model_inputs()
     @replace_return_docstrings(output_type=Qwen3VLCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -1643,7 +1641,15 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         hidden_states = hidden_states[:, slice_indices, :]
         loss = None
         logits = None
-        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+        if labels is not None:
+            loss, logits = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
 
         return Qwen3VLCausalLMOutputWithPast(
             loss=loss,
@@ -1831,10 +1837,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
         return input_ids, model_kwargs
 
+if is_torch_npu_available():
+    from .npu_patch import apply_qwen3vl_npu_patch
 
-# Modification:
-# Register the ModelClass which is used by veOmni to tell which class to match the config.json architecture
-ModelClass = Qwen3VLForConditionalGeneration
+    apply_qwen3vl_npu_patch()
 
 __all__ = [
     "Qwen3VLVisionModel",

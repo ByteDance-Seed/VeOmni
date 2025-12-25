@@ -1,0 +1,78 @@
+name: Check PR Title Format
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check_pr_title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Title Format
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+
+            // ================= CONFIGURATION =================
+            // 1. Allowed Modules
+            const allowedModules = new Set([
+              'misc', 'ci', 'config', 'docs', 'data', 'dist',
+              'omni', 'logging', 'model', 'optim', 'ckpt',
+              'release', 'task', 'perf', 'ops', 'parallel'
+            ]);
+
+            // 2. Allowed Types
+            const allowedTypes = ['feat', 'fix', 'refactor', 'chore', 'test'];
+
+            // ================= LOGIC =================
+            console.log(`Checking PR Title: "${title}"`);
+
+            // Regex Breakdown:
+            // ^(\[BREAKING\])?   -> Group 1: Optional "[BREAKING]" prefix
+            // \s* -> Optional space (tolerant)
+            // \[([^\]]+)\]       -> Group 2: The modules content inside square brackets (e.g. "ci, model")
+            // \s+                -> Required space
+            // (feat|fix|...)     -> Group 3: The type
+            // :\s+               -> Colon and required space
+            // .+                 -> The description
+            const regex = new RegExp(`^(\\[BREAKING\\])?\\s*\\[([^\\]]+)\\]\\s+(${allowedTypes.join('|')}):\\s+.+$`);
+
+            const match = title.match(regex);
+
+            // 1. Check Basic Structure and Type
+            if (!match) {
+              core.setFailed(
+                `❌ PR Title format error!\n\n` +
+                `Your title: "${title}"\n\n` +
+                `Expected format: "[{modules}] {type}: {description}"\n` +
+                `Or for breaking: "[BREAKING][{modules}] {type}: {description}"\n\n` +
+                `Allowed types: ${allowedTypes.join(', ')}\n` +
+                `Example: "[parallel, model] feat: dynamic batching"`
+              );
+              return;
+            }
+
+            // 2. Check Modules (Group 2)
+            const rawModules = match[2]; // e.g. "ci, data" or "model"
+            // Split by comma and trim whitespace
+            const userModules = rawModules.split(',').map(m => m.trim());
+
+            const invalidModules = userModules.filter(m => !allowedModules.has(m));
+
+            if (invalidModules.length > 0) {
+              core.setFailed(
+                `❌ Invalid module name(s) detected: "${invalidModules.join(', ')}"\n\n` +
+                `Allowed modules are:\n` +
+                `${Array.from(allowedModules).join(', ')}\n\n` +
+                `Tip: Separate multiple modules with commas, e.g., "[ci, model]"`
+              );
+              return;
+            }
+
+            console.log("✅ PR Title format is valid.");
+            console.log(`   Modules: ${userModules.join(', ')}`);
+            console.log(`   Type:    ${match[3]}`);

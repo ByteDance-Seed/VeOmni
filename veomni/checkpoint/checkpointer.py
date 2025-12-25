@@ -33,7 +33,6 @@ def build_checkpointer(ckpt_manager: str, dist_backend: str):
 
 def ckpt_to_state_dict(
     save_checkpoint_path: Union[str, os.PathLike],
-    output_dir: Union[str, os.PathLike],
     ckpt_manager: str = "dcp",
 ) -> Dict[str, Any]:
     """
@@ -43,12 +42,11 @@ def ckpt_to_state_dict(
 
     Args:
         save_checkpoint_path: Path to the checkpoint.
-        output_dir: Path to the output directory.
         ckpt_manager: Checkpoint manager.
     Returns:
         state_dict: State dict.
     """
-    return CHECKPOINT_TO_STATE_DICT_REGISTRY[ckpt_manager](save_checkpoint_path, output_dir)
+    return CHECKPOINT_TO_STATE_DICT_REGISTRY[ckpt_manager](save_checkpoint_path)
 
 
 class CheckpointerBase(ABC):

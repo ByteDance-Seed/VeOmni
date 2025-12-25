@@ -13,7 +13,7 @@ train:
   output_dir: qwen3_vl_dense_sft
   data_parallel_mode: fsdp2
   enable_reentrant: false
-  use_wandb: true
+  use_wandb: false
   wandb_project: qwen3_vl_dense
   wandb_name: qwen3_vl_dense
   rmpad: false

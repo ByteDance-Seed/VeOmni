@@ -1,3 +1,4 @@
+# Copyright 2024-2025 The Black-forest-labs Authors. All rights reserved.
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,13 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from transformers import AutoConfig
-
-from .config_wan import WanConfig
-from .modeling_wan import WanModel
+from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
-AutoConfig.register("wan", WanConfig)
+@MODEL_CONFIG_REGISTRY.register("wan")
+def register_wan_config():
+    from .config_wan import WanConfig
 
-__all__ = ["WanModel", "WanConfig"]
+    return WanConfig
+
+
+@MODELING_REGISTRY.register("wan")
+def register_wan_modeling(architecture: str):
+    from .modeling_wan import WanModel
+
+    return WanModel

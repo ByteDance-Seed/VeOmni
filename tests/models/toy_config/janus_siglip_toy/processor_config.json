@@ -1,0 +1,23 @@
+{
+    "do_normalize": false,
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_size": 384,
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "min_size": 14,
+    "processor_class": "JanusSiglipEncoderProcessor",
+    "rescale_factor": 0.00392156862745098,
+    "token_num": 576,
+    "token_size": [
+      1,
+      24,
+      24
+    ]
+  }

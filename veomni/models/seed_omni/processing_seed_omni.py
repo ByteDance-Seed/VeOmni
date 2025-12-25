@@ -34,7 +34,7 @@ class SeedOmniProcessor(ProcessorMixin):
         ["input_image_processor", "input_video_processor", "input_audio_processor"]
         + ["output_image_processor", "output_video_processor", "output_audio_processor"]
         + ["target_image_processor", "target_video_processor", "target_audio_processor"]
-        + ["chat_template"]
+        + ["chat_template", "audio_tokenizer"]
     )
     input_image_processor_class = "AutoProcessor"
     input_audio_processor_class = "AutoProcessor"

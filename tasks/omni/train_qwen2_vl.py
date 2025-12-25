@@ -23,6 +23,7 @@ from veomni.data import (
 )
 from veomni.data.constants import IMAGE_INPUT_INDEX
 from veomni.data.multimodal import conv_preprocess
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -44,9 +45,7 @@ if TYPE_CHECKING:
 
     from veomni.data.chat_template import ChatTemplate
 
-
 logger = helper.create_logger(__name__)
-
 
 MAX_PIXELS = 768 * 28 * 28
 ROLE_MAPPING = {
@@ -165,7 +164,6 @@ def main():
         weights_path=args.model.model_path,
         torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
@@ -241,6 +239,7 @@ def main():
 
     model = build_parallelize_model(
         model,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
@@ -275,6 +274,7 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
@@ -376,10 +376,7 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
@@ -394,7 +391,9 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.set_postfix_str(
+                f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}", refresh=False
+            )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:

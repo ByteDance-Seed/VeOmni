@@ -143,25 +143,18 @@ class _SeqAllToAll(torch.autograd.Function):
         local_input: Tensor,
         scatter_dim: int,
         gather_dim: int,
-        async_op: bool,
     ) -> Tensor:
         ctx.group = group
         ctx.scatter_dim = scatter_dim
         ctx.gather_dim = gather_dim
-        ctx.async_op = async_op
-        return all_to_all_tensor(local_input, scatter_dim, gather_dim, group, async_op)
+        return all_to_all_tensor(local_input, scatter_dim, gather_dim, group)
 
     @staticmethod
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
-        if ctx.async_op:
-            input_t = torch.cat(grad_output[1:], dim=ctx.gather_dim).contiguous()
-        else:
-            input_t = grad_output[0]
+        input_t = grad_output[0]
         return (
             None,
             all_to_all_tensor(input_t, ctx.gather_dim, ctx.scatter_dim, ctx.group, False),
-            None,
-            None,
             None,
             None,
         )
@@ -183,7 +176,7 @@ class _Slice(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None]:
         dim_size = list(grad_output.size())
         split_size = dim_size[0]
-        output = _all_gather(grad_output, group=ctx.group)
+        output = _all_gather_into_tensor(grad_output, group=ctx.group)
         if ctx.scale_grad:
             output = output / ctx.seq_world_size
         return (None, torch.cat(output.split(split_size), dim=ctx.dim), None, None)
@@ -233,7 +226,7 @@ def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: Proc
     if dim_size % sp_world != 0:
         padding_size = sp_world - (dim_size % sp_world)
         x = pad_tensor(x, seq_dim, padding_size)
-    return _SeqAllToAll.apply(group, x, seq_dim, head_dim, False)
+    return _SeqAllToAll.apply(group, x, seq_dim, head_dim)
 
 
 def gather_seq_scatter_heads(
@@ -241,7 +234,6 @@ def gather_seq_scatter_heads(
     seq_dim: int,
     head_dim: int,
     unpadded_dim_size: int = 0,
-    async_op: bool = False,
     group: ProcessGroup = None,
 ) -> Tensor:
     """
@@ -251,14 +243,11 @@ def gather_seq_scatter_heads(
     if not group:
         return x
     sp_world = get_ulysses_sequence_parallel_world_size(group)
-    if async_op:
-        return _SeqAllToAll.apply(group, x, head_dim, seq_dim, async_op)
-    else:
-        x = _SeqAllToAll.apply(group, x, head_dim, seq_dim, async_op)
-        if unpadded_dim_size and unpadded_dim_size % sp_world != 0:
-            padding_size = x.size(seq_dim) - unpadded_dim_size
-            x = unpad_tensor(x, seq_dim, padding_size)
-        return x
+    x = _SeqAllToAll.apply(group, x, head_dim, seq_dim)
+    if unpadded_dim_size and unpadded_dim_size % sp_world != 0:
+        padding_size = x.size(seq_dim) - unpadded_dim_size
+        x = unpad_tensor(x, seq_dim, padding_size)
+    return x
 
 
 def gather_seq_scatter_heads_qkv(
@@ -266,7 +255,6 @@ def gather_seq_scatter_heads_qkv(
     seq_dim: int,
     unpadded_dim_size: Optional[int] = None,
     restore_shape: bool = True,
-    async_op: bool = False,
     group: ProcessGroup = None,
 ) -> Tensor:
     """
@@ -287,23 +275,21 @@ def gather_seq_scatter_heads_qkv(
     qkv_proj_dim = bef_all2all_shape[-1]
     bef_all2all_shape = bef_all2all_shape[:-1] + [3, qkv_proj_dim // 3]
     qkv_tensor = qkv_tensor.view(bef_all2all_shape)
-    if async_op:
-        return _SeqAllToAll.apply(group, qkv_tensor, scatter_dim, seq_dim, async_op)
-    else:
-        qkv_tensor = _SeqAllToAll.apply(group, qkv_tensor, scatter_dim, seq_dim, async_op)
 
-        if restore_shape:
-            out_shape = list(orig_shape)
-            out_shape[seq_dim] *= sp_world
-            out_shape[-1] = qkv_proj_dim // sp_world
-            qkv_tensor = qkv_tensor.view(out_shape)
+    qkv_tensor = _SeqAllToAll.apply(group, qkv_tensor, scatter_dim, seq_dim)
 
-        # remove padding
-        if unpadded_dim_size and unpadded_dim_size % sp_world != 0:
-            padding_size = qkv_tensor.size(seq_dim) - unpadded_dim_size
-            qkv_tensor = unpad_tensor(qkv_tensor, seq_dim, padding_size)
+    if restore_shape:
+        out_shape = list(orig_shape)
+        out_shape[seq_dim] *= sp_world
+        out_shape[-1] = qkv_proj_dim // sp_world
+        qkv_tensor = qkv_tensor.view(out_shape)
 
-        return qkv_tensor
+    # remove padding
+    if unpadded_dim_size and unpadded_dim_size % sp_world != 0:
+        padding_size = qkv_tensor.size(seq_dim) - unpadded_dim_size
+        qkv_tensor = unpad_tensor(qkv_tensor, seq_dim, padding_size)
+
+    return qkv_tensor
 
 
 class _AlltoAllRegion(torch.autograd.Function):

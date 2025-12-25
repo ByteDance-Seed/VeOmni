@@ -62,6 +62,9 @@ class ParallelPlan:
                     if check_fqn_match(fqn_pattern, fqn):
                         assert param.size(shard.dim) % ep_size == 0
                         ep_placement = ep_replicate[:-1] + [shard]
+                        logger.info_rank0(
+                            f"EP sharding: slicing param {fqn} along ep_mesh with placement {ep_placement}"
+                        )
                         dtensor = DTensor.from_local(
                             local_tensor=param.data, device_mesh=ep_mesh, placements=ep_replicate
                         )

@@ -17,7 +17,9 @@ from veomni.data import (
     build_dataloader,
     build_dataset,
 )
+from veomni.data.constants import IGNORE_INDEX
 from veomni.data.data_transform import process_pretrain_example, process_sft_example
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -139,7 +141,6 @@ def main():
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
@@ -185,6 +186,7 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
@@ -268,6 +270,12 @@ def main():
             total_loss = 0
             synchronize()
             start_time = time.time()
+
+            length_in_batch = torch.tensor(0, dtype=torch.int32, device=get_device_type())
+            for micro_batch in micro_batches:
+                length_in_batch += torch.sum(micro_batch["labels"] != IGNORE_INDEX)
+            length_in_batch = all_reduce(length_in_batch, op="sum", group=get_parallel_state().fsdp_group)
+
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
@@ -280,7 +288,12 @@ def main():
                     for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
-                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss.mean() / len(micro_batches)
+                    model_outputs = model(**micro_batch, use_cache=False)
+
+                length_in_micro_batch = torch.sum(micro_batch["labels"] != IGNORE_INDEX)
+                loss: "torch.Tensor" = (
+                    model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
+                )
 
                 with model_bwd_context:
                     loss.backward()
@@ -288,15 +301,7 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            # Prefer model-provided clip_grad_norm_ (now both FSDP1 and FSDP2 registers custom grad norm clipping)
-            if hasattr(model, "clip_grad_norm_"):
-                _gn = model.clip_grad_norm_(args.train.max_grad_norm)
-                grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
-            else:
-                logger.info_rank0(
-                    "Can NOT find regitsered clip_grad_norm_ method in the model, using PyTorch default implementation.."
-                )
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
@@ -311,7 +316,9 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.set_postfix_str(
+                f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}", refresh=False
+            )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
@@ -375,7 +382,6 @@ def main():
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         model_state_dict = ckpt_to_state_dict(
             save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
             ckpt_manager=args.train.ckpt_manager,
         )
         save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)

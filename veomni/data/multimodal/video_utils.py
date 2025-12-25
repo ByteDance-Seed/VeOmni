@@ -92,7 +92,7 @@ def smart_resize(
     max_ratio: int = None,
     **kwargs,
 ):
-    width, height = video.shape[2], video.shape[3]
+    height, width = video.shape[2], video.shape[3]
     if max_ratio is not None:
         ratio = max(width, height) / min(width, height)
         if ratio > max_ratio:

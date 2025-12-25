@@ -17,7 +17,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from .....utils import logging
 from ....seed_omni.projector import build_feature_projector
-from .configuring_ultra_edit import UltraEditConfig
+from .configuration_ultra_edit import UltraEditConfig
 
 
 logger = logging.get_logger(__name__)

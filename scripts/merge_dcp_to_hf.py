@@ -3,7 +3,7 @@ import os
 
 from transformers import AutoConfig, AutoProcessor
 
-from veomni.checkpoint import dcp_to_torch_state_dict
+from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_weights
 from veomni.utils import helper
 
@@ -13,7 +13,7 @@ logger = helper.create_logger(__name__)
 
 def merge_to_hf_pt(load_dir: str, save_path: str, model_assets_dir: str = None):
     # save model in huggingface's format
-    state_dict = dcp_to_torch_state_dict(
+    state_dict = ckpt_to_state_dict(
         save_checkpoint_path=load_dir,
     )
     # logger.info_rank0(f"Converting state_dict: {}")

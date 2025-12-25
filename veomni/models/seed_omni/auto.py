@@ -16,11 +16,10 @@
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 import torch
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedModel
 from transformers.modeling_utils import no_init_weights
 
 from ...distributed.parallel_state import get_parallel_state
-from ..auto import build_foundation_model, build_processor
+from ..auto import build_config, build_foundation_model, build_processor, build_tokenizer
 from ..module_utils import init_empty_weights, load_model_weights
 from .configuration_seed_omni import SeedOmniConfig
 from .modeling_seed_omni import SeedOmniModel
@@ -43,26 +42,26 @@ def build_omni_processor(
     """
     Builds omni modality processor using foundation tokenizer, encoders and decoders.
     """
-    foundation_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+    foundation_config = build_config(config_path)
     if isinstance(foundation_config, SeedOmniConfig):
         return build_processor(tokenizer_path)
 
-    processor_dict = {"tokenizer": AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)}
+    processor_dict = {"tokenizer": build_tokenizer(tokenizer_path)}
 
     input_encoders = encoders if input_encoder == "encoder" else decoders
     output_encoders = decoders if output_encoder == "decoder" else encoders
 
     for encoder_type, encoder_args in input_encoders.items():
-        processor = AutoProcessor.from_pretrained(encoder_args["config_path"], trust_remote_code=True)
+        processor = build_processor(encoder_args["config_path"])
         processor_dict[f"input_{encoder_type}_processor"] = processor
 
     for encoder_type, encoder_args in output_encoders.items():
-        processor = AutoProcessor.from_pretrained(encoder_args["config_path"], trust_remote_code=True)
+        processor = build_processor(encoder_args["config_path"])
         processor_dict[f"output_{encoder_type}_processor"] = processor
 
     if encode_target:
         for decoder_type, decoder_args in decoders.items():
-            processor = AutoProcessor.from_pretrained(decoder_args["config_path"], trust_remote_code=True)
+            processor = build_processor(decoder_args["config_path"])
             processor_dict[f"target_{decoder_type}_processor"] = processor
 
     omni_processor = SeedOmniProcessor(**processor_dict)
@@ -81,7 +80,6 @@ def build_omni_model(
     attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2"]] = "flash_attention_2",
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
-    force_use_huggingface: bool = False,
 ) -> "PreTrainedModel":
     """
     Builds omni modality model using foundation model, encoders, and decoders.
@@ -89,9 +87,7 @@ def build_omni_model(
     if config_kwargs is None:
         config_kwargs = {}
 
-    foundation_config: "PretrainedConfig" = AutoConfig.from_pretrained(
-        config_path, trust_remote_code=True, **config_kwargs, **foundation
-    )
+    foundation_config: "PretrainedConfig" = build_config(config_path, **config_kwargs, **foundation)
     if isinstance(foundation_config, SeedOmniConfig):
         return build_foundation_model(
             config_path=config_path,
@@ -100,17 +96,16 @@ def build_omni_model(
             attn_implementation=attn_implementation,
             init_device=init_device,
             config_kwargs=config_kwargs,
-            force_use_huggingface=force_use_huggingface,
         )
 
     foundation_config = foundation_config.to_dict()
     encoder_config = {"text_config": foundation_config}  # TODO: only keep nessesary keys
     for encoder_type, encoder_args in encoders.items():
         extra_args = {key: value for key, value in encoder_args.items() if key not in ["config_path", "model_path"]}
-        encoder_config[f"{encoder_type}_config"] = AutoConfig.from_pretrained(
+        encoder_config[f"{encoder_type}_config"] = build_config(
             encoder_args["config_path"],
-            trust_remote_code=True,
             output_size=foundation_config["hidden_size"],
+            tie_word_embeddings=False,
             **extra_args,
             **config_kwargs,
         ).to_dict()
@@ -120,10 +115,10 @@ def build_omni_model(
     decoder_config = {}
     for decoder_type, decoder_args in decoders.items():
         extra_args = {key: value for key, value in decoder_args.items() if key not in ["config_path", "model_path"]}
-        decoder_config[f"{decoder_type}_config"] = AutoConfig.from_pretrained(
+        decoder_config[f"{decoder_type}_config"] = build_config(
             decoder_args["config_path"],
-            trust_remote_code=True,
             output_size=foundation_config["hidden_size"],
+            tie_word_embeddings=False,
             **extra_args,
             **config_kwargs,
         ).to_dict()
@@ -138,6 +133,7 @@ def build_omni_model(
         tie_word_embeddings=foundation_config["tie_word_embeddings"],
         **config_kwargs,
     )
+
     init_kwargs = {
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),

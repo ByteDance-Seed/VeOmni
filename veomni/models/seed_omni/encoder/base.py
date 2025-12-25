@@ -29,7 +29,7 @@ class BaseEncoderConfigMixin(PretrainedConfig, ABC):
 class BaseEncoderProcessorMixin(ProcessorMixin, ABC):
     valid_kwargs = ["token_size", "token_num"]
     attributes = []
-    optional_attributes = ["chat_template"]
+    optional_attributes = ["chat_template", "audio_tokenizer"]
 
     def __init__(self, token_size=None, token_num=None, **kwargs):
         """ """
