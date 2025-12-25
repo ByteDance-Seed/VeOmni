@@ -51,7 +51,7 @@ jobs:
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
-        --network host
+        --network "host"
         --privileged
         --shm-size 16g
     env:
@@ -75,11 +75,7 @@ jobs:
           fetch-depth: 0
           clean: true
       - name: Install uv and dependencies
-        env:
-          UV_PYTHON_INSTALL_MIRROR: "https://python-standalone.org/mirror/astral-sh/python-build-standalone/"
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: "0.9.8"
+        run: curl -LsSf https://astral.sh/uv/0.9.8/install.sh | sh
       - name: Sync dependencies
         run: |
           uv sync --extra npu --group dev

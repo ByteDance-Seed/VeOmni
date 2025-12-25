@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -x
+set -o pipefail
 
 export TOKENIZERS_PARALLELISM=false
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1

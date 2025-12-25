@@ -1,10 +1,12 @@
+(examples-qwen3_vl)=
+
 # Qwen3 VL training guide
 
 ## Download dataset
 
-1. Download the ShareGPT4V and place it in the root directory of VeOmni:  [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingfacce.co/datasets/Lin-Chen/ShareGPT4V/blob/main/sharegpt4v_instruct_gpt4-vision_cap100k.json)
+Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset and download the data annotation JSON file [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main).
 
-2. Use the following Python script to filter the data file `sharegpt4v_instruct_gpt4-vision_cap100k.json` and retain only the content from the COCO dataset.
+Modify the sharegpt4v_instruct_gpt4-vision_cap100k.json
 
 ```python
 import json
@@ -20,37 +22,51 @@ for item in data:
 with open('sharegpt4v_instruct_gpt4-vision_cap100k_coco.json', 'w', encoding='utf-8') as f:
     json.dump(filtered_data, f, ensure_ascii=False, indent=4)
 ```
-After executing the Python script, a file named `sharegpt4v_instruct_gpt4-vision_cap100k_coco.json` will be generated in the root directory of VeOmni.
 
-3. Download the COCO 2017 training images:  [COCO train2017 dataset](https://images.cocodataset.org/zips/train2017.zip)
+## Download Qwen3 VL model
 
-4. Final directory structure should be like this:
-> ```
-> VeOmni
-> ├—— sharegpt4v_instruct_gpt4-vision_cap100k.json
-> ├—— sharegpt4v_instruct_gpt4-vision_cap100k_coco.json
-> └—— coco/
->     └—— train2017/
->         ├—— 000000000009.jpg
->         ├—— 000000000026.jpg
->         └—— ... (more images)
-> ```
+### Qwen3-VL-8B
 
-## Download qwen3vl model
 ```shell
 python3 scripts/download_hf_model.py \
     --repo_id Qwen/Qwen3-VL-8B-Instruct \
     --local_dir .
 ```
 
-## Start training on NPU
+### Qwen3-VL-30B
+
+```shell
+python3 scripts/download_hf_model.py \
+    --repo_id Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --local_dir .
+```
+
+## Start training on GPU/NPU
+
+### Qwen3-VL-8B
 
 ```shell
 bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --model.model_path ./Qwen3-VL-8B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --data.dataloader_type native \
-    --data.dataset_type iterable \
+    --data.dataset_type mapping \
     --data.sourcename sharegpt4v_sft \
+    --data.num_workers 8 \
+    --train.micro_batch_size 3 \
+    --train.use_wandb false
+```
+
+### Qwen3-VL-30B
+
+```shell
+bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
+    --model.model_path ./Qwen3-VL-30B-A3B-Instruct \
+    --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
+    --data.dataloader_type native \
+    --data.dataset_type mapping \
+    --data.sourcename sharegpt4v_sft \
+    --data.num_workers 8 \
+    --train.micro_batch_size 3 \
     --train.use_wandb false
 ```
