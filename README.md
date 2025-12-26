@@ -3,27 +3,20 @@
 
 <img src="./docs/assets/logo.png" width="50%">
 
-## VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
+<div align="center">
+    VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
+    <br>
+    <br>
+</div>
 
-<p align="center">
-  <a href="https://github.com/ByteDance-Seed/VeOmni/stargazers">
-    <img src="https://img.shields.io/github/stars/ByteDance-Seed/VeOmni?style=social"></a>
-  <a href="https://github.com/ByteDance-Seed/VeOmni">
-    <img src="https://img.shields.io/badge/VeOmni-Project Page-yellow"></a>
-  <a href="https://arxiv.org/abs/2508.02317">
-    <img src="https://img.shields.io/badge/VeOmni-Tech Report-red"></a>
-  <a href="https://huggingface.co/ByteDance-Seed">
-    <img src="https://img.shields.io/badge/VeOmni-Hugging Face-orange"></a>
-  <br>
-  <a href="https://github.com/ByteDance-Seed/VeOmni/asserts/wechat.png">
-    <img src="https://img.shields.io/badge/VeOmni-Wechat Communication Group-07C160"></a>
-  <a href="LICENSE">
-    <img src="https://img.shields.io/badge/License-Apache--2.0-blue"></a>
-</p>
+[![GitHub Repo stars](https://img.shields.io/github/stars/ByteDance-Seed/VeOmni)](https://github.com/ByteDance-Seed/VeOmni/stargazers)
+[![Paper](https://img.shields.io/badge/Paper-red)](https://arxiv.org/abs/2508.02317)
+[![Documentation](https://img.shields.io/badge/Documentation-blue)](https://veomni.readthedocs.io/en/latest/)
+[![WeChat](https://img.shields.io/badge/WeChat-green?logo=wechat&amp)](https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/WeChat.JPG)
 
 </div>
 
-## 🔗 Overview
+## 🍪 Overview
 VeOmni is a versatile framework for both single- and multi-modal pre-training and post-training. It empowers users to seamlessly scale models of any modality across various accelerators, offering both flexibility and user-friendliness.
 
 Our guiding principles when building VeOmni are:
@@ -37,264 +30,56 @@ Our guiding principles when building VeOmni are:
 <img src="./docs/assets/system.png" width="100%">
 </div>
 
-### 🔥 Latest News
+## 🔥 Latest News
 - [2025/1/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo]() was accepted by AAAI 2026
 - [2025/09/19] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
 - [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
 - [2025/04/03] We release VeOmni!
 
 
-## 🔖 Table of Contents
-
-- [VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](#veomni-scaling-any-modality-model-training-with-model-centric-distributed-recipe-zoo)
-- [🔗 Overview](#-overview)
-  - [🔥 Latest News](#-latest-news)
-- [🔖 Table of Contents](#-table-of-contents)
-- [📚 Key Features](#-key-features)
-  - [🧪 Upcoming Features](#-upcoming-features)
-- [🎈 Getting Started](#-getting-started)
-  - [🔧 Installation](#-installation)
-    - [(Recommended) Use `uv` Managed Virtual Environment](#recommended-use-uv-managed-virtual-environment)
-    - [`pip` Based Install](#pip-based-install)
-  - [🚀 Quick Start](#-quick-start)
-  - [🔒 Merge checkpoints](#-merge-checkpoints)
-  - [📦 Build Docker](#-build-docker)
-- [🧱 Training Examples](#-training-examples)
-- [✏️ Supported Models](#️-supported-models)
-- [⛰️ Performance](#️-performance)
-- [😊 Acknowledgement](#-acknowledgement)
-- [💡 Awesome work using VeOmni](#-awesome-work-using-veomni)
-- [🎨 Contributing](#-contributing)
-- [📄 License](#-license)
-- [📝 Citation](#-citation)
-- [🌱 About ByteDance Seed Team](#-about-bytedance-seed-team)
-
 ## 📚 Key Features
 
 - **Parallelism**
-  - Parallel state by [DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html)
-  - Torch FSDP1/2
-  - Experts parallelism(Experimental)
-  - Easy to add new parallelism plan
-  - Sequence parallelism
-    - [Ulysess](https://arxiv.org/abs/2309.14509)
-    - Async-Ulysses
-  - Activation offloading
-  - Activation checkpointing
+  - **FSDP**, **FSDP2** backend for training.
+  - **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
+  - **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
+
 - **Kernels**
-  - GroupGemm ops for moe
+  - Efficient **GroupGemm** ops for Moe model.
   - [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) integrations
+
 - **Model**
-  - Any [transformers](https://github.com/huggingface/transformers) models.
-  - Multi-modal
-    - Qwen2.5-VL
-    - Qwen2-VL
-    - Seed-Omni
+  - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
+
 - **Data IO**
   - Dynamic batching strategy
   - Omnidata processing
+
 - **Distributed Checkpointing**
-  - [ByteCheckpoint](https://github.com/ByteDance-Seed/ByteCheckpoint)
-  - Torch Distributed checkpointing
-  - Dcp merge tools
-- **Other tools**
-  - Profiling tools
-  - Easy yaml configuration and argument parsing
+  - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)
 
-### 🧪 Upcoming Features
+- **Platform**
+  - Support for both Nvidia-GPU and Ascend-NPU training.
 
-- [ ] Torch native Tensor parallelism
-- [ ] torch.compile
-- [ ] [Flux: Fine-grained Computation-communication Overlapping GPU Kernel](https://github.com/bytedance/flux) integrations
-- [ ] Better offloading strategy
-- [ ] More models support
-- [ ] Torch native pipeline parallelism
+- **Tools**
+  - Experiment tracking with wandb
 
+## 📝 Upcoming Features and Changes
 
-## 🎈 Getting Started
-
-Read the [VeOmni Best Practice](docs/start/best_practice.md) for more details.
-
-### 🔧 Installation
-
-#### (Recommended) Use `uv` Managed Virtual Environment
-
-We recommend using [`uv`](https://docs.astral.sh/uv/) managed virtual environment to run VeOmni.
-
-**Install uv** (if not already installed):
-```shell
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-**Install VeOmni with uv**:
-
-```shell
-# For GPU (CUDA 12.8)
-uv sync --extra gpu
-
-# For Ascend NPU (x86)
-uv sync --extra npu
-
-# For Ascend NPU (aarch64/ARM)
-uv sync --extra npu_aarch64
-
-# Install multiple extras (e.g., GPU + audio + DiT support)
-uv sync --extra gpu --extra audio --extra dit
-
-# Activate the uv managed virtual environment
-source .venv/bin/activate
-```
-
-**Available extras**:
-- `gpu`: CUDA 12.8 support with torch 2.8.0, flash-attention, liger-kernel
-- `npu`: Ascend NPU support for x86 with torch-npu
-- `npu_aarch64`: Ascend NPU support for aarch64/ARM with torch-npu
-- `audio`: Audio processing libraries (av, librosa, soundfile)
-- `dit`: Diffusion model support (diffusers, bitsandbytes)
-- `megatron`: Megatron-Energon support
-- `trl`: Transformer Reinforcement Learning support
-
-#### `pip` Based Install
-
-Install from PyPI (requires manually installing PyTorch first):
-
-```shell
-# Install PyTorch first (choose based on your hardware)
-# For GPU with CUDA 12.8:
-pip3 install torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 \
-  --index-url https://download.pytorch.org/whl/cu128
-
-# For CPU:
-pip3 install torch==2.8.0+cpu torchvision==0.23.0+cpu torchaudio==2.8.0+cpu \
-  --index-url https://download.pytorch.org/whl/cpu
-
-# Then install VeOmni
-pip3 install veomni
-```
-
-Install from source code:
-
-```shell
-# Install PyTorch first (see above), then:
-pip3 install -e .
-```
-
-**Note**: Using `uv` is recommended as it handles PyTorch version management and CUDA compatibility automatically. With `pip`, you need to manually ensure PyTorch versions match your CUDA installation.
-
-### 🚀 Quick Start
-
-User can quickly start training like this:
-
-```shell
-bash train.sh $TRAIN_SCRIPT $CONFIG.yaml
-```
-
-You can also override arguments in yaml by passing arguments from an external command line:
-
-```shell
-bash train.sh $TRAIN_SCRIPT $CONFIG.yaml \
-    --model.model_path PATH/TO/MODEL \
-    --data.train_path PATH/TO/DATA \
-    --train.global_batch_size GLOBAL_BATCH_SIZE \
-```
-
-Here is an end-to-end workflow for preparing a subset of the fineweb dataset, continuing training a qwen2_5 model with sequence parallel 2 for 20 steps, and then merging the global_step_10 distributed checkpoint to hf weight by ByteCheckpoint.
-
-1. Download fineweb dataset
-
-```shell
-python3 scripts/download_hf_data.py \
-  --repo_id HuggingFaceFW/fineweb \
-  --local_dir ./fineweb/ \
-  --allow_patterns sample/10BT/*
-```
-
-2. Download qwen2_5 model
-
-```shell
-python3 scripts/download_hf_model.py \
-  --repo_id Qwen/Qwen2.5-7B \
-  --local_dir .
-```
-
-3. Training
-
-```shell
-bash train.sh tasks/train_torch.py configs/pretrain/qwen2_5.yaml \
-    --model.model_path ./Qwen2.5-7B \
-    --data.train_path ./fineweb/sample/10BT/ \
-    --train.global_batch_size 512 \
-    --train.lr 5e-7 \
-    --train.ulysses_parallel_size 2 \
-    --train.save_steps 10 \
-    --train.max_steps 20 \
-    --train.output_dir Qwen2.5-7B_CT
-```
-
-4. Merge checkpoints
-
-```shell
-python3 scripts/mereg_dcp_to_hf.py \
-    --load-dir Qwen2.5-7B-Instruct_CT/checkpoints/global_step_10 \
-    --model_assets_dir Qwen2.5-7B-Instruct_CT/model_assets \
-    --save-dir Qwen2.5-7B-Instruct_CT/checkpoints/global_step_10/hf_ckpt
-```
-
-5. Inference
-
-```shell
-python3 tasks/infer.py \
-  --infer.model_path Qwen2.5-7B-Instruct_CT/checkpoints/global_step_10/hf_ckpt
-```
+- VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
+- Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
+- Validation dataset during training validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
+- RL post training for omni-modality models with VeRL https://github.com/ByteDance-Seed/VeOmni/issues/262
 
 
-### 🔒 Merge checkpoints
+## 🚀 Getting Started
 
-we use [ByteCheckpoint](https://github.com/ByteDance-Seed/ByteCheckpoint) to save checkpoints in torch.distributed.checkpoint(dcp) format. You can merge the dcp files using this command:
+<a href="https://veomni.readthedocs.io/en/latest/index.html"><b>Documentation</b></a>
 
-```shell
-python3 scripts/mereg_dcp_to_hf.py \
-    --load-dir PATH/TO/CHECKPOINTS \
-    --model_assets_dir PATH/TO/MODEL_ASSETS \
-    --save-dir PATH/TO/SAVE_HF_WEIGHT \
-```
+### Quick Start
+  - [Installation](https://veomni.readthedocs.io/en/latest/get_started/installation/install.html)
+  - [Quick Start with Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html)
 
-For example, your output_dir is `seed_omni`, and you want to merge global_step_100 checkpoint to huggingface-type weight:
-
-```shell
-python3 scripts/mereg_dcp_to_hf.py \
-    --load-dir seed_omni/checkpoints/global_step_100 \
-    --model_assets_dir seed_omni/model_assets \
-    --save-dir seed_omni/hf_ckpt \
-```
-
-### 📦 Build Docker
-
-```shell
-cd docker/
-docker compose up -d
-docker compose exec VeOmni bash
-```
-
-## 🧱 Training Examples
-
-PyTorch FSDP2 Qwen2VL
-
-```shell
-bash train.sh tasks/multimodal/omni/train_qwen2_vl.py configs/multimodal/qwen2_vl/qwen2_vl.yaml
-```
-
-PyTorch FSDP2 Qwen2
-
-```shell
-bash train.sh tasks/train_torch.py configs/pretrain/qwen2_5.yaml
-```
-
-PyTorch FSDP2 llama3-8b-instruct
-
-```shell
-bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
-```
 
 ## ✏️ Supported Models
 
@@ -318,7 +103,7 @@ bash train.sh  tasks/train_torch.py configs/pretrain/llama3.yaml
 
 Seed in Tech report (https://arxiv.org/abs/2508.02317)
 
-## 😊 Acknowledgement
+## 😃 Acknowledgement
 
 Thanks to the following projects for their excellent work:
 
@@ -360,7 +145,7 @@ If you find VeOmni useful for your research and applications, feel free to give 
 }
 ```
 
-## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
+## 🌱 About [ByteDance Seed](https://team.doubao.com/)
 
 ![seed logo](https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216)
 
