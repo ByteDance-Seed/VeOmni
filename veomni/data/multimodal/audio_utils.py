@@ -7,6 +7,8 @@ import librosa
 import numpy as np
 import soundfile as sf
 
+from .file_utils import resolve_relative_path
+
 
 AudioInput = Union[
     np.ndarray,
@@ -59,12 +61,13 @@ def load_audio_from_path(audio_path: str, sample_rate: int = 16000, **kwargs):
     if audio_path.startswith("http://") or audio_path.startswith("https://"):
         return librosa.load(audioread.ffdec.FFmpegAudioFile(audio_path), sr=sample_rate)[0]
     else:
+        audio_path = resolve_relative_path(audio_path, kwargs.get("train_path"))
         return librosa.load(audio_path, sr=sample_rate)[0]
 
 
 def load_audio(audios: AudioInput, **kwargs):
     if isinstance(audios, str):
-        return load_audio_from_path(audios)
+        return load_audio_from_path(audios, **kwargs)
     elif isinstance(audios, bytes):
         return load_audio_from_bytes(audios, **kwargs)
     else:

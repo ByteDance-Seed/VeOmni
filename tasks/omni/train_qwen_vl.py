@@ -143,6 +143,7 @@ def main():
             processor=processor,
             chat_template=chat_template,
             position_id_func=position_id_func,
+            train_path=args.data.train_path,
             **args.data.mm_configs,
         )
     elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
@@ -151,6 +152,7 @@ def main():
             processor=processor,
             chat_template=chat_template,
             position_id_func=position_id_func,
+            train_path=args.data.train_path,
             **args.data.mm_configs,
         )
     else:
