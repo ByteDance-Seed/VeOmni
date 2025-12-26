@@ -105,6 +105,7 @@ def ForCausalLMLoss(
 
 def apply_veomni_loss_patch():
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
+    LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
     global _cross_entropy
     if is_torch_npu_available():
         _cross_entropy = eager_cross_entropy
