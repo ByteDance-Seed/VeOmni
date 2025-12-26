@@ -102,7 +102,7 @@ def _compute_seqlens(
         seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
     elif rmpad_with_pos_ids:
         seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-        seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
+        seqlens = seqlens[:-1] if (micro_batch["position_ids"][:, -seqlens[-1] :] == 0).all().item() else seqlens
     else:
         seqlens = attention_mask.sum(-1).tolist()
 
