@@ -25,6 +25,7 @@ if not hasattr(av, "AVError"):
 VideoInput = Union[
     List["PIL.Image.Image"],
     Dict[str, "np.ndarray"],
+    List[bytes],
     ByteString,
     str,
 ]
@@ -152,6 +153,56 @@ def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs):
         audio_fps = info["audio_fps"]
     return video, video_fps, audio, audio_fps
 
+def load_video_from_bytes_list(video, **kwargs):
+    """
+    Loads video frames from a list of bytes with memory optimization.
+    Returns metadata in the format {"fps": val, "total_num_frames": count}.
+    """
+    if isinstance(video, np.ndarray):
+        video = video.tolist()
+    if not video:
+        raise ValueError("Input video frame list is empty")
+
+    # 1. Extract metadata
+    # kwargs['fps'] is expected to be the sampled fps provided during data processing
+    fps_val = kwargs.get('fps', 2.0) 
+    nframes = len(video)
+    
+    # 2. Decode the first frame to determine dimensions (H, W) for pre-allocation
+    with PIL.Image.open(BytesIO(video[0])) as img:
+        img = img.convert('RGB')
+        w, h = img.size
+    
+    T = nframes
+    C = 3
+    
+    # 3. Memory Optimization: Pre-allocate Tensor (T, C, H, W)
+    # [Key Optimization]: Using uint8 saves ~75% memory compared to float32
+    video_tensor = torch.empty((T, C, h, w), dtype=torch.uint8)
+    
+    # 4. Decode and fill frames sequentially
+    for i, frame_bytes in enumerate(video):
+        with PIL.Image.open(BytesIO(frame_bytes)) as img:
+            # Ensure RGB mode
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # PIL Image (W, H) -> Numpy (H, W, C)
+            frame_arr = np.array(img)
+            
+            # Numpy (H, W, C) -> Tensor (C, H, W)
+            # Use copy=False to attempt zero-copy; permute dimensions
+            frame_t = torch.from_numpy(frame_arr).permute(2, 0, 1)
+            
+            # Assign to pre-allocated tensor
+            video_tensor[i] = frame_t
+
+    # 5. Construct metadata dictionary
+    # Aligns with the output format of smart_video_nframes
+    video_info = {"fps": fps_val, "total_num_frames": nframes}
+
+    # Return tuple compatible with the load_video interface (audio is None)
+    return video_tensor, video_info, None, None
 
 def load_video_from_bytes(video: bytes, use_audio_in_video: bool = True, **kwargs):
     container = av.open(BytesIO(video))
@@ -194,6 +245,8 @@ def load_video(video: VideoInput, **kwargs):
         return load_video_from_path(video, **kwargs)
     elif isinstance(video, bytes):
         return load_video_from_bytes(video, **kwargs)
+    elif isinstance(video, (list, np.ndarray)):
+        return load_video_from_bytes_list(video, **kwargs)
     else:
         raise NotImplementedError
 
@@ -216,3 +269,35 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
         smart_audio_nframes(audio, audio_fps, **kwargs) for audio, audio_fps in zip(audio_inputs, audio_fps_list)
     ]
     return video_inputs, audio_inputs
+
+def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
+    video_inputs_raw, video_fps_list = [], []
+    # no audio
+    dir_return = False
+    if 'fps' in kwargs:
+        dir_return = True
+        fps_list = kwargs.pop('fps')
+    else:
+        fps_list = [None] * len(videos)
+    for video_item, fps in zip(videos, fps_list):
+        # Returns Tensor or ndarray
+        v, v_fps, _, _ = load_video(video_item, fps=fps, **kwargs)
+        video_inputs_raw.append(v)
+        video_fps_list.append(v_fps)
+
+    if dir_return:
+        # directly return
+        return video_inputs_raw, video_fps_list
+    
+    final_video_inputs = []
+    final_fps_inputs = []
+
+    for v_raw, v_fps in zip(video_inputs_raw, video_fps_list):
+        processed_v, processed_fps = smart_video_nframes(
+            smart_resize(v_raw, **kwargs), v_fps, **kwargs
+        )
+        final_video_inputs.append(processed_v)
+        final_fps_inputs.append(processed_fps)
+
+    
+    return final_video_inputs, final_fps_inputs
