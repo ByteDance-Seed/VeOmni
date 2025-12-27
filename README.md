@@ -82,9 +82,11 @@ Support new models to VeOmni see [Support New Models](https://veomni.readthedocs
 
 ## ⛰️ Performance
 
-<div align="center">
+<div align="left">
 <img src="./docs/assets/performance.png" width="90%">
 </div>
+
+For more details, please refer to our [paper](https://arxiv.org/abs/2508.02317).
 
 ## 💡 Awesome work using VeOmni
 - [dFactory: Easy and Efficient dLLM Fine-Tuning](https://github.com/inclusionAI/dFactory)
