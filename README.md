@@ -31,7 +31,7 @@ Our guiding principles when building VeOmni are:
 </div>
 
 ## 🔥 Latest News
-- [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo]() was accepted by AAAI 2026
+- [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
 - [2025/09] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
 - [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
 - [2025/04] We release VeOmni!
@@ -52,7 +52,7 @@ Our guiding principles when building VeOmni are:
 
 - VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
 - Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
-- Validation dataset during training validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
+- Validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
 - RL post training for omni-modality models with VeRL https://github.com/ByteDance-Seed/VeOmni/issues/262
 
 
