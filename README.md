@@ -127,6 +127,10 @@ Thanks to the following projects for their excellent work:
 
 ## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
 
+<div align="center">
+<img src="https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216" width="100%">
+</div>
+
 Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's most advanced AI foundation models. The team aspires to become a world-class research team and make significant contributions to the advancement of science and society. You can get to know Bytedance Seed better through the following channels👇
 <div>
   <a href="https://team.doubao.com/">
