@@ -12,7 +12,7 @@
 [![GitHub Repo stars](https://img.shields.io/github/stars/ByteDance-Seed/VeOmni)](https://github.com/ByteDance-Seed/VeOmni/stargazers)
 [![Paper](https://img.shields.io/badge/Paper-red)](https://arxiv.org/abs/2508.02317)
 [![Documentation](https://img.shields.io/badge/Documentation-blue)](https://veomni.readthedocs.io/en/latest/)
-[![WeChat](https://img.shields.io/badge/WeChat-green?logo=wechat&amp)](https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/WeChat.JPG)
+[![WeChat](https://img.shields.io/badge/WeChat-green?logo=wechat&amp)](https://raw.githubusercontent.com/ByteDance-Seed/VeOmni/refs/heads/main/docs/assets/wechat.png)
 
 </div>
 
@@ -27,42 +27,26 @@ Our guiding principles when building VeOmni are:
 - **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
 
 <div align="center">
-<img src="./docs/assets/system.png" width="100%">
+<img src="./docs/assets/system.png" width="90%">
 </div>
 
 ## 🔥 Latest News
-- [2025/1/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo]() was accepted by AAAI 2026
-- [2025/09/19] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
-- [2025/08/01] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
-- [2025/04/03] We release VeOmni!
+- [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo]() was accepted by AAAI 2026
+- [2025/09] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
+- [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
+- [2025/04] We release VeOmni!
 
 
 ## 📚 Key Features
-
-- **Parallelism**
-  - **FSDP**, **FSDP2** backend for training.
-  - **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
-  - **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
-
-- **Kernels**
-  - Efficient **GroupGemm** ops for Moe model.
-  - [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) integrations
-
-- **Model**
-  - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
-
-- **Data IO**
-  - Dynamic batching strategy
-  - Omnidata processing
-
-- **Distributed Checkpointing**
-  - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)
-
-- **Platform**
-  - Support for both Nvidia-GPU and Ascend-NPU training.
-
-- **Tools**
-  - Experiment tracking with wandb
+- **FSDP**, **FSDP2** backend for training.
+- **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
+- **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
+- Efficient **GroupGemm** kernel for Moe model, [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
+- Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
+- Dynamic batching strategy, Omnidata processing
+- [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
+- Support for both Nvidia-GPU and Ascend-NPU training.
+- Experiment tracking with wandb
 
 ## 📝 Upcoming Features and Changes
 
@@ -94,25 +78,13 @@ Our guiding principles when building VeOmni are:
 | [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
 | Omni Model                                               | Any Modality Training         | [seed_omni.yaml](configs/multimodal/omni/seed_omni.yaml)              |
 
-
-> VeOmni Support all [transformers](https://github.com/huggingface/transformers) models if you don't need sequence parallelism or experts parallelism or other parallelism and cuda kernal optimize in VeOmni. We design a [model registry mechanism](veomni/models/registry.py). When the model is registered in veomni, we will automatically load the model and optimizer in VeOmni. Otherwise, it will default to load the modeling file in transformers.
-
-> If you want to add a new model, you can add a new model in the model registry. See in [Support costom model](docs/key_features/model_loader.md) docs.
+Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models.html)
 
 ## ⛰️ Performance
 
-Seed in Tech report (https://arxiv.org/abs/2508.02317)
-
-## 😃 Acknowledgement
-
-Thanks to the following projects for their excellent work:
-
-- [ByteCheckpoint](https://arxiv.org/abs/2407.20143)
-- [veScale](https://github.com/volcengine/veScale)
-- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
-- [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
-- [torchtitan](https://github.com/pytorch/torchtitan/)
-- [torchtune](https://github.com/pytorch/torchtune)
+<div align="center">
+<img src="./docs/assets/performance.png" width="90%">
+</div>
 
 ## 💡 Awesome work using VeOmni
 - [dFactory: Easy and Efficient dLLM Fine-Tuning](https://github.com/inclusionAI/dFactory)
@@ -127,12 +99,8 @@ Agentic Models in Minecraft](https://arxiv.org/pdf/2509.13347)
 
 Contributions from the community are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) our project roadmap(To be updated),
 
-## 📄 License
 
-This project is licensed under Apache License 2.0. See the [LICENSE](LICENSE) file for details.
-
-
-## 📝 Citation
+## 📝 Citation and Acknowledgement
 
 If you find VeOmni useful for your research and applications, feel free to give us a star ⭐ or cite us using:
 
@@ -145,21 +113,27 @@ If you find VeOmni useful for your research and applications, feel free to give 
 }
 ```
 
-## 🌱 About [ByteDance Seed](https://team.doubao.com/)
+Thanks to the following projects for their excellent work:
 
-![seed logo](https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216)
+- [ByteCheckpoint](https://arxiv.org/abs/2407.20143)
+- [veScale](https://github.com/volcengine/veScale)
+- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
+- [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
+- [torchtitan](https://github.com/pytorch/torchtitan/)
+- [torchtune](https://github.com/pytorch/torchtune)
 
-Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's most advanced AI foundation models. The team aspires to become a world-class research team and make significant contributions to the advancement of science and society.
 
-You can get to know us better through the following channels👇
-<p align="center">
-  <br>
+## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
+
+Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's most advanced AI foundation models. The team aspires to become a world-class research team and make significant contributions to the advancement of science and society. You can get to know Bytedance Seed better through the following channels👇
+<div>
   <a href="https://team.doubao.com/">
     <img src="https://img.shields.io/badge/Website-%231e37ff?style=for-the-badge&logo=bytedance&logoColor=white"></a>
-  <a href="https://github.com/user-attachments/assets/93481cda-a7f3-47f3-b333-fe6b3da86b78">
+  <a href="https://github.com/user-attachments/assets/469535a8-42f2-4797-acdf-4f7a1d4a0c3e">
     <img src="https://img.shields.io/badge/WeChat-07C160?style=for-the-badge&logo=wechat&logoColor=white"></a>
  <a href="https://www.xiaohongshu.com/user/profile/668e7e15000000000303157d?xsec_token=ABl2-aqekpytY6A8TuxjrwnZskU-6BsMRE_ufQQaSAvjc%3D&xsec_source=pc_search">
     <img src="https://img.shields.io/badge/Xiaohongshu-%23FF2442?style=for-the-badge&logo=xiaohongshu&logoColor=white"></a>
   <a href="https://www.zhihu.com/org/dou-bao-da-mo-xing-tuan-dui/">
     <img src="https://img.shields.io/badge/zhihu-%230084FF?style=for-the-badge&logo=zhihu&logoColor=white"></a>
-</p>
+
+</div>
