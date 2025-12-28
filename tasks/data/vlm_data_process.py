@@ -164,6 +164,7 @@ def process_sample_qwen3_vl(
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
+        tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
     if "videos" in sample:
         videos, metadata = fetch_videos_metadata(sample["videos"], fps=sample["fps"], **kwargs)
         # Process videos without resizing or sampling frames initially
@@ -176,8 +177,8 @@ def process_sample_qwen3_vl(
         # Extract metadata for use in the chat template
         video_metadata = video_inputs.pop("video_metadata")
 
-    # Uses Qwen3-VL chat template encoding with video metadata
-    tokenized_example = chat_template.encode_messages(conversations, token_num_inputs, video_metadata=video_metadata)
+        # Uses Qwen3-VL chat template encoding with video metadata
+        tokenized_example = chat_template.encode_messages(conversations, token_num_inputs, video_metadata=video_metadata)
     
     # Ensure all values are tensors
     tokenized_example = {
@@ -202,70 +203,6 @@ def process_sample_qwen3_vl(
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
     
-    if record_process_time:
-        process_time = time.time() - start_time
-        tokenized_example["process_sample_time_sec"] = process_time
-
-    return [tokenized_example]
-
-
-def process_sample_qwen3_vl(
-    sample: Dict[str, Any],
-    processor: "ProcessorMixin",
-    chat_template: "ChatTemplate",
-    position_id_func: "Callable",
-    **kwargs,
-):
-    """
-    Processes multimodal example with qwen3_vl's pre-processor.
-    """
-    record_process_time = kwargs.get("record_process_time", False)
-    if record_process_time:
-        start_time = time.time()
-
-    source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
-    )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
-    conversations = conv_preprocess(source, conversations, **kwargs)
-
-    token_num_inputs, image_inputs, video_inputs = {}, {}, {}
-    image_grid_thw, video_grid_thw = None, None
-    if "images" in sample:
-        images = fetch_images(sample["images"], **kwargs)
-        image_inputs = processor.image_processor(images=images, return_tensors="pt")
-        image_grid_thw = image_inputs["image_grid_thw"]
-        merge_length = processor.image_processor.merge_size**2
-        image_token_num = image_grid_thw.prod(dim=-1) // merge_length
-        token_num_inputs["image"] = image_token_num
-    if "videos" in sample:
-        videos, _ = fetch_videos(sample["videos"], **kwargs)
-        video_inputs = processor.video_processor(images=None, videos=videos, return_tensors="pt")
-        video_grid_thw = video_inputs["video_grid_thw"]
-        merge_length = processor.video_processor.merge_size**2
-        video_token_num = video_grid_thw.prod(dim=-1) // merge_length
-        token_num_inputs["video"] = video_token_num
-
-    tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
-    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
-    input_ids = tokenized_example["input_ids"]
-
-    tokenized_example["position_ids"] = position_id_func(
-        input_ids=input_ids.unsqueeze(0),
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=video_grid_thw,
-        attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
-    )["position_ids"]  # (dim, 1, seq_length)
-    # Squeezed to (dim, seq_len) for later collator processing
-    tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
-
-    tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
-    tokenized_example["video_mask"] = tokenized_example["input_ids"] == VIDEO_INPUT_INDEX
-    tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
-    tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
-    tokenized_example.update(image_inputs)
-    tokenized_example.update(video_inputs)
-
     if record_process_time:
         process_time = time.time() - start_time
         tokenized_example["process_sample_time_sec"] = process_time
