@@ -480,7 +480,10 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                 
                 elif value[0] == "video":
                     # --- [Core Modification: Video Timestamp Processing] ---
-                    total_video_tokens = next(video_token_num_list)
+                    try:
+                        total_video_tokens = next(video_token_num_list)
+                    except StopIteration:
+                        raise ValueError("Video token number is missing for a video input.")
                     
                     # Get metadata for the current video
                     try:
