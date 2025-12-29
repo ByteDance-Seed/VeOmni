@@ -269,7 +269,7 @@ def build_mapping_dataset(
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
 
         elif os.path.isdir(data_path):
-            data_files.extend([os.path.join(data_path, fn) for fn in os.listdir(data_path)])
+            data_files.extend([os.path.join(data_path, fn) for fn in sorted(os.listdir(data_path))])
         elif os.path.isfile(data_path):
             data_files.append(data_path)
         else:
@@ -321,7 +321,7 @@ def build_iterable_dataset(
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
 
         elif os.path.isdir(data_path):
-            data_files.extend([os.path.join(data_path, fn) for fn in os.listdir(data_path)])
+            data_files.extend([os.path.join(data_path, fn) for fn in sorted(os.listdir(data_path))])
         elif os.path.isfile(data_path):
             data_files.append(data_path)
         else:
