@@ -292,7 +292,7 @@ def main():
 
                 length_in_micro_batch = torch.sum(micro_batch["labels"] != IGNORE_INDEX)
                 loss: "torch.Tensor" = (
-                    model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
+                    model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().fsdp_size
                 )
 
                 with model_bwd_context:
