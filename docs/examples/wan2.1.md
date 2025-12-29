@@ -4,10 +4,10 @@
 
 ## Download model
 
-```python
-pip install "huggingface_hub[cli]"
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
---local-dir ./Wan2.1-I2V-14B-480P-Diffusers
+```shell
+python3 scripts/download_hf_model.py \
+    --repo_id Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
+    --local_dir .
 ```
 
 ## Prepare Dataset
@@ -26,13 +26,13 @@ You can adjust parameter **num_files and video specifications (T, H, W)** in the
 
 ```shell
 bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \
---model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer
+    --model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer
 ```
 
 ## Start training on NPU
 
 ```shell
 bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \
---model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer \
---train.init_device npu
+    --model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer \
+    --train.init_device npu
 ```
