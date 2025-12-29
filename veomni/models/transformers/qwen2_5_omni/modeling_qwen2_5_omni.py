@@ -1559,7 +1559,12 @@ class Qwen2_5OmniRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        if hasattr(self.config, "rope_parameters"):
+            from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding as Qwen3RoPE
+
+            self.rope_init_fn = Qwen3RoPE.compute_default_rope_parameters
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
