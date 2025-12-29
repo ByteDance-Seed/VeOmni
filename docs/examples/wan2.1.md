@@ -18,21 +18,21 @@ We are constructing random tensors to conduct test training.
 Ensure the current working directory is the **project root**.
 
 ```shell
-python docs/examples/generate.py
+python docs/examples/generate_wan_dataset.py
 ```
 You can adjust parameter **num_files and video specifications (T, H, W)** in the script to control the scale of the test dataset.
 
 ## Start training on GPU
 
 ```shell
-bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \ 
+bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \
 --model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer
 ```
 
 ## Start training on NPU
 
 ```shell
-bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \ 
---model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer \ 
---train.init_device: npu
+bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \
+--model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer \
+--train.init_device npu
 ```
