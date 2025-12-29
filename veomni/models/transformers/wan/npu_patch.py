@@ -17,8 +17,9 @@ def rope_apply_fused(x, **kwargs):
     head_dim = kwargs.pop("head_dim")
     x = rearrange(x, "b s (n d) -> b s n d", d=head_dim)
     x_float = x.to(torch.float32)
-    x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode='interleave').flatten(-2)
+    x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode="interleave").flatten(-2)
     return x_out.to(x.dtype)
+
 
 def apply_wan_npu_patch():
     # Patches for wan2.1 Model
