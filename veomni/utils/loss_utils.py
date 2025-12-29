@@ -27,7 +27,7 @@ def mean_global_loss(
     micro_batches_token_len: dict[str, torch.Tensor],
 ):
     """Calcuate the global mean loss. Avg on all_reduced_token_num instead of on dp_size.
-    - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().world_size
+    - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().fsdp_size
     - loss_bwd = sum(dict(cur_losses))
     """
     loss_bwd = torch.tensor(0.0, device=get_device_type())
@@ -47,7 +47,7 @@ def mean_global_loss(
         all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
 
         if all_reduced_len != 0:
-            cur_loss = cur_loss / all_reduced_len * get_parallel_state().world_size
+            cur_loss = cur_loss / all_reduced_len * get_parallel_state().fsdp_size
         else:  # no loss
             assert torch.allclose(cur_loss, torch.zeros_like(cur_loss)), f"cur_loss: {cur_loss}"
 
