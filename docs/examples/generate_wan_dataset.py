@@ -8,10 +8,16 @@ import torch
 
 
 # --- Fixed Architectural Constants (Internal Only) ---
+
+# channel number of video lantent
 FIXED_C = 16
+# sequence length of text
 FIXED_L_TEXT = 512
+# embedding dimension of text
 FIXED_D_TEXT = 4096
+# dimension of clip feature (video)
 FIXED_D_CLIP = 1280
+# channel number of image latent
 FIXED_C_Y = 20
 
 
