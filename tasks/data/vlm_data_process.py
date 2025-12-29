@@ -166,7 +166,7 @@ def process_sample_qwen3_vl(
         token_num_inputs["image"] = image_token_num
         tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
     if "videos" in sample:
-        videos, metadata = fetch_videos_metadata(sample["videos"], fps=sample["fps"], **kwargs)
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], fps=sample["fps"], **kwargs)
         # Process videos without resizing or sampling frames initially
         video_inputs = processor.video_processor(videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True)
         video_grid_thw = video_inputs["video_grid_thw"]
