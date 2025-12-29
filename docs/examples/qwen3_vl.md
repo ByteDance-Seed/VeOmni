@@ -50,7 +50,7 @@ bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_d
     --model.model_path ./Qwen3-VL-8B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --data.dataloader_type native \
-    --data.dataset_type mapping \
+    --data.dataset_type iterable \
     --data.sourcename sharegpt4v_sft \
     --data.num_workers 8 \
     --train.micro_batch_size 3 \
@@ -64,7 +64,7 @@ bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_m
     --model.model_path ./Qwen3-VL-30B-A3B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --data.dataloader_type native \
-    --data.dataset_type mapping \
+    --data.dataset_type iterable \
     --data.sourcename sharegpt4v_sft \
     --data.num_workers 8 \
     --train.micro_batch_size 3 \
