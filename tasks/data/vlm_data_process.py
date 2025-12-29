@@ -10,7 +10,6 @@ Functions:
     process_sample_qwen3_vl: Process samples for Qwen3-VL models
 """
 
-import time
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
 import torch
@@ -82,9 +81,6 @@ def process_sample_qwen2_5_vl(
     """
     Processes multimodal example with qwen2_5_vl's pre-processor.
     """
-    record_process_time = kwargs.get("record_process_time", False)
-    if record_process_time:
-        start_time = time.time()
 
     source = (
         kwargs["source_name"] if "source_name" in kwargs else sample["source"]
@@ -129,10 +125,6 @@ def process_sample_qwen2_5_vl(
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
 
-    if record_process_time:
-        process_time = time.time() - start_time
-        tokenized_example["process_sample_time_sec"] = process_time
-
     return [tokenized_example]
 
 
@@ -146,9 +138,6 @@ def process_sample_qwen3_vl(
     """
     Processes multimodal example with qwen3_vl's pre-processor.
     """
-    record_process_time = kwargs.get("record_process_time", False)
-    if record_process_time:
-        start_time = time.time()
 
     source = (
         kwargs["source_name"] if "source_name" in kwargs else sample["source"]
@@ -192,9 +181,5 @@ def process_sample_qwen3_vl(
     tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
-
-    if record_process_time:
-        process_time = time.time() - start_time
-        tokenized_example["process_sample_time_sec"] = process_time
 
     return [tokenized_example]
