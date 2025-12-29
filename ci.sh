@@ -1,6 +1,7 @@
 export USE_MOJO_OPSET=0
 export USE_LIGER_KERNEL=0
 export USE_SEED_KERNELS=0
+export NCCL_DEBUG=ERROR
 
 SP_SIZE=2
 EXP_NAME=baseline_qwen3_sft_sp_${SP_SIZE}
