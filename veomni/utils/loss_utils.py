@@ -43,11 +43,10 @@ def mean_global_loss(
         if get_parallel_state().sp_enabled:
             cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=get_parallel_state().sp_group)
 
-        cur_loss = cur_loss * cur_token_len
         all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
 
         if all_reduced_len != 0:
-            cur_loss = cur_loss / all_reduced_len * get_parallel_state().fsdp_size
+            cur_loss = cur_loss * cur_token_len / all_reduced_len * get_parallel_state().fsdp_size
         else:  # no loss
             assert torch.allclose(cur_loss, torch.zeros_like(cur_loss)), f"cur_loss: {cur_loss}"
 
