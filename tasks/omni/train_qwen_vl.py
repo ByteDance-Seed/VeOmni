@@ -233,7 +233,6 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
-    model.language_model.layers = torch.nn.ModuleList(model.language_model.layers[:2])  # clip layers
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
@@ -386,7 +385,7 @@ def main():
             lr_scheduler.step()
             optimizer.zero_grad()
 
-            # collect mean grad_norm across data parallel group
+            # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
             synchronize()
             delta_time = time.time() - start_time
