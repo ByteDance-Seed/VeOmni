@@ -18,7 +18,7 @@ Please refer to [Installation with Ascend NPU](installation-install_ascend).
 |                               | 30B        | ✅       |       | ✅     |    |    |      |
 | [Qwen3 VL](examples-qwen3_vl) | 8B         | ✅       |       | ✅     |    | ✅  |      |
 |                               | 30B        | ✅       |       | ✅     | ✅  | ✅  |      |
-| Wan2.1                        | 14B        | 🚧      |       |       |    |    |      |
+| [Wan2.1](examples-wan2.1)     | 14B        | ✅      | ✅     |       |    | ✅  |      |
 
 ## Environment Variables
 
