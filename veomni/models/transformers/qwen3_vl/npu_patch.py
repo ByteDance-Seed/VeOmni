@@ -34,19 +34,8 @@ def apply_rotary_pos_emb_vision_npu(q, k, cos, sin, position_ids=None, unsqueeze
 
     return q_embed, k_embed
 
-def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    orig_dtype = q.dtype
-    cos_4d = cos.unsqueeze(unsqueeze_dim).float()
-    sin_4d = sin.unsqueeze(unsqueeze_dim).float()
-
-    q_contig = q.float().contiguous()
-    k_contig = k.float().contiguous()
-    q_embed = torch_npu.npu_rotary_mul(q_contig, cos_4d, sin_4d)
-    k_embed = torch_npu.npu_rotary_mul(k_contig, cos_4d, sin_4d)
-    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
-
 def apply_qwen3vl_npu_patch():
     # Patches for Qwen3VL Model
     modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
-    modeling_qwen3_vl.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+    modeling_qwen3_vl.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu
     modeling_qwen3_vl.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision_npu
