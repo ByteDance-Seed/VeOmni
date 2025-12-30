@@ -5,7 +5,7 @@ import pytest
 import torch
 from transformers import AutoConfig
 
-from veomni.ops import apply_ops_patch
+from veomni import _safe_apply_patches
 from veomni.utils.device import get_torch_device
 
 from ..tools.common_utils import print_device_mem_info
@@ -51,7 +51,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
         print(f"{'-' * 10} {running_id=} {'-' * 10}")
 
         set_environ_param(model_mode_cur)
-        apply_ops_patch()
+        _safe_apply_patches()
 
         model_cur, optim_cur = build_base_model_optim(
             config_path,

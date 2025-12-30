@@ -1057,6 +1057,8 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+        else:
+            logits = self.lm_head(hidden_states)
 
         aux_loss = None
         if output_router_logits:

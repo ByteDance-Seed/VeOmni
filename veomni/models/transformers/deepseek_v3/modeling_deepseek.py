@@ -1231,6 +1231,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+        else:
+            logits = self.lm_head(hidden_states)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

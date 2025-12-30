@@ -17,6 +17,7 @@ import os
 import torch
 
 from ...utils import logging
+from ...utils.env import get_env
 from ...utils.import_utils import is_fused_moe_available, is_torch_npu_available
 
 
@@ -60,15 +61,12 @@ def fused_moe_forward(
 def apply_veomni_fused_moe_patch():
     global _fused_moe_forward
     if is_torch_npu_available():
-        from .npu_fused_moe import npu_fused_moe_forward
+        from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
-    elif is_fused_moe_available() and os.environ.get("USE_GROUP_GEMM", "1") == "1":
-        from .group_gemm_fused_moe import group_gemm_fused_moe_forward
+    elif is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
+        from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
         _fused_moe_forward = None
-
-    kernel_name = _fused_moe_forward.__name__ if _fused_moe_forward is not None else "None"
-    logger.info_rank0(f"✅ using {kernel_name} for fused moe kernel")
