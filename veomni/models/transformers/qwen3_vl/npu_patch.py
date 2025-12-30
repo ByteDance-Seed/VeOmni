@@ -20,4 +20,4 @@ def apply_qwen3vl_npu_patch():
     # Patches for Qwen3VL Model
     modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
     modeling_qwen3_vl.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu
-    modeling_qwen3_vl.apply_rotary_pos_emb_vision = npu_fused_operator.apply_rotary_pos_emb_vision_qwen3vl_npu
+    modeling_qwen3_vl.apply_rotary_pos_emb_vision = npu_fused_operator.apply_rotary_pos_emb_vision_npu

@@ -33,7 +33,7 @@ def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
     k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
-def apply_rotary_pos_emb_vision_qwen3vl_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb_vision_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     orig_dtype = q.dtype
     q_4d = q.unsqueeze(0).float().contiguous()
     k_4d = k.unsqueeze(0).float().contiguous()
