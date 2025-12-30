@@ -349,7 +349,9 @@ class CheckpointExtensions(FSDPExtensions):
                     for key, val in optim_state["state"][fqn].items():
                         # key in OPTIM_STATE_NO_SHARD_KEY in optim stat dict is scalar, like'step', should not be sharded
                         if key not in OPTIM_STATE_NO_SHARD_KEY:
-                            val = _shard_tensor(val, cur_spec_info.ep_fsdp_mesh, cur_spec_info.placement).to(val.device)
+                            val = _shard_tensor(val, cur_spec_info.ep_fsdp_mesh, cur_spec_info.placement).to(
+                                val.device
+                            )
                         fqn_state[key] = val
                     optim_state["state"][fqn] = fqn_state
             return optim_state
