@@ -18,12 +18,7 @@ import torch_npu
 import torch.nn as nn
 
 from . import modeling_qwen3_vl
-
-def rms_norm_forward_npu(self, x):
-    """NPU optimized implementation for RMSNorm."""
-    if x.dtype != self.weight.dtype:
-        x = x.to(self.weight.dtype)
-    return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.variance_epsilon)[0]
+from ....ops.npu_patch import npu_fused_operator
 
 def apply_rotary_pos_emb_vision_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     orig_dtype = q.dtype
@@ -53,6 +48,6 @@ def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
 
 def apply_qwen3vl_npu_patch():
     # Patches for Qwen3VL Model
-    modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = rms_norm_forward_npu
+    modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
     modeling_qwen3_vl.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
     modeling_qwen3_vl.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision_npu
