@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import torch_npu
-import torch.nn as nn
 
 from . import modeling_qwen3_vl
 from ....ops.npu_patch import npu_fused_operator
