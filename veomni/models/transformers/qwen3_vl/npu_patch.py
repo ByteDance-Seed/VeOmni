@@ -13,29 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import torch_npu
-
 from . import modeling_qwen3_vl
 from ....ops.npu_patch import npu_fused_operator
-
-def apply_rotary_pos_emb_vision_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    orig_dtype = q.dtype
-    q_4d = q.unsqueeze(0).float().contiguous()
-    k_4d = k.unsqueeze(0).float().contiguous()
-    cos_4d = cos.unsqueeze(0).unsqueeze(2).float()
-    sin_4d = sin.unsqueeze(0).unsqueeze(2).float()
-
-    q_embed_4d = torch_npu.npu_rotary_mul(q_4d, cos_4d, sin_4d)
-    k_embed_4d = torch_npu.npu_rotary_mul(k_4d, cos_4d, sin_4d)
-
-    q_embed = q_embed_4d.transpose(1, 2).to(orig_dtype)
-    k_embed = k_embed_4d.transpose(1, 2).to(orig_dtype)
-
-    return q_embed, k_embed
 
 def apply_qwen3vl_npu_patch():
     # Patches for Qwen3VL Model
     modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
     modeling_qwen3_vl.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu
-    modeling_qwen3_vl.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision_npu
+    modeling_qwen3_vl.apply_rotary_pos_emb_vision = npu_fused_operator.apply_rotary_pos_emb_vision_qwen3vl_npu
