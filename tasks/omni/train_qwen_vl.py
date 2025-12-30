@@ -233,6 +233,7 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
+    model.language_model.layers = torch.nn.ModuleList(model.language_model.layers[:2])  # clip layers
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,

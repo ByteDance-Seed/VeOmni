@@ -56,7 +56,7 @@ def culen2pos(cu_seqlens: "torch.Tensor") -> "torch.Tensor":
 
 def prepare_fa_kwargs_from_position_ids(position_ids):
     """
-    Copy from transformers/modeling_flash_attention_utils.py 354567d955fbc5fbd70fc841b7a7bcc654bea3f1
+    Copy from https://github.com/huggingface/transformers/blob/bdc85cb85c8772d37aa29ce447860b44d7fad6ef/src/transformers/modeling_flash_attention_utils.py#L354
     This function returns all the necessary kwargs to call `flash_attn_varlen_func` extracted from position_ids.
 
     Arguments:

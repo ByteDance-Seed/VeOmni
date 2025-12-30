@@ -3,7 +3,7 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -12,7 +12,6 @@ from tqdm import trange
 
 from tasks.data.vlm_data_process import (
     prepare_fa_kwargs_from_position_ids,
-    process_sample_qwen2_5_vl,
     process_sample_qwen3_vl,
 )
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
@@ -42,16 +41,9 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 
 
-if TYPE_CHECKING:
-    pass
-
 logger = helper.create_logger(__name__)
 
 MAX_PIXELS = 768 * 28 * 28
-ROLE_MAPPING = {
-    "human": "user",
-    "gpt": "assistant",
-}
 
 
 def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
@@ -133,31 +125,18 @@ def main():
     helper.print_device_mem_info("VRAM usage after building model")
 
     logger.info_rank0("Prepare data")
-    processor = build_processor(args.model.tokenizer_path)
-    processor.image_processor.max_pixels = MAX_PIXELS
+    processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
+
     position_id_func = model.get_position_id_func()
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
-    if model_config.model_type == "qwen2_5_vl":
-        transform = partial(
-            process_sample_qwen2_5_vl,
-            processor=processor,
-            chat_template=chat_template,
-            position_id_func=position_id_func,
-            **args.data.mm_configs,
-        )
-    elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
-        transform = partial(
-            process_sample_qwen3_vl,
-            processor=processor,
-            chat_template=chat_template,
-            position_id_func=position_id_func,
-            **args.data.mm_configs,
-        )
-    else:
-        raise ValueError(f"Unsupported model type: {model_config.model_type}")
-    if args.train.rmpad:
-        raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
+    transform = partial(
+        process_sample_qwen3_vl,
+        processor=processor,
+        chat_template=chat_template,
+        position_id_func=position_id_func,
+        **args.data.mm_configs,
+    )
 
     data_collate_fn = []
     if args.train.rmpad_with_pos_ids:
@@ -200,7 +179,7 @@ def main():
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
         seed=args.train.seed,
-        collate_fn=data_collate_fn,
+        collate_fn=[],
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
@@ -233,6 +212,7 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
+    model.language_model.layers = torch.nn.ModuleList(model.language_model.layers[:2])  # clip layers
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
