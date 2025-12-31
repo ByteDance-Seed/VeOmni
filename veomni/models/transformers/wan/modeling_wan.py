@@ -389,7 +389,7 @@ class CrossAttention(nn.Module):
 
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, **kwargs):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
@@ -398,11 +398,11 @@ class CrossAttention(nn.Module):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(ctx))
         v = self.v(ctx)
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, **kwargs)
         if self.has_image_input:
             k_img = self.norm_k_img(self.k_img(img))
             v_img = self.v_img(img)
-            y = self.attn(q, k_img, v_img, head_dim=self.head_dim)
+            y = self.attn(q, k_img, v_img, head_dim=self.head_dim, **kwargs)
             x = x + y
         return self.o(x)
 
