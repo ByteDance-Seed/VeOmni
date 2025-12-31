@@ -96,16 +96,17 @@ def _compute_seqlens(
         rmpad_with_pos_ids (bool): Whether to remove the padding tokens using the position ids.
         enable_multisource (bool): Whether to enable the multi-source dataloader.
     """
-    attention_mask = micro_batch["attention_mask"]
-    if rmpad:
+    attention_mask = micro_batch["attention_mask"]  # rm this, attention_mask will be all ones
+    if rmpad:  # rm this, veomni will only have rmpad_with_pos_ids
         seqlens = culen2len(micro_batch["cu_seqlens"]).tolist()
         seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
     elif rmpad_with_pos_ids:
         seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-        # seqlen is the last dim of position_ids: 3, 1, seqlen for qwenvl; 1, seqlen for llm
-        seqlens = seqlens[:-1] if (micro_batch["position_ids"][..., -seqlens[-1] :] == 0).all().item() else seqlens
+        # seqlens = 1 is sp_pad
+        seqlens = [s for s in seqlens if s != 1]
     else:
-        seqlens = attention_mask.sum(-1).tolist()
+        seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
+        seqlens = [s for s in seqlens if s != 1]
 
     ds_idx = None
     if enable_multisource:
