@@ -1641,7 +1641,6 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                 deepstack_visual_embeds = fake_deepstack
             else:
                 deepstack_visual_embeds = None
-
         if position_ids is None:
             attention_mask_tensor = (
                 attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]

@@ -11,7 +11,6 @@ import wandb
 from tqdm import trange
 
 from tasks.data.vlm_data_process import (
-    prepare_fa_kwargs_from_position_ids,
     process_sample_qwen3_vl,
 )
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
@@ -311,19 +310,9 @@ def main():
                 # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)
                 # data collator adds batch dim -> (1, dim, seq_len) for unified SP slicing
                 # transpose back to (dim, 1, seq_len) for QwenVL compatibility
+                # TODO(szl): mv to modeling
                 if micro_batch["position_ids"].shape[1] == 3:
                     micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
-
-                # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
-                micro_batch.update(
-                    dict(
-                        cu_seq_lens_q=fa_kwargs["cu_seq_lens_q"],
-                        cu_seq_lens_k=fa_kwargs["cu_seq_lens_k"],
-                        max_length_q=fa_kwargs["max_length_q"],
-                        max_length_k=fa_kwargs["max_length_k"],
-                    )
-                )
 
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
