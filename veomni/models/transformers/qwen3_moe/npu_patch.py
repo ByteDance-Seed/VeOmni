@@ -19,24 +19,8 @@ import torch.nn.functional as F
 import torch_npu
 
 from ....ops.group_gemm.kernel.npu_group_gemm import GmmFunction
+from ....ops.npu_patch import npu_fused_operator
 from . import modeling_qwen3_moe
-
-
-# This api can improve performance on ASCEND NPU
-def rms_norm_forward_npu(self, x):
-    """NPU optimized implementation for RMSNorm."""
-    if x.dtype != self.weight.dtype:
-        x = x.to(self.weight.dtype)
-    return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.variance_epsilon)[0]
-
-
-def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """NPU optimized implementation for RoPE."""
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
-    return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
 
 def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -77,6 +61,6 @@ def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) ->
 
 def apply_qwen3moe_npu_patch():
     # Patches for Qwen3 MoE Model
-    modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = rms_norm_forward_npu
+    modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
     modeling_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = qwen3_moe_sparse_moe_block_forward_npu
-    modeling_qwen3_moe.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+    modeling_qwen3_moe.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu
