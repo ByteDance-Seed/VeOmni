@@ -451,7 +451,7 @@ class DiTBlock(nn.Module):
         ).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, cos, sin, last_loss))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = x + self.cross_attn(self.norm3(x), context, skip_ulysses=True)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
