@@ -16,9 +16,6 @@ from tasks.data.vlm_data_process import (
 )
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
-    OmniDataCollatorWithPacking,
-    OmniDataCollatorWithPadding,
-    OmniSequenceShardCollator,
     build_dataloader,
     build_dataset,
     build_multimodal_chat_template,
@@ -29,6 +26,7 @@ from veomni.distributed.parallel_state import get_parallel_state, init_parallel_
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
 from veomni.optim import build_lr_scheduler, build_optimizer
+from veomni.trainer.preforward import Preforward
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
@@ -138,27 +136,10 @@ def main():
         **args.data.mm_configs,
     )
 
-    data_collate_fn = []
-    if args.train.rmpad_with_pos_ids:
-        data_collate_fn.append(OmniDataCollatorWithPacking())
-    else:
-        data_collate_fn.append(OmniDataCollatorWithPadding())
-    if get_parallel_state().sp_enabled:
-        data_collate_fn.append(
-            OmniSequenceShardCollator(
-                padding_scale={
-                    "pixel_values": processor.image_processor.merge_size**2,
-                    "pixel_values_videos": (
-                        processor.video_processor
-                        if hasattr(processor, "video_processor")
-                        else processor.image_processor
-                    ).merge_size
-                    ** 2,
-                },
-                rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            )
-        )
-
+    preforward_func = Preforward(
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        attn_implementation=args.model.attn_implementation,
+    )
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,
         transform=transform,
@@ -310,6 +291,7 @@ def main():
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
 
+            micro_batches = preforward_func(micro_batches)
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 

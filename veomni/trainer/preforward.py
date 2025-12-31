@@ -36,7 +36,7 @@ MODALITY = ["image", "video", "audio"]
 class DataCollateInfo:
     pack_dim: int = field(
         default=0,
-        metadata={"help": "Dim to pack in batch. Default is 0"},
+        metadata={"help": "Dim to pack in batch. Default is 0. If -1, pack in last dim and unsqueeze(0)"},
     )
     pad_value: int = field(
         default=None,
@@ -76,9 +76,9 @@ class Preforward:
         "position_ids": (-1, 0, False, 0, 1),
         "pixel_values": (0, None, True, 0, 4),
         "pixel_values_videos": (0, None, True, 0, 4),
-        "image_mask": (-1, 0, False, None, None),
-        "video_mask": (-1, 0, False, None, None),
-        "audio_mask": (-1, 0, False, None, None),
+        "image_mask": (-1, 0, False, 0, 1),
+        "video_mask": (-1, 0, False, 0, 1),
+        "audio_mask": (-1, 0, False, 0, 1),
         "image_grid_hw": (0, None, False, None, None),
         "image_grid_thw": (0, None, False, None, None),
         "video_grid_thw": (0, None, False, None, None),
@@ -122,24 +122,18 @@ class Preforward:
         if get_parallel_state().sp_enabled:
             self.preforward_pipeline.append(SequenceParallelPreforward(self.collate_infos))
 
+        if attn_implementation == "flash_attention_2" or attn_implementation == "flash_attention_3":
+            self.preforward_pipeline.append(FlashAttenPreforward())
+
         logger.info_rank0(self.log_collate_infos())
 
-    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        for preforward_func in self.preforward_pipeline:
-            features = preforward_func(features)
-
-        position_ids = features["position_ids"]
-        if position_ids.dim() == 3:  # bs, dim, seq_len
-            position_ids = position_ids[:, 0, :]
-        (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-            position_ids
-        )
-        features["cu_seq_lens_q"] = cu_seq_lens_q
-        features["cu_seq_lens_k"] = cu_seq_lens_k
-        features["max_length_q"] = max_length_q
-        features["max_length_k"] = max_length_k
-
-        return features
+    def __call__(self, micro_batches: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        preforwad_micro_batches = []
+        for micro_batch in micro_batches:
+            for preforward_func in self.preforward_pipeline:
+                micro_batch = preforward_func(micro_batch)
+            preforwad_micro_batches.append(micro_batch)
+        return preforwad_micro_batches
 
     def log_collate_infos(self) -> None:
         sample_info = next(iter(self.collate_infos.values()))
@@ -163,6 +157,21 @@ class Preforward:
 
         log_str += "=" * (25 + 18 * len(fields)) + "\n"
         return log_str
+
+
+class FlashAttenPreforward:
+    def __call__(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        position_ids = features["position_ids"]
+        if position_ids.dim() == 3:  # bs, dim, seq_len
+            position_ids = position_ids[:, 0, :]
+        (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+            position_ids.contiguous()
+        )
+        features["cu_seq_lens_q"] = cu_seq_lens_q
+        features["cu_seq_lens_k"] = cu_seq_lens_k
+        features["max_length_q"] = max_length_q
+        features["max_length_k"] = max_length_k
+        return features
 
 
 class PackingPreforward:
@@ -189,6 +198,8 @@ class PackingPreforward:
             else:
                 pack_dim = collate_info.pack_dim
                 batch[key] = torch.cat(batch[key], dim=pack_dim)
+                if pack_dim == -1:
+                    batch[key] = batch[key].unsqueeze(0)
 
         return batch
 
@@ -295,7 +306,14 @@ class SequenceParallelPreforward:
         labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
 
         cu_seqlens = pos2culen(batch["position_ids"])
-        labels[:, cu_seqlens[1:-1] - 1] = IGNORE_INDEX
+
+        if labels.size(0) != 1:  # padding
+            bs = labels.size(0)
+            labels = labels.view(-1)
+            labels[cu_seqlens[:-1] - 1] = IGNORE_INDEX
+            labels = labels.view(bs, -1)  # align shape with input_ids to align sp_pad & sp_slice
+        else:
+            labels[:, cu_seqlens[1:-1] - 1] = IGNORE_INDEX
 
         batch["labels"] = labels
 
