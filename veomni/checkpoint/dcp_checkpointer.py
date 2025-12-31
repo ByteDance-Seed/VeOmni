@@ -431,17 +431,13 @@ class DistributedCheckpointer(CheckpointerBase):
         state["extra_state"] = torch.load(extra_state_path, weights_only=False)
 
 
-def dcp_to_torch_state_dict(
-    save_checkpoint_path: Union[str, os.PathLike], model_only: bool = False
-) -> STATE_DICT_TYPE:
+def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> STATE_DICT_TYPE:
     """
     Given a directory containing a DCP checkpoint, this function will convert it into a
     Torch state_dict.
 
     Args:
         save_checkpoint_path: Directory containing the DCP checkpoint.
-        model_only: If True, only load model weights (ignoring optimizer states, etc.).
-                   This significantly reduces memory usage for large models.
 
     .. warning::
         To avoid OOM, it's recommended to only run this function on a single rank.
@@ -450,16 +446,10 @@ def dcp_to_torch_state_dict(
     # Load the state_dict from the DCP checkpoint
     state_dict: STATE_DICT_TYPE = {}
 
-    # Filter to only load model weights if requested
-    # keys=["model"] will only load model state dict (excluding optimizer states)
-    # keys=None will load all keys from the checkpoint (model, optimizer, etc.)
-    # See _EmptyStateDictLoadPlanner._should_include_key() in torch's default_planner.py
-    keys = ["model"] if model_only else None
-
     _load_state_dict(
         state_dict,
         storage_reader=FileSystemReader(save_checkpoint_path),
-        planner=_EmptyStateDictLoadPlanner(keys=keys),
+        planner=_EmptyStateDictLoadPlanner(),
         no_dist=True,
     )
     if "state" in state_dict:
