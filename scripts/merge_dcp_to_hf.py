@@ -31,6 +31,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Dict, Optional, Sequence, Union
 
 import torch
+from safetensors.torch import save_file
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE
@@ -43,13 +44,6 @@ if TYPE_CHECKING:
     from transformers import GenerationConfig, PretrainedConfig, PreTrainedTokenizer, ProcessorMixin
 
     ModelAssets = Union[GenerationConfig, PretrainedConfig, PreTrainedTokenizer, ProcessorMixin]
-
-try:
-    from safetensors.torch import save_file
-
-    SAFETENSORS_AVAILABLE = True
-except ImportError:
-    SAFETENSORS_AVAILABLE = False
 
 
 # Setup logging
@@ -209,8 +203,6 @@ def _save_state_dict(
         safe_serialization: If True, use safetensors; otherwise use pickle.
     """
     if safe_serialization:
-        if not SAFETENSORS_AVAILABLE:
-            raise ImportError("safetensors is not available. Please install it with: pip install safetensors")
         save_file(state_dict, path_to_save, metadata={"format": "pt"})
     else:
         torch.save(state_dict, path_to_save)
