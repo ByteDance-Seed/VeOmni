@@ -29,6 +29,21 @@ uv sync --locked  --extra npu
 source .venv/bin/activate
 ```
 
+You can use `--extra` to install other optional dependencies. Refer to [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml) for more details.
+
+```bash
+# eg. install with video processing dependencies (torchcodec, PyAV, librosa)
+uv sync --locked  --extra npu --extra video
+```
+
+> **Note**: For video processing with the `video` extra, you also need to install ffmpeg separately:
+> ```bash
+> # Ubuntu/Debian/openEuler
+> sudo apt-get install ffmpeg
+> # or
+> sudo yum install ffmpeg
+> ```
+
 **Pip**
 
 ```bash
