@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -940,6 +941,10 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1":
+            self.loss_type = "ChunkLoss"
+        else:
+            self.loss_type = "ForCausalLM"
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1052,6 +1057,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             loss, logits = self.loss_function(
                 logits=logits,
                 labels=labels,
+                loss_type=self.loss_type,
                 vocab_size=self.config.vocab_size,
                 hidden_states=hidden_states,
                 weights=self.lm_head.weight,
