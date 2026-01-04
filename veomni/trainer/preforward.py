@@ -68,7 +68,7 @@ class DataCollateInfo:
 
 
 class Preforward:
-    #                            pack_dim , pad_value      , sp_slice  , sp_pad_value  , sp_pad_scale
+    # pack_dim , pad_value, sp_slice, sp_pad_value, sp_pad_scale
     default_info = {
         "input_ids": (-1, 0, True, 0, 1),
         "labels": (-1, IGNORE_INDEX, True, IGNORE_INDEX, 1),
@@ -113,14 +113,17 @@ class Preforward:
         As eager attention not supports sp, we pad `attention_mask` with 0.
         """
         if attn_implementation == "eager":
-            full_info["attention_mask"].pad_value = 0
+            self.collate_infos["attention_mask"].pad_value = 0
+        assert self.collate_infos["position_ids"].sp_slice is False, (
+            "position_ids should be sp sliced after precompute fa kwargs"
+        )
 
         if self.rmpad_with_pos_ids:
-            self.preforward_pipeline.append(PackingPreforward(full_info))
+            self.preforward_pipeline.append(PackingPreforward(self.collate_infos))
         else:
-            self.preforward_pipeline.append(PaddingPreforward(full_info))
+            self.preforward_pipeline.append(PaddingPreforward(self.collate_infos))
         if get_parallel_state().sp_enabled:
-            self.preforward_pipeline.append(SequenceParallelPreforward(full_info))
+            self.preforward_pipeline.append(SequenceParallelPreforward(self.collate_infos))
 
         if attn_implementation == "flash_attention_2" or attn_implementation == "flash_attention_3":
             self.preforward_pipeline.append(FlashAttenPreforward())
