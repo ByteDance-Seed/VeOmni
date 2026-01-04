@@ -24,7 +24,6 @@ from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
     gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_world_size,
