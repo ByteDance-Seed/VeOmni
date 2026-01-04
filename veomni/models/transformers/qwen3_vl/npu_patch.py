@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from . import modeling_qwen3_vl
+
 from ....ops.npu_patch import npu_fused_operator
 
 
