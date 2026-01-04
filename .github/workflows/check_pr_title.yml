@@ -21,7 +21,7 @@ jobs:
             // 1. Allowed Modules
             const allowedModules = new Set([
               'misc', 'ci', 'config', 'docs', 'data', 'dist',
-              'omni', 'logging', 'model', 'optim', 'ckpt',
+              'omni', 'logging', 'model', 'optim', 'ckpt', 'trainer',
               'release', 'task', 'perf', 'ops', 'parallel'
             ]);
 
