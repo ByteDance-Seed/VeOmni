@@ -95,7 +95,12 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_type = self.config.rope_parameters["rope_type"]
+        if hasattr(self.config, "rope_parameters"):
+            self.rope_type = self.config.rope_parameters["rope_type"]
+        elif hasattr(self.config, "rope_scaling") and self.config.rope_scaling is not None:
+            self.rope_type = self.config.rope_scaling["rope_type"]
+        else:
+            self.rope_type = "default"
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
@@ -123,7 +128,10 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
             Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
-        base = config.rope_parameters["rope_theta"]
+        if hasattr(config, "rope_parameters"):
+            base = config.rope_parameters["rope_theta"]
+        else:
+            base = config.rope_theta
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
 
         attention_factor = 1.0  # Unused in this type of RoPE
