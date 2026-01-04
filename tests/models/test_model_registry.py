@@ -54,6 +54,7 @@ remote_test_cases = [
 ]
 
 
+@pytest.mark.xfail(reason="Remote path test may get too many requests error.")
 @pytest.mark.parametrize("config_path, hf_registered, veomni_registered", remote_test_cases)
 def test_remote_model_registry(monkeypatch, config_path, hf_registered, veomni_registered):
     monkeypatch.setenv("MODELING_BACKEND", "hf")

@@ -51,7 +51,7 @@ jobs:
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
-        --network "host"
+        --network host
         --privileged
         --shm-size 16g
     env:

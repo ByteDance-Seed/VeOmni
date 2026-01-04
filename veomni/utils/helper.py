@@ -584,7 +584,6 @@ class ProfilerWithMem:
 
     def __init__(self, inner):
         self._p = inner
-        self.first_step = True  # flagging the first step for record memory history
 
     # delegate ctx-manager behaviour
     def __enter__(self):
@@ -594,7 +593,9 @@ class ProfilerWithMem:
         return self._p.__exit__(*a)
 
     def start(self):
-        return self._p.start()
+        out = self._p.start()
+        get_torch_device().memory._record_memory_history()
+        return out
 
     def stop(self):
         out = self._p.stop()
@@ -602,11 +603,7 @@ class ProfilerWithMem:
         return out
 
     def step(self, *a, **kw):
-        out = self._p.step(*a, **kw)
-        if self.first_step:
-            get_torch_device().memory._record_memory_history()
-            self.first_step = False
-        return out
+        return self._p.step(*a, **kw)
 
 
 def create_profiler(
@@ -657,9 +654,8 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
-            get_torch_device().memory._dump_snapshot(gpu_memory_file)
-            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+        get_torch_device().memory._dump_snapshot(gpu_memory_file)
+        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)
