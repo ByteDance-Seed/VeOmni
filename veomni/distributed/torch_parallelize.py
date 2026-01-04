@@ -343,7 +343,7 @@ def parallelize_model_fsdp2(
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
     if IS_NPU_AVAILABLE and parallel_state.ep_enabled:
-        from veomni.ops.patch.hccl_premul_sum import apply_hccl_premul_sum_patch
+        from veomni.ops.npu_patch.hccl_premul_sum import apply_hccl_premul_sum_patch
 
         apply_hccl_premul_sum_patch()
     for layer_fqn, layer_mod, experts_mod in layer_pairs:

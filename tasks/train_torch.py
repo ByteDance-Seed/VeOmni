@@ -17,7 +17,6 @@ from veomni.data import (
     build_dataloader,
     build_dataset,
 )
-from veomni.data.constants import IGNORE_INDEX
 from veomni.data.data_transform import process_pretrain_example, process_sft_example
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -35,6 +34,7 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
+from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 
 
 logger = helper.create_logger(__name__)
@@ -271,13 +271,11 @@ def main():
             synchronize()
             start_time = time.time()
 
-            length_in_batch = torch.tensor(0, dtype=torch.int32, device=get_device_type())
-            for micro_batch in micro_batches:
-                length_in_batch += torch.sum(micro_batch["labels"] != IGNORE_INDEX)
-            length_in_batch = all_reduce(length_in_batch, op="sum", group=get_parallel_state().fsdp_group)
+            micro_batches_token_num = count_loss_token(micro_batches)
 
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
+                micro_batch_token_num = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
                     micro_batch.pop("cur_token_num", None)
@@ -288,12 +286,9 @@ def main():
                     for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
-                    model_outputs = model(**micro_batch, use_cache=False)
+                    loss = model(**micro_batch, use_cache=False).loss
 
-                length_in_micro_batch = torch.sum(micro_batch["labels"] != IGNORE_INDEX)
-                loss: "torch.Tensor" = (
-                    model_outputs.loss * length_in_micro_batch / length_in_batch * get_parallel_state().dp_size
-                )
+                loss, _ = mean_global_loss(loss, micro_batch_token_num, micro_batches_token_num)
 
                 with model_bwd_context:
                     loss.backward()

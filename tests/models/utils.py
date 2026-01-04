@@ -269,6 +269,7 @@ def apply_veomni_loss_unpatch():
     fused_cross_entropy._cross_entropy = None
 
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
+    LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
 
 
 def apply_veomni_moe_unpatch():
