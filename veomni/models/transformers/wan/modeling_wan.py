@@ -330,10 +330,6 @@ class SelfAttention(nn.Module):
             q = self.norm_q(self.q(x))
             k = self.norm_k(self.k(x))
             v = self.v(x)
-
-            if get_parallel_state().ulysses_enabled:
-                q, k, v = gather_seq_scatter_heads_qkv(q, k, v, seq_dim=1, head_dim=2)
-
         else:
             q, k, v = async_ulysses_qkv_projection(
                 hidden_states=x,
@@ -356,9 +352,6 @@ class SelfAttention(nn.Module):
         x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True)
 
         if not self.sp_async:
-            if get_parallel_state().ulysses_enabled:
-                x = gather_heads_scatter_seq(x, seq_dim=1, head_dim=2)
-
             x = self.o(x)
         else:
             x = async_ulysses_output_projection(
@@ -462,7 +455,7 @@ class DiTBlock(nn.Module):
         ).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, cos, sin, last_loss))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = x + self.cross_attn(self.norm3(x), context, skip_ulysses=True)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
