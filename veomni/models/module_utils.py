@@ -32,22 +32,18 @@ except ImportError:
     from ..utils.hdfs_io import copy
 from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME as DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME
 from diffusers.utils import SAFETENSORS_WEIGHTS_NAME as DIFFUSERS_SAFETENSORS_WEIGHTS_NAME
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
 from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
-from transformers.utils.import_utils import is_safetensors_available
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
-
-
-if is_safetensors_available():
-    from safetensors import safe_open
-    from safetensors.torch import save_file
 
 
 if TYPE_CHECKING:
