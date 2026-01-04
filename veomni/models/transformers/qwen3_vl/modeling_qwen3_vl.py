@@ -1930,6 +1930,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
         return input_ids, model_kwargs
 
+
 if is_torch_npu_available():
     from .npu_patch import apply_qwen3vl_npu_patch
 

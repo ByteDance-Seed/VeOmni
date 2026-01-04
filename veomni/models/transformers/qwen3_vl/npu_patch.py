@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import modeling_qwen3_vl
 from ....ops.npu_patch import npu_fused_operator
+from . import modeling_qwen3_vl
+
 
 def apply_qwen3vl_npu_patch():
     # Patches for Qwen3VL Model
