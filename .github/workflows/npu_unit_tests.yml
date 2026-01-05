@@ -82,7 +82,7 @@ jobs:
           fetch-depth: 0
           clean: true
       - name: Install uv and dependencies
-        run: curl -LsSf https://astral.sh/uv/0.9.8/install.sh | sh
+        run: pip3 install uv==0.9.8
       - name: Sync dependencies
         run: |
           uv pip install -e ".[npu]"
