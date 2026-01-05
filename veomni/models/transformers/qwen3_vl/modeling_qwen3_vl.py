@@ -1736,7 +1736,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             loss, logits = self.loss_function(
                 logits=logits,
                 labels=labels,
-                vocab_size=self.config.vocab_size,
+                vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
                 weights=self.lm_head.weight,
                 **kwargs,
