@@ -73,6 +73,6 @@ ENV PATH="/bin/:$PATH"
 # uv sync
 WORKDIR /app
 COPY . ./
-RUN uv sync --locked --all-packages --extra npu_aarch64 --extra audio --dev --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
+RUN uv sync --locked --all-packages --extra npu --extra audio --dev --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
 
 USER root
