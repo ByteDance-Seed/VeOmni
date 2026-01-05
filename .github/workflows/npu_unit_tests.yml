@@ -85,7 +85,7 @@ jobs:
         run: pip3 install uv==0.9.8
       - name: Sync dependencies
         run: |
-          uv pip install -e ".[npu]"
+          uv sync --no-all-extras --extra npu --group dev
       - name: Check final pip list
         run: |
           uv pip list
