@@ -25,6 +25,7 @@ from veomni.distributed.parallel_state import get_parallel_state, init_parallel_
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
 from veomni.optim import build_lr_scheduler, build_optimizer
+from veomni.trainer.postforward import Postforward
 from veomni.trainer.preforward import Preforward
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
@@ -138,6 +139,9 @@ def main():
     preforward_func = Preforward(
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         attn_implementation=args.model.attn_implementation,
+    )
+    postforward_func = Postforward(
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
     )
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,
@@ -298,8 +302,9 @@ def main():
             start_time = time.time()
             micro_batches_token_len = count_loss_token(micro_batches)
 
+            micro_batches_outputs = []
             for micro_batch in micro_batches:
-                environ_meter.add(micro_batch)
+                seq_lens = environ_meter.add(micro_batch)
                 micro_batch_token_len = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
@@ -312,15 +317,18 @@ def main():
                 }
 
                 with model_fwd_context:
-                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss
+                    outputs = model(**micro_batch, use_cache=False)
 
-                loss, _ = mean_global_loss(loss, micro_batch_token_len, micro_batches_token_len)
+                loss, _ = mean_global_loss(outputs.loss, micro_batch_token_len, micro_batches_token_len)
 
                 with model_bwd_context:
                     loss.backward()
 
                 total_loss += loss.item()
                 del micro_batch
+
+                outputs = postforward_func(outputs, seq_lens)
+                micro_batches_outputs.append(outputs)
 
             grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 

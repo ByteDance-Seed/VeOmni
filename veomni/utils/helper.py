@@ -207,6 +207,7 @@ class EnvironMeter:
             self.batch_ds_idx.extend(ds_idx)
         else:
             self.batch_seqlens.extend(seqlens)
+        return seqlens
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0:
