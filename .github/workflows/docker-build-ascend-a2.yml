@@ -51,6 +51,8 @@ jobs:
             echo "tag=${{ steps.base_image.outputs.new_image_name }}-${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
           elif [ "$BRANCH_NAME" = "main" ]; then
             echo "tag=${{ steps.base_image.outputs.new_image_name }}-latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ steps.base_image.outputs.new_image_name }}-test" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Docker Buildx
