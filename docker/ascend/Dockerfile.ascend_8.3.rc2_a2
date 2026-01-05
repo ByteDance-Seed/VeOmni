@@ -9,8 +9,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 
 # Define installation arguments
-ARG APT_SOURCE=https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
-ARG PIP_INDEX=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+# ARG APT_SOURCE=https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
+# ARG PIP_INDEX=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 # Set apt source
 # ubuntu 22.04
