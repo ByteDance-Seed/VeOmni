@@ -75,7 +75,7 @@ def _get_sharding_plan(
     checkpoint_path: Union[str, os.PathLike],
     shard_size: int,
     save_dtype: Optional[Union[str, torch.dtype]],
-) -> Tuple[List[Dict[str, str]], Dict[str, str], int, List[str]]:
+) -> Tuple[List[Dict[str, str]], int, List[str]]:
     """
     Create sharding plan from checkpoint metadata without loading weights.
 
