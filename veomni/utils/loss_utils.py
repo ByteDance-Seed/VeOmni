@@ -59,6 +59,6 @@ def mean_global_loss(
 
         loss_bwd += cur_loss
 
-        loss_dict[key] = cur_loss.item()
+        loss_dict[key] = cur_loss
 
     return loss_bwd, loss_dict

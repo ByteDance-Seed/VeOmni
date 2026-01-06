@@ -1,32 +1,50 @@
-"""
-Base Callback class for Trainer.
-
-This module provides the BaseCallback base class which defines all available
-hook points during training. Subclasses can override specific methods to customize
-behavior at different stages of training.
-"""
-
-from abc import ABC, abstractmethod
-from typing import Any, Dict
+from abc import ABC
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 
-class BaseCallback(ABC):
-    """
-    Base class for all trainer callbacks.
+if TYPE_CHECKING:
+    from ..base import BaseTrainer
 
-    A callback is a set of functions that get called at various stages of training.
-    Subclasses can override any of the following methods:
 
-    evaluate: evaluation callback
-    on_log: logging callback
-    """
+@dataclass
+class TrainerState:
+    global_step: int = 0
+    epoch: int = 0
 
-    @abstractmethod
-    def evaluate(self, trainer, **kwargs) -> None:
-        """for evaluation callback."""
-        raise NotImplementedError("Subclasses must implement this method.")
 
-    @abstractmethod
-    def on_log(self, trainer, **kwargs) -> Dict[str, Any]:
-        """for metrics callback."""
-        raise NotImplementedError("Subclasses must implement this method.")
+class Callback(ABC):
+    def __init__(self, trainer: "BaseTrainer") -> None:
+        self.trainer = trainer
+
+    def on_step_begin(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_epoch_begin(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+
+class CallbackHandler:
+    def __init__(self, callbacks: list[Callback]):
+        self.callbacks = callbacks
+
+    def call(self, event: str, state: TrainerState, **kwargs):
+        for cb in self.callbacks:
+            fn = getattr(cb, event, None)
+            if fn is not None:
+                fn(state, **kwargs)
+
+    def add(self, callback: Callback):
+        self.callbacks.append(callback)

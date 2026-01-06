@@ -482,6 +482,14 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Number of epochs between two checkpoint saves."},
     )
+    hf_save_steps: int = field(
+        default=None,
+        metadata={"help": "Number of steps between two hf model weights save."},
+    )
+    hf_save_epochs: int = field(
+        default=None,
+        metadata={"help": "Number of epochs between two hf model weights save."},
+    )
     eval_steps: int = field(
         default=0,
         metadata={"help": "Number of steps between two evaluations. 0 to disable."},

@@ -12,21 +12,68 @@ Features:
     - Checkpointing
 """
 
+import json
+import time
 from abc import ABC
+from collections import defaultdict
 from collections.abc import Generator, Iterable
-from typing import Any, Callable, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List
 
 import torch
+import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
+from tqdm import trange
 from transformers import PretrainedConfig, PreTrainedTokenizerBase
+from transformers.modeling_outputs import ModelOutput
 
-from ..utils.logging import get_logger
+from ..checkpoint import CheckpointerBase, build_checkpointer
+from ..data import (
+    DistributedDataloader,
+    build_dataloader,
+    build_dataset,
+)
+from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.offloading import build_activation_offloading_context
+from ..distributed.parallel_state import get_parallel_state, init_parallel_state
+from ..distributed.torch_parallelize import build_parallelize_model
+from ..models import build_foundation_model, build_tokenizer, save_model_assets
+from ..optim import build_lr_scheduler, build_optimizer
+from ..utils import helper, logging
+from ..utils.arguments import DataArguments, ModelArguments, TrainingArguments, save_args
+from ..utils.device import (
+    get_device_type,
+    get_dist_comm_backend,
+    get_torch_device,
+    synchronize,
+)
+from ..utils.dist_utils import all_reduce
+from ..utils.loss_utils import count_loss_token, mean_global_loss
+from .callbacks import (
+    Callback,
+    CallbackHandler,
+    CheckpointerCallback,
+    EvaluateCallback,
+    HuggingfaceCkptCallback,
+    ProfileTraceCallback,
+    TrainerState,
+    WandbTraceCallback,
+)
+from .postforward import Postforward
+from .preforward import Preforward
 
 
-logger = get_logger(__name__)
+logger = logging.get_logger(__name__)
+
+
+@dataclass
+class Arguments:
+    model: "ModelArguments" = field(default_factory=ModelArguments)
+    data: "DataArguments" = field(default_factory=DataArguments)
+    train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 class BaseTrainer(Stateful, ABC):
@@ -58,41 +105,47 @@ class BaseTrainer(Stateful, ABC):
     """
 
     # Core configs
-    args: Any  # Global Arguments
+    args: Arguments  # Global Arguments
+
+    # Data
+    train_dataset: Dataset  # Dataset
+    val_dataset: Dataset  # Dataset
+    train_dataloader: DistributedDataloader  # Dataloader
+    val_dataloader: DistributedDataloader  # Dataloader
+    data_transform: Callable  # Data transform function, transform one data example
 
     # Swappable training components
     tokenizer: PreTrainedTokenizerBase  # Tokenizer
-    train_dataset: Dataset  # Dataset
-    val_dataset: Dataset  # Dataset
-    train_dataloader: DataLoader  # Dataloader
-    val_dataloader: DataLoader  # Dataloader
     model: torch.nn.Module  # model_parts[0], if only one model
     model_config: PretrainedConfig  # ModelConfig
-    model_parts: list[torch.nn.Module] = []  # [model], if multiple models
     loss_fn: Any  # LossFunction, e.g. torch.nn.CrossEntropyLoss
     optimizers: Optimizer  # Optimizers, e.g. torch.optim.Adam
     lr_schedulers: LRScheduler  # LRSchedulers, e.g. torch.optim.lr_scheduler.LambdaLR
-    validator: Any  # Validator
-    metrics_processor: Any  # MetricsProcessor
+    environ_meter: helper.EnvironMeter
+    step_train_metrics: Dict
 
-    # Non-swappable training components
-    checkpointer: Any  # CheckpointManager
-    ft_manager: Any  # FTManager
+    checkpointer: CheckpointerBase
 
     # Runtime utilities
     device: torch.device
     train_context: Generator[None, None, None]
-    gradient_accumulation_steps: int
 
     # training states
     global_step: int
     train_steps: int
     ntokens_seen: int
 
-    # Callback system
-    callbacks: List[Callable] = []
+    model_assets: List[Any]
 
-    def __init__(self, args: Any):
+    # context
+    model_fwd_context: Any
+    model_bwd_context: Any
+
+    # Callback system
+    callbacks: CallbackHandler
+    state: TrainerState
+
+    def __init__(self, args: Arguments):
         """
         Initialize the trainer.
 
@@ -104,198 +157,432 @@ class BaseTrainer(Stateful, ABC):
                 train: TrainingArguments
         """
 
-        self.args = args
+        self.args: Arguments = args
+        logger.info_rank0(json.dumps(asdict(self.args), indent=2))
+        self._init_distributed()
 
-        # Initialize distributed and build meshes
-        self.init_distributed()
+        # Set random seed
+        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
 
-        # Initialize fault tolerance manager
-        # self.ft_manager = FTManager(job_config.fault_tolerance)
-        # dp_degree, dp_rank = self.ft_manager.get_dp_info(dp_degree, dp_rank)
-        self.ft_manager = None  # Placeholder - replace with actual FTManager
+        # Enable third party logging
+        if args.train.local_rank == 0:
+            helper.enable_third_party_logging()
 
-        # Build tokenizer and dataloader
-        # self.tokenizer = build_tokenizer(args.model.tokenizer_path)
-        self.tokenizer = None  # Placeholder
+        # Save arguments
+        if self.args.train.global_rank == 0:
+            save_args(self.args, self.args.train.output_dir)
 
-        # Build train and val datasets
-        # self.train_dataset = build_dataset(args.data.train_path)
-        # self.val_dataset = build_dataset(args.data.val_path)
-        self.train_dataset = None  # Placeholder
-        self.val_dataset = None  # Placeholder
+        # build checkpointer
+        self._build_checkpointer()
 
-        # self.train_dataloader = build_dataloader(train_dataset, tokenizer, args.train.global_batch_size)
-        # self.val_dataloader = build_dataloader(val_dataset, tokenizer, args.train.global_batch_size)
-        self.train_dataloader = None
-        self.val_dataloader = None
+        # build tokenizer, processor, chat_template
+        self.build_model_assets()
 
-        # Build model (using meta init)
-        # model = build_model(args.model.model_path)
-        self.model = None  # Placeholder
-        self.model_config = None  # Placeholder
-        self.model_parts = [self.model]
+        # build model, add model config to assets
+        self._build_model()
 
-        # Build loss function
-        # self.loss_fn = build_loss_function(args.train.loss_function)
-        self.loss_fn = None  # Placeholder
+        # freeze module
+        self.freeze_module()
 
-        # Build optimizer and LR scheduler
-        # self.optimizer = build_optimizer(args.train.optimizer)
-        # self.lr_scheduler = build_lr_scheduler(args.train.lr_scheduler)
+        # Prepare data, tokenizer, transform function, dataset, dataloader and calculate train steps
+        self._build_data()
 
-        self.optimizer = None  # Placeholder
-        self.lr_scheduler = None  # Placeholder
-        self.optimizers = []  # Placeholder
-        self.lr_schedulers = []  # Placeholder
+        # Parallelize model
+        self._build_parallelized_model()
 
-        # Build checkpointer
-        # self.checkpointer = build_checkpointer(args.train.ckpt_manager)
-        self.checkpointer = None  # Placeholder
-
-        # Build validator
-        # self.validator = build_validator(args.train.validator)
-        self.validator = None  # Placeholder
-
-        # Build metrics processor
-        # self.metrics_processor = helper.EnvironMeter()
-        self.metrics_processor = None  # Placeholder
+        # Build optimizer and lr scheduler
+        self._build_optimizer_and_scheduler()
 
         # Initialize training states
         self.global_step = 0
         self.train_steps = 0
-        self.ntokens_seen = 0
-        self.pp_has_first_stage = False
-        self.pp_has_last_stage = False
+        self.start_epoch = 0
+        self.start_step = 0
 
         # Build training context
-        self.train_context = None  # Placeholder
-        self.model_fwd_context = None  # Placeholder
-        self.model_bwd_context = None  # Placeholder
+        self._build_training_context()
 
-        logger.info("Trainer is initialized")
+        # Initialize metrics and environ_meter
+        self._init_metrics()
+
+        # save model assets
+        self._save_model_assets()
+
+        # Initialize callbacks
+        self._init_callbacks()
+
+        # preforward & postforward
+        self._build_preforward_postforward()
 
         # Call post-initialization hook for subclasses
         self.post_init()
 
-    def add_callback(self, callback: Callable) -> None:
-        """
-        Add a callback to the trainer.
-
-        Args:
-            callback: TrainerCallback instance to add.
-        """
-        self.callbacks.append(callback)
-
     def post_init(self) -> None:
-        """
-        Post-initialization hook called after all components are set up.
-
-        Subclasses can override this method to perform additional initialization
-        after the base trainer setup is complete.
-        """
         pass
 
-    def init_distributed(self) -> Any:
-        """
-        Initialize distributed training environment.
+    def freeze_module(self):
+        self.fsdp_kwargs = {}
 
-        Returns:
-            None
-        """
-        pass
+    def _save_model_assets(self):
+        if self.args.train.global_rank == 0:
+            save_model_assets(self.args.train.model_assets_dir, self.model_assets)
+
+    def build_param_groups(self):
+        return None
+
+    def build_data_transform(self):
+        raise NotImplementedError("build_data_transform must be implemented in subclasses")
+
+    def build_model_assets(self):
+        self.tokenizer = build_tokenizer(self.args.model.tokenizer_path)
+        self.model_assets = [self.tokenizer]
+
+    def _init_distributed(self):
+        device_str = f"{get_device_type()}:{self.args.train.local_rank}"
+        get_torch_device().set_device(device_str)
+        self.device = torch.device(device_str)
+
+        # Initialize distributed process group
+        if not dist.is_initialized():
+            dist.init_process_group(backend=get_dist_comm_backend(), device_id=self.device)
+
+        logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
+
+        # Initialize parallel state
+        init_parallel_state(
+            dp_size=self.args.train.data_parallel_size,
+            dp_replicate_size=self.args.train.data_parallel_replicate_size,
+            dp_shard_size=self.args.train.data_parallel_shard_size,
+            tp_size=self.args.train.tensor_parallel_size,
+            ep_size=self.args.train.expert_parallel_size,
+            pp_size=self.args.train.pipeline_parallel_size,
+            cp_size=self.args.train.context_parallel_size,
+            ulysses_size=self.args.train.ulysses_parallel_size,
+            dp_mode=self.args.train.data_parallel_mode,
+            async_enabled=self.args.train.async_enabled,
+        )
+
+    def _build_checkpointer(self):
+        logger.info_rank0("Build checkpointer")
+        self.checkpointer = build_checkpointer(
+            dist_backend=self.args.train.data_parallel_mode, ckpt_manager=self.args.train.ckpt_manager
+        )
+
+    def _build_model(self):
+        logger.info_rank0("Build model")
+        self.model = build_foundation_model(
+            config_path=self.args.model.config_path,
+            weights_path=self.args.model.model_path,
+            torch_dtype="float32" if self.args.train.enable_mixed_precision else "bfloat16",
+            attn_implementation=self.args.model.attn_implementation,
+            moe_implementation=self.args.model.moe_implementation,
+            init_device=self.args.train.init_device,
+        )
+        self.model_config = self.model.config
+        self.model_assets.append(self.model_config)
+        helper.print_device_mem_info("VRAM usage after building model")
+
+    def _build_data(self):
+        logger.info_rank0("Build data")
+        args: Arguments = self.args
+
+        data_transform = self.build_data_transform()
+        # Build dataset
+        train_dataset = build_dataset(
+            dataset_name=args.data.dataset_name,
+            transform=data_transform,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            seed=args.train.seed,
+            **asdict(args.data),
+        )
+        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+        if args.data.datasets_type == "mapping":
+            dataset_length = dataset_length / args.train.data_parallel_size
+        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+        self.train_steps = args.train.train_steps
+
+        # Build dataloader
+        self.train_dataloader = build_dataloader(
+            dataloader_type=args.data.dataloader_type,
+            dataset=train_dataset,
+            micro_batch_size=args.train.micro_batch_size,
+            global_batch_size=args.train.global_batch_size,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            seed=args.train.seed,
+            collate_fn=[],
+            max_seq_len=args.data.max_seq_len,
+            train_steps=args.train.train_steps,
+            rmpad=args.train.rmpad,
+            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+            bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+            dyn_bsz_margin=args.train.dyn_bsz_margin,
+            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+            num_workers=args.data.num_workers,
+            drop_last=args.data.drop_last,
+            pin_memory=args.data.pin_memory,
+            prefetch_factor=args.data.prefetch_factor,
+        )
+
+    def _build_parallelized_model(self):
+        args: Arguments = self.args
+
+        # Parallelize model
+        self.model = build_parallelize_model(
+            self.model,
+            init_device=args.train.init_device,
+            weights_path=args.model.model_path,
+            enable_full_shard=args.train.enable_full_shard,
+            enable_mixed_precision=args.train.enable_mixed_precision,
+            enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
+            enable_fsdp_offload=args.train.enable_fsdp_offload,
+            fsdp_kwargs=self.fsdp_kwargs,
+            basic_modules=self.model._no_split_modules + args.model.basic_modules,
+            enable_reentrant=args.train.enable_reentrant,
+            enable_forward_prefetch=args.train.enable_forward_prefetch,
+        )
+
+        self.model.train()
+
+    def _build_optimizer_and_scheduler(self):
+        """Build optimizer and learning rate scheduler."""
+        args: Arguments = self.args
+
+        param_groups = self.build_param_groups()
+
+        # Build optimizer
+        self.optimizer = build_optimizer(
+            self.model,
+            lr=args.train.lr,
+            weight_decay=args.train.weight_decay,
+            fused=True,
+            optimizer_type=args.train.optimizer,
+            param_groups=param_groups,
+        )
+
+        # Build lr scheduler
+        self.lr_scheduler = build_lr_scheduler(
+            self.optimizer,
+            train_steps=args.train.train_steps * args.train.num_train_epochs,
+            lr=args.train.lr,
+            lr_min=args.train.lr_min,
+            lr_decay_style=args.train.lr_decay_style,
+            lr_decay_ratio=args.train.lr_decay_ratio,
+            lr_warmup_ratio=args.train.lr_warmup_ratio,
+            lr_start=args.train.lr_start,
+        )
+
+    def _build_training_context(self):
+        """Build training context for distributed training."""
+        # Build activation offloading context
+        self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
+            self.args.train.enable_activation_offload,
+            self.args.train.enable_gradient_checkpointing,
+            self.args.train.activation_gpu_limit,
+        )
+
+    def _init_metrics(self):
+        """Initialize metrics and environment meter."""
+
+        args: Arguments = self.args
+
+        # Initialize environment meter
+        self.environ_meter = helper.EnvironMeter(
+            config=self.model_config,
+            global_batch_size=args.train.global_batch_size,
+            rmpad=False,  # TODO(szl): remove this
+            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+            empty_cache_steps=args.train.empty_cache_steps,
+            enable_multisource=args.data.enable_multisource,
+            dataloader=self.train_dataloader,
+            data_path=args.data.train_path,
+        )
+
+    def _init_callbacks(self):
+        """Initialize callbacks."""
+        callbacks = [
+            CheckpointerCallback(self),
+            HuggingfaceCkptCallback(self),
+            EvaluateCallback(self),
+            WandbTraceCallback(self),
+            ProfileTraceCallback(self),
+        ]
+        self.callbacks = CallbackHandler(callbacks)
+        self.state = TrainerState()
+
+    def _build_preforward_postforward(self):
+        """Build preforward and postforward hooks."""
+        self.pre_forward = Preforward(
+            rmpad_with_pos_ids=self.args.train.rmpad_with_pos_ids,
+            attn_implementation=self.args.model.attn_implementation,
+        )
+        self.post_forward = Postforward(
+            rmpad_with_pos_ids=self.args.train.rmpad_with_pos_ids,
+        )
+
+    def add_callback(self, callback: Callback):
+        self.callbacks.add(callback)
+
+    def fit(self):
+        args: Arguments = self.args
+        self.callbacks.call("on_train_begin", self.state)
+        logger.info(
+            f"Rank{args.train.local_rank} Start training. "
+            f"Train_steps: {args.train.train_steps}. "
+            f"Epochs: {args.train.num_train_epochs}."
+        )
+
+        for epoch in range(self.start_epoch, args.train.num_train_epochs):
+            if hasattr(self.train_dataloader, "set_epoch"):
+                self.train_dataloader.set_epoch(epoch)
+            self.state.epoch = epoch
+
+            self.callbacks.call("on_epoch_begin", self.state)
+
+            data_loader_tqdm = trange(
+                args.train.train_steps,
+                desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
+                total=args.train.train_steps,
+                initial=self.start_step,
+                disable=args.train.local_rank != 0,
+            )
+
+            # Create a batch generator
+            data_iterator = self.batch_generator(self.train_dataloader)
+
+            for _ in range(self.start_step, args.train.train_steps):
+                try:
+                    training_step_info = self.train_step(data_iterator)
+                except RuntimeError as e:
+                    if "Data loader exhausted" in str(e):
+                        logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                        break
+                    raise e
+
+                # Update progress bar
+                postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in training_step_info.items())
+                data_loader_tqdm.set_postfix_str(postfix)
+                data_loader_tqdm.update()
+
+            data_loader_tqdm.close()
+            self.callbacks.call("on_epoch_end", self.state)
+            self.start_step = 0
+            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+        synchronize()
+
+        # Clean up optimizer and lr scheduler
+        del self.optimizer, self.lr_scheduler
+        helper.empty_cache()
+        self.callbacks.call("on_train_end", self.state)
+        dist.barrier()
+        dist.destroy_process_group()
 
     def batch_generator(
-        self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+        self, data_loader: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
-        """
-        Returns an iterator that processes batches from the data iterator.
+        """Returns an iterator that processes batches from the data iterator."""
+        data_iterator = iter(data_loader)
+        while True:
+            try:
+                micro_batches = next(data_iterator)
+            except StopIteration as ex:
+                raise RuntimeError("Data loader exhausted") from ex
 
-        This method handles device transfer and token counting. Subclasses can
-        override this method to customize batch processing (e.g., different
-        device placement, custom data augmentation, etc.).
+            micro_batches = self.pre_forward(micro_batches)
+            for micro_batch in micro_batches:
+                self.environ_meter.add(micro_batch)
+                if self.args.data.enable_multisource:
+                    micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("source_name", None)
+                    micro_batch.pop("cur_token_num", None)
 
-        Args:
-            data_iterable: Iterable over raw data batches.
+            yield micro_batches
 
-        Returns:
-            Iterator over processed batches (input_dict, labels).
+    def forward_backward_step(
+        self, micro_batch: dict[str, torch.Tensor], micro_batches_token_len: torch.Tensor
+    ) -> torch.Tensor:
+        micro_batch_token_len = count_loss_token(micro_batch)
 
-        Subclasses can override this method to customize batch processing.
-        """
-        return None  # Placeholder
+        micro_batch = {
+            k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in micro_batch.items()
+        }
 
-    def pre_forward(
-        self, input_dict: dict[str, torch.Tensor], labels: Optional[torch.Tensor] = None
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], dict[str, torch.Tensor], dict[str, Any]]:
-        """
-        Pre-process data before model forward pass.
+        with self.model_fwd_context:
+            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-        This method is called right before the model forward pass to perform
-        final data preparation. It processes the raw data from the dataloader
-        and prepares it for the model's forward pass. It can separate the main
-        input tensor from auxiliary inputs and construct additional keyword
-        arguments (e.g., attention masks).
+        loss, loss_dict = mean_global_loss(outputs.loss, micro_batch_token_len, micro_batches_token_len)
 
-        This method can be overridden in subclasses to customize data processing
-        for different training strategies (e.g., converting tensors to DTensors,
-        applying custom transformations, etc.).
+        # Backward pass
+        with self.model_bwd_context:
+            loss.backward()
 
-        Args:
-            input_dict: Dictionary containing tensors from the dataloader. Must
-                contain an "input" key with the main input tensor. May contain
-                additional keys for auxiliary inputs (e.g., position ids).
-            labels: Target labels for the batch.
+        del micro_batch
+        return loss, loss_dict
 
-        Returns:
-            A tuple of (inputs, labels, extra_inputs, extra_kwargs) where:
-                - inputs: Main input tensor extracted from input_dict["input"].
-                - labels: Target labels (unchanged from input parameter).
-                - extra_inputs: Dict of auxiliary input tensors (all keys except
-                    "input" from input_dict). These are passed to the model forward
-                    but are NOT forwarded across pipeline parallel stages.
-                - extra_kwargs: Dict of additional keyword arguments for model forward.
-                    These ARE forwarded across pipeline parallel stages. Contains
-                    attention_masks if flex attention is enabled.
+    def train_step(
+        self,
+        data_iterator: Any,
+    ) -> Dict[str, float]:
+        args = self.args
+        # Update step counters
+        self.global_step += 1
+        self.state.global_step = self.global_step
+        self.callbacks.call("on_step_begin", self.state)
 
-        Note:
-            The distinction between extra_inputs and extra_kwargs is important for
-            pipeline parallelism: extra_kwargs are forwarded to all pipeline stages,
-            while extra_inputs are only available to the first stage.
+        # Get micro_batches from iterator
+        # data_iterator yields List[Dict] (micro_batches)
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        Subclasses should override this method to customize data preprocessing.
-        """
-        pass
+        # Print example on first step
+        if self.global_step == 1:
+            helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
-    def forward_backward_step(self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
-        """
-        Perform forward and backward pass for a single batch.
+        # Forward and backward for each micro batch
+        synchronize()
 
-        This method can be overridden in subclasses to customize the forward/backward
-        logic (e.g., different loss computation, custom gradient handling, etc.).
+        total_loss = 0.0
+        total_loss_dict = defaultdict(int)
+        start_time = time.time()
+        micro_batches_token_len = count_loss_token(micro_batches)
 
-        Args:
-            input_dict: Dictionary containing input tensors from the dataloader.
-            labels: Target labels for the batch.
+        # forward and backward pass with gradient_accumulationsteps
+        for micro_batch in micro_batches:
+            loss: torch.Tensor
+            loss_dict: Dict[str, torch.Tensor]
+            loss, loss_dict = self.forward_backward_step(micro_batch, micro_batches_token_len)
 
-        Returns:
-            The computed loss tensor.
+            total_loss += loss.item()
+            for k, v in loss_dict.items():
+                total_loss_dict[k] += v.item()
 
-        Subclasses can override this method to implement custom training strategies.
-        """
+        # Gradient clipping
+        grad_norm = veomni_clip_grad_norm(self.model, args.train.max_grad_norm)
 
-        pass
+        # Optimizer and scheduler step
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
 
-    def train_step(self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]) -> None:
-        """
-        Execute a single training step.
+        if hasattr(grad_norm, "full_tensor"):
+            grad_norm = grad_norm.full_tensor().item()
 
-        This method performs gradient accumulation, optimizer step, and metrics logging.
-        Subclasses can override this method to customize the training step logic
-        (e.g., different gradient clipping, custom logging, etc.).
+        training_step_info = {
+            "loss": total_loss,
+            "grad_norm": grad_norm,
+        }
+        training_step_info.update(total_loss_dict)
+        training_step_info = {
+            f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
+            for k, v in training_step_info.items()
+        }
+        delta_time = time.time() - start_time
+        lr = max(self.lr_scheduler.get_last_lr())
+        training_step_info["training/lr"] = lr
 
-        Args:
-            data_iterator: Iterator over training batches.
-
-        Subclasses can override this method to implement custom training step behavior.
-        """
-        pass
+        # Update metrics
+        self.step_train_metrics = self.environ_meter.step(delta_time, global_step=self.global_step)
+        self.step_train_metrics.update(training_step_info)
+        self.callbacks.call("on_step_end", self.state)
+        return training_step_info
