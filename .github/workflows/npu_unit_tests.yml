@@ -32,7 +32,7 @@ jobs:
   npu_unit_tests:
     if: github.repository_owner == 'phdddd'
     name: VeOmni Ascend test (self-host)
-    runs-on: [self-hosted, npu-0]
+    runs-on: ubuntu-latest
     timeout-minutes: 60 # Increase this timeout value as needed
     container:
       image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
