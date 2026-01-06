@@ -47,10 +47,28 @@ jobs:
         id: version
         run: |
           BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's/refs\/heads\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
+          BASE_IMAGE_NAME="${{ steps.base_image.outputs.new_image_name }}"
+          QUAY_REPO="quay.io/ascend/veomni"
           if [ "${{ github.event_name }}" = "release" ]; then
-            echo "tag=${{ steps.base_image.outputs.new_image_name }}-${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+            VERSION_CORE=$(echo "$RELEASE_TAG" | sed 's/^v//g')
+            TAG_PREFIX="${BASE_IMAGE_NAME}-${VERSION_CORE}"
+            EXISTING_TAGS=$(skopeo list-tags "docker://${QUAY_REPO}" | jq -r '.Tags[]' 2>/dev/null || echo "")
+            if [ -n "$EXISTING_TAGS" ]; then
+              HAS_BASE_TAG=$(echo "$EXISTING_TAGS" | grep -c "^${TAG_PREFIX}$")
+              POST_COUNT=$(echo "$EXISTING_TAGS" | grep -c "${TAG_PREFIX}.post")
+              if [ $HAS_BASE_TAG -gt 0 ] || [ $POST_COUNT -gt 0 ]; then
+                POST_NUM=$((POST_COUNT + 1))
+                FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}.post${POST_NUM}"
+              else
+                FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}"
+              fi
+            else
+              FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}"
+            fi
+            echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
           elif [ "$BRANCH_NAME" = "main" ]; then
-            echo "tag=${{ steps.base_image.outputs.new_image_name }}-latest" >> "$GITHUB_OUTPUT"
+            echo "tag=${BASE_IMAGE_NAME}-latest" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Docker Buildx
