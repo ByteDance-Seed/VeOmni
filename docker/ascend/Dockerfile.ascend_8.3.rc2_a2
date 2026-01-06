@@ -14,13 +14,13 @@ ENV PIP_ROOT_USER_ACTION=ignore
 
 # Set apt source
 # ubuntu 22.04
-RUN cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
-    { \
-    echo "deb ${APT_SOURCE} jammy main restricted universe multiverse"; \
-    echo "deb ${APT_SOURCE} jammy-updates main restricted universe multiverse"; \
-    echo "deb ${APT_SOURCE} jammy-backports main restricted universe multiverse"; \
-    echo "deb ${APT_SOURCE} jammy-security main restricted universe multiverse"; \
-    } > /etc/apt/sources.list
+# RUN cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+#     { \
+#     echo "deb ${APT_SOURCE} jammy main restricted universe multiverse"; \
+#     echo "deb ${APT_SOURCE} jammy-updates main restricted universe multiverse"; \
+#     echo "deb ${APT_SOURCE} jammy-backports main restricted universe multiverse"; \
+#     echo "deb ${APT_SOURCE} jammy-security main restricted universe multiverse"; \
+#     } > /etc/apt/sources.list
 
 # Set timezone
 RUN apt-get update -y && \
@@ -73,6 +73,6 @@ ENV PATH="/bin/:$PATH"
 # uv sync
 WORKDIR /app
 COPY . ./
-RUN uv sync --locked --all-packages --extra npu --extra audio --dev
+RUN uv sync --locked --all-packages --extra npu --extra audio --dev --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
 
 USER root
