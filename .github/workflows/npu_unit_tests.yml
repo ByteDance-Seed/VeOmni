@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   npu_unit_tests:
-    if: github.repository_owner == 'ByteDance-Seed'
+    if: github.repository_owner == 'phdddd'
     name: VeOmni Ascend test (self-host)
     runs-on: [self-hosted, npu-0]
     timeout-minutes: 60 # Increase this timeout value as needed
