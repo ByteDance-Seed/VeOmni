@@ -129,7 +129,7 @@ def seqcls_token_loss_function(
 
     # Reduce loss when using sp
     if sp_enabled:
-        num_valid_tokens = (labels != ignore_index).sum()
+        num_valid_tokens = (labels != IGNORE_INDEX).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
 
     return loss, logits
