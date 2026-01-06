@@ -17,6 +17,7 @@
 Utilities for verifying checkpoint conversions between DCP and HuggingFace formats.
 """
 
+import gc
 import json
 import logging
 import os
@@ -44,46 +45,99 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _normalize_key(key: str) -> Optional[str]:
+    """
+    Convert DCP key to HuggingFace format. Returns None for non-model weights.
+
+    This function mirrors the key normalization logic in scripts/merge_dcp_to_hf.py
+    to ensure consistent behavior between conversion and verification.
+
+    Conversion rules:
+    - "model.model.*" -> "model.*" (remove first "model." prefix)
+    - "model.lm_head.weight" -> "lm_head.weight" (special case)
+    - Other "model.*" keys -> log warning and strip "model." prefix
+    - Keys without "model." prefix -> None (non-model weights)
+    """
+    if not key.startswith("model."):
+        return None
+
+    if key.startswith("model.model."):
+        # Standard case: model.model.* -> model.*
+        return key[6:]  # Remove first "model." prefix
+    elif key == "model.lm_head.weight":
+        # Special case: model.lm_head.weight -> lm_head.weight
+        return "lm_head.weight"
+    else:
+        # Other keys with single "model." prefix - log and strip prefix
+        logger.warning(
+            f"Found key with single 'model.' prefix that doesn't match expected patterns: '{key}'. "
+            f"Converting to '{key[6:]}' by stripping 'model.' prefix."
+        )
+        return key[6:]
+
+
 def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
     """
-    Load a DCP (Distributed Checkpoint) checkpoint from disk.
+    Load a DCP (Distributed Checkpoint) checkpoint from disk and extract model weights.
+
+    This function:
+    1. Reads all tensor metadata from DCP checkpoint
+    2. Filters for model weights (keys starting with "model.")
+    3. Loads only model weights
+    4. Normalizes keys to HuggingFace format using _normalize_key()
 
     Args:
         dcp_checkpoint_dir: Directory containing the DCP checkpoint.
 
     Returns:
-        State dict loaded from the checkpoint.
+        State dict with model weights in HuggingFace format (normalized keys).
     """
-    import gc
     from collections import OrderedDict
 
     from torch.distributed.checkpoint.metadata import Metadata
 
     logger.info(f"Loading DCP checkpoint from {dcp_checkpoint_dir}")
 
-    # Step 1: Get all keys from metadata
+    # Step 1: Read metadata and identify all model weight keys
     reader = FileSystemReader(dcp_checkpoint_dir)
     metadata = reader.read_metadata()
 
-    all_keys = []
-    if isinstance(metadata, Metadata):
-        for key in metadata.state_dict_metadata.keys():
-            if key.startswith("model."):
-                all_keys.append(key)
+    if not isinstance(metadata, Metadata):
+        raise ValueError(f"Invalid metadata format in {dcp_checkpoint_dir}")
 
-    logger.info(f"Found {len(all_keys)} model keys in DCP checkpoint")
+    # Collect all DCP keys and their corresponding HF keys
+    dcp_to_hf_keys = {}
+    non_model_keys = []
 
-    # Step 2: Pre-initialize state_dict with placeholder tensors
+    for dcp_key in metadata.state_dict_metadata.keys():
+        hf_key = _normalize_key(dcp_key)
+        if hf_key is not None:
+            dcp_to_hf_keys[dcp_key] = hf_key
+        else:
+            non_model_keys.append(dcp_key)
+
+    logger.info(f"Found {len(dcp_to_hf_keys)} model weight keys in DCP checkpoint")
+    logger.info(f"Skipping {len(non_model_keys)} non-model keys (e.g., optimizer states)")
+
+    if len(dcp_to_hf_keys) == 0:
+        logger.warning("No model weights found! Check if checkpoint path is correct and contains 'model.' keys.")
+        return {}
+
+    # Step 2: Pre-initialize state_dict with placeholder tensors (only for model weights)
     state_dict = OrderedDict()
-    for key in all_keys:
-        tensor_metadata = metadata.state_dict_metadata[key]
-        state_dict[key] = torch.empty(
+    for dcp_key in dcp_to_hf_keys.keys():
+        tensor_metadata = metadata.state_dict_metadata[dcp_key]
+        if not hasattr(tensor_metadata.properties, "dtype"):
+            raise ValueError(
+                f"Cannot determine dtype for tensor '{dcp_key}': metadata does not contain dtype information"
+            )
+        state_dict[dcp_key] = torch.empty(
             tensor_metadata.size,
-            dtype=tensor_metadata.properties.dtype if hasattr(tensor_metadata.properties, "dtype") else torch.float32,
+            dtype=tensor_metadata.properties.dtype,
         )
 
-    # Step 3: Load the checkpoint
-    logger.info("Loading tensors from DCP (this may take a while)...")
+    # Step 3: Load only model weights from checkpoint
+    logger.info(f"Loading {len(state_dict)} model weight tensors from DCP (this may take a while)...")
     load(
         state_dict,
         checkpoint_id=dcp_checkpoint_dir,
@@ -91,31 +145,24 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         no_dist=True,
     )
 
-    logger.info(f"Loaded {len(state_dict)} tensors")
+    logger.info(f"Loaded {len(state_dict)} model weight tensors")
 
-    # Step 4: Process tensors
-    logger.info("Processing tensors...")
+    # Step 4: Process and normalize tensors
+    logger.info("Processing and normalizing tensors to HuggingFace format...")
     loaded_state_dict = {}
     total_keys = len(state_dict)
 
-    for idx, (key, tensor) in enumerate(state_dict.items(), 1):
+    for idx, (dcp_key, tensor) in enumerate(state_dict.items(), 1):
         if not torch.is_tensor(tensor):
+            logger.warning(f"Skipping non-tensor key: {dcp_key}")
             continue
 
         # Handle DTensor (distributed tensor)
         if hasattr(tensor, "full_tensor"):
             tensor = tensor.full_tensor()
 
-        # Convert DCP key to HuggingFace format:
-        # - "model.model.*" -> "model.*" (remove first "model." prefix)
-        # - "model.lm_head.weight" -> "lm_head.weight" (special case)
-        if key.startswith("model.model."):
-            hf_key = key[6:]  # Remove first "model." prefix
-        elif key == "model.lm_head.weight":
-            hf_key = "lm_head.weight"
-        else:
-            # Keep other keys as-is after removing "model." prefix
-            hf_key = key[6:]
+        # Convert DCP key to HuggingFace format
+        hf_key = dcp_to_hf_keys[dcp_key]
         loaded_state_dict[hf_key] = tensor.detach().cpu()
 
         # Show progress
@@ -126,7 +173,7 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         if idx % 10 == 0:
             gc.collect()
 
-    logger.info(f"✓ Successfully loaded {len(loaded_state_dict)} tensors from DCP checkpoint")
+    logger.info(f"✓ Successfully loaded {len(loaded_state_dict)} model weight tensors from DCP checkpoint")
     return loaded_state_dict
 
 
