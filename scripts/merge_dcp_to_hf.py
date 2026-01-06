@@ -81,7 +81,11 @@ def _get_sharding_plan(
             if save_dtype:
                 dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
             else:
-                dtype = tensor_meta.properties.dtype if hasattr(tensor_meta.properties, "dtype") else torch.float32
+                if not hasattr(tensor_meta.properties, "dtype"):
+                    raise ValueError(
+                        f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
+                    )
+                dtype = tensor_meta.properties.dtype
 
             # Calculate tensor size in bytes
             numel = 1
@@ -151,9 +155,13 @@ def _process_shard(
 
     for dcp_key in dcp_keys_to_load:
         tensor_metadata = metadata.state_dict_metadata[dcp_key]
+        if not hasattr(tensor_metadata.properties, "dtype"):
+            raise ValueError(
+                f"Cannot determine dtype for tensor '{dcp_key}': metadata does not contain dtype information"
+            )
         state_dict[dcp_key] = torch.empty(
             tensor_metadata.size,
-            dtype=tensor_metadata.properties.dtype if hasattr(tensor_metadata.properties, "dtype") else torch.float32,
+            dtype=tensor_metadata.properties.dtype,
         )
 
     # Load partial checkpoint
