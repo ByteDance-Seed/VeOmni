@@ -2,7 +2,6 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -27,7 +26,7 @@ from transformers.utils import (
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
-from ....ops.loss import causallm_loss_function, seqcls_token_loss_sp_aware
+from ....ops.loss import causallm_loss_function, seqcls_token_loss_function
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
 from ...module_utils import GradientCheckpointingLayer
@@ -708,7 +707,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             **kwargs,
         )
-
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -743,7 +741,7 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
         self.num_labels = config.num_labels
         self.model = Qwen3Model(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-        self.loss_fct = CrossEntropyLoss(ignore_index=-100, reduction="none")
+        self.loss_function = seqcls_token_loss_function
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -779,23 +777,7 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
         logits = self.score(hidden_states)
 
         loss = None
-        if labels is not None:
-            # labels are token-level now, shape must match logits tokens
-            if logits.dim() == 3:
-                # [B, L, C] -> [B*L, C]
-                B, L, C = logits.shape
-                logits_2d = logits.view(B * L, C)
-                labels_1d = labels.view(B * L).to(logits.device)
-            elif logits.dim() == 2:
-                # [T, C] -> [T, C]
-                logits_2d = logits
-                labels_1d = labels.view(-1).to(logits.device)
-            else:
-                raise ValueError(f"Unexpected logits shape: {logits.shape}")
-
-            ps = get_parallel_state()
-            sp_group = ps.sp_group if ps.sp_enabled else None
-            loss = seqcls_token_loss_sp_aware(logits_2d, labels_1d, self.loss_fct, sp_group)
+        loss, _ = self.loss_function(hidden_states, self.score.weight, labels)
 
         return SequenceClassifierOutputWithPast(
             loss=loss,

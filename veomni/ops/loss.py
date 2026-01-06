@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -93,21 +92,44 @@ def causallm_loss_function(
     return loss, logits
 
 
-def seqcls_token_loss_sp_aware(
-    logits: torch.Tensor,  # [N, C]
-    labels: torch.Tensor,  # [N]
-    loss_fct: nn.Module,
-    sp_group,
+def seqcls_token_loss_function(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
+    shift_labels: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> torch.Tensor:
-    # local sum loss
-    # CrossEntropyLoss(reduction="none") + mask + sum
-    per = loss_fct(logits, labels)  # [N] if reduction="none"
-    valid = labels != ignore_index
-    loss_sum = (per * valid).sum()
-    cnt = valid.sum().to(dtype=loss_sum.dtype)
+    # We don't use shift_labels
+    assert shift_labels is None
 
-    if sp_group is not None:
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=sp_group)
-        dist.all_reduce(cnt, op=dist.ReduceOp.SUM, group=sp_group)
-    return loss_sum / cnt.clamp_min(1.0)
+    loss = None
+    logits = None
+
+    if labels is None:
+        logits = F.linear(hidden_states, weight)
+        return loss, logits
+
+    sp_enabled = get_parallel_state().sp_enabled
+
+    # Flatten the labels and hidden_states
+    labels = labels.view(-1)
+    hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+
+    # Calculate loss
+    if fused_linear_cross_entropy is not None:  # use kernels
+        if is_seed_kernels_available():
+            loss = fused_linear_cross_entropy(hidden_states, weight, labels, ignore_index=ignore_index)
+        elif is_liger_kernel_available():
+            loss = fused_linear_cross_entropy(weight, hidden_states, labels)
+    else:
+        logits = F.linear(hidden_states, weight).float()
+        loss = fixed_cross_entropy(logits, labels, num_items_in_batch, ignore_index, **kwargs)
+
+    # Reduce loss when using sp
+    if sp_enabled:
+        num_valid_tokens = (labels != ignore_index).sum()
+        loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
+
+    return loss, logits
