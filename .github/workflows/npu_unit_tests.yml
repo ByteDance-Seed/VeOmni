@@ -42,6 +42,7 @@ jobs:
         - /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/
         - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
         - /etc/ascend_install.info:/etc/ascend_install.info
+        - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
         # - /data00/dataset:/github/home/dataset
         # - /data00/models:/github/home/models
         # Use self-host cache speed up pip and model download
@@ -55,13 +56,19 @@ jobs:
         --privileged
         --shm-size 16g
     env:
-      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
 
     steps:
+      - name: Set up proxy
+        run: |
+          CURRENT_PROXY=$(cat /tmp/latest_proxy)
+          echo "Current proxy: $CURRENT_PROXY"
+          echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+          echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+          echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+          echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
       - name: Check npu and CANN info
         run: |
           cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
@@ -75,7 +82,7 @@ jobs:
           fetch-depth: 0
           clean: true
       - name: Install uv and dependencies
-        run: curl -LsSf https://astral.sh/uv/0.9.8/install.sh | sh
+        run: pip3 install uv==0.9.8
       - name: Sync dependencies
         run: |
           uv sync --extra npu --group dev
