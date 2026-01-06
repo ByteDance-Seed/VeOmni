@@ -756,8 +756,6 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> SequenceClassifierOutputWithPast:
         transformer: Qwen3Model = getattr(self, self.base_model_prefix)
@@ -768,8 +766,6 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
             **kwargs,
         )
 
