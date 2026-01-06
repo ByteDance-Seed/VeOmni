@@ -205,7 +205,7 @@ def save_model_weights(
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
 ) -> None:
-    """Convert DCP checkpoint to HuggingFace format with streaming (memory-efficient)."""
+    """Convert DCP checkpoint to HuggingFace format with shard-by-shard processing (memory-efficient)."""
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Saving model weights to {output_dir}")
     logger.info(
