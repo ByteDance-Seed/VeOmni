@@ -45,10 +45,30 @@ def get_dtype_size(dtype: torch.dtype) -> int:
 
 
 def _normalize_key(key: str) -> Optional[str]:
-    """Strip 'model.' prefix from DCP keys. Returns None for non-model weights."""
-    if key.startswith("model."):
+    """
+    Convert DCP key to HuggingFace format. Returns None for non-model weights.
+
+    Conversion rules:
+    - "model.model.*" -> "model.*" (remove first "model." prefix)
+    - "model.lm_head.weight" -> "lm_head.weight" (special case)
+    - Other "model.*" keys -> log warning and strip "model." prefix
+    """
+    if not key.startswith("model."):
+        return None
+
+    if key.startswith("model.model."):
+        # Standard case: model.model.* -> model.*
+        return key[6:]  # Remove first "model." prefix
+    elif key == "model.lm_head.weight":
+        # Special case: model.lm_head.weight -> lm_head.weight
+        return "lm_head.weight"
+    else:
+        # Other keys with single "model." prefix - log and strip prefix
+        logger.warning(
+            f"Found key with single 'model.' prefix that doesn't match expected patterns: '{key}'. "
+            f"Converting to '{key[6:]}' by stripping 'model.' prefix."
+        )
         return key[6:]
-    return None
 
 
 def _get_sharding_plan(

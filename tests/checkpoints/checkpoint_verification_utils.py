@@ -106,13 +106,16 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         if hasattr(tensor, "full_tensor"):
             tensor = tensor.full_tensor()
 
-        # Remove the first "model." prefix for HuggingFace format
-        # DCP keys are like "model.model.layers.0.weight"
-        # HF keys should be like "model.layers.0.weight"
-        # Remove the first "model." prefix for HuggingFace format
-        # DCP keys are like "model.model.layers.0.weight"
-        # HF keys should be like "model.layers.0.weight"
-        hf_key = key[6:]  # Remove "model." prefix (6 characters)
+        # Convert DCP key to HuggingFace format:
+        # - "model.model.*" -> "model.*" (remove first "model." prefix)
+        # - "model.lm_head.weight" -> "lm_head.weight" (special case)
+        if key.startswith("model.model."):
+            hf_key = key[6:]  # Remove first "model." prefix
+        elif key == "model.lm_head.weight":
+            hf_key = "lm_head.weight"
+        else:
+            # Keep other keys as-is after removing "model." prefix
+            hf_key = key[6:]
         loaded_state_dict[hf_key] = tensor.detach().cpu()
 
         # Show progress
