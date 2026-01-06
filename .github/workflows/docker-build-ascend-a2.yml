@@ -12,7 +12,7 @@ on:
 
 jobs:
   build-ascend-image-a2:
-    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'phdddd' }}
+    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'ByteDance-Seed' }}
     runs-on: ubuntu-latest
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-build-ascend-image-a2
