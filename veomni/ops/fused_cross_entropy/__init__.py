@@ -161,7 +161,7 @@ def ForSequenceClassificationLoss(
     target = labels
 
     # Flatten the tokens
-    target = target.view(-1).to(device)
+    target = target.view(-1)
     if hidden_states is not None:
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
     if logits is not None:
@@ -196,6 +196,8 @@ def ForSequenceClassificationLoss(
         num_valid_tokens = (target != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
     return loss, logits
+
+
 class ChunkLoss(torch.autograd.Function):
     @staticmethod
     def forward(
