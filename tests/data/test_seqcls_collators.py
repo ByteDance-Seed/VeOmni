@@ -45,7 +45,7 @@ def test_classification_data_collator_packing_and_position_ids(monkeypatch, feat
 
     monkeypatch.setattr(m, "add_flash_attention_kwargs_from_position_ids", fake_add_fa)
 
-    collator = m.ClassificationDataCollatorWithPositionIDs()
+    collator = m.DataCollatorWithPositionIDs(mask_boundary_labels=False)
     batch = collator(features_two_samples)
 
     assert batch["input_ids"].shape == (1, 5)
@@ -69,7 +69,7 @@ def test_classification_data_collator_sp_enabled_uses_prepare_fa(monkeypatch, fe
 
     monkeypatch.setattr(m, "prepare_fa_kwargs_from_position_ids", fake_prepare)
 
-    collator = m.ClassificationDataCollatorWithPositionIDs()
+    collator = m.DataCollatorWithPositionIDs(mask_boundary_labels=False)
     batch = collator(features_two_samples)
 
     assert batch["input_ids"].shape == (1, 5)
@@ -109,7 +109,13 @@ def test_seqcls_text_sequence_shard_collator_no_shift_and_no_mask(monkeypatch):
 
     monkeypatch.setattr(m, "add_flash_attention_kwargs_from_position_ids", fake_add_fa)
 
-    collator = m.ClassificationTextSequenceShardCollator(rmpad=False, rmpad_with_pos_ids=False, pad_token_id=0)
+    collator = m.TextSequenceShardCollator(
+        rmpad=False,
+        rmpad_with_pos_ids=False,
+        pad_token_id=0,
+        shift_labels=False,
+        mask_boundary_labels=False,
+    )
     out = collator(batch)
 
     # chunk_size = ceil(5/2)=3, pad to 6, slice rank0 -> first 3 tokens
@@ -146,7 +152,13 @@ def test_seqcls_text_sequence_shard_collator_shapes(monkeypatch):
 
     monkeypatch.setattr(m, "add_flash_attention_kwargs_from_position_ids", lambda b: b)
 
-    collator = m.ClassificationTextSequenceShardCollator(rmpad=False, rmpad_with_pos_ids=False, pad_token_id=0)
+    collator = m.TextSequenceShardCollator(
+        rmpad=False,
+        rmpad_with_pos_ids=False,
+        pad_token_id=0,
+        shift_labels=False,
+        mask_boundary_labels=False,
+    )
     out = collator(batch)
 
     # seq_len=7, sp_size=4 => chunk=2, pad to 8, each rank gets 2
