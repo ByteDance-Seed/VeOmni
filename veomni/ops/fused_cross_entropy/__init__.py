@@ -128,7 +128,7 @@ def ForSequenceClassificationLoss(
         num_labels (`int`):
             Number of classes.
         num_items_in_batch (`int`):
-            Used as the denominator to accurately calculate the average loss for each sample.
+            Used to accurately calculate the average loss for each sample.
         ignore_index (`int`, defaults to `-100`):
             Label value to ignore when computing the loss.
         hidden_states (`torch.Tensor`):
