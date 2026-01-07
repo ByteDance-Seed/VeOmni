@@ -325,3 +325,120 @@ class TextSequenceShardCollator(DataCollator):
             add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch
+
+
+@dataclass
+class ClassificationDataCollatorWithPositionIDs(DataCollator):
+    """
+    Reuse DataCollatorWithPositionIDs from veomni.data,
+    but remove the part that masks out the labels corresponding to the boundary tokens of each subsequence.
+    """
+
+    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
+        batch = {}
+        for input_name in features[0].keys():
+            if input_name in ("input_ids", "attention_mask", "labels", "position_ids"):
+                batch[input_name] = torch.cat([feature[input_name] for feature in features], dim=-1).unsqueeze(0)
+            else:
+                batch[input_name] = default_collate([feature[input_name] for feature in features])
+
+        if "position_ids" not in batch:
+            batch["position_ids"] = torch.cat(
+                [torch.arange(len(feature["input_ids"])) for feature in features]
+            ).unsqueeze(0)
+
+        # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
+        if not get_parallel_state().sp_enabled:
+            # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
+            # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
+            cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
+        else:
+            # Still need cu_seq_lens_q for label masking even when sp_enabled
+            (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
+
+        return batch
+
+
+@dataclass
+class ClassificationTextSequenceShardCollator(DataCollator):
+    """
+    Patch of TextSequenceShardCollator for SeqCls token-level labels:
+      - NO label shift
+      - NO masking of last token
+    Keep everything else identical.
+    """
+
+    rmpad: bool
+    rmpad_with_pos_ids: bool
+    pad_token_id: int = 0
+
+    def __post_init__(self):
+        self.sp_size = get_parallel_state().sp_size
+        self.sp_rank = get_parallel_state().sp_rank
+
+    def sp_slice(self, tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        seq_length = tensor.size(dim)
+        sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
+        return tensor.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
+
+    def sp_padding(
+        self, tensor: torch.Tensor, dim: int = -1, pad_value: int = 0, pad_length: int = 0, sequential: bool = False
+    ) -> torch.Tensor:
+        if pad_length == 0:
+            return tensor
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_length
+        if sequential:
+            seq = torch.arange(pad_length, device=tensor.device, dtype=tensor.dtype)
+            view_shape = [1] * tensor.ndim
+            view_shape[dim] = pad_length
+            pad = seq.view(view_shape).expand(pad_shape)
+        else:
+            pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
+        return torch.cat((tensor, pad), dim=dim)
+
+    def __call__(self, batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        input_ids = batch.pop("input_ids")
+
+        # CHANGED: do NOT shift labels for seq-cls token-level labels
+        labels = batch.pop("labels").contiguous()
+
+        # CHANGED: do NOT mask the last token of each sequence (your class id sits there)
+        if (not self.rmpad_with_pos_ids) and (not self.rmpad) and ("position_ids" not in batch):
+            batch["position_ids"] = torch.arange(0, input_ids.size(-1), device=input_ids.device).unsqueeze(0)
+
+        # sp padding
+        seq_length = input_ids.size(-1)
+        sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
+        pad_length = sp_chunk_size * self.sp_size - seq_length
+
+        input_ids = self.sp_padding(input_ids, dim=-1, pad_value=self.pad_token_id, pad_length=pad_length)
+        labels = self.sp_padding(labels, dim=-1, pad_value=IGNORE_INDEX, pad_length=pad_length)
+
+        if self.rmpad_with_pos_ids:
+            batch["attention_mask"] = self.sp_padding(
+                batch["attention_mask"], dim=-1, pad_value=1, pad_length=pad_length
+            )
+        else:
+            batch["attention_mask"] = self.sp_padding(
+                batch["attention_mask"], dim=-1, pad_value=0, pad_length=pad_length
+            )
+
+        if self.rmpad:
+            if pad_length > 0:
+                batch["cu_seqlens"] = F.pad(
+                    batch["cu_seqlens"], (0, 1), "constant", batch["cu_seqlens"][-1].item() + pad_length
+                )
+        else:
+            batch["position_ids"] = self.sp_padding(
+                batch["position_ids"], dim=-1, pad_value=0, pad_length=pad_length, sequential=True
+            )
+
+        # sp slice
+        batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
+        batch["labels"] = self.sp_slice(labels, dim=-1)
+
+        if not self.rmpad:
+            add_flash_attention_kwargs_from_position_ids(batch)
+
+        return batch
