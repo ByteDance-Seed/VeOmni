@@ -39,6 +39,7 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
+from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 
 
 if TYPE_CHECKING:
@@ -117,6 +118,7 @@ def main():
         cp_size=args.train.context_parallel_size,
         ulysses_size=args.train.ulysses_parallel_size,
         dp_mode=args.train.data_parallel_mode,
+        async_enabled=args.train.async_enabled,
     )
 
     logger.info_rank0("Prepare model")
@@ -124,7 +126,6 @@ def main():
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
         moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
     )
@@ -155,7 +156,6 @@ def main():
         )
     else:
         raise ValueError(f"Unsupported model type: {model_config.model_type}")
-
     if args.train.rmpad:
         raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
 
@@ -187,6 +187,7 @@ def main():
         seed=args.train.seed,
         **asdict(args.data),
     )
+
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
@@ -335,8 +336,11 @@ def main():
             total_loss = 0
             synchronize()
             start_time = time.time()
+            micro_batches_token_len = count_loss_token(micro_batches)
+
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
+                micro_batch_token_len = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
                     micro_batch.pop("cur_token_num", None)
@@ -365,7 +369,9 @@ def main():
                 }
 
                 with model_fwd_context:
-                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss / len(micro_batches)
+                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss
+
+                loss, _ = mean_global_loss(loss, micro_batch_token_len, micro_batches_token_len)
 
                 with model_bwd_context:
                     loss.backward()
@@ -387,7 +393,7 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}", refresh=False
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}", refresh=False
             )
             data_loader_tqdm.update()
 

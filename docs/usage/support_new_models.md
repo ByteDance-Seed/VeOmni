@@ -62,7 +62,7 @@ This ensures all ranks participate in collective operations without affecting th
 
 ## 2. Sequence Parallelism Support
 
-VeOmni automatically registers the wrapped FlashAttention from veomni/ops/attention.py, and we should use causallm_loss_function from veomni/ops/loss.py to support Ulysses within the unified interfaces. You also need to handle sequence-dimension slicing for embeddings carefully and manage the tensor transformations between the ViT and language model components.
+VeOmni automatically registers the wrapped FlashAttention from veomni/ops/attention.py, LOSS_MAPPING from veomni/ops/loss.py. You also need to handle sequence-dimension slicing for embeddings carefully and manage the tensor transformations between the ViT and language model components.
 
 ### 2.1 Language Model Part - Simple Position Embedding Slicing
 

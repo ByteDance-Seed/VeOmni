@@ -164,7 +164,6 @@ def main():
         weights_path=args.model.model_path,
         torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
@@ -393,7 +392,7 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}", refresh=False
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}", refresh=False
             )
             data_loader_tqdm.update()
 

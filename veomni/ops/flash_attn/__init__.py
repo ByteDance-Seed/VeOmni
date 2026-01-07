@@ -1,3 +1,17 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Optional
 
 import torch
@@ -6,15 +20,34 @@ from transformers.modeling_flash_attention_utils import (
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ..distributed.parallel_state import get_parallel_state
-from ..distributed.sequence_parallel import (
+from ...distributed.parallel_state import get_parallel_state
+from ...distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
 )
-from ..utils import logging
+from ...utils import logging
 
 
 logger = logging.get_logger(__name__)
+_flash_attention_forward = None
+
+
+def transformers_flash_attention_forward(
+    query,
+    key,
+    value,
+    attention_mask,
+    **kwargs,
+):
+    attn_implementation = kwargs.pop("attn_implementation")
+    return _transformers_flash_attention_forward(
+        query,
+        key,
+        value,
+        attention_mask,
+        implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 to remove this patch
+        **kwargs,
+    )
 
 
 # patch transformers.integrations.flash_attention.py
@@ -73,14 +106,6 @@ def flash_attention_forward(
     is_causal = kwargs.pop("is_causal", None)
     if is_causal is None:
         is_causal = module.is_causal
-
-    # This is for Qwen2VL's mrope
-
-    # TODO(szl): mv this to qwen2vl modeling
-    position_ids = kwargs.get("position_ids", None)
-    if position_ids is not None and position_ids.dim() == 3:
-        position_ids = position_ids[0]
-        kwargs["position_ids"] = position_ids
 
     # Ulysses patch
     ulysses_enabled = get_parallel_state().ulysses_enabled
@@ -164,25 +189,8 @@ def flash_attention_forward(
     return attn_output, None
 
 
-def _flash_attention_forward(
-    query,
-    key,
-    value,
-    attention_mask,
-    **kwargs,
-):
-    attn_implementation = kwargs.pop("attn_implementation")
-    return _transformers_flash_attention_forward(
-        query,
-        key,
-        value,
-        attention_mask,
-        implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 to remove this patch
-        **kwargs,
-    )
-
-
 def apply_veomni_attention_patch():
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
-    logger.info_rank0("✅ Transformers ALL_ATTENTION_FUNCTIONS patched with new flash_attention_forward in VeOmni")
+    global _flash_attention_forward
+    _flash_attention_forward = transformers_flash_attention_forward

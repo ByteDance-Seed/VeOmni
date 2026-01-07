@@ -19,6 +19,7 @@ import datetime
 import gc
 import logging as builtin_logging
 import os
+import random
 import subprocess
 import sys
 import warnings
@@ -33,7 +34,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformers
-from transformers import enable_full_determinism
 from transformers import set_seed as set_seed_func
 
 from veomni.distributed.parallel_state import get_parallel_state
@@ -102,7 +102,8 @@ def _compute_seqlens(
         seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
     elif rmpad_with_pos_ids:
         seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-        seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
+        # seqlen is the last dim of position_ids: 3, 1, seqlen for qwenvl; 1, seqlen for llm
+        seqlens = seqlens[:-1] if (micro_batch["position_ids"][..., -seqlens[-1] :] == 0).all().item() else seqlens
     else:
         seqlens = attention_mask.sum(-1).tolist()
 
@@ -380,12 +381,43 @@ def enable_high_precision_for_bf16():
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
 
+def enable_full_determinism(seed: int):
+    """
+    Helper function for reproducibility in distributed training.
+    See https://pytorch.org/docs/stable/notes/randomness.html for details.
+    """
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ["NCCL_DETERMINISTIC"] = "1"
+    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+    if IS_NPU_AVAILABLE:
+        # The environment variable required to enable deterministic mode on Ascend NPUs.
+        os.environ["NCCL_DETERMINISTIC"] = "true"
+        os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    # Enable CUDNN deterministic mode
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = False
+
+    if IS_NPU_AVAILABLE:
+        torch.npu.manual_seed(seed)
+        torch.npu.manual_seed_all(seed)
+
+
 def set_seed(seed: int, full_determinism: bool = False) -> None:
     """
     Sets a manual seed on all devices.
     """
     if full_determinism:
-        enable_full_determinism(seed, warn_only=True)
+        enable_full_determinism(seed)
     else:
         set_seed_func(seed)
 
@@ -552,7 +584,6 @@ class ProfilerWithMem:
 
     def __init__(self, inner):
         self._p = inner
-        self.first_step = True  # flagging the first step for record memory history
 
     # delegate ctx-manager behaviour
     def __enter__(self):
@@ -562,7 +593,9 @@ class ProfilerWithMem:
         return self._p.__exit__(*a)
 
     def start(self):
-        return self._p.start()
+        out = self._p.start()
+        get_torch_device().memory._record_memory_history()
+        return out
 
     def stop(self):
         out = self._p.stop()
@@ -570,11 +603,7 @@ class ProfilerWithMem:
         return out
 
     def step(self, *a, **kw):
-        out = self._p.step(*a, **kw)
-        if self.first_step:
-            get_torch_device().memory._record_memory_history()
-            self.first_step = False
-        return out
+        return self._p.step(*a, **kw)
 
 
 def create_profiler(
@@ -625,9 +654,8 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
-            get_torch_device().memory._dump_snapshot(gpu_memory_file)
-            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+        get_torch_device().memory._dump_snapshot(gpu_memory_file)
+        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)

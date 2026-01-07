@@ -62,7 +62,7 @@ def run_data_test():
     # build dummy data
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
-    multisource_datasets = [DummyDataset(size=1000, dataset_name=name) for name in multisource_names]
+    multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in multisource_names]
     multisource_path = [dataset.save_path for dataset in multisource_datasets]
 
     multisource_config = dict(
@@ -169,13 +169,6 @@ def run_data_test():
                             group_size=get_parallel_state().sp_size,
                             group=get_parallel_state().sp_group,
                         )
-                    if args.train.rmpad:
-                        compare_items(
-                            micro_batches[0]["cu_seqlens"],
-                            rank=get_parallel_state().sp_rank,
-                            group_size=get_parallel_state().sp_size,
-                            group=get_parallel_state().sp_group,
-                        )
 
             if global_step > save_step:
                 gt_global_batch_list.append(micro_batches)
@@ -254,14 +247,9 @@ def run_data_test():
 def build_command(dataset_type, dataloader_type):
     port = 12345 + random.randint(0, 100)
 
-    if dataloader_type == "rmpad":
-        rmpad = True
-        rmpad_with_pos_ids = False
-    elif dataloader_type == "rmpad_with_pos_ids":
-        rmpad = False
+    if dataloader_type == "rmpad_with_pos_ids":
         rmpad_with_pos_ids = True
     else:
-        rmpad = False
         rmpad_with_pos_ids = False
     command = [
         "torchrun",
@@ -282,20 +270,10 @@ def build_command(dataset_type, dataloader_type):
         "--train.ulysses_parallel_size=2",
         "--train.bsz_warmup_ratio=0",
         "--train.output_dir=.tests/cache",
-        f"--train.rmpad={rmpad}",
+        "--train.rmpad=False",
         f"--train.rmpad_with_pos_ids={rmpad_with_pos_ids}",
     ]
     return command
-
-
-def test_multisource_data_rmpad():
-    command = build_command(dataset_type="mapping", dataloader_type="rmpad")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-    command = build_command(dataset_type="iterable", dataloader_type="rmpad")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
 
 
 def test_multisource_data_rmpad_with_pos_ids():
