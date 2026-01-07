@@ -107,11 +107,37 @@ def ForSequenceClassificationLoss(
     ignore_index: int = -100,
     **kwargs,
 ) -> torch.Tensor:
-    """
-    SeqCls token-level labels loss (LM-style labels):
-      - labels shape matches token layout: [B,L] or [T]
-      - labels == ignore_index everywhere except supervised tokens (last token per sample)
-      - NO shifting
+    r"""
+    Token-level loss for sequence classification.
+
+    This loss follows the "token-level labels" convention: `labels` has the same layout as the token
+    sequence, with all positions set to `ignore_index` except the
+    supervised token(s) (the last valid token of each sample). No shifting is applied.
+
+    When sequence parallelism (SP) is enabled, the loss is reduced across SP ranks using the number
+    of non-ignored tokens.
+
+    Args:
+        logits (`torch.Tensor`):
+            Pre-computed classification logits of shape `[*, num_labels]`.
+        labels (`torch.Tensor`):
+            Token-level labels with `ignore_index` marking non-supervised positions.
+        num_labels (`int`):
+            Number of classes.
+        num_items_in_batch (`int`):
+            Used as the denominator to accurately calculate the average loss for each sample.
+        ignore_index (`int`, defaults to `-100`):
+            Label value to ignore when computing the loss.
+        hidden_states (`torch.Tensor`):
+            Hidden states of shape `[*, hidden_size]`, used for fused linear cross-entropy.
+        weights (`torch.Tensor`):
+            Classification head weights, used for fused linear cross-entropy.
+
+    Returns:
+        loss (`torch.Tensor`):
+            Scalar classification loss.
+        logits (`torch.Tensor`):
+            Flattened logits of shape `[T, num_labels]`.
     """
 
     # pop fused loss kwargs
