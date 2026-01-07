@@ -5,7 +5,6 @@ import torch
 
 from ..data.constants import IGNORE_INDEX
 from ..distributed.parallel_state import get_parallel_state
-from .device import get_device_type
 from .dist_utils import all_reduce
 
 
@@ -14,10 +13,20 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     if isinstance(batches, dict):
         batches = [batches]
     token_len = defaultdict(int)
-    for batch in batches:
-        token_len["foundation_tokens"] += torch.sum(batch["labels"] != IGNORE_INDEX)  # text tokens
-        if "image_output_mask" in batch:
-            token_len["image_decoder_tokens"] += torch.sum(batch["image_output_mask"])  # image generation tokens
+
+    def _count(obj):
+        if isinstance(obj, dict):
+            token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
+
+            if "image_output_mask" in obj:
+                token_len["image_decoder_tokens"] += torch.sum(obj["image_output_mask"])  # image generation tokens
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                _count(item)
+        else:
+            raise TypeError(f"Unsupported batch type: {type(obj)}")
+
+    _count(batches)
     return token_len
 
 
@@ -29,9 +38,7 @@ def mean_global_loss(
     """Calcuate the global mean loss. Avg on all_reduced_token_num instead of on dp_size.
     - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().fsdp_size
     # fsdp by default divides gradients by its size, so we need to multiply by fsdp_size
-    - loss_bwd = sum(dict(cur_losses))
     """
-    loss_bwd = torch.tensor(0.0, device=get_device_type())
     loss_dict = {}
 
     if isinstance(losses, torch.Tensor):  # text loss only
@@ -57,8 +64,6 @@ def mean_global_loss(
         if get_parallel_state().sp_enabled:
             cur_loss = cur_loss / get_parallel_state().sp_size
 
-        loss_bwd += cur_loss
-
         loss_dict[key] = cur_loss
 
-    return loss_bwd, loss_dict
+    return loss_dict

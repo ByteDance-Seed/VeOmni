@@ -46,7 +46,6 @@ from veomni.utils.device import (
     get_torch_device,
 )
 from veomni.utils.dist_utils import all_reduce
-from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
 
 from .multisource_utils import parse_multisource_config
 
@@ -85,32 +84,24 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 
 
 def _compute_seqlens(
-    micro_batch: Dict[str, "torch.Tensor"], rmpad: bool, rmpad_with_pos_ids: bool, enable_multisource: bool
+    micro_batch: Dict[str, "torch.Tensor"], enable_multisource: bool
 ) -> Tuple[List[int], Optional[List[int]]]:
     """
     Computes the sequence lengths of the current batch.
 
     Args:
         micro_batch (Dict[str, Tensor]): The current batch.
-        rmpad (bool): Whether to remove the padding tokens.
-        rmpad_with_pos_ids (bool): Whether to remove the padding tokens using the position ids.
         enable_multisource (bool): Whether to enable the multi-source dataloader.
     """
-    attention_mask = micro_batch["attention_mask"]  # rm this, attention_mask will be all ones
-    if rmpad:  # rm this, veomni will only have rmpad_with_pos_ids
-        seqlens = culen2len(micro_batch["cu_seqlens"]).tolist()
-        seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
-    elif rmpad_with_pos_ids:
-        seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-        # seqlens = 1 is sp_pad
-        seqlens = [s for s in seqlens if s != 1]
-    else:
-        seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-        seqlens = [s for s in seqlens if s != 1]
+    attention_mask = micro_batch["attention_mask"]
+    seqlens = attention_mask.sum().item()
 
     ds_idx = None
     if enable_multisource:
-        ds_idx = micro_batch["ds_idx"].tolist()
+        ds_idx = micro_batch.pop("ds_idx")
+        ds_idx = ds_idx.item()
+        micro_batch.pop("source_name", None)
+        micro_batch.pop("cur_token_num", None)
 
     return seqlens, ds_idx
 
@@ -122,8 +113,6 @@ class EnvironMeter:
     Args:
         config (PretrainedConfig): The configuration of the model.
         global_batch_size (int): The global batch size.
-        rmpad (bool, optional): Whether to remove the padding tokens. Defaults to False.
-        rmpad_with_pos_ids (bool, optional): Whether to remove the padding tokens using the position ids. Defaults to False.
         enable_multisource (bool, optional): Whether to enable the multi-source dataloader. Defaults to False.
         dataloader (DataLoader, optional): The training dataloader for multi-source dataloader. Defaults to None.
         data_path (str, optional): The data path for multi-source dataloader. Defaults to "".
@@ -134,8 +123,6 @@ class EnvironMeter:
         self,
         config: "PretrainedConfig",
         global_batch_size: int,
-        rmpad: bool = False,
-        rmpad_with_pos_ids: bool = False,
         enable_multisource: bool = False,
         dataloader: Optional["DataLoader"] = None,
         data_path: str = "",
@@ -144,8 +131,6 @@ class EnvironMeter:
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
-        self.rmpad = rmpad
-        self.rmpad_with_pos_ids = rmpad_with_pos_ids
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
@@ -185,7 +170,7 @@ class EnvironMeter:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
     def add(self, micro_batch: Dict[str, "torch.Tensor"]) -> None:
-        seqlens, ds_idx = _compute_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids, self.enable_multisource)
+        seqlens, ds_idx = _compute_seqlens(micro_batch, self.enable_multisource)
 
         if "image_grid_thw" in micro_batch:
             image_grid_thw = micro_batch["image_grid_thw"]
@@ -202,12 +187,9 @@ class EnvironMeter:
             video_seqlens = torch.repeat_interleave(video_grid_thw[:, 1] * video_grid_thw[:, 2], video_grid_thw[:, 0])
             self.images_seqlens.extend(video_seqlens.tolist())  # video equals to image
 
+        self.batch_seqlens.append(seqlens)
         if self.enable_multisource:
-            self.batch_seqlens.extend(seqlens[: len(ds_idx)])  # rmpad_with_pos_ids has a pad item
-            self.batch_ds_idx.extend(ds_idx)
-        else:
-            self.batch_seqlens.extend(seqlens)
-        return seqlens
+            self.batch_ds_idx.append(ds_idx)
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0:

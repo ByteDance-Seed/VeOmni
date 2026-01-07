@@ -17,10 +17,10 @@ class TextTrainer(BaseTrainer):
         args: Arguments = self.args
         self.tokenizer = build_tokenizer(args.model.tokenizer_path)
         if args.data.data_type == "plaintext":
-            self.model_assets = [self.tokenizer]
+            return [self.tokenizer]
         else:
             self.chat_template = build_chat_template(args.data.chat_template, self.tokenizer)
-            self.model_assets = [self.chat_template]
+            return [self.chat_template]
 
     def build_data_transform(self):
         args: Arguments = self.args

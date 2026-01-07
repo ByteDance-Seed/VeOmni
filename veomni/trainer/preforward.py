@@ -132,13 +132,10 @@ class Preforward:
 
         logger.info_rank0(self.log_collate_infos())
 
-    def __call__(self, micro_batches: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        preforwad_micro_batches = []
-        for micro_batch in micro_batches:
-            for preforward_func in self.preforward_pipeline:
-                micro_batch = preforward_func(micro_batch)
-            preforwad_micro_batches.append(micro_batch)
-        return preforwad_micro_batches
+    def __call__(self, micro_batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        for preforward_func in self.preforward_pipeline:
+            micro_batch = preforward_func(micro_batch)
+        return micro_batch
 
     def log_collate_infos(self) -> None:
         sample_info = next(iter(self.collate_infos.values()))

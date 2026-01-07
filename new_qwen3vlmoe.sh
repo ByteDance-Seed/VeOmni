@@ -26,6 +26,8 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
     --train.global_batch_size 8 \
     --train.rmpad_with_pos_ids ${USE_RM_PAD} \
     --train.num_train_epochs 1 \
+    --train.hf_save_steps 10 \
     --train.micro_batch_size ${BS} \
     --train.max_steps 20 \
-    --train.profile_trace_dir /opt/tiger/exp/${EXP_NAME}/trace
+    --train.profile_trace_dir /opt/tiger/exp/${EXP_NAME}/trace \
+    --train.load_checkpoint_path auto

@@ -164,15 +164,16 @@ class VLMTrainer(BaseTrainer):
     def build_model_assets(self):
         self.processor = build_processor(self.args.model.tokenizer_path, max_pixels=MAX_PIXELS)
         self.chat_template = build_multimodal_chat_template(self.args.data.chat_template, self.processor.tokenizer)
-        self.model_assets = [self.chat_template]
+        return [self.chat_template]
 
     def freeze_module(self):
         args: Arguments = self.args
-        self.fsdp_kwargs = {}
+        fsdp_kwargs = {}
         if args.train.freeze_vit:
             self.model.visual.requires_grad_(False)
             if args.train.data_parallel_mode == "fsdp1":
-                self.fsdp_kwargs["use_orig_params"] = True
+                fsdp_kwargs["use_orig_params"] = True
+        return fsdp_kwargs
 
     def build_param_groups(self):
         args: Arguments = self.args
