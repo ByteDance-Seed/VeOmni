@@ -401,9 +401,7 @@ def test_trainer_saveload_ep8():
     assert verify_dcp_to_hf_conversion(
         dcp_checkpoint_dir=checkpoint_dir,
         hf_checkpoint_dir=hf_output_dir,
-        verify_structure=True,
-        verify_weights=True,
-        num_keys_to_check=None,  # Check all keys for thorough verification
+        safe_serialization=True,
     ), "HF checkpoint verification failed"
 
 
@@ -453,9 +451,7 @@ def test_trainer_saveload_ep4():
     assert verify_dcp_to_hf_conversion(
         dcp_checkpoint_dir=checkpoint_dir,
         hf_checkpoint_dir=hf_output_dir,
-        verify_structure=True,
-        verify_weights=True,
-        num_keys_to_check=None,  # Check all keys for thorough verification
+        safe_serialization=True,
     ), "HF checkpoint verification failed"
 
 
@@ -505,9 +501,7 @@ def test_trainer_saveload_no_ep():
     assert verify_dcp_to_hf_conversion(
         dcp_checkpoint_dir=checkpoint_dir,
         hf_checkpoint_dir=hf_output_dir,
-        verify_structure=True,
-        verify_weights=True,
-        num_keys_to_check=None,  # Check all keys for thorough verification
+        safe_serialization=True,
     ), "HF checkpoint verification failed"
 
 

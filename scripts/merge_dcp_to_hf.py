@@ -75,7 +75,7 @@ def _get_sharding_plan(
     checkpoint_path: Union[str, os.PathLike],
     shard_size: int,
     save_dtype: Optional[Union[str, torch.dtype]],
-) -> Tuple[List[Dict[str, str]], Dict[str, str], int, List[str]]:
+) -> Tuple[List[Dict[str, str]], int, List[str]]:
     """
     Create sharding plan from checkpoint metadata without loading weights.
 
@@ -207,10 +207,19 @@ def _process_shard(
         if target_dtype:
             tensor = tensor.to(dtype=target_dtype)
 
-        processed_dict[hf_key] = tensor.detach().cpu()
+        # Explicitly move to CPU and detach to avoid memory retention
+        processed_dict[hf_key] = tensor.cpu().detach().clone()
+        # Delete the original tensor immediately
+        del tensor
 
+    # Clean up state_dict and force garbage collection
     del state_dict
+    del metadata
+    del reader
     gc.collect()
+    # Clear CUDA cache if available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Save shard
     if safe_serialization:
@@ -218,8 +227,11 @@ def _process_shard(
     else:
         torch.save(processed_dict, save_path)
 
+    # Clean up processed tensors and force garbage collection
     del processed_dict
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return filename
 
