@@ -782,8 +782,7 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
             supervised token(s) (e.g., the last valid token of each sample) carry a real class id in
             `[0, ..., num_labels - 1]`. Tokens with label `-100` are ignored.
 
-            Note: this model expects `labels` to be provided for classification. If `labels` is `None`,
-            it will raise an error.
+            Note: `labels` should be provided for classification training tasks.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -815,7 +814,7 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
                 **kwargs,
             )
         else:
-            raise ValueError("For classification tasks, `labels` must be provided, but got None.")
+            logits = self.score(hidden_states)
 
         return SequenceClassifierOutputWithPast(
             loss=loss,
