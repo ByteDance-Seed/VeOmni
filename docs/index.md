@@ -26,6 +26,7 @@ get_started/installation/install_ascend.md
 usage/basic_modules.md
 usage/arguments.md
 usage/support_new_models.md
+usage/checkpoint_conversion.md
 ```
 
 ```{toctree}
