@@ -5,13 +5,13 @@ export NCCL_DEBUG=ERROR
 
 EP_SIZE=2
 SP_SIZE=2
-USE_RM_PAD=false
+USE_RM_PAD=true
 moe_imple=fused
-BS=2
+BS=1
 
-EXP_NAME=patch_qwen3_vl_moe_IMPLE${moe_imple}_EP${EP_SIZE}_SP${SP_SIZE}_rmpad${USE_RM_PAD}_bs${BS}
+EXP_NAME=trainer_qwen3_vl_moe_IMPLE${moe_imple}_EP${EP_SIZE}_SP${SP_SIZE}_rmpad${USE_RM_PAD}_bs${BS}
 
-bash train.sh tasks/vlm/train_qwen3_vl_moe.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
     --model.model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-30B-A3B-Instruct\
     --model.moe_implementation ${moe_imple} \
     --data.train_path /mnt/hdfs/veomni/dataset/sharegpt4v_cap_100k \

@@ -1,14 +1,6 @@
-from dataclasses import dataclass, field
-
 from veomni.trainer import TextTrainer
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-
-
-@dataclass
-class Arguments:
-    model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
+from veomni.trainer.text_trainer import Arguments
+from veomni.utils.arguments import parse_args
 
 
 if __name__ == "__main__":

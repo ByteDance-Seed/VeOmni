@@ -341,7 +341,7 @@ class BaseTrainer(Stateful, ABC):
             enable_reentrant=args.train.enable_reentrant,
             enable_forward_prefetch=args.train.enable_forward_prefetch,
         )
-
+        self.model.language_model.layers = torch.nn.ModuleList(self.model.language_model.layers[:2])  # clip layers
         self.model.train()
 
     def _build_optimizer_and_scheduler(self):
