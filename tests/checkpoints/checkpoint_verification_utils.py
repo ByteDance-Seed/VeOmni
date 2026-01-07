@@ -80,9 +80,11 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
     Load a DCP (Distributed Checkpoint) checkpoint from disk and extract model weights.
 
     This function uses a DIFFERENT approach than merge_dcp_to_hf.py for cross-validation:
-    1. Load ALL tensors from DCP checkpoint in one go (including optimizer states, etc.)
-    2. Filter out non-model weights after loading
-    3. Normalize keys to HuggingFace format
+    1. Read metadata and get ALL keys (including optimizer states, etc.)
+    2. Pre-allocate tensors for ALL keys
+    3. Load everything in one go
+    4. Filter out non-model weights after loading
+    5. Normalize keys to HuggingFace format
 
     This independent implementation provides cross-validation for the conversion script.
 
@@ -92,11 +94,47 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
     Returns:
         State dict with model weights in HuggingFace format (normalized keys).
     """
-    logger.info(f"Loading DCP checkpoint from {dcp_checkpoint_dir}")
-    logger.info("Using simplified loading: load ALL tensors, then filter for model weights")
+    from collections import OrderedDict
 
-    # Load the ENTIRE checkpoint (all tensors including optimizer states)
-    state_dict = {}
+    from torch.distributed.checkpoint.metadata import Metadata
+
+    logger.info(f"Loading DCP checkpoint from {dcp_checkpoint_dir}")
+    logger.info("Reading metadata and loading ALL tensors, then filtering for model weights")
+
+    # Step 1: Read metadata to get all keys
+    reader = FileSystemReader(dcp_checkpoint_dir)
+    metadata = reader.read_metadata()
+
+    if not isinstance(metadata, Metadata):
+        raise ValueError(f"Invalid metadata format in {dcp_checkpoint_dir}")
+
+    # Step 2: Pre-allocate placeholder tensors for ALL keys (not just model weights)
+    # Note: Some keys may have BytesStorageMetadata (non-tensor data), skip those
+    state_dict = OrderedDict()
+    skipped_keys = []
+
+    for dcp_key, tensor_metadata in metadata.state_dict_metadata.items():
+        # Check if this is tensor metadata (has 'properties' attribute)
+        if not hasattr(tensor_metadata, "properties"):
+            skipped_keys.append(dcp_key)
+            continue
+
+        # Check if dtype is available
+        if not hasattr(tensor_metadata.properties, "dtype"):
+            logger.warning(f"Skipping key '{dcp_key}': no dtype information in metadata")
+            skipped_keys.append(dcp_key)
+            continue
+
+        state_dict[dcp_key] = torch.empty(
+            tensor_metadata.size,
+            dtype=tensor_metadata.properties.dtype,
+        )
+
+    logger.info(f"Found {len(state_dict)} tensor keys in DCP checkpoint")
+    if skipped_keys:
+        logger.info(f"Skipped {len(skipped_keys)} non-tensor keys (e.g., optimizer config)")
+
+    # Step 3: Load ALL tensors from checkpoint
     load(
         state_dict,
         checkpoint_id=dcp_checkpoint_dir,
@@ -106,7 +144,7 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
     logger.info(f"Loaded {len(state_dict)} total tensors from DCP")
 
-    # Filter for model weights and normalize keys to HuggingFace format
+    # Step 4: Filter for model weights and normalize keys to HuggingFace format
     loaded_state_dict = {}
     non_model_count = 0
 
