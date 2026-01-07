@@ -360,42 +360,13 @@ class ClassificationDataCollatorWithPositionIDs(DataCollator):
 
 
 @dataclass
-class ClassificationTextSequenceShardCollator(DataCollator):
+class ClassificationTextSequenceShardCollator(TextSequenceShardCollator):
     """
     Patch of TextSequenceShardCollator for SeqCls token-level labels:
       - NO label shift
       - NO masking of last token
     Keep everything else identical.
     """
-
-    rmpad: bool
-    rmpad_with_pos_ids: bool
-    pad_token_id: int = 0
-
-    def __post_init__(self):
-        self.sp_size = get_parallel_state().sp_size
-        self.sp_rank = get_parallel_state().sp_rank
-
-    def sp_slice(self, tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        seq_length = tensor.size(dim)
-        sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
-        return tensor.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
-
-    def sp_padding(
-        self, tensor: torch.Tensor, dim: int = -1, pad_value: int = 0, pad_length: int = 0, sequential: bool = False
-    ) -> torch.Tensor:
-        if pad_length == 0:
-            return tensor
-        pad_shape = list(tensor.shape)
-        pad_shape[dim] = pad_length
-        if sequential:
-            seq = torch.arange(pad_length, device=tensor.device, dtype=tensor.dtype)
-            view_shape = [1] * tensor.ndim
-            view_shape[dim] = pad_length
-            pad = seq.view(view_shape).expand(pad_shape)
-        else:
-            pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
-        return torch.cat((tensor, pad), dim=dim)
 
     def __call__(self, batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids = batch.pop("input_ids")
