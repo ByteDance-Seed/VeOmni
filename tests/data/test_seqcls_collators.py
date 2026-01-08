@@ -28,7 +28,6 @@ def features_two_samples():
 
 
 def test_classification_data_collator_packing_and_position_ids(monkeypatch, features_two_samples):
-    # Adjust this import to your real module path
     import veomni.data.data_collator as m
 
     # mock parallel state
