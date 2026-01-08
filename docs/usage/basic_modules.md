@@ -2,7 +2,7 @@
 
 ## Usage
 1. **Install VeOmni**  
-    Please refer to [Install](install-guide) for detailed instructions.
+    Please refer to [Install](../get_started/installation/install.md) for detailed instructions.
 
 2. **Run Example Script**  
    Verify training startup: (need download the dataset first)
@@ -32,7 +32,7 @@
 
 ## Arguments
 **Default Parameter Access**:  
-veomni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments-api-reference).
+veomni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md).
 
 ```python
 from dataclasses import dataclass, field

@@ -1,5 +1,3 @@
-(examples-qwen3)=
-
 # Qwen3 training guide
 
 ## Download dataset

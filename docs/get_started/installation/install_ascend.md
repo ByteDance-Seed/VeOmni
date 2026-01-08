@@ -1,5 +1,3 @@
-(installation-install_ascend)=
-
 # Installation with Ascend NPU
 
 ## Required Environment

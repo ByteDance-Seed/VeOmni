@@ -1,9 +1,8 @@
-(install-guide)=
 # Installation with Nvidia GPU
 
 In this section, we provide the installation guide for Nvidia GPU.
 
-VeOmni also supports other hardware platform, please refer to [Ascend](installation-install_ascend).
+VeOmni also supports other hardware platform, please refer to [Ascend](install_ascend.md).
 
 ## Required Environment
 

@@ -42,6 +42,7 @@ hardware_support/get_started_npu.md
 
 examples/qwen3.md
 examples/qwen3_vl.md
+examples/wan2.1.md
 ```
 
 ```{toctree}

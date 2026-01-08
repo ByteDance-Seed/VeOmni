@@ -1,5 +1,3 @@
-(examples-qwen3_vl)=
-
 # Qwen3 VL training guide
 
 ## Download dataset
