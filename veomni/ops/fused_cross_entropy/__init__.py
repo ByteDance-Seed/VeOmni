@@ -148,9 +148,14 @@ def ForSequenceClassificationLoss(
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
 
-    assert hidden_states is not None or logits is not None, "hidden_states or logits must be provided."
-    assert labels is not None, "labels must be provided for SequenceClassification loss."
-    assert num_labels is not None, "num_labels must be provided."
+    if hidden_states is None and logits is None:
+        raise ValueError("Either hidden_states or logits must be provided.")
+
+    if labels is None:
+        raise ValueError("labels must be provided for sequence classification loss.")
+
+    if num_labels is None:
+        raise ValueError("num_labels must be provided.")
 
     device = logits.device if logits is not None else hidden_states.device
     # Upcast to float if we need to compute the loss to avoid potential precision issues

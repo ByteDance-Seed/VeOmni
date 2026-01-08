@@ -5,6 +5,8 @@ import torch
 
 import veomni.ops.fused_cross_entropy as m
 
+from ..veomni.data.constants import IGNORE_INDEX
+
 
 def _manual_ce_one_token(logits_1d: torch.Tensor, target: int) -> float:
     """
@@ -28,7 +30,7 @@ def test_seqcls_loss_logits_path_manual_handcalc(monkeypatch):
     """
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
 
-    ignore = -100
+    ignore = IGNORE_INDEX
     num_labels = 3
 
     logits = torch.tensor(
@@ -156,7 +158,7 @@ def test_seqcls_loss_sp_enabled_calls_reduce_with_correct_num_valid_tokens(monke
         return loss  # identity
 
     monkeypatch.setattr(m, "reduce_sequence_parallel_loss", _fake_reduce)
-    ignore = -100
+    ignore = IGNORE_INDEX
     num_labels = 3
 
     logits = torch.tensor(
