@@ -12,8 +12,9 @@ def rms_norm_forward_npu(self, x):
 
 def rope_apply_fused(x, **kwargs):
     """NPU optimized implementation for RoPE."""
-    cos = kwargs.pop("cos").expand(-1, -1, -1, -1, 2).flatten(-2)
-    sin = kwargs.pop("sin").expand(-1, -1, -1, -1, 2).flatten(-2)
+    freqs = kwargs.pop("freqs")
+    cos = freqs.real.to(torch.float32).unsqueeze(0).repeat_interleave(2, dim=-1).contiguous()
+    sin = freqs.imag.to(torch.float32).unsqueeze(0).repeat_interleave(2, dim=-1).contiguous()
     head_dim = kwargs.pop("head_dim")
     x = rearrange(x, "b s (n d) -> b s n d", d=head_dim)
     x_float = x.to(torch.float32)

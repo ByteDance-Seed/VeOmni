@@ -44,4 +44,7 @@ pip3 install -e .[npu]
 # Make sure CANN_path is set to your CANN installation directory, e.g., export CANN_path=/usr/local/Ascend
 source $CANN_path/ascend-toolkit/set_env.sh
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+# Add chunkloss feature
+export VEOMNI_ENABLE_CHUNK_LOSS=1
 ```
