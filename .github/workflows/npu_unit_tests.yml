@@ -87,12 +87,14 @@ jobs:
       - name: Check final pip list
         run: |
           uv pip list
-      - name: Run models tests
-        run: |
-          uv run --frozen pytest -s -x tests/models/test_models_patch.py
       - name: Run parallel tests
         run: |
-          uv run --frozen pytest -s -x tests/parallel
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
+      - name: Run models tests
+        run: |
+          uv run --frozen pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -s -x tests/models/test_models_patch.py
       - name: Run fsdp2/ep+fsdp2 clip grad norm test
         run: |
           uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
