@@ -144,6 +144,10 @@ class DataArguments:
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
+    eval_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
+    )
     train_size: int = field(
         default=10_000_000,
         metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
@@ -477,6 +481,22 @@ class TrainingArguments:
     save_epochs: int = field(
         default=1,
         metadata={"help": "Number of epochs between two checkpoint saves."},
+    )
+    hf_save_steps: int = field(
+        default=None,
+        metadata={"help": "Number of steps between two hf model weights save."},
+    )
+    hf_save_epochs: int = field(
+        default=None,
+        metadata={"help": "Number of epochs between two hf model weights save."},
+    )
+    eval_steps: int = field(
+        default=0,
+        metadata={"help": "Number of steps between two evaluations. 0 to disable."},
+    )
+    eval_epochs: int = field(
+        default=1,
+        metadata={"help": "Number of epochs between two evaluations. 0 to disable."},
     )
     save_hf_weights: bool = field(
         default=True,

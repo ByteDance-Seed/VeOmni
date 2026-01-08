@@ -666,7 +666,8 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
             if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()
 
-        position_ids = sp_pad_and_slice(position_ids, dim=-1)
+        if get_parallel_state().sp_enabled:
+            position_ids = sp_pad_and_slice(position_ids, dim=-1)
 
         # Modification 6
         kwargs.update(text_flash_attn_kwargs)

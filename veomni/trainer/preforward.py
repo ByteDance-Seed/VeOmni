@@ -118,6 +118,8 @@ class Preforward:
             "position_ids should be sp sliced after precompute fa kwargs"
         )
 
+        self.preforward_pipeline.append(PrecomputePositionIDs())
+
         if self.rmpad_with_pos_ids:
             self.preforward_pipeline.append(PackingPreforward(self.collate_infos))
         else:
@@ -126,17 +128,14 @@ class Preforward:
             self.preforward_pipeline.append(SequenceParallelPreforward(self.collate_infos))
 
         if attn_implementation == "flash_attention_2" or attn_implementation == "flash_attention_3":
-            self.preforward_pipeline.append(FlashAttenPreforward())
+            self.preforward_pipeline.append(PrecomputeFlashAttenKwargs())
 
         logger.info_rank0(self.log_collate_infos())
 
-    def __call__(self, micro_batches: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        preforwad_micro_batches = []
-        for micro_batch in micro_batches:
-            for preforward_func in self.preforward_pipeline:
-                micro_batch = preforward_func(micro_batch)
-            preforwad_micro_batches.append(micro_batch)
-        return preforwad_micro_batches
+    def __call__(self, micro_batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        for preforward_func in self.preforward_pipeline:
+            micro_batch = preforward_func(micro_batch)
+        return micro_batch
 
     def log_collate_infos(self) -> None:
         sample_info = next(iter(self.collate_infos.values()))
@@ -162,7 +161,16 @@ class Preforward:
         return log_str
 
 
-class FlashAttenPreforward:
+class PrecomputePositionIDs:
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        for feature in features:
+            if "position_ids" not in feature:
+                # default position_ids is 0 ~ seq_len - 1 for text models
+                feature["position_ids"] = torch.arange(feature["input_ids"].size(-1), dtype=torch.int64)
+        return features
+
+
+class PrecomputeFlashAttenKwargs:
     def __call__(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         position_ids = features["position_ids"]
         if position_ids.dim() == 3:  # bs, dim, seq_len

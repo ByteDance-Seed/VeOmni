@@ -33,4 +33,3 @@ train:
   profile_end_step: 21
   profile_record_shapes: true
   ckpt_manager: dcp
-  save_hf_weights: false
