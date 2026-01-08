@@ -1,11 +1,8 @@
-import math
-
 import pytest
 import torch
 
 import veomni.ops.fused_cross_entropy as m
-
-from ..veomni.data.constants import IGNORE_INDEX
+from veomni.data.constants import IGNORE_INDEX
 
 
 def _manual_ce_one_token(logits_1d: torch.Tensor, target: int) -> float:
@@ -23,9 +20,10 @@ class _FakePS:
 
 def test_seqcls_loss_logits_path_manual_handcalc(monkeypatch):
     """
-    logits provided
-    hidden_states/weights = None
-    sp_enabled = False
+    Case:
+        logits provided
+        hidden_states/weights = None
+        sp_enabled = False
     Manually calculate the cross-entropy for a single effective token, and verify that it matches the function output.
     """
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
@@ -62,9 +60,10 @@ def test_seqcls_loss_logits_path_manual_handcalc(monkeypatch):
 
 def test_seqcls_loss_hidden_states_weights_path_build_logits_and_loss(monkeypatch):
     """
-    logits = None
-    hidden_states and weights provided
-    sp_enabled = False
+    Case:
+        logits = None
+        hidden_states and weights provided
+        sp_enabled = False
     """
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
     monkeypatch.setattr(m, "_cross_entropy", m.eager_cross_entropy)
@@ -113,40 +112,77 @@ def test_seqcls_loss_hidden_states_weights_path_build_logits_and_loss(monkeypatc
 
 def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_present(monkeypatch):
     """
-    logits provided
-    hidden_states+weights present
-    sp_enabled = False
+    Case:
+        logits provided
+        hidden_states + weights present (matrix path available)
+        sp_enabled = False
+
+    Expected (with Liger fused loss enabled):
+      - loss is computed from (hidden_states, weights, labels) via fused linear cross-entropy.
+        The passed-in `logits` is NOT used for loss computation in this fused path.
+      - out_logits is the flattened *input* logits, because fused_liger_kernel_cross_entropy
+        returns `(loss, logits)` without materializing projected logits.
     """
     device = torch.device("cuda")
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
-    ignore = -100
-    logits = torch.zeros((1, 2, 3), device=device)
-    labels = torch.tensor([[ignore, 1]], device=device)
-    hidden_states = torch.zeros((1, 2, 5), device=device)
-    weights = torch.zeros((3, 5), device=device)
+
+    ignore = IGNORE_INDEX
+    B, T, H, C = 1, 2, 5, 3
+
+    hidden_states = torch.tensor(
+        [[[1.0, 0.0, -1.0, 2.0, 0.5], [0.5, -1.0, 0.0, 1.5, -0.5]]],
+        device=device,
+        dtype=torch.float32,
+    )
+    weights = torch.tensor(
+        [[0.2, -0.1, 0.0, 0.3, 0.5], [-0.4, 0.6, 0.1, -0.2, 0.0], [0.1, 0.2, -0.3, 0.0, 0.4]],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    logits = torch.randn((B, T, C), device=device, dtype=torch.float32)
+    labels = torch.tensor([[ignore, 1]], device=device, dtype=torch.long)
 
     loss, out_logits = m.ForSequenceClassificationLoss(
         logits=logits,
         labels=labels,
-        num_labels=3,
+        num_labels=C,
         ignore_index=ignore,
         hidden_states=hidden_states,
         weights=weights,
     )
-    expected = math.log(float(3))
+
+    # -------------------------------
+    # Hand-written expected:
+    #   proj = hidden_states @ weights.T
+    #   log_probs = log_softmax(proj)
+    #   NLL = -log_probs[target_class]
+    #   mean over valid (label != ignore)
+    # -------------------------------
+    proj = hidden_states.reshape(-1, H) @ weights.t()  # [B*T, C]
+    flat_labels = labels.reshape(-1)  # [B*T]
+    valid = flat_labels != ignore
+
+    log_probs = torch.log_softmax(proj, dim=-1)  # [B*T, C]
+    nll = -log_probs[valid, flat_labels[valid]]  # [num_valid]
+    expected = nll.mean() if nll.numel() > 0 else proj.sum() * 0.0
+
     assert torch.isfinite(loss)
-    assert abs(loss.item() - expected) < 1e-6
+    # Fused kernel may have tiny numerical differences; allow small tolerance.
+    assert torch.allclose(loss.float(), expected.float(), atol=2e-3, rtol=0.0)
 
     assert out_logits is not None
-    assert out_logits.shape == (1 * 2, 3)
+    assert out_logits.shape == (B * T, C)
     assert out_logits.dtype == torch.float32
     assert out_logits.device == logits.device
-    assert torch.allclose(out_logits, logits.view(-1, 3).float())
+    # Current contract: fused returns *input logits* (flattened), not projected logits
+    assert torch.allclose(out_logits, logits.view(-1, C).float(), atol=1e-6)
 
 
 def test_seqcls_loss_sp_enabled_calls_reduce_with_correct_num_valid_tokens(monkeypatch):
     """
-    sp_enabled=True
+    Case:
+        sp_enabled=True
     """
     seen = {"called": False}
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=True))
@@ -190,9 +226,10 @@ def test_seqcls_loss_sp_enabled_calls_reduce_with_correct_num_valid_tokens(monke
 
 def test_seqcls_loss_assertions(monkeypatch):
     """
-    labels = None
-    num_labels = None
-    logits = None and hidden_states = None
+    Case:
+        labels = None
+        num_labels = None
+        logits = None and hidden_states = None
     """
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
 
