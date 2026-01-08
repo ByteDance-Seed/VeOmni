@@ -614,8 +614,8 @@ class WanModel(PreTrainedModel):
             .reshape(f * h * w, 1, -1)
             .to(x.device)
         )
-        cos = freqs.real.unsqueeze(0).unsqueeze(-1).contiguous().to(torch.float32)
-        sin = freqs.imag.unsqueeze(0).unsqueeze(-1).contiguous().to(torch.float32)
+        cos = freqs.real.squeeze().contiguous()
+        sin = freqs.imag.squeeze().contiguous()
 
         if get_parallel_state().ulysses_enabled:
             x = slice_input_tensor_scale_grad(x, dim=1)
