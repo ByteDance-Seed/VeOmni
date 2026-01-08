@@ -150,6 +150,9 @@ class DataCollatorWithPositionIDs(DataCollator):
     Data collator with packing by position ids.
     """
 
+    def __post_init__(self):
+        self.sp_enabled = get_parallel_state().sp_enabled
+
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         batch = {}
         for input_name in features[0].keys():
@@ -164,7 +167,7 @@ class DataCollatorWithPositionIDs(DataCollator):
             ).unsqueeze(0)
 
         # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
-        if not get_parallel_state().sp_enabled:
+        if not self.sp_enabled:
             # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
             # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
             cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
