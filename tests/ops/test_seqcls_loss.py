@@ -152,13 +152,6 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
         weights=weights,
     )
 
-    # -------------------------------
-    # Hand-written expected:
-    #   proj = hidden_states @ weights.T
-    #   log_probs = log_softmax(proj)
-    #   NLL = -log_probs[target_class]
-    #   mean over valid (label != ignore)
-    # -------------------------------
     proj = hidden_states.reshape(-1, H) @ weights.t()  # [B*T, C]
     flat_labels = labels.reshape(-1)  # [B*T]
     valid = flat_labels != ignore
