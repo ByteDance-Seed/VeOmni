@@ -951,7 +951,10 @@ class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = inv_freq
 
-        self.mrope_section = config.rope_parameters.get("mrope_section", [24, 20, 20])
+        if hasattr(config, "rope_parameters"):
+            self.mrope_section = config.rope_parameters.get("mrope_section", [24, 20, 20])
+        else:
+            self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
 
     @staticmethod
     def compute_default_rope_parameters(
