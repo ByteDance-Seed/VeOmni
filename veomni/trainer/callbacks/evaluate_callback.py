@@ -17,7 +17,7 @@ class EvaluateCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "Arguments" = self.trainer.args
-        if args.train.eval_steps and (state.global_step + 1) % args.train.eval_steps == 0:
+        if args.train.eval_steps and state.global_step % args.train.eval_steps == 0:
             self._evaluate(state)
 
     def _evaluate(self, state: TrainerState):

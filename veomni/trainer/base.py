@@ -364,7 +364,7 @@ class BaseTrainer(Stateful, ABC):
             rmpad_with_pos_ids=self.args.train.rmpad_with_pos_ids,
             attn_implementation=self.args.model.attn_implementation,
         )
-        self.post_forward = lambda x: None
+        self.post_forward = lambda x: None  # postforward only used for rl_trainer
 
     def add_callback(self, callback: Callback):
         self.callbacks.add(callback)
@@ -422,14 +422,12 @@ class BaseTrainer(Stateful, ABC):
             self.LOG_SAMPLE = False
         return micro_batch
 
-    def postforward(self, outputs: ModelOutput) -> None:
+    def postforward(self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]) -> None:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
         )
-
         loss = torch.stack(list(loss_dict.values())).sum()
-        self.post_forward(outputs)
         return loss, loss_dict
 
     def forward_backward_step(self, micro_batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -440,13 +438,12 @@ class BaseTrainer(Stateful, ABC):
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs)
+        loss, loss_dict = self.postforward(outputs, micro_batch)
 
         # Backward pass
         with self.model_bwd_context:
             loss.backward()
 
-        self.postforward(outputs)
         del micro_batch
         return loss, loss_dict
 

@@ -32,7 +32,7 @@ class CheckpointerCallback(Callback):
             self._save_checkpoint(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.every_n_epochs and state.epoch % self.every_n_epochs == 0:
+        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
             self._save_checkpoint(state)
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
@@ -84,7 +84,6 @@ class CheckpointerCallback(Callback):
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
-
         self.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.save_async)
 
         # Empty cache and barrier
@@ -111,7 +110,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             self._save_checkpoint(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.save_hf_weights and self.every_n_epochs and state.epoch % self.every_n_epochs == 0:
+        if self.save_hf_weights and self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
             self._save_checkpoint(state)
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
@@ -129,8 +128,8 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         args: "Arguments" = self.trainer.args
         save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{state.global_step}")
         if not os.path.exists(save_checkpoint_path):
+            dist.barrier()
             super()._save_checkpoint(state)
-
         if args.train.global_rank == 0:
             hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
 
