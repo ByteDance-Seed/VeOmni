@@ -235,13 +235,13 @@ def test_seqcls_loss_assertions(monkeypatch):
     labels = torch.tensor([[-100, 1]])
 
     # labels None -> assert
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="labels must be provided"):
         m.ForSequenceClassificationLoss(logits=logits, labels=None, num_labels=3)
 
     # num_labels None -> assert
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="num_labels must be provided"):
         m.ForSequenceClassificationLoss(logits=logits, labels=labels, num_labels=None)
 
     # logits and hidden_states both None -> assert
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="Either hidden_states or logits must be provided"):
         m.ForSequenceClassificationLoss(logits=None, labels=labels, num_labels=3)
