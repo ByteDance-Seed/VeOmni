@@ -3,8 +3,7 @@ import types
 import pytest
 import torch
 
-
-IGNORE_INDEX = -100
+from veomni.data.constants import IGNORE_INDEX
 
 
 def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
