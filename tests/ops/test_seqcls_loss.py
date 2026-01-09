@@ -3,6 +3,7 @@ import torch
 
 import veomni.ops.fused_cross_entropy as m
 from veomni.data.constants import IGNORE_INDEX
+from veomni.utils.device import get_device_type, get_torch_device
 
 
 def _manual_ce_one_token(logits_1d: torch.Tensor, target: int) -> float:
@@ -123,7 +124,11 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
       - out_logits is the flattened *input* logits, because fused_liger_kernel_cross_entropy
         returns `(loss, logits)` without materializing projected logits.
     """
-    device = torch.device("cuda")
+    dev_api = get_torch_device()
+    local_rank = 0
+    dev_api.set_device(f"{get_device_type()}:{local_rank}")
+
+    device = torch.device(get_device_type(), local_rank)
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
 
     ignore = IGNORE_INDEX
