@@ -7,6 +7,8 @@ import numpy as np
 import requests
 from PIL import Image
 
+from .file_utils import resolve_relative_path
+
 
 ImageInput = Union[
     Image.Image,
@@ -75,6 +77,7 @@ def load_image_from_path(image: str, **kwargs):
         response = requests.get(image, stream=True)
         image_obj = Image.open(BytesIO(response.content))
     else:
+        image = resolve_relative_path(image, kwargs.get("train_path"))
         image_obj = Image.open(image)
     return image_obj.convert("RGB")
 
@@ -93,7 +96,7 @@ def load_image(image: ImageInput, **kwargs):
 
 
 def fetch_images(images: List[ImageInput], **kwargs):
-    images = [load_image(image) for image in images]
+    images = [load_image(image, **kwargs) for image in images]
     max_image_nums = kwargs.get("max_image_nums", len(images))
     images = images[:max_image_nums]
     images = [smart_resize(image, **kwargs) for image in images]
