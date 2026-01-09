@@ -82,6 +82,9 @@ jobs:
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data
+      - name: Run ops tests
+        run: |
+          uv run --frozen pytest -s -x tests/ops
 
 
   cleanup:

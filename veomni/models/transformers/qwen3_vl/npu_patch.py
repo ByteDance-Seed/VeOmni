@@ -1,5 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
+# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -11,18 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY
+
+from ....ops.npu_patch import npu_fused_operator
+from . import modeling_qwen3_vl
 
 
-@MODELING_REGISTRY.register("qwen3")
-def register_qwen3_modeling(architecture: str):
-    from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
-
-    if "ForCausalLM" in architecture:
-        return Qwen3ForCausalLM
-    elif "ForSequenceClassification" in architecture:
-        return Qwen3ForSequenceClassification
-    elif "Model" in architecture:
-        return Qwen3Model
-    else:
-        return Qwen3ForCausalLM
+def apply_qwen3vl_npu_patch():
+    # Patches for Qwen3VL Model
+    modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
+    modeling_qwen3_vl.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu
+    modeling_qwen3_vl.apply_rotary_pos_emb_vision = npu_fused_operator.apply_rotary_pos_emb_vision_npu
