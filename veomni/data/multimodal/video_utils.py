@@ -162,7 +162,7 @@ def smart_video_nframes(
     idx = torch.linspace(0, total_frames - 1, int(nframes)).round().long()
     video = video[idx]
 
-    return video, {"fps": fps_out, "total_num_frames": nframes}
+    return video, {"fps": fps_out, "total_num_frames": len(idx)}
 
 
 def smart_audio_nframes(audio: np.ndarray, audio_fps: int, sample_rate: int = 16000, **kwargs):
@@ -331,7 +331,10 @@ def fetch_videos_metadata(
     direct_return = False
     if "fps" in kwargs:
         direct_return = True
-        fps_list = kwargs.pop("fps")
+        fps = kwargs.pop("fps")
+        if not isinstance(fps, List):
+            fps = [fps] * len(videos)
+        fps_list = fps
     else:
         fps_list = [None] * len(videos)
 

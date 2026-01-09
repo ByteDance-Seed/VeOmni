@@ -461,7 +461,6 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
         sys_msg = self._get_system_mesage()
         messages = [] if sys_msg is None else [sys_msg]
         data_type = ""
-
         image_token_num_list = iter(num_tokens.pop("image", []))
         video_token_num_list = iter(num_tokens.pop("video", []))
 
@@ -523,7 +522,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                     # Format: <t seconds><|vision_start|>...tokens...<|vision_end|>
                     video_str_buffer = ""
                     for t_val in timestamps:
-                        video_str_buffer += f"<{t_val:.1f} seconds>"
+                        video_str_buffer += f"<{float(t_val):.1f} seconds>"
                         video_str_buffer += "<|vision_start|>"  # self.vision_start_token
                         video_str_buffer += "<|video_pad|>" * tokens_per_chunk
                         video_str_buffer += "<|vision_end|>"

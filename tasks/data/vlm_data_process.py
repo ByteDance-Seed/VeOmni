@@ -87,9 +87,9 @@ def process_sample_qwen2_5_vl(
         start_time = time.time()
 
     source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
+        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
@@ -151,14 +151,16 @@ def process_sample_qwen3_vl(
         start_time = time.time()
 
     source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
+        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # 'source_name' is used if using a multisource dataset
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
-    if "images" in sample:
+
+    tokenized_example = {}
+    if "images" in sample and sample["images"]:
         images = fetch_images(sample["images"], **kwargs)
         image_inputs = processor.image_processor(images=images, return_tensors="pt")
         image_grid_thw = image_inputs["image_grid_thw"]
@@ -166,8 +168,8 @@ def process_sample_qwen3_vl(
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
         tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
-    if "videos" in sample:
-        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], fps=sample["fps"], **kwargs)
+    if "videos" in sample and sample["videos"]:
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
         # Process videos without resizing or sampling frames initially
         video_inputs = processor.video_processor(
             videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
@@ -184,6 +186,9 @@ def process_sample_qwen3_vl(
         tokenized_example = chat_template.encode_messages(
             conversations, token_num_inputs, video_metadata=video_metadata
         )
+
+    if not tokenized_example:
+        tokenized_example = chat_template.encode_messages(conversations)
 
     # Ensure all values are tensors
     tokenized_example = {
