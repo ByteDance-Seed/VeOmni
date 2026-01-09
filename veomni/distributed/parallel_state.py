@@ -90,6 +90,7 @@ class ParallelState:
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
     ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
+    async_enabled: Optional[bool] = False
 
     def __post_init__(self):
         if not self.include_sp_in_fsdp:
@@ -458,6 +459,7 @@ def init_parallel_state(
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     ep_outside: bool = False,
+    async_enabled: Optional[bool] = False,
 ) -> None:
     """
     Initializes global parallel state.
@@ -562,6 +564,7 @@ def init_parallel_state(
         include_sp_in_fsdp=include_sp_in_fsdp,
         device_mesh=device_mesh,
         ep_fsdp_device_mesh=ep_fsdp_device_mesh,
+        async_enabled=async_enabled,
     )
 
 

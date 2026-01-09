@@ -39,7 +39,6 @@ from transformers.utils.generic import check_model_inputs
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
-from ....ops.loss import causallm_loss_function
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
 from ...module_utils import GradientCheckpointingLayer
@@ -436,7 +435,6 @@ class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
         self.model = SeedOssModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.loss_function = causallm_loss_function
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -498,11 +496,21 @@ class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        hidden_states = hidden_states[:, slice_indices, :]
+        logits = self.lm_head(hidden_states)
 
         loss = None
-        logits = None
-        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+        if labels is not None:
+            loss, logits = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states)
 
         return CausalLMOutputWithPast(
             loss=loss,

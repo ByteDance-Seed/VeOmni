@@ -14,7 +14,7 @@ train:
   output_dir: qwen3_vl_moe_sft
   data_parallel_mode: fsdp2
   enable_reentrant: false
-  use_wandb: true
+  use_wandb: false
   wandb_project: qwen3_vl_moe
   wandb_name: qwen3_vl_moe
   rmpad: false

@@ -14,7 +14,6 @@ from veomni.optim import build_optimizer
 from veomni.utils import helper
 from veomni.utils.arguments import TrainingArguments, parse_args
 from veomni.utils.device import (
-    IS_NPU_AVAILABLE,
     get_device_id,
     get_device_type,
     get_dist_comm_backend,
@@ -193,12 +192,8 @@ def main():
         # the data of ep params would see have only ep_fsdp num
         # * If there is no grad divide factor set, the default grad divide factor is ep_fsdp_size, the local grad after backward is still 1
         # * Since we set grad divide factor to world_size (= fsdp_size = ep size * ep_fsdp_size), we expect grad here to be 1/ep_size
-        # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
-        # On NPU, we are missing PreSumMul ReduceOp for set_gradient_divide_factor,
-        # * Now we skip this API so the expected param grad here should still be 1.0 for both ep and non-ep param
-        # * As a result, we need divide the ep_fsdp_size on local grad during clipping to calculate the total norm correctly
         expected = 1.0
-        ep_expected = 1.0 / ps.ep_size if not IS_NPU_AVAILABLE else 1.0
+        ep_expected = 1.0 / ps.ep_size
         check_model_param_grad_one_by_one(expected_grad=expected, ep_expected_grad=ep_expected, msg="Before clipping")
 
         # Every local param grad is 1.0 / ps.ep_size, model total norm should be sqrt(1 * non_ep_param_num + 1/ep_size^2 * ep_param_num)

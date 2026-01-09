@@ -81,7 +81,15 @@ class ModelArguments:
         default=False,
         metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
     )
-    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]] = field(
+    attn_implementation: Optional[
+        Literal[
+            "eager",
+            "sdpa",
+            "flash_attention_2",
+            "flash_attention_3",
+            "native-sparse",
+        ]
+    ] = field(
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
@@ -92,10 +100,6 @@ class ModelArguments:
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
-    )
-    force_use_huggingface: bool = field(
-        default=False,
-        metadata={"help": "Force loading model from huggingface."},
     )
 
     def __post_init__(self):
@@ -394,12 +398,6 @@ class TrainingArguments:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
-    enable_rank0_init: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable rank0-only initialization for FSDP1 training. Note: this argument will be deprecated in the future, please use `init_device=cpu` instead."
-        },
-    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
         metadata={
@@ -415,12 +413,6 @@ class TrainingArguments:
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
-    )
-    allow_cuda_launch_blocking: bool = field(
-        default=False,
-        metadata={
-            "help": "Set CUDA_LAUNCH_BLOCK=1 would degrade performance significantly. Leave this as False to prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled. DO NOT enable this unless you are debugging something"
-        },
     )
     empty_cache_steps: int = field(
         default=500,
@@ -499,7 +491,7 @@ class TrainingArguments:
         metadata={"help": "Enable torch compile."},
     )
     use_wandb: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Use wandb to log experiment."},
     )
     wandb_project: str = field(
@@ -547,6 +539,10 @@ class TrainingArguments:
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
+    )
+    async_enabled: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to enable async ulysses."},
     )
 
     def __post_init__(self):
@@ -607,17 +603,6 @@ class TrainingArguments:
             )
 
         # init method check
-        # TODO: remove `enable_rank0_init`
-        logger.warning_rank0(
-            "`enable_rank0_init` will be deprecated in the future, please use `init_device=cpu` instead."
-        )
-        if self.enable_rank0_init:
-            if self.init_device != "cpu":
-                logger.warning_rank0(
-                    "`enable_rank0_init` is set to True, but `init_device` is not set to `cpu`. We change `init_device=cpu`."
-                    "If you try to init model in `cuda` or `meta`, please use `init_device = cuda` or `init_device = meta` instead."
-                )
-            self.init_device = "cpu"
         assert self.expert_parallel_size == 1 or self.init_device != "cpu", (
             "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
         )
@@ -672,16 +657,6 @@ class TrainingArguments:
                 self.profile_this_rank = True
         else:
             self.profile_this_rank = False
-
-        # Prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled
-        if not self.allow_cuda_launch_blocking:
-            assert not self.enable_full_determinism, (
-                "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LUANCH_BLOCKING to 1!"
-            )
-            cuda_launch_blocking_val = os.environ.get("CUDA_LAUNCH_BLOCKING", "").strip()
-            assert cuda_launch_blocking_val != "1", (
-                "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
-            )
 
         from ..checkpoint import CHECKPOINTER_REGISTRY
 

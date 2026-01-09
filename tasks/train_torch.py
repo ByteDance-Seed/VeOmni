@@ -34,6 +34,7 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
+from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 
 
 logger = helper.create_logger(__name__)
@@ -140,7 +141,6 @@ def main():
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
@@ -186,6 +186,7 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
@@ -269,8 +270,12 @@ def main():
             total_loss = 0
             synchronize()
             start_time = time.time()
+
+            micro_batches_token_num = count_loss_token(micro_batches)
+
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
+                micro_batch_token_num = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
                     micro_batch.pop("cur_token_num", None)
@@ -281,7 +286,9 @@ def main():
                     for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
-                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss.mean() / len(micro_batches)
+                    loss = model(**micro_batch, use_cache=False).loss
+
+                loss, _ = mean_global_loss(loss, micro_batch_token_num, micro_batches_token_num)
 
                 with model_bwd_context:
                     loss.backward()
@@ -304,7 +311,9 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.set_postfix_str(
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}", refresh=False
+            )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:

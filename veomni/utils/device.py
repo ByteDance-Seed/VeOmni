@@ -80,6 +80,16 @@ def synchronize() -> None:
     get_torch_device().synchronize()
 
 
+def stream_synchronize() -> None:
+    """Execute device stream synchronize operation."""
+    if IS_CUDA_AVAILABLE:
+        torch.cuda.current_stream().synchronize()
+    elif IS_NPU_AVAILABLE:
+        torch.npu.current_stream().synchronize()
+    else:
+        synchronize()
+
+
 def empty_cache() -> None:
     """Execute torch empty cache operation."""
     get_torch_device().empty_cache()

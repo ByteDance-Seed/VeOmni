@@ -148,7 +148,6 @@ def main():
         init_device=args.train.init_device,
         torch_dtype="bfloat16",
         attn_implementation=args.model.attn_implementation,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     model.micro_batch_size = args.train.micro_batch_size
 
@@ -188,6 +187,7 @@ def main():
     ops_to_save = convert_ops_to_objects(args.train.ops_to_save)
     model = build_parallelize_model(
         model,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
@@ -214,6 +214,7 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
@@ -384,7 +385,8 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s"
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s",
+                refresh=False,
             )
             data_loader_tqdm.update()
 

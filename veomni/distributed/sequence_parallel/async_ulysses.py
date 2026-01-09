@@ -21,10 +21,15 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from .comm import get_ulysses_sequence_parallel_group
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+from .comm import get_ulysses_sequence_parallel_group, get_ulysses_sequence_parallel_world_size
 from .ulysses import all_to_all_tensor
 from .utils import padding_tensor_for_seqeunce_parallel, unpadding_tensor_for_seqeunce_parallel
 
+
+if IS_NPU_AVAILABLE:
+    import torch_npu
 
 fused_layer_norm_cuda = None
 
@@ -65,9 +70,29 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         group: ProcessGroup,
     ):
         sp_group = get_ulysses_sequence_parallel_group() if group is None else group
+        ulysses_size = get_ulysses_sequence_parallel_world_size()
+
+        num_q_heads = q_weight.shape[0] // head_dim
+        num_kv_heads = k_weight.shape[0] // head_dim
+        batch_size = hidden_states.shape[0]
+
+        assert num_q_heads % ulysses_size == 0, (
+            f"num_query_heads ({num_q_heads}) must be divisible by ulysses_size ({ulysses_size})"
+        )
+
+        if ulysses_size > num_kv_heads:
+            assert ulysses_size % num_kv_heads == 0, (
+                f"ulysses_size ({ulysses_size}) must be divisible by num_key_value_heads ({num_kv_heads})"
+            )
+            ctx.need_repeat_kv = True
+            ctx.n_repeat = ulysses_size // num_kv_heads
+            ctx.original_num_kv_heads = num_kv_heads
+        else:
+            ctx.need_repeat_kv = False
 
         # q projection
         q = F.linear(hidden_states, q_weight, q_bias)
+        q = q.view(batch_size, -1, num_q_heads, head_dim)
 
         # q communication launch
         q_res = all_to_all_tensor(
@@ -76,6 +101,10 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # k projection
         k = F.linear(hidden_states, k_weight, k_bias)
+        k = k.view(batch_size, -1, num_kv_heads, head_dim)
+
+        if ctx.need_repeat_kv:
+            k = torch.repeat_interleave(k, dim=2, repeats=ctx.n_repeat)
 
         # k communication launch
         k_res = all_to_all_tensor(
@@ -84,6 +113,10 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v projection
         v = F.linear(hidden_states, v_weight, v_bias)
+        v = v.view(batch_size, -1, num_kv_heads, head_dim)
+
+        if ctx.need_repeat_kv:
+            v = torch.repeat_interleave(v, dim=2, repeats=ctx.n_repeat)
 
         # v communication launch
         v_res = all_to_all_tensor(
@@ -93,28 +126,38 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # q communication collect
         q = q_res()
         q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
-        q = q.reshape(list(q.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # k communication collect
         k = k_res()
         k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
-        k = k.reshape(list(k.shape[:-1]) + [-1, head_dim]).contiguous()
+
+        q = q.contiguous()
+        k = k.contiguous()
 
         # qk normalization (if needed)
         if norm_type is not None:
             if isinstance(normalized_shape, numbers.Integral):
                 normalized_shape = (normalized_shape,)
             normalized_shape = torch.Size(normalized_shape)
-            global fused_layer_norm_cuda
-            if fused_layer_norm_cuda is None:
-                fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
             norm_q_weight = norm_q_weight.contiguous()
             norm_k_weight = norm_k_weight.contiguous()
             output_q, mean_q, invvar_q = None, None, None
             output_k, mean_k, invvar_k = None, None, None
+            if IS_CUDA_AVAILABLE:
+                global fused_layer_norm_cuda
+                if fused_layer_norm_cuda is None:
+                    fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
             if norm_type == "rmsnorm":
-                output_q, invvar_q = fused_layer_norm_cuda.rms_forward_affine(q, normalized_shape, norm_q_weight, eps)
-                output_k, invvar_k = fused_layer_norm_cuda.rms_forward_affine(k, normalized_shape, norm_k_weight, eps)
+                if IS_CUDA_AVAILABLE:
+                    output_q, invvar_q = fused_layer_norm_cuda.rms_forward_affine(
+                        q, normalized_shape, norm_q_weight, eps
+                    )
+                    output_k, invvar_k = fused_layer_norm_cuda.rms_forward_affine(
+                        k, normalized_shape, norm_k_weight, eps
+                    )
+                else:
+                    output_q, invvar_q = torch_npu.npu_rms_norm(q, norm_q_weight, eps)
+                    output_k, invvar_k = torch_npu.npu_rms_norm(k, norm_k_weight, eps)
             elif norm_type == "layernorm":
                 output_q, mean_q, invvar_q = fused_layer_norm_cuda.forward_affine(
                     q, normalized_shape, norm_q_weight, norm_q_bias, eps
@@ -135,7 +178,6 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # v communication collect
         v = v_res()
         v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
-        v = v.reshape(list(v.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # save ctx for backward
         ctx.sp_group = sp_group
@@ -174,6 +216,10 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         head_dimension = ctx.head_dimension
         norm_type = ctx.norm_type
         normalized_shape = ctx.normalized_shape
+        need_repeat_kv = ctx.need_repeat_kv
+        if need_repeat_kv:
+            n_repeat = ctx.n_repeat
+            original_num_kv_heads = ctx.original_num_kv_heads
         eps = ctx.eps
         (
             hidden_states,
@@ -210,7 +256,6 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v grad communication launch
         grad_v = grad_output[2].contiguous()
-        grad_v = grad_v.reshape(list(grad_v.shape[:-2]) + [-1]).contiguous()
         grad_v = padding_tensor_for_seqeunce_parallel(grad_v, dim=seq_dimension)
         grad_v_res = all_to_all_tensor(
             grad_v,
@@ -223,24 +268,39 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # qk normalization backward (if needed)
         if norm_type is not None:
             if norm_type == "rmsnorm":
-                grad_k, grad_norm_k_weight = fused_layer_norm_cuda.rms_backward_affine(
-                    grad_output[1].contiguous(),
-                    invvar_k,
-                    k,
-                    normalized_shape,
-                    norm_k_weight,
-                    eps,
-                    False,
-                )
-                grad_q, grad_norm_q_weight = fused_layer_norm_cuda.rms_backward_affine(
-                    grad_output[0].contiguous(),
-                    invvar_q,
-                    q,
-                    normalized_shape,
-                    norm_q_weight,
-                    eps,
-                    False,
-                )
+                if IS_CUDA_AVAILABLE:
+                    grad_k, grad_norm_k_weight = fused_layer_norm_cuda.rms_backward_affine(
+                        grad_output[1].contiguous(),
+                        invvar_k,
+                        k,
+                        normalized_shape,
+                        norm_k_weight,
+                        eps,
+                        False,
+                    )
+                    grad_q, grad_norm_q_weight = fused_layer_norm_cuda.rms_backward_affine(
+                        grad_output[0].contiguous(),
+                        invvar_q,
+                        q,
+                        normalized_shape,
+                        norm_q_weight,
+                        eps,
+                        False,
+                    )
+                else:
+                    grad_k, grad_norm_k_weight = torch_npu.npu_rms_norm_backward(
+                        grad_output[1].contiguous(),
+                        k,
+                        norm_k_weight,
+                        invvar_k,
+                    )
+
+                    grad_q, grad_norm_q_weight = torch_npu.npu_rms_norm_backward(
+                        grad_output[0].contiguous(),
+                        q,
+                        norm_q_weight,
+                        invvar_q,
+                    )
             elif norm_type == "layernorm":
                 grad_k, grad_norm_k_weight, grad_norm_k_bias = fused_layer_norm_cuda.backward_affine(
                     grad_output[1].contiguous(),
@@ -274,9 +334,12 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v grad communication collect
         grad_v = grad_v_res()
+        if need_repeat_kv:
+            grad_v = grad_v.reshape(
+                grad_v.shape[0], grad_v.shape[1], original_num_kv_heads, n_repeat, grad_v.shape[-1]
+            ).sum(dim=3)
 
         # k grad communication launch
-        grad_k = grad_k.reshape(list(grad_k.shape[:-2]) + [-1]).contiguous()
         grad_k = padding_tensor_for_seqeunce_parallel(grad_k, dim=seq_dimension)
         grad_k_res = all_to_all_tensor(
             grad_k,
@@ -287,6 +350,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         )
 
         # v projection grad
+        grad_v = grad_v.reshape(grad_v.shape[0], grad_v.shape[1], -1)
         grad_v_input = grad_v @ v_weight
         grad_v_weight = grad_v.transpose(-1, -2) @ hidden_states
         if v_bias is not None and ctx.needs_input_grad[7]:
@@ -294,9 +358,12 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # k grad communication collect
         grad_k = grad_k_res()
+        if need_repeat_kv:
+            grad_k = grad_k.reshape(
+                grad_k.shape[0], grad_k.shape[1], original_num_kv_heads, n_repeat, grad_k.shape[-1]
+            ).sum(dim=3)
 
         # q grad communication launch
-        grad_q = grad_q.reshape(list(grad_q.shape[:-2]) + [-1]).contiguous()
         grad_q = padding_tensor_for_seqeunce_parallel(grad_q, dim=seq_dimension)
         grad_q_res = all_to_all_tensor(
             grad_q,
@@ -307,6 +374,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         )
 
         # k projection grad
+        grad_k = grad_k.reshape(grad_k.shape[0], grad_k.shape[1], -1)
         grad_k_input = grad_k @ k_weight
         grad_k_weight = grad_k.transpose(-1, -2) @ hidden_states
         if k_bias is not None and ctx.needs_input_grad[5]:
@@ -316,6 +384,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         grad_q = grad_q_res()
 
         # q projection grad
+        grad_q = grad_q.reshape(grad_q.shape[0], grad_q.shape[1], -1)
         grad_q_input = grad_q @ q_weight
         grad_q_weight = grad_q.transpose(-1, -2) @ hidden_states
         if q_bias is not None and ctx.needs_input_grad[3]:
@@ -366,6 +435,10 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
         hidden_states = all_to_all_tensor(
             hidden_states, scatter_dim=seq_dimension, gather_dim=head_dimension, group=sp_group
         )
+        ctx.num_heads = hidden_states.shape[head_dimension]
+        ctx.head_dim = hidden_states.shape[-1]
+
+        hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], -1)
         o = F.linear(hidden_states, proj_weight, proj_bias)
 
         # save ctx for backward
@@ -394,6 +467,8 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
             proj_weight,
             proj_bias,
         ) = ctx.saved_tensors
+        num_heads = ctx.num_heads
+        head_dim = ctx.head_dim
 
         # initialize grads
         grad_o = None
@@ -402,6 +477,7 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
 
         # output grad
         grad_o = grad_output[0] @ (proj_weight)
+        grad_o = grad_o.reshape(grad_o.shape[0], -1, num_heads, head_dim)
 
         # output grad communication launch
         grad_out_res = all_to_all_tensor(

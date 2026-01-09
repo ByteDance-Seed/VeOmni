@@ -1,3 +1,4 @@
+
 # # Tests layout
 
 name: GPU unit tests
@@ -29,7 +30,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:sgl055.dev2"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_8"
   DYNAMIC_RUNNER_ENDPOINT: "https://sd4hav466omp034ocfn0g.apigateway-cn-beijing.volceapi.com/veomni/runner"
   NCCL_DEBUG: "WARN"
 
@@ -55,35 +56,35 @@ jobs:
     runs-on: [ "${{ needs.setup.outputs.runner-label || 'L20x8' }}" ]
     timeout-minutes: 60 # Increase this timeout value as needed
     env:
-      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-      HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
-      NO_PROXY: "localhost,127.0.0.1"
       HF_HUB_ENABLE_HF_TRANSFER: 1
+      NCCL_DEBUG: "WARN"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
             fetch-depth: 0
-      - name: Install the current repository
+      - name: Sync dependencies
         run: |
-          pip3 install -e .[dev] --index-url https://pypi.org/simple
-          pip3 install diffusers
+          uv sync --frozen --extra gpu --group dev
       - name: Run parallel tests
         run: |
-          pytest -s -x tests/parallel/ulysses/test_ulysses.py
-          pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
       - name: Run models tests
         run: |
-          pytest -s -x tests/models/test_model_registry.py
-          pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -s -x tests/models/test_models_patch.py
       - name: Run fsdp2/ep+fsdp2 clip grad norm test
         run: |
-          pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+          uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
       - name: Run e2e dcp save and load test
         run: |
-          pytest -s -x tests/checkpoints/test_trainer_saveload.py
+          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run data tests
         run: |
-          pytest -s -x tests/data
+          uv run --frozen pytest -s -x tests/data
+      - name: Run ops tests
+        run: |
+          uv run --frozen pytest -s -x tests/ops
 
 
   cleanup:
