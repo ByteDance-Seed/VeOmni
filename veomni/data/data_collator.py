@@ -156,6 +156,7 @@ class DataCollatorWithPositionIDs(DataCollator):
     """
 
     mask_boundary_labels: bool = True
+
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
 
