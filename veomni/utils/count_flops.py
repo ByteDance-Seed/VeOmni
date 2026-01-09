@@ -359,9 +359,7 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-
     def _estimate_qwen3_vl_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-
         # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
         hidden_size = self.config.text_config.hidden_size
         vocab_size = self.config.text_config.vocab_size
@@ -372,7 +370,11 @@ class VeomniFlopsCounter:
         moe_intermediate_size = self.config.text_config.moe_intermediate_size
         moe_num_expert = self.config.text_config.num_experts
         moe_topk = self.config.text_config.num_experts_per_tok
-        head_dim = getattr(self.config.text_config, "head_dim", self.config.text_config.hidden_size // self.config.text_config.num_attention_heads)
+        head_dim = getattr(
+            self.config.text_config,
+            "head_dim",
+            self.config.text_config.hidden_size // self.config.text_config.num_attention_heads,
+        )
         q_size = num_attention_heads * head_dim
         k_size = num_key_value_heads * head_dim
         v_size = num_key_value_heads * head_dim
@@ -400,7 +402,6 @@ class VeomniFlopsCounter:
             vit_flops = self._estimate_qwen3_vit_flop(image_seqlens, self.config.vision_config)
         else:
             vit_flops = 0
-        print("vit_flops:",vit_flops)
         # all_layer & all_token fwd & bwd flops
         flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
