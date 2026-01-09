@@ -774,15 +774,18 @@ class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> SequenceClassifierOutputWithPast:
         r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the classification loss.
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the classification loss.
 
-            This head uses a single-label cross-entropy loss. In our setup, labels typically follow the
-            "token-level labels" convention: positions not supervised should be set to `-100`, and only the
-            supervised token(s) (e.g., the last valid token of each sample) carry a real class id in
-            `[0, ..., num_labels - 1]`. Tokens with label `-100` are ignored.
+                This head uses a single-label cross-entropy loss. In our setup, labels typically follow the
+                "token-level labels" convention: positions not supervised should be set to `-100`, and only the
+                supervised token(s) (e.g., the last valid token of each sample) carry a real class id in
+                `[0, ..., num_labels - 1]`. Tokens with label `-100` are ignored.
 
-            Note: `labels` should be provided for classification training tasks.
+                Note: `labels` should be provided for classification training tasks.
+
+        Returns:
+
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
