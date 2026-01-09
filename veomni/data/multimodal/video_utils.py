@@ -9,9 +9,11 @@ import PIL.Image
 import torch
 import torchvision
 from torchvision.io.video import _read_from_stream
-from torchvision.transforms import InterpolationMode, functional as F
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as F
 
 from ...utils import logging
+
 
 logger = logging.get_logger(__name__)
 
@@ -83,7 +85,7 @@ def smart_resize(
         else:
             h_bar = math.floor(height / beta)
             w_bar = math.floor(width / beta)
-    
+
     if video_min_pixels is not None and h_bar * w_bar < video_min_pixels:
         beta = math.sqrt(video_min_pixels / (height * width))
         if scale_factor is not None:
@@ -126,9 +128,9 @@ def smart_video_nframes(
         Tuple containing processed video tensor and metadata dictionary.
     """
     total_frames = video.shape[0]
-    
-    if 'frames' in kwargs:
-        nframes = kwargs['frames']
+
+    if "frames" in kwargs:
+        nframes = kwargs["frames"]
     else:
         nframes = total_frames / video_fps * fps
 
@@ -143,12 +145,12 @@ def smart_video_nframes(
         nframes = min(max_frames, nframes)
 
     nframes = min(nframes, total_frames)
-    
+
     if frame_factor is not None:
         nframes = math.floor(nframes / frame_factor) * frame_factor
         nframes = max(nframes, frame_factor)
 
-    # Padding if necessary (though current logic prevents nframes > total_frames above, 
+    # Padding if necessary (though current logic prevents nframes > total_frames above,
     # original logic retained for robustness or edge cases)
     if nframes > total_frames:
         pad_count = int(nframes - total_frames)
@@ -159,7 +161,7 @@ def smart_video_nframes(
     fps_out = video_fps * nframes / total_frames
     idx = torch.linspace(0, total_frames - 1, int(nframes)).round().long()
     video = video[idx]
-    
+
     return video, {"fps": fps_out, "total_num_frames": nframes}
 
 
@@ -169,7 +171,6 @@ def smart_audio_nframes(audio: np.ndarray, audio_fps: int, sample_rate: int = 16
             audio = librosa.resample(y=audio, orig_sr=audio_fps, target_sr=sample_rate)
     num_frames = len(audio) if audio is not None else 0
     return audio, {"fps": sample_rate, "total_num_frames": num_frames}
-
 
 
 def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs) -> Tuple:
@@ -195,8 +196,9 @@ def load_video_from_path(video: str, use_audio_in_video: bool = True, **kwargs) 
         audio = torch.mean(_audio, dim=0).numpy()
         audio_fps = info["audio_fps"]
         audio_metadata = {"fps": audio_fps, "total_num_frames": _audio.shape[0]}
-        
+
     return video, video_metadata, audio, audio_metadata
+
 
 def load_video_from_bytes_list(video: Union[List[bytes], np.ndarray], **kwargs) -> Tuple:
     """
@@ -208,12 +210,12 @@ def load_video_from_bytes_list(video: Union[List[bytes], np.ndarray], **kwargs) 
     if not video:
         raise ValueError("Input video frame list is empty")
 
-    fps_val = kwargs.get('fps', 2.0)
+    fps_val = kwargs.get("fps", 2.0)
     nframes = len(video)
 
     # Decode first frame to get dimensions
     with PIL.Image.open(BytesIO(video[0])) as img:
-        img = img.convert('RGB')
+        img = img.convert("RGB")
         w, h = img.size
 
     T, C = nframes, 3
@@ -222,9 +224,9 @@ def load_video_from_bytes_list(video: Union[List[bytes], np.ndarray], **kwargs) 
 
     for i, frame_bytes in enumerate(video):
         with PIL.Image.open(BytesIO(frame_bytes)) as img:
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
             frame_arr = np.array(img)
             # Convert to Tensor (C, H, W)
             frame_t = torch.from_numpy(frame_arr).permute(2, 0, 1)
@@ -300,29 +302,23 @@ def fetch_videos(videos: List[VideoInput], **kwargs) -> Tuple[List[torch.Tensor]
 
     # Process videos
     processed_videos = [
-        smart_video_nframes(
-            smart_resize(v, **kwargs), 
-            v_meta['fps'], 
-            **kwargs
-        )[0]
+        smart_video_nframes(smart_resize(v, **kwargs), v_meta["fps"], **kwargs)[0]
         for v, v_meta in zip(video_inputs, video_metadata_list)
     ]
 
     # Process audio
     processed_audios = [
-        smart_audio_nframes(a, a_meta['fps'], **kwargs)[0] 
-        if a_meta else None
+        smart_audio_nframes(a, a_meta["fps"], **kwargs)[0] if a_meta else None
         for a, a_meta in zip(audio_inputs, audio_metadata_list)
     ]
-    
+
     # Filter out None audios if necessary or keep structure depending on downstream needs
     # Here we return raw list which might contain None
     return processed_videos, processed_audios
 
 
 def fetch_videos_metadata(
-    videos: List[VideoInput], 
-    **kwargs
+    videos: List[VideoInput], **kwargs
 ) -> Tuple[List[torch.Tensor], List[Dict], List[Optional[np.ndarray]], List[Optional[Dict]]]:
     """
     Loads and processes videos and audio, returning full metadata.
@@ -333,9 +329,9 @@ def fetch_videos_metadata(
 
     # Determine if we are in 'direct return' mode (bypassing smart processing)
     direct_return = False
-    if 'fps' in kwargs:
+    if "fps" in kwargs:
         direct_return = True
-        fps_list = kwargs.pop('fps')
+        fps_list = kwargs.pop("fps")
     else:
         fps_list = [None] * len(videos)
 
@@ -344,8 +340,8 @@ def fetch_videos_metadata(
         # Pass fps kwarg specifically for bytes_list loader
         load_kwargs = kwargs.copy()
         if fps is not None:
-            load_kwargs['fps'] = fps
-            
+            load_kwargs["fps"] = fps
+
         v, v_meta, a, a_meta = load_video(video_item, **load_kwargs)
         video_inputs_raw.append(v)
         video_metadata_raw.append(v_meta)
@@ -360,11 +356,7 @@ def fetch_videos_metadata(
     audio_inputs_final, audio_metadata_final = [], []
 
     for v_raw, v_meta in zip(video_inputs_raw, video_metadata_raw):
-        processed_v, processed_v_meta = smart_video_nframes(
-            smart_resize(v_raw, **kwargs), 
-            v_meta['fps'], 
-            **kwargs
-        )
+        processed_v, processed_v_meta = smart_video_nframes(smart_resize(v_raw, **kwargs), v_meta["fps"], **kwargs)
         video_inputs_final.append(processed_v)
         video_metadata_final.append(processed_v_meta)
 
@@ -372,13 +364,11 @@ def fetch_videos_metadata(
         # Handle cases where audio might be None
         if a_raw is not None and a_meta is not None:
             # Use 'sample_rate' if available, fallback to 'fps'
-            orig_sr = a_meta['fps']
-            processed_a, processed_a_meta = smart_audio_nframes(
-                a_raw, orig_sr, **kwargs
-            )
+            orig_sr = a_meta["fps"]
+            processed_a, processed_a_meta = smart_audio_nframes(a_raw, orig_sr, **kwargs)
         else:
             processed_a, processed_a_meta = None, None
-            
+
         audio_inputs_final.append(processed_a)
         audio_metadata_final.append(processed_a_meta)
 
