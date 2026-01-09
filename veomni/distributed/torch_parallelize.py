@@ -93,7 +93,9 @@ def parallelize_model_fsdp1(
     """
     Applies EP (when enabled) + FSDP1 parallel strategy to the model.
     """
-    assert  not (enable_full_shard and enable_shard_grad_op), "You must explicitly specify enable_full_shard as False if enable_shard_grad_op is set to True"
+    assert not (enable_full_shard and enable_shard_grad_op), (
+        "You must explicitly specify enable_full_shard as False if enable_shard_grad_op is set to True"
+    )
     parallel_state = get_parallel_state()
 
     if parallel_state.ep_enabled:
