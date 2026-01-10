@@ -81,9 +81,13 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
+      - name: Install ffmpeg
+        run: |
+          apt-get update
+          apt-get install -y ffmpeg
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra npu --group dev
+          uv sync --frozen --extra npu --extra audio --group dev
       - name: Check final pip list
         run: |
           uv pip list

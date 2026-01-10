@@ -28,7 +28,22 @@ You can use `--extra` to install other optional dependencies. Refer to [pyprojec
 ```bash
 # eg. install with dit dependencies in GPU
 uv sync --locked  --extra gpu --extra dit
+
+# eg. install with video/audio processing dependencies (torchcodec, PyAV, librosa, soundfile)
+# Note: `video` and `audio` extras are equivalent - both include video and audio processing
+uv sync --locked  --extra gpu --extra video
+# or equivalently:
+uv sync --locked  --extra gpu --extra audio
 ```
+
+> **Note**: For video/audio processing with the `video` or `audio` extra, you also need to install ffmpeg separately:
+> ```bash
+> # Ubuntu/Debian
+> sudo apt-get install ffmpeg
+>
+> # macOS
+> brew install ffmpeg
+> ```
 
 **Pip**
 

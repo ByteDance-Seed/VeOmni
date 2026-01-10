@@ -17,6 +17,7 @@
 
 import importlib.metadata
 import importlib.util
+import subprocess
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict
 
@@ -89,3 +90,21 @@ def is_transformers_version_greater_or_equal_to(value: str) -> bool:
 
 def is_veomni_patch_available() -> bool:
     return _PACKAGE_FLAGS["veomni_patch"]
+
+
+_FFMPEG_AVAILABLE = None
+
+
+def is_ffmpeg_available() -> bool:
+    """Check if ffmpeg is available (required for torchcodec and URL downloads).
+
+    Supported FFmpeg versions: 4-8.
+    """
+    global _FFMPEG_AVAILABLE
+    if _FFMPEG_AVAILABLE is None:
+        try:
+            subprocess.run(["ffmpeg", "-version"], check=True, capture_output=True, text=True)
+            _FFMPEG_AVAILABLE = True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            _FFMPEG_AVAILABLE = False
+    return _FFMPEG_AVAILABLE
