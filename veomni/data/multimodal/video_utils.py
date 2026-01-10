@@ -43,27 +43,24 @@ def calculate_frame_indices(
     max_frames: int = None,
     **kwargs,
 ) -> tuple[List[int], int]:
-    """
-    Calculate frame indices to sample and number of frames to pad.
+    """Calculate frame indices to sample and padding count.
 
     Args:
-        total_frames: Total number of frames in the video
-        video_fps: Original video frame rate
-        fps: Target sampling rate
-        frame_factor: Ensure output frame count is a multiple of this
-        min_frames: Minimum number of frames to output
-        max_frames: Maximum number of frames to output
+        total_frames: Total frames in video
+        video_fps: Original video FPS
+        fps: Target sampling FPS
+        frame_factor: Align output frame count to multiples of this
+        min_frames: Minimum frames to output
+        max_frames: Maximum frames to output
         **kwargs: Extra arguments (ignored)
 
     Returns:
-        tuple: (indices, pad_count)
-            - indices: List of frame indices to sample
-            - pad_count: Number of frames to pad at the end
+        (indices, pad_count): Frame indices to sample and padding count
     """
-    # Calculate target frame count based on desired sampling rate
+    # Calculate target frame count
     nframes = total_frames / video_fps * fps
 
-    # Apply frame limits
+    # Apply min/max limits
     if min_frames is not None:
         if frame_factor is not None:
             min_frames = math.ceil(min_frames / frame_factor) * frame_factor
@@ -74,18 +71,17 @@ def calculate_frame_indices(
             max_frames = math.floor(max_frames / frame_factor) * frame_factor
         nframes = min(max_frames, nframes)
 
-    # Align nframes to frame_factor
+    # Align to frame_factor
     if frame_factor is not None:
         nframes = math.floor(nframes / frame_factor) * frame_factor
         nframes = max(nframes, frame_factor)
 
     nframes = int(max(1, nframes))
 
-    # Calculate padding needed
+    # Calculate padding
     pad_count = 0
     if nframes > total_frames:
         pad_count = nframes - total_frames
-        # We can only sample total_frames
         sample_count = total_frames
     else:
         sample_count = nframes
@@ -108,27 +104,24 @@ def smart_video_nframes(
     max_frames: int = None,
     **kwargs,
 ) -> tuple[torch.Tensor, Dict[str, Union[float, int]]]:
-    """Sample video frames adaptively with fps, frame count, and alignment constraints.
+    """Sample video frames with fps and alignment constraints.
 
     Args:
-        video: Video tensor of shape (T, C, H, W)
-        video_fps: Original video frame rate
-        fps: Target sampling rate
-        frame_factor: Ensure output frame count is a multiple of this
-        min_frames: Minimum number of frames to output
-        max_frames: Maximum number of frames to output
-        **kwargs: Additional arguments (e.g., 'frames' for explicit frame count)
+        video: Video tensor (T, C, H, W)
+        video_fps: Original video FPS
+        fps: Target sampling FPS
+        frame_factor: Align output frame count to multiples of this
+        min_frames: Minimum frames to output
+        max_frames: Maximum frames to output
+        **kwargs: Additional arguments (e.g., 'frames' for explicit count)
 
     Returns:
-        Tuple containing:
-            - Processed video tensor
-            - Metadata dict with 'fps' and 'total_num_frames'
+        (video, metadata): Processed video and metadata dict with 'fps', 'total_num_frames'
     """
     total_frames = video.shape[0]
 
-    # Support explicit frames parameter
+    # Support explicit frame count override
     if "frames" in kwargs:
-        # Override fps-based calculation with explicit frame count
         target_frames = kwargs["frames"]
         indices, pad_count = calculate_frame_indices(
             total_frames=total_frames,
@@ -148,15 +141,13 @@ def smart_video_nframes(
             max_frames=max_frames,
         )
 
-    # Select frames
     video = video[indices]
 
-    # Pad if needed
+    # Pad with last frame if needed
     if pad_count > 0:
         last_frame = video[-1:].expand(pad_count, -1, -1, -1)
         video = torch.cat([video, last_frame], dim=0)
 
-    # Calculate output fps
     nframes = video.shape[0]
     fps_out = video_fps * nframes / total_frames if total_frames > 0 else fps
 
@@ -166,22 +157,19 @@ def smart_video_nframes(
 def smart_audio_nframes(
     audio: np.ndarray, audio_fps: int, sample_rate: int = 16000, **kwargs
 ) -> tuple[np.ndarray, Dict[str, Union[float, int]]]:
-    """Resample audio to target sample rate using high-quality librosa resampling.
+    """Resample audio to target sample rate.
 
     Args:
         audio: Input audio array (can be None)
-        audio_fps: Original audio sample rate
+        audio_fps: Original sample rate
         sample_rate: Target sample rate (default: 16kHz)
         **kwargs: Additional arguments (ignored)
 
     Returns:
-        Tuple containing:
-            - Resampled audio array or None if input is None
-            - Metadata dict with 'fps' and 'total_num_frames'
+        (audio, metadata): Resampled audio and metadata dict with 'fps', 'total_num_frames'
     """
-    if audio is not None:
-        if audio_fps != sample_rate:
-            audio = librosa.resample(audio, orig_sr=audio_fps, target_sr=sample_rate)
+    if audio is not None and audio_fps != sample_rate:
+        audio = librosa.resample(audio, orig_sr=audio_fps, target_sr=sample_rate)
     num_frames = len(audio) if audio is not None else 0
     return audio, {"fps": sample_rate, "total_num_frames": num_frames}
 
@@ -196,19 +184,16 @@ def smart_resize(
 ):
     """Resize video preserving aspect ratio with pixel and alignment constraints.
 
-    Aligns dimensions to scale_factor multiples (e.g., 14 for ViT patch size),
-    respects min/max pixel limits, and validates aspect ratio.
-
     Args:
-        video: Input video tensor of shape (T, C, H, W)
-        scale_factor: Align H and W to multiples of this value
-        video_min_pixels: Minimum total pixels (H x W)
-        video_max_pixels: Maximum total pixels (H x W)
+        video: Video tensor (T, C, H, W)
+        scale_factor: Align H and W to multiples of this (e.g., 14 for ViT)
+        video_min_pixels: Minimum total pixels (H × W)
+        video_max_pixels: Maximum total pixels (H × W)
         max_ratio: Maximum aspect ratio (max_dim / min_dim)
         **kwargs: Additional arguments (ignored)
 
     Returns:
-        Resized video tensor with shape (T, C, h_bar, w_bar)
+        Resized video tensor (T, C, h_bar, w_bar)
 
     Raises:
         ValueError: If aspect ratio exceeds max_ratio or video is not 4D
@@ -217,13 +202,11 @@ def smart_resize(
         raise ValueError(f"video must be 4-dim, but got {video.ndim}")
     _, _, height, width = video.shape
 
-    # Validate aspect ratio
     if max_ratio is not None:
         ratio = max(width, height) / min(width, height)
         if ratio > max_ratio:
             raise ValueError(f"absolute aspect ratio must be smaller than {max_ratio}, got {ratio}")
 
-    # Align to scale_factor
     if scale_factor is not None:
         h_bar = max(scale_factor, round(height / scale_factor) * scale_factor)
         w_bar = max(scale_factor, round(width / scale_factor) * scale_factor)
@@ -231,7 +214,6 @@ def smart_resize(
         h_bar = height
         w_bar = width
 
-    # Scale down if exceeds max pixels
     if video_max_pixels is not None and h_bar * w_bar > video_max_pixels:
         beta = math.sqrt((height * width) / video_max_pixels)
         if scale_factor is not None:
@@ -241,7 +223,6 @@ def smart_resize(
             h_bar = math.floor(height / beta)
             w_bar = math.floor(width / beta)
 
-    # Scale up if below min pixels
     if video_min_pixels is not None and h_bar * w_bar < video_min_pixels:
         beta = math.sqrt(video_min_pixels / (height * width))
         if scale_factor is not None:
@@ -251,7 +232,6 @@ def smart_resize(
             h_bar = math.ceil(height * beta)
             w_bar = math.ceil(width * beta)
 
-    # Apply resize
     video = functional.resize(
         video,
         [h_bar, w_bar],
@@ -262,7 +242,7 @@ def smart_resize(
 
 
 def _download_url_to_bytes(url: str) -> bytes:
-    """Download video from URL to bytes using ffmpeg."""
+    """Download video from URL using ffmpeg."""
     try:
         result = subprocess.run(
             ["ffmpeg", "-i", url, "-f", "mp4", "-"],
@@ -275,16 +255,14 @@ def _download_url_to_bytes(url: str) -> bytes:
 
 
 def _pil_images_to_tensor(images: List["PIL.Image.Image"]) -> torch.Tensor:
-    """Convert PIL images to tensor with shape (T, C, H, W)."""
+    """Convert PIL images to tensor (T, C, H, W)."""
     tensors = []
     for img in images:
-        # Convert PIL to RGB if needed
         if img.mode != "RGB":
             img = img.convert("RGB")
-        # Convert to tensor (C, H, W)
         tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1)
         tensors.append(tensor)
-    return torch.stack(tensors)  # (T, C, H, W)
+    return torch.stack(tensors)
 
 
 def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
@@ -299,12 +277,11 @@ def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
     video_np = video_dict["video"]
     logger.debug(f"Processing video array with shape: {video_np.shape}, dtype: {video_np.dtype}")
 
-    # Assume video_np is (T, H, W, C) or (T, C, H, W)
     if video_np.ndim == 4:
-        if video_np.shape[-1] == 3:  # (T, H, W, C)
+        if video_np.shape[-1] == 3:
             logger.debug(f"Converting (T, H, W, C) format: {video_np.shape} -> permute to (T, C, H, W)")
-            video = torch.from_numpy(video_np).permute(0, 3, 1, 2)  # -> (T, C, H, W)
-        else:  # Assume (T, C, H, W)
+            video = torch.from_numpy(video_np).permute(0, 3, 1, 2)
+        else:
             logger.debug(f"Assuming (T, C, H, W) format: {video_np.shape}, no permutation needed")
             video = torch.from_numpy(video_np)
     else:
@@ -314,29 +291,23 @@ def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
         raise ValueError(f"Video array must be 4D, got shape {video_np.shape}")
 
     audio = video_dict.get("audio", None)
-    video_fps = video_dict.get("video_fps", 30.0)  # Default FPS
+    video_fps = video_dict.get("video_fps", 30.0)
     audio_fps = video_dict.get("audio_fps", None)
 
     return video, video_fps, audio, audio_fps
 
 
 def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_video: bool = True, **kwargs):
-    """Unified video processing with torchcodec (video) and PyAV (audio).
+    """Load and process video using torchcodec (video) and PyAV (audio).
 
-    Supports: str (file path/URL), bytes, List[PIL.Image.Image], List[bytes], Dict[str, np.ndarray].
+    Supports: str (path/URL), bytes, List[PIL.Image], List[bytes], Dict[str, np.ndarray].
 
     Returns:
-        Tuple containing:
-            - processed_video: torch.Tensor (T, C, H, W)
-            - audio: np.ndarray or None
-            - audio_fps: float or None
-            - frames_indices: torch.Tensor or None (indices of sampled frames from original video)
+        (video, audio, audio_fps, frames_indices): Processed video, audio array, audio FPS,
+        and sampled frame indices from original video
     """
-    # Handle different input types
     if isinstance(video_input, list):
-        # Check if it's a list of bytes (encoded image frames) or PIL images
         if len(video_input) > 0 and isinstance(video_input[0], bytes):
-            # List of bytes: convert to PIL images first
             from io import BytesIO
 
             pil_images = []
@@ -347,33 +318,27 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
                     pil_images.append(img.copy())
             video = _pil_images_to_tensor(pil_images)
         else:
-            # List of PIL images
             video = _pil_images_to_tensor(video_input)
 
-        video_fps = kwargs.get("fps", 2.0)  # Use target fps as source fps for images
+        video_fps = kwargs.get("fps", 2.0)
         audio, audio_fps = None, None
 
         video, _ = smart_video_nframes(smart_resize(video, **kwargs), video_fps, **kwargs)
-        # For PIL images/bytes list, generate synthetic indices (0, 1, 2, ...)
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
     elif isinstance(video_input, dict):
         video, video_fps, audio, audio_fps = _dict_to_video_audio(video_input)
         video, _ = smart_video_nframes(smart_resize(video, **kwargs), video_fps, **kwargs)
-        # For dict input, generate synthetic indices
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
-    # From here, video_input is str (path/URL) or bytes
-
-    # Video decoding with TorchCodec
-    # If URL decoding fails, download with ffmpeg and retry
+    # video_input is str (path/URL) or bytes
     try:
         decoder = VideoDecoder(video_input, device="cpu", num_ffmpeg_threads=0)
     except Exception as e:
         if isinstance(video_input, str) and ("http://" in video_input or "https://" in video_input):
-            logger.warning(f"Direct URL decoding failed: {e}. Downloading video with ffmpeg...")
+            logger.warning(f"Direct URL decoding failed: {e}. Downloading with ffmpeg...")
             try:
                 video_bytes = _download_url_to_bytes(video_input)
                 decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
@@ -386,15 +351,14 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
     video_fps = metadata.average_fps
     total_frames = metadata.num_frames
 
-    # Safety margin: some videos report inaccurate total_frames
+    # Safety margin for inaccurate frame counts
     effective_total_frames = max(1, total_frames - 1)
 
-    # Calculate frame indices to decode
     indices, pad_count = calculate_frame_indices(total_frames=effective_total_frames, video_fps=video_fps, **kwargs)
 
     try:
         frames = decoder.get_frames_at(indices).data
-        sampled_indices = indices  # Keep track of successfully sampled indices
+        sampled_indices = indices
     except Exception as e:
         if "Requested next frame" in str(e) or "End of stream" in str(e):
             logger.warning(f"Decoding failed: {e}. Retrying with first frame only.")
@@ -409,35 +373,30 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
 
     resized_frames = smart_resize(frames, **kwargs)
 
-    # Apply padding if needed
     if pad_count > 0:
         last_frame = resized_frames[-1:].expand(pad_count, -1, -1, -1)
         final_frames = torch.cat([resized_frames, last_frame], dim=0)
-        # Extend indices with repeated last index for padded frames
         padded_indices = sampled_indices + [sampled_indices[-1]] * pad_count
     else:
         final_frames = resized_frames
         padded_indices = sampled_indices
 
-    # Audio extraction with PyAV (delegated to audio_utils)
+    # Extract audio with PyAV
     audio, audio_fps = None, None
     if use_audio_in_video:
         max_audio_duration = (metadata.duration_seconds or 60.0) + 1.0
         audio, audio_fps = extract_audio_from_video(video_input, max_duration_seconds=max_audio_duration)
 
-    # Convert indices to tensor for consistency with Qwen3-VL metadata expectations
     frames_indices = torch.tensor(padded_indices, dtype=torch.long)
 
     return final_frames, audio, audio_fps, frames_indices
 
 
 def fetch_videos(videos: List[VideoInput], **kwargs):
-    """Fetch and process videos with unified interface.
+    """Fetch and process videos.
 
-    Requires torchcodec and ffmpeg to be available.
-
-    Note: This function does NOT return frames_indices. Use fetch_videos_metadata() if you need
-    frame indices for temporal modeling (e.g., Qwen3-VL timestamp calculation).
+    Note: Does NOT return frames_indices. Use fetch_videos_metadata() for temporal modeling
+    (e.g., Qwen3-VL timestamp calculation).
     """
     if not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
@@ -455,7 +414,6 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
         except Exception as e:
             raise RuntimeError(f"Failed to process video {i}: {e}")
 
-    # Resample audio
     processed_audio_inputs = [
         smart_audio_nframes(audio, audio_fps, **kwargs)[0] if audio is not None and audio_fps is not None else None
         for audio, audio_fps in zip(audio_inputs, audio_fps_list)
@@ -467,23 +425,14 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
 def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
     """Fetch and process videos with full metadata.
 
-    This function provides detailed metadata about processed videos and audio,
-    including fps, frame counts, and sampled frame indices. It's useful when you need to track the
-    exact processing parameters applied to each video.
-
-    IMPORTANT: For Qwen3-VL models, this function returns frames_indices which is critical for
-    accurate timestamp calculation in the chat template.
+    IMPORTANT: For Qwen3-VL, this returns frames_indices needed for timestamp calculation.
 
     Args:
         videos: List of video inputs (paths, bytes, PIL images, or dicts)
         **kwargs: Processing parameters (fps, min_frames, max_frames, etc.)
 
     Returns:
-        Tuple containing:
-            - List of processed video tensors
-            - List of video metadata dicts (includes 'fps', 'total_num_frames', 'frames_indices')
-            - List of processed audio arrays (or None)
-            - List of audio metadata dicts (or None)
+        (videos, video_metadata, audios, audio_metadata): Processed videos and audios with metadata
     """
     if not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
@@ -495,20 +444,17 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
 
     for i, video in enumerate(videos):
         try:
-            # Process video and get raw frames with indices
             processed_video, audio, audio_fps, frames_indices = _load_and_process_video_with_codec(video, **kwargs)
 
-            # Get video metadata
             video_meta = {
-                "fps": kwargs.get("fps", 2.0),  # Target fps
+                "fps": kwargs.get("fps", 2.0),
                 "total_num_frames": processed_video.shape[0],
-                "frames_indices": frames_indices,  # Sampled frame indices from original video
+                "frames_indices": frames_indices,
             }
 
             video_inputs.append(processed_video)
             video_metadata_list.append(video_meta)
 
-            # Process audio with metadata
             if audio is not None and audio_fps is not None:
                 processed_audio, audio_meta = smart_audio_nframes(audio, audio_fps, **kwargs)
                 audio_inputs.append(processed_audio)
@@ -523,12 +469,9 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
     return video_inputs, video_metadata_list, audio_inputs, audio_metadata_list
 
 
-# Compatibility layer functions for backward compatibility with torchvision-based API
+# Backward compatibility with torchvision-based API
 def load_video_from_path(video_path: str, use_audio_in_video: bool = True, **kwargs):
     """Load video from file path (compatibility wrapper).
-
-    This function provides backward compatibility with the torchvision-based API.
-    Internally uses torchcodec for better performance.
 
     Args:
         video_path: Path to video file or URL
@@ -536,7 +479,7 @@ def load_video_from_path(video_path: str, use_audio_in_video: bool = True, **kwa
         **kwargs: Additional processing parameters
 
     Returns:
-        Tuple of (video_tensor, video_metadata, audio_array, audio_metadata)
+        (video, video_metadata, audio, audio_metadata)
     """
     if not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
@@ -550,16 +493,13 @@ def load_video_from_path(video_path: str, use_audio_in_video: bool = True, **kwa
 def load_video_from_bytes(video_bytes: bytes, use_audio_in_video: bool = True, **kwargs):
     """Load video from bytes (compatibility wrapper).
 
-    This function provides backward compatibility with the torchvision-based API.
-    Internally uses torchcodec for better performance.
-
     Args:
         video_bytes: Video data as bytes
         use_audio_in_video: Whether to extract audio
         **kwargs: Additional processing parameters
 
     Returns:
-        Tuple of (video_tensor, video_metadata, audio_array, audio_metadata)
+        (video, video_metadata, audio, audio_metadata)
     """
     if not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
@@ -573,25 +513,21 @@ def load_video_from_bytes(video_bytes: bytes, use_audio_in_video: bool = True, *
 def load_video_from_bytes_list(video_frames: Union[List[bytes], np.ndarray], **kwargs):
     """Load video from list of image bytes (compatibility wrapper).
 
-    This function provides backward compatibility with the old API that accepted
-    lists of JPEG/PNG encoded frames.
-
     Args:
-        video_frames: List of image bytes or numpy array of bytes
+        video_frames: List of image bytes or numpy array
         **kwargs: Additional processing parameters (must include 'fps')
 
     Returns:
-        Tuple of (video_tensor, video_metadata, audio_array, audio_metadata)
+        (video, video_metadata, audio, audio_metadata)
 
     Raises:
-        ValueError: If video_frames is empty or fps is not provided
+        ValueError: If video_frames is empty
     """
     if isinstance(video_frames, np.ndarray):
         video_frames = video_frames.tolist()
     if not video_frames:
         raise ValueError("Input video frame list is empty")
 
-    # Convert bytes list to PIL images
     from io import BytesIO
 
     import PIL.Image
@@ -603,7 +539,6 @@ def load_video_from_bytes_list(video_frames: Union[List[bytes], np.ndarray], **k
                 img = img.convert("RGB")
             pil_images.append(img.copy())
 
-    # Use fetch_videos_metadata with PIL images
     if not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
@@ -614,25 +549,21 @@ def load_video_from_bytes_list(video_frames: Union[List[bytes], np.ndarray], **k
 def load_video(video: VideoInput, **kwargs):
     """Unified video loading interface (compatibility wrapper).
 
-    Automatically detects input type and loads accordingly.
-
     Args:
         video: Video input (str path, bytes, list of PIL images, or dict)
         **kwargs: Additional processing parameters
 
     Returns:
-        Tuple of (video_tensor, video_metadata, audio_array, audio_metadata)
+        (video, video_metadata, audio, audio_metadata)
     """
     if isinstance(video, str):
         return load_video_from_path(video, **kwargs)
     elif isinstance(video, bytes):
         return load_video_from_bytes(video, **kwargs)
     elif isinstance(video, (list, np.ndarray)):
-        # Check if it's a list of bytes (encoded frames) or PIL images
         if len(video) > 0:
             if isinstance(video[0], bytes):
                 return load_video_from_bytes_list(video, **kwargs)
-            # Otherwise assume it's PIL images, use fetch_videos_metadata
             if not is_ffmpeg_available():
                 raise RuntimeError(
                     "ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg"
