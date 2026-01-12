@@ -208,6 +208,12 @@ class PackingPreforward:
                     pass
             else:
                 pack_dim = collate_info.pack_dim
+
+                # first token of packed sequence must be -100
+                if key == "labels":
+                    for i in range(1, len(batch[key])):
+                        batch[key][i][0] = IGNORE_INDEX
+
                 batch[key] = torch.cat(batch[key], dim=pack_dim)
                 if pack_dim == -1:
                     batch[key] = batch[key].unsqueeze(0)
