@@ -35,13 +35,18 @@ def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
 
 
 def apply_rotary_pos_emb_vision_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    orig_dtype = q.dtype
+    orig_q_shape = q.shape
+    orig_k_shape = k.shape
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
     q_4d = q.unsqueeze(0).float().contiguous()
     k_4d = k.unsqueeze(0).float().contiguous()
     cos_4d = cos.unsqueeze(0).unsqueeze(2).float()
     sin_4d = sin.unsqueeze(0).unsqueeze(2).float()
     q_embed_4d = torch_npu.npu_rotary_mul(q_4d, cos_4d, sin_4d)
     k_embed_4d = torch_npu.npu_rotary_mul(k_4d, cos_4d, sin_4d)
-    q_embed = q_embed_4d.transpose(1, 2).to(orig_dtype)
-    k_embed = k_embed_4d.transpose(1, 2).to(orig_dtype)
+    q_embed = q_embed_4d.squeeze(0).to(orig_q_dtype)
+    k_embed = k_embed_4d.squeeze(0).to(orig_k_dtype)
+    q_embed = q_embed.reshape(orig_q_shape)
+    k_embed = k_embed.reshape(orig_k_shape)
     return q_embed, k_embed

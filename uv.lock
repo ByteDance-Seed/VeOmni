@@ -28,6 +28,9 @@ overrides = [
     { name = "torchaudio", marker = "extra == 'gpu'", specifier = "==2.8.0+cu128", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
+    { name = "torchcodec", marker = "extra == 'gpu'", specifier = ">=0.6.0,<0.8.0" },
+    { name = "torchcodec", marker = "extra == 'npu'", specifier = ">=0.4.0,<0.6.0" },
+    { name = "torchcodec", marker = "extra == 'npu-aarch64'", specifier = ">=0.4.0,<0.6.0" },
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.23.0+cu128", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
@@ -2268,6 +2271,37 @@ wheels = [
 ]
 
 [[package]]
+name = "torchcodec"
+version = "0.5"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/9f/8e0ae96b2560050eb1a8780dabbe3d192cf99e62a5ce2a128684bfd6f5d6/torchcodec-0.5-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d582981f251979d4432a1606d2bfbc8d56b98a701957afbaf4cafe7569b19c68", size = 3307718, upload-time = "2025-07-23T17:43:52.805Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/a1/cc2b7f72104cbb5f60f5f277f470e9d0172bffb354f74b0e13a02a241165/torchcodec-0.5-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:00252c2a138c655851cc7aa6e7ad6455c6513c9b2f93cec74563cba83196be8a", size = 1374385, upload-time = "2025-07-23T17:42:43.219Z" },
+]
+
+[[package]]
+name = "torchcodec"
+version = "0.7.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "sys_platform == 'linux'",
+    "sys_platform != 'linux'",
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6a/f1/bb2b5ab929ef3f092cb6508673510ffc2aafd8324493c94a2d41f1c8a683/torchcodec-0.7.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:967a14b31e04721901ddbf965f9e9f733f328c5e98a51e22f414e25ac32e20ba", size = 3388626, upload-time = "2025-09-08T14:17:50.433Z" },
+    { url = "https://files.pythonhosted.org/packages/06/14/8ff28247988365fc47e8471e28cdfd8d037232fcf73abb67ee815ac80f1d/torchcodec-0.7.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:afb1c48b52bd4ee8f485f5a427bb4e82380590255a26b8e9e3fe099e0779287f", size = 1419444, upload-time = "2025-09-08T14:17:41.479Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/80/04f23dff2c7ac406d2d6b24a52be7654a946d2fdfe158b19341a524dae20/torchcodec-0.7.0-cp311-cp311-win_amd64.whl", hash = "sha256:a68765cd29159da3cf36eb5716481c617ad9d168fe06418bcde2a9360cc7eb5e", size = 1563430, upload-time = "2025-09-08T14:17:58.571Z" },
+]
+
+[[package]]
 name = "torchdata"
 version = "0.11.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2519,6 +2553,7 @@ gpu = [
     { name = "nvidia-nccl-cu12", version = "2.27.3", source = { registry = "https://pypi.org/simple" } },
     { name = "torch", version = "2.8.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl" } },
     { name = "torchaudio", version = "2.8.0+cu128", source = { registry = "https://download.pytorch.org/whl/" } },
+    { name = "torchcodec", version = "0.7.0", source = { registry = "https://pypi.org/simple" } },
     { name = "torchvision", version = "0.23.0+cu128", source = { registry = "https://download.pytorch.org/whl/" } },
 ]
 megatron = [
@@ -2530,6 +2565,7 @@ npu = [
     { name = "torch", version = "2.7.1+cpu", source = { registry = "https://download.pytorch.org/whl/" } },
     { name = "torch-npu" },
     { name = "torchaudio", version = "2.7.1+cpu", source = { registry = "https://download.pytorch.org/whl/" } },
+    { name = "torchcodec", version = "0.5", source = { registry = "https://pypi.org/simple" } },
     { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" } },
 ]
 npu-aarch64 = [
@@ -2540,11 +2576,17 @@ npu-aarch64 = [
     { name = "torch-npu" },
     { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torchaudio", version = "2.7.1+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchcodec", version = "0.5", source = { registry = "https://pypi.org/simple" } },
     { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 trl = [
     { name = "trl" },
+]
+video = [
+    { name = "av" },
+    { name = "librosa" },
+    { name = "soundfile" },
 ]
 
 [package.dev-dependencies]
@@ -2566,6 +2608,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'audio'", specifier = ">=14.3.0,<15.0" },
+    { name = "av", marker = "extra == 'video'", specifier = ">=14.3.0,<15.0" },
     { name = "bitsandbytes", marker = "extra == 'dit'", specifier = ">=0.46.0,<=0.47.0" },
     { name = "blobfile", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=2.16.0,<=2.21.0" },
@@ -2579,6 +2622,7 @@ requires-dist = [
     { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.09.28/flash_attn_3-3.0.0b1%2B20250928.cu128torch280cxx11abitrue.5059fd-cp39-abi3-linux_x86_64.whl" },
     { name = "hf-transfer", marker = "extra == 'gpu'" },
     { name = "librosa", marker = "extra == 'audio'", specifier = ">=0.11.0,<0.12" },
+    { name = "librosa", marker = "extra == 'video'", specifier = ">=0.11.0,<0.12" },
     { name = "liger-kernel", marker = "extra == 'gpu'" },
     { name = "megatron-energon", marker = "extra == 'megatron'", specifier = ">=7.2.1" },
     { name = "nvidia-cusparselt-cu12", marker = "extra == 'gpu'" },
@@ -2592,6 +2636,7 @@ requires-dist = [
     { name = "scipy", marker = "extra == 'npu-aarch64'", specifier = ">=1.16.2" },
     { name = "setuptools" },
     { name = "soundfile", marker = "extra == 'audio'", specifier = ">=0.13.1,<0.14" },
+    { name = "soundfile", marker = "extra == 'video'", specifier = ">=0.13.1,<0.14" },
     { name = "tiktoken", specifier = ">=0.9.0" },
     { name = "timm" },
     { name = "torch", marker = "extra == 'gpu'", url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl" },
@@ -2603,6 +2648,11 @@ requires-dist = [
     { name = "torchaudio", marker = "extra == 'gpu'", specifier = "==2.8.0+cu128", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
+    { name = "torchcodec", marker = "extra == 'audio'" },
+    { name = "torchcodec", marker = "extra == 'gpu'", specifier = ">=0.6.0,<0.8.0" },
+    { name = "torchcodec", marker = "extra == 'npu'", specifier = ">=0.4.0,<0.6.0" },
+    { name = "torchcodec", marker = "extra == 'npu-aarch64'", specifier = ">=0.4.0,<0.6.0" },
+    { name = "torchcodec", marker = "extra == 'video'" },
     { name = "torchdata", specifier = ">=0.8.0,<1.0" },
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.23.0+cu128", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
@@ -2611,7 +2661,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'trl'", specifier = "<=0.9.6" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "audio", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl"]
+provides-extras = ["dev", "audio", "video", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl"]
 
 [package.metadata.requires-dev]
 dev = [

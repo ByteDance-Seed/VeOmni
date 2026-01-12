@@ -23,6 +23,7 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoModelForSequenceClassification,
     AutoModelForVision2Seq,
     AutoProcessor,
     PretrainedConfig,
@@ -114,6 +115,9 @@ def get_model_class(model_config: PretrainedConfig):
 
     arch_name = get_model_arch_from_config(model_config)
     model_type = model_config.model_type
+    modeling_backend = get_env("MODELING_BACKEND")
+    if not modeling_backend == "hf":
+        return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
         load_class = AutoModelForImageTextToText
     elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
@@ -124,12 +128,15 @@ def get_model_class(model_config: PretrainedConfig):
         and type(model_config) in AutoModelForCausalLM._model_mapping.keys()
     ):
         load_class = AutoModelForCausalLM
+    elif (
+        arch_name is not None
+        and "ForSequenceClassification" in arch_name
+        and type(model_config) in AutoModelForSequenceClassification._model_mapping.keys()
+    ):
+        load_class = AutoModelForSequenceClassification
     else:
         load_class = AutoModel
-    modeling_backend = get_env("MODELING_BACKEND")
-    if modeling_backend == "hf":
-        return load_class
-    return MODELING_REGISTRY[model_type](arch_name)
+    return load_class
 
 
 class BaseModelLoader(ABC):

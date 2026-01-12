@@ -5,9 +5,12 @@ model:
 data:
   train_path: sharegpt4v_pretrain
   data_type: conversation
-  chat_template: qwen2_5vl
+  chat_template: qwen3vl
   max_seq_len: 4096
   train_size: 80000000
+  mm_config:
+    fps: 2.0
+    use_audio_in_video: false
 
 train:
   output_dir: qwen3_vl_dense_sft

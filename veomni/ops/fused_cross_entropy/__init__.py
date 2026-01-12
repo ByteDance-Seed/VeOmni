@@ -104,6 +104,105 @@ def ForCausalLMLoss(
     return loss, logits
 
 
+def ForSequenceClassificationLoss(
+    logits: torch.Tensor = None,
+    labels: torch.Tensor = None,
+    num_labels: int = None,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+    **kwargs,
+) -> torch.Tensor:
+    r"""
+    Token-level loss for sequence classification.
+
+    This loss follows the "token-level labels" convention:
+    `labels` has the same layout as the token sequence,
+    with all positions set to `ignore_index` except the supervised tokens (the last valid token of each sample).
+    No shifting is applied.
+    When SP is enabled, the loss is reduced across SP ranks using the number of non-ignored tokens.
+
+    Args:
+        logits (`torch.Tensor`):
+            Classification logits.
+        labels (`torch.Tensor`):
+            Token-level labels with `ignore_index` marking non-supervised positions.
+        num_labels (`int`):
+            Number of classes.
+        num_items_in_batch (`int`):
+            Used to accurately calculate the average loss for each sample.
+        ignore_index (`int`, defaults to `-100`):
+            Label value to ignore when computing the loss.
+        hidden_states (`torch.Tensor`):
+            Hidden states, used for fused linear cross-entropy.
+        weights (`torch.Tensor`):
+            Classification head weights, used for fused linear cross-entropy.
+
+    Returns:
+        loss (`torch.Tensor`):
+            Scalar classification loss.
+        logits (`torch.Tensor`):
+            Flattened logits.
+    """
+
+    # pop fused loss kwargs
+    hidden_states = kwargs.pop("hidden_states", None)
+    weights = kwargs.pop("weights", None)
+
+    if hidden_states is None and logits is None:
+        raise ValueError("Either hidden_states or logits must be provided.")
+
+    if labels is None:
+        raise ValueError("labels must be provided for sequence classification loss.")
+
+    if num_labels is None:
+        raise ValueError("num_labels must be provided.")
+
+    device = logits.device if logits is not None else hidden_states.device
+    # Upcast to float if we need to compute the loss to avoid potential precision issues
+    if logits is not None:
+        logits = logits.float()
+
+    sp_enabled = get_parallel_state().sp_enabled
+    target = labels
+
+    # Flatten the tokens
+    target = target.view(-1)
+    if hidden_states is not None:
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+    if logits is not None:
+        logits = logits.view(-1, num_labels)
+    # Enable model parallelism
+    target = target.to(device)
+
+    if hidden_states is None or weights is None:
+        logger.warning_once(
+            "hidden_states or weights is None, use eager loss implementation."
+            "To enable fused linear cross entropy loss, please patch modeling.py `forward` function "
+            "to pass `hidden_states` and `weights` to `loss_function`."
+        )
+        loss_func = eager_cross_entropy
+    else:
+        loss_func = _cross_entropy
+
+    loss, logits = loss_func(
+        logits,
+        target,
+        num_labels,
+        num_items_in_batch,
+        ignore_index,
+        target,
+        hidden_states=hidden_states,
+        weights=weights,
+        **kwargs,
+    )
+
+    # Reduce loss when using sp
+    if sp_enabled:
+        num_valid_tokens = (target != ignore_index).sum()
+        loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
+    return loss, logits
+
+
 class ChunkLoss(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -198,6 +297,7 @@ def chunk_loss_function(
 def apply_veomni_loss_patch():
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
+    LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
     global _cross_entropy
     if is_torch_npu_available():
         if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1":

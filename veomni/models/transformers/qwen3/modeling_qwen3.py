@@ -10,6 +10,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
@@ -737,6 +738,96 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
+class Qwen3ForSequenceClassification(Qwen3PreTrainedModel):
+    """
+    Adapted from transformers.models.qwen3.modeling_qwen3.Qwen3ForSequenceClassification.
+    Differences:
+    - Backbone uses our own Qwen3Model.
+    - Compatible with both varlen (cu_seqlens) and padding input formats.
+    - The current loss function directly uses single-label CrossEntropyLoss.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = Qwen3Model(config)
+        self.num_labels = config.num_labels
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @can_return_tuple
+    @add_start_docstrings_to_model_forward(QWEN3_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=SequenceClassifierOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> SequenceClassifierOutputWithPast:
+        r"""
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the classification loss.
+
+                This head uses a single-label cross-entropy loss. In our setup, labels typically follow the
+                "token-level labels" convention: positions not supervised should be set to `-100`, and only the
+                supervised token(s) (e.g., the last valid token of each sample) carry a real class id in
+                `[0, ..., num_labels - 1]`. Tokens with label `-100` are ignored.
+
+                Note: `labels` should be provided for classification training tasks.
+
+        Returns:
+
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+
+        loss = None
+        logits = None
+        if labels is not None:
+            loss, logits = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.num_labels,
+                hidden_states=hidden_states,
+                weights=self.score.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.score(hidden_states)
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
 if is_liger_kernel_available():
     apply_rotary_pos_emb = liger_rotary_pos_emb
     Qwen3RMSNorm = LigerRMSNorm
@@ -748,4 +839,4 @@ if is_torch_npu_available() and is_transformers_version_greater_or_equal_to("4.5
 
     apply_qwen3_npu_patch()
 
-__all__ = ["Qwen3ForCausalLM", "Qwen3Model", "Qwen3PreTrainedModel"]
+__all__ = ["Qwen3ForCausalLM", "Qwen3Model", "Qwen3PreTrainedModel", "Qwen3ForSequenceClassification"]

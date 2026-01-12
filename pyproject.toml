@@ -40,6 +40,14 @@ dev = [
   "expecttest>=0.3.0,<0.4"
 ]
 audio = [
+  "torchcodec",
+  "av>=14.3.0,<15.0",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14"
+]
+# Alias for audio extra - includes both video and audio processing dependencies
+video = [
+  "torchcodec",
   "av>=14.3.0,<15.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
@@ -54,7 +62,8 @@ npu_aarch64 = [
   "torchvision==0.22.1",
   "torchaudio==2.7.1",
   "decorator>=5.2.1",
-  "scipy>=1.16.2"
+  "scipy>=1.16.2",
+  "torchcodec>=0.4.0,<0.6.0"
 ]
 npu = [
   "torch==2.7.1+cpu",
@@ -62,7 +71,8 @@ npu = [
   "torchvision==0.22.1+cpu",
   "torchaudio==2.7.1+cpu",
   "decorator>=5.2.1",
-  "scipy>=1.16.2"
+  "scipy>=1.16.2",
+  "torchcodec>=0.4.0,<0.6.0"
 ]
 gpu = [
   "torch==2.8.0+cu128",
@@ -74,6 +84,7 @@ gpu = [
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
+  "torchcodec>=0.6.0,<0.8.0"
 ]
 megatron = [
   "megatron-energon>=7.2.1"
@@ -120,14 +131,17 @@ override-dependencies = [
     "torch==2.8.0+cu128; (extra == 'gpu')",
     "torchaudio==2.8.0+cu128; (extra == 'gpu')",
     "torchvision==0.23.0+cu128; (extra == 'gpu')",
+    "torchcodec>=0.6.0,<0.8.0; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
     "torchvision==0.22.1; (extra == 'npu_aarch64')",
+    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu_aarch64')",
     # Adding explicit override for NPU backends - x86 variant (default npu)
     "torch==2.7.1+cpu; (extra == 'npu')",
     "torchaudio==2.7.1+cpu; (extra == 'npu')",
     "torchvision==0.22.1+cpu; (extra == 'npu')",
+    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
     # Fixate to a specific transformers version since upgrading transformers is a large task.
     "transformers==4.57.3",
 ]
@@ -207,3 +221,8 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+markers = [
+    "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
+]
