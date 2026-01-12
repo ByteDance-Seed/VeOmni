@@ -19,7 +19,7 @@ from veomni.data.multimodal.video_utils import (
 
 
 # Make sure to place a sample.mp4 file in tests/data/assets
-VIDEO_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "sample.mp4")
+VIDEO_PATH = os.path.join(os.environ["CI_SAMPLES_DIR"], "sample.mp4")
 
 # Skip tests if the sample video file doesn't exist
 pytestmark = pytest.mark.skipif(not os.path.exists(VIDEO_PATH), reason=f"Test video not found at {VIDEO_PATH}")

@@ -59,6 +59,7 @@ jobs:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+      CI_SAMPLES_DIR: "/root/models/samples"
 
     steps:
       - name: Set up proxy
