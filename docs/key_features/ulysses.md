@@ -162,3 +162,122 @@ loss = loss_fct(logits, labels)
 loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
 return loss
 ```
+
+## Experimental feature: Async Ulysses CP
+
+We also support **Async Ulysses** which further improves performance by overlapping communication and computation, reducing communication latency and improving hardware utilization.
+
+### Asynchronous Ulysses
+
+VeOmni extends the original Ulysses implementation with asynchronous communication capabilities, further improving performance by overlapping communication and computation.
+
+#### Performance Benefits
+
+By overlapping communication and computation, Async Ulysses:
+- Reduces idle time during communication operations
+- Improves XPU utilization
+- Lowers end-to-end training time
+- Maintains nearly the same memory efficiency as original Ulysses
+
+#### Enabling Async Ulysses
+
+To enable Async Ulysses, simply set the `async_enabled` parameter to `True`:
+
+```shell
+bash train.sh tasks/multimodal/omni/train_qwen2_5_vl.py configs/multimodal/qwen2_5_vl/qwen2_5_vl_fsdp1.yaml \
+    --model.model_path YOUR_MODEL_PATH \
+    --data.train_path YOUR_DATA_PATH \
+    --train.ulysses_parallel_size 4 \
+    --train.async_enabled true
+```
+
+### Core API
+
+1. async_ulysses_qkv_projection
+
+An asynchronous method to perform QKV projection and all-to-all communication, overlapping computation and communication.
+
+```Python
+def async_ulysses_qkv_projection(
+    hidden_states: torch.Tensor,
+    seq_dimension: int,
+    head_dimension: int,
+    q_weight: torch.Tensor,
+    q_bias: Optional[torch.Tensor],
+    k_weight: torch.Tensor,
+    k_bias: Optional[torch.Tensor],
+    v_weight: torch.Tensor,
+    v_bias: Optional[torch.Tensor],
+    norm_type: Optional[str] = None,
+    norm_q_weight: Optional[torch.Tensor] = None,
+    norm_q_bias: Optional[torch.Tensor] = None,
+    norm_k_weight: Optional[torch.Tensor] = None,
+    norm_k_bias: Optional[torch.Tensor] = None,
+    normalized_shape: Optional[Union[int, torch.Size]] = None,
+    eps: float = 1e-5,
+    unpadded_dim_size: int = 0,
+    head_dim: int = 0,
+    group: Optional[ProcessGroup] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+```
+
+Args:
+- hidden_states: Input hidden states
+- seq_dimension: Sequence dimension
+- head_dimension: Head dimension
+- q_weight: Query projection weight
+- q_bias: Query projection bias
+- k_weight: Key projection weight
+- k_bias: Key projection bias
+- v_weight: Value projection weight
+- v_bias: Value projection bias
+- norm_type: Normalization type ("rmsnorm" or "layernorm")
+- norm_q_weight: Query normalization weight
+- norm_q_bias: Query normalization bias
+- norm_k_weight: Key normalization weight
+- norm_k_bias: Key normalization bias
+- normalized_shape: Normalization shape
+- eps: Normalization epsilon
+- unpadded_dim_size: Unpadded dimension size
+- head_dim: Head dimension size
+- group: Process group (optional)
+
+2. async_ulysses_output_projection
+
+An asynchronous method to perform output projection and all-to-all communication.
+
+```Python
+def async_ulysses_output_projection(
+    hidden_states: torch.Tensor,
+    seq_dimension: int,
+    head_dimension: int,
+    proj_weight: torch.Tensor,
+    proj_bias: Optional[torch.Tensor],
+    unpadded_dim_size: int = 0,
+    group: Optional[ProcessGroup] = None,
+) -> torch.Tensor
+```
+
+Args:
+- hidden_states: Input hidden states
+- seq_dimension: Sequence dimension
+- head_dimension: Head dimension
+- proj_weight: Projection weight
+- proj_bias: Projection bias
+- unpadded_dim_size: Unpadded dimension size
+- group: Process group (optional)
+
+
+### Enabling Async Ulysses
+
+To enable Async Ulysses for an existing model, you need to:
+
+1. Check if Async Ulysses is supported for your model (currently supported for Qwen3VL)
+2. Set `async_enabled=True` in your training configuration
+3. Ensure you're using Flash Attention 2.0
+4. Verify that your hardware supports asynchronous operations
+
+Async Ulysses is currently available for the following models:
+- Qwen3VL (dense variant)
+
+Support for more models will be added in future releases.
