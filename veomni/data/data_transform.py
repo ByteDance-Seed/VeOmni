@@ -23,19 +23,7 @@ if TYPE_CHECKING:
 
     from .chat_template import ChatTemplate
 
-
-
-
-
 from veomni.data.constants import IGNORE_INDEX
-from veomni.utils import logging
-
-logger = logging.get_logger(__name__)
-
-
-
-
-
 
 def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int]]:
     """
@@ -203,12 +191,6 @@ def process_classification_example(
         return sample
 
     if len(tokens) > max_seq_len:
-        logger.warning_once(
-            "Text length (%d tokens) exceeds max_seq_len=%d; "
-            "only the first segment is kept for classification.",
-            len(tokens),
-            max_seq_len,
-        )
         tokens = tokens[:max_seq_len]
 
     examples.append(build_sample(tokens))
