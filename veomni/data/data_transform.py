@@ -172,7 +172,7 @@ def process_classification_example(
         raise ValueError(f"label ({label_val}) became negative after applying label_offset={label_offset}.")
 
     # 3) tokenize
-    tokens: List[int] = tokenizer.encode(text, add_special_tokens=False)
+    tokens: List[int] = tokenizer.encode(text, add_special_tokens=True)
 
     # 4) build samples
     examples: List[Dict[str, "torch.Tensor"]] = []
