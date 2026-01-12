@@ -1,4 +1,3 @@
-(arguments-api-reference)=
 # Arguments API Reference
 
 ## Model configuration arguments

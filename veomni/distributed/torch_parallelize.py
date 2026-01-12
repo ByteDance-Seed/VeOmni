@@ -80,7 +80,9 @@ def parallelize_model_fsdp1(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     enable_full_shard: bool = True,
+    enable_shard_grad_op: bool = False,
     enable_mixed_precision: bool = True,
+    use_orig_params: bool = True,
     basic_modules: Optional[List[str]] = None,
     fsdp_no_shard_states=None,
     fsdp_no_shard_states_fqn=None,
@@ -91,6 +93,9 @@ def parallelize_model_fsdp1(
     """
     Applies EP (when enabled) + FSDP1 parallel strategy to the model.
     """
+    assert not (enable_full_shard and enable_shard_grad_op), (
+        "You must explicitly specify enable_full_shard as False if enable_shard_grad_op is set to True"
+    )
     parallel_state = get_parallel_state()
 
     if parallel_state.ep_enabled:
@@ -110,16 +115,15 @@ def parallelize_model_fsdp1(
 
     # set fsdp/hsdp sharding strategy
     if parallel_state.fsdp_mesh.ndim > 1 and parallel_state.fsdp_mesh.size() > 1:
-        strategy = ShardingStrategy.HYBRID_SHARD
+        strategy = ShardingStrategy.HYBRID_SHARD if enable_full_shard else ShardingStrategy._HYBRID_SHARD_ZERO2
     else:
-        strategy = ShardingStrategy.FULL_SHARD
-
+        strategy = ShardingStrategy.FULL_SHARD if enable_full_shard else ShardingStrategy.SHARD_GRAD_OP
     fsdp_kwargs = {
         "auto_wrap_policy": wrap_policy,
         "ignored_states": fsdp_no_shard_states,
         "device_id": get_device_id(),
-        "sharding_strategy": strategy if enable_full_shard else ShardingStrategy.NO_SHARD,
-        "use_orig_params": True,
+        "sharding_strategy": strategy if enable_full_shard or enable_shard_grad_op else ShardingStrategy.NO_SHARD,
+        "use_orig_params": use_orig_params,
     }
 
     fsdp_kwargs["device_mesh"] = parallel_state.fsdp_mesh
@@ -430,6 +434,8 @@ def build_parallelize_model(
     weights_path: Optional[str] = None,
     sharding_plan: Optional[Dict[str, Any]] = None,
     enable_full_shard: bool = True,
+    enable_shard_grad_op: bool = False,
+    use_orig_params: bool = True,
     enable_mixed_precision: bool = True,
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
@@ -486,6 +492,8 @@ def build_parallelize_model(
                 model=model,
                 weights_path=weights_path,
                 enable_full_shard=enable_full_shard,
+                enable_shard_grad_op=enable_shard_grad_op,
+                use_orig_params=use_orig_params,
                 enable_mixed_precision=enable_mixed_precision,
                 basic_modules=basic_modules,
                 fsdp_no_shard_states=fsdp_no_shard_states,

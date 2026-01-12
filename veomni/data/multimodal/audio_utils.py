@@ -1,11 +1,24 @@
 import io
 from io import BytesIO
-from typing import ByteString, List, Optional, Union
+from typing import ByteString, List, Optional, Tuple, Union
 
 import audioread
+import av
 import librosa
 import numpy as np
 import soundfile as sf
+
+from ...utils import logging
+
+
+logger = logging.get_logger(__name__)
+
+
+if not hasattr(av, "AVError"):
+    try:
+        from av.error import AVError  # noqa: F401
+    except (ImportError, AttributeError):
+        av.AVError = OSError
 
 
 AudioInput = Union[
@@ -74,3 +87,72 @@ def load_audio(audios: AudioInput, **kwargs):
 def fetch_audios(audios: List[AudioInput], **kwargs):
     audios = [load_audio(audio, **kwargs) for audio in audios]
     return audios
+
+
+def extract_audio_from_video(
+    video_input: Union[str, bytes], max_duration_seconds: Optional[float] = None
+) -> Tuple[Optional[np.ndarray], Optional[int]]:
+    """Extract audio from video file using PyAV.
+
+    Args:
+        video_input: Video file path (str) or video bytes
+        max_duration_seconds: Maximum audio duration to extract (prevents OOM).
+                            If None, uses video duration + 1 second buffer.
+
+    Returns:
+        Tuple containing:
+            - audio: Mono audio array (np.ndarray) or None if no audio stream
+            - audio_fps: Audio sample rate (int) or None if no audio stream
+
+    Raises:
+        Exception: If PyAV fails to open the video container
+    """
+    audio, audio_fps = None, None
+
+    try:
+        # Open video container with PyAV
+        container_input = io.BytesIO(video_input) if isinstance(video_input, bytes) else video_input
+        container = av.open(container_input)
+
+        # Check if video has audio streams
+        if len(container.streams.audio) > 0:
+            audio_stream = container.streams.audio[0]
+            audio_fps = audio_stream.rate
+
+            # Prevent OOM: limit audio buffer size
+            if max_duration_seconds is None:
+                # Use video duration if available, otherwise default to 60 seconds
+                video_duration = container.duration / av.time_base if container.duration else 60.0
+                max_duration_seconds = video_duration + 1.0
+
+            max_samples = int(max_duration_seconds * audio_fps)
+
+            audio_frames_list = []
+            current_samples = 0
+
+            # Decode audio frames
+            for frame in container.decode(audio_stream):
+                frame_np = frame.to_ndarray()
+                audio_frames_list.append(frame_np)
+                current_samples += frame_np.shape[1]
+                if current_samples >= max_samples:
+                    break
+
+            # Concatenate and convert to mono
+            if len(audio_frames_list) > 0:
+                aframes = np.concatenate(audio_frames_list, axis=1)
+                # Convert multi-channel to mono
+                if aframes.shape[0] > 1:
+                    aframes = np.mean(aframes, axis=0)
+                else:
+                    aframes = aframes[0]
+                audio = aframes
+
+        container.close()
+
+    except Exception as e:
+        logger.warning(f"Failed to extract audio from video: {e}")
+        audio = None
+        audio_fps = None
+
+    return audio, audio_fps

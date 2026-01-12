@@ -1,5 +1,3 @@
-(examples-wan2.1)=
-
 # Wan2.1-I2V training guide
 
 ## Download model

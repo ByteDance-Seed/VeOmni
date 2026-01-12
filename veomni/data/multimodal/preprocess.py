@@ -162,6 +162,7 @@ def imagenet1k_caption_preprocess(conversations, **kwargs):
 
 @PREPROCESSOR_REGISTRY.register("fineweb_100BT")
 def fineweb_preprocess(conversations, **kwargs):
+    conversations = conversations["text"]
     constructed_conversation = [
         ["assistant", ("text", conversations)],
     ]
@@ -360,6 +361,15 @@ def voice_assistant_preprocess(conversations, **kwargs):
         ["user", ("audio", None)],
         ["assistant", ("text", conversations[1]["value"])],
     ]
+    return constructed_conversation
+
+
+@PREPROCESSOR_REGISTRY.register("tulu-3-sft-mixture")
+def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
+    text_example = conversations["messages"]
+    constructed_conversation = []
+    for conversation in text_example:
+        constructed_conversation.append([conversation["role"], ("text", conversation["content"])])
     return constructed_conversation
 
 

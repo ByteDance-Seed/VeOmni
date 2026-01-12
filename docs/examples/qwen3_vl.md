@@ -1,5 +1,3 @@
-(examples-qwen3_vl)=
-
 # Qwen3 VL training guide
 
 ## Download dataset
@@ -53,8 +51,7 @@ bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_d
     --data.datasets_type iterable \
     --data.source_name sharegpt4v_sft \
     --data.num_workers 8 \
-    --train.micro_batch_size 3 \
-    --train.use_wandb false
+    --train.micro_batch_size 3
 ```
 
 ### Qwen3-VL-30B
@@ -67,6 +64,5 @@ bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_m
     --data.datasets_type iterable \
     --data.source_name sharegpt4v_sft \
     --data.num_workers 8 \
-    --train.micro_batch_size 3 \
-    --train.use_wandb false
+    --train.micro_batch_size 3
 ```
