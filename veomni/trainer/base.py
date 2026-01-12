@@ -409,7 +409,7 @@ class BaseTrainer(Stateful, ABC):
         dist.barrier()
         dist.destroy_process_group()
 
-    def preforward(self, micro_batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
         micro_batch = self.pre_forward(micro_batch)
 
@@ -422,7 +422,9 @@ class BaseTrainer(Stateful, ABC):
             self.LOG_SAMPLE = False
         return micro_batch
 
-    def postforward(self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]) -> None:
+    def postforward(
+        self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
@@ -430,7 +432,9 @@ class BaseTrainer(Stateful, ABC):
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
-    def forward_backward_step(self, micro_batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward_backward_step(
+        self, micro_batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
         with self.model_fwd_context:

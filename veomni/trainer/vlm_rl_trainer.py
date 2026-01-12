@@ -54,7 +54,6 @@ class VLMRLTrainer(VLMTrainer):
         logits = logits.float()
         shift_labels = labels.view(-1)
 
-        torch.distributed.barrier()
         loss = nn.functional.cross_entropy(logits, shift_labels, ignore_index=-100, reduction="mean")
 
         outputs.loss = loss
