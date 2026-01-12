@@ -11,6 +11,7 @@ class DummyTokenizer:
     - returns [101] + [1,2,3,...,n] + [102]
     - length depends on whitespace-separated tokens
     """
+
     def encode(self, text, add_special_tokens=True):
         n = 0 if text is None else len(str(text).split())
         ids = list(range(1, n + 1))

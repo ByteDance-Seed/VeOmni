@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 from veomni.data.constants import IGNORE_INDEX
 
+
 def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int]]:
     """
     Splits a long sequence into chunks.
@@ -92,7 +93,6 @@ def process_sft_example(
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
-
 
 
 def process_classification_example(
