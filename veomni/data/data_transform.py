@@ -19,6 +19,7 @@ import torch
 
 from veomni.data.constants import IGNORE_INDEX
 
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
