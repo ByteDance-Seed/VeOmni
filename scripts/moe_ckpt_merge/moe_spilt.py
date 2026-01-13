@@ -62,23 +62,13 @@ def main(merge_hf_path, split_hf_path):
     num_hidden_layers = config.num_hidden_layers
     for i in range(num_hidden_layers):
         print(f"Converting layer {i}")
-        # Split gate_proj back to individual experts
-        if f"model.layers.{i}.mlp.experts.gate_proj" in new_state_dict:
-            gate_proj_stack = new_state_dict.pop(f"model.layers.{i}.mlp.experts.gate_proj")
-            for j in range(num_experts):
-                new_state_dict[f"model.layers.{i}.mlp.experts.{j}.gate_proj.weight"] = gate_proj_stack[j]
-
-        # Split up_proj back to individual experts
-        if f"model.layers.{i}.mlp.experts.up_proj" in new_state_dict:
-            up_proj_stack = new_state_dict.pop(f"model.layers.{i}.mlp.experts.up_proj")
-            for j in range(num_experts):
-                new_state_dict[f"model.layers.{i}.mlp.experts.{j}.up_proj.weight"] = up_proj_stack[j]
-
-        # Split down_proj back to individual experts
-        if f"model.layers.{i}.mlp.experts.down_proj" in new_state_dict:
-            down_proj_stack = new_state_dict.pop(f"model.layers.{i}.mlp.experts.down_proj")
-            for j in range(num_experts):
-                new_state_dict[f"model.layers.{i}.mlp.experts.{j}.down_proj.weight"] = down_proj_stack[j]
+        for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+            stacked_key = f"model.layers.{i}.mlp.experts.{proj_name}"
+            if stacked_key in new_state_dict:
+                stacked_tensor = new_state_dict.pop(stacked_key)
+                for j in range(num_experts):
+                    expert_key = f"model.layers.{i}.mlp.experts.{j}.{proj_name}.weight"
+                    new_state_dict[expert_key] = stacked_tensor[j]
 
     model_assets = [config, tokenizer]
 
