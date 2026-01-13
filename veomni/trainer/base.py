@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
+from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
     build_dataloader,
@@ -125,6 +126,9 @@ class BaseTrainer(Stateful, ABC):
     environ_meter: helper.EnvironMeter  # see in trace_callback.EnvironMeterCallback
     step_env_metrics: Dict[str, Any]  # mfu, flops, tokens, etc
     step_train_metrics: Dict[str, Any]  # loss, grad_norm, lr, etc
+
+    # Checkpointer
+    checkpointer: CheckpointerBase  # see in checkpoint_callback.CheckpointerCallback
 
     # Callback system
     callbacks: CallbackHandler
@@ -245,10 +249,8 @@ class BaseTrainer(Stateful, ABC):
 
         helper.print_device_mem_info("VRAM usage after building model")
 
-    def _build_data(self):
-        logger.info_rank0("Build data")
+    def build_training_dataset(self):
         args: Arguments = self.args
-
         data_transform = self.build_data_transform()
         # Build dataset
         self.train_dataset = build_dataset(
@@ -264,7 +266,8 @@ class BaseTrainer(Stateful, ABC):
         args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
         self.train_steps = args.train.train_steps
 
-        # Build dataloader
+    def build_training_dataloader(self):
+        args: Arguments = self.args
         self.train_dataloader = build_dataloader(
             dataloader_type=args.data.dataloader_type,
             dataset=self.train_dataset,
@@ -287,6 +290,10 @@ class BaseTrainer(Stateful, ABC):
             prefetch_factor=args.data.prefetch_factor,
         )
 
+    def _build_data(self):
+        logger.info_rank0("Build data")
+        self.build_training_dataset()
+        self.build_training_dataloader()
         # TODO: val dataset & dataloader
 
     def _build_parallelized_model(self):
@@ -400,12 +407,13 @@ class BaseTrainer(Stateful, ABC):
             self.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
-        synchronize()
+        self.callbacks.call("on_train_end", self.state)
 
+        synchronize()
         # Clean up optimizer and lr scheduler
         del self.optimizer, self.lr_scheduler
         helper.empty_cache()
-        self.callbacks.call("on_train_end", self.state)
+
         dist.barrier()
         dist.destroy_process_group()
 

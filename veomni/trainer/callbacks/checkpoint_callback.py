@@ -23,7 +23,7 @@ class CheckpointerCallback(Callback):
         args: "Arguments" = self.trainer.args
         self.every_n_steps = args.train.save_steps
         self.every_n_epochs = args.train.save_epochs
-        self.checkpointer: CheckpointerBase = build_checkpointer(
+        self.trainer.checkpointer: CheckpointerBase = build_checkpointer(
             dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager
         )
 
@@ -49,7 +49,7 @@ class CheckpointerCallback(Callback):
             "optimizer": self.trainer.optimizer,
             "extra_state": {},
         }
-        self.checkpointer.load(args.train.load_checkpoint_path, state)
+        self.trainer.checkpointer.load(args.train.load_checkpoint_path, state)
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
         self.trainer.start_epoch = self.trainer.state.global_step // args.train.train_steps
@@ -84,7 +84,7 @@ class CheckpointerCallback(Callback):
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
-        self.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.save_async)
+        self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.save_async)
 
         # Empty cache and barrier
         helper.empty_cache()
@@ -130,9 +130,12 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             super()._save_checkpoint(state)
+
+        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
+            self.trainer.checkpointer.save_future.result()
+
         if args.train.global_rank == 0:
             hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-
             model_state_dict = ckpt_to_state_dict(
                 save_checkpoint_path=save_checkpoint_path,
                 ckpt_manager=args.train.ckpt_manager,

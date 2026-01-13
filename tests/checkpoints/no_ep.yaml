@@ -1,8 +1,6 @@
 model:
-  # model_path: ./qwen3moe_4layers_merged
   config_path: configs/model_configs/qwen/qwen3_moe_30a3b_4_layers.json
   tokenizer_path: Qwen/Qwen3-30B-A3B
-  weight_path: None
   moe_implementation: fused
   attn_implementation: flash_attention_2
 
