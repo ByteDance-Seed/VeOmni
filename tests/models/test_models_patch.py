@@ -68,15 +68,15 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
             model_mode.sync_weight_func(config, state_dict, model_cur)
 
         loss, gnorm = train_one_step(model_cur, optim_cur, dummy_data[model_mode.attn_case])
-        
+
         result_metrics = {
             "loss": loss.item(),
             "gnorm": gnorm.item(),
         }
-        
+
         print_device_mem_info(f"[Memory Info] after model {idx} train_one_step:")
         del model_cur, optim_cur, loss, gnorm
-        
+
         return result_metrics
 
     # Train HF backend models

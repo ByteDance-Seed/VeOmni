@@ -15,43 +15,38 @@
 # Patch https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3/modeling_qwen3.py
 
 
-from typing import Callable, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
+import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
+from transformers import Qwen3ForCausalLM, Qwen3Model
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
 from transformers.processing_utils import Unpack
 from transformers.utils import (
     TransformersKwargs,
     can_return_tuple,
 )
-from transformers.utils.generic import check_model_inputs
-from transformers import Qwen3Model, Qwen3ForCausalLM
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
 from ....utils import logging
+from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from ....utils.import_utils import (
     is_liger_kernel_available,
     is_transformers_version_greater_or_equal_to,
 )
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
 if is_liger_kernel_available():
-    from liger_kernel.transformers.rms_norm import LigerRMSNorm
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
-    from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+    pass
 
 logger = logging.get_logger(__name__)
+
 
 # ================================================================
 # PATCH: Qwen3Model.forward
@@ -114,7 +109,7 @@ def qwen3model_forward(
 
     # --- Patch.1 ---
     sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)    
+    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
     # --- Patch.1 ---
 
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
@@ -135,9 +130,10 @@ def qwen3model_forward(
         past_key_values=past_key_values if use_cache else None,
     )
 
+
 # ================================================================
 # PATCH: Qwen3ForCausalLM.forward
-# 1. Support use with fuse cross_entropy loss function. 
+# 1. Support use with fuse cross_entropy loss function.
 # ================================================================
 @can_return_tuple
 def qwen3forcausallm_forward(
@@ -200,12 +196,12 @@ def qwen3forcausallm_forward(
             vocab_size=self.config.vocab_size,
             hidden_states=hidden_states,
             weights=self.lm_head.weight,
-            **kwargs
+            **kwargs,
         )
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
     # --- Patch.1 ---
-    
+
     return CausalLMOutputWithPast(
         loss=loss,
         logits=logits,
@@ -223,12 +219,13 @@ def apply_veomni_qwen3_patch():
 
     if IS_CUDA_AVAILABLE:
         from .gpu_patch import apply_veomni_qwen3_gpu_patch
+
         apply_veomni_qwen3_gpu_patch()
     elif IS_NPU_AVAILABLE and is_transformers_version_greater_or_equal_to("4.50.4"):
         from .npu_patch import apply_qwen3_npu_patch
+
         apply_qwen3_npu_patch()
     else:
-        logger.warning_rank0("Qwen3ForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4.")
-    
-
-
+        logger.warning_rank0(
+            "Qwen3ForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4."
+        )

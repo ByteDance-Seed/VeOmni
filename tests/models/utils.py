@@ -1,11 +1,11 @@
 import os
-from dataclasses import dataclass
-from dataclasses import asdict, fields
-from typing import Dict, Optional, Callable
-from rich.console import Console
-from rich.table import Table
+from dataclasses import asdict, dataclass, fields
+from typing import Callable, Dict, Optional
+
 import torch
 import torch.nn.functional as F
+from rich.console import Console
+from rich.table import Table
 from transformers import set_seed
 
 from veomni.models import build_foundation_model
@@ -52,6 +52,7 @@ class ModelMode:
 
     def __str__(self):
         return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]_[{self.attn_case}]"
+
 
 def prepare_model_modes(is_moe: bool = False):
     base_model_modes = [
@@ -218,30 +219,28 @@ def train_one_step(model, optimizer, inputs):
 
 
 def print_all_values(output_dict, value_key):
-
     console = Console()
     first_mode = next(iter(output_dict.keys()))
-    
 
     table = Table(title=f"Alignment Result: [bold magenta]{value_key}[/bold magenta]")
     mode_fields = [f.name for f in fields(first_mode) if f.name != "sync_weight_func"]
-    
+
     for field in mode_fields:
         table.add_column(field, style="cyan", justify="left")
-    
+
     table.add_column(value_key.upper(), style="bold green", justify="right")
 
     for mode, output in output_dict.items():
-        mode_data = asdict(mode)        
+        mode_data = asdict(mode)
         row_cells = []
-        
+
         for field in mode_fields:
             row_cells.append(str(mode_data[field]))
-            
+
         val_obj = output.get(value_key, "N/A")
-        val_str = f"{val_obj.item() if hasattr(val_obj, 'item') else val_obj:.8f}" # 这里加上了.4f保留小数
+        val_str = f"{val_obj.item() if hasattr(val_obj, 'item') else val_obj:.8f}"  # 这里加上了.4f保留小数
         row_cells.append(val_str)
-        
+
         table.add_row(*row_cells)
 
     console.print(table)

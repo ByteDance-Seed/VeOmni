@@ -1,6 +1,8 @@
 import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
-from ....utils.import_utils import is_liger_kernel_available
+
 from ....utils import logging
+from ....utils.import_utils import is_liger_kernel_available
+
 
 logger = logging.get_logger(__name__)
 
@@ -18,6 +20,5 @@ def apply_veomni_qwen3_gpu_patch():
         hf_qwen3.apply_rotary_pos_emb = liger_rotary_pos_emb
         hf_qwen3.Qwen3RMSNorm = LigerRMSNorm
         hf_qwen3.Qwen3MLP = LigerSwiGLUMLP
-        
-        logger.info_rank0("Apply liger kernel to Qwen3.")
 
+        logger.info_rank0("Apply liger kernel to Qwen3.")
