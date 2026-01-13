@@ -99,7 +99,6 @@ def _compute_seqlens(
     ds_idx = None
     if enable_multisource:
         ds_idx = micro_batch.pop("ds_idx")
-        ds_idx = ds_idx.item()
         micro_batch.pop("source_name", None)
         micro_batch.pop("cur_token_num", None)
 

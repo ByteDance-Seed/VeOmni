@@ -401,7 +401,7 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
     if not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
-    logger.info_once("Using torchcodec for video loading.")
+    logger.warning_once("Using torchcodec for video loading.")
 
     video_inputs, audio_inputs, audio_fps_list = [], [], []
 
@@ -437,7 +437,7 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
     if not is_ffmpeg_available():
         raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
-    logger.info_once("Using torchcodec for video loading with metadata.")
+    logger.warning_once("Using torchcodec for video loading with metadata.")
 
     video_inputs, video_metadata_list = [], []
     audio_inputs, audio_metadata_list = [], []
