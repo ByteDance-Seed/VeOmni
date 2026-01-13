@@ -16,14 +16,14 @@
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import torch
-
+from veomni.data.constants import IGNORE_INDEX
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
     from .chat_template import ChatTemplate
 
-from veomni.data.constants import IGNORE_INDEX
+
 
 
 def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int]]:

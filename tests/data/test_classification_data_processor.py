@@ -83,7 +83,7 @@ def test_process_classification_example_truncates_to_max_seq_len():
     sample = out[0]
     _assert_sample_structure(sample, expected_len=6)
 
-    # still: last token gets label, others ignore
+    # last token gets label, others ignore
     assert torch.all(sample["labels"][:-1] == IGNORE_INDEX)
     assert int(sample["labels"][-1].item()) == 1
 
@@ -91,7 +91,7 @@ def test_process_classification_example_truncates_to_max_seq_len():
 def test_process_classification_example_missing_text_key_raises():
     tok = DummyTokenizer()
     ex = {"label": 0}
-    with pytest.raises(ValueError, match="Missing text key"):
+    with pytest.raises(KeyError, match="'text'"):
         process_classification_example(ex, tok, max_seq_len=16)
 
 
