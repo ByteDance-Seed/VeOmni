@@ -418,7 +418,6 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = config.patch_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
-        self.num_grid = self.num_grid_per_side * self.num_grid_per_side
 
         self.patch_embed = Qwen3VLVisionPatchEmbed(
             config=config,
@@ -426,6 +425,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
         self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
+        self.num_grid = self.num_grid_per_side * self.num_grid_per_side
 
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
@@ -495,7 +495,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
         offset = 0
         for num_frames, height, width in grid_thw:
-            coords = self.rot_pos_ids(height, width, merge_size)
+            coords = self.rot_pos_ids(height, width, merge_size).to(device)
 
             if num_frames > 1:
                 coords = coords.repeat(num_frames, 1)
