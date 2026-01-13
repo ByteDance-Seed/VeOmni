@@ -26,8 +26,6 @@ if TYPE_CHECKING:
     from .chat_template import ChatTemplate
 
 
-
-
 def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int]]:
     """
     Splits a long sequence into chunks.
