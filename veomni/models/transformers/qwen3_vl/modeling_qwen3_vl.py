@@ -789,12 +789,8 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         outputs = []
         dtype = self.pos_embed.weight.dtype
         for t, h, w in grid_thw:
-            h_idxs = torch.linspace(
-                0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64
-            )
-            w_idxs = torch.linspace(
-                0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64
-            )
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
 
             h_floor = h_idxs.to(torch.long)
             w_floor = w_idxs.to(torch.long)
@@ -831,9 +827,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
             embeds = self.pos_embed(indices) * weights
             combined = embeds[0] + embeds[1] + embeds[2] + embeds[3]
-            combined = combined.reshape(
-                h // m_size, m_size, w // m_size, m_size, hidden_dim
-            )
+            combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
 
             combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
             repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
