@@ -20,6 +20,7 @@ from functools import partial
 from types import SimpleNamespace
 from typing import Optional, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
