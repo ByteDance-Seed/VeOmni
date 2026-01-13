@@ -350,15 +350,318 @@ def Qwen3VLVisionModel_forward(
             position_embeddings=position_embeddings,
             **kwargs,
         )
+<<<<<<< HEAD
         if layer_num in self.deepstack_visual_indexes:
             deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
                 hidden_states
             )
             deepstack_feature_lists.append(deepstack_feature)
+=======
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Llava outputs, with hidden states and attentions.
+    """
+)
+class Qwen3VLModelOutputWithPast(ModelOutput):
+    r"""
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+        `past_key_values` input) to speed up sequential decoding.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    """
+
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
+    hidden_states: Optional[tuple[torch.FloatTensor]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
+    rope_deltas: Optional[torch.LongTensor] = None
+
+
+@auto_docstring
+class Qwen3VLPreTrainedModel(PreTrainedModel):
+    config: Qwen3VLConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
+    _skip_keys_device_placement = "past_key_values"
+    _supports_flash_attn = True
+    _supports_sdpa = True
+
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": Qwen3VLTextDecoderLayer,
+        "attentions": Qwen3VLTextAttention,
+    }
+
+
+class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
+    config: Qwen3VLVisionConfig
+    _no_split_modules = ["Qwen3VLVisionBlock"]
+
+    def __init__(self, config, *inputs, **kwargs) -> None:
+        super().__init__(config, *inputs, **kwargs)
+        self.spatial_merge_size = config.spatial_merge_size
+        self.patch_size = config.patch_size
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+        self.num_grid = self.num_grid_per_side * self.num_grid_per_side
+
+        self.patch_embed = Qwen3VLVisionPatchEmbed(
+            config=config,
+        )
+
+        self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
+
+        head_dim = config.hidden_size // config.num_heads
+        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
+
+        self.blocks = nn.ModuleList([Qwen3VLVisionBlock(config) for _ in range(config.depth)])
+        self.merger = Qwen3VLVisionPatchMerger(
+            config=config,
+            use_postshuffle_norm=False,
+        )
+
+        self.deepstack_visual_indexes = config.deepstack_visual_indexes
+        self.deepstack_merger_list = nn.ModuleList(
+            [
+                Qwen3VLVisionPatchMerger(
+                    config=config,
+                    use_postshuffle_norm=True,
+                )
+                for _ in range(len(config.deepstack_visual_indexes))
+            ]
+        )
+
+        self.gradient_checkpointing = False
+
+    # Copied from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L431
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+        if isinstance(h, torch.Tensor):
+            h = int(h.item())
+        if isinstance(w, torch.Tensor):
+            w = int(w.item())
+        if isinstance(spatial_merge_size, torch.Tensor):
+            spatial_merge_size = int(spatial_merge_size.item())
+        hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+        h_div = h // spatial_merge_size
+        w_div = w // spatial_merge_size
+        hpos_ids = hpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
+        hpos_ids = hpos_ids.flatten()
+
+        wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+        wpos_ids = wpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
+        wpos_ids = wpos_ids.flatten()
+
+        return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        merge_size = self.spatial_merge_size
+
+        max_hw = int(grid_thw[:, 1:].max().item())
+        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+        device = freq_table.device
+
+        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
+        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+        offset = 0
+        for num_frames, height, width in grid_thw:
+            coords = self.rot_pos_ids(height, width, merge_size)
+
+            if num_frames > 1:
+                coords = coords.repeat(num_frames, 1)
+
+            num_tokens = coords.shape[0]
+            pos_ids[offset : offset + num_tokens] = coords
+            offset += num_tokens
+
+        embeddings = freq_table[pos_ids]  # lookup rotary embeddings
+        embeddings = embeddings.flatten(1)
+        return embeddings
+
+    # Copied and adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L474
+    def fast_pos_embed_interpolate(self, grid_thw):
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
+
+        outputs = []
+        dtype = self.pos_embed.weight.dtype
+        for t, h, w in grid_thw:
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
+>>>>>>> d02f041 ([model]chore: ruff check)
 
     hidden_states = self.merger(hidden_states)
 
+<<<<<<< HEAD
     return hidden_states, deepstack_feature_lists
+=======
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
+
+            # Create meshgrid view for all h, w vars
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+            # original computation of weights
+            # w00 = (1 - dh_grid) * (1 - dw_grid)
+            # w01 = (1 - dh_grid) * dw_grid
+            # w10 = dh_grid * (1 - dw_grid)
+            # w11 = dh_grid * dw_grid
+            # we reuse w11 here to avoid duplicate
+            # dh_grid * dw_grid computation
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
+
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
+
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=dtype)
+
+            embeds = self.pos_embed(indices) * weights
+            combined = embeds[0] + embeds[1] + embeds[2] + embeds[3]
+            combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+
+            outputs.append(repeated)
+
+        return torch.cat(outputs, dim=0)
+
+    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
+                The final hidden states of the model.
+            grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
+                The temporal, height and width of feature shape of each image in LLM.
+
+        Returns:
+            `torch.Tensor`: hidden_states.
+        """
+        hidden_states = self.patch_embed(hidden_states)
+
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+        # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos embedding
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        if sp_group is not None:
+            # We need to do padding here because of hidden_states did padding with pad_scale=4
+            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
+        hidden_states = hidden_states + pos_embeds
+
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+            dim=0,
+            # Select dtype based on the following factors:
+            #  - FA2 requires that cu_seqlens_q must have dtype int32
+            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
+            # See https://github.com/huggingface/transformers/pull/34852 for more information
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # Modifcation: Get before-sliced full seq from cu_seqlens
+        # total_seq_len should equal to seq_len when not using SP
+        total_seq_len = cu_seqlens[-1]
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos embedding
+        if sp_group is not None:
+            cos, sin = position_embeddings
+            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
+            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
+            position_embeddings = (cos, sin)
+
+        # Modification: pad cu_seqlens when using SP to match the padded hidden_states
+        if sp_group is not None:
+            ps = get_parallel_state()
+            sp_size = getattr(ps, "sp_size", 1)
+            # Calculate the last one padding seq_len : seq_len*sp_size - total_seq_len
+            pad_seq_len = seq_len * sp_size - total_seq_len.item()
+            if pad_seq_len > 0:
+                # Add this extra sequence to cu_seqlens with the padding length
+                new_cumsum = cu_seqlens[-1] + pad_seq_len
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+
+        deepstack_feature_lists = []
+        # Modification: calculate max_seqlen from cu_seqlens here to avoid per layer CPU-GPU sync
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        # Modification: move cu_seqlens to cpu when using NPU to avoid per layer CPU-GPU sync when using FA
+        if is_torch_npu_available():
+            cu_seqlens = cu_seqlens.cpu()
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            if layer_num in self.deepstack_visual_indexes:
+                deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
+                    hidden_states
+                )
+                deepstack_feature_lists.append(deepstack_feature)
+
+        hidden_states = self.merger(hidden_states)
+
+        return hidden_states, deepstack_feature_lists
+
+    def dummy_forward(self):
+        if get_parallel_state().sp_enabled:
+            sp_size = get_parallel_state().sp_size
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            # If using SP, pixel_values is sliced but grid_thw is not
+            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        else:
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+
+        return self(**dummy_data)
+>>>>>>> d02f041 ([model]chore: ruff check)
 
 
 # ================================================================
