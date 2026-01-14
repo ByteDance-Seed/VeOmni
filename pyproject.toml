@@ -108,6 +108,7 @@ lint = [
 test = [
   "pytest",
   "expecttest",
+  "rich",
 ]
 
 [tool.uv]

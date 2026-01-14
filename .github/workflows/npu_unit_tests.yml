@@ -89,8 +89,6 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra npu --extra audio --group dev
-      - name: Check final pip list
-        run: |
           uv pip list
       - name: Run parallel tests
         run: |

@@ -67,6 +67,7 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra gpu --extra audio --group dev
+          uv pip list
       - name: Run parallel tests
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
