@@ -64,6 +64,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
             fetch-depth: 0
+      - name: Install FFmpeg dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            ffmpeg libavformat-dev libavcodec-dev libswscale-dev libavutil-dev pkg-config
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra gpu --extra audio --group dev
