@@ -174,6 +174,8 @@ torchaudio = { index = "pytorch" }
 # Download flash-attn wheel directly to avoid build issues.
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' or extra == 'sglang'" }
 flash-attn-3 = { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.09.28/flash_attn_3-3.0.0b1%2B20250928.cu128torch280cxx11abitrue.5059fd-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"}
+# Download av wheel directly to avoid FFmpeg build dependency issues in CI.
+av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video'" }
 
 [[tool.uv.index]]
 name = "pytorch"

@@ -175,8 +175,10 @@ wheels = [
 [[package]]
 name = "av"
 version = "14.4.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/86/f6/0b473dab52dfdea05f28f3578b1c56b6c796ce85e76951bab7c4e38d5a74/av-14.4.0.tar.gz", hash = "sha256:3ecbf803a7fdf67229c0edada0830d6bfaea4d10bfb24f0c3f4e607cd1064b42", size = 3892203, upload-time = "2025-05-16T19:13:35.737Z" }
+source = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6bed513cbcb3437d0ae47743edc1f5b4a113c0b66cdd4e1aafc533abf5b2fbf2" },
+]
 
 [[package]]
 name = "bitsandbytes"
@@ -2641,8 +2643,8 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", marker = "extra == 'audio'", specifier = ">=14.3.0,<15.0" },
-    { name = "av", marker = "extra == 'video'", specifier = ">=14.3.0,<15.0" },
+    { name = "av", marker = "extra == 'audio'", url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
+    { name = "av", marker = "extra == 'video'", url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "bitsandbytes", marker = "extra == 'dit'", specifier = ">=0.46.0,<=0.47.0" },
     { name = "blobfile", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=2.16.0,<=2.21.0" },
