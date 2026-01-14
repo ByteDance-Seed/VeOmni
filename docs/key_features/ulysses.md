@@ -280,6 +280,6 @@ To enable Async Ulysses for an existing model, you need to:
 4. Verify that your hardware supports asynchronous operations
 
 Async Ulysses is currently available for the following models:
-- Qwen3VL
+- Qwen3VL Dense
 
 Support for more models will be added in future releases.
