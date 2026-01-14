@@ -13,6 +13,7 @@ from transformers import (
     T5TokenizerFast,
 )
 
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data.diffusion.data_loader import build_dit_dataloader
 from veomni.data.diffusion.dataset import build_text_image_dataset
@@ -33,7 +34,6 @@ from veomni.models.transformers.flux.utils_flux import FluxTextEncoder2, FluxVAE
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.schedulers.flow_match import FlowMatchScheduler
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,

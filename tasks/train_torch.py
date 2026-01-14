@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from datetime import timedelta
 from functools import partial
 from typing import Any, Dict, List
@@ -11,6 +11,8 @@ import torch.distributed as dist
 import wandb
 from tqdm import trange
 
+# from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from veomni.arguments import VeOmniArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     build_chat_template,
@@ -25,7 +27,6 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -40,11 +41,11 @@ from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 logger = helper.create_logger(__name__)
 
 
-@dataclass
-class Arguments:
-    model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
+# @dataclass
+# class Arguments:
+#     model: "ModelArguments" = field(default_factory=ModelArguments)
+#     data: "DataArguments" = field(default_factory=DataArguments)
+#     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 def main():
@@ -55,7 +56,7 @@ def main():
     logger.info(f"Process_group timeout: {nccl_timeout}")
     dist.init_process_group(backend=get_dist_comm_backend(), timeout=pg_nccl_timeout)
 
-    args = parse_args(Arguments)
+    args = parse_args(VeOmniArguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
