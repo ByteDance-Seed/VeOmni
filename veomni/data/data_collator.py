@@ -148,7 +148,14 @@ class DataCollatorWithPacking(DataCollator):
 class DataCollatorWithPositionIDs(DataCollator):
     """
     Data collator with packing by position ids.
+
+    Args:
+        mask_boundary_labels:
+            If True, mask labels at packed subsequence boundary token positions (default behavior).
+            Turn it off for sequence classification tasks.
     """
+
+    mask_boundary_labels: bool = True
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
@@ -175,7 +182,7 @@ class DataCollatorWithPositionIDs(DataCollator):
             # Still need cu_seq_lens_q for label masking even when sp_enabled
             (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
 
-        if "labels" in batch:
+        if self.mask_boundary_labels and "labels" in batch:
             batch["labels"][:, cu_seq_lens_q[1:-1]] = IGNORE_INDEX
 
         return batch
@@ -230,11 +237,20 @@ class TextSequenceShardCollator(DataCollator):
         rmpad: whether the samples is packing or not.
         rmpad_with_pos_ids: whether the samples is packing by position ids or not.
         pad_token_id: the id of the padding token.
+        shift_labels:
+            If true, shift labels so that each token is trained to predict the next token (default behavior).
+            Turn it off for sequence classification token-level labels.
+        mask_boundary_labels:
+            If True, mask labels at packed subsequence boundary token positions (default behavior).
+            Turn it off for sequence classification token-level labels.
     """
 
     rmpad: bool
     rmpad_with_pos_ids: bool
     pad_token_id: int = 0
+
+    shift_labels: bool = True
+    mask_boundary_labels: bool = True
 
     def __post_init__(self):
         self.sp_size = get_parallel_state().sp_size
@@ -278,18 +294,25 @@ class TextSequenceShardCollator(DataCollator):
 
     def __call__(self, batch: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         input_ids = batch.pop("input_ids")
-        labels = batch.pop("labels")[..., 1:].contiguous()  # shift labels
-        labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
-
-        if self.rmpad_with_pos_ids:  # mask the last token of each sequence
-            cu_seqlens = pos2culen(batch["position_ids"])
-            labels[:, cu_seqlens[1:-1] - 1] = IGNORE_INDEX
-        elif self.rmpad:
-            labels = labels.view(-1)
-            labels[batch["cu_seqlens"][1:-1] - 1] = IGNORE_INDEX
+        if self.shift_labels:
+            labels = batch.pop("labels")[..., 1:].contiguous()  # shift labels
+            labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
         else:
-            if "position_ids" not in batch:  # we should calculate the position ids before chunking
-                batch["position_ids"] = torch.arange(0, input_ids.size(-1)).unsqueeze(0)
+            labels = batch.pop("labels").contiguous()
+
+        if self.mask_boundary_labels:
+            if self.rmpad_with_pos_ids:  # mask the last token of each sequence
+                cu_seqlens = pos2culen(batch["position_ids"])
+                labels[:, cu_seqlens[1:-1] - 1] = IGNORE_INDEX
+            elif self.rmpad:
+                labels = labels.view(-1)
+                labels[batch["cu_seqlens"][1:-1] - 1] = IGNORE_INDEX
+            else:
+                if "position_ids" not in batch:  # we should calculate the position ids before chunking
+                    batch["position_ids"] = torch.arange(0, input_ids.size(-1)).unsqueeze(0)
+        else:
+            if (not self.rmpad_with_pos_ids) and (not self.rmpad) and ("position_ids" not in batch):
+                batch["position_ids"] = torch.arange(0, input_ids.size(-1), device=input_ids.device).unsqueeze(0)
 
         # sp padding
         seq_length = input_ids.size(-1)
