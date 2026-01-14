@@ -163,7 +163,7 @@ loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
 return loss
 ```
 
-## Experimental feature: Async Ulysses CP
+## ⚡ Async Ulysses CP
 
 We also support **Async Ulysses** which further improves performance by overlapping communication and computation, reducing communication latency and improving hardware utilization.
 
@@ -184,12 +184,11 @@ By overlapping communication and computation, Async Ulysses:
 To enable Async Ulysses, simply set the `async_enabled` parameter to `True`:
 
 ```shell
-bash train.sh tasks/multimodal/omni/train_qwen2_5_vl.py configs/multimodal/qwen2_5_vl/qwen2_5_vl_fsdp1.yaml \
-    --model.model_path YOUR_MODEL_PATH \
-    --data.train_path YOUR_DATA_PATH \
+bash train.sh tasks/multimodal/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --train.ulysses_parallel_size 4 \
     --train.async_enabled true
 ```
+
 
 ### Core API
 
@@ -278,6 +277,6 @@ To enable Async Ulysses for an existing model, you need to:
 4. Verify that your hardware supports asynchronous operations
 
 Async Ulysses is currently available for the following models:
-- Qwen3VL (dense variant)
+- Qwen3VL
 
 Support for more models will be added in future releases.
