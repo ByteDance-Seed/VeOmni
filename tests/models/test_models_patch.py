@@ -87,8 +87,8 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
         res[mode] = run_step(idx, mode)
 
     assert len(res) == len(hf_model_modes) + len(veomni_model_modes)
-    print_all_values(res, "loss")
-    print_all_values(res, "gnorm")
+    print_all_values(res, "loss", config.model_type)
+    print_all_values(res, "gnorm", config.model_type)
     compare_multi_items(res, rtol=rtol, atol=atol)
 
     gc.collect()

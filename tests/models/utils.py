@@ -218,11 +218,11 @@ def train_one_step(model, optimizer, inputs):
     return loss, gnorm
 
 
-def print_all_values(output_dict, value_key):
+def print_all_values(output_dict, value_key: str, model_type: str = ""):
     console = Console()
     first_mode = next(iter(output_dict.keys()))
 
-    table = Table(title=f"Alignment Result: [bold magenta]{value_key}[/bold magenta]")
+    table = Table(title=f"Alignment Result: [bold magenta]{model_type} {value_key}[/bold magenta]")
     mode_fields = [f.name for f in fields(first_mode) if f.name != "sync_weight_func"]
 
     for field in mode_fields:
