@@ -23,6 +23,7 @@ from veomni.data.multimodal.audio_utils import fetch_audios
 from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.data.multimodal.video_utils import fetch_videos
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -503,16 +504,11 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            if hasattr(grad_norm, "full_tensor"):
-                grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)

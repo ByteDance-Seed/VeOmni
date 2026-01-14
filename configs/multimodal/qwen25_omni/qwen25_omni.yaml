@@ -24,7 +24,8 @@ data:
 
 train:
   output_dir: qwen2_5_omni_sft
-  data_parallel_mode: fsdp1
+  init_device: meta
+  data_parallel_mode: fsdp2
   wandb_project: qwen2_5_omni
   wandb_name: qwen2_5_omni
   rmpad: false
