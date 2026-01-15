@@ -106,6 +106,7 @@ lint = [
   "ruff",
 ]
 test = [
+  "rich",
   "pytest",
   "expecttest",
 ]

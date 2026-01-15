@@ -12,37 +12,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-"""Argument utils"""
-
-import argparse
-import json
 import math
 import os
-import sys
-import types
-from collections import defaultdict
-from dataclasses import MISSING, asdict, dataclass, field, fields
-from enum import Enum
-from inspect import isclass
-from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union, get_type_hints
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal, Optional
 
-import yaml
+from ..utils import logging
 
-
-try:
-    from hdfs_io import copy, exists, makedirs  # for internal use only
-except ImportError:
-    from .hdfs_io import copy, exists, makedirs
-
-from . import helper, logging
-
-
-T = TypeVar("T")
 
 logger = logging.get_logger(__name__)
 
 
+# ================================ Sub Training Arguments ======================================
+@dataclass
+class ParallelArguments:
+    pass
+
+
+@dataclass
+class ProfileArguments:
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable profiling."},
+    )
+    start_step: int = field(
+        default=1,
+        metadata={"help": "Start step for profiling."},
+    )
+    end_step: int = field(
+        default=2,
+        metadata={"help": "End step for profiling."},
+    )
+    trace_dir: Optional[str] = field(
+        default="./trace",
+        metadata={"help": "Directory to save profiling traces."},
+    )
+    record_shapes: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to record the shapes of the input tensors."},
+    )
+    profile_memory: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to profile the memory usage."},
+    )
+    with_stack: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to record the stack traces."},
+    )
+    rank0_only: bool = field(
+        default=True,
+        metadata={
+            "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
+        },
+    )
+
+
+# ================================ Base Arguments ======================================
 @dataclass
 class ModelArguments:
     config_path: Optional[str] = field(
@@ -635,7 +660,7 @@ class TrainingArguments:
             self.dataloader_batch_size = self.global_batch_size // self.data_parallel_size  # = micro bsz * grad accu
 
         if self.load_checkpoint_path == "auto":
-            from .checkpoint_utils import get_checkpoint_path
+            from ..utils.checkpoint_utils import get_checkpoint_path
 
             self.load_checkpoint_path = get_checkpoint_path(
                 output_dir=self.output_dir, is_local_rank0=self.local_rank == 0, ckpt_manager=self.ckpt_manager
@@ -694,6 +719,17 @@ class TrainingArguments:
 
 
 @dataclass
+class VeOmniArguments:
+    model: ModelArguments = field(default_factory=ModelArguments)
+    data: DataArguments = field(default_factory=DataArguments)
+    train: TrainingArguments = field(default_factory=TrainingArguments)
+
+    def __post_init__(self):
+        pass
+
+
+# ================================ Infer Arguments ======================================
+@dataclass
 class InferArguments:
     model_path: str = field(
         metadata={"help": "Local path/HDFS path to the pre-trained model."},
@@ -726,215 +762,3 @@ class InferArguments:
     def __post_init__(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
-
-
-def _string_to_bool(value: Union[bool, str]) -> bool:
-    """
-    Converts a string input to bool value.
-
-    Taken from: https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
-    """
-    if isinstance(value, bool):
-        return value
-    if value.lower() in ("yes", "true", "t", "y", "1"):
-        return True
-    if value.lower() in ("no", "false", "f", "n", "0"):
-        return False
-    raise argparse.ArgumentTypeError(
-        f"Truthy value expected: got {value} but expected one of yes/no, true/false, t/f, y/n, 1/0 (case insensitive)."
-    )
-
-
-def _convert_str_dict(input_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Safely checks that a passed value is a dictionary and converts any string values to their appropriate types.
-
-    Taken from: https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/training_args.py#L189
-    """
-    for key, value in input_dict.items():
-        if isinstance(value, dict):
-            input_dict[key] = _convert_str_dict(value)
-        elif isinstance(value, str):
-            if value.lower() in ("true", "false"):  # check for bool
-                input_dict[key] = value.lower() == "true"
-            elif value.isdigit():  # check for digit
-                input_dict[key] = int(value)
-            elif value.replace(".", "", 1).isdigit():
-                input_dict[key] = float(value)
-
-    return input_dict
-
-
-def _make_choice_type_function(choices: List[Any]) -> Callable[[str], Any]:
-    """
-    Creates a mapping function from each choices string representation to the actual value. Used to support multiple
-    value types for a single argument.
-
-    Based on: https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/hf_argparser.py#L48
-
-    Args:
-        choices (list): List of choices.
-
-    Returns:
-        Callable[[str], Any]: Mapping function from string representation to actual value for each choice.
-    """
-    str_to_choice = {str(choice): choice for choice in choices}
-    return lambda arg: str_to_choice.get(arg, arg)
-
-
-def parse_args(rootclass: T) -> T:
-    """
-    Parses the root argument class using the CLI inputs or yaml inputs.
-
-    Based on: https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/hf_argparser.py#L266
-    """
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    base_to_subclass = {}
-    dict_fields = set()
-    for subclass in fields(rootclass):
-        base = subclass.name
-        base_to_subclass[base] = subclass.default_factory
-        try:
-            type_hints: Dict[str, type] = get_type_hints(subclass.default_factory)
-        except Exception:
-            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.")
-
-        for attr in fields(subclass.default_factory):
-            if not attr.init:
-                continue
-
-            attr_type = type_hints[attr.name]
-            origin_type = getattr(attr_type, "__origin__", attr_type)
-            if isinstance(attr_type, str):
-                raise RuntimeError(f"Cannot resolve type {attr.type} of {attr.name}.")
-
-            if origin_type is Union or (hasattr(types, "UnionType") and isinstance(origin_type, types.UnionType)):
-                if len(attr_type.__args__) != 2 or type(None) not in attr_type.__args__:  # only allows Optional[X]
-                    raise RuntimeError(f"Cannot resolve type {attr.type} of {attr.name}.")
-
-                if bool not in attr_type.__args__:  # except for `Union[bool, NoneType]`
-                    attr_type = (
-                        attr_type.__args__[0] if isinstance(None, attr_type.__args__[1]) else attr_type.__args__[1]
-                    )
-                    origin_type = getattr(attr_type, "__origin__", attr_type)
-
-            parser_kwargs = attr.metadata.copy()
-            if origin_type is Literal or (isinstance(attr_type, type) and issubclass(attr_type, Enum)):
-                if origin_type is Literal:
-                    parser_kwargs["choices"] = attr_type.__args__
-                else:
-                    parser_kwargs["choices"] = [x.value for x in attr_type]
-
-                parser_kwargs["type"] = _make_choice_type_function(parser_kwargs["choices"])
-
-                if attr.default is not MISSING:
-                    parser_kwargs["default"] = attr.default
-                else:
-                    parser_kwargs["required"] = True
-
-            elif attr_type is bool or attr_type == Optional[bool]:
-                parser_kwargs["type"] = _string_to_bool
-                if attr_type is bool or (attr.default is not None and attr.default is not MISSING):
-                    parser_kwargs["default"] = False if attr.default is MISSING else attr.default
-                    parser_kwargs["nargs"] = "?"
-                    parser_kwargs["const"] = True
-
-            elif isclass(origin_type) and issubclass(origin_type, list):
-                parser_kwargs["type"] = attr_type.__args__[0]
-                parser_kwargs["nargs"] = "+"
-                if attr.default_factory is not MISSING:
-                    parser_kwargs["default"] = attr.default_factory()
-                elif attr.default is MISSING:
-                    parser_kwargs["required"] = True
-
-            elif isclass(origin_type) and issubclass(origin_type, dict):
-                parser_kwargs["type"] = str  # parse dict inputs with json string
-                dict_fields.add(f"{base}.{attr.name}")
-                if attr.default_factory is not MISSING:
-                    parser_kwargs["default"] = str(attr.default_factory())
-                elif attr.default is MISSING:
-                    parser_kwargs["required"] = True
-
-            else:
-                parser_kwargs["type"] = attr_type
-                if attr.default is not MISSING:
-                    parser_kwargs["default"] = attr.default
-                elif attr.default_factory is not MISSING:
-                    parser_kwargs["default"] = attr.default_factory()
-                else:
-                    parser_kwargs["required"] = True
-
-            parser.add_argument(f"--{base}.{attr.name}", **parser_kwargs)
-
-    cmd_args = sys.argv[1:]
-    cmd_args_string = "=".join(cmd_args)  # use `=` to mark the end of arg name
-    input_data = {}
-    if cmd_args[0].endswith(".yaml") or cmd_args[0].endswith(".yml"):
-        input_path = cmd_args.pop(0)
-        with open(os.path.abspath(input_path), encoding="utf-8") as f:
-            input_data: Dict[str, Dict[str, Any]] = yaml.safe_load(f)
-
-    elif cmd_args[0].endswith(".json"):
-        input_path = cmd_args.pop(0)
-        with open(os.path.abspath(input_path), encoding="utf-8") as f:
-            input_data: Dict[str, Dict[str, Any]] = json.load(f)
-
-    for base, arg_dict in input_data.items():
-        for arg_name, arg_value in arg_dict.items():
-            if f"--{base}.{arg_name}=" not in cmd_args_string:  # lower priority
-                cmd_args.append(f"--{base}.{arg_name}")
-                if isinstance(arg_value, str):
-                    cmd_args.append(arg_value)
-                elif isinstance(arg_value, list):
-                    cmd_args.extend(str(x) for x in arg_value)
-                else:
-                    cmd_args.append(json.dumps(arg_value))
-    args, remaining_args = parser.parse_known_args(cmd_args)
-    if remaining_args:
-        logger.warning(f"Some specified arguments are not used by the ArgumentParser: {remaining_args}")
-
-    parse_result = defaultdict(dict)
-    for key, value in vars(args).items():
-        if key in dict_fields:
-            if isinstance(value, str) and value.startswith("{"):
-                value = _convert_str_dict(json.loads(value))
-            else:
-                raise ValueError(f"Expect a json string for dict argument, but got {value}")
-
-        base, name = key.split(".", maxsplit=1)
-        parse_result[base][name] = value
-
-    data_classes = {}
-    for base, subclass_type in base_to_subclass.items():
-        data_classes[base] = subclass_type(**parse_result.get(base, {}))
-
-    return rootclass(**data_classes)
-
-
-def save_args(args: T, output_path: str) -> None:
-    """
-    Saves arguments to a json file.
-
-    Args:
-        args (dataclass): Arguments.
-        output_path (str): Output path.
-    """
-    if output_path.startswith("hdfs://"):
-        local_dir = helper.get_cache_dir()
-        remote_dir = output_path
-    else:
-        logger.warning_once("Recommend to use hdfs path or hdfs_fuse path as the output path.")
-        local_dir = output_path
-        remote_dir = None
-
-    os.makedirs(local_dir, exist_ok=True)
-    local_path = os.path.join(local_dir, "veomni_cli.yaml")
-    with open(local_path, "w") as f:
-        f.write(yaml.safe_dump(asdict(args), default_flow_style=False))
-
-    if remote_dir is not None:
-        if not exists(remote_dir):
-            makedirs(remote_dir)
-
-        remote_path = os.path.join(remote_dir, "veomni_cli.yaml")
-        copy(local_path, helper.convert_hdfs_fuse_path(remote_path))

@@ -18,7 +18,7 @@ RUN apt-get update -y && \
 
 # Install apt packages.
 RUN apt-get update -y && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates ffmpeg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
     pip install --upgrade pip setuptools packaging && \

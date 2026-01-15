@@ -163,11 +163,13 @@ loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
 return loss
 ```
 
-## Experimental feature: Async Ulysses CP
+## ⚡ Async Ulysses CP
 
 We also support **Async Ulysses** which further improves performance by overlapping communication and computation, reducing communication latency and improving hardware utilization.
 
 ### Asynchronous Ulysses
+
+![async_ulysses](../assets/async_ulysses.jpg)
 
 VeOmni extends the original Ulysses implementation with asynchronous communication capabilities, further improving performance by overlapping communication and computation.
 
@@ -175,7 +177,6 @@ VeOmni extends the original Ulysses implementation with asynchronous communicati
 
 By overlapping communication and computation, Async Ulysses:
 - Reduces idle time during communication operations
-- Improves XPU utilization
 - Lowers end-to-end training time
 - Maintains nearly the same memory efficiency as original Ulysses
 
@@ -183,15 +184,16 @@ By overlapping communication and computation, Async Ulysses:
 
 To enable Async Ulysses, simply set the `async_enabled` parameter to `True`:
 
+Notice: Async Ulysses works when `ulysses_parallel_size > 1`.
+
 ```shell
-bash train.sh tasks/multimodal/omni/train_qwen2_5_vl.py configs/multimodal/qwen2_5_vl/qwen2_5_vl_fsdp1.yaml \
-    --model.model_path YOUR_MODEL_PATH \
-    --data.train_path YOUR_DATA_PATH \
+bash train.sh tasks/multimodal/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --train.ulysses_parallel_size 4 \
     --train.async_enabled true
 ```
 
-### Core API
+
+### API
 
 1. async_ulysses_qkv_projection
 
@@ -272,12 +274,12 @@ Args:
 
 To enable Async Ulysses for an existing model, you need to:
 
-1. Check if Async Ulysses is supported for your model (currently supported for Qwen3VL)
+1. Check if Async Ulysses is supported for your model (currently supported for Qwen3VL Dense)
 2. Set `async_enabled=True` in your training configuration
-3. Ensure you're using Flash Attention 2.0
+3. Ensure you're using Flash Attention 2.0 and Ulysses Context Parallelism is **enabled**
 4. Verify that your hardware supports asynchronous operations
 
 Async Ulysses is currently available for the following models:
-- Qwen3VL (dense variant)
+- Qwen3VL Dense
 
 Support for more models will be added in future releases.

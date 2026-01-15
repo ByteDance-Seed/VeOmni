@@ -6,12 +6,12 @@ import requests
 import torch
 from PIL import Image
 
+from veomni.arguments import InferArguments, parse_args
 from veomni.data import build_multimodal_chat_template
 from veomni.data.multimodal.multimodal_transform import mask_input_ids
 from veomni.models import build_foundation_model, build_processor
 from veomni.models.seed_omni import SeedOmniModel, SeedOmniProcessor
 from veomni.utils import helper
-from veomni.utils.arguments import InferArguments, parse_args
 from veomni.utils.device import get_device_type
 
 

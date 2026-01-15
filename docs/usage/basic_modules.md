@@ -36,7 +36,7 @@ veomni offers a unified argument management system, which can be easily extended
 
 ```python
 from dataclasses import dataclass, field
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 
 @dataclass
 class Arguments:

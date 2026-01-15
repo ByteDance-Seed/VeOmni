@@ -10,6 +10,7 @@ import yaml
 from transformers import PretrainedConfig
 from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
 
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_dataloader,
@@ -17,7 +18,6 @@ from veomni.data import (
 )
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.helper import get_cache_dir
 
