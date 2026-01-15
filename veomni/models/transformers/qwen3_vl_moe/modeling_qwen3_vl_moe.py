@@ -544,7 +544,7 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
         if pixel_values_videos is not None:
             # --- Patch.4 ---
             video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            # Modification: sequence parallel patch for video embeds
+            # sequence parallel patch for video embeds
             if get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 video_embeds = gather_seq_scatter_heads(
@@ -559,13 +559,13 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                 video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
 
-            # Modification: Slice tensor to drop any padded video tokens
+            # Slice tensor to drop any padded video tokens
             video_embeds = video_embeds[:n_video_tokens]
             deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-            # Modification: sequence parallel patch for video_mask & deepstack_video_embeds
+            # sequence parallel patch for video_mask & deepstack_video_embeds
             if get_parallel_state().sp_enabled:
                 seq_len = video_mask.shape[1]
 
@@ -708,24 +708,29 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
 
 
 # ================================================================
-# Modification: Qwen3VLMoeForConditionalGeneration
+# Patch: Qwen3VLMoeForConditionalGeneration
 # 1. wrapped Qwen3VLMoeModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 # 2. use the unified loss function to handle Ulysses internally to reduce redudnecy code
 # ================================================================
 
 
-# Modification 1
+# --- Patch.1 ---
 def get_position_id(main_func, self, **kwargs):
     # must be a global func for multiproceesing serialize
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
+# --- Patch.1 ---
+
+
 class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
-    # Modification: add the get_position_id_func to be used in data_transform
+    # --- Patch.1 ---
     def get_position_id_func(self):
         fake_model = SimpleNamespace(config=self.config)
         return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
+
+    # --- Patch.1 ---
 
     @check_model_inputs()
     def forward(
@@ -814,7 +819,7 @@ class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
-        # Modification 2
+        # --- Patch.2 ---
         hidden_states = hidden_states[:, slice_indices, :]
         loss = None
         logits = None
@@ -829,6 +834,7 @@ class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
             )
         else:
             logits = self.lm_head(hidden_states)
+        # --- Patch.2 ---
 
         aux_loss = None
         if kwargs.get("output_router_logits", False):

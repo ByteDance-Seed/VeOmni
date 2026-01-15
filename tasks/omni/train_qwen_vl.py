@@ -11,7 +11,6 @@ import wandb
 from tqdm import trange
 
 from tasks.data.vlm_data_process import (
-    prepare_fa_kwargs_from_position_ids,
     process_sample_qwen2_5_vl,
     process_sample_qwen3_vl,
 )
@@ -40,6 +39,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 
 if TYPE_CHECKING:
@@ -233,6 +233,7 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
+    model.language_model.layers = torch.nn.ModuleList(model.language_model.layers[:2])  # clip layers
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
@@ -346,20 +347,16 @@ def main():
                     micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
-                # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)
-                # data collator adds batch dim -> (1, dim, seq_len) for unified SP slicing
-                # transpose back to (dim, 1, seq_len) for QwenVL compatibility
-                if micro_batch["position_ids"].shape[1] == 3:
-                    micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
-
                 # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
+                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                    micro_batch["position_ids"][:, 0, :]
+                )
                 micro_batch.update(
                     dict(
-                        cu_seq_lens_q=fa_kwargs["cu_seq_lens_q"],
-                        cu_seq_lens_k=fa_kwargs["cu_seq_lens_k"],
-                        max_length_q=fa_kwargs["max_length_q"],
-                        max_length_k=fa_kwargs["max_length_k"],
+                        cu_seq_lens_q=cu_seq_lens_q,
+                        cu_seq_lens_k=cu_seq_lens_k,
+                        max_length_q=max_length_q,
+                        max_length_k=max_length_k,
                     )
                 )
 
