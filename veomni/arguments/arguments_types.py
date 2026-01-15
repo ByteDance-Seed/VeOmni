@@ -15,6 +15,44 @@ class ParallelArguments:
     pass
 
 
+@dataclass
+class ProfileArguments:
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable profiling."},
+    )
+    start_step: int = field(
+        default=1,
+        metadata={"help": "Start step for profiling."},
+    )
+    end_step: int = field(
+        default=2,
+        metadata={"help": "End step for profiling."},
+    )
+    trace_dir: Optional[str] = field(
+        default="./trace",
+        metadata={"help": "Directory to save profiling traces."},
+    )
+    record_shapes: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to record the shapes of the input tensors."},
+    )
+    profile_memory: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to profile the memory usage."},
+    )
+    with_stack: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to record the stack traces."},
+    )
+    rank0_only: bool = field(
+        default=True,
+        metadata={
+            "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
+        },
+    )
+
+
 # ================================ Base Arguments ======================================
 @dataclass
 class ModelArguments:
