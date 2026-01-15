@@ -3,7 +3,7 @@ import dataclasses
 import os
 from dataclasses import asdict, is_dataclass
 from enum import Enum
-from typing import Any, Dict, Type, TypeVar, Union, get_type_hints
+from typing import Any, Dict, Literal, Type, TypeVar, Union, get_type_hints
 
 import yaml
 
@@ -83,6 +83,9 @@ def _add_arguments_recursive(parser: argparse.ArgumentParser, cls: Type[Any], pr
             elif hasattr(field_type, "__origin__") and field_type.__origin__ is list:
                 kwargs["nargs"] = "+"
                 kwargs["type"] = field_type.__args__[0]
+            elif hasattr(field_type, "__origin__") and field_type.__origin__ is Literal:
+                kwargs["choices"] = list(field_type.__args__)
+                kwargs["type"] = type(field_type.__args__[0])
             else:
                 kwargs["type"] = field_type
 
