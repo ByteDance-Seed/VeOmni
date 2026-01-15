@@ -63,11 +63,11 @@ from ....distributed.sequence_parallel.async_ulysses import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
-from ....utils import helper
+from ....utils import logging
 from ....utils.device import IS_NPU_AVAILABLE
 
 
-logger = helper.create_logger(__name__)
+logger = logging.get_logger(__name__)
 
 
 # ================================================================

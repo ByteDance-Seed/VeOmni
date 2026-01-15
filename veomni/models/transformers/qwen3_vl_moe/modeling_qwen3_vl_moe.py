@@ -57,11 +57,11 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....ops import fused_moe_forward
-from ....utils import helper
+from ....utils import logging
 from ....utils.device import is_torch_npu_available
 
 
-logger = helper.create_logger(__name__)
+logger = logging.get_logger(__name__)
 
 
 # ================================================================
