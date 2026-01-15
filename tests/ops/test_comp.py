@@ -37,7 +37,6 @@ def generate_grid_thw(
         grid_thw[i, 0] = t
         grid_thw[i, 1] = h*spatial_merge_size
         grid_thw[i, 2] = w*spatial_merge_size
-    # print(f"{grid_thw=}")
     return grid_thw
 
 def fast_pos_embed_interpolate_ref(self, grid_thw):
@@ -169,9 +168,9 @@ def test_fn(args, model, grid_thw, ref_fn, test_fn):
     synchronize()
     test_time = time.time() - start_time
 
-    print(f"Reference time: {ref_time:.6f} seconds")
-    print(f"Test time: {test_time:.6f} seconds")
-    print(f"Speedup: {ref_time / test_time:.2f}x")
+    print(f"Reference time: {ref_time/args.iters:.6f} seconds")
+    print(f"Test time: {test_time/args.iters:.6f} seconds")
+    print(f"Speedup: {(ref_time - test_time) / ref_time:.2f}x")
 
     return ref_result, test_result
 
@@ -189,8 +188,9 @@ def main(args):
         return
 
     grid_thw = generate_grid_thw(batch=args.batch, spatial_merge_size=dummy_model.spatial_merge_size, device=args.device)
+    print(f"grid_thw: {grid_thw}")
     test_fn(args, dummy_model, grid_thw, fast_pos_embed_interpolate_ref, dummy_model.fast_pos_embed_interpolate)
-    test_fn(args, dummy_model, grid_thw, rot_pos_embed_ref, dummy_model.rot_pos_embed)
+    test_fn(args, dummy_model, grid_thw, rot_pos_embed_ref, dummy_model.rot_pos_emb)
 
 
 if __name__ == "__main__":
