@@ -235,7 +235,7 @@ class Qwen3VLVisionAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if self.config._attn_implementation == "flash_attention_2":
+        if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
             # Flash Attention 2: Use cu_seqlens for variable length attention
             attn_output, _ = attention_interface(
                 self,
