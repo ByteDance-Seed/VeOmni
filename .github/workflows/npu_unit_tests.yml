@@ -65,7 +65,6 @@ jobs:
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
-          echo "Current proxy: $CURRENT_PROXY"
           echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
           echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
           echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
@@ -82,10 +81,6 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
-      - name: Install ffmpeg
-        run: |
-          apt-get update
-          apt-get install -y ffmpeg
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra npu --extra audio --group dev
