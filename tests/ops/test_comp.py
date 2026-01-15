@@ -1,9 +1,11 @@
 import argparse
-import torch
 import time
 
-from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel, Qwen3VLVisionConfig
+import torch
+
+from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionConfig, Qwen3VLVisionModel
 from veomni.utils.device import synchronize
+
 
 npu_available = True
 try:
@@ -11,14 +13,19 @@ try:
 except ImportError:
     npu_available = False
 
+'''
+Usage:
+    python tests/ops/test_comp.py --warmups 10 --iters 100 --batch 20
+'''
+
 
 def generate_grid_thw(
-    batch: int, 
+    batch: int,
     spatial_merge_size: int,
     min_t=1,
     max_t=4,
-    min_hw=14, 
-    max_hw=56, 
+    min_hw=14,
+    max_hw=56,
     device="cpu"
 ):
     grid_thw = torch.zeros((batch, 3), dtype=torch.long, device=device)
@@ -30,7 +37,7 @@ def generate_grid_thw(
         grid_thw[i, 0] = t
         grid_thw[i, 1] = h*spatial_merge_size
         grid_thw[i, 2] = w*spatial_merge_size
-    print(f"{grid_thw=}")
+    # print(f"{grid_thw=}")
     return grid_thw
 
 def fast_pos_embed_interpolate_ref(self, grid_thw):
@@ -139,11 +146,11 @@ def test_fn(args, model, grid_thw, ref_fn, test_fn):
     # warmup
     for _ in range(args.warmups):
         ref_fn(model, grid_thw)
-        test_fn(model, grid_thw)
+        test_fn(grid_thw)
 
     # test for bitwise equal
     ref_result = ref_fn(model, grid_thw)
-    test_result = test_fn(model, grid_thw)
+    test_result = test_fn(grid_thw)
     assert torch.allclose(ref_result, test_result, equal_nan=True)
     print("Bitwise equal test passed!")
 
@@ -158,7 +165,7 @@ def test_fn(args, model, grid_thw, ref_fn, test_fn):
     synchronize()
     start_time = time.time()
     for _ in range(args.iters):
-        test_fn(model, grid_thw)
+        test_fn(grid_thw)
     synchronize()
     test_time = time.time() - start_time
 
@@ -188,11 +195,11 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--warmups", type=int, default=10)
+    parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--batch", type=int, default=20)
     args = parser.parse_args()
-    args.device = torch.device("cuda" if torch.cuda.is_available() else 
+    args.device = torch.device("cuda" if torch.cuda.is_available() else
                                "npu" if npu_available else "cpu")
     print(f"{args=}")
     main(args)
