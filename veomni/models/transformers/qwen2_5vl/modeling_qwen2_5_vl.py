@@ -1986,6 +1986,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_mask = kwargs["image_mask"] if "image_mask" in kwargs else None
+        video_mask = kwargs["video_mask"] if "video_mask" in kwargs else None
 
         # sp patch: get full sequence dimension of input embeds
         if inputs_embeds is None:
@@ -2022,17 +2023,19 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
                 video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+                if self.training and get_parallel_state().sp_enabled:
+                    video_embeds = gather_seq_scatter_heads(
+                        video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                    )
+                n_video_tokens = video_mask.sum().long().item()
+                video_embeds = video_embeds[:n_video_tokens]
                 n_video_features = video_embeds.shape[0]
                 if n_video_tokens != n_video_features:
                     raise ValueError(
                         f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
                     )
 
-                mask = input_ids == self.config.video_token_id
-                mask_unsqueezed = mask.unsqueeze(-1)
-                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                video_mask = mask_expanded.to(inputs_embeds.device)
+                video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
 
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
@@ -2080,7 +2083,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         elif position_ids is not None:
-            if position_ids.shape[1] == 3:  # TODO: unify position_ids to bs, dim, l
+            if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, dim, l -> dim, bs, l
 
         outputs = self.model(
