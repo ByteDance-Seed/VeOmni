@@ -55,6 +55,7 @@ from ....distributed.sequence_parallel import (
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops import fused_moe_forward
 from ....utils import helper
+from ....utils.data_balance.data_balance import EncoderDataBalance
 from ....utils.device import is_torch_npu_available
 
 
@@ -726,6 +727,7 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         )
 
         self.gradient_checkpointing = False
+        self.data_balance = EncoderDataBalance(spatial_merge_unit=self.spatial_merge_unit)
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size
@@ -838,6 +840,7 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        self.data_balance.balance_data(pixel_values=hidden_states, grid_thw=grid_thw)
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -908,6 +911,8 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
                 deepstack_feature_lists.append(deepstack_feature)
 
         hidden_states = self.merger(hidden_states)
+
+        hidden_states, deepstack_feature_lists = self.data_balance.data_bridge(hidden_states, deepstack_feature_lists)
 
         return hidden_states, deepstack_feature_lists
 
