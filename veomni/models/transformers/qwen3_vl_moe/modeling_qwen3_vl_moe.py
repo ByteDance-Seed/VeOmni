@@ -165,7 +165,8 @@ def get_parallel_plan(self):
 
 # ================================================================
 # Patch: Qwen3VLMoeVisionAttention.forward
-# 1. use precomputed max_seqlen in advance to avoid per-layer cpu-gpu sync
+# 1. add flash_attention_3 support
+# 2. use precomputed max_seqlen in advance to avoid per-layer cpu-gpu sync
 # ================================================================
 def Qwen3VLMoeVisionAttention_forward(
     self: Qwen3VLMoeVisionAttention,
@@ -191,11 +192,13 @@ def Qwen3VLMoeVisionAttention_forward(
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-    if self.config._attn_implementation == "flash_attention_2":
+    # --- Patch.1 ---
+    if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
+        # --- Patch.1 ---
         # Flash Attention 2: Use cu_seqlens for variable length attention
-        # --- Patch.1 ---
+        # --- Patch.2 ---
         # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        # --- Patch.1 ---
+        # --- Patch.2 ---
         attn_output, _ = attention_interface(
             self,
             query_states,
