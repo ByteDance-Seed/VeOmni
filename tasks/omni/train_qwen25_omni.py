@@ -3,18 +3,13 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
 from tqdm import trange
 
-from tasks.data.vlm_data_process import (
-    process_sample_qwen2_5_vl,
-    process_sample_qwen3_vl,
-)
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     OmniDataCollatorWithPacking,
@@ -22,15 +17,21 @@ from veomni.data import (
     OmniSequenceShardCollator,
     build_dataloader,
     build_dataset,
-    build_multimodal_chat_template,
 )
+from veomni.data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.data.multimodal.audio_utils import fetch_audios
+from veomni.data.multimodal.image_utils import fetch_images
+from veomni.data.multimodal.preprocess import conv_preprocess
+from veomni.data.multimodal.video_utils import fetch_videos
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
+from veomni.models.transformers.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -38,44 +39,144 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
-from veomni.utils.loss_utils import count_loss_token, mean_global_loss
-from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
+from veomni.utils.model_utils import pretty_print_trainable_parameters
 
 
 if TYPE_CHECKING:
-    pass
+    from transformers import ProcessorMixin
+
 
 logger = helper.create_logger(__name__)
 
-MAX_PIXELS = 768 * 28 * 28
-ROLE_MAPPING = {
-    "human": "user",
-    "gpt": "assistant",
-}
+SYSTEM_MESSAGE = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating text and speech."
+)
 
 
-def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
-    vit_params, other_params = [], []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if "visual" in name:
-                vit_params.append(param)
-            else:
-                other_params.append(param)
+def process_sample(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    position_id_func: "Callable",
+    **kwargs,
+):
+    """
+    Processes multimodal example with qwen2_5_vl's pre-processor.
+    """
+    source = (
+        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+    )  # source_name if use multisource_dataset
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
+    conversations = conv_preprocess(source, conversations, **kwargs)
+    input_conversations = [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": SYSTEM_MESSAGE,
+                },
+            ],
+        },
+    ]
+    for conversation in conversations:
+        contents = []
+        for message in conversation[1:]:
+            contents.append({"type": message[0], message[0]: message[1]})
+        tmp_conv = {
+            "role": conversation[0],
+            "content": contents,
+        }
+        input_conversations.append(tmp_conv)
+    text = processor.apply_chat_template(input_conversations, tokenize=False)
 
-    return [{"params": vit_params, "lr": vit_lr}, {"params": other_params, "lr": default_lr}]
+    images = sample.get("images", [])
+    if images:
+        images = fetch_images(images, **kwargs)
+    else:
+        images = []
 
+    videos = sample.get("videos", [])
+    if videos:
+        videos, video_audios = fetch_videos(videos, **kwargs)
+    else:
+        videos, video_audios = [], []
 
-@dataclass
-class MyTrainingArguments(TrainingArguments):
-    freeze_vit: bool = field(
-        default=False,
-        metadata={"help": "Whether or not to freeze the vit parameters."},
+    audios = sample.get("audios", [])
+    if audios:
+        audio_audios = fetch_audios(audios, **kwargs)
+    else:
+        audio_audios = []
+
+    audios = []
+    for item in input_conversations:
+        for content in item["content"]:
+            if content["type"] == "video":
+                audios.append(video_audios.pop(0))
+            elif content["type"] == "audio":
+                audios.append(audio_audios.pop(0))
+
+    model_inputs = processor(
+        text=text,
+        audios=audios,
+        images=images,
+        videos=videos,
+        return_tensors="pt",
+        padding=True,
     )
-    vit_lr: float = field(
-        default=1e-6,
-        metadata={"help": "Maximum learning rate for vit parameters."},
-    )
+    model_inputs = model_inputs.data  # batch_feature to dict
+    # process audio inputs:
+    input_features = model_inputs.pop("input_features", None)
+    feature_attention_mask = model_inputs.pop("feature_attention_mask", None)
+    if feature_attention_mask is not None:
+        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+        valid_mask = audio_feature_lengths != 0  # filter videos without audios
+        input_features = input_features[valid_mask].permute(0, 2, 1)[
+            feature_attention_mask[valid_mask].bool()
+        ]  # l, dim
+
+    if feature_attention_mask is None or input_features.shape[0] == 0:
+        audio_feature_lengths = None
+    else:
+        model_inputs["input_features"] = input_features
+        model_inputs["audio_feature_lengths"] = audio_feature_lengths
+
+    input_ids = model_inputs["input_ids"].squeeze(0)
+    image_mask = input_ids == 151655
+    video_mask = input_ids == 151656
+    audio_mask = input_ids == 151646
+    input_ids[image_mask] = IMAGE_INPUT_INDEX
+    input_ids[video_mask] = VIDEO_INPUT_INDEX
+    input_ids[audio_mask] = AUDIO_INPUT_INDEX
+
+    model_inputs["position_ids"] = position_id_func(
+        input_ids=input_ids.unsqueeze(0),
+        image_grid_thw=model_inputs.get("image_grid_thw", None),
+        video_grid_thw=model_inputs.get("video_grid_thw", None),
+        attention_mask=model_inputs["attention_mask"],
+        audio_seqlens=audio_feature_lengths,
+        second_per_grids=model_inputs.pop("video_second_per_grid", None),
+    )["position_ids"]  # (dim, l)
+
+    model_inputs["position_ids"] = model_inputs["position_ids"].clone()
+    model_inputs["image_mask"] = image_mask
+    model_inputs["video_mask"] = video_mask
+    model_inputs["audio_mask"] = audio_mask
+    input_ids[image_mask | video_mask | audio_mask] = 0
+    model_inputs["input_ids"] = input_ids
+    model_inputs["attention_mask"] = model_inputs["attention_mask"].squeeze(0)
+
+    labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
+    user_start_index = torch.where(input_ids == 872)[0].tolist()  # "user" 872
+    assistant_start_index = torch.where(input_ids == 77091)[0].tolist()  # "assistant" 77091
+    user_start_index.append(len(input_ids) + 1)
+    user_i = 0
+    for assis_i in assistant_start_index:
+        while user_start_index[user_i] < assis_i:
+            user_i += 1
+        labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
+    model_inputs["labels"] = labels
+    return [model_inputs]
 
 
 @dataclass
@@ -90,7 +191,7 @@ class MyDataArguments(DataArguments):
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
-    train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
+    train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 def main():
@@ -99,7 +200,10 @@ def main():
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_dist_comm_backend())
+
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
+
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
@@ -118,63 +222,102 @@ def main():
         cp_size=args.train.context_parallel_size,
         ulysses_size=args.train.ulysses_parallel_size,
         dp_mode=args.train.data_parallel_mode,
-        async_enabled=args.train.async_enabled,
     )
 
     logger.info_rank0("Prepare model")
-    model = build_foundation_model(
+    model: Qwen2_5OmniForConditionalGeneration = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
-        moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
     )
+    model.disable_talker()
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
-
     logger.info_rank0("Prepare data")
     processor = build_processor(args.model.tokenizer_path)
-    processor.image_processor.max_pixels = MAX_PIXELS
-    position_id_func = model.get_position_id_func()
-    chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
+    position_id_func = model.thinker.get_position_id_func()
+    transform = partial(
+        process_sample,
+        processor=processor,
+        position_id_func=position_id_func,
+        **args.data.mm_configs,
+    )
 
-    if model_config.model_type == "qwen2_5_vl":
-        transform = partial(
-            process_sample_qwen2_5_vl,
-            processor=processor,
-            chat_template=chat_template,
-            position_id_func=position_id_func,
-            **args.data.mm_configs,
-        )
-    elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
-        transform = partial(
-            process_sample_qwen3_vl,
-            processor=processor,
-            chat_template=chat_template,
-            position_id_func=position_id_func,
-            **args.data.mm_configs,
-        )
-    else:
-        raise ValueError(f"Unsupported model type: {model_config.model_type}")
     if args.train.rmpad:
-        raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
+        raise ValueError("Qwen2_5_omni does not support rmpad. Use `rmpad_with_pos_ids` instead.")
 
     data_collate_fn = []
     if args.train.rmpad_with_pos_ids:
-        data_collate_fn.append(OmniDataCollatorWithPacking())
+        data_collate_fn.append(
+            OmniDataCollatorWithPacking(
+                packing_features=[
+                    "input_ids",
+                    "attention_mask",
+                    "labels",
+                    "position_ids",
+                    "image_mask",
+                    "video_mask",
+                    "audio_mask",
+                ],
+                concat_features=[
+                    "pixel_values",
+                    "image_grid_thw",
+                    "pixel_values_videos",
+                    "video_grid_thw",
+                    "input_features",
+                    "audio_feature_lengths",
+                ],
+            )
+        )
     else:
-        data_collate_fn.append(OmniDataCollatorWithPadding())
+        data_collate_fn.append(
+            OmniDataCollatorWithPadding(
+                concat_features={
+                    "pixel_values": 0,
+                    "image_grid_thw": 0,
+                    "pixel_values_videos": 0,
+                    "video_grid_thw": 0,
+                    "input_features": 0,
+                    "audio_feature_lengths": 0,
+                },
+                padding_features={
+                    "input_ids": 0,
+                    "attention_mask": 0,
+                    "labels": IGNORE_INDEX,
+                    "position_ids": 0,
+                    "image_mask": False,
+                    "video_mask": False,
+                    "audio_mask": False,
+                },
+            )
+        )
     if get_parallel_state().sp_enabled:
         data_collate_fn.append(
             OmniSequenceShardCollator(
+                sp_slice_features={
+                    "input_ids": -1,
+                    "labels": -1,
+                    "pixel_values": 0,
+                    "pixel_values_videos": 0,
+                    "input_features": 0,
+                },
+                padding_features={
+                    "input_ids": 0,
+                    "attention_mask": 0,
+                    "labels": IGNORE_INDEX,
+                    "position_ids": 0,
+                    "pixel_values": 0,
+                    "pixel_values_videos": 0,
+                    "input_features": 0,
+                    "image_mask": False,
+                    "video_mask": False,
+                    "audio_mask": False,
+                },
                 padding_scale={
-                    "pixel_values": processor.image_processor.merge_size**2,
-                    "pixel_values_videos": (
-                        processor.video_processor
-                        if hasattr(processor, "video_processor")
-                        else processor.image_processor
-                    ).merge_size
-                    ** 2,
+                    "pixel_values": 4,
+                    "pixel_values_videos": 4,
+                    "input_features": 1,
                 },
                 rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
             )
@@ -187,9 +330,8 @@ def main():
         seed=args.train.seed,
         **asdict(args.data),
     )
-
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
-    if args.data.datasets_type == "mapping":
+    if args.data.datasets_type == "mapping" and dataset_length is not None:
         dataset_length = dataset_length / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
@@ -200,25 +342,30 @@ def main():
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
         seed=args.train.seed,
-        collate_fn=data_collate_fn,
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
+        collate_fn=data_collate_fn,
     )
 
     fsdp_kwargs = {}
-    if args.train.freeze_vit:
-        model.visual.requires_grad_(False)
-        if args.train.data_parallel_mode == "fsdp1":
-            fsdp_kwargs["use_orig_params"] = True
+    model.thinker.audio_tower.requires_grad_(False)
+    model.thinker.audio_tower.proj.requires_grad_(True)
+    model.thinker.visual.requires_grad_(False)
+    model.thinker.visual.merger.requires_grad_(False)
+    if args.train.data_parallel_mode == "fsdp1":
+        fsdp_kwargs["use_orig_params"] = True
+
+    pretty_print_trainable_parameters(model)
 
     model = build_parallelize_model(
         model,
@@ -239,7 +386,6 @@ def main():
         weight_decay=args.train.weight_decay,
         fused=False,
         optimizer_type=args.train.optimizer,
-        param_groups=get_param_groups(model, args.train.lr, args.train.vit_lr),
     )
     lr_scheduler = build_lr_scheduler(
         optimizer,
@@ -257,24 +403,23 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
-                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
+        if args.train.enable_profiling:
+            profiler = helper.create_profiler(
+                start_step=args.train.profile_start_step,
+                end_step=args.train.profile_end_step,
+                trace_dir=args.train.profile_trace_dir,
+                record_shapes=args.train.profile_record_shapes,
+                profile_memory=args.train.profile_profile_memory,
+                with_stack=args.train.profile_with_stack,
+            )
+            profiler.start()
+
+        # save model_assets before training
         model_assets = [model_config, processor]
         save_model_assets(args.train.model_assets_dir, model_assets)
-
-    if args.train.profile_this_rank:
-        profiler = helper.create_profiler(
-            start_step=args.train.profile_start_step,
-            end_step=args.train.profile_end_step,
-            trace_dir=args.train.profile_trace_dir,
-            record_shapes=args.train.profile_record_shapes,
-            profile_memory=args.train.profile_profile_memory,
-            with_stack=args.train.profile_with_stack,
-            global_rank=args.train.global_rank,
-        )
-        profiler.start()
 
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
@@ -287,6 +432,7 @@ def main():
         dataloader=train_dataloader,
         data_path=args.data.train_path,
         empty_cache_steps=args.train.empty_cache_steps,
+        gc_steps=args.train.gc_steps,
     )
 
     if args.train.load_checkpoint_path:
@@ -301,6 +447,8 @@ def main():
         if start_step == 0:  # resume at the end of epoch
             iter(train_dataloader)  # clear resume state and prefetch data
 
+        if args.train.global_rank == 0:
+            helper.load_step2token(args.train.load_checkpoint_path)
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
 
@@ -336,38 +484,19 @@ def main():
             total_loss = 0
             synchronize()
             start_time = time.time()
-            micro_batches_token_len = count_loss_token(micro_batches)
-
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
-                micro_batch_token_len = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
                     micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
-                # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-                    micro_batch["position_ids"][:, 0, :]
-                )
-                micro_batch.update(
-                    dict(
-                        cu_seq_lens_q=cu_seq_lens_q,
-                        cu_seq_lens_k=cu_seq_lens_k,
-                        max_length_q=max_length_q,
-                        max_length_k=max_length_k,
-                    )
-                )
-
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
                     for k, v in micro_batch.items()
                 }
-
                 with model_fwd_context:
-                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss
-
-                loss, _ = mean_global_loss(loss, micro_batch_token_len, micro_batches_token_len)
+                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss / len(micro_batches)
 
                 with model_bwd_context:
                     loss.backward()
@@ -388,9 +517,7 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}", refresh=False
-            )
+            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
@@ -400,10 +527,10 @@ def main():
                     )
                     wandb.log(train_metrics, step=global_step)
 
-            if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
-                profiler.step()
-                if global_step == args.train.profile_end_step:
-                    profiler.stop()
+                if args.train.enable_profiling and global_step <= args.train.profile_end_step:
+                    profiler.step()
+                    if global_step == args.train.profile_end_step:
+                        profiler.stop()
 
             if args.train.save_steps and global_step % args.train.save_steps == 0:
                 helper.empty_cache()
@@ -419,6 +546,13 @@ def main():
                     },
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                if args.train.global_rank == 0:
+                    helper.save_step2token(
+                        args.train.step2token_path,
+                        consumed_tokens=train_metrics["consume_tokens(B)"],
+                        global_step=global_step,
+                        save_checkpoint_path=save_checkpoint_path,
+                    )
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
@@ -439,6 +573,13 @@ def main():
                 },
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+            if args.train.global_rank == 0:
+                helper.save_step2token(
+                    args.train.step2token_path,
+                    consumed_tokens=train_metrics["consume_tokens(B)"],
+                    global_step=global_step,
+                    save_checkpoint_path=save_checkpoint_path,
+                )
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 

@@ -1,0 +1,13 @@
+sources:
+- sharegpt4v_cap_100k
+- tulu-3-sft-mixture
+- llava_video
+- voice_assistant
+names:
+- sharegpt4v_captioner_sft
+- tulu-3-sft-mixture
+- LLaVA-Video-178K
+- VoiceAssistant
+schedule:
+- schedule_type: const
+  weights: [0.25, 0.25, 0.25, 0.25]

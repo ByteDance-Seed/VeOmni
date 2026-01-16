@@ -5,9 +5,9 @@ from dataclasses import asdict, dataclass, field
 import torch
 from transformers import AutoTokenizer, TextStreamer
 
+from veomni.arguments import InferArguments, parse_args
 from veomni.models import build_foundation_model
 from veomni.utils import helper
-from veomni.utils.arguments import InferArguments, parse_args
 
 
 logger = helper.create_logger(__name__)

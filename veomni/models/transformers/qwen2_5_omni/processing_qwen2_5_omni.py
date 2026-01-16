@@ -21,7 +21,6 @@ import re
 from typing import List, Optional, Union
 
 import numpy as np
-import torch
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_pil_image, is_valid_image
 from transformers.processing_utils import ImagesKwargs, ProcessingKwargs, ProcessorMixin, Unpack, VideosKwargs
@@ -195,7 +194,7 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             input_lengths = (attention_mask.sum(-1) - 1) // 2 + 1
             audio_inputs["input_features"] = features
             audio_inputs["feature_attention_mask"] = attention_mask
-            audio_lengths = (torch.tensor(input_lengths) - 2) // 2 + 1
+            audio_lengths = (input_lengths.clone() - 2) // 2 + 1
             audio_lengths = iter(audio_lengths)
         else:
             audio_inputs = {}

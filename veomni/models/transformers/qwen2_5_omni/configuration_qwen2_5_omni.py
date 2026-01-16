@@ -1028,7 +1028,8 @@ class Qwen2_5OmniConfig(PretrainedConfig):
         self.token2wav_config = Qwen2_5OmniToken2WavConfig(**token2wav_config)
         self.enable_audio_output = enable_audio_output
 
-        super().__init__(**kwargs)
+        kwargs.pop("tie_word_embeddings", None)
+        super().__init__(tie_word_embeddings=False, **kwargs)
 
 
 __all__ = ["Qwen2_5OmniConfig", "Qwen2_5OmniThinkerConfig", "Qwen2_5OmniTalkerConfig", "Qwen2_5OmniToken2WavConfig"]

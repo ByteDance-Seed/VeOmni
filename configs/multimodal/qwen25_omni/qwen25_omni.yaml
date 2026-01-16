@@ -1,0 +1,39 @@
+model:
+  model_path: qwen2_5-omni-7b
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo_voiceassistant.yaml
+  data_type: conversation
+  max_seq_len: 8196
+  train_size: 80000000
+  num_workers: 0
+  mm_configs:
+    scale_factor: 28
+    image_min_pixels: 3136 # 4 * 28 * 28
+    image_max_pixels: 12845056 # 16384 * 28 * 28
+    video_min_pixels: 100352 # 128 * 28 * 28
+    video_max_pixels: 602112 # 768 * 28 * 28
+    max_ratio: 200
+    min_frames: 4
+    # max_frames: 768
+    max_frames: 20
+    frame_factor: 2
+    sample_rate: 16000
+    fps: 2.0
+    use_audio_in_video: True
+
+train:
+  output_dir: qwen2_5_omni_sft
+  init_device: meta
+  data_parallel_mode: fsdp2
+  wandb_project: qwen2_5_omni
+  wandb_name: qwen2_5_omni
+  rmpad: false
+  rmpad_with_pos_ids: true
+  ulysses_parallel_size: 1
+  lr: 1.0e-5
+  lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 1
+  global_batch_size: 8
+  max_steps: 20
