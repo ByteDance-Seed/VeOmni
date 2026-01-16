@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
+from ..models.module_utils import _convert_weight_key as convert_weight_key
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
@@ -74,6 +75,14 @@ def verbose_fsdp_grouping(model, prefix="", depth=0):
             verbose_fsdp_grouping(child, prefix=f"{prefix}{name}.", depth=depth + 1)
         else:
             verbose_fsdp_grouping(child, prefix=f"{prefix}{name}.", depth=depth)
+
+
+def _convert_weight_key(state_dict, model):
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = convert_weight_key(key, model)
+        new_state_dict[new_key] = value
+    return new_state_dict
 
 
 def parallelize_model_fsdp1(
@@ -155,7 +164,7 @@ def parallelize_model_fsdp1(
         shard_states = kwargs.get("shard_states", {})
         if not shard_states and weights_path:
             shard_states = parallel_load_safetensors(weights_path)
-
+        shard_states = _convert_weight_key(shard_states, model)
         fsdp_kwargs["param_init_fn"] = parallel_init_fsdp_fn(
             model,
             shard_states.copy(),
