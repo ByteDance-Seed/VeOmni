@@ -118,7 +118,7 @@ class ModelArguments:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
-    moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
+    moe_implementation: Optional[Literal["eager", "fused"]] = field(
         default=None,
         metadata={"help": "MoE implementation to use."},
     )

@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
+from ..arguments import DataArguments, ModelArguments, TrainingArguments, save_args
 from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
@@ -40,7 +41,6 @@ from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
-from ..utils.arguments import DataArguments, ModelArguments, TrainingArguments, save_args
 from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,

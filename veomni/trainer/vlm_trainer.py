@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, Optional
 import torch
 from transformers import ProcessorMixin
 
+from ..arguments import DataArguments, ModelArguments, TrainingArguments
 from ..data import build_multimodal_chat_template
 from ..data.chat_template import ChatTemplate
 from ..data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -13,7 +14,6 @@ from ..data.multimodal.image_utils import fetch_images
 from ..data.multimodal.video_utils import fetch_videos, fetch_videos_metadata
 from ..models import build_processor
 from ..utils import helper
-from ..utils.arguments import DataArguments, ModelArguments, TrainingArguments
 from .base import BaseTrainer
 
 
@@ -67,14 +67,14 @@ def process_sample_qwen2_5_vl(
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
-    if "images" in sample:
+    if "images" in sample and sample["images"]:
         images = fetch_images(sample["images"], **kwargs)
         image_inputs = processor.image_processor(images=images, return_tensors="pt")
         image_grid_thw = image_inputs["image_grid_thw"]
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
-    if "videos" in sample:
+    if "videos" in sample and sample["videos"]:
         videos, _ = fetch_videos(sample["videos"], **kwargs)
         video_inputs = processor.image_processor(images=None, videos=videos, return_tensors="pt")
         video_grid_thw = video_inputs["video_grid_thw"]
@@ -83,7 +83,9 @@ def process_sample_qwen2_5_vl(
         token_num_inputs["video"] = video_token_num
 
     tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
-    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+    tokenized_example = {
+        k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
+    }
     input_ids = tokenized_example["input_ids"]
 
     tokenized_example["position_ids"] = position_id_func(
