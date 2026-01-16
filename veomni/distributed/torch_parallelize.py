@@ -160,7 +160,7 @@ def parallelize_model_fsdp1(
         shard_states = kwargs.get("shard_states", {})
         if not shard_states and weights_path:
             shard_states = parallel_load_safetensors(weights_path)
-        shard_states = _convert_weight_key(shard_states, model)
+        shard_states = _convert_state_dict_keys(shard_states, model)
         fsdp_kwargs["param_init_fn"] = parallel_init_fsdp_fn(
             model,
             shard_states.copy(),
