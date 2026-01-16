@@ -65,6 +65,7 @@ from ....distributed.sequence_parallel.async_ulysses import (
 )
 from ....utils import logging
 from ....utils.device import IS_NPU_AVAILABLE
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 logger = logging.get_logger(__name__)
@@ -99,7 +100,7 @@ def Qwen3VLVisionAttention_forward(
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
     # --- Patch.1 ---
-    if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
+    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
         # --- Patch.1 ---
         # --- Patch.2 ---
         # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -161,11 +162,11 @@ class Qwen3VLTextAttention(_Qwen3VLTextAttention):
         """
         Forward pass for asynchronous Ulysses attention implementation.
         """
-        if self.config._attn_implementation != "flash_attention_2":
+        if self.config._attn_implementation not in VARLEN_ATTENTION_TYPES:
             raise ValueError(
-                f"Async Ulysses attention only supports 'flash_attention_2' implementation. "
+                "Async Ulysses attention only supports flash attention implementations. "
                 f"Current implementation: '{self.config._attn_implementation}'. "
-                f"Please set attn_implementation = 'flash_attention_2' or disable async Ulysses."
+                "Please set attn_implementation to a flash attention variant or disable async Ulysses."
             )
 
         unpadded_seq_len = hidden_states.size(1)

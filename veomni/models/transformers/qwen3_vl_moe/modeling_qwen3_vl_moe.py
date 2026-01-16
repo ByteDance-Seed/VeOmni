@@ -59,6 +59,7 @@ from ....distributed.sequence_parallel import (
 from ....ops import fused_moe_forward
 from ....utils import logging
 from ....utils.device import is_torch_npu_available
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 logger = logging.get_logger(__name__)
@@ -193,7 +194,7 @@ def Qwen3VLMoeVisionAttention_forward(
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
     # --- Patch.1 ---
-    if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
+    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
         # --- Patch.1 ---
         # Flash Attention 2: Use cu_seqlens for variable length attention
         # --- Patch.2 ---

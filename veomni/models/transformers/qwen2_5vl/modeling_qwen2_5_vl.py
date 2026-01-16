@@ -57,6 +57,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....utils import logging
 from ....utils.device import IS_NPU_AVAILABLE
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 logger = logging.get_logger(__name__)
@@ -90,8 +91,8 @@ def Qwen2_5_VLVisionAttention_forward(
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-    if self.config._attn_implementation == "flash_attention_2":
-        # Flash Attention 2: Use cu_seqlens for variable length attention
+    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
+        # Use cu_seqlens for variable length attention
         # --- Patch.1 ---
         # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         # --- Patch.1 ---

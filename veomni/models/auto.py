@@ -66,9 +66,11 @@ def build_foundation_model(
             "sdpa",
             "flash_attention_2",
             "flash_attention_3",
+            "veomni_flash_attention_2_with_sp",
+            "veomni_flash_attention_3_with_sp",
             "native-sparse",
         ]
-    ] = "flash_attention_2",
+    ] = "veomni_flash_attention_2_with_sp",
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,

@@ -137,6 +137,17 @@ class ModelArguments:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
 
+        if self.attn_implementation == "flash_attention_2":
+            logger.info_rank0(
+                "Replacing ModelArgument attn_implementation from 'flash_attention_2' to 'veomni_flash_attention_2_with_sp'"
+            )
+            self.attn_implementation = "veomni_flash_attention_2_with_sp"
+        if self.attn_implementation == "flash_attention_3":
+            logger.info_rank0(
+                "Replacing ModelArgument attn_implementation from 'flash_attention_3' to 'veomni_flash_attention_3_with_sp'"
+            )
+            self.attn_implementation = "veomni_flash_attention_3_with_sp"
+
         suppoerted_encoder_types = ["image", "video", "audio"]
         for encoder_type, encoder_args in self.encoders.items():
             if encoder_type not in suppoerted_encoder_types:
