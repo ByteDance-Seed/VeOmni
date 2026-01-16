@@ -77,12 +77,8 @@ def verbose_fsdp_grouping(model, prefix="", depth=0):
             verbose_fsdp_grouping(child, prefix=f"{prefix}{name}.", depth=depth)
 
 
-def _convert_weight_key(state_dict, model):
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        new_key = convert_weight_key(key, model)
-        new_state_dict[new_key] = value
-    return new_state_dict
+def _convert_state_dict_keys(state_dict, model):
+    return {convert_weight_key(key, model): value for key, value in state_dict.items()}
 
 
 def parallelize_model_fsdp1(
