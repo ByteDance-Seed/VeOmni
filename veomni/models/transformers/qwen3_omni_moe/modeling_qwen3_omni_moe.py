@@ -2328,6 +2328,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
             # Modification: Slice tensor to drop any padded video tokens
             video_embeds = video_embeds[:n_video_tokens]
+            deepstack_video_embeds = video_embeds_multiscale
             deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
             n_video_features = video_embeds.shape[0]
             if n_video_tokens != n_video_features:
