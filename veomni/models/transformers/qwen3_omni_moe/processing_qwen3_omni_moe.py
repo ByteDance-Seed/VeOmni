@@ -23,13 +23,12 @@ import re
 from typing import Optional, Union
 
 import numpy as np
-
-from ...audio_utils import AudioInput
-from ...feature_extraction_utils import BatchFeature
-from ...image_utils import ImageInput
-from ...processing_utils import ImagesKwargs, ProcessingKwargs, ProcessorMixin, VideosKwargs
-from ...tokenization_utils_base import TextInput
-from ...video_utils import VideoInput, make_batched_videos
+from transformers.audio_utils import AudioInput
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_utils import ImageInput
+from transformers.processing_utils import ImagesKwargs, ProcessingKwargs, ProcessorMixin, VideosKwargs
+from transformers.tokenization_utils_base import TextInput
+from transformers.video_utils import VideoInput, make_batched_videos
 
 
 class Qwen3OmniMoeVideosKwargs(VideosKwargs):

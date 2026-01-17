@@ -19,9 +19,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...configuration_utils import PretrainedConfig, layer_type_validation
-from ...modeling_rope_utils import rope_config_validation
-from ...utils import logging
+from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+from transformers.modeling_rope_utils import rope_config_validation
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -1203,7 +1203,14 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         assistant_token_id=77091,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        """
+        Modification:
+            Qwen3OmniMoe didn't set tie_word_embeddings, so it is set to True by default.
+            However, Qwen3OmniMoe model didn't set get_output_embeddings, so the `embed_tokens` can't tie with `lm_head`
+            Logically, `tie_word_embeddings=False`
+        """
+        kwargs.pop("tie_word_embeddings", None)
+        super().__init__(tie_word_embeddings=False, **kwargs)
         if thinker_config is None:
             thinker_config = {}
             logger.info("thinker_config is None. Initializing thinker model with default values")
