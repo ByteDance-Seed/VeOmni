@@ -89,7 +89,7 @@ def _get_feat_extract_output_lengths(input_lengths):
 
 class Qwen3OmniMoeProcessor(ProcessorMixin):
     r"""
-    Constructs a Qwen2.5Omni processor.
+    Constructs a Qwen3OmniMoe processor.
     [`Qwen3OmniMoeProcessor`] offers all the functionalities of [`Qwen2VLImageProcessor`], [`WhisperFeatureExtractor`], and [`Qwen2TokenizerFast`]. See the
     [`~Qwen3OmniMoeProcessor.__call__`] and [`~Qwen3OmniMoeProcessor.decode`] for more information.
 
