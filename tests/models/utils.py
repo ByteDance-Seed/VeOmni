@@ -59,7 +59,11 @@ def prepare_model_modes(is_moe: bool = False):
         ModelMode(modeling_backend="hf", attn_implementation="eager", attn_case="padded_bsh"),
         ModelMode(modeling_backend="veomni", attn_implementation="eager", attn_case="padded_bsh"),
         ModelMode(modeling_backend="hf", attn_implementation="flash_attention_2", attn_case="position_ids"),
-        ModelMode(modeling_backend="veomni", attn_implementation="flash_attention_2", attn_case="position_ids"),
+        ModelMode(
+            modeling_backend="veomni",
+            attn_implementation="veomni_flash_attention_2_with_sp",
+            attn_case="position_ids",
+        ),
     ]
     if not is_torch_npu_available():
         base_model_modes.extend(
@@ -67,13 +71,13 @@ def prepare_model_modes(is_moe: bool = False):
                 ModelMode(modeling_backend="hf", attn_implementation="flash_attention_3", attn_case="position_ids"),
                 ModelMode(
                     modeling_backend="veomni",
-                    attn_implementation="flash_attention_3",
+                    attn_implementation="veomni_flash_attention_3_with_sp",
                     attn_case="position_ids",
                     use_liger_kernel=True,
                 ),
                 ModelMode(
                     modeling_backend="veomni",
-                    attn_implementation="flash_attention_3",
+                    attn_implementation="veomni_flash_attention_3_with_sp",
                     attn_case="position_ids",
                     use_liger_kernel=False,
                 ),
@@ -101,7 +105,7 @@ def prepare_model_modes(is_moe: bool = False):
         ),
         ModelMode(
             modeling_backend="veomni",
-            attn_implementation="flash_attention_2",
+            attn_implementation="veomni_flash_attention_2_with_sp",
             attn_case="position_ids",
             moe_implementation="fused",
         ),
@@ -117,14 +121,14 @@ def prepare_model_modes(is_moe: bool = False):
                 ),
                 ModelMode(
                     modeling_backend="veomni",
-                    attn_implementation="flash_attention_3",
+                    attn_implementation="veomni_flash_attention_3_with_sp",
                     attn_case="position_ids",
                     moe_implementation="fused",
                     use_liger_kernel=True,
                 ),
                 ModelMode(
                     modeling_backend="veomni",
-                    attn_implementation="flash_attention_3",
+                    attn_implementation="veomni_flash_attention_3_with_sp",
                     attn_case="position_ids",
                     moe_implementation="fused",
                     use_liger_kernel=False,
@@ -276,18 +280,6 @@ def compare_multi_items(outputs_dict: Dict, rtol=1e-3, atol=1e-5):
             raise AssertionError("Gnorm not match")
 
 
-def apply_veomni_attention_unpatch():
-    from transformers.integrations.flash_attention import flash_attention_forward
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-    from veomni.ops import flash_attn
-
-    flash_attn._flash_attention_forward = None
-
-    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
-    ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
-
-
 def apply_veomni_loss_unpatch():
     from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
 
@@ -306,7 +298,6 @@ def apply_veomni_moe_unpatch():
 
 
 def set_environ_param(model_mode: ModelMode):
-    apply_veomni_attention_unpatch()
     apply_veomni_loss_unpatch()
     apply_veomni_moe_unpatch()
     if model_mode.modeling_backend == "veomni":
