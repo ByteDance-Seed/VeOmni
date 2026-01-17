@@ -93,6 +93,8 @@ def build_foundation_model(
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
+        if moe_implementation == "eager":
+            logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
 
     loader: Optional[BaseModelLoader] = get_loader(config)
 
@@ -102,6 +104,11 @@ def build_foundation_model(
         "attn_implementation": attn_implementation,
         "trust_remote_code": True,
     }
+
+    if attn_implementation not in ("veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"):
+        logger.warning_rank0(
+            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use veomni_flash_attention_2_with_sp or veomni_flash_attention_3_with_sp for SP."
+        )
 
     if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":
         empty_init = True
