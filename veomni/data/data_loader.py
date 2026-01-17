@@ -70,6 +70,7 @@ def build_native_dataloader(
     rmpad_with_pos_ids: bool = False,
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
+    dyn_bsz: bool = True,
     dyn_bsz_buffer_size: int = 500,
     dyn_bsz_margin: int = 0,
     collate_fn: Optional[Union[Callable, List[Callable]]] = None,
@@ -111,7 +112,7 @@ def build_native_dataloader(
     if isinstance(collate_fn, list):
         collate_fn = CollatePipeline(collate_fn)
 
-    if use_rmpad:
+    if use_rmpad and dyn_bsz:
         batching_strategy = TextBatchingStrategy(
             token_micro_bsz=token_micro_bsz - dyn_bsz_margin * max_seq_len,
             buffer_size=dyn_bsz_buffer_size,
@@ -144,7 +145,7 @@ def build_native_dataloader(
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
     )
-    if use_rmpad:
+    if use_rmpad and dyn_bsz:
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
             batching_strategy=batching_strategy,

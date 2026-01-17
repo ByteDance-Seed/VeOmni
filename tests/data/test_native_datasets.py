@@ -80,6 +80,7 @@ def run_data_test():
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
+        dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         num_workers=1,
@@ -213,7 +214,7 @@ def run_data_test():
         dist.destroy_process_group()
 
 
-def build_command(dataset_type, dataloader_type):
+def build_command(dataset_type, dataloader_type, dyn_bsz):
     port = 12345 + random.randint(0, 100)
 
     if dataloader_type == "rmpad":
@@ -237,6 +238,7 @@ def build_command(dataset_type, dataloader_type):
         "--data.max_seq_len=16",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=2",
+        f"--train.dyn_bsz={dyn_bsz}",
         "--train.data_parallel_mode=ddp",
         "--train.ckpt_manager=dcp",
         f"--data.datasets_type={dataset_type}",
@@ -271,6 +273,12 @@ def test_data_rmpad_with_pos_ids():
 
 def test_data_padding():
     command = build_command("mapping", "padding")
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+def test_decouple_rmpad_and_dyn_bsz():
+    command = build_command("mapping", "rmpad_with_pos_ids", False)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
