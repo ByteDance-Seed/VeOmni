@@ -10,7 +10,7 @@ import torch.distributed as dist
 import wandb
 from tqdm import trange
 
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from tasks.data.vlm_data_process import prepare_fa_kwargs_from_position_ids
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     OmniDataCollatorWithPacking,
@@ -24,7 +24,6 @@ from veomni.data.multimodal.audio_utils import fetch_audios
 from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.data.multimodal.video_utils import fetch_videos
-from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -34,6 +33,7 @@ from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -42,7 +42,6 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
-from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 
 if TYPE_CHECKING:
@@ -67,9 +66,9 @@ def process_sample(
     Processes multimodal example with qwen2_5_vl's pre-processor.
     """
     source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
     )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
+    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
     conversations = conv_preprocess(source, conversations, **kwargs)
     input_conversations = [
         {
@@ -93,24 +92,9 @@ def process_sample(
         input_conversations.append(tmp_conv)
     text = processor.apply_chat_template(input_conversations, tokenize=False)
 
-    images = sample.get("images", [])
-    if images:
-        images = fetch_images(images, **kwargs)
-    else:
-        images = []
-
-    videos = sample.get("videos", [])
-    if videos:
-        videos, video_audios = fetch_videos(videos, **kwargs)
-    else:
-        videos, video_audios = [], []
-
-    audios = sample.get("audios", [])
-    if audios:
-        audio_audios = fetch_audios(audios, **kwargs)
-    else:
-        audio_audios = []
-
+    images = fetch_images(sample.get("images", []), **kwargs)
+    videos, video_audios = fetch_videos(sample.get("videos", []), **kwargs)
+    audio_audios = fetch_audios(sample.get("audios", []), **kwargs)
     audios = []
     for item in input_conversations:
         for content in item["content"]:
@@ -121,9 +105,9 @@ def process_sample(
 
     model_inputs = processor(
         text=text,
-        audios=audios,
+        # audios=audios,
         images=images,
-        videos=videos,
+        # videos=videos,
         return_tensors="pt",
         padding=True,
     )
@@ -160,8 +144,6 @@ def process_sample(
         audio_seqlens=audio_feature_lengths,
         second_per_grids=model_inputs.pop("video_second_per_grid", None),
     )["position_ids"]  # (dim, l)
-
-    model_inputs["position_ids"] = model_inputs["position_ids"].clone()
     model_inputs["image_mask"] = image_mask
     model_inputs["video_mask"] = video_mask
     model_inputs["audio_mask"] = audio_mask
@@ -350,7 +332,6 @@ def main():
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-        dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
@@ -503,15 +484,13 @@ def main():
                     micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
 
                 # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-                    micro_batch["position_ids"][0]
-                )
+                fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
                 micro_batch.update(
                     dict(
-                        cu_seq_lens_q=cu_seq_lens_q,
-                        cu_seq_lens_k=cu_seq_lens_k,
-                        max_length_q=max_length_q,
-                        max_length_k=max_length_k,
+                        cu_seq_lens_q=fa_kwargs["cu_seq_lens_q"],
+                        cu_seq_lens_k=fa_kwargs["cu_seq_lens_k"],
+                        max_length_q=fa_kwargs["max_length_q"],
+                        max_length_k=fa_kwargs["max_length_k"],
                     )
                 )
 
@@ -528,11 +507,16 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
+            if args.train.data_parallel_mode == "fsdp1":
+                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
 
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+            if hasattr(grad_norm, "full_tensor"):
+                grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
@@ -570,6 +554,13 @@ def main():
                     },
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                if args.train.global_rank == 0:
+                    helper.save_step2token(
+                        args.train.step2token_path,
+                        consumed_tokens=train_metrics["consume_tokens(B)"],
+                        global_step=global_step,
+                        save_checkpoint_path=save_checkpoint_path,
+                    )
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
@@ -590,6 +581,13 @@ def main():
                 },
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+            if args.train.global_rank == 0:
+                helper.save_step2token(
+                    args.train.step2token_path,
+                    consumed_tokens=train_metrics["consume_tokens(B)"],
+                    global_step=global_step,
+                    save_checkpoint_path=save_checkpoint_path,
+                )
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 

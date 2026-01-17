@@ -45,7 +45,7 @@ def register_qwen3_omni_moe_modeling(architecture: str):
 
 
 @MODEL_PROCESSOR_REGISTRY.register("Qwen3OmniMoeProcessor")
-def register_qwen3_omni_moe_processor():
+def register_qwen2_5_omni_processor():
     from .processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
 
     return Qwen3OmniMoeProcessor

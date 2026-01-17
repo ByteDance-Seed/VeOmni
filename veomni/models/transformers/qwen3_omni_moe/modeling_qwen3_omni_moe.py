@@ -2328,7 +2328,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
             # Modification: Slice tensor to drop any padded video tokens
             video_embeds = video_embeds[:n_video_tokens]
-            deepstack_video_embeds = video_embeds_multiscale
             deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
             n_video_features = video_embeds.shape[0]
             if n_video_tokens != n_video_features:
@@ -2339,6 +2338,20 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+            if visual_embeds_multiscale is None:
+                visual_embeds_multiscale = video_embeds_multiscale
+                visual_pos_masks = video_mask
+            else:
+                visual_pos_masks = video_mask | image_mask
+                visual_embeds_multiscale_joint = ()
+                image_mask_joint = image_mask[visual_pos_masks]
+                video_mask_joint = video_mask[visual_pos_masks]
+                for img_embed, vid_embed in zip(visual_embeds_multiscale, video_embeds_multiscale):
+                    embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1])
+                    embed_joint[image_mask_joint, :] = img_embed
+                    embed_joint[video_mask_joint, :] = vid_embed
+                    visual_embeds_multiscale_joint = visual_embeds_multiscale_joint + (embed_joint,)
+                visual_embeds_multiscale = visual_embeds_multiscale_joint
         elif get_parallel_state().fsdp_enabled:
             # Modification: add dummy ViT forward to avoid FSDP reduce-scatter hang
             # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
@@ -2507,7 +2520,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             use_cache=use_cache,
             output_router_logits=output_router_logits,
             cache_position=cache_position,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            deepstack_visual_embeds=visual_embeds_multiscale,
             visual_pos_masks=visual_pos_masks,
             **kwargs,
         )
