@@ -665,7 +665,7 @@ class TrainingArguments:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # calculate dataloader batch size (for StreamingDataset and StreamingDataLoader)
-        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker":
+        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker" and self.dyn_bsz:
             self.dataloader_batch_size = 1
         else:
             self.dataloader_batch_size = self.global_batch_size // self.data_parallel_size  # = micro bsz * grad accu
@@ -704,7 +704,7 @@ class TrainingArguments:
         """
         Computes the training steps per epoch according to the data length.
         """
-        if self.rmpad or self.rmpad_with_pos_ids:
+        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz:
             assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
             token_micro_bsz = self.micro_batch_size * max_seq_len
             train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))

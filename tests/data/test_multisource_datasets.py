@@ -108,6 +108,7 @@ def run_data_test():
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
+        dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=0.0,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         num_workers=1,
