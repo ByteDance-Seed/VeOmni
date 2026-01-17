@@ -30,11 +30,9 @@ logger = logging.get_logger(__name__)
 class Qwen3OmniMoeAudioEncoderConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3OmniMoeAudioEncoder`]. It is used to instantiate a
-    Qwen2.5-Omni-Thinker audio encoder according to the specified arguments, defining the model architecture. Instantiating a
+    Qwen3-Omni-Moe-Thinker audio encoder according to the specified arguments, defining the model architecture. Instantiating a
     configuration with the defaults will yield a similar configuration to that of the audio encoder of the Qwen2-Audio
     architecture.
-
-    e.g. [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B)
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
@@ -1148,7 +1146,7 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
     model according to the specified sub-models configurations, defining the model architecture.
 
     Instantiating a configuration with the defaults will yield a similar configuration to that of the
-    [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) architecture.
+    [Qwen/Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) architecture.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
