@@ -117,13 +117,23 @@ def test_data_collator_padded_packed_length_is_static(features_two_samples):
     pad_to_length = 8
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 2, 2], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 1], dtype=torch.long),
+        },
+    ]
     collator = m.DataCollatorWithPositionIDsAndPadding(
         pad_to_length=pad_to_length,
         pad_token_id=0,
         position_id_pad_value=0,
         attention_mask_pad_value=1,
     )
-    out = collator(features_two_samples)
+    out = collator(token_labels)
 
     assert out["input_ids"].shape[-1] == pad_to_length
     assert out["attention_mask"].shape[-1] == pad_to_length
@@ -145,13 +155,23 @@ def test_padded_packed_with_sp_padding(features_two_samples):
     pad_to_length = 8
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=2, sp_rank=0))
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 2, 2], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 1], dtype=torch.long),
+        },
+    ]
     collator = m.DataCollatorWithPositionIDsAndPadding(
         pad_to_length=pad_to_length,
         pad_token_id=0,
         position_id_pad_value=0,
         attention_mask_pad_value=1,
     )
-    out = collator(features_two_samples)
+    out = collator(token_labels)
 
     # After SP padding/slicing, seq length is ceil(pad_to_length / sp_size).
     assert out["input_ids"].shape[-1] == 4
