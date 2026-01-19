@@ -180,7 +180,8 @@ class DataCollatorWithPositionIDs(DataCollator):
             cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
             batch["rmpad_with_pos_ids"] = True
         else:
-            # Still need cu_seq_lens_q for label masking even when sp_enabled
+            # Still need cu_seq_lens_q for label masking even when sp_enabled.
+            # Flash-attn kwargs are injected later in TextSequenceShardCollator after SP padding/slicing.
             (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
 
         if self.mask_boundary_labels and "labels" in batch:
