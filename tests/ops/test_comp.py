@@ -5,18 +5,10 @@ import time
 import torch
 
 from veomni.models import build_foundation_model
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, synchronize
+from veomni.utils.device import get_device_type, synchronize
 
 
-def generate_grid_thw(
-    batch: int,
-    spatial_merge_size: int,
-    min_t=1,
-    max_t=4,
-    min_hw=14,
-    max_hw=56,
-    device="cpu"
-):
+def generate_grid_thw(batch: int, spatial_merge_size: int, min_t=1, max_t=4, min_hw=14, max_hw=56, device="cpu"):
     grid_thw = torch.zeros((batch, 3), dtype=torch.long, device=device)
 
     for i in range(batch):
@@ -24,8 +16,8 @@ def generate_grid_thw(
         h = torch.randint(min_hw, max_hw, (1,)).item()
         w = torch.randint(min_hw, max_hw, (1,)).item()
         grid_thw[i, 0] = t
-        grid_thw[i, 1] = h*spatial_merge_size
-        grid_thw[i, 2] = w*spatial_merge_size
+        grid_thw[i, 1] = h * spatial_merge_size
+        grid_thw[i, 2] = w * spatial_merge_size
     return grid_thw
 
 
@@ -160,8 +152,8 @@ def compare(args, model, grid_thw, ref_fn, test_fn):
     synchronize()
     test_time = time.time() - start_time
 
-    print(f"Reference time: {ref_time/args.iters:.6f} seconds")
-    print(f"Test time: {test_time/args.iters:.6f} seconds")
+    print(f"Reference time: {ref_time / args.iters:.6f} seconds")
+    print(f"Test time: {test_time / args.iters:.6f} seconds")
     print(f"Speedup: {(ref_time - test_time) / ref_time:.2f}x")
 
     return ref_result, test_result
@@ -174,7 +166,6 @@ def main(args):
         init_device=args.device,
     ).model.visual
 
-
     dummy_model.pos_embed.weight = torch.nn.Parameter(torch.randn_like(dummy_model.pos_embed.weight))
     try:
         dummy_model = dummy_model.to(args.device)
@@ -182,7 +173,9 @@ def main(args):
         print(f"Error moving dummy model to device {args.device}: {e}")
         return
 
-    grid_thw = generate_grid_thw(batch=args.batch, spatial_merge_size=dummy_model.spatial_merge_size, device=args.device)
+    grid_thw = generate_grid_thw(
+        batch=args.batch, spatial_merge_size=dummy_model.spatial_merge_size, device=args.device
+    )
     print(f"grid_thw: {grid_thw}")
     compare(args, dummy_model, grid_thw, fast_pos_embed_interpolate_ref, dummy_model.fast_pos_embed_interpolate)
     compare(args, dummy_model, grid_thw, rot_pos_emb_ref, dummy_model.rot_pos_emb)
@@ -195,8 +188,7 @@ def test_comp(args: None):
         args.iters = 100
         args.batch = 20
 
-    args.device = "cuda" if IS_CUDA_AVAILABLE else \
-                    "npu" if IS_NPU_AVAILABLE else "cpu"
+    args.device = get_device_type()
     args.config_path = os.path.dirname(os.path.abspath(__file__)) + "/../models/toy_config/qwen3vl_toy"
     print(f"{args=}")
     main(args)
