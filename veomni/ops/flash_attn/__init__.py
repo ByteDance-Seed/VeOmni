@@ -87,8 +87,6 @@ def flash_attention_forward(
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
 
-    rmpad_with_pos_ids = kwargs.pop("rmpad_with_pos_ids", False)
-
     # In PEFT, usually we cast the layer norms in float32 for training stability reasons
     # therefore the input hidden states gets silently casted in float32. Hence, we need
     # cast them back in the correct dtype just to be sure everything works as expected.
@@ -159,10 +157,6 @@ def flash_attention_forward(
 
         # Only after all_to_all we got the full seq_len
         seq_len = query.shape[1]
-    else:
-        if rmpad_with_pos_ids:
-            cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
-            assert isinstance(cu_seq_lens_q, torch.Tensor), "cu_seq_lens_q must be provided for packed input."
 
     if module.config._attn_implementation == "veomni_flash_attention_2_with_sp":
         fa_kernel_implementation = "flash_attention_2"
@@ -200,9 +194,6 @@ def flash_attention_forward(
             attn_output = attn_output.unsqueeze(0)
         else:
             attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2, group=ulysses_group)
-    elif rmpad_with_pos_ids:
-        # Keep shape unchanged; varlen FA tolerates padded tails for this backend.
-        pass
 
     return attn_output, None
 

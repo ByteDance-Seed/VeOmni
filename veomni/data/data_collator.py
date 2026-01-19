@@ -178,7 +178,6 @@ class DataCollatorWithPositionIDs(DataCollator):
             # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
             # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
             cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
-            batch["rmpad_with_pos_ids"] = True
         else:
             # Still need cu_seq_lens_q for label masking even when sp_enabled.
             # Flash-attn kwargs are injected later in TextSequenceShardCollator after SP padding/slicing.
