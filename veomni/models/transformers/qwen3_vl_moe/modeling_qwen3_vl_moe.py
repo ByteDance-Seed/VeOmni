@@ -404,6 +404,8 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
         # --- Patch.1 ---
         super().__init__(config)
 
+        self.encoder_data_balance = EncoderDataBalance(spatial_merge_unit=self.visual.spatial_merge_unit)
+
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
@@ -415,7 +417,9 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
+        pixel_values, image_grid_thw = self.encoder_data_balance.balance_data(pixel_values, image_grid_thw)
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, deepstack_image_embeds = self.encoder_data_balance.data_bridge(image_embeds, deepstack_image_embeds)
         # --- Patch.2 ---
         # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         # image_embeds = torch.split(image_embeds, split_sizes)
