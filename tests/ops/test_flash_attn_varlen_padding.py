@@ -1,9 +1,11 @@
 import pytest
 import torch
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
 
 def _skip_if_no_flash_attn():
-    if not torch.cuda.is_available():
+    if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA is required for flash-attn.")
     try:
         from flash_attn import flash_attn_varlen_func  # noqa: F401
@@ -12,15 +14,16 @@ def _skip_if_no_flash_attn():
 
 
 def test_varlen_flash_attn_padded_input_matches_unpadded():
+    """Varlen FA should tolerate padded tails when cu_seqlens reflect real tokens."""
     _skip_if_no_flash_attn()
     from flash_attn import flash_attn_varlen_func
 
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.float16
 
     seqlens = torch.tensor([5, 7], dtype=torch.int32, device=device)
-    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens, dim=0), (1, 0), value=0)
+    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0), value=0)
     max_seqlen = int(seqlens.max().item())
 
     total_tokens = int(cu_seqlens[-1].item())
