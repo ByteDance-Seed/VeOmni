@@ -1,3 +1,15 @@
+# What does this .py file do?
+# It tests the use of rmpad_with_pos_ids without dyn_bsz, which is typically used during SFT (Supervised Fine-Tuning).
+
+# This file copied from tests/data/test_native_datasets.py
+# Then the following key modifications were made:
+# 1. Passed args.train.dyn_bsz to build_dataloader
+# 2. Set train.ulysses_parallel_size=1, train.rmpad=false, and train.rmpad_with_pos_ids=true in the command
+# 3. Added the train.dyn_bsz argument to the command to control dyn_bsz
+# 4. Added the function test_rmpad_with_pos_ids_without_dyn_bsz to support pytest
+
+# It can be observed that cu_seq_lens_q.shape is micro_batch_size+1 for each rank, as expected.
+
 import os
 import random
 import subprocess
