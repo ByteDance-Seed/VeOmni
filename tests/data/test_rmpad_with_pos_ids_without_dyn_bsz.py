@@ -235,8 +235,8 @@ def build_command(dataset_type, dynamic_batch):
         "--train.ulysses_parallel_size=1",
         "--train.bsz_warmup_ratio=0",
         "--train.output_dir=.tests/cache",
-        f"--train.rmpad=false",
-        f"--train.rmpad_with_pos_ids=true",
+        "--train.rmpad=false",
+        "--train.rmpad_with_pos_ids=true",
         f"--train.dyn_bsz={dynamic_batch}",
     ]
     return command
