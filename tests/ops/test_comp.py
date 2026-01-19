@@ -1,22 +1,11 @@
 import argparse
+import os
 import time
 
 import torch
 
-from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionConfig, Qwen3VLVisionModel
-from veomni.utils.device import synchronize
-
-
-npu_available = True
-try:
-    import torch_npu
-except ImportError:
-    npu_available = False
-
-'''
-Usage:
-    python tests/ops/test_comp.py --warmups 10 --iters 100 --batch 20
-'''
+from veomni.models import build_foundation_model
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, synchronize
 
 
 def generate_grid_thw(
@@ -38,6 +27,7 @@ def generate_grid_thw(
         grid_thw[i, 1] = h*spatial_merge_size
         grid_thw[i, 2] = w*spatial_merge_size
     return grid_thw
+
 
 def fast_pos_embed_interpolate_ref(self, grid_thw):
     grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
@@ -101,7 +91,8 @@ def fast_pos_embed_interpolate_ref(self, grid_thw):
     patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
     return patch_pos_embeds
 
-def rot_pos_embed_ref(self, grid_thw):
+
+def rot_pos_emb_ref(self, grid_thw):
     merge_size = self.spatial_merge_size
 
     max_hw = int(grid_thw[:, 1:].max().item())
@@ -140,7 +131,8 @@ def rot_pos_embed_ref(self, grid_thw):
     embeddings = embeddings.flatten(1)
     return embeddings
 
-def test_fn(args, model, grid_thw, ref_fn, test_fn):
+
+def compare(args, model, grid_thw, ref_fn, test_fn):
     print(f"Testing {ref_fn.__name__} vs {test_fn.__name__}...")
     # warmup
     for _ in range(args.warmups):
@@ -174,12 +166,15 @@ def test_fn(args, model, grid_thw, ref_fn, test_fn):
 
     return ref_result, test_result
 
-def main(args):
-    # Create a sample configuration for the vision model
-    dummy_conf = Qwen3VLVisionConfig()
 
-    # Initialize the vision model
-    dummy_model = Qwen3VLVisionModel(dummy_conf)
+def main(args):
+    # Initialize the model and get the visual
+    dummy_model = build_foundation_model(
+        config_path=args.config_path,
+        init_device=args.device,
+    ).model.visual
+
+
     dummy_model.pos_embed.weight = torch.nn.Parameter(torch.randn_like(dummy_model.pos_embed.weight))
     try:
         dummy_model = dummy_model.to(args.device)
@@ -189,8 +184,22 @@ def main(args):
 
     grid_thw = generate_grid_thw(batch=args.batch, spatial_merge_size=dummy_model.spatial_merge_size, device=args.device)
     print(f"grid_thw: {grid_thw}")
-    test_fn(args, dummy_model, grid_thw, fast_pos_embed_interpolate_ref, dummy_model.fast_pos_embed_interpolate)
-    test_fn(args, dummy_model, grid_thw, rot_pos_embed_ref, dummy_model.rot_pos_emb)
+    compare(args, dummy_model, grid_thw, fast_pos_embed_interpolate_ref, dummy_model.fast_pos_embed_interpolate)
+    compare(args, dummy_model, grid_thw, rot_pos_emb_ref, dummy_model.rot_pos_emb)
+
+
+def test_comp(args: None):
+    if args is None:
+        args = argparse.Namespace()
+        args.warmups = 5
+        args.iters = 100
+        args.batch = 20
+
+    args.device = "cuda" if IS_CUDA_AVAILABLE else \
+                    "npu" if IS_NPU_AVAILABLE else "cpu"
+    args.config_path = os.path.dirname(os.path.abspath(__file__)) + "/../models/toy_config/qwen3vl_toy"
+    print(f"{args=}")
+    main(args)
 
 
 if __name__ == "__main__":
@@ -199,7 +208,4 @@ if __name__ == "__main__":
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--batch", type=int, default=20)
     args = parser.parse_args()
-    args.device = torch.device("cuda" if torch.cuda.is_available() else
-                               "npu" if npu_available else "cpu")
-    print(f"{args=}")
-    main(args)
+    test_comp(args)
