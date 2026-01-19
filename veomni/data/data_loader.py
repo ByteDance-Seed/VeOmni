@@ -88,7 +88,7 @@ def build_native_dataloader(
     bsz_warmup_steps = int(train_steps * bsz_warmup_ratio)
     use_rmpad = rmpad or rmpad_with_pos_ids
     logger.info_rank0(
-        f"train_steps: {train_steps}, max_seq_len: {max_seq_len}, use_rmpad: {use_rmpad}, "
+        f"train_steps: {train_steps}, max_seq_len: {max_seq_len}, use_rmpad: {use_rmpad}, dyn_bsz: {dyn_bsz}, "
         f"bsz_warmup_steps: {bsz_warmup_steps}, bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}, "
         f"token_micro_bsz: {token_micro_bsz}, num_micro_batch: {num_micro_batch}, "
         f"micro_batch_size: {micro_batch_size}, global_batch_size: {global_batch_size}, "

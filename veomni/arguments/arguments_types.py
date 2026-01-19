@@ -704,12 +704,20 @@ class TrainingArguments:
         """
         Computes the training steps per epoch according to the data length.
         """
-        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz:
-            assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
-            token_micro_bsz = self.micro_batch_size * max_seq_len
-            train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))
-            eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
-            self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
+        if self.rmpad or self.rmpad_with_pos_ids:
+            if self.dyn_bsz:
+                assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
+                token_micro_bsz = self.micro_batch_size * max_seq_len
+                train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))
+                eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
+                self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
+            else:
+                if dataset_length is not None: # for dataset with __len__ attribute (e.g. mapping dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
+                    self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)
+                elif self.max_steps is not None: # for dataset without __len__ attribute (e.g. iterable dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
+                    self._train_steps = self.max_steps
+                else:
+                    raise ValueError("For iterable dataset, please provide 'max_steps' or set dyn_bsz=True when removing padding.")
         elif dataset_length is not None:
             self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)  # assuming drop_last is true
         elif self.max_steps is not None:
