@@ -10,7 +10,7 @@ import torch.distributed as dist
 import wandb
 from tqdm import trange
 
-from tasks.data.vlm_data_process import prepare_fa_kwargs_from_position_ids
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     OmniDataCollatorWithPacking,
@@ -33,7 +33,6 @@ from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -42,6 +41,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 
 if TYPE_CHECKING:
@@ -484,13 +484,15 @@ def main():
                     micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
 
                 # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
+                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                    micro_batch["position_ids"][0]
+                )
                 micro_batch.update(
                     dict(
-                        cu_seq_lens_q=fa_kwargs["cu_seq_lens_q"],
-                        cu_seq_lens_k=fa_kwargs["cu_seq_lens_k"],
-                        max_length_q=fa_kwargs["max_length_q"],
-                        max_length_k=fa_kwargs["max_length_k"],
+                        cu_seq_lens_q=cu_seq_lens_q,
+                        cu_seq_lens_k=cu_seq_lens_k,
+                        max_length_q=max_length_q,
+                        max_length_k=max_length_k,
                     )
                 )
 
