@@ -49,9 +49,7 @@ def test_varlen_flash_attn_padded_input_matches_unpadded():
         dim=0,
     )
 
-    out_unpadded = flash_attn_varlen_func(
-        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0
-    )
+    out_unpadded = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0)
     out_padded = flash_attn_varlen_func(
         q_padded, k_padded, v_padded, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0
     )
