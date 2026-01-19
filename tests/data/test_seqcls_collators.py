@@ -111,6 +111,56 @@ def test_data_collator_sp_enabled_values_and_calls_prepare_fa(monkeypatch, featu
     assert called["prep"] == 1
 
 
+def test_data_collator_padded_packed_length_is_static(features_two_samples):
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    collator = m.DataCollatorWithPositionIDsAndPadding(
+        pad_to_length=pad_to_length,
+        pad_token_id=0,
+        position_id_pad_value=0,
+        attention_mask_pad_value=1,
+    )
+    out = collator(features_two_samples)
+
+    assert out["input_ids"].shape[-1] == pad_to_length
+    assert out["attention_mask"].shape[-1] == pad_to_length
+    assert out["labels"].shape[-1] == pad_to_length
+    assert out["position_ids"].shape[-1] == pad_to_length
+
+    # Check padded tail values.
+    tail = slice(5, pad_to_length)
+    assert torch.equal(out["input_ids"][0, tail], torch.zeros(pad_to_length - 5, dtype=torch.long))
+    assert torch.equal(out["attention_mask"][0, tail], torch.ones(pad_to_length - 5, dtype=torch.long))
+    assert torch.equal(out["labels"][0, tail], torch.full((pad_to_length - 5,), IGNORE_INDEX, dtype=torch.long))
+    assert torch.equal(out["position_ids"][0, tail], torch.zeros(pad_to_length - 5, dtype=torch.long))
+    monkeypatch.undo()
+
+
+def test_padded_packed_with_sp_padding(features_two_samples):
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=2, sp_rank=0))
+    collator = m.DataCollatorWithPositionIDsAndPadding(
+        pad_to_length=pad_to_length,
+        pad_token_id=0,
+        position_id_pad_value=0,
+        attention_mask_pad_value=1,
+    )
+    out = collator(features_two_samples)
+
+    # After SP padding/slicing, seq length is ceil(pad_to_length / sp_size).
+    assert out["input_ids"].shape[-1] == 4
+    assert out["attention_mask"].shape[-1] == 4
+    assert out["labels"].shape[-1] == 4
+    assert out["position_ids"].shape[-1] == 4
+    monkeypatch.undo()
+
+
 def test_seqcls_text_sequence_shard_collator_no_shift_no_mask_values(monkeypatch):
     import veomni.data.data_collator as m
 

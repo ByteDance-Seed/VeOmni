@@ -213,7 +213,7 @@ def run_data_test():
         dist.destroy_process_group()
 
 
-def build_command(dataset_type, dataloader_type, pad_packed_to_length=None, ulysses_parallel_size=2):
+def build_command(dataset_type, dataloader_type, pad_packed_to_length=None, ulysses_parallel_size=2, dyn_bsz=None):
     port = 12345 + random.randint(0, 100)
 
     if dataloader_type == "rmpad":
@@ -250,6 +250,8 @@ def build_command(dataset_type, dataloader_type, pad_packed_to_length=None, ulys
         command.append(f"--train.pad_packed_to_length={pad_packed_to_length}")
         command.append("--train.pad_packed_token_id=0")
         command.append("--train.pad_packed_input=true")
+    if dyn_bsz is not None:
+        command.append(f"--train.dyn_bsz={dyn_bsz}")
     return command
 
 
@@ -281,6 +283,12 @@ def test_data_rmpad_with_pos_ids_padded():
 
 def test_data_rmpad_with_pos_ids_padded_sp():
     command = build_command("mapping", "rmpad_with_pos_ids", pad_packed_to_length=32, ulysses_parallel_size=2)
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+def test_data_rmpad_with_pos_ids_padded_dyn_bsz_off():
+    command = build_command("mapping", "rmpad_with_pos_ids", pad_packed_to_length=32, dyn_bsz=False)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
