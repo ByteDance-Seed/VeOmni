@@ -2,6 +2,7 @@ import argparse
 import os
 import time
 
+import pytest
 import torch
 
 from veomni.models import build_foundation_model
@@ -181,23 +182,17 @@ def main(args):
     compare(args, dummy_model, grid_thw, rot_pos_emb_ref, dummy_model.rot_pos_emb)
 
 
-def test_comp(args: None):
-    if args is None:
-        args = argparse.Namespace()
-        args.warmups = 5
-        args.iters = 100
-        args.batch = 20
+test_cases = [
+    {"warmups": 5, "iters": 100, "batch": 10},
+    {"warmups": 5, "iters": 100, "batch": 20},
+    {"warmups": 5, "iters": 100, "batch": 30},
+]
 
+
+@pytest.mark.parametrize("args", test_cases)
+def test_comp(args: dict):
+    args = argparse.Namespace(**args)
     args.device = get_device_type()
     args.config_path = os.path.dirname(os.path.abspath(__file__)) + "/../models/toy_config/qwen3vl_toy"
     print(f"{args=}")
     main(args)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--warmups", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--batch", type=int, default=20)
-    args = parser.parse_args()
-    test_comp(args)
