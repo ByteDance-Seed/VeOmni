@@ -385,7 +385,7 @@ __all__ = [
 
 Export the model class:
 ```python
-# Register the cutomized model in __init__.py so that VeOmni uses our custom modeling/config/processor code instead of the Hugging Face version
+# Register the customized model in __init__.py so that VeOmni uses our custom modeling/config/processor code instead of the Hugging Face version
 from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, MODEL_PROCESSOR_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("qwen3_vl_moe")

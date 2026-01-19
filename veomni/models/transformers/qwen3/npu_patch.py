@@ -1,6 +1,7 @@
 import torch_npu
+import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
 
-from . import modeling_qwen3
+from ....ops.npu_patch import npu_fused_operator
 
 
 def rms_norm_forward_npu(self, x):
@@ -21,5 +22,5 @@ def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
 
 def apply_qwen3_npu_patch():
     # Patches for Qwen3 Model
-    modeling_qwen3.Qwen3RMSNorm.forward = rms_norm_forward_npu
-    modeling_qwen3.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+    hf_qwen3.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu
+    hf_qwen3.Qwen3RMSNorm.forward = npu_fused_operator.rms_norm_forward_npu

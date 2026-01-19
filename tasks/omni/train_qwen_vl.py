@@ -11,10 +11,10 @@ import wandb
 from tqdm import trange
 
 from tasks.data.vlm_data_process import (
-    prepare_fa_kwargs_from_position_ids,
     process_sample_qwen2_5_vl,
     process_sample_qwen3_vl,
 )
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
     OmniDataCollatorWithPacking,
@@ -31,7 +31,6 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -40,6 +39,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 
 if TYPE_CHECKING:
@@ -205,6 +205,7 @@ def main():
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
@@ -346,20 +347,16 @@ def main():
                     micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
-                # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)
-                # data collator adds batch dim -> (1, dim, seq_len) for unified SP slicing
-                # transpose back to (dim, 1, seq_len) for QwenVL compatibility
-                if micro_batch["position_ids"].shape[1] == 3:
-                    micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
-
                 # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
+                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                    micro_batch["position_ids"][:, 0, :]
+                )
                 micro_batch.update(
                     dict(
-                        cu_seq_lens_q=fa_kwargs["cu_seq_lens_q"],
-                        cu_seq_lens_k=fa_kwargs["cu_seq_lens_k"],
-                        max_length_q=fa_kwargs["max_length_q"],
-                        max_length_k=fa_kwargs["max_length_k"],
+                        cu_seq_lens_q=cu_seq_lens_q,
+                        cu_seq_lens_k=cu_seq_lens_k,
+                        max_length_q=max_length_q,
+                        max_length_k=max_length_k,
                     )
                 )
 

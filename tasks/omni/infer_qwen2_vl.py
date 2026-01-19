@@ -4,9 +4,9 @@ from dataclasses import asdict, dataclass, field
 import requests
 from PIL import Image
 
+from veomni.arguments import InferArguments, parse_args
 from veomni.models import build_foundation_model, build_processor
 from veomni.utils import helper
-from veomni.utils.arguments import InferArguments, parse_args
 from veomni.utils.device import get_device_type
 
 

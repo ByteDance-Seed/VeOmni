@@ -64,6 +64,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 if is_flash_attn_2_available():
@@ -470,6 +471,7 @@ class VisionSdpaAttention(nn.Module):
 QWEN2_VL_VISION_ATTENTION_CLASSES = {
     "eager": VisionAttention,
     "flash_attention_2": VisionFlashAttention2,
+    "veomni_flash_attention_2_with_sp": VisionFlashAttention2,
     "sdpa": VisionSdpaAttention,
 }
 
@@ -705,7 +707,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        if config.use_sliding_window and config._attn_implementation != "flash_attention_2":
+        if config.use_sliding_window and config._attn_implementation not in VARLEN_ATTENTION_TYPES:
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
@@ -1088,7 +1090,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool,
     ):
-        if self.config._attn_implementation == "flash_attention_2":
+        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
             if attention_mask is not None and past_key_values is not None:
                 is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]
                 if is_padding_right:

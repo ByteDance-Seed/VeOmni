@@ -104,6 +104,7 @@ if is_liger_kernel_available():
 
 from ....data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils import logging
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 logger = logging.get_logger(__name__)
@@ -834,6 +835,7 @@ class Qwen2_5OmniAudioSdpaAttention(Qwen2_5OmniAudioAttention):
 QWEN2_5_OMNI_AUDIO_ATTENTION_CLASSES = {
     "eager": Qwen2_5OmniAudioAttention,
     "flash_attention_2": Qwen2_5OmniAudioFlashAttention2,
+    "veomni_flash_attention_2_with_sp": Qwen2_5OmniAudioFlashAttention2,
     "sdpa": Qwen2_5OmniAudioSdpaAttention,
 }
 
@@ -1265,6 +1267,7 @@ class Qwen2_5OmniMLP(nn.Module):
 QWEN2_5_OMNI_VISION_ATTENTION_CLASSES = {
     "eager": Qwen2_5OmniVisionAttention,
     "flash_attention_2": Qwen2_5OmniVisionFlashAttention2,
+    "veomni_flash_attention_2_with_sp": Qwen2_5OmniVisionFlashAttention2,
     "sdpa": Qwen2_5OmniVisionSdpaAttention,
 }
 
@@ -2071,6 +2074,7 @@ class Qwen2_5OmniSdpaAttention(Qwen2_5OmniAttention):
 QWEN2_5_OMNI_ATTENTION_CLASSES = {
     "eager": Qwen2_5OmniAttention,
     "flash_attention_2": Qwen2_5OmniFlashAttention2,
+    "veomni_flash_attention_2_with_sp": Qwen2_5OmniFlashAttention2,
     "sdpa": Qwen2_5OmniSdpaAttention,
 }
 
@@ -2080,7 +2084,7 @@ class Qwen2_5OmniDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        if config.use_sliding_window and config._attn_implementation != "flash_attention_2":
+        if config.use_sliding_window and config._attn_implementation not in VARLEN_ATTENTION_TYPES:
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
@@ -2332,7 +2336,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool = False,
     ):
-        if self.config._attn_implementation == "flash_attention_2":
+        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
             if attention_mask is not None and past_key_values is not None:
                 is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]
                 if is_padding_right:
@@ -3124,10 +3128,7 @@ class Qwen2_5OmniTalkerModel(Qwen2_5OmniPreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool = False,
     ):
-        if (
-            self.config._attn_implementation == "flash_attention_2"
-            or self.config._attn_implementation == "flash_attention_3"
-        ):
+        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
             if attention_mask is not None and past_key_values is not None:
                 is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]
                 if is_padding_right:
@@ -4667,9 +4668,9 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
     def __init__(self, config: Qwen2_5OmniToken2WavConfig):
         super().__init__(config)
         attn_impl = config._attn_implementation
-        if config._attn_implementation == "flash_attention_2":
+        if config._attn_implementation in VARLEN_ATTENTION_TYPES:
             logger.warning_once(
-                "Qwen2_5OmniToken2WavModel must inference with fp32, but flash_attention_2 only supports fp16 and bf16, "
+                "Qwen2_5OmniToken2WavModel must inference with fp32, but flash attention only supports fp16 and bf16, "
                 "attention implementation of Qwen2_5OmniToken2WavModel will fallback to sdpa."
             )
             attn_impl = "sdpa"

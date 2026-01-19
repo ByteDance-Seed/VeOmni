@@ -48,6 +48,7 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 if is_liger_kernel_available():
@@ -639,10 +640,7 @@ class LlamaModel(LlamaPreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool,
     ):
-        if (
-            self.config._attn_implementation == "flash_attention_2"
-            or self.config._attn_implementation == "flash_attention_3"
-        ):
+        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask
             return None

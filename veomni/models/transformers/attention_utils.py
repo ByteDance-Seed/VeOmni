@@ -11,21 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY
 
 
-@MODELING_REGISTRY.register("qwen3_vl_moe")
-def register_qwen3_vl_moe_modeling(architecture: str):
-    from .modeling_qwen3_vl_moe import (
-        Qwen3VLMoeForConditionalGeneration,
-        Qwen3VLMoeModel,
-        apply_veomni_qwen3vlmoe_patch,
-    )
-
-    apply_veomni_qwen3vlmoe_patch()
-    if "ForConditionalGeneration" in architecture:
-        return Qwen3VLMoeForConditionalGeneration
-    elif "Model" in architecture:
-        return Qwen3VLMoeModel
-    else:
-        return Qwen3VLMoeForConditionalGeneration
+VARLEN_ATTENTION_TYPES = (
+    "flash_attention_2",
+    "flash_attention_3",
+    "veomni_flash_attention_2_with_sp",
+    "veomni_flash_attention_3_with_sp",
+)

@@ -158,6 +158,15 @@ def flash_attention_forward(
         # Only after all_to_all we got the full seq_len
         seq_len = query.shape[1]
 
+    if module.config._attn_implementation == "veomni_flash_attention_2_with_sp":
+        fa_kernel_implementation = "flash_attention_2"
+    elif module.config._attn_implementation == "veomni_flash_attention_3_with_sp":
+        fa_kernel_implementation = "flash_attention_3"
+    else:
+        raise ValueError(
+            f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
+        )
+
     attn_output = _flash_attention_forward(
         query,
         key,
@@ -171,7 +180,7 @@ def flash_attention_forward(
         softcap=softcap,
         use_top_left_mask=False,
         target_dtype=target_dtype,
-        attn_implementation=module.config._attn_implementation,
+        attn_implementation=fa_kernel_implementation,
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
         **kwargs,
     )
@@ -190,7 +199,7 @@ def flash_attention_forward(
 
 
 def apply_veomni_attention_patch():
-    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
-    ALL_ATTENTION_FUNCTIONS.register("flash_attention_3", flash_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", flash_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", flash_attention_forward)
     global _flash_attention_forward
     _flash_attention_forward = transformers_flash_attention_forward

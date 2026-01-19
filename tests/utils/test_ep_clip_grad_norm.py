@@ -6,13 +6,13 @@ import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor, Shard
 
+from veomni.arguments import TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import TrainingArguments, parse_args
 from veomni.utils.device import (
     get_device_id,
     get_device_type,

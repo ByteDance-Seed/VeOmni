@@ -10,6 +10,7 @@ import yaml
 from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from tqdm import trange
 
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader, build_dummy_dataset
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -18,7 +19,6 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 

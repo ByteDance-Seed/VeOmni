@@ -1,3 +1,15 @@
+# What does this .py file do?
+# It tests the use of rmpad_with_pos_ids without dyn_bsz, which is typically used during SFT (Supervised Fine-Tuning).
+
+# This file copied from tests/data/test_native_datasets.py
+# Then the following key modifications were made:
+# 1. Passed args.train.dyn_bsz to build_dataloader
+# 2. Set train.ulysses_parallel_size=1, train.rmpad=false, and train.rmpad_with_pos_ids=true in the command
+# 3. Added the train.dyn_bsz argument to the command to control dyn_bsz
+# 4. Added the function test_rmpad_with_pos_ids_without_dyn_bsz to support pytest
+
+# It can be observed that cu_seq_lens_q.shape is micro_batch_size+1 for each rank, as expected.
+
 import os
 import random
 import subprocess
@@ -80,6 +92,7 @@ def run_data_test():
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
+        dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         num_workers=1,
@@ -213,24 +226,15 @@ def run_data_test():
         dist.destroy_process_group()
 
 
-def build_command(dataset_type, dataloader_type):
+def build_command(dataset_type, dynamic_batch):
     port = 12345 + random.randint(0, 100)
 
-    if dataloader_type == "rmpad":
-        rmpad = True
-        rmpad_with_pos_ids = False
-    elif dataloader_type == "rmpad_with_pos_ids":
-        rmpad = False
-        rmpad_with_pos_ids = True
-    else:
-        rmpad = False
-        rmpad_with_pos_ids = False
     command = [
         "torchrun",
         "--nnodes=1",
         "--nproc_per_node=8",
         f"--master_port={port}",
-        "tests/data/test_native_datasets.py",
+        "tests/data/test_rmpad_with_pos_ids_without_dyn_bsz.py",
         "--model.config_path=test",
         "--data.train_path=None",
         "--data.train_size=1000",
@@ -240,37 +244,18 @@ def build_command(dataset_type, dataloader_type):
         "--train.data_parallel_mode=ddp",
         "--train.ckpt_manager=dcp",
         f"--data.datasets_type={dataset_type}",
-        "--train.ulysses_parallel_size=2",
+        "--train.ulysses_parallel_size=1",
         "--train.bsz_warmup_ratio=0",
         "--train.output_dir=.tests/cache",
-        f"--train.rmpad={rmpad}",
-        f"--train.rmpad_with_pos_ids={rmpad_with_pos_ids}",
+        "--train.rmpad=false",
+        "--train.rmpad_with_pos_ids=true",
+        f"--train.dyn_bsz={dynamic_batch}",
     ]
     return command
 
 
-def test_data_rmpad():
-    command = build_command("mapping", "rmpad")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-    command = build_command("iterable", "rmpad")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-
-def test_data_rmpad_with_pos_ids():
-    command = build_command("mapping", "rmpad_with_pos_ids")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-    command = build_command("iterable", "rmpad_with_pos_ids")
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
-
-
-def test_data_padding():
-    command = build_command("mapping", "padding")
+def test_rmpad_with_pos_ids_without_dyn_bsz():
+    command = build_command(dataset_type="mapping", dynamic_batch=False)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 

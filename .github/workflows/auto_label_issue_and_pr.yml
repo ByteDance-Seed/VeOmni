@@ -95,23 +95,32 @@ jobs:
               ['doc', ['doc', 'documentation', 'readme', 'docs', '/doc']],
               ['example', ['example', 'demo', 'tutorial', '/example']],
               ['hf_v5', ['hf_v5', 'transformers v5', '/hf_v5']],
-              ['roadmap', ['roadmap', 'plan', '/roadmap']]
+              ['roadmap', ['roadmap', 'plan', '/roadmap']],
+              ['docker', ['docker', 'image', '/docker']]
             ];
 
             const labelsToAdd = new Set(); // Use Set to prevent duplicate labels
 
             // --- 4. Match Keywords ---
             const isCommentEvent = (eventName === 'issue_comment' || eventName === 'pull_request_review_comment');
-
+            function escapeRegExp(string) {
+              return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }
             for (const [label, keywords] of rules) {
               let keywordsToMatch = keywords;
-
-              // Filter keywords if it's a comment event, only support /xxx keywords
+              // if comment event, only match keywords start with /
               if (isCommentEvent) {
                 keywordsToMatch = keywords.filter(k => k.startsWith('/'));
               }
-
-              if (keywordsToMatch.some(word => textToCheck.includes(word))) {
+              // use regex to match keywords
+              const matched = keywordsToMatch.some(word => {
+                const escapedWord = escapeRegExp(word);
+                // (^|[^a-zA-Z0-9_]): start with a non-word character or the beginning of the string
+                // (?=[^a-zA-Z0-9_]|$): followed by a non-word character or the end of the string
+                const regex = new RegExp(`(^|[^a-zA-Z0-9_])${escapedWord}(?=[^a-zA-Z0-9_]|$)`, 'i');
+                return regex.test(textToCheck);
+              });
+              if (matched) {
                 labelsToAdd.add(label);
               }
             }
