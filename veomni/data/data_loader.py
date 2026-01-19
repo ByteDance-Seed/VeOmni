@@ -29,6 +29,7 @@ from .data_collator import (
     DataCollatorWithPacking,
     DataCollatorWithPadding,
     DataCollatorWithPositionIDs,
+    DataCollatorWithPositionIDsAndPadding,
     MakeMicroBatchCollator,
     TextSequenceShardCollator,
     UnpackDataCollator,
@@ -71,6 +72,8 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
+    pad_packed_to_length: Optional[int] = None,
+    pad_packed_token_id: int = 0,
     dyn_bsz_buffer_size: int = 500,
     dyn_bsz_margin: int = 0,
     collate_fn: Optional[Union[Callable, List[Callable]]] = None,
@@ -98,7 +101,15 @@ def build_native_dataloader(
     if collate_fn is None:
         collate_fn_list = []
         if rmpad_with_pos_ids:
-            collate_fn_list.append(DataCollatorWithPositionIDs())
+            if pad_packed_to_length is not None:
+                collate_fn_list.append(
+                    DataCollatorWithPositionIDsAndPadding(
+                        pad_to_length=pad_packed_to_length,
+                        pad_token_id=pad_packed_token_id,
+                    )
+                )
+            else:
+                collate_fn_list.append(DataCollatorWithPositionIDs())
         elif rmpad:
             collate_fn_list.append(DataCollatorWithPacking())
         else:

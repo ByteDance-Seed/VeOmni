@@ -178,12 +178,53 @@ class DataCollatorWithPositionIDs(DataCollator):
             # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
             # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
             cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
+            batch["rmpad_with_pos_ids"] = True
         else:
             # Still need cu_seq_lens_q for label masking even when sp_enabled
             (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
 
         if self.mask_boundary_labels and "labels" in batch:
             batch["labels"][:, cu_seq_lens_q[1:-1]] = IGNORE_INDEX
+
+        return batch
+
+
+@dataclass
+class DataCollatorWithPositionIDsAndPadding(DataCollator):
+    """
+    Data collator with packing by position ids and fixed-length padding.
+    """
+
+    pad_to_length: int
+    pad_token_id: int = 0
+    position_id_pad_value: int = 0
+    attention_mask_pad_value: int = 1
+
+    def __post_init__(self):
+        self.base_collator = DataCollatorWithPositionIDs()
+
+    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
+        batch = self.base_collator(features)
+        seq_len = batch["input_ids"].shape[-1]
+        assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
+
+        pad_len = self.pad_to_length - seq_len
+        if pad_len == 0:
+            return batch
+
+        def pad_last_dim(tensor: "torch.Tensor", pad_value: int) -> "torch.Tensor":
+            pad_shape = list(tensor.shape)
+            pad_shape[-1] = pad_len
+            pad = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, pad], dim=-1)
+
+        batch["input_ids"] = pad_last_dim(batch["input_ids"], self.pad_token_id)
+        if "attention_mask" in batch:
+            batch["attention_mask"] = pad_last_dim(batch["attention_mask"], self.attention_mask_pad_value)
+        if "labels" in batch:
+            batch["labels"] = pad_last_dim(batch["labels"], IGNORE_INDEX)
+        if "position_ids" in batch:
+            batch["position_ids"] = pad_last_dim(batch["position_ids"], self.position_id_pad_value)
 
         return batch
 

@@ -213,7 +213,7 @@ def run_data_test():
         dist.destroy_process_group()
 
 
-def build_command(dataset_type, dataloader_type):
+def build_command(dataset_type, dataloader_type, pad_packed_to_length=None):
     port = 12345 + random.randint(0, 100)
 
     if dataloader_type == "rmpad":
@@ -246,6 +246,9 @@ def build_command(dataset_type, dataloader_type):
         f"--train.rmpad={rmpad}",
         f"--train.rmpad_with_pos_ids={rmpad_with_pos_ids}",
     ]
+    if pad_packed_to_length is not None:
+        command.append(f"--train.pad_packed_to_length={pad_packed_to_length}")
+        command.append("--train.pad_packed_token_id=0")
     return command
 
 
@@ -265,6 +268,12 @@ def test_data_rmpad_with_pos_ids():
     assert result.returncode == 0
 
     command = build_command("iterable", "rmpad_with_pos_ids")
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+def test_data_rmpad_with_pos_ids_padded():
+    command = build_command("mapping", "rmpad_with_pos_ids", pad_packed_to_length=32)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 

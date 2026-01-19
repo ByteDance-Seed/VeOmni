@@ -364,6 +364,14 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable padding-free training by using the position_ids."},
     )
+    pad_packed_to_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Pad packed sequences to a fixed length when rmpad_with_pos_ids is enabled."},
+    )
+    pad_packed_token_id: int = field(
+        default=0,
+        metadata={"help": "Padding token id for fixed-length packed sequences."},
+    )
     dyn_bsz: bool = field(
         default=True,
         metadata={"help": "Enable dynamic batch size for padding-free training."},
@@ -750,7 +758,12 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
-        pass
+        if (
+            self.train.rmpad_with_pos_ids
+            and self.train.pad_packed_to_length is None
+            and self.data.max_seq_len is not None
+        ):
+            self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
 
 
 # ================================ Infer Arguments ======================================
