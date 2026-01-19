@@ -59,7 +59,7 @@ In summary,
 
 At this step, you already understand how EP+FSDP2 is designed in VeOmni which is sufficient to setup the training! If you are not interested in the implementation details, you can skip the following sections.
 
-The methods discussed in the following sections are trasparent to the end users and automically applied by VeOmni, without any additional efforts to configure.
+The methods discussed in the following sections are transparent to the end users and automatically applied by VeOmni, without any additional efforts to configure.
 
 ## Expert Parallelism Details
 
@@ -69,7 +69,7 @@ As a model-centric framework, VeOmni registers leaf expert weight keys, i.e, "fu
 
 In this way, each model exposes `get_parallel_plan()` method which returns a `ParallelPlan` containing an `ep_plan` dict. Keys are parameter FQN patterns that identify expert weights; values are `Shard(dim=...)` telling which tensor dimension is sharded across EP ranks (in this case always dim-0 to shard expert number).
 
-After applying EP sharding on these registered modules, we immediately drop their device mesh info by replacing the parameter with its local shard. This is because we do not want to gather them back during experts computation like FSDP, we would mauanlly control how EP ranks interact with each other in the model's fused MoE implementation.
+After applying EP sharding on these registered modules, we immediately drop their device mesh info by replacing the parameter with its local shard. This is because we do not want to gather them back during experts computation like FSDP, we would manually control how EP ranks interact with each other in the model's fused MoE implementation.
 
 > In this way, we also avoid using experimental APIs like TorchTitan to override TP-oriented `parallelize_module` to implement EP.
 
@@ -79,7 +79,7 @@ After applying EP sharding on these registered modules, we immediately drop thei
 
 ### Sharding from the bottom up
 
-FSDP2 relis on `fully_shard`, which should be applied in a bottom-up fashion.
+FSDP2 relies on `fully_shard`, which should be applied in a bottom-up fashion.
 
 For EP+FSDP2, a simplified view looks like:
 
@@ -129,7 +129,7 @@ After loading process, we drop EP-dim again to avoid confusing the FSDP process 
 
 Note that this is implemented in `ModelState` class, which is used for saving checkpoints only. So, the other calls of `model.state_dict()` is not affected.
 
-## Acknoledgements
+## Acknowledgements
 
 We largely refer the implementations in [TorchTitan](https://github.com/pytorch/torchtitan) to address the consequences of mixed sharding.
 

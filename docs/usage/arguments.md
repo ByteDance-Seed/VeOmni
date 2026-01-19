@@ -8,9 +8,9 @@
 | model.tokenizer_path | str | Path to the tokenizer | model.model_path |
 | model.encoders | dict | Configuration file for multi-modal encoders | {} |
 | model.decoders | dict | Configuration file for multi-modal decoders | {} |
-| model.input_encoder | str: {"encoder", "decoder"} | Use the encoder of the encoder or decoder to encode the input image | encoder |
-| model.output_encoder | str: {"encoder", "decoder"} | Use the encoder of the encoder or decoder to encode the output image | decoder |
-| model.encode_target | bool | Used to encode the training data for the diffusion model | False |
+| model.input_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the input image | encoder |
+| model.output_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the output image | decoder |
+| model.encode_target | bool | Whether to encode the training data for the diffusion model | False |
 
 ## Data configuration arguments
 
@@ -19,7 +19,7 @@
 | data.train_path | str | Path of training dataset | Required |
 | data.train_size | int | Total number of tokens in the training set | 10,000,000 |
 | data.data_type | str: {"plaintext", "conversation"} | Dataset type.  | conversation |
-| data.dataloader_type | str: {"native"} | Use the pytorch dataloader or  | native |
+| data.dataloader_type | str: {"native"} | Type of the dataloader | native |
 | data.datasets_type | str: {"mapping", "iterable"} | Dataset type. `IterativeDataset` or `MappingDataset`, or your custom datsets | mapping |
 | data.text_keys | str: {"content_split", "messages"} | The key corresponding to the text samples in the data dictionary. Generally, it is "content_split" for pretraining and "messages" for SFT. | content_split |
 | data.image_keys | str | The key corresponding to the image samples in the data dictionary. Generally, it is "images". | images |

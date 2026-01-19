@@ -12,14 +12,14 @@
    ```
 
 3. **Create Custom Task Directory**  
-    [`train_torch.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, youcan just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_qwen2_vl.py)
+    [`train_torch.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, you can just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_qwen2_vl.py)
     ```bash
     mkdir tasks/your_task
     cp tasks/train_torch.py tasks/your_task/train.py
     ```
 
 4. **Launch Custom Training**  
-    you  can overwrite the default arguments in train yaml by passing them to the script.
+    You can overwrite the default arguments in train yaml by passing them to the script.
     ```bash
     bash train.sh tasks/your_task/train.py \
         $CONFIG.yaml \
@@ -123,9 +123,9 @@ train_dataset = build_dataset(
 >
 > args.train.compute_train_steps is used to compute the number of training steps. without this, the train steps will be computed incorrectly.
 >
-> if you dataset is iterable, you are recommended to add data.train_size(the token you want to comsume) to the config file, the `train_steps` will approximate to `train_size / (global_batch_size * max_seq_len)`(without any warm strategy).
+> If your dataset is iterable, you are recommended to add data.train_size (the token you want to consume) to the config file, the `train_steps` will approximate to `train_size / (global_batch_size * max_seq_len)` (without any warm strategy).
 >
-> if you dataset is mapping, you are recommended to add pass the len(train_dataset) to the `train_steps` to compute the correct train steps.
+> If your dataset is mapping, you are recommended to pass len(train_dataset) to the `train_steps` to compute the correct train steps.
 
 ### Custom Datasets
 VeOmni is a flexible framework that supports custom datasets. You can implement your own dataset function and use it with VeOmni.
@@ -138,7 +138,7 @@ def build_custom_dataset(data_path, transform)-> Dataset:
 elif args.data.datasets_type == "custom":
     logger.info_rank0("Start building custom dataset")
     train_dataset = build_custom_dataset(args.data.train_path, transform=transform)
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset)) # compute train steps, remove the len(train_dataset) if you dataset is iterable
+    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset)) # compute train steps, remove the len(train_dataset) if your dataset is iterable
 ```
 
 ### Data Transform (Preprocess)
@@ -194,9 +194,9 @@ class CustomTemplate(ChatTemplate):
 
 ## DataLoader
 VeOmni offered a flexible and powerful dataloader implementation, which supports
-- both padding and remove padding(packing) strategy
+- both padding and remove padding (packing) strategy
 - dynamic batching strategy
--
+
 (source code: [veomni/data/data_loader.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_loader.py)):
 
 ```python
