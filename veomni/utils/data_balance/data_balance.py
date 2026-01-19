@@ -40,32 +40,17 @@ class EncoderDataBalance:
 
         return balanced_pixel_values, balanced_grid_thw
 
-    def data_bridge(self, hidden_state, deepstack_feature_lists):
-        recoverd_hidden_state = self._recover_image_data(hidden_state)
+    def data_bridge(self, hidden_state, deepstack_feature_lists, require_grad=True):
+        recoverd_hidden_state = self.reverse_all_to_all_redistribution(hidden_state, require_grad=require_grad)
         if deepstack_feature_lists:
             recovered_deepstack_feature_lists = [
-                self._recover_image_data(df)
+                self.reverse_all_to_all_redistribution(df, require_grad=require_grad)
                 for df in deepstack_feature_lists
             ]
         else:
             recovered_deepstack_feature_lists = []
 
         return recoverd_hidden_state, recovered_deepstack_feature_lists
-
-    def _recover_image_data(self, hidden_state):
-        recovered_hidden_state = self.all_to_all_communication(
-            list(hidden_state.split(self.state_buffer['image']["pixel_values_split"])),
-            self.state_buffer['image']["pixel_values_origin"],
-            (hidden_state.shape[-1],),
-            self.dp_group
-        )
-        recovered_hidden_state = torch.cat(recovered_hidden_state).split(
-            self.state_buffer['image']["image_grid_thw_origin_split"])
-        origin_hidden_state = [None] * len(recovered_hidden_state)
-        for i, idx in enumerate(self.state_buffer['image']['pixel_values_data_list']):
-            origin_hidden_state[idx] = recovered_hidden_state[i]
-
-        return torch.cat(origin_hidden_state)
 
     @staticmethod
     def _set_sorting_algo(sorting_algo_name):
@@ -143,8 +128,21 @@ class EncoderDataBalance:
 
         return balanced_datas
 
-    def reverse_all_to_all_redistribution(self):
-        pass
+    def reverse_all_to_all_redistribution(self, hidden_state, require_grad):
+        recovered_hidden_state = self.all_to_all_communication(
+            list(hidden_state.split(self.state_buffer['image']["pixel_values_split"])),
+            self.state_buffer['image']["pixel_values_origin"],
+            (hidden_state.shape[-1],),
+            self.dp_group,
+            require_grad=require_grad
+        )
+        recovered_hidden_state = torch.cat(recovered_hidden_state).split(
+            self.state_buffer['image']["image_grid_thw_origin_split"])
+        origin_hidden_state = [None] * len(recovered_hidden_state)
+        for i, idx in enumerate(self.state_buffer['image']['pixel_values_data_list']):
+            origin_hidden_state[idx] = recovered_hidden_state[i]
+
+        return torch.cat(origin_hidden_state)
 
     @staticmethod
     def rank_table_mapping(rank_table, dp_rank):
@@ -167,11 +165,15 @@ class EncoderDataBalance:
         return new_data_group_per_rank
 
     @staticmethod
-    def all_to_all_communication(data, balanced_data_lengths, data_dim, dp_process_group):
+    def all_to_all_communication(data, balanced_data_lengths, data_dim, dp_process_group, require_grad=False):
         balanced_data_cache = [
             torch.empty(
                 (*new_length, *data_dim), dtype=data[0].dtype, device=data[0].device
             ).squeeze(-1) for new_length in balanced_data_lengths
         ]
-        dist.all_to_all(balanced_data_cache, data, group=dp_process_group)
+        if require_grad:
+            from torch.distributed.nn.functional import all_to_all
+        else:
+            from torch.distributed import all_to_all
+        all_to_all(balanced_data_cache, data, group=dp_process_group)
         return balanced_data_cache
