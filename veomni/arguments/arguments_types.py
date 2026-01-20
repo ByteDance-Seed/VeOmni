@@ -402,11 +402,11 @@ class TrainingArguments:
     )
     enable_reshard_after_forward: bool = field(
         default=True,
-        metadata={"help": "Enabl reshard after forward for FSDP2."},
+        metadata={"help": "Enable reshard after forward for FSDP2."},
     )
     enable_reshard_after_backward: bool = field(
         default=True,
-        metadata={"help": "Enabl reshard after backward for  FSDP2."},
+        metadata={"help": "Enable reshard after backward for  FSDP2."},
     )
     enable_mixed_precision: bool = field(
         default=True,
