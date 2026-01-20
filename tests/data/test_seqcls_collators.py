@@ -127,12 +127,7 @@ def test_data_collator_padded_packed_length_is_static(features_two_samples):
             "labels": torch.tensor([1, 1], dtype=torch.long),
         },
     ]
-    collator = m.DataCollatorWithPositionIDsAndPadding(
-        pad_to_length=pad_to_length,
-        pad_token_id=0,
-        position_id_pad_value=0,
-        attention_mask_pad_value=1,
-    )
+    collator = m.DataCollatorWithPositionIDsAndPadding(pad_to_length=pad_to_length)
     out = collator(token_labels)
 
     assert out["input_ids"].shape[-1] == pad_to_length
@@ -167,7 +162,6 @@ def test_padded_packed_with_sp_padding(features_two_samples):
     ]
     collator = m.DataCollatorWithPositionIDsAndPadding(
         pad_to_length=pad_to_length,
-        pad_token_id=0,
         position_id_pad_value=0,
         attention_mask_pad_value=1,
     )

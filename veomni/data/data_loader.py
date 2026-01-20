@@ -73,7 +73,6 @@ def build_native_dataloader(
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
     pad_packed_to_length: Optional[int] = None,
-    pad_packed_token_id: int = 0,
     dyn_bsz_buffer_size: int = 500,
     dyn_bsz_margin: int = 0,
     collate_fn: Optional[Union[Callable, List[Callable]]] = None,
@@ -105,7 +104,6 @@ def build_native_dataloader(
                 collate_fn_list.append(
                     DataCollatorWithPositionIDsAndPadding(
                         pad_to_length=pad_packed_to_length,
-                        pad_token_id=pad_packed_token_id,
                     )
                 )
             else:

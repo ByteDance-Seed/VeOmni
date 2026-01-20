@@ -193,10 +193,15 @@ class DataCollatorWithPositionIDs(DataCollator):
 class DataCollatorWithPositionIDsAndPadding(DataCollator):
     """
     Data collator with packing by position ids and fixed-length padding.
+
+    Padding values are fixed to avoid config drift:
+    - input_ids: 0
+    - labels: IGNORE_INDEX
+    - position_ids: 0
+    - attention_mask: 1
     """
 
     pad_to_length: int
-    pad_token_id: int = 0
     position_id_pad_value: int = 0
     attention_mask_pad_value: int = 1
 
@@ -218,7 +223,7 @@ class DataCollatorWithPositionIDsAndPadding(DataCollator):
             pad = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
             return torch.cat([tensor, pad], dim=-1)
 
-        batch["input_ids"] = pad_last_dim(batch["input_ids"], self.pad_token_id)
+        batch["input_ids"] = pad_last_dim(batch["input_ids"], 0)
         if "attention_mask" in batch:
             batch["attention_mask"] = pad_last_dim(batch["attention_mask"], self.attention_mask_pad_value)
         if "labels" in batch:

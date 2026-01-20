@@ -372,10 +372,6 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable padding for packed sequences when rmpad_with_pos_ids is enabled."},
     )
-    pad_packed_token_id: int = field(
-        default=0,
-        metadata={"help": "Padding token id for fixed-length packed sequences."},
-    )
     dyn_bsz: bool = field(
         default=True,
         metadata={"help": "Enable dynamic batch size for padding-free training."},
@@ -769,6 +765,13 @@ class VeOmniArguments:
                 and self.data.max_seq_len is not None
             ):
                 self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
+                logger.info_rank0(
+                    f"pad_packed_input is set to true without pad_packed_to_length, setting pad_packed_to_length to train.micro_batch_size * data.max_seq_len = {self.train.pad_packed_to_length}"
+                )
+            if self.train.pad_packed_to_length < self.train.micro_batch_size * self.data.max_seq_len:
+                logger.warning_rank0(
+                    "pad_packed_to_length is smaller than train.micro_batch_size * data.max_seq_len, the actual input size can be larger than pad_packed_to_length"
+                )
         else:
             self.train.pad_packed_to_length = None
 

@@ -51,7 +51,6 @@ def test_qwen3_loss_match_with_padded_packed_input(monkeypatch, pad_to_length):
     base_collator = DataCollatorWithPositionIDs(mask_boundary_labels=False)
     padded_collator = DataCollatorWithPositionIDsAndPadding(
         pad_to_length=pad_to_length,
-        pad_token_id=0,
         position_id_pad_value=0,
         attention_mask_pad_value=1,
     )
