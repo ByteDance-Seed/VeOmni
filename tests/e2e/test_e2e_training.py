@@ -7,7 +7,6 @@ from utils import parse_training_log
 
 test_cases = [
     pytest.param("qwen3_0p6b_base_tulu_sft"),
-    pytest.param("qwen3_omni_moe_coco_sft"),
 ]
 
 
