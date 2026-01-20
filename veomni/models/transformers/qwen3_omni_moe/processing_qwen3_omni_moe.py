@@ -170,7 +170,7 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
         use_audio_in_video = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
         fps = output_kwargs["videos_kwargs"].get("fps", 1.0)
 
-        if audio is not None:
+        if audio:
             output_kwargs["audio_kwargs"]["padding"] = True  # Setting to True to avoid default truncation
             audio_inputs = self.feature_extractor(audio, **output_kwargs["audio_kwargs"])
             audio_inputs["feature_attention_mask"] = audio_inputs.pop(
@@ -184,14 +184,14 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
             audio_inputs = {}
             audio_lengths = iter([])
 
-        if images is not None:
+        if images:
             images_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
             image_grid_thw = iter(images_inputs["image_grid_thw"])
         else:
             images_inputs = {}
             image_grid_thw = iter([])
 
-        if videos is not None:
+        if videos:
             videos = make_batched_videos(videos)
             videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
             fps = [fps] * len(videos)

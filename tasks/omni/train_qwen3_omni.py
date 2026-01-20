@@ -66,7 +66,7 @@ def process_sample(
     Processes multimodal example with qwen2_5_vl's pre-processor.
     """
     source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
+        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # source_name if use multisource_dataset
     conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
     conversations = conv_preprocess(source, conversations, **kwargs)
@@ -92,9 +92,24 @@ def process_sample(
         input_conversations.append(tmp_conv)
     text = processor.apply_chat_template(input_conversations, tokenize=False)
 
-    images = fetch_images(sample.get("images", []), **kwargs)
-    videos, video_audios = fetch_videos(sample.get("videos", []), **kwargs)
-    audio_audios = fetch_audios(sample.get("audios", []), **kwargs)
+    images = sample.get("images", [])
+    if images:
+        images = fetch_images(images, **kwargs)
+    else:
+        images = []
+
+    videos = [sample.get("video")] if "video" in sample else []
+    if videos:
+        videos, video_audios = fetch_videos(videos, **kwargs)
+    else:
+        videos, video_audios = [], []
+
+    audios = sample.get("audios", [])
+    if audios:
+        audio_audios = fetch_audios(audios, **kwargs)
+    else:
+        audio_audios = []
+
     audios = []
     for item in input_conversations:
         for content in item["content"]:
