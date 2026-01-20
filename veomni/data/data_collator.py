@@ -224,12 +224,14 @@ class DataCollatorWithPositionIDsAndPadding(DataCollator):
             return torch.cat([tensor, pad], dim=-1)
 
         batch["input_ids"] = pad_last_dim(batch["input_ids"], 0)
-        if "attention_mask" in batch:
-            batch["attention_mask"] = pad_last_dim(batch["attention_mask"], self.attention_mask_pad_value)
         if "labels" in batch:
             batch["labels"] = pad_last_dim(batch["labels"], IGNORE_INDEX)
         if "position_ids" in batch:
             batch["position_ids"] = pad_last_dim(batch["position_ids"], self.position_id_pad_value)
+
+        # Update flash-attn kwargs to match the padded length.
+        if "position_ids" in batch and not self.base_collator.sp_enabled:
+            add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch
 
