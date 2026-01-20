@@ -73,3 +73,14 @@ Example fixed batch size = 2 samples:
 * Batch 2: S3 + S4
 * input_ids = [G H I J]
 * position_ids = [0 1 2 0]
+
+## Padding packed inputs (pad_packed_input)
+
+When `rmpad_with_pos_ids` is enabled, `pad_packed_input` can pad the packed sequence to a fixed length
+(`pad_packed_to_length`). This is useful to avoid uneven lengths that can trigger kernel recompilation.
+
+Important details:
+
+* Padding is applied only after packing; labels are padded with `IGNORE_INDEX`.
+* FlashAttention kwargs (`cu_seq_lens_q/k` and `max_length_q/k`) are recomputed after padding so they match
+  the padded length and avoid numerical instability.
