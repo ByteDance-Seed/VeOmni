@@ -436,7 +436,7 @@ def main():
                 if (
                     args.train.data_parallel_mode == "fsdp2"
                     and not args.train.enable_reshard_after_backward
-                    and num_micro_steps > 0
+                    and num_micro_steps > 1
                 ):
                     if micro_step == 0:
                         model.set_reshard_after_backward(False)
