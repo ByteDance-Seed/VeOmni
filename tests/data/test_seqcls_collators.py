@@ -173,11 +173,11 @@ def test_padded_packed_with_sp_padding(features_two_samples):
     )
     out = collator(token_labels)
 
-    # After SP padding/slicing, seq length is ceil(pad_to_length / sp_size).
-    assert out["input_ids"].shape[-1] == 4
-    assert out["attention_mask"].shape[-1] == 4
-    assert out["labels"].shape[-1] == 4
-    assert out["position_ids"].shape[-1] == 4
+    # This collator does not apply SP slicing; lengths stay at pad_to_length.
+    assert out["input_ids"].shape[-1] == pad_to_length
+    assert out["attention_mask"].shape[-1] == pad_to_length
+    assert out["labels"].shape[-1] == pad_to_length
+    assert out["position_ids"].shape[-1] == pad_to_length
     monkeypatch.undo()
 
 
