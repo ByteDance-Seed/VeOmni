@@ -187,6 +187,8 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                id=args.train.wandb_id,
+                resume="allow" if args.train.wandb_id else None,
                 settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )

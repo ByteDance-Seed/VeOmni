@@ -538,6 +538,10 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Wandb experiment name."},
     )
+    wandb_id: Optional[str] = field(
+        default=None,
+        metadata={"help": "Wandb run ID for resuming a previous run."},
+    )
     enable_profiling: bool = field(
         default=False,
         metadata={"help": "Enable profiling."},

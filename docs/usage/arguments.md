@@ -73,6 +73,7 @@
 | train.use_wandb | bool | Whether to enable byted wandb experiment logging.                                                                                                                              | False |
 | train.wandb_project | str | Name of the wandb experiment project.                                                                                                                                          | VeOmni |
 | train.wandb_name | str | Name of the wandb experiment.                                                                                                                                                  | None |
+| train.wandb_id | str | Wandb run ID for resuming a previous run. When specified, training logs will continue in the existing wandb run.                                                              | None |
 | train.enable_profiling | bool | Whether to use torch profiling.                                                                                                                                                | False |
 | train.profile_start_step | int | Starting step of profiling.                                                                                                                                                    | 1 |
 | train.profile_end_step | int | Ending step of profiling.                                                                                                                                                      | 2 |
