@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from veomni.data.constants import IGNORE_INDEX
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
@@ -112,6 +113,8 @@ def test_data_collator_sp_enabled_values_and_calls_prepare_fa(monkeypatch, featu
 
 
 def test_data_collator_padded_packed_length_is_static(features_two_samples):
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU does not support this padding test yet.")
     import veomni.data.data_collator as m
 
     pad_to_length = 8
@@ -140,7 +143,10 @@ def test_data_collator_padded_packed_length_is_static(features_two_samples):
     assert torch.equal(out["input_ids"][0, tail], torch.zeros(pad_to_length - 5, dtype=torch.long))
     assert torch.equal(out["attention_mask"][0, tail], torch.ones(pad_to_length - 5, dtype=torch.long))
     assert torch.equal(out["labels"][0, tail], torch.full((pad_to_length - 5,), IGNORE_INDEX, dtype=torch.long))
-    assert torch.equal(out["position_ids"][0, tail], torch.zeros(pad_to_length - 5, dtype=torch.long))
+    assert torch.equal(
+        out["position_ids"][0, tail],
+        torch.arange(pad_to_length - 5, dtype=torch.long),
+    )
     monkeypatch.undo()
 
 

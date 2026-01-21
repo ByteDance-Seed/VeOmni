@@ -227,7 +227,11 @@ class DataCollatorWithPositionIDsAndPadding(DataCollator):
         if "labels" in batch:
             batch["labels"] = pad_last_dim(batch["labels"], IGNORE_INDEX)
         if "position_ids" in batch:
-            batch["position_ids"] = pad_last_dim(batch["position_ids"], self.position_id_pad_value)
+            pad_shape = list(batch["position_ids"].shape)
+            pad_shape[-1] = pad_len
+            pad = torch.arange(pad_len, device=batch["position_ids"].device, dtype=batch["position_ids"].dtype)
+            pad = pad.expand(pad_shape)
+            batch["position_ids"] = torch.cat([batch["position_ids"], pad], dim=-1)
 
         # Update flash-attn kwargs to match the padded length.
         if "position_ids" in batch and not self.base_collator.sp_enabled:
