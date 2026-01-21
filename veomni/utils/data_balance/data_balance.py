@@ -2,8 +2,11 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from veomni.utils import helper
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.data_balance.balance_sorting_algo import SORTING_ALGO_FUNC
+
+logger = helper.create_logger(__name__)
 
 
 class EncoderDataBalance:
@@ -12,10 +15,12 @@ class EncoderDataBalance:
             sorting_algo_name="post_mbs_balancing_greedy_without_pad",
             spatial_merge_unit=None
     ):
+        logger.info_rank0("Initializing encoder data balance...")
         self.state_buffer = {}
         self.merge_down_ratio = spatial_merge_unit
         self.sorting_algo = self._set_sorting_algo(sorting_algo_name)
         self.dp_group = get_parallel_state().dp_group
+        logger.info_rank0("Successfully initialized encoder data balance")
 
     def balance_data(self, pixel_values, grid_thw):
         # split input data

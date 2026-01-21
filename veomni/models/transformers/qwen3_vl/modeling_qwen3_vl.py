@@ -16,10 +16,11 @@
 
 
 from collections.abc import Callable
-from functools import partial
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Optional, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -254,6 +255,139 @@ class Qwen3VLTextAttention(_Qwen3VLTextAttention):
                 cache_position=cache_position,
                 **kwargs,
             )
+
+
+# ================================================================
+# Patch: Qwen3VLVisionModel.rot_pos_emb
+# 1. use rot_pos_ids to get pos_ids, and use lru_cache to cache the result
+# ================================================================
+# --- Patch.1 ---
+# Copied and adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L431
+@lru_cache(maxsize=1024)
+def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+    if isinstance(h, torch.Tensor):
+        h = int(h.item())
+    if isinstance(w, torch.Tensor):
+        w = int(w.item())
+    if isinstance(spatial_merge_size, torch.Tensor):
+        spatial_merge_size = int(spatial_merge_size.item())
+    hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+    h_div = h // spatial_merge_size
+    w_div = w // spatial_merge_size
+    hpos_ids = hpos_ids.reshape(
+        h_div,
+        spatial_merge_size,
+        w_div,
+        spatial_merge_size,
+    )
+    hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
+    hpos_ids = hpos_ids.flatten()
+
+    wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+    wpos_ids = wpos_ids.reshape(
+        h_div,
+        spatial_merge_size,
+        w_div,
+        spatial_merge_size,
+    )
+    wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
+    wpos_ids = wpos_ids.flatten()
+
+    return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+
+def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    merge_size = self.spatial_merge_size
+
+    max_hw = int(grid_thw[:, 1:].max().item())
+    freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+    device = freq_table.device
+
+    total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
+    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+    offset = 0
+    for num_frames, height, width in grid_thw:
+        coords = rot_pos_ids(height, width, merge_size).to(device)
+
+        if num_frames > 1:
+            coords = coords.repeat(num_frames, 1)
+
+        num_tokens = coords.shape[0]
+        pos_ids[offset : offset + num_tokens] = coords
+        offset += num_tokens
+
+    embeddings = freq_table[pos_ids]  # lookup rotary embeddings
+    embeddings = embeddings.flatten(1)
+    return embeddings
+
+
+# --- Patch.1 ---
+
+
+# ================================================================
+# Patch: Qwen3VLVisionModel.fast_pos_embed_interpolate
+# 1. an efficient implementation of the fast_pos_embed_interpolate function
+# ================================================================
+# --- Patch.1 ---
+# Copied and adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L474
+def fast_pos_embed_interpolate(self, grid_thw):
+    num_grid_per_side = self.num_grid_per_side
+    m_size = self.spatial_merge_size
+    hidden_dim = self.pos_embed.embedding_dim
+
+    outputs = []
+    dtype = self.pos_embed.weight.dtype
+    for t, h, w in grid_thw:
+        h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
+        w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
+
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        # Create meshgrid view for all h, w vars
+        dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+        h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+        h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+        # original computation of weights
+        # w00 = (1 - dh_grid) * (1 - dw_grid)
+        # w01 = (1 - dh_grid) * dw_grid
+        # w10 = dh_grid * (1 - dw_grid)
+        # w11 = dh_grid * dw_grid
+        # we reuse w11 here to avoid duplicate
+        # dh_grid * dw_grid computation
+        w11 = dh_grid * dw_grid
+        w10 = dh_grid - w11
+        w01 = dw_grid - w11
+        w00 = 1 - dh_grid - w01
+
+        h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+        w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+        h_grid_idx = h_grid * num_grid_per_side
+
+        indices = (h_grid_idx + w_grid).reshape(4, -1)
+        weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+        weights = weights.to(dtype=dtype)
+
+        embeds = self.pos_embed(indices) * weights
+        combined = embeds[0] + embeds[1] + embeds[2] + embeds[3]
+        combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+
+        combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+        repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+
+        outputs.append(repeated)
+
+    return torch.cat(outputs, dim=0)
+
+
+# --- Patch.1 ---
 
 
 # ================================================================
@@ -831,6 +965,8 @@ def apply_veomni_qwen3vl_patch():
     hf_qwen3vl.Qwen3VLVisionAttention.forward = Qwen3VLVisionAttention_forward
     hf_qwen3vl.Qwen3VLTextAttention = Qwen3VLTextAttention
     hf_qwen3vl.Qwen3VLTextModel._deepstack_process = Qwen3VLTextModel__deepstack_process
+    hf_qwen3vl.Qwen3VLVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+    hf_qwen3vl.Qwen3VLVisionModel.rot_pos_emb = rot_pos_emb
     hf_qwen3vl.Qwen3VLVisionModel.forward = Qwen3VLVisionModel_forward
     hf_qwen3vl.Qwen3VLVisionModel.dummy_forward = Qwen3VLVisionModel_dummy_forward
     hf_qwen3vl.Qwen3VLModel = Qwen3VLModel
