@@ -78,6 +78,7 @@ Example fixed batch size = 2 samples:
 
 When `rmpad_with_pos_ids` is enabled, `pad_packed_input` can pad the packed sequence to a fixed length
 (`pad_packed_to_length`). This is useful to avoid uneven lengths that can trigger kernel recompilation.
+- Related GitHub issue: [#402](https://github.com/ByteDance-Seed/VeOmni/issues/402)
 
 Important details:
 

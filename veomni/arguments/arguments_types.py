@@ -759,11 +759,8 @@ class VeOmniArguments:
 
     def __post_init__(self):
         if self.train.pad_packed_input:
-            if (
-                self.train.rmpad_with_pos_ids
-                and self.train.pad_packed_to_length is None
-                and self.data.max_seq_len is not None
-            ):
+            assert self.train.rmpad_with_pos_ids, "when using pad_packed_input, rmpad_with_pos_ids must be enabled."
+            if self.train.pad_packed_to_length is None and self.data.max_seq_len is not None:
                 self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(
                     f"pad_packed_input is set to true without pad_packed_to_length, setting pad_packed_to_length to train.micro_batch_size * data.max_seq_len = {self.train.pad_packed_to_length}"
