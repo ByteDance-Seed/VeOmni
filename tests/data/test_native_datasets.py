@@ -248,7 +248,6 @@ def build_command(dataset_type, dataloader_type, pad_packed_to_length=None, ulys
     ]
     if pad_packed_to_length is not None:
         command.append(f"--train.pad_packed_to_length={pad_packed_to_length}")
-        command.append("--train.pad_packed_token_id=0")
         command.append("--train.pad_packed_input=true")
     if dyn_bsz is not None:
         command.append(f"--train.dyn_bsz={dyn_bsz}")
