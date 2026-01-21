@@ -224,6 +224,8 @@ class DataCollatorWithPositionIDsAndPadding(DataCollator):
             return torch.cat([tensor, pad], dim=-1)
 
         batch["input_ids"] = pad_last_dim(batch["input_ids"], 0)
+        if "attention_mask" in batch:
+            batch["attention_mask"] = pad_last_dim(batch["attention_mask"], self.attention_mask_pad_value)
         if "labels" in batch:
             batch["labels"] = pad_last_dim(batch["labels"], IGNORE_INDEX)
         if "position_ids" in batch:

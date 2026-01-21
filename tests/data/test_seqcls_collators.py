@@ -142,6 +142,7 @@ def test_data_collator_padded_packed_length_is_static(features_two_samples):
     tail = slice(5, pad_to_length)
     assert torch.equal(out["input_ids"][0, tail], torch.zeros(pad_to_length - 5, dtype=torch.long))
     assert torch.equal(out["attention_mask"][0, tail], torch.ones(pad_to_length - 5, dtype=torch.long))
+    assert torch.equal(out["attention_mask"][0, tail], torch.ones(pad_to_length - 5, dtype=torch.long))
     assert torch.equal(out["labels"][0, tail], torch.full((pad_to_length - 5,), IGNORE_INDEX, dtype=torch.long))
     assert torch.equal(
         out["position_ids"][0, tail],
