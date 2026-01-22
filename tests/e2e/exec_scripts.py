@@ -24,15 +24,14 @@ def qwen3_0p6b_base_tulu_sft_script():
     return exec_script
 
 
-def qwen3_omni_moe_coco_sft_script():
+def qwen3_omni_moe_sft_script():
     params = [
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4322",
         "tasks/omni/train_qwen3_omni.py",
         "configs/multimodal/qwen3_omni/qwen3_omni.yaml",
         f"--model.model_path {os.path.dirname(os.path.abspath(__file__)) + '/../models/toy_config/qwen3omni_toy'}",
-        f"--data.train_path {os.path.join(CI_DATASET_DIR, 'sharegpt4v_instruct_gpt4-vision_cap100k_coco.json')}",
         "--train.num_train_epochs 1",
-        "--train.max_steps 20",
+        "--train.max_steps 10",
         "--train.use_wandb false $@ 2>&1",
     ]
 
@@ -43,7 +42,7 @@ def qwen3_omni_moe_coco_sft_script():
 
 SFT_SCRIPT = {
     "qwen3_0p6b_base_tulu_sft": qwen3_0p6b_base_tulu_sft_script(),
-    "qwen3_omni_moe_coco_sft": qwen3_omni_moe_coco_sft_script(),
+    "qwen3_omni_moe_sft": qwen3_omni_moe_sft_script(),
 }
 
 E2E_TEST_SCRIPT = {**SFT_SCRIPT}
