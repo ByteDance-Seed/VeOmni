@@ -2248,8 +2248,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
 
-        visual_embeds_multiscale = None
-        visual_pos_masks = None
         # 2. Merge text , audios , image and video
         if input_features is not None:
             # TODO audio
@@ -2296,9 +2294,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 )
 
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
-            visual_pos_masks = image_mask
-            visual_embeds_multiscale = deepstack_image_embeds
         elif get_parallel_state().fsdp_enabled:
             # Modification: add dummy ViT forward to avoid FSDP reduce-scatter hang
             # when some ranks get None pixel_values while others get valid pixel_values
