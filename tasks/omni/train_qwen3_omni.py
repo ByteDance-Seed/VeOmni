@@ -24,6 +24,7 @@ from veomni.data.multimodal.audio_utils import fetch_audios
 from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.data.multimodal.video_utils import fetch_videos
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -68,7 +69,7 @@ def process_sample(
     source = (
         kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
     input_conversations = [
         {
@@ -98,7 +99,7 @@ def process_sample(
     else:
         images = []
 
-    videos = [sample.get("video")] if "video" in sample else []
+    videos = sample.get("videos", [])
     if videos:
         videos, video_audios = fetch_videos(videos, **kwargs)
     else:
@@ -120,9 +121,9 @@ def process_sample(
 
     model_inputs = processor(
         text=text,
-        # audios=audios,
+        audios=audios,
         images=images,
-        # videos=videos,
+        videos=videos,
         return_tensors="pt",
         padding=True,
     )
@@ -159,6 +160,8 @@ def process_sample(
         audio_seqlens=audio_feature_lengths,
         second_per_grids=model_inputs.pop("video_second_per_grid", None),
     )["position_ids"]  # (dim, l)
+
+    model_inputs["position_ids"] = model_inputs["position_ids"].clone()
     model_inputs["image_mask"] = image_mask
     model_inputs["video_mask"] = video_mask
     model_inputs["audio_mask"] = audio_mask
@@ -347,6 +350,7 @@ def main():
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
@@ -524,16 +528,11 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            if hasattr(grad_norm, "full_tensor"):
-                grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
@@ -571,13 +570,6 @@ def main():
                     },
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-                if args.train.global_rank == 0:
-                    helper.save_step2token(
-                        args.train.step2token_path,
-                        consumed_tokens=train_metrics["consume_tokens(B)"],
-                        global_step=global_step,
-                        save_checkpoint_path=save_checkpoint_path,
-                    )
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
@@ -598,13 +590,6 @@ def main():
                 },
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-            if args.train.global_rank == 0:
-                helper.save_step2token(
-                    args.train.step2token_path,
-                    consumed_tokens=train_metrics["consume_tokens(B)"],
-                    global_step=global_step,
-                    save_checkpoint_path=save_checkpoint_path,
-                )
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
