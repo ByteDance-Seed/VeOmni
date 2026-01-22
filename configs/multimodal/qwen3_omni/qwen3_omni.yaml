@@ -4,11 +4,12 @@ model:
   attn_implementation: flash_attention_2
 
 data:
-  train_path: sharegpt4v_instruct_gpt4-vision_cap100k_coco.json
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
   data_type: conversation
   max_seq_len: 8196
   train_size: 80000000
   source_name: sharegpt4v_captioner_sft
+  num_workers: 0
   mm_configs:
     scale_factor: 28
     image_min_pixels: 3136 # 4 * 28 * 28
@@ -38,4 +39,4 @@ train:
   num_train_epochs: 3
   micro_batch_size: 1
   global_batch_size: 32
-  max_steps: 2000
+  max_steps: 20
