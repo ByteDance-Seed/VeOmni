@@ -6,8 +6,7 @@ from utils import parse_training_log
 
 
 test_cases = [
-    pytest.param("qwen3_0p6b_base_tulu_sft"),
-    pytest.param("qwen3_0p6b_base_tulu_sft_rmpad_with_pos_ids_padded"),
+    pytest.param("qwen3_0p6b_base_tulu_sft_no_reshard"),
 ]
 
 

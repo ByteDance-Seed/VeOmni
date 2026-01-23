@@ -372,6 +372,14 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable padding-free training by using the position_ids."},
     )
+    pad_packed_to_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Pad packed sequences to a fixed length when rmpad_with_pos_ids is enabled."},
+    )
+    pad_packed_input: bool = field(
+        default=False,
+        metadata={"help": "Enable padding for packed sequences when rmpad_with_pos_ids is enabled."},
+    )
     dyn_bsz: bool = field(
         default=True,
         metadata={"help": "Enable dynamic batch size for padding-free training."},
@@ -407,6 +415,14 @@ class TrainingArguments:
     lr_decay_ratio: float = field(
         default=1.0,
         metadata={"help": "Ratio of learning rate decay steps."},
+    )
+    enable_reshard_after_forward: bool = field(
+        default=True,
+        metadata={"help": "Enable reshard after forward for FSDP2."},
+    )
+    enable_reshard_after_backward: bool = field(
+        default=True,
+        metadata={"help": "Enable reshard after backward for  FSDP2."},
     )
     enable_mixed_precision: bool = field(
         default=True,
@@ -758,7 +774,19 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
-        pass
+        if self.train.pad_packed_input:
+            assert self.train.rmpad_with_pos_ids, "when using pad_packed_input, rmpad_with_pos_ids must be enabled."
+            if self.train.pad_packed_to_length is None and self.data.max_seq_len is not None:
+                self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
+                logger.info_rank0(
+                    f"pad_packed_input is set to true without pad_packed_to_length, setting pad_packed_to_length to train.micro_batch_size * data.max_seq_len = {self.train.pad_packed_to_length}"
+                )
+            if self.train.pad_packed_to_length < self.train.micro_batch_size * self.data.max_seq_len:
+                logger.warning_rank0(
+                    "pad_packed_to_length is smaller than train.micro_batch_size * data.max_seq_len, the actual input size can be larger than pad_packed_to_length"
+                )
+        else:
+            self.train.pad_packed_to_length = None
 
 
 # ================================ Infer Arguments ======================================

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from veomni.data.constants import IGNORE_INDEX
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
@@ -109,6 +110,76 @@ def test_data_collator_sp_enabled_values_and_calls_prepare_fa(monkeypatch, featu
     assert torch.equal(out["position_ids"], exp_pos)
     assert torch.equal(out["labels"], exp_labels)
     assert called["prep"] == 1
+
+
+def test_data_collator_padded_packed_length_is_static(features_two_samples):
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU does not support this padding test yet.")
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 2, 2], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 1], dtype=torch.long),
+        },
+    ]
+    collator = m.DataCollatorWithPositionIDsAndPadding(pad_to_length=pad_to_length)
+    out = collator(token_labels)
+
+    assert out["input_ids"].shape[-1] == pad_to_length
+    assert out["attention_mask"].shape[-1] == pad_to_length
+    assert out["labels"].shape[-1] == pad_to_length
+    assert out["position_ids"].shape[-1] == pad_to_length
+
+    # Check padded tail values.
+    tail = slice(5, pad_to_length)
+    assert torch.equal(out["input_ids"][0, tail], torch.zeros(pad_to_length - 5, dtype=torch.long))
+    assert torch.equal(out["attention_mask"][0, tail], torch.ones(pad_to_length - 5, dtype=torch.long))
+    assert torch.equal(out["attention_mask"][0, tail], torch.ones(pad_to_length - 5, dtype=torch.long))
+    assert torch.equal(out["labels"][0, tail], torch.full((pad_to_length - 5,), IGNORE_INDEX, dtype=torch.long))
+    assert torch.equal(
+        out["position_ids"][0, tail],
+        torch.arange(pad_to_length - 5, dtype=torch.long),
+    )
+    monkeypatch.undo()
+
+
+def test_padded_packed_with_sp_padding(features_two_samples):
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=2, sp_rank=0))
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 2, 2], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 1], dtype=torch.long),
+        },
+    ]
+    collator = m.DataCollatorWithPositionIDsAndPadding(
+        pad_to_length=pad_to_length,
+        position_id_pad_value=0,
+        attention_mask_pad_value=1,
+    )
+    out = collator(token_labels)
+
+    # This collator does not apply SP slicing; lengths stay at pad_to_length.
+    assert out["input_ids"].shape[-1] == pad_to_length
+    assert out["attention_mask"].shape[-1] == pad_to_length
+    assert out["labels"].shape[-1] == pad_to_length
+    assert out["position_ids"].shape[-1] == pad_to_length
+    monkeypatch.undo()
 
 
 def test_seqcls_text_sequence_shard_collator_no_shift_no_mask_values(monkeypatch):

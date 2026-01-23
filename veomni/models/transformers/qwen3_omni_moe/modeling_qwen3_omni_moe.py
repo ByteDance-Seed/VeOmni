@@ -20,37 +20,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import math
 from dataclasses import dataclass
+from functools import partial
+from types import SimpleNamespace
 from typing import Callable, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+import transformers
 from torch import nn
-from torch.nn import Parameter
-from torch.nn import functional as F
-
-from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
-from ...generation import GenerationMixin
-from ...integrations import use_kernel_forward_from_hub
-from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from ...modeling_flash_attention_utils import FlashAttentionKwargs
-from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import (
+from torch.nn import CrossEntropyLoss, Parameter
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
     MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
 )
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...processing_utils import Unpack
-from ...utils import auto_docstring, can_return_tuple
-from ...utils.deprecation import deprecate_kwarg
-from ...utils.generic import OutputRecorder, TransformersKwargs, check_model_inputs
-from .configuration_qwen3_omni_moe import (
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoderConfig,
     Qwen3OmniMoeCode2WavConfig,
     Qwen3OmniMoeConfig,
@@ -61,6 +60,64 @@ from .configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
+from transformers.processing_utils import Unpack
+from transformers.utils import (
+    auto_docstring,
+    can_return_tuple,
+    is_flash_attn_2_available,
+    is_torch_flex_attn_available,
+)
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.generic import OutputRecorder, TransformersKwargs, check_model_inputs
+
+from ....data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from ....distributed.parallel_state import get_parallel_state
+from ....distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
+    reduce_sequence_parallel_loss,
+    slice_position_embedding,
+    sp_pad_and_slice,
+)
+from ....distributed.sequence_parallel.ulysses import _Gather
+
+
+if is_flash_attn_2_available():
+    from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.layers.rotary import apply_rotary_emb
+
+    _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+else:
+    flash_attn_varlen_func = None
+    apply_rotary_emb = None
+
+
+if is_torch_flex_attn_available() and transformers.__version__ >= "4.51.0":
+    pass
+
+from ....utils.import_utils import is_liger_kernel_available
+
+
+if transformers.__version__ >= "4.51.3":
+    from transformers.modeling_rope_utils import dynamic_rope_update
+else:
+    from functools import wraps
+
+    def dynamic_rope_update(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return wrapper
+
+
+if is_liger_kernel_available():
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss  # type: ignore
+
+from ....utils import logging
+
+
+logger = logging.get_logger(__name__)
 
 
 @auto_docstring
@@ -68,7 +125,7 @@ class Qwen3OmniMoePreTrainedModel(PreTrainedModel):
     config: Qwen3OmniMoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3OmniMoeDecoderLayer", "Qwen3OmniMoeVisionBlock"]
+    _no_split_modules = ["Qwen3OmniMoeThinkerTextDecoderLayer", "Qwen3OmniMoeVisionBlock"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -1174,15 +1231,13 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+        # Modifcation: slice pos embedding if using sp to let sharded hidden_states get its corresponding pos embedding
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        if sp_group is not None:
+            # We need to do padding here because of hidden_states did padding with pad_scale=4
+            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
         hidden_states = hidden_states + pos_embeds
-
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -1193,6 +1248,34 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # Modifcation: Get before-sliced full seq from cu_seqlens
+        # total_seq_len should equal to seq_len when not using SP
+        total_seq_len = cu_seqlens[-1]
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        # Modifcation: slice pos embedding when using sp to let sp-sliced hidden_states get its corresponding pos embedding
+        if sp_group is not None:
+            cos, sin = position_embeddings
+            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
+            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
+            position_embeddings = (cos, sin)
+
+        # Modification: pad cu_seqlens when using SP to match the padded hidden_states
+        if sp_group is not None:
+            ps = get_parallel_state()
+            sp_size = getattr(ps, "sp_size", 1)
+            # Calculate the last one padding seq_len : seq_len*sp_size - total_seq_len
+            pad_seq_len = seq_len * sp_size - total_seq_len.item()
+            if pad_seq_len > 0:
+                # Add this extra sequence to cu_seqlens with the padding length
+                new_cumsum = cu_seqlens[-1] + pad_seq_len
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
@@ -1211,6 +1294,21 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
         hidden_states = self.merger(hidden_states)
 
         return hidden_states, deepstack_feature_lists
+
+    # Modification: add dummy_forward to avoid FSDP reduce-scatter hang
+    # when some ranks get None pixel_values while others get valid pixel_values
+    def dummy_forward(self):
+        if get_parallel_state().sp_enabled:
+            sp_size = get_parallel_state().sp_size
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            # If using SP, pixel_values is sliced but grid_thw is not
+            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        else:
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        return self(**dummy_data)
 
     @property
     def deepstack_merger_list(self):
@@ -1694,6 +1792,11 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        # Modifcation: slice pos embedding when using sp to let sp-sliced hidden_states get its corresponding pos_embedding
+        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+        if sp_group is not None:
+            position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
+
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
             layer_outputs = decoder_layer(
@@ -1723,7 +1826,13 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         )
 
     def _deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
-        visual_pos_masks = visual_pos_masks[..., 0]
+        # Handle case when visual_pos_masks is None (both image and video pixel_values are None)
+        # Still call this operation but just add 0.0 to hidden_states to avoid FSDP reduce scatter stuck
+        if visual_pos_masks is None:
+            visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+            hidden_states = hidden_states + visual_embeds.mean() * 0.0
+            return hidden_states
+
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
         local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
@@ -1824,6 +1933,42 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
+def get_position_id(main_func, self, **kwargs):
+    """
+    This function is used during the data preprocessing stage to generate position_ids
+    and associated parameters (e.g., rope_deltas) for a **single sample** (bs = 1).
+    This function is a global function for multiprocessing serialization.
+    Args:
+        main_func: model.get_position_id
+        self: An object holding model-specific information (e.g., SimpleNamespace(config=...)).
+        **kwargs: Additional arguments passed to `main_func` (e.g., input_ids).
+    Returns:
+        dict:
+            - "position_ids": Tensor of shape (dim, l), with the batch dimension squeezed.
+            - other necessary parameters with the batch dimension squeezed (e.g., rope_deltas).
+
+    Example usage:
+        class Model:
+            def get_position_id_func(self):  # Used in data_transform during training
+                fake_model = SimpleNamespace(config=self.config)
+                return partial(get_position_id, main_func, fake_model)
+
+        model = Model()
+        func = model.get_position_id_func()
+        position_func_returns = func(input_ids=input_ids.unsqueeze(0), **kwargs)
+        position_ids = position_func_returns['position_ids']  # shape: (dim, l)
+
+    If a model does not implement `get_position_id_func()`, a default fallback for position_ids can be:
+        position_id_returns = {
+            "position_ids": torch.arange(0, len(text_inputs["input_ids"])).unsqueeze(0)  # shape: (dim, l)
+        }
+    """
+    position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, 1, l), rope_deltas (1, 1)
+    assert len(position_ids.shape) == 3 and position_ids.shape[1] == 1
+    assert len(rope_deltas.shape) == 2 and rope_deltas.shape[0] == 1
+    return {"position_ids": position_ids.squeeze(1), "rope_deltas": rope_deltas.squeeze(0)}
+
+
 @auto_docstring(
     custom_intro="""
     The Qwen2.5OmniThinker model which consists of a audio backbone and a language model.
@@ -1857,7 +2002,25 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.rope_deltas = None
         self.num_experts = config.text_config.num_experts
         self.num_experts_per_tok = config.text_config.num_experts_per_tok
+
+        self.image_token_index = IMAGE_INPUT_INDEX
+        self.video_token_index = VIDEO_INPUT_INDEX
+        self.audio_token_index = AUDIO_INPUT_INDEX
         self.post_init()
+
+    def get_position_id_func(self):
+        fake_model = SimpleNamespace(
+            config=self.config,
+            image_token_index=self.image_token_index,
+            video_token_index=self.video_token_index,
+            audio_token_index=self.audio_token_index,
+            spatial_merge_size=self.spatial_merge_size,
+            get_llm_pos_ids_for_vision=partial(
+                Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_llm_pos_ids_for_vision, None
+            ),
+            get_chunked_index=partial(Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_chunked_index, None),
+        )
+        return partial(get_position_id, Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index, fake_model)
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -1912,6 +2075,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
+        # TODO audio sp support
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("audio sp is not supported yet.")
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
             input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
@@ -1927,53 +2093,54 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         return audio_features
 
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: Optional[torch.FloatTensor] = None,
-        video_features: Optional[torch.FloatTensor] = None,
-    ):
-        """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
-        """
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_image_mask = special_image_mask.all(-1)
-            special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_video_mask = special_video_mask.all(-1)
-            special_audio_mask = (
-                inputs_embeds
-                == self.get_input_embeddings()(
-                    torch.tensor(self.config.audio_token_id, dtype=torch.long, device=inputs_embeds.device)
-                )
-            ).all(-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
-            special_audio_mask = input_ids == self.config.audio_token_id
+    # We don't use this but compute the image and video masks in advance in process_sample
+    # def get_placeholder_mask(
+    #     self,
+    #     input_ids: torch.LongTensor,
+    #     inputs_embeds: torch.FloatTensor,
+    #     image_features: Optional[torch.FloatTensor] = None,
+    #     video_features: Optional[torch.FloatTensor] = None,
+    # ):
+    #     """
+    #     Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
+    #     equal to the length of multimodal features. If the lengths are different, an error is raised.
+    #     """
+    #     if input_ids is None:
+    #         special_image_mask = inputs_embeds == self.get_input_embeddings()(
+    #             torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+    #         )
+    #         special_image_mask = special_image_mask.all(-1)
+    #         special_video_mask = inputs_embeds == self.get_input_embeddings()(
+    #             torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+    #         )
+    #         special_video_mask = special_video_mask.all(-1)
+    #         special_audio_mask = (
+    #             inputs_embeds
+    #             == self.get_input_embeddings()(
+    #                 torch.tensor(self.config.audio_token_id, dtype=torch.long, device=inputs_embeds.device)
+    #             )
+    #         ).all(-1)
+    #     else:
+    #         special_image_mask = input_ids == self.config.image_token_id
+    #         special_video_mask = input_ids == self.config.video_token_id
+    #         special_audio_mask = input_ids == self.config.audio_token_id
 
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
-            )
+    #     n_image_tokens = special_image_mask.sum()
+    #     special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    #     if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
+    #         raise ValueError(
+    #             f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+    #         )
 
-        n_video_tokens = special_video_mask.sum()
-        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
-            raise ValueError(
-                f"Videos features and image tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
-            )
+    #     n_video_tokens = special_video_mask.sum()
+    #     special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    #     if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
+    #         raise ValueError(
+    #             f"Videos features and image tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+    #         )
 
-        special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        return special_image_mask, special_video_mask, special_audio_mask
+    #     special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    #     return special_image_mask, special_video_mask, special_audio_mask
 
     @can_return_tuple
     @auto_docstring
@@ -2063,8 +2230,26 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        visual_embeds_multiscale = None
-        visual_pos_masks = None
+        # Modification: we use the pre-computed image and video mask to support ulysses
+        assert "image_mask" in kwargs, "image_mask should have already been computed in process_sample"
+        assert "video_mask" in kwargs, "video_mask should have already been computed in process_sample"
+        image_mask = kwargs["image_mask"]
+        video_mask = kwargs["video_mask"]
+
+        # Modification: Pop flash attention kwargs for ViT, they should only be used for language model
+        # Qwen3L ViT input images seq lens should be computed during ViT forward using grid_thw
+        # https://github.com/huggingface/transformers/blob/94df0e65602922be2831b3faa457a2bde78b936b/src/transformers/modeling_flash_attention_utils.py#L432-L450
+        flash_attn_kwargs = {}
+        for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+            if key in kwargs:
+                flash_attn_kwargs[key] = kwargs.pop(key)
+
+        if self.training and get_parallel_state().sp_enabled:
+            # (batch_size, seq_len // sp_size, hidden_size) to  (batch_size, seq_len, hidden_size // sp_size)
+            inputs_embeds = gather_seq_scatter_heads(
+                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
+            )
+
         # 2. Merge text , audios , image and video
         if input_features is not None:
             audio_features = self.get_audio_features(
@@ -2076,40 +2261,205 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
-        if pixel_values is not None:
-            image_embeds, image_embeds_multiscale = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        # Initialize fake_deepstack to None
+        fake_deepstack = None
 
-            visual_pos_masks = image_mask
-            visual_embeds_multiscale = image_embeds_multiscale
+        if pixel_values is not None:
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            # Modification:sp patch
+            if self.training and get_parallel_state().sp_enabled:
+                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+                image_embeds = gather_seq_scatter_heads(
+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
+            # Original: We calcuated the special_image_mask in the forward pass,
+            # but now we pre-compute it and pass it in as image_mask to avoid
+            # all-gather to get complete image_mask info when using sequence parallel
+            # image_mask, _, _ = self.get_placeholder_mask(
+            #     input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            # )
+
+            # Modification: Get the num of image tokens from the pre-computed image_mask
+            # And reshape the masks to match the shape of inputs_embeds
+            n_image_tokens = image_mask.sum().long().item()
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+
+            # Modification: Slice tensor to drop any padded image tokens
+            image_embeds = image_embeds[:n_image_tokens]
+            deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
+            n_image_features = image_embeds.shape[0]
+            if n_image_tokens != n_image_features:
+                raise ValueError(
+                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                )
+
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        elif get_parallel_state().fsdp_enabled:
+            # Modification: add dummy ViT forward to avoid FSDP reduce-scatter hang
+            # when some ranks get None pixel_values while others get valid pixel_values
+            fake_embeds, fake_deepstack = self.visual.dummy_forward()
+            fake_embeds = fake_embeds.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
 
         if pixel_values_videos is not None:
             video_embeds, video_embeds_multiscale = self.get_video_features(pixel_values_videos, video_grid_thw)
 
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
+            # Modification: sequence parallel patch for video embeds
+            if self.training and get_parallel_state().sp_enabled:
+                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+                video_embeds = gather_seq_scatter_heads(
+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
+            # _, video_mask, _ = self.get_placeholder_mask(
+            #     input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            # )
+
+            # Modification: Get the num of video tokens from the pre-computed video_mask
+            # And reshape the masks to match the shape of inputs_embeds
+            n_video_tokens = video_mask.sum().long().item()
+            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+
+            # Modification: Slice tensor to drop any padded video tokens
+            video_embeds = video_embeds[:n_video_tokens]
+            deepstack_video_embeds = video_embeds_multiscale
+            deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
+            n_video_features = video_embeds.shape[0]
+            if n_video_tokens != n_video_features:
+                raise ValueError(
+                    f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                )
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-            if visual_embeds_multiscale is None:
-                visual_embeds_multiscale = video_embeds_multiscale
-                visual_pos_masks = video_mask
+        elif get_parallel_state().fsdp_enabled:
+            # Modification: add dummy ViT forward to avoid FSDP reduce-scatter hang
+            # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
+            fake_embeds, fake_deepstack = self.visual.dummy_forward()
+            fake_embeds = fake_embeds.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
+
+        # Prepare sliced masks for deepstack use
+        rank_image_mask = None
+        rank_video_mask = None
+
+        # Modification: sequence parallel patch
+        if self.training and get_parallel_state().sp_enabled:
+            # (batch_size, seq_len, hidden_size // sp_size) back to (batch_size, seq_len // sp_size, hidden_size)
+            inputs_embeds = gather_heads_scatter_seq(
+                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+            )
+
+            # After sequence is scattered, do all_gather on deepstack embeddings
+            # and use masks to select the corresponding visual tokens for this rank
+            sp_size = get_parallel_state().sp_size
+            sp_rank = get_parallel_state().sp_rank
+
+            if pixel_values is not None:
+                # Do all_gather on deepstack_image_embeds
+                # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
+                deepstack_image_embeds = [
+                    _Gather.apply(get_parallel_state().sp_group, embed, 0, False) for embed in deepstack_image_embeds
+                ]
+
+                # Now use image_mask to select visual tokens for this rank's sequence slice
+                # image_mask is (batch_size, seq_len, hidden_size // sp_size) before gather_heads_scatter_seq
+                image_mask_1d = image_mask[..., 0]  # (batch_size, seq_len)
+
+                # Determine which sequence positions belong to this rank
+                seq_len = image_mask_1d.shape[1]
+                seq_per_rank = seq_len // sp_size
+                rank_start = sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
+
+                # Get the mask for this rank's sequence slice and save it for later
+                rank_image_mask = image_mask_1d[:, rank_start:rank_end]  # (batch_size, seq_len // sp_size)
+                # Count how many visual tokens are before this rank's slice
+                before_rank_mask = image_mask_1d[:, :rank_start]
+                offset = before_rank_mask.sum().item()
+                # Count how many visual tokens are in this rank's slice
+                num_visual_tokens = rank_image_mask.sum().item()
+                # Slice the all-gathered deepstack embeddings
+                deepstack_image_embeds = [
+                    embed[offset : offset + num_visual_tokens] for embed in deepstack_image_embeds
+                ]
+
+            if pixel_values_videos is not None:
+                # Do all_gather on deepstack_video_embeds
+                # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size)
+                deepstack_video_embeds = [
+                    _Gather.apply(get_parallel_state().sp_group, embed, 0, False) for embed in deepstack_video_embeds
+                ]
+
+                # Same logic for video embeddings
+                video_mask_1d = video_mask[..., 0]  # (batch_size, seq_len)
+                seq_len = video_mask_1d.shape[1]
+                seq_per_rank = seq_len // sp_size
+                rank_start = sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
+
+                # Get the mask for this rank's sequence slice and save it for later
+                rank_video_mask = video_mask_1d[:, rank_start:rank_end]
+                before_rank_mask = video_mask_1d[:, :rank_start]
+                offset = before_rank_mask.sum().item()
+                num_visual_tokens = rank_video_mask.sum().item()
+                deepstack_video_embeds = [
+                    embed[offset : offset + num_visual_tokens] for embed in deepstack_video_embeds
+                ]
+
+        visual_pos_masks = None
+        deepstack_visual_embeds = None
+
+        # Modification: use pixel_values and pixel_values_videos instead of masks
+        if pixel_values is not None and pixel_values_videos is not None:
+            # aggregate visual_pos_masks and deepstack_visual_embeds
+            # reuse the sliced masks if SP is enabled
+            if rank_image_mask is not None:
+                image_mask = rank_image_mask
             else:
-                visual_pos_masks = video_mask | image_mask
-                visual_embeds_multiscale_joint = ()
-                image_mask_joint = image_mask[visual_pos_masks]
-                video_mask_joint = video_mask[visual_pos_masks]
-                for img_embed, vid_embed in zip(visual_embeds_multiscale, video_embeds_multiscale):
-                    embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1])
-                    embed_joint[image_mask_joint, :] = img_embed
-                    embed_joint[video_mask_joint, :] = vid_embed
-                    visual_embeds_multiscale_joint = visual_embeds_multiscale_joint + (embed_joint,)
-                visual_embeds_multiscale = visual_embeds_multiscale_joint
+                image_mask = image_mask[..., 0]
+            if rank_video_mask is not None:
+                video_mask = rank_video_mask
+            else:
+                video_mask = video_mask[..., 0]
+            visual_pos_masks = image_mask | video_mask
+            deepstack_visual_embeds = []
+            image_mask_joint = image_mask[visual_pos_masks]
+            video_mask_joint = video_mask[visual_pos_masks]
+            for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+                embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+                embed_joint[image_mask_joint, :] = img_embed
+                embed_joint[video_mask_joint, :] = vid_embed
+                deepstack_visual_embeds.append(embed_joint)
+        elif pixel_values is not None:
+            # Modification: Reuse the sliced mask if SP is enabled
+            if rank_image_mask is not None:
+                image_mask = rank_image_mask
+            else:
+                image_mask = image_mask[..., 0]
+            visual_pos_masks = image_mask
+            deepstack_visual_embeds = deepstack_image_embeds
+        elif pixel_values_videos is not None:
+            # Modification: Reuse the sliced mask if SP is enabled
+            if rank_video_mask is not None:
+                video_mask = rank_video_mask
+            else:
+                video_mask = video_mask[..., 0]
+            visual_pos_masks = video_mask
+            deepstack_visual_embeds = deepstack_video_embeds
+        else:
+            # Both pixel_values and pixel_values_videos are None
+            # still pass fake_deepstack to language_model to trigger _deepstack_process
+            # to avoid FSDP backward reduce scatter stuck
+            # visual_pos_masks remains None, so _deepstack_process will just add 0.0
+            if fake_deepstack is not None:
+                deepstack_visual_embeds = fake_deepstack
+            else:
+                deepstack_visual_embeds = None
 
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
@@ -2142,6 +2492,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        # Modification: Restore flash attention kwargs for language model to avoid CPU-GPU sync
+        kwargs.update(flash_attn_kwargs)
+
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -2150,19 +2503,42 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             use_cache=use_cache,
             output_router_logits=output_router_logits,
             cache_position=cache_position,
-            deepstack_visual_embeds=visual_embeds_multiscale,
+            deepstack_visual_embeds=deepstack_visual_embeds,
             visual_pos_masks=visual_pos_masks,
             **kwargs,
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-
-        loss = None
+        # sp patch: reduce loss
         if labels is not None:
-            loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
-            )
+            if not get_parallel_state().sp_enabled:
+                labels = labels[..., 1:].contiguous()  # shift labels
+
+            labels = labels.view(-1)  # flatten labels
+
+            if is_liger_kernel_available():
+                loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="mean")
+                if not get_parallel_state().sp_enabled:
+                    hidden_states = hidden_states[..., :-1, :].contiguous()  # shift hidden states
+
+                hidden_states = hidden_states.view(-1, self.config.text_config.hidden_size)  # flatten hidden states
+                loss = loss_fct(self.lm_head.weight, hidden_states, labels)
+                logits = None
+            else:
+                loss_fct = CrossEntropyLoss(reduction="mean")
+                logits = self.lm_head(hidden_states)
+                if not get_parallel_state().sp_enabled:
+                    logits = logits[..., :-1, :].contiguous()  # shift logits
+
+                logits = logits.float().view(-1, self.config.text_config.vocab_size)  # flatten logits
+                loss = loss_fct(logits, labels)
+
+            if get_parallel_state().sp_enabled:
+                num_valid_tokens = (labels != IGNORE_INDEX).sum()
+                loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
+        else:
+            logits = self.lm_head(hidden_states)
+            loss = None
 
         aux_loss = None
         if output_router_logits:
@@ -3774,6 +4150,9 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
             self.enable_talker()
         self.post_init()
 
+    def get_input_embeddings(self):
+        return self.thinker.get_input_embeddings()
+
     def enable_talker(self):
         self.talker = Qwen3OmniMoeTalkerForConditionalGeneration._from_config(self.config.talker_config)
         self.code2wav = Qwen3OmniMoeCode2Wav._from_config(self.config.code2wav_config)
@@ -4047,6 +4426,16 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
         talker_wavs = self.code2wav.chunked_decode(talker_codes, chunk_size=300, left_context_size=25)
 
         return thinker_result, talker_wavs.float()
+
+    def forward(
+        self,
+        **kwargs,
+    ) -> Union[tuple, Qwen3OmniMoeThinkerCausalLMOutputWithPast]:
+        thinker_outputs = self.thinker(
+            **kwargs,
+        )
+        # TODO: talker_outputs
+        return thinker_outputs
 
 
 __all__ = [

@@ -277,6 +277,7 @@ model = build_foundation_model(...)
 model = build_parallelize_model(
     model,
     enable_full_shard=args.train.enable_full_shard, # enable full shard, same to Zero3
+    enable_reshard_after_forward=args.train.enable_reshard_after_forward, # enable reshard after forward for FSDP2
     enable_mixed_precision=args.train.enable_mixed_precision, # enable mixed precision
     enable_gradient_checkpointing=args.train.enable_gradient_checkpointing, # enable gradient checkpointing
     init_device=args.train.init_device, # model init device

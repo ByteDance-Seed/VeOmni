@@ -19,9 +19,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...configuration_utils import PretrainedConfig, layer_type_validation
-from ...modeling_rope_utils import rope_config_validation
-from ...utils import logging
+from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+from transformers.modeling_rope_utils import rope_config_validation
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -30,11 +30,9 @@ logger = logging.get_logger(__name__)
 class Qwen3OmniMoeAudioEncoderConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3OmniMoeAudioEncoder`]. It is used to instantiate a
-    Qwen2.5-Omni-Thinker audio encoder according to the specified arguments, defining the model architecture. Instantiating a
+    Qwen3-Omni-Moe-Thinker audio encoder according to the specified arguments, defining the model architecture. Instantiating a
     configuration with the defaults will yield a similar configuration to that of the audio encoder of the Qwen2-Audio
     architecture.
-
-    e.g. [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B)
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
@@ -1148,7 +1146,7 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
     model according to the specified sub-models configurations, defining the model architecture.
 
     Instantiating a configuration with the defaults will yield a similar configuration to that of the
-    [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) architecture.
+    [Qwen/Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) architecture.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
@@ -1203,7 +1201,14 @@ class Qwen3OmniMoeConfig(PretrainedConfig):
         assistant_token_id=77091,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        """
+        Modification:
+            Qwen3OmniMoe didn't set tie_word_embeddings, so it is set to True by default.
+            However, Qwen3OmniMoe model didn't set get_output_embeddings, so the `embed_tokens` can't tie with `lm_head`
+            Logically, `tie_word_embeddings=False`
+        """
+        kwargs.pop("tie_word_embeddings", None)
+        super().__init__(tie_word_embeddings=False, **kwargs)
         if thinker_config is None:
             thinker_config = {}
             logger.info("thinker_config is None. Initializing thinker model with default values")
