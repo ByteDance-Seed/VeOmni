@@ -149,7 +149,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                 input_image_features: torch.Tensor = self.image_encoder.lm_encode(**input_image_inputs).to(
                     inputs_embeds
                 )
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_image_features = gather_seq_scatter_heads(
                         input_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -167,7 +167,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                 output_image_features: torch.Tensor = self.image_encoder.lm_encode(**output_image_inputs).to(
                     inputs_embeds
                 )
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     output_image_features = gather_seq_scatter_heads(
                         output_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -193,7 +193,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                     input_video_features: torch.Tensor = self.image_encoder.lm_encode(**input_video_inputs).to(
                         inputs_embeds
                     )
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_video_features = gather_seq_scatter_heads(
                         input_video_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -219,7 +219,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                     inputs_embeds
                 )
                 # TODO: sp_check
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_audio_features = gather_seq_scatter_heads(
                         input_audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -237,7 +237,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
         inputs_embeds: torch.Tensor = self.text_encoder(input_ids)
         decoder_inputs = {}
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_seq_scatter_heads(
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
@@ -251,7 +251,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
         if "audio" in self.modality:
             inputs_embeds = self.audio_forward(inputs_embeds, decoder_inputs, **kwargs)
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(
                 inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
             )
@@ -299,7 +299,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
             input_image_mask: torch.Tensor = input_image_inputs.pop("mask", None)
             if input_image_inputs:
                 input_image_features, _ = self.image_decoder.lm_encode(**input_image_inputs)
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_image_features = gather_seq_scatter_heads(
                         input_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -316,7 +316,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
             output_image_mask: torch.Tensor = output_image_inputs.pop("mask", None)
             if output_image_inputs:
                 output_image_features, output_image_indices = self.image_decoder.lm_encode(**output_image_inputs)
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     output_image_features = gather_seq_scatter_heads(
                         output_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -338,7 +338,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         """
         decoder_inputs = kwargs.pop("decoder_inputs", {})
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_seq_scatter_heads(
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
@@ -346,7 +346,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         if "image" in self.modality:
             inputs_embeds = self.image_encode(inputs_embeds, decoder_inputs, **kwargs)
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
@@ -359,7 +359,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         if target_inputs or image_output_labels is not None:
             output_image_inputs = extract_model_inputs("image_output_", kwargs)
             output_image_mask: torch.Tensor = output_image_inputs.pop("mask", None)
-            if self.training and get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled:
                 bs = output_image_mask.size(0)
                 sp_size = get_parallel_state().sp_size
                 sp_rank = get_parallel_state().sp_rank

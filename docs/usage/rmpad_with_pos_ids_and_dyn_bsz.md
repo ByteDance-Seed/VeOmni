@@ -73,3 +73,47 @@ Example fixed batch size = 2 samples:
 * Batch 2: S3 + S4
 * input_ids = [G H I J]
 * position_ids = [0 1 2 0]
+
+## Padding packed inputs (pad_packed_input)
+
+When `rmpad_with_pos_ids` is enabled, `pad_packed_input` can pad the packed sequence to a fixed length
+(`pad_packed_to_length`). This is useful to avoid uneven lengths that can trigger kernel recompilation.
+- Related GitHub issue: [#402](https://github.com/ByteDance-Seed/VeOmni/issues/402)
+
+Important details:
+
+* Padding is applied only after packing; labels are padded with `IGNORE_INDEX`.
+* FlashAttention kwargs (`cu_seq_lens_q/k` and `max_length_q/k`) are recomputed after padding so they match
+  the padded length and avoid numerical instability.
+
+Examples (data level):
+
+1) SFT-style packing with fixed-length padding:
+
+* Packed tokens (two samples): input_ids = [A B C D E F], position_ids = [0 1 2 3 0 1]
+* cu_seqlens (from position_ids): [0 4 6]
+* With `pad_packed_to_length=8`:
+  * input_ids = [A B C D E F 0 0]
+  * position_ids = [0 1 2 3 0 1 0 1]
+  * cu_seqlens (padded): [0 4 6 8]
+  * labels padded with `IGNORE_INDEX` for the last 2 positions
+
+2) dyn_bsz packing with fixed-length padding:
+
+* Packed tokens (three samples): input_ids = [A B C D E F G], position_ids = [0 1 2 0 1 0 1]
+* cu_seqlens (from position_ids): [0 3 5 7]
+* With `pad_packed_to_length=10`:
+  * input_ids = [A B C D E F G 0 0 0]
+  * position_ids = [0 1 2 0 1 0 1 0 1 2]
+  * cu_seqlens (padded): [0 3 5 7 10]
+  * labels padded with `IGNORE_INDEX` for the last 3 positions
+
+3) Inferred pad length (micro_batch_size * max_seq_len):
+
+* micro_batch_size=2, max_seq_len=4 -> pad_packed_to_length=8
+* Packed tokens (two samples): input_ids = [A B C D E], position_ids = [0 1 2 3 0]
+* cu_seqlens (from position_ids): [0 4 5]
+* After padding:
+  * input_ids = [A B C D E 0 0 0]
+  * position_ids = [0 1 2 3 0 1 2 3]
+  * cu_seqlens (padded): [0 4 5 8]

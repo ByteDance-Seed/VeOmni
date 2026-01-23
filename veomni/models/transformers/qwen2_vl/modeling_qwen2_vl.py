@@ -384,7 +384,7 @@ class VisionFlashAttention2(nn.Module):
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
 
-        if self.training and get_parallel_state().ulysses_enabled:
+        if get_parallel_state().ulysses_enabled:
             qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2)
             unpadded_dim_size = cu_seqlens[-1]
             sp_padding_size = qkv.size(1) - unpadded_dim_size
@@ -414,7 +414,7 @@ class VisionFlashAttention2(nn.Module):
             q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, deterministic=deterministic
         )
 
-        if self.training and get_parallel_state().ulysses_enabled:
+        if get_parallel_state().ulysses_enabled:
             attn_output = pad_tensor(attn_output, dim=0, padding_size=sp_padding_size)
             attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=0)
 
@@ -1613,7 +1613,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
 
-            if self.training and get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled:
                 inputs_embeds = gather_seq_scatter_heads(
                     inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
                 )
@@ -1622,7 +1622,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                 pixel_values = pixel_values.type(self.visual.get_dtype())
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
                 n_image_tokens = (image_mask).sum().long()
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     image_embeds = gather_seq_scatter_heads(
                         image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                     )
@@ -1668,7 +1668,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-            if self.training and get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled:
                 inputs_embeds = gather_heads_scatter_seq(
                     inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
                 )
