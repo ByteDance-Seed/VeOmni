@@ -1578,7 +1578,6 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.hidden_size = config.hidden_size
-
         self.self_attn = Qwen3OmniMoeThinkerTextAttention(config, layer_idx)
 
         if (layer_idx not in config.mlp_only_layers) and (
@@ -2076,6 +2075,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
+        # TODO audio sp support
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("audio sp is not supported yet.")
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
             input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
@@ -2250,7 +2252,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         # 2. Merge text , audios , image and video
         if input_features is not None:
-            # TODO audio
             audio_features = self.get_audio_features(
                 input_features,
                 feature_attention_mask=feature_attention_mask,
