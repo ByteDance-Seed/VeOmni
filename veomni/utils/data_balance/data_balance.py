@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -16,13 +18,13 @@ class EncoderDataBalance:
             spatial_merge_unit=None
     ):
         logger.info_rank0("Initializing encoder data balance...")
-        self.state_buffer = {}
+        self.state_buffer = defaultdict(dict)
         self.merge_down_ratio = spatial_merge_unit
         self.sorting_algo = self._set_sorting_algo(sorting_algo_name)
         self.dp_group = get_parallel_state().dp_group
         logger.info_rank0("Successfully initialized encoder data balance")
 
-    def balance_data(self, pixel_values, grid_thw):
+    def balance_data(self, pixel_values, grid_thw, data_type="image"):
         # split input data
         split_batch = {}
         pixel_values_length = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
@@ -38,7 +40,7 @@ class EncoderDataBalance:
         balanced_datas = self.all_to_all_redistribution(
             data_lengths=torch.stack(split_lengths, dim=-1),
             datas=split_batch,
-            data_type="image",
+            data_type=data_type,
         )
         balanced_grid_thw = torch.cat(balanced_datas['image_grid_thw'])
         balanced_pixel_values = torch.cat(balanced_datas['pixel_values'])
@@ -57,16 +59,12 @@ class EncoderDataBalance:
 
         return recoverd_hidden_state, recovered_deepstack_feature_lists
 
-    @staticmethod
-    def _set_sorting_algo(sorting_algo_name):
-        return SORTING_ALGO_FUNC[sorting_algo_name]
-
     def all_to_all_redistribution(
             self,
             data_lengths: torch.Tensor,
             datas: dict[str, torch.Tensor],
             data_type='Unknown data',
-            **kwargs):
+    ):
         dp_rank = self.dp_group.rank()
         num_replicas = self.dp_group.size()
 
@@ -96,10 +94,6 @@ class EncoderDataBalance:
         )
         data_list, rank_table = self.rank_table_mapping(rank_table, dp_rank)
 
-        balance_data_mapping_index = [torch.where(rank_table[dp_rank][:, 0] == r)[0] for r in range(num_replicas)]
-        self.state_buffer[data_type] = {
-            'balance_data_mapping_index': torch.cat(balance_data_mapping_index),
-        }
         balanced_datas = {}
         balanced_data_lengths = torch.empty(
             num_replicas, 2, dtype=rank_table[dp_rank].dtype, device=rank_table[dp_rank].device
@@ -182,3 +176,11 @@ class EncoderDataBalance:
             from torch.distributed import all_to_all
         all_to_all(balanced_data_cache, data, group=dp_process_group)
         return balanced_data_cache
+
+    @staticmethod
+    def _set_sorting_algo(sorting_algo_name):
+        if sorting_algo_name in SORTING_ALGO_FUNC:
+            return SORTING_ALGO_FUNC[sorting_algo_name]
+        else:
+            raise ValueError(f"encoder data balance sorting algorithm name '{sorting_algo_name}' "
+                             f"does not be implemented, allowed algotighms: {list(SORTING_ALGO_FUNC.keys())}")
