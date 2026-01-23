@@ -24,14 +24,20 @@ def qwen3_0p6b_base_tulu_sft_script():
     return exec_script
 
 
-def qwen3_omni_moe_sft_script():
+def qwen3_0p6b_base_tulu_sft_rmpad_with_pos_ids_padded_script():
     params = [
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4322",
-        "tasks/omni/train_qwen3_omni.py",
-        "configs/multimodal/qwen3_omni/qwen3_omni.yaml",
-        f"--model.model_path {os.path.dirname(os.path.abspath(__file__)) + '/../models/toy_config/qwen3omni_toy'}",
+        "tasks/train_torch.py",
+        "configs/sft/qwen3_sft.yaml",
+        f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
+        f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
+        "--train.output_dir Qwen3-0.6B-Base-sft-rmpad-pos-padded",
+        "--train.enable_full_determinism true",
         "--train.num_train_epochs 1",
-        "--train.max_steps 10",
+        "--train.max_steps 20",
+        "--train.rmpad false",
+        "--train.rmpad_with_pos_ids true",
+        "--train.pad_packed_input true",
         "--train.use_wandb false $@ 2>&1",
     ]
 
@@ -42,7 +48,9 @@ def qwen3_omni_moe_sft_script():
 
 SFT_SCRIPT = {
     "qwen3_0p6b_base_tulu_sft": qwen3_0p6b_base_tulu_sft_script(),
-    "qwen3_omni_moe_sft": qwen3_omni_moe_sft_script(),
+    "qwen3_0p6b_base_tulu_sft_rmpad_with_pos_ids_padded": (
+        qwen3_0p6b_base_tulu_sft_rmpad_with_pos_ids_padded_script()
+    ),
 }
 
 E2E_TEST_SCRIPT = {**SFT_SCRIPT}
