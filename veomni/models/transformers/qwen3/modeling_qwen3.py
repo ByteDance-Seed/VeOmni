@@ -19,7 +19,7 @@ from typing import Optional, Union
 
 import torch
 import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
-from transformers import Qwen3ForCausalLM, Qwen3forSequenceClassification, Qwen3Model
+from transformers import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import (
@@ -218,7 +218,7 @@ def qwen3forcausallm_forward(
 # ================================================================
 @can_return_tuple
 def qwen3forSequenceClassification_forward(
-    self: Qwen3forSequenceClassification,
+    self: Qwen3ForSequenceClassification,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
