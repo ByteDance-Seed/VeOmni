@@ -28,17 +28,11 @@ class EncoderDataBalance:
         # split input data
         split_batch = {}
         pixel_values_length = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
-        split_batch['pixel_values'] = pixel_values.npu().split(pixel_values_length.tolist(), dim=0)
-        split_batch['image_grid_thw'] = grid_thw.npu()
+        split_batch['pixel_values'] = pixel_values.split(pixel_values_length.tolist(), dim=0)
+        split_batch['image_grid_thw'] = grid_thw
 
-        split_lengths = [
-            pixel_values_length.npu(),
-            torch.empty(
-                pixel_values_length.shape[0], dtype=torch.long, device='npu'
-            ).fill_(grid_thw.shape[-1])
-        ]
         balanced_datas = self.all_to_all_redistribution(
-            data_lengths=torch.stack(split_lengths, dim=-1),
+            data_lengths=pixel_values_length,
             datas=split_batch,
             data_type=data_type,
         )
@@ -83,7 +77,7 @@ class EncoderDataBalance:
                 torch.arange(
                     len(batch), dtype=batch.dtype, device=batch.device
                 ).view(-1, 1),
-                batch
+                batch.unsqueeze(-1)
             ], dim=-1), pad=(1, 0), value=i)
             for i, batch in enumerate(gathered_lengths)
         ]
@@ -102,18 +96,17 @@ class EncoderDataBalance:
         for i, (data_name, data) in enumerate(datas.items()):
             reorganized_data = self.data_reorganization(data, data_list)
             balanced_data_dim = ()
+            balanced_data_lengths[:, 1] = data[0].shape[-1]
 
             if data_name != 'pixel_values':
                 balanced_data_dim = (*data[0].shape[1:],)
                 balanced_data_lengths[:, 0] = sample_num_per_rank
-                balanced_data_lengths[:, 1] = torch.stack([l[0, i] for l in gathered_lengths])
                 origin_data = torch.cat(reorganized_data)
                 self.state_buffer[data_type][f"{data_name}_origin_split"] = (
                         origin_data[:, 0] * origin_data[:, 1] * origin_data[:, 2] // self.merge_down_ratio).tolist()
             else:
                 balanced_data_lengths[:, 0] = 0
                 balanced_data_lengths[:, 0].index_add_(0, rank_table[dp_rank][:, 0], rank_table[dp_rank][:, 2 + i])
-                balanced_data_lengths[:, 1] = data[0].shape[-1]
                 self.state_buffer[data_type][f"{data_name}_split"] = (
                         balanced_data_lengths[:, 0] // self.merge_down_ratio).tolist()
                 self.state_buffer[data_type][f"{data_name}_origin"] = [
@@ -127,18 +120,18 @@ class EncoderDataBalance:
 
         return balanced_datas
 
-    def reverse_all_to_all_redistribution(self, hidden_state, require_grad):
+    def reverse_all_to_all_redistribution(self, hidden_state, require_grad, data_type="image"):
         recovered_hidden_state = self.all_to_all_communication(
-            list(hidden_state.split(self.state_buffer['image']["pixel_values_split"])),
-            self.state_buffer['image']["pixel_values_origin"],
+            list(hidden_state.split(self.state_buffer[data_type]["pixel_values_split"])),
+            self.state_buffer[data_type]["pixel_values_origin"],
             (hidden_state.shape[-1],),
             self.dp_group,
             require_grad=require_grad
         )
         recovered_hidden_state = torch.cat(recovered_hidden_state).split(
-            self.state_buffer['image']["image_grid_thw_origin_split"])
+            self.state_buffer[data_type]["image_grid_thw_origin_split"])
         origin_hidden_state = [None] * len(recovered_hidden_state)
-        for i, idx in enumerate(self.state_buffer['image']['pixel_values_data_list']):
+        for i, idx in enumerate(self.state_buffer[data_type]['pixel_values_data_list']):
             origin_hidden_state[idx] = recovered_hidden_state[i]
 
         return torch.cat(origin_hidden_state)
