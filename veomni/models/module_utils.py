@@ -180,7 +180,7 @@ def _dispatch_parameter(
     module, local_name = _find_submodule(module, name)
     orig_tensor = module._parameters[local_name].data
 
-    # Handle parameter slicing according to parallel_plan, now only EP-aware
+    # Handle parameter slicing according to parallel_plan, now only ExtraParallel-aware
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
