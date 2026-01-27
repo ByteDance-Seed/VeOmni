@@ -293,6 +293,8 @@ class DataArguments:
                 self.text_keys = "content_split"
             elif self.data_type == "conversation":
                 self.text_keys = "messages"
+            elif self.data_type == "classification":
+                self.text_keys = "text"
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 
