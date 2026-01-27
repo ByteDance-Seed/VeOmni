@@ -19,7 +19,7 @@ from typing import Optional, Union
 
 import torch
 import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
-from transformers import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+from transformers import Qwen3ForCausalLM, Qwen3Model, Qwen3ForSequenceClassification
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import (
@@ -269,7 +269,6 @@ def qwen3forSequenceClassification_forward(
         loss, logits = self.loss_function(
             logits=logits,
             labels=labels,
-            vocab_size=self.num_labels,
             hidden_states=hidden_states,
             weights=self.score.weight,
             **kwargs,

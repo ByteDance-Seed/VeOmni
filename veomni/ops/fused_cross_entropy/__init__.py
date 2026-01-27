@@ -107,7 +107,6 @@ def ForCausalLMLoss(
 def ForSequenceClassificationLoss(
     logits: torch.Tensor = None,
     labels: torch.Tensor = None,
-    num_labels: int = None,
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
     **kwargs,
@@ -147,6 +146,13 @@ def ForSequenceClassificationLoss(
     # pop fused loss kwargs
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
+    
+    if weights is not None:
+        num_labels = weights.size(0)
+    elif logits is not None:
+        num_labels = logits.size(-1)
+    else:
+        raise ValueError("Either logits or weights must be provided to infer num_labels.")
 
     if hidden_states is None and logits is None:
         raise ValueError("Either hidden_states or logits must be provided.")
