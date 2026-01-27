@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
@@ -37,7 +35,6 @@ class OmniSequenceShardCollator(DataCollator):
     """
 
     rmpad_with_pos_ids: bool = False
-
     # features to slice sequence dimension
     sp_slice_features: Dict[str, int] = field(
         default_factory=lambda: {
@@ -48,7 +45,6 @@ class OmniSequenceShardCollator(DataCollator):
         },
         metadata={"help": "features to slice sequence dimension."},
     )
-
     # features to padding sequence dimension
     padding_features: Dict[str, int] = field(
         default_factory=lambda: {
@@ -64,7 +60,6 @@ class OmniSequenceShardCollator(DataCollator):
         },
         metadata={"help": "features to padding sequence dimension."},
     )
-
     # padding scale for padding features
     padding_scale: Dict[str, int] = field(
         default_factory=lambda: {"pixel_values": 4}, metadata={"help": "padding scale for padding features."}
@@ -73,12 +68,10 @@ class OmniSequenceShardCollator(DataCollator):
     def __post_init__(self):
         self.sp_size = get_parallel_state().sp_size
         self.sp_rank = get_parallel_state().sp_rank
-
         # if rmpad_with_pos_ids, attention_mask will be set to 1 for flash attention in transformers
         # refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L641
         # `if not (attention_mask == 0.0).any()`, ``attention_mask`` will be set to None
         # so we need to set attention_mask to 1 for padding features
-
         if self.rmpad_with_pos_ids:
             self.padding_features["attention_mask"] = 1
 
@@ -95,12 +88,10 @@ class OmniSequenceShardCollator(DataCollator):
         """
         seq_length = tensor.size(dim)
         scale_sp_size = self.sp_size * pad_scale
-
         sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
         pad_size = sp_chunk_size * scale_sp_size - seq_length
         if pad_size == 0:
             return tensor
-
         pad_shape = list(tensor.shape)
         pad_shape[dim] = pad_size
         pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
@@ -110,16 +101,13 @@ class OmniSequenceShardCollator(DataCollator):
         # shift labels
         labels = batch["labels"][..., 1:].contiguous()
         labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
-
         if "position_ids" in batch.keys():
             cu_seqlens = pos2culen(batch["position_ids"])
             labels[:, cu_seqlens[1:-1] - 1] = IGNORE_INDEX
         elif "cu_seqlens" in batch.keys():
             labels = labels.view(-1)
             labels[batch["cu_seqlens"][1:-1] - 1] = IGNORE_INDEX
-
         batch["labels"] = labels
-
         # padding to sp size
         for key in batch.keys():
             if key in self.padding_features.keys():
@@ -133,7 +121,6 @@ class OmniSequenceShardCollator(DataCollator):
         for key in batch.keys():
             if key in self.sp_slice_features.keys():
                 batch[key] = self.sp_slice(batch[key], dim=self.sp_slice_features[key])
-
         return batch
 
 
@@ -173,7 +160,6 @@ class OmniDataCollatorWithPadding(DataCollator):
         },
         metadata={"help": "features to concat in batch."},
     )
-
     padding_features: Dict[str, int] = field(
         default_factory=lambda: {
             "input_ids": 0,
@@ -192,7 +178,6 @@ class OmniDataCollatorWithPadding(DataCollator):
         for feature in features:
             for key in feature.keys():
                 batch[key].append(feature[key])
-
         for key in batch.keys():
             if key in self.concat_features:
                 batch[key] = torch.cat(batch[key], dim=self.concat_features[key])
@@ -210,7 +195,6 @@ class OmniDataCollatorWithPadding(DataCollator):
                 batch[key] = torch.cat(batch[key], dim=0)
             else:
                 batch[key] = default_collate(batch[key])
-
         return batch
 
 
@@ -253,7 +237,6 @@ class OmniDataCollatorWithPacking(DataCollator):
         ],
         metadata={"help": "features to packing in batch."},
     )
-
     concat_features: List = field(
         default_factory=lambda: [
             "pixel_values",
@@ -285,5 +268,4 @@ class OmniDataCollatorWithPacking(DataCollator):
                 batch[input_name] = default_collate(
                     [feature[input_name] for feature in features if input_name in feature]
                 )
-
         return batch

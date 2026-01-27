@@ -82,6 +82,7 @@ class ParallelState:
     dp_shard_size: int = 1
     tp_size: int = 1
     ep_size: int = 1
+    emb_size: int = 1
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
@@ -90,6 +91,7 @@ class ParallelState:
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
     ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
+    emb_fsdp_device_mesh: Optional["DeviceMesh"] = None
     async_enabled: Optional[bool] = False
 
     def __post_init__(self):
@@ -356,6 +358,46 @@ class ParallelState:
         # and their grads are all-reduced which would match grads for the same data without SP.
         return self.world_size
 
+    # ------------------------------ emb ------------------------------ #
+    @property
+    @requires_mesh
+    def emb_mesh(self) -> "DeviceMesh":
+        return self.emb_fsdp_device_mesh["emb"]
+
+    @property
+    @requires_mesh
+    def emb_fsdp_mesh(self) -> "DeviceMesh":
+        return self.emb_fsdp_device_mesh["emb", "emb_fsdp"]
+
+    @cached_property
+    @requires_mesh
+    def emb_group(self) -> "ProcessGroup":
+        return self.emb_mesh.get_group()
+
+    @property
+    def emb_enabled(self) -> bool:
+        return self.emb_size > 1
+
+    @property
+    def emb_rank(self) -> int:
+        return self.emb_fsdp_device_mesh.get_local_rank("emb")
+
+    @property
+    def emb_fsdp_size(self) -> int:
+        assert self.emb_enabled, "emb_fsdp_size is only available when emb is enabled (emb_size > 1)"
+        return self.fsdp_size // self.emb_size
+
+    @property
+    def emb_gradient_divide_factor(self) -> int:
+        # We assume the world size is the total dp size by now
+        # TP and PP would make this assumption not true
+        assert self.tp_size == 1
+        assert self.pp_size == 1
+        # For emb+fsdp2, the grad divide factor should alwasy be world size (no matter HSDP or not)
+        # SP does not affect this since SP groups still replicate params
+        # and their grads are all-reduced which would match grads for the same data without SP.
+        return self.world_size
+
     # ------------------------------ SP ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
@@ -452,6 +494,7 @@ def init_parallel_state(
     dp_shard_size: int = 1,
     tp_size: int = 1,
     ep_size: int = 1,
+    emb_size: int = 1,
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
@@ -459,6 +502,7 @@ def init_parallel_state(
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     ep_outside: bool = False,
+    emb_outside: bool = False,
     async_enabled: Optional[bool] = False,
 ) -> None:
     """
@@ -480,7 +524,8 @@ def init_parallel_state(
         f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, ep_size {ep_size}, cp_size {cp_size}, ulysses_size {ulysses_size}"
     )
 
-    device_mesh, ep_fsdp_device_mesh = None, None
+    device_mesh, ep_fsdp_device_mesh, emb_fsdp_device_mesh = None, None, None
+
     if is_torch_version_greater_than("2.4"):
         mesh_shape = []
         mesh_dim_names = []
@@ -547,8 +592,21 @@ def init_parallel_state(
                 mesh_dim_names=("ep", "ep_fsdp"),
             )
 
+        if emb_size > 1:
+            world_size = dist.get_world_size()
+            assert world_size % emb_size == 0, "emb_size must be a factor of world_size"
+            emb_fsdp_size = world_size // emb_size
+
+            mesh = init_ep_mesh_matrix(ep_size=emb_size, ep_fsdp_size=emb_fsdp_size, ep_outside=emb_outside)
+            emb_fsdp_device_mesh = DeviceMesh(
+                device_type=device_type,
+                mesh=mesh,
+                mesh_dim_names=("emb", "emb_fsdp"),
+            )
+
         logger.info_rank0(f"Device mesh: {device_mesh}")
         logger.info_rank0(f"EP FSDP device mesh: {ep_fsdp_device_mesh}")
+        logger.info_rank0(f"Emb FSDP device mesh: {emb_fsdp_device_mesh}")
 
     _PARALLEL_STATE = ParallelState(
         dp_size=dp_size,
@@ -556,6 +614,7 @@ def init_parallel_state(
         dp_shard_size=dp_shard_size,
         tp_size=tp_size,
         ep_size=ep_size,
+        emb_size=emb_size,
         pp_size=pp_size,
         cp_size=cp_size,
         ulysses_size=ulysses_size,
@@ -564,6 +623,7 @@ def init_parallel_state(
         include_sp_in_fsdp=include_sp_in_fsdp,
         device_mesh=device_mesh,
         ep_fsdp_device_mesh=ep_fsdp_device_mesh,
+        emb_fsdp_device_mesh=emb_fsdp_device_mesh,
         async_enabled=async_enabled,
     )
 

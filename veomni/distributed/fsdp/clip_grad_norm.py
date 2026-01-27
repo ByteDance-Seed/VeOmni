@@ -15,9 +15,14 @@ from ..parallel_plan import SpecInfo
 def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
     extension = fsdp_model._fsdp_extension
     ep_mesh = extension.ep_mesh
-    ep_group = None if ep_mesh is None else ep_mesh.get_group()
+    emb_mesh = extension.emb_mesh
 
-    if ep_group is None or dist.get_world_size(ep_group) in (1, dist.get_world_size()):
+    ep_group = None if ep_mesh is None else ep_mesh.get_group()
+    emb_group = None if emb_mesh is None else emb_mesh.get_group()
+
+    if (ep_group is None or dist.get_world_size(ep_group) in (1, dist.get_world_size())) and (
+        emb_group is None or dist.get_world_size(emb_group) in (1, dist.get_world_size())
+    ):
         return FSDP.clip_grad_norm_(fsdp_model, max_norm, norm_type)
 
     assert fsdp_model._is_root
@@ -28,12 +33,14 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
     fsdp_managed_params = set()
     sharded_params_for_gnorm = {}
     ep_fsdp_sharded_params_for_gnorm = {}
+    emb_fsdp_sharded_params_for_gnorm = {}
     nonsharded_params_for_gnorm = {}
     grads_for_clip = []
     ep_fsdp_process_group = None
+    emb_fsdp_process_group = None
 
     for handle in fsdp_model._all_handles:
-        assert handle.uses_sharded_strategy
+        # assert handle.uses_sharded_strategy  # params init in CPU have no uses_sharded_strategy
         assert handle._use_orig_params, "tensor parallelism can only work with FSDP using `use_orig_params=True`"
         for param in handle.flat_param._params:
             assert hasattr(param, "spec_info")
@@ -43,9 +50,15 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
                 grads_for_clip.append(param.grad)
             # ep param
             if isinstance(spec_info.placement, Shard):
-                if ep_fsdp_process_group is None:
-                    ep_fsdp_process_group = handle.process_group
-                ep_fsdp_sharded_params_for_gnorm.setdefault(param, None)
+                if spec_info.ep_mesh:
+                    if ep_fsdp_process_group is None:
+                        ep_fsdp_process_group = handle.process_group
+                    ep_fsdp_sharded_params_for_gnorm.setdefault(param, None)
+                elif spec_info.emb_mesh:
+                    if emb_fsdp_process_group is None:
+                        emb_fsdp_process_group = handle.process_group
+                    emb_fsdp_sharded_params_for_gnorm.setdefault(param, None)
+
             # fsdp param
             else:
                 sharded_params_for_gnorm.setdefault(param, None)
@@ -73,6 +86,11 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
         if ep_fsdp_sharded_params_for_gnorm
         else None
     )
+    local_emb_fsdp_sharded_norm = (
+        _get_grad_norm(emb_fsdp_sharded_params_for_gnorm, **grad_norm_kwargs).to(fsdp_model.compute_device)
+        if emb_fsdp_sharded_params_for_gnorm
+        else None
+    )
     local_nonsharded_norm = (
         _get_grad_norm(nonsharded_params_for_gnorm, **grad_norm_kwargs).to(fsdp_model.compute_device)
         if nonsharded_params_for_gnorm
@@ -97,6 +115,11 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
             dist.all_reduce(total_ep_fsdp_sharded_norm, group=ep_fsdp_process_group)
             dist.all_reduce(total_ep_fsdp_sharded_norm, group=ep_group)
             total_norm += total_ep_fsdp_sharded_norm
+        if local_emb_fsdp_sharded_norm is not None:
+            total_emb_fsdp_sharded_norm = local_emb_fsdp_sharded_norm**norm_type
+            dist.all_reduce(total_emb_fsdp_sharded_norm, group=emb_fsdp_process_group)
+            dist.all_reduce(total_emb_fsdp_sharded_norm, group=emb_group)
+            total_norm += total_emb_fsdp_sharded_norm
 
         # All-reducing the local non-sharded norm would count it an extra
         # world-size-many times

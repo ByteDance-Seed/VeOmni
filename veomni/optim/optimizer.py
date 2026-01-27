@@ -210,9 +210,9 @@ class MultiOptimizer(Optimizer, Stateful):
         return len(self.optimizers_dict)
 
 
-def _should_build_ep_aware(model: "nn.Module") -> bool:
+def _should_build_ep_emb_aware(model: "nn.Module") -> bool:
     ps = get_parallel_state()
-    if ps.dp_mode == "fsdp2" and ps.ep_enabled:
+    if ps.dp_mode == "fsdp2" and (ps.ep_enabled or ps.emb_enabled):
         return True
 
     return False
@@ -271,9 +271,8 @@ def build_optimizer(
     no_decay_params: Optional[List[str]] = None,
 ) -> "torch.optim.Optimizer":
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
-    if _should_build_ep_aware(model):
-        logger.info_rank0("Building EP+FSDP2 optimizer")
-        return build_ep_fsdp2_optimizer(
+    if _should_build_ep_emb_aware(model):
+        return build_ep_emb_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
     # Other cases remain the same
@@ -307,7 +306,7 @@ def build_optimizer(
     return optim
 
 
-def build_ep_fsdp2_optimizer(
+def build_ep_emb_fsdp2_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
     betas: Tuple[float, float] = (0.9, 0.95),
@@ -329,9 +328,10 @@ def build_ep_fsdp2_optimizer(
     - Each group's params are automatically split into EP and non-EP based on DTensor mesh
     - Custom learning rates and other optimizer settings are preserved per group
     """
-    # Collect all EP and non-EP parameters across all groups
+    # Collect all EP/Emb and non-EP-Emb parameters across all groups
     ep_groups: List[Dict[str, Any]] = []
-    non_ep_groups: List[Dict[str, Any]] = []
+    emb_groups: List[Dict[str, Any]] = []
+    non_ep_emb_groups: List[Dict[str, Any]] = []
 
     # Process custom param_groups if provided
     if param_groups is not None:
@@ -348,9 +348,10 @@ def build_ep_fsdp2_optimizer(
             group_lr = group_config.get("lr", lr)
             group_params = group_config["params"]
 
-            # Split this group's params into EP and non-EP
+            # Split this group's params into EP, Emb and non-EP-Emb
             group_ep_params: List[torch.nn.Parameter] = []
-            group_non_ep_params: List[torch.nn.Parameter] = []
+            group_emb_params: List[torch.nn.Parameter] = []
+            group_non_ep_emb_params: List[torch.nn.Parameter] = []
 
             for p in group_params:
                 if not p.requires_grad:
@@ -361,7 +362,10 @@ def build_ep_fsdp2_optimizer(
                     if "ep_fsdp" in names:
                         group_ep_params.append(p)
                         continue
-                group_non_ep_params.append(p)
+                    elif "emb_fsdp" in names:
+                        group_emb_params.append(p)
+                        continue
+                group_non_ep_emb_params.append(p)
 
             # Create subgroups with weight decay handling
             if group_ep_params:
@@ -376,21 +380,34 @@ def build_ep_fsdp2_optimizer(
                             subgroup[key] = value
                 ep_groups.extend(group_ep_subgroups)
 
-            if group_non_ep_params:
-                group_non_ep_subgroups = _make_param_groups_for_subset(
-                    model, group_non_ep_params, weight_decay, no_decay_modules, no_decay_params
+            if group_emb_params:
+                group_emb_subgroups = _make_param_groups_for_subset(
+                    model, group_emb_params, weight_decay, no_decay_modules, no_decay_params
                 )
-                for subgroup in group_non_ep_subgroups:
+                for subgroup in group_emb_subgroups:
                     subgroup["lr"] = group_lr
                     # Preserve other custom settings from original group
                     for key, value in group_config.items():
                         if key not in ["params", "lr", "weight_decay"]:
                             subgroup[key] = value
-                non_ep_groups.extend(group_non_ep_subgroups)
+                emb_groups.extend(group_emb_subgroups)
+
+            if group_non_ep_emb_params:
+                group_non_ep_emb_subgroups = _make_param_groups_for_subset(
+                    model, group_non_ep_emb_params, weight_decay, no_decay_modules, no_decay_params
+                )
+                for subgroup in group_non_ep_emb_subgroups:
+                    subgroup["lr"] = group_lr
+                    # Preserve other custom settings from original group
+                    for key, value in group_config.items():
+                        if key not in ["params", "lr", "weight_decay"]:
+                            subgroup[key] = value
+                non_ep_emb_groups.extend(group_non_ep_emb_subgroups)
     else:
         # Default case (param_groups is None): all model parameters with uniform settings(lr)
         ep_params: List[torch.nn.Parameter] = []
-        non_ep_params: List[torch.nn.Parameter] = []
+        emb_params: List[torch.nn.Parameter] = []
+        non_ep_emb_params: List[torch.nn.Parameter] = []
 
         for name, p in model.named_parameters():
             if not p.requires_grad:
@@ -400,16 +417,22 @@ def build_ep_fsdp2_optimizer(
                 names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
                 logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
                 if "ep_fsdp" in names:
-                    logger.debug_rank0(f"Adding {name} to ep_params in ep+fsdp2 optimizer")
+                    logger.debug_rank0(f"Adding {name} to ep_params in ep+emb+fsdp2 optimizer")
                     ep_params.append(p)
                     continue
+                elif "emb_fsdp" in names:
+                    logger.debug_rank0(f"Adding {name} to emb_params in ep+emb+fsdp2 optimizer")
+                    emb_params.append(p)
+                    continue
+
             logger.debug_rank0(f"Adding {name} to non_ep_params in ep+fsdp2 optimizer")
-            non_ep_params.append(p)
+            non_ep_emb_params.append(p)
 
         # Build param groups with weight decay handling
         ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
-        non_ep_groups = _make_param_groups_for_subset(
-            model, non_ep_params, weight_decay, no_decay_modules, no_decay_params
+        emb_groups = _make_param_groups_for_subset(model, emb_params, weight_decay, no_decay_modules, no_decay_params)
+        non_ep_emb_groups = _make_param_groups_for_subset(
+            model, non_ep_emb_params, weight_decay, no_decay_modules, no_decay_params
         )
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
@@ -426,13 +449,16 @@ def build_ep_fsdp2_optimizer(
     optimizer_dict: Dict[str, Optimizer] = {}
     if ep_groups:
         optimizer_dict["ep"] = _build(ep_groups)
-    if non_ep_groups:
-        optimizer_dict["non_ep"] = _build(non_ep_groups)
+    if emb_groups:
+        optimizer_dict["emb"] = _build(emb_groups)
+    if non_ep_emb_groups:
+        optimizer_dict["non_ep_emb"] = _build(non_ep_emb_groups)
 
     # cache for EP-aware grad clipping helpers
-    model._ep_param_groups = {
+    model._ep_emb_param_groups = {
         "ep": [p for g in ep_groups for p in g.get("params", [])] if ep_groups else [],
-        "non_ep": [p for g in non_ep_groups for p in g.get("params", [])] if non_ep_groups else [],
+        "emb": [p for g in emb_groups for p in g.get("params", [])] if emb_groups else [],
+        "non_ep_emb": [p for g in non_ep_emb_groups for p in g.get("params", [])] if non_ep_emb_groups else [],
     }
 
     key_names = list(optimizer_dict.keys())
