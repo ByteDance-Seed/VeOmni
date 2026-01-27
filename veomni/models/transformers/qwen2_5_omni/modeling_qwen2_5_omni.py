@@ -34,6 +34,16 @@ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+    Qwen2_5OmniAudioEncoderConfig,
+    Qwen2_5OmniBigVGANConfig,
+    Qwen2_5OmniDiTConfig,
+    Qwen2_5OmniTalkerConfig,
+    Qwen2_5OmniTextConfig,
+    Qwen2_5OmniThinkerConfig,
+    Qwen2_5OmniToken2WavConfig,
+    Qwen2_5OmniVisionEncoderConfig,
+)
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -56,15 +66,7 @@ from ....distributed.sequence_parallel import (
     unpad_tensor,
 )
 from .configuration_qwen2_5_omni import (
-    Qwen2_5OmniAudioEncoderConfig,
-    Qwen2_5OmniBigVGANConfig,
     Qwen2_5OmniConfig,
-    Qwen2_5OmniDiTConfig,
-    Qwen2_5OmniTalkerConfig,
-    Qwen2_5OmniTextConfig,
-    Qwen2_5OmniThinkerConfig,
-    Qwen2_5OmniToken2WavConfig,
-    Qwen2_5OmniVisionEncoderConfig,
 )
 
 
