@@ -20,9 +20,11 @@ from .utils import (
 )
 
 
+# Model configs for testing - add new models here
 test_cases = [
-    pytest.param("./tests/models/toy_config/qwen25_toy.json", prepare_model_modes()),
-    pytest.param("./tests/models/toy_config/qwen3_toy.json", prepare_model_modes()),
+    pytest.param("./tests/models/toy_config/llama31_toy/config.json", prepare_model_modes(), id="llama3.1"),
+    pytest.param("./tests/models/toy_config/qwen25_toy/config.json", prepare_model_modes(), id="qwen2.5"),
+    pytest.param("./tests/models/toy_config/qwen3_toy/config.json", prepare_model_modes(), id="qwen3"),
 ]
 
 
