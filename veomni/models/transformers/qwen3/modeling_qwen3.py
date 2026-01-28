@@ -226,8 +226,6 @@ def qwen3forSequenceClassification_forward(
     inputs_embeds: Optional[torch.FloatTensor] = None,
     labels: Optional[torch.LongTensor] = None,
     use_cache: Optional[bool] = None,
-    output_attentions: Optional[bool] = None,
-    output_hidden_states: Optional[bool] = None,
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> SequenceClassifierOutputWithPast:
@@ -245,10 +243,6 @@ def qwen3forSequenceClassification_forward(
     Returns:
 
     """
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
     outputs: BaseModelOutputWithPast = self.model(
         input_ids,
         attention_mask=attention_mask,
@@ -256,8 +250,6 @@ def qwen3forSequenceClassification_forward(
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
         use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
         cache_position=cache_position,
         **kwargs,
     )
@@ -269,6 +261,7 @@ def qwen3forSequenceClassification_forward(
         loss, logits = self.loss_function(
             logits=logits,
             labels=labels,
+            num_labels=self.num_labels,
             hidden_states=hidden_states,
             weights=self.score.weight,
             **kwargs,
