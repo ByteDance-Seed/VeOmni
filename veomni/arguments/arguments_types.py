@@ -174,7 +174,6 @@ class ModelArguments:
             if decoder_args.get("config_path") is None:
                 decoder_args["config_path"] = decoder_args["model_path"]
 
-
 @dataclass
 class DataArguments:
     train_path: str = field(
@@ -294,6 +293,37 @@ class DataArguments:
 
         if self.num_workers == 0:
             self.prefetch_factor = None
+
+@dataclass
+class ValidationArguments(DataArguments):
+    val_interval: int = field(
+        default=0,
+        metadata={"help": "Validation per `val_interval` steps during training."},
+    )
+    val_steps: int = field(
+        default=10,
+        metadata={"help": "Number of validation dataloader iterations."},
+    )
+    micro_batch_size: int = field(
+        default=1,
+        metadata={"help": "Micro batch size. The number of samples per iteration on each device."},
+    )
+    rmpad: bool = field(
+        default=True,
+        metadata={"help": "Enable padding-free training by using the cu_seqlens."},
+    )
+    rmpad_with_pos_ids: bool = field(
+        default=False,
+        metadata={"help": "Enable padding-free training by using the position_ids."},
+    )
+    dyn_bsz_buffer_size: int = field(
+        default=200,
+        metadata={"help": "Buffer size for dynamic batch size."},
+    )
+    dataloader_batch_size: int = field(
+        default=1,
+        metadata={"help": "dataloader_batch_size"},
+    )
 
 
 @dataclass
@@ -748,7 +778,7 @@ class VeOmniArguments:
     model: ModelArguments = field(default_factory=ModelArguments)
     data: DataArguments = field(default_factory=DataArguments)
     train: TrainingArguments = field(default_factory=TrainingArguments)
-
+    val: ValidationArguments = field(default_factory=ValidationArguments)
     def __post_init__(self):
         pass
 
