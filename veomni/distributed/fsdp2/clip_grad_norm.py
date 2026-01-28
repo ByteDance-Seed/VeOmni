@@ -21,9 +21,10 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
-    # EP-aware path (FSDP2 + EP): maintain mathematical parity with FSDP1 clipper
-    if hasattr(model, "_ep_param_groups"):
-        return ep_fsdp2_clip_grad_norm(
+    # EP-Emb-aware path (FSDP2 + EP + Emb): maintain mathematical parity with FSDP1 clipper
+
+    if hasattr(model, "_ep_emb_param_groups"):
+        return ep_emb_fsdp2_clip_grad_norm(
             model,
             max_norm,
             norm_type=norm_type,
@@ -44,7 +45,7 @@ def clip_grad_norm(
 
 
 @torch.no_grad()
-def ep_fsdp2_clip_grad_norm(
+def ep_emb_fsdp2_clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
     """
@@ -61,40 +62,69 @@ def ep_fsdp2_clip_grad_norm(
     ps = get_parallel_state()
     fsdp_group = ps.fsdp_group
     ep_group = ps.ep_group if ps.ep_enabled else None
+    emb_group = ps.emb_group if ps.emb_enabled else None
+
     # For EP params sharded by FSDP2 along hidden dimension
     ep_fsdp_group = None
     if ps.ep_enabled and ps.ep_fsdp_device_mesh is not None:
         ep_fsdp_group = ps.ep_fsdp_device_mesh["ep_fsdp"].get_group()
 
+    # For emb params sharded by FSDP2 along hidden dimension
+    emb_fsdp_group = None
+    if ps.emb_enabled and ps.emb_fsdp_device_mesh is not None:
+        emb_fsdp_group = ps.emb_fsdp_device_mesh["emb_fsdp"].get_group()
+
     # Build param groups (filter out params without grads)
-    ep_params: List[torch.nn.Parameter] = [p for p in model._ep_param_groups.get("ep", []) if p.grad is not None]
-    non_ep_params: List[torch.nn.Parameter] = [
-        p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
+    ep_params: List[torch.nn.Parameter] = [p for p in model._ep_emb_param_groups.get("ep", []) if p.grad is not None]
+    emb_params: List[torch.nn.Parameter] = [p for p in model._ep_emb_param_groups.get("emb", []) if p.grad is not None]
+    non_ep_emb_params: List[torch.nn.Parameter] = [
+        p for p in model._ep_emb_param_groups.get("non_ep_emb", []) if p.grad is not None
     ]
-    # Compute and reduce non-EP
-    non_ep_total = _fsdp2_reduce_group(
-        params=non_ep_params,
-        norm_type=norm_type,
-        reduce_groups=[("fsdp", fsdp_group)],
-    )
-    logger.debug_rank0(f"non_ep total grad norm: {non_ep_total}")
+    # Compute and reduce non-EP-Emb
+    if len(non_ep_emb_params) > 0:
+        non_ep_emb_total = _fsdp2_reduce_group(
+            params=non_ep_emb_params,
+            norm_type=norm_type,
+            reduce_groups=[("fsdp", fsdp_group)],
+        )
+        logger.debug_rank0(f"non_ep total grad norm: {non_ep_emb_total}")
+    else:
+        non_ep_emb_total = torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
+
     logger.debug_rank0(f"ep_params reduces groups: {ep_fsdp_group=}, {ep_group=}")
+    logger.debug_rank0(f"emb_params reduces groups: {emb_fsdp_group=}, {emb_group=}")
+
     # Compute and reduce EP: first across ep_fsdp, then across ep
-    ep_total = _fsdp2_reduce_group(
-        params=ep_params,
-        norm_type=norm_type,
-        reduce_groups=[("ep_fsdp", ep_fsdp_group), ("ep", ep_group)],
-    )
-    logger.debug_rank0(f"ep total grad norm: {ep_total}")
+    if len(ep_params) > 0:
+        ep_total = _fsdp2_reduce_group(
+            params=ep_params,
+            norm_type=norm_type,
+            reduce_groups=[("ep_fsdp", ep_fsdp_group), ("ep", ep_group)],
+        )
+        logger.debug_rank0(f"ep total grad norm: {ep_total}")
+    else:
+        ep_total = torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
+
+    # Compute and reduce Emb: first across emb_fsdp, then across emb
+    if len(emb_params) > 0:
+        emb_total = _fsdp2_reduce_group(
+            params=emb_params,
+            norm_type=norm_type,
+            reduce_groups=[("emb_fsdp", emb_fsdp_group), ("emb", emb_group)],
+        )
+        logger.debug_rank0(f"emb total grad norm: {emb_total}")
+    else:
+        emb_total = torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
 
     if math.isinf(norm_type):
-        total_norm = torch.maximum(non_ep_total, ep_total)
+        total_norm = torch.maximum(non_ep_emb_total, ep_total, emb_total)
     else:
-        total_norm = (non_ep_total + ep_total) ** (1.0 / float(norm_type))
+        total_norm = (non_ep_emb_total + ep_total + emb_total) ** (1.0 / float(norm_type))
 
     # Apply the same clip coefficient to both groups
     torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
+    torch.nn.utils.clip_grads_with_norm_(emb_params, max_norm, total_norm, foreach=foreach)
+    torch.nn.utils.clip_grads_with_norm_(non_ep_emb_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
 
@@ -106,6 +136,7 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
         g.to_local().detach().to(torch.float32) if isinstance(g, DTensor) else g.detach().to(torch.float32)
         for g in grads
     ]
+
     default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
     res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
     with torch.no_grad():
