@@ -29,7 +29,6 @@
 | data.drop_last | bool | Whether to discard the remaining data at the end. | True |
 | data.pin_memory | bool | Whether to pin the data in the CPU memory. | True |
 | data.prefetch_factor | int | Number of samples preprocessed by the dataloader. | 2 |
-| data.num_labels | int | Number of labels for classification task. | None |
 
 ### Training configuration arguments
 | Name | Type | Description                                                                                                                                                                    | Default Value |
