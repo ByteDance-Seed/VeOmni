@@ -25,17 +25,20 @@ class EncoderDataBalance:
         logger.info_rank0("Successfully initialized encoder data balance")
 
     def balance_data(self, pixel_values, grid_thw, data_type="image"):
-        # split input data
+        # split pixel value
         split_batch = {}
         pixel_values_length = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
         split_batch['pixel_values'] = pixel_values.split(pixel_values_length.tolist(), dim=0)
         split_batch['image_grid_thw'] = grid_thw
 
+        # balanced pixel value
         balanced_datas = self.all_to_all_redistribution(
             data_lengths=pixel_values_length,
             datas=split_batch,
             data_type=data_type,
         )
+
+        # reorganize data to vision encoder input form
         balanced_grid_thw = torch.cat(balanced_datas['image_grid_thw'])
         balanced_pixel_values = torch.cat(balanced_datas['pixel_values'])
 
@@ -62,30 +65,33 @@ class EncoderDataBalance:
         dp_rank = self.dp_group.rank()
         num_replicas = self.dp_group.size()
 
+        # Get all the data length from each dp rank
+        # Considering each dp group may have different number of image, we firstly get the number of images in each dp rank
         cur_bs = torch.tensor(data_lengths.shape[0], dtype=torch.long, device=data_lengths.device)
         all_gather_bs = [torch.empty(1, dtype=torch.long, device=data_lengths.device) for _ in range(num_replicas)]
         dist.all_gather(all_gather_bs, cur_bs, group=self.dp_group)
-
+        # Then get all data lengths in each dp rank
         gathered_lengths = [
             torch.empty((all_gather_bs[i], *data_lengths.shape[1:]), dtype=data_lengths.dtype, device=data_lengths.device)
             for i in range(num_replicas)
         ]
         dist.all_gather(gathered_lengths, data_lengths, group=self.dp_group)
 
+        # Add coordinate for each sample, each sample's dim is:
+        #     dim 0: dp rank
+        #     dim 1: the position of sample within the corresponding dp rank
+        #     dim 2: sample length
         samples_lengths = [
             F.pad(torch.cat([
-                torch.arange(
-                    len(batch), dtype=batch.dtype, device=batch.device
-                ).view(-1, 1),
+                torch.arange(len(batch), dtype=batch.dtype, device=batch.device).view(-1, 1),
                 batch.unsqueeze(-1)
             ], dim=-1), pad=(1, 0), value=i)
             for i, batch in enumerate(gathered_lengths)
         ]
         samples_lengths = torch.cat(samples_lengths)
-
-        rank_table = self.sorting_algo(
-            samples_lengths, num_replicas,
-        )
+        # Redistribute all samples across dp groups using function "self.sorting_algo", ensuring balanced workload among the dp ranks
+        rank_table = self.sorting_algo(samples_lengths, num_replicas)
+        # Based on the rank_table, determine the distribution of current rank's data (i.e. data_list) across the load-balanced dp ranks
         data_list, rank_table = self.rank_table_mapping(rank_table, dp_rank)
 
         balanced_datas = {}
@@ -94,10 +100,12 @@ class EncoderDataBalance:
         )
         sample_num_per_rank = torch.bincount(rank_table[dp_rank][:, 0], minlength=num_replicas)
         for i, (data_name, data) in enumerate(datas.items()):
+            # Allocate data in current dp rank to the specified dp ranks according to the data_list
             reorganized_data = self.data_reorganization(data, data_list)
+            # Get new all-data shapes of current rank to implement all-to-all operation
+            # self.state_buffer store the information of shape, split, which will be used in reverse data distribution
             balanced_data_dim = ()
             balanced_data_lengths[:, 1] = data[0].shape[-1]
-
             if data_name != 'pixel_values':
                 balanced_data_dim = (*data[0].shape[1:],)
                 balanced_data_lengths[:, 0] = sample_num_per_rank
@@ -114,20 +122,21 @@ class EncoderDataBalance:
                     for d in reorganized_data
                 ]
                 self.state_buffer[data_type][f"{data_name}_data_list"] = torch.cat(data_list)
-            balanced_data = self.all_to_all_communication(
-                reorganized_data, balanced_data_lengths, balanced_data_dim, self.dp_group)
+            # execute all to all communication to redistribute data across dp ranks
+            balanced_data = self.all_to_all_communication(reorganized_data, balanced_data_lengths, balanced_data_dim)
             balanced_datas[data_name] = balanced_data
 
         return balanced_datas
 
     def reverse_all_to_all_redistribution(self, hidden_state, require_grad, data_type="image"):
+        # Redistribute the data back to its original dp rank
         recovered_hidden_state = self.all_to_all_communication(
             list(hidden_state.split(self.state_buffer[data_type]["pixel_values_split"])),
             self.state_buffer[data_type]["pixel_values_origin"],
             (hidden_state.shape[-1],),
-            self.dp_group,
             require_grad=require_grad
         )
+        # Split the concatenated data and restoring the original ordering
         recovered_hidden_state = torch.cat(recovered_hidden_state).split(
             self.state_buffer[data_type]["image_grid_thw_origin_split"])
         origin_hidden_state = [None] * len(recovered_hidden_state)
@@ -135,6 +144,20 @@ class EncoderDataBalance:
             origin_hidden_state[idx] = recovered_hidden_state[i]
 
         return torch.cat(origin_hidden_state)
+
+    def all_to_all_communication(self, data, balanced_data_lengths, data_dim, require_grad=False):
+        balanced_data_cache = [
+            torch.empty(
+                (*new_length, *data_dim), dtype=data[0].dtype, device=data[0].device
+            ).squeeze(-1) for new_length in balanced_data_lengths
+        ]
+        if require_grad:
+            # This API is an official API that supports backward, but incurs a slight additional overhead in execution time
+            from torch.distributed.nn.functional import all_to_all
+        else:
+            from torch.distributed import all_to_all
+        all_to_all(balanced_data_cache, data, group=self.dp_group)
+        return balanced_data_cache
 
     @staticmethod
     def rank_table_mapping(rank_table, dp_rank):
@@ -155,20 +178,6 @@ class EncoderDataBalance:
                 for new_group_idxs in data_list
             ]
         return new_data_group_per_rank
-
-    @staticmethod
-    def all_to_all_communication(data, balanced_data_lengths, data_dim, dp_process_group, require_grad=False):
-        balanced_data_cache = [
-            torch.empty(
-                (*new_length, *data_dim), dtype=data[0].dtype, device=data[0].device
-            ).squeeze(-1) for new_length in balanced_data_lengths
-        ]
-        if require_grad:
-            from torch.distributed.nn.functional import all_to_all
-        else:
-            from torch.distributed import all_to_all
-        all_to_all(balanced_data_cache, data, group=dp_process_group)
-        return balanced_data_cache
 
     @staticmethod
     def _set_sorting_algo(sorting_algo_name):
