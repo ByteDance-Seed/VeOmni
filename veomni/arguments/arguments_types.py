@@ -264,10 +264,6 @@ class DataArguments:
         default=False,
         metadata={"help": "Whether to ignore exceptions using byted dataset. Defaults to ``False``"},
     )
-    num_labels: Optional[int] = field(
-        default=None,
-        metadata={"help": "Number of labels for classification task."},
-    )
 
     def __post_init__(self):
         self.enable_multisource = self.train_path.endswith(".yaml")
@@ -300,10 +296,6 @@ class DataArguments:
 
         if self.num_workers == 0:
             self.prefetch_factor = None
-
-        if self.data_type == "classification":
-            if self.num_labels is None:
-                raise ValueError("For classification, num_labels must be set.")
 
 
 @dataclass
