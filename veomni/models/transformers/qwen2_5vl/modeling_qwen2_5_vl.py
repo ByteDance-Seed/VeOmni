@@ -564,7 +564,7 @@ def get_position_id(main_func, self, **kwargs):
 class Qwen2_5_VLForConditionalGeneration(_Qwen2_5_VLForConditionalGeneration):
     # --- Patch.1 ---
     def get_position_id_func(self):
-        fake_config = copy.deepcopy(self.config)
+        fake_config = copy.copy(self.config)
         # --- Patch.3 ---
         fake_config.image_token_id = IMAGE_INPUT_INDEX
         fake_config.video_token_id = VIDEO_INPUT_INDEX
