@@ -620,7 +620,6 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
             )
         hidden_states = self.merger(hidden_states)
         reverse_indices = torch.argsort(window_index)
-
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             sp_padding_size = hidden_states.size(0) - unpadded_dim_size
@@ -921,6 +920,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            **kwargs,
         )
         hidden_states = outputs[0]
 
