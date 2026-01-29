@@ -18,7 +18,7 @@
 | --- | --- | --- | --- |
 | data.train_path | str | Path of training dataset | Required |
 | data.train_size | int | Total number of tokens in the training set | 10,000,000 |
-| data.data_type | str: {"plaintext", "conversation"} | Dataset type.  | conversation |
+| data.data_type | str: {"plaintext", "conversation", "classification"} | Dataset type.  | conversation |
 | data.dataloader_type | str: {"native"} | Type of the dataloader | native |
 | data.datasets_type | str: {"mapping", "iterable"} | Dataset type. `IterativeDataset` or `MappingDataset`, or your custom datsets | mapping |
 | data.text_keys | str: {"content_split", "messages"} | The key corresponding to the text samples in the data dictionary. Generally, it is "content_split" for pretraining and "messages" for SFT. | content_split |
