@@ -3,7 +3,7 @@ Temporary weight-sync adapters for models where HF and VeOmni state dict layouts
 These will be removed in a future version when layouts are aligned; use only in tests.
 """
 
-from typing import Callable, Optional
+from typing import Callable, Union
 
 import torch
 
@@ -13,9 +13,9 @@ import torch
 SYNC_WEIGHT_REGISTRY: dict[str, Callable] = {}
 
 
-def get_sync_weight_func(model_key: str) -> Optional[Callable]:
+def get_sync_weight_func(model_key: str) -> Union[Callable, None]:
     """Return the sync weight function for a model key, or None if not needed."""
-    return SYNC_WEIGHT_REGISTRY.get(model_key)
+    return SYNC_WEIGHT_REGISTRY.get(model_key, None)
 
 
 def sync_weight_qwen3moe(config, state_dict_source, veomni_model):

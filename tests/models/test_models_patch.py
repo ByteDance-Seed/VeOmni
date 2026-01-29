@@ -1,6 +1,5 @@
 import copy
 import gc
-from typing import Optional
 
 import pytest
 import torch
@@ -22,31 +21,53 @@ from .utils import (
 from .weight_sync_adapters import get_sync_weight_func
 
 
-# Test case: (config_path, is_moe, sync_weight_key).
-# sync_weight_key: optional key for weight_sync_adapters registry (e.g. "qwen3_moe"); None for normal models.
-# Add new models by appending a param tuple and optionally registering a sync func in weight_sync_adapters.
+# Test case: (config_path, is_moe, rtol, atol). id= must match weight_sync_adapters key if the model needs custom sync.
+# rtol/atol: tolerances for compare_multi_items; can be set per case.
+_DEFAULT_RTOL = 1e-3
+_DEFAULT_ATOL = 1e-3
+
 test_cases = [
-    pytest.param("./tests/models/toy_config/llama31_toy/config.json", False, None, id="llama3.1"),
-    pytest.param("./tests/models/toy_config/qwen25_toy/config.json", False, None, id="qwen2.5"),
-    pytest.param("./tests/models/toy_config/qwen3_toy/config.json", False, None, id="qwen3"),
+    pytest.param(
+        "./tests/models/toy_config/llama31_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="llama3.1",
+    ),
+    pytest.param(
+        "./tests/models/toy_config/qwen25_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2.5",
+    ),
+    pytest.param(
+        "./tests/models/toy_config/qwen3_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3",
+    ),
     pytest.param(
         "./tests/models/toy_config/qwen3_moe_toy/config.json",
         True,
-        "qwen3_moe",
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="qwen3_moe",
     ),
 ]
 
 
-@pytest.mark.parametrize("config_path, is_moe, sync_weight_key", test_cases)
+@pytest.mark.parametrize("config_path, is_moe, rtol, atol", test_cases)
 def test_models_patch_fwd_bwd(
+    request: pytest.FixtureRequest,
     config_path: str,
     is_moe: bool,
-    sync_weight_key: Optional[str],
-    rtol: float = 0.01,
-    atol: float = 0.01,
+    rtol: float,
+    atol: float,
 ):
-    sync_weight_func = get_sync_weight_func(sync_weight_key) if sync_weight_key else None
+    case_id = request.node.callspec.id
+    sync_weight_func = get_sync_weight_func(case_id)
     hf_model_modes, veomni_model_modes = prepare_model_modes(is_moe=is_moe, sync_weight_func=sync_weight_func)
     dummy_data = prepare_data(bsz=2, max_seq_len=1024, seq_lens=torch.tensor([1024, 1024]))
 
