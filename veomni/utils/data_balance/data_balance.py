@@ -11,20 +11,30 @@ from veomni.utils.data_balance.balance_sorting_algo import SORTING_ALGO_FUNC
 logger = helper.create_logger(__name__)
 
 
-class EncoderDataBalance:
+class Qwen3VLEncoderDataBalance:
     def __init__(
             self,
+            spatial_merge_unit,
             sorting_algo_name="post_mbs_balancing_greedy_without_pad",
-            spatial_merge_unit=None
     ):
-        logger.info_rank0("Initializing encoder data balance...")
+        """
+        A data balance algorithm for Qwen3 VL encoder. The algorithm provides two interface functions:
+            1. balance_data: performs data balance across dp group on the input data "pixel_values" and "grid_thw"
+            2. data_bridge: restores the encoder output (hidden_states and deepstack_feature_lists) to their original dp group, ensuring correct downstream LLM computation
+
+        Args:
+            spatial_merge_unit: should be equal to encoder.spatial_merge_unit. This parameter is used to adapt the shape of encoder's output.
+            sorting_algo_name: choose the sorting algorithm to use.
+        """
+        logger.info_rank0("Initializing Qwen3 vl encoder data balance...")
         self.state_buffer = defaultdict(dict)
         self.merge_down_ratio = spatial_merge_unit
         self.sorting_algo = self._set_sorting_algo(sorting_algo_name)
         self.dp_group = get_parallel_state().dp_group
-        logger.info_rank0("Successfully initialized encoder data balance")
+        logger.info_rank0("Successfully initialized Qwen3 vl encoder data balance")
 
     def balance_data(self, pixel_values, grid_thw, data_type="image"):
+        self.state_buffer[data_type] = {}
         # split pixel value
         split_batch = {}
         pixel_values_length = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
@@ -44,11 +54,11 @@ class EncoderDataBalance:
 
         return balanced_pixel_values, balanced_grid_thw
 
-    def data_bridge(self, hidden_state, deepstack_feature_lists, require_grad=True):
-        recoverd_hidden_state = self.reverse_all_to_all_redistribution(hidden_state, require_grad=require_grad)
+    def data_bridge(self, hidden_state, deepstack_feature_lists, require_grad=True, data_type='image'):
+        recoverd_hidden_state = self.reverse_all_to_all_redistribution(hidden_state, require_grad=require_grad, data_type=data_type)
         if deepstack_feature_lists:
             recovered_deepstack_feature_lists = [
-                self.reverse_all_to_all_redistribution(df, require_grad=require_grad)
+                self.reverse_all_to_all_redistribution(df, require_grad=require_grad, data_type=data_type)
                 for df in deepstack_feature_lists
             ]
         else:
@@ -90,7 +100,7 @@ class EncoderDataBalance:
         ]
         samples_lengths = torch.cat(samples_lengths)
         # Redistribute all samples across dp groups using function "self.sorting_algo", ensuring balanced workload among the dp ranks
-        rank_table = self.sorting_algo(samples_lengths, num_replicas)
+        rank_table = self.sorting_algo(samples_lengths, num_replicas, dim=2)
         # Based on the rank_table, determine the distribution of current rank's data (i.e. data_list) across the load-balanced dp ranks
         data_list, rank_table = self.rank_table_mapping(rank_table, dp_rank)
 

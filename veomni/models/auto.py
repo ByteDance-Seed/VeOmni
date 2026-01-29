@@ -98,14 +98,17 @@ def build_foundation_model(
         if moe_implementation == "eager":
             logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
 
-    if config.model_type == 'qwen3_vl_moe':
-        config.encoder_data_balance = encoder_data_balance
-        config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
-    elif encoder_data_balance:
-        logger.warning_rank0(
-            f"Encoder data balance currently supported only for Qwen3-VL MoE, "
-            f"current model type: {config.model_type}, reset encoder_data_balance = False"
-        )
+    if encoder_data_balance:
+        if config.model_type == 'qwen3_vl_moe':
+            config.encoder_data_balance = encoder_data_balance
+            config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
+        else:
+            logger.warning_rank0(
+                f"Encoder data balance currently supported only for Qwen3-VL MoE, "
+                f"current model type: {config.model_type}, reset encoder_data_balance = False"
+            )
+            config.encoder_data_balance = False
+    else:
         config.encoder_data_balance = False
 
     loader: Optional[BaseModelLoader] = get_loader(config)

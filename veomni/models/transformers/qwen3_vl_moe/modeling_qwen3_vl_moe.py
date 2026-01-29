@@ -58,7 +58,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....ops import fused_moe_forward
 from ....utils import logging
-from ....utils.data_balance.data_balance import EncoderDataBalance
+from ....utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from ....utils.device import is_torch_npu_available
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -405,7 +405,7 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
         super().__init__(config)
 
         if config.encoder_data_balance:
-            self.encoder_data_balance = EncoderDataBalance(
+            self.encoder_data_balance = Qwen3VLEncoderDataBalance(
                 sorting_algo_name=config.encoder_data_balance_sorting_algo,
                 spatial_merge_unit=self.visual.spatial_merge_unit
             )

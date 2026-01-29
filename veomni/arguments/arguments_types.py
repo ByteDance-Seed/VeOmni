@@ -132,7 +132,8 @@ class ModelArguments:
     )
     encoder_data_balance_sorting_algo: Optional[str] = field(
         default="post_mbs_balancing_greedy_without_pad",
-        metadata={"help": "The sorting algorithm of encoder data balance"}
+        metadata={"help": "The sorting algorithm of encoder data balance. All viable algorithms are defined in "
+                          "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"}
     )
 
     def __post_init__(self):
