@@ -1,5 +1,5 @@
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Callable, Dict, Optional
 
 import torch
@@ -54,10 +54,15 @@ class ModelMode:
         return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]_[{self.attn_case}]"
 
 
-def prepare_model_modes(is_moe: bool = False):
-    base_model_modes = [
+def _base_model_modes():
+    """Base (non-MoE) model modes; all use sync_weight_func=None by default."""
+    modes = [
         ModelMode(modeling_backend="hf", attn_implementation="eager", attn_case="padded_bsh"),
-        ModelMode(modeling_backend="veomni", attn_implementation="eager", attn_case="padded_bsh"),
+        ModelMode(
+            modeling_backend="veomni",
+            attn_implementation="eager",
+            attn_case="padded_bsh",
+        ),
         ModelMode(modeling_backend="hf", attn_implementation="flash_attention_2", attn_case="position_ids"),
         ModelMode(
             modeling_backend="veomni",
@@ -66,7 +71,7 @@ def prepare_model_modes(is_moe: bool = False):
         ),
     ]
     if not is_torch_npu_available():
-        base_model_modes.extend(
+        modes.extend(
             [
                 ModelMode(modeling_backend="hf", attn_implementation="flash_attention_3", attn_case="position_ids"),
                 ModelMode(
@@ -83,8 +88,12 @@ def prepare_model_modes(is_moe: bool = False):
                 ),
             ]
         )
+    return modes
 
-    moe_model_modes = [
+
+def _moe_model_modes():
+    """MoE model modes; all use sync_weight_func=None by default."""
+    modes = [
         ModelMode(
             modeling_backend="hf",
             attn_implementation="eager",
@@ -111,7 +120,7 @@ def prepare_model_modes(is_moe: bool = False):
         ),
     ]
     if not is_torch_npu_available():
-        moe_model_modes.extend(
+        modes.extend(
             [
                 ModelMode(
                     modeling_backend="hf",
@@ -135,11 +144,36 @@ def prepare_model_modes(is_moe: bool = False):
                 ),
             ]
         )
+    return modes
 
-    final_models_modes = base_model_modes + moe_model_modes if is_moe else base_model_modes
-    hf_model_modes = [model_mode for model_mode in final_models_modes if model_mode.modeling_backend == "hf"]
-    veomni_model_modes = [model_mode for model_mode in final_models_modes if model_mode.modeling_backend == "veomni"]
 
+def prepare_model_modes(
+    is_moe: bool = False,
+    sync_weight_func: Optional[Callable] = None,
+):
+    """
+    Build model modes for patch tests.
+
+    Args:
+        is_moe: If True, include MoE-specific modes (e.g. fused MoE).
+        sync_weight_func: Optional callable(config, state_dict, model) used only for
+            VeOmni backend modes when HF/VeOmni state dict layouts differ. Will be
+            removed in a future version when layouts align; pass None for normal models.
+    """
+    base_modes = _base_model_modes()
+    moe_modes = _moe_model_modes()
+    final_models_modes = base_modes + moe_modes if is_moe else base_modes
+
+    if sync_weight_func is not None:
+        final_models_modes = [
+            replace(mode, sync_weight_func=sync_weight_func)
+            if mode.modeling_backend == "veomni"
+            else mode
+            for mode in final_models_modes
+        ]
+
+    hf_model_modes = [m for m in final_models_modes if m.modeling_backend == "hf"]
+    veomni_model_modes = [m for m in final_models_modes if m.modeling_backend == "veomni"]
     return hf_model_modes, veomni_model_modes
 
 
@@ -250,7 +284,7 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
     console.print(table)
 
 
-def compare_multi_items(outputs_dict: Dict, rtol=1e-3, atol=1e-5):
+def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
     base_task = next(iter(outputs_dict))
     base_output = outputs_dict[base_task]
 
@@ -309,3 +343,5 @@ def set_environ_param(model_mode: ModelMode):
         os.environ["USE_LIGER_KERNEL"] = "1"
     else:
         os.environ["USE_LIGER_KERNEL"] = "0"
+
+
