@@ -54,96 +54,63 @@ class ModelMode:
         return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]_[{self.attn_case}]"
 
 
+# For each attn_case: HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
+# On NPU skip FA3.
+_BASE_ATTN_CASES = ["padded_bsh", "position_ids"]
+_HF_ATTN = ["eager", "flash_attention_2", "flash_attention_3"]
+_VEOMNI_ATTN = [
+    "eager",
+    "veomni_flash_attention_2_with_sp",
+    "veomni_flash_attention_3_with_sp",
+]
+_USE_LIGER_KERNEL = [True, False]
+
+
+def _skip_fa3_npu(attn_impl: str) -> bool:
+    """Skip FA3 on NPU."""
+    if not is_torch_npu_available():
+        return False
+    return attn_impl in ("flash_attention_3", "veomni_flash_attention_3_with_sp")
+
+
+def _append_veomni_modes(modes: list, attn_case: str, moe_implementation: str = "eager"):
+    """Append VeOmni modes for one attn_case; every attn uses _USE_LIGER_KERNEL (True/False)."""
+    for veomni_attn in _VEOMNI_ATTN:
+        if _skip_fa3_npu(veomni_attn):
+            continue
+        for use_liger in _USE_LIGER_KERNEL:
+            modes.append(
+                ModelMode(
+                    "veomni",
+                    veomni_attn,
+                    attn_case,
+                    moe_implementation=moe_implementation,
+                    use_liger_kernel=use_liger,
+                )
+            )
+
+
 def _base_model_modes():
     """Base (non-MoE) model modes; all use sync_weight_func=None by default."""
-    modes = [
-        ModelMode(modeling_backend="hf", attn_implementation="eager", attn_case="padded_bsh"),
-        ModelMode(
-            modeling_backend="veomni",
-            attn_implementation="eager",
-            attn_case="padded_bsh",
-        ),
-        ModelMode(modeling_backend="hf", attn_implementation="flash_attention_2", attn_case="position_ids"),
-        ModelMode(
-            modeling_backend="veomni",
-            attn_implementation="veomni_flash_attention_2_with_sp",
-            attn_case="position_ids",
-        ),
-    ]
-    if not is_torch_npu_available():
-        modes.extend(
-            [
-                ModelMode(modeling_backend="hf", attn_implementation="flash_attention_3", attn_case="position_ids"),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    use_liger_kernel=True,
-                ),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    use_liger_kernel=False,
-                ),
-            ]
-        )
+    modes = []
+    for attn_case in _BASE_ATTN_CASES:
+        for hf_attn in _HF_ATTN:
+            if _skip_fa3_npu(hf_attn):
+                continue
+            modes.append(ModelMode("hf", hf_attn, attn_case))
+        _append_veomni_modes(modes, attn_case)
     return modes
 
 
 def _moe_model_modes():
-    """MoE model modes; all use sync_weight_func=None by default."""
-    modes = [
-        ModelMode(
-            modeling_backend="hf",
-            attn_implementation="eager",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            modeling_backend="veomni",
-            attn_implementation="eager",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            modeling_backend="hf",
-            attn_implementation="flash_attention_2",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            modeling_backend="veomni",
-            attn_implementation="veomni_flash_attention_2_with_sp",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-    ]
-    if not is_torch_npu_available():
-        modes.extend(
-            [
-                ModelMode(
-                    modeling_backend="hf",
-                    attn_implementation="flash_attention_3",
-                    attn_case="position_ids",
-                    moe_implementation="fused",
-                ),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    moe_implementation="fused",
-                    use_liger_kernel=True,
-                ),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    moe_implementation="fused",
-                    use_liger_kernel=False,
-                ),
-            ]
-        )
+    """MoE model modes: same attn variants with moe_implementation=fused."""
+    modes = []
+    for attn_case in _BASE_ATTN_CASES:
+        for hf_attn in _HF_ATTN:
+            if _skip_fa3_npu(hf_attn):
+                continue
+            modes.append(ModelMode("hf", hf_attn, attn_case, moe_implementation="fused"))
+        _append_veomni_modes(modes, attn_case, moe_implementation="fused")
     return modes
 
 
