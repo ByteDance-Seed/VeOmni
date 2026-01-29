@@ -166,9 +166,7 @@ def prepare_model_modes(
 
     if sync_weight_func is not None:
         final_models_modes = [
-            replace(mode, sync_weight_func=sync_weight_func)
-            if mode.modeling_backend == "veomni"
-            else mode
+            replace(mode, sync_weight_func=sync_weight_func) if mode.modeling_backend == "veomni" else mode
             for mode in final_models_modes
         ]
 
@@ -343,5 +341,3 @@ def set_environ_param(model_mode: ModelMode):
         os.environ["USE_LIGER_KERNEL"] = "1"
     else:
         os.environ["USE_LIGER_KERNEL"] = "0"
-
-

@@ -26,9 +26,9 @@ from .weight_sync_adapters import get_sync_weight_func
 # sync_weight_key: optional key for weight_sync_adapters registry (e.g. "qwen3_moe"); None for normal models.
 # Add new models by appending a param tuple and optionally registering a sync func in weight_sync_adapters.
 test_cases = [
-    # pytest.param("./tests/models/toy_config/llama31_toy/config.json", False, None, id="llama3.1"),
-    # pytest.param("./tests/models/toy_config/qwen25_toy/config.json", False, None, id="qwen2.5"),
-    # pytest.param("./tests/models/toy_config/qwen3_toy/config.json", False, None, id="qwen3"),
+    pytest.param("./tests/models/toy_config/llama31_toy/config.json", False, None, id="llama3.1"),
+    pytest.param("./tests/models/toy_config/qwen25_toy/config.json", False, None, id="qwen2.5"),
+    pytest.param("./tests/models/toy_config/qwen3_toy/config.json", False, None, id="qwen3"),
     pytest.param(
         "./tests/models/toy_config/qwen3_moe_toy/config.json",
         True,

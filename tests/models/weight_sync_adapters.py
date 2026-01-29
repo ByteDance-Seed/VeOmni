@@ -2,6 +2,7 @@
 Temporary weight-sync adapters for models where HF and VeOmni state dict layouts differ.
 These will be removed in a future version when layouts are aligned; use only in tests.
 """
+
 from typing import Callable, Optional
 
 import torch
