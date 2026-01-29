@@ -92,6 +92,12 @@ def is_veomni_patch_available() -> bool:
     return _PACKAGE_FLAGS["veomni_patch"]
 
 
+def is_linux_aarch64_platform() -> bool:
+    import platform
+
+    return platform.system() == "Linux" and platform.machine().lower() == "aarch64"
+
+
 _FFMPEG_AVAILABLE = None
 
 
