@@ -52,7 +52,7 @@ logger = logging.get_logger(__name__)
 # PATCH: LlamaModel.forward
 # 1. Support SP
 # ================================================================
-def llamamodel_forward(
+def llama_model_forward(
     self: LlamaModel,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -122,7 +122,7 @@ def llamamodel_forward(
 # 1. Support use with fuse cross_entropy loss function.
 # ================================================================
 @can_return_tuple
-def llamaforcausallm_forward(
+def llama_forcausallm_forward(
     self: LlamaForCausalLM,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -195,8 +195,8 @@ def llamaforcausallm_forward(
 def apply_veomni_llama_patch():
     logger.info_rank0("Apply VeOmni patch to Llama.")
 
-    hf_llama.LlamaModel.forward = llamamodel_forward
-    hf_llama.LlamaForCausalLM.forward = llamaforcausallm_forward
+    hf_llama.LlamaModel.forward = llama_model_forward
+    hf_llama.LlamaForCausalLM.forward = llama_forcausallm_forward
 
     if IS_CUDA_AVAILABLE:
         from .gpu_patch import apply_veomni_llama_gpu_patch

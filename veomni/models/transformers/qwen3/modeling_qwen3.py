@@ -54,7 +54,7 @@ logger = logging.get_logger(__name__)
 # ================================================================
 # TODO: check_model_inputs wrap did not save the signature
 # @check_model_inputs
-def qwen3model_forward(
+def qwen3_model_forward(
     self: Qwen3Model,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -214,7 +214,7 @@ def qwen3forcausallm_forward(
 def apply_veomni_qwen3_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen3.")
 
-    hf_qwen3.Qwen3Model.forward = qwen3model_forward
+    hf_qwen3.Qwen3Model.forward = qwen3_model_forward
     hf_qwen3.Qwen3ForCausalLM.forward = qwen3forcausallm_forward
 
     if IS_CUDA_AVAILABLE:
