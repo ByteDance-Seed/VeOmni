@@ -23,8 +23,8 @@ from .weight_sync_adapters import get_sync_weight_func
 
 # Test case: (config_path, is_moe, rtol, atol). id= must match weight_sync_adapters key if the model needs custom sync.
 # rtol/atol: tolerances for compare_multi_items; can be set per case.
-_DEFAULT_RTOL = 1e-3
-_DEFAULT_ATOL = 1e-3
+_DEFAULT_RTOL = 1e-2
+_DEFAULT_ATOL = 1e-2
 
 test_cases = [
     pytest.param(

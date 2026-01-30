@@ -213,7 +213,7 @@ def train_one_step(model, optimizer, inputs):
         inputs[k] = v.to(get_device_type())
 
     optimizer.zero_grad()
-    loss = model(**inputs).loss.mean()
+    loss = model(**inputs, use_cache=False).loss.mean()
     loss.backward()
     gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
     optimizer.step()
