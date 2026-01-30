@@ -138,7 +138,7 @@ def main():
     position_id_func = model.get_position_id_func()
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
-    if model_config.model_type == "qwen2_5_vl":
+    if model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
         transform = partial(
             process_sample_qwen2_5_vl,
             processor=processor,
