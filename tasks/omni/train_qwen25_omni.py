@@ -369,8 +369,6 @@ def main():
 
     pretty_print_trainable_parameters(model)
 
-    # model.thinker.model.layers = torch.nn.ModuleList(model.thinker.model.layers[:2])
-
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
