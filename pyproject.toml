@@ -144,7 +144,7 @@ override-dependencies = [
     "torchvision==0.22.1+cpu; (extra == 'npu')",
     "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
     # Fixate to a specific transformers version since upgrading transformers is a large task.
-    "transformers==5.0.0rc3",
+    "transformers==5.0.0",
 ]
 
 conflicts = [

@@ -24,7 +24,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
-    AutoModelForVision2Seq,
+    # AutoModelForVision2Seq,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedModel,
@@ -120,8 +120,8 @@ def get_model_class(model_config: PretrainedConfig):
         return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
         load_class = AutoModelForImageTextToText
-    elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
-        load_class = AutoModelForVision2Seq
+    # elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
+    #     load_class = AutoModelForVision2Seq
     elif (
         arch_name is not None
         and "ForCausalLM" in arch_name
