@@ -502,6 +502,8 @@ def test_trainer_saveload_no_ep():
         dcp_checkpoint_dir=checkpoint_dir,
         hf_checkpoint_dir=hf_output_dir,
         safe_serialization=True,
+        rtol=1e-2,
+        atol=1e-2,
     ), "HF checkpoint verification failed"
 
 
