@@ -274,8 +274,6 @@ def verify_hf_checkpoint_weights(
     hf_checkpoint_dir: str,
     original_state_dict: Dict[str, torch.Tensor],
     safe_serialization: bool = True,
-    rtol: float = 1e-3,
-    atol: float = 5e-4,
 ) -> bool:
     """
     Verify that the HuggingFace checkpoint weights match the original state dict.
@@ -283,6 +281,7 @@ def verify_hf_checkpoint_weights(
     Args:
         hf_checkpoint_dir: Directory containing the saved HF checkpoint.
         original_state_dict: Original state dict to compare against (with HF-format keys).
+            Should be in the same dtype as the HF checkpoint (typically bf16).
         safe_serialization: Whether the checkpoint uses safetensors format.
         rtol: Relative tolerance for value comparison.
         atol: Absolute tolerance for value comparison.
@@ -325,15 +324,16 @@ def verify_hf_checkpoint_weights(
                 logger.error(f"Shape mismatch for key '{key}': {original_tensor.shape} vs {loaded_tensor.shape}")
                 return False
 
-            # Check values (with tolerance for dtype conversion)
-            # Convert to float for comparison to handle different dtypes
-            original_float = original_tensor.cpu().float()
-            loaded_float = loaded_tensor.cpu().float()
+            # Check dtype matches (both should be bf16 now)
+            if original_tensor.dtype != loaded_tensor.dtype:
+                logger.error(f"Dtype mismatch for key '{key}': {original_tensor.dtype} vs {loaded_tensor.dtype}")
+                return False
 
-            if not torch.allclose(original_float, loaded_float, rtol=rtol, atol=atol):
-                max_diff = (original_float - loaded_float).abs().max().item()
-                mismatches.append((key, max_diff))
-                logger.warning(f"Value mismatch for key '{key}', max diff: {max_diff}")
+            # Direct comparison since both tensors should be in the same dtype (bf16)
+            if not torch.equal(original_tensor.cpu(), loaded_tensor.cpu()):
+                diff = (original_tensor.cpu().float() - loaded_tensor.cpu().float()).abs().max().item()
+                mismatches.append((key, diff))
+                logger.warning(f"Value mismatch for key '{key}', max diff: {diff}")
 
         if mismatches:
             logger.error(f"Found {len(mismatches)} tensor(s) with value mismatches:")
@@ -341,7 +341,7 @@ def verify_hf_checkpoint_weights(
                 logger.error(f"  - {key}: max_diff={max_diff}")
             return False
 
-        logger.info(f"✓ Verified {len(original_keys)} tensor(s) - all values match (rtol={rtol}, atol={atol})")
+        logger.info(f"✓ Verified {len(original_keys)} tensor(s) - all values match exactly")
         logger.info("✓ HuggingFace checkpoint weight verification passed!")
         return True
 
@@ -357,8 +357,6 @@ def verify_hf_checkpoint(
     hf_checkpoint_dir: str,
     original_state_dict: Dict[str, torch.Tensor],
     safe_serialization: bool = True,
-    rtol: float = 1e-3,
-    atol: float = 5e-4,
 ) -> bool:
     """
     Comprehensive verification of a HuggingFace checkpoint.
@@ -366,9 +364,10 @@ def verify_hf_checkpoint(
     Args:
         hf_checkpoint_dir: Directory containing the saved HF checkpoint.
         original_state_dict: Original state dict to compare against (with HF-format keys).
+            Should be in the same dtype as the HF checkpoint for exact comparison.
         safe_serialization: Whether the checkpoint uses safetensors format.
-        rtol: Relative tolerance for value comparison.
-        atol: Absolute tolerance for value comparison.
+        rtol: Relative tolerance for value comparison (kept for API compatibility, not used).
+        atol: Absolute tolerance for value comparison (kept for API compatibility, not used).
 
     Returns:
         True if all verifications pass, False otherwise.
@@ -382,8 +381,8 @@ def verify_hf_checkpoint(
         logger.error("Structure verification failed!")
         return False
 
-    # Verify weights
-    if not verify_hf_checkpoint_weights(hf_checkpoint_dir, original_state_dict, safe_serialization, rtol, atol):
+    # Verify weights (exact match, rtol/atol not used when both are bf16)
+    if not verify_hf_checkpoint_weights(hf_checkpoint_dir, original_state_dict, safe_serialization):
         logger.error("Weight verification failed!")
         return False
 
@@ -397,8 +396,6 @@ def verify_dcp_to_hf_conversion(
     dcp_checkpoint_dir: str,
     hf_checkpoint_dir: str,
     safe_serialization: bool = True,
-    rtol: float = 1e-3,
-    atol: float = 5e-4,
 ) -> bool:
     """
     Verify DCP to HuggingFace checkpoint conversion by comparing weights.
@@ -406,7 +403,11 @@ def verify_dcp_to_hf_conversion(
     This function:
     1. Loads ALL tensors from DCP checkpoint (different approach than merge_dcp_to_hf.py)
     2. Filters for model weights and normalizes keys to HF format
-    3. Compares with the converted HuggingFace checkpoint
+    3. Converts DCP weights (fp32) to bf16 to match HF checkpoint dtype
+    4. Compares with the converted HuggingFace checkpoint using exact match (rtol=0, atol=0)
+
+    Since HF checkpoints are saved in bf16, we convert the DCP fp32 weights to bf16
+    before comparison. This ensures exact match verification without tolerance.
 
     This provides independent cross-validation of the conversion script.
 
@@ -414,8 +415,6 @@ def verify_dcp_to_hf_conversion(
         dcp_checkpoint_dir: Directory containing the DCP checkpoint.
         hf_checkpoint_dir: Directory containing the HF checkpoint.
         safe_serialization: Whether the HF checkpoint uses safetensors format.
-        rtol: Relative tolerance for value comparison.
-        atol: Absolute tolerance for value comparison.
 
     Returns:
         True if verification passes, False otherwise.
@@ -434,11 +433,14 @@ def verify_dcp_to_hf_conversion(
         traceback.print_exc()
         return False
 
-    # Verify the HF checkpoint against DCP state dict
+    # Convert DCP state dict from fp32 to bf16 to match HF checkpoint dtype
+    logger.info("Converting DCP weights from fp32 to bf16 for exact comparison...")
+    dcp_state_dict_bf16 = {key: tensor.to(torch.bfloat16) for key, tensor in dcp_state_dict.items()}
+    logger.info(f"✓ Converted {len(dcp_state_dict_bf16)} tensors to bf16")
+
+    # Verify the HF checkpoint against DCP state dict (bf16 vs bf16, exact match)
     return verify_hf_checkpoint(
         hf_checkpoint_dir=hf_checkpoint_dir,
-        original_state_dict=dcp_state_dict,
+        original_state_dict=dcp_state_dict_bf16,
         safe_serialization=safe_serialization,
-        rtol=rtol,
-        atol=atol,
     )
