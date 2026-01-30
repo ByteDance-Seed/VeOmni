@@ -6,7 +6,7 @@ import torch
 from transformers import AutoConfig
 
 from veomni import _safe_apply_patches
-from veomni.utils.device import empty_cache, get_device_type, synchronize
+from veomni.utils.device import empty_cache, synchronize
 
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
@@ -22,11 +22,6 @@ from .weight_sync_adapters import get_sync_weight_func
 
 
 def _release_device_memory():
-    """Release device memory after fwd/bwd. Safe for GPU and NPU; no-op on CPU."""
-    device_type = get_device_type()
-    if device_type not in ("cuda", "npu"):
-        gc.collect()
-        return
     synchronize()
     gc.collect()
     empty_cache()
