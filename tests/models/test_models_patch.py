@@ -6,7 +6,7 @@ import torch
 from transformers import AutoConfig
 
 from veomni import _safe_apply_patches
-from veomni.utils.device import get_torch_device
+from veomni.utils.device import empty_cache, get_device_type, synchronize
 
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
@@ -19,6 +19,17 @@ from .utils import (
     train_one_step,
 )
 from .weight_sync_adapters import get_sync_weight_func
+
+
+def _release_device_memory():
+    """Release device memory after fwd/bwd. Safe for GPU and NPU; no-op on CPU."""
+    device_type = get_device_type()
+    if device_type not in ("cuda", "npu"):
+        gc.collect()
+        return
+    synchronize()
+    gc.collect()
+    empty_cache()
 
 
 # Test case: (config_path, is_moe, rtol, atol). id= must match weight_sync_adapters key if the model needs custom sync.
@@ -84,6 +95,7 @@ def test_models_patch_fwd_bwd(
 
     state_dict = copy.deepcopy(model_base.state_dict())
     del model_base, optim_base
+    _release_device_memory()
     print_device_mem_info("[Memory Info] after building the base model and optimizer:")
 
     res = {}
@@ -114,8 +126,9 @@ def test_models_patch_fwd_bwd(
             "gnorm": gnorm.item(),
         }
 
-        print_device_mem_info(f"[Memory Info] after model {idx} train_one_step:")
         del model_cur, optim_cur, loss, gnorm
+        _release_device_memory()
+        print_device_mem_info(f"[Memory Info] after model {idx} train_one_step:")
 
         return result_metrics
 
@@ -131,7 +144,5 @@ def test_models_patch_fwd_bwd(
     print_all_values(res, "gnorm", config.model_type)
     compare_multi_items(res, rtol=rtol, atol=atol)
 
-    gc.collect()
-    get_torch_device().empty_cache()
-
+    _release_device_memory()
     print_device_mem_info("[Memory Info] after running train_compare_models:")

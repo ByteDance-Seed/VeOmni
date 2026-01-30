@@ -109,7 +109,6 @@ def _moe_model_modes():
         for hf_attn in _HF_ATTN:
             if _skip_fa3_npu(hf_attn):
                 continue
-            modes.append(ModelMode("hf", hf_attn, attn_case, moe_implementation="fused"))
         _append_veomni_modes(modes, attn_case, moe_implementation="fused")
     return modes
 
