@@ -22,7 +22,7 @@ from typing import Optional
 
 import torch
 
-from ..patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
 
 
 config = PatchConfig(
