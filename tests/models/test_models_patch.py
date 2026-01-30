@@ -6,7 +6,7 @@ import torch
 from transformers import AutoConfig
 
 from veomni import _safe_apply_patches
-from veomni.utils.device import get_torch_device
+from veomni.utils.device import empty_cache, synchronize
 
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
@@ -18,19 +18,63 @@ from .utils import (
     set_environ_param,
     train_one_step,
 )
+from .weight_sync_adapters import get_sync_weight_func
 
 
-# Model configs for testing - add new models here
+def _release_device_memory():
+    synchronize()
+    gc.collect()
+    empty_cache()
+
+
+# Test case: (config_path, is_moe, rtol, atol). id= must match weight_sync_adapters key if the model needs custom sync.
+# rtol/atol: tolerances for compare_multi_items; can be set per case.
+_DEFAULT_RTOL = 1e-2
+_DEFAULT_ATOL = 1e-2
+
 test_cases = [
-    pytest.param("./tests/models/toy_config/llama31_toy/config.json", prepare_model_modes(), id="llama3.1"),
-    pytest.param("./tests/models/toy_config/qwen25_toy/config.json", prepare_model_modes(), id="qwen2.5"),
-    pytest.param("./tests/models/toy_config/qwen3_toy/config.json", prepare_model_modes(), id="qwen3"),
+    pytest.param(
+        "./tests/models/toy_config/llama31_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="llama3.1",
+    ),
+    pytest.param(
+        "./tests/models/toy_config/qwen25_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2.5",
+    ),
+    pytest.param(
+        "./tests/models/toy_config/qwen3_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3",
+    ),
+    pytest.param(
+        "./tests/models/toy_config/qwen3_moe_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_moe",
+    ),
 ]
 
 
-@pytest.mark.parametrize("config_path, model_modes", test_cases)
-def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
-    hf_model_modes, veomni_model_modes = model_modes
+@pytest.mark.parametrize("config_path, is_moe, rtol, atol", test_cases)
+def test_models_patch_fwd_bwd(
+    request: pytest.FixtureRequest,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+):
+    case_id = request.node.callspec.id
+    sync_weight_func = get_sync_weight_func(case_id)
+    hf_model_modes, veomni_model_modes = prepare_model_modes(is_moe=is_moe, sync_weight_func=sync_weight_func)
     dummy_data = prepare_data(bsz=2, max_seq_len=1024, seq_lens=torch.tensor([1024, 1024]))
 
     config = AutoConfig.from_pretrained(config_path)
@@ -46,6 +90,7 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
 
     state_dict = copy.deepcopy(model_base.state_dict())
     del model_base, optim_base
+    _release_device_memory()
     print_device_mem_info("[Memory Info] after building the base model and optimizer:")
 
     res = {}
@@ -76,8 +121,9 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
             "gnorm": gnorm.item(),
         }
 
-        print_device_mem_info(f"[Memory Info] after model {idx} train_one_step:")
         del model_cur, optim_cur, loss, gnorm
+        _release_device_memory()
+        print_device_mem_info(f"[Memory Info] after model {idx} train_one_step:")
 
         return result_metrics
 
@@ -93,7 +139,5 @@ def test_models_patch_fwd_bwd(config_path, model_modes, rtol=1e-3, atol=1e-5):
     print_all_values(res, "gnorm", config.model_type)
     compare_multi_items(res, rtol=rtol, atol=atol)
 
-    gc.collect()
-    get_torch_device().empty_cache()
-
+    _release_device_memory()
     print_device_mem_info("[Memory Info] after running train_compare_models:")

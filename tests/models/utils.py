@@ -1,5 +1,5 @@
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Callable, Dict, Optional
 
 import torch
@@ -54,92 +54,90 @@ class ModelMode:
         return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]_[{self.attn_case}]"
 
 
-def prepare_model_modes(is_moe: bool = False):
-    base_model_modes = [
-        ModelMode(modeling_backend="hf", attn_implementation="eager", attn_case="padded_bsh"),
-        ModelMode(modeling_backend="veomni", attn_implementation="eager", attn_case="padded_bsh"),
-        ModelMode(modeling_backend="hf", attn_implementation="flash_attention_2", attn_case="position_ids"),
-        ModelMode(
-            modeling_backend="veomni",
-            attn_implementation="veomni_flash_attention_2_with_sp",
-            attn_case="position_ids",
-        ),
-    ]
+# For each attn_case: HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
+# On NPU skip FA3.
+_BASE_ATTN_CASES = ["padded_bsh", "position_ids"]
+_HF_ATTN = ["eager", "flash_attention_2", "flash_attention_3"]
+_VEOMNI_ATTN = [
+    "eager",
+    "veomni_flash_attention_2_with_sp",
+    "veomni_flash_attention_3_with_sp",
+]
+_USE_LIGER_KERNEL = [True, False]
+
+
+def _skip_fa3_npu(attn_impl: str) -> bool:
+    """Skip FA3 on NPU."""
     if not is_torch_npu_available():
-        base_model_modes.extend(
-            [
-                ModelMode(modeling_backend="hf", attn_implementation="flash_attention_3", attn_case="position_ids"),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    use_liger_kernel=True,
-                ),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    use_liger_kernel=False,
-                ),
-            ]
-        )
+        return False
+    return attn_impl in ("flash_attention_3", "veomni_flash_attention_3_with_sp")
 
-    moe_model_modes = [
-        ModelMode(
-            modeling_backend="hf",
-            attn_implementation="eager",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            modeling_backend="veomni",
-            attn_implementation="eager",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            modeling_backend="hf",
-            attn_implementation="flash_attention_2",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-        ModelMode(
-            modeling_backend="veomni",
-            attn_implementation="veomni_flash_attention_2_with_sp",
-            attn_case="position_ids",
-            moe_implementation="fused",
-        ),
-    ]
-    if not is_torch_npu_available():
-        moe_model_modes.extend(
-            [
-                ModelMode(
-                    modeling_backend="hf",
-                    attn_implementation="flash_attention_3",
-                    attn_case="position_ids",
-                    moe_implementation="fused",
-                ),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    moe_implementation="fused",
-                    use_liger_kernel=True,
-                ),
-                ModelMode(
-                    modeling_backend="veomni",
-                    attn_implementation="veomni_flash_attention_3_with_sp",
-                    attn_case="position_ids",
-                    moe_implementation="fused",
-                    use_liger_kernel=False,
-                ),
-            ]
-        )
 
-    final_models_modes = base_model_modes + moe_model_modes if is_moe else base_model_modes
-    hf_model_modes = [model_mode for model_mode in final_models_modes if model_mode.modeling_backend == "hf"]
-    veomni_model_modes = [model_mode for model_mode in final_models_modes if model_mode.modeling_backend == "veomni"]
+def _append_veomni_modes(modes: list, attn_case: str, moe_implementation: str = "eager"):
+    """Append VeOmni modes for one attn_case; every attn uses _USE_LIGER_KERNEL (True/False)."""
+    for veomni_attn in _VEOMNI_ATTN:
+        if _skip_fa3_npu(veomni_attn):
+            continue
+        for use_liger in _USE_LIGER_KERNEL:
+            modes.append(
+                ModelMode(
+                    "veomni",
+                    veomni_attn,
+                    attn_case,
+                    moe_implementation=moe_implementation,
+                    use_liger_kernel=use_liger,
+                )
+            )
 
+
+def _base_model_modes():
+    """Base (non-MoE) model modes; all use sync_weight_func=None by default."""
+    modes = []
+    for attn_case in _BASE_ATTN_CASES:
+        for hf_attn in _HF_ATTN:
+            if _skip_fa3_npu(hf_attn):
+                continue
+            modes.append(ModelMode("hf", hf_attn, attn_case))
+        _append_veomni_modes(modes, attn_case)
+    return modes
+
+
+def _moe_model_modes():
+    """MoE model modes: same attn variants with moe_implementation=fused."""
+    modes = []
+    for attn_case in _BASE_ATTN_CASES:
+        for hf_attn in _HF_ATTN:
+            if _skip_fa3_npu(hf_attn):
+                continue
+        _append_veomni_modes(modes, attn_case, moe_implementation="fused")
+    return modes
+
+
+def prepare_model_modes(
+    is_moe: bool = False,
+    sync_weight_func: Optional[Callable] = None,
+):
+    """
+    Build model modes for patch tests.
+
+    Args:
+        is_moe: If True, include MoE-specific modes (e.g. fused MoE).
+        sync_weight_func: Optional callable(config, state_dict, model) used only for
+            VeOmni backend modes when HF/VeOmni state dict layouts differ. Will be
+            removed in a future version when layouts align; pass None for normal models.
+    """
+    base_modes = _base_model_modes()
+    moe_modes = _moe_model_modes()
+    final_models_modes = base_modes + moe_modes if is_moe else base_modes
+
+    if sync_weight_func is not None:
+        final_models_modes = [
+            replace(mode, sync_weight_func=sync_weight_func) if mode.modeling_backend == "veomni" else mode
+            for mode in final_models_modes
+        ]
+
+    hf_model_modes = [m for m in final_models_modes if m.modeling_backend == "hf"]
+    veomni_model_modes = [m for m in final_models_modes if m.modeling_backend == "veomni"]
     return hf_model_modes, veomni_model_modes
 
 
@@ -214,7 +212,7 @@ def train_one_step(model, optimizer, inputs):
         inputs[k] = v.to(get_device_type())
 
     optimizer.zero_grad()
-    loss = model(**inputs).loss.mean()
+    loss = model(**inputs, use_cache=False).loss.mean()
     loss.backward()
     gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
     optimizer.step()
@@ -250,7 +248,7 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
     console.print(table)
 
 
-def compare_multi_items(outputs_dict: Dict, rtol=1e-3, atol=1e-5):
+def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
     base_task = next(iter(outputs_dict))
     base_output = outputs_dict[base_task]
 

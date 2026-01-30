@@ -3,7 +3,7 @@ from torch.distributed._tensor import Shard
 from ....distributed.parallel_plan import ParallelPlan
 
 
-def get_paralle_plan():
+def get_parallel_plan():
     ep_plan = {
         "model.layers.*.mlp.experts.gate_proj": Shard(0),
         "model.layers.*.mlp.experts.up_proj": Shard(0),

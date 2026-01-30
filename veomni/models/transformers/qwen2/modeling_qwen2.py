@@ -52,7 +52,7 @@ logger = logging.get_logger(__name__)
 # PATCH: Qwen2Model.forward
 # 1. Support SP
 # ================================================================
-def qwen2model_forward(
+def qwen2_model_forward(
     self: Qwen2Model,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -134,7 +134,7 @@ def qwen2model_forward(
 # 1. Support use with fuse cross_entropy loss function.
 # ================================================================
 @can_return_tuple
-def qwen2forcausallm_forward(
+def qwen2_forcausallm_forward(
     self: Qwen2ForCausalLM,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -207,8 +207,8 @@ def qwen2forcausallm_forward(
 def apply_veomni_qwen2_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen2.")
 
-    hf_qwen2.Qwen2Model.forward = qwen2model_forward
-    hf_qwen2.Qwen2ForCausalLM.forward = qwen2forcausallm_forward
+    hf_qwen2.Qwen2Model.forward = qwen2_model_forward
+    hf_qwen2.Qwen2ForCausalLM.forward = qwen2_forcausallm_forward
 
     if IS_CUDA_AVAILABLE:
         from .gpu_patch import apply_veomni_qwen2_gpu_patch
