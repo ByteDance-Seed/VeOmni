@@ -87,7 +87,7 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
         seconds_per_chunk = output_kwargs["videos_kwargs"].pop("seconds_per_chunk")
         position_id_per_seconds = output_kwargs["videos_kwargs"].pop("position_id_per_seconds")
         # --- Patch.2 ---
-        # use_audio_in_video = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
+        _ = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
         # --- Patch.2 ---
 
         if audios:

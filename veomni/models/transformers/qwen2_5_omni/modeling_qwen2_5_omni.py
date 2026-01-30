@@ -256,8 +256,8 @@ def Qwen2_5OmniPreTrainedModelForConditionalGeneration_get_rope_index(
                         )
 
                         t_ntoken_per_chunk = int(position_id_per_seconds * seconds_per_chunk)
-                        video_chunk_indexes = self.get_chunked_index(video_llm_pos_ids, t_ntoken_per_chunk, st_idx)
-                        audio_chunk_indexes = self.get_chunked_index(audio_llm_pos_ids, t_ntoken_per_chunk, st_idx)
+                        video_chunk_indexes = self.get_chunked_index(video_llm_pos_ids[0], t_ntoken_per_chunk, st_idx)
+                        audio_chunk_indexes = self.get_chunked_index(audio_llm_pos_ids[0], t_ntoken_per_chunk, st_idx)
                         sub_len = 0
                         for j in range(max(len(video_chunk_indexes), len(audio_chunk_indexes))):
                             video_chunk_index = video_chunk_indexes[j] if j < len(video_chunk_indexes) else None
@@ -627,7 +627,6 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
             if sp_padding_size > 0:
                 hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
         # --- Patch.1 ---
-
         hidden_states = hidden_states[reverse_indices, :]
 
         ## --- Patch.1 ---
