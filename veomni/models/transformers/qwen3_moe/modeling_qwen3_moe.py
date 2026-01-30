@@ -1,4 +1,9 @@
 # Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# This file has been modified by Bytedance Ltd. and/or its affiliates.
+# The original version found at:
+#   https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

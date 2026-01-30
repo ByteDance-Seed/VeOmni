@@ -12,24 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: build commit quality style test
+name: Check Copyright
 
-check_dirs := tasks tests veomni docs
+on:
+  pull_request:
+  push:
+    branches:
+      - main
 
-build:
-	python3 setup.py sdist bdist_wheel
+permissions:
+  contents: read
 
-commit:
-	pre-commit install
-	pre-commit run --all-files
+jobs:
+  check_copyright:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-quality:
-	ruff check $(check_dirs)
-	ruff format --check $(check_dirs)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-style:
-	ruff check $(check_dirs) --fix
-	ruff format $(check_dirs)
-
-test:
-	pytest tests/
+      - name: Check Copyright headers
+        run: python scripts/check_copyright.py
