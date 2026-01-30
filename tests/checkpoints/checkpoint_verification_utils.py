@@ -271,7 +271,9 @@ def verify_hf_checkpoint_weights(
                 return False
 
             # Direct comparison since both tensors should be in the same dtype (bf16)
-            if not torch.equal(original_tensor.cpu(), loaded_tensor.cpu()):
+            try:
+                torch.testing.assert_close(original_tensor.cpu(), loaded_tensor.cpu(), rtol=0, atol=0)
+            except AssertionError:
                 diff = (original_tensor.cpu().float() - loaded_tensor.cpu().float()).abs().max().item()
                 mismatches.append((key, diff))
                 logger.warning(f"Value mismatch for key '{key}', max diff: {diff}")
