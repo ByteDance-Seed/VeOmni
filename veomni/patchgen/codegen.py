@@ -787,14 +787,15 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Generate patched modeling code from a patch configuration.")
     parser.add_argument(
-        "patch_module", help="Python module containing the PatchConfig (e.g., 'patches.qwen3_patches')"
+        "patch_module",
+        help="Python module containing the PatchConfig (e.g., 'veomni.models.transformers.qwen3.patches.qwen3_gpu_patches')",
     )
     parser.add_argument(
         "-o",
         "--output-dir",
         type=Path,
-        default=Path("generated"),
-        help="Output directory for generated files (default: generated/)",
+        default=None,
+        help="Output directory for generated files (default: sibling generated/ next to patch module)",
     )
     parser.add_argument(
         "-c",
@@ -810,14 +811,22 @@ if __name__ == "__main__":
         patch_module = importlib.import_module(args.patch_module)
         config = getattr(patch_module, args.config_name)
 
+        output_dir = args.output_dir
+        if output_dir is None:
+            module_path = Path(patch_module.__file__).resolve()
+            if module_path.parent.name == "patches":
+                output_dir = module_path.parent.parent / "generated"
+            else:
+                output_dir = Path("generated")
+
         if not isinstance(config, PatchConfig):
             print(f"Error: {args.config_name} is not a PatchConfig instance", file=sys.stderr)
             sys.exit(1)
 
         # Generate the code
-        output = generate_from_config(config, args.output_dir)
+        output = generate_from_config(config, output_dir)
         print("\nGeneration complete!")
-        print(f"Output written to: {args.output_dir / config.target_file}")
+        print(f"Output written to: {output_dir / config.target_file}")
 
     except ImportError as e:
         print(f"Error importing patch module: {e}", file=sys.stderr)

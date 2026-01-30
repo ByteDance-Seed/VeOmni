@@ -20,19 +20,19 @@ common configurations. It can be used as a CLI tool or imported.
 
 Usage:
     # Generate from a specific patch configuration
-    python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches
 
     # Generate to a specific output directory
-    python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches -o /path/to/output
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -o /path/to/output
 
     # List available patch configurations
     python -m veomni.patchgen.run_codegen --list
 
     # Dry run (show what would be generated without writing)
-    python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --dry-run
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --dry-run
 
     # Diff generated file against original HuggingFace code
-    python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff
 """
 
 import argparse
@@ -46,29 +46,35 @@ from typing import Optional
 
 
 MODULE_DIR = Path(__file__).parent
+VEOMNI_DIR = MODULE_DIR.parent
+MODELS_DIR = VEOMNI_DIR / "models" / "transformers"
 PACKAGE_NAME = __package__ or "veomni.patchgen"
-PATCHES_PACKAGE = f"{PACKAGE_NAME}.patches"
+PATCHES_PACKAGE = "veomni.models.transformers.qwen3.patches"
 
 from .codegen import CodegenError, ModelingCodeGenerator
 from .patch_spec import PatchConfig
 
 
-def list_patch_configs(patches_dir: Path = MODULE_DIR / "patches") -> list[str]:
-    """List all available patch configurations."""
+def list_patch_configs(models_dir: Path = MODELS_DIR) -> list[str]:
+    """List all available patch configurations under veomni/models/transformers."""
     configs = []
-    if not patches_dir.exists():
+    if not models_dir.exists():
         return configs
 
-    for py_file in patches_dir.glob("*.py"):
-        if py_file.name.startswith("_"):
+    for patches_dir in models_dir.rglob("patches"):
+        if not patches_dir.is_dir():
             continue
-        module_name = f"{PATCHES_PACKAGE}.{py_file.stem}"
-        try:
-            module = importlib.import_module(module_name)
-            if hasattr(module, "config") and isinstance(module.config, PatchConfig):
-                configs.append(module_name)
-        except ImportError:
-            continue
+        for py_file in patches_dir.glob("*.py"):
+            if py_file.name.startswith("_"):
+                continue
+            module_path = py_file.relative_to(VEOMNI_DIR).with_suffix("")
+            module_name = ".".join(("veomni",) + module_path.parts)
+            try:
+                module = importlib.import_module(module_name)
+                if hasattr(module, "config") and isinstance(module.config, PatchConfig):
+                    configs.append(module_name)
+            except ImportError:
+                continue
 
     return configs
 
@@ -77,8 +83,15 @@ def normalize_patch_module(patch_module: str) -> str:
     if patch_module.startswith(f"{PACKAGE_NAME}."):
         return patch_module
     if patch_module.startswith("patches."):
-        return f"{PACKAGE_NAME}.{patch_module}"
+        return f"{PATCHES_PACKAGE}.{patch_module.removeprefix('patches.')}"
     return patch_module
+
+
+def default_output_dir_for_module(module: object) -> Path:
+    module_path = Path(module.__file__).resolve()
+    if module_path.parent.name == "patches":
+        return module_path.parent.parent / "generated"
+    return MODULE_DIR / "generated"
 
 
 def print_config_summary(config: PatchConfig) -> None:
@@ -108,7 +121,7 @@ def print_config_summary(config: PatchConfig) -> None:
 
 def run_codegen(
     patch_module: str,
-    output_dir: Path,
+    output_dir: Optional[Path],
     config_name: str = "config",
     dry_run: bool = False,
     verbose: bool = False,
@@ -118,7 +131,7 @@ def run_codegen(
 
     Args:
         patch_module: Module path containing the PatchConfig
-        output_dir: Directory to write generated files
+        output_dir: Directory to write generated files (defaults to sibling generated/ next to patch module)
         config_name: Name of the config variable in the module
         dry_run: If True, don't write files
         verbose: If True, print detailed progress
@@ -132,6 +145,9 @@ def run_codegen(
             print(f"Loading patch module: {patch_module}")
         module = importlib.import_module(normalize_patch_module(patch_module))
         config = getattr(module, config_name)
+
+        if output_dir is None:
+            output_dir = default_output_dir_for_module(module)
 
         if not isinstance(config, PatchConfig):
             print(f"Error: {config_name} in {patch_module} is not a PatchConfig", file=sys.stderr)
@@ -180,7 +196,7 @@ def run_codegen(
 
 def run_diff(
     patch_module: str,
-    output_dir: Path,
+    output_dir: Optional[Path],
     config_name: str = "config",
     use_external_diff: bool = True,
     context_lines: int = 3,
@@ -206,6 +222,9 @@ def run_diff(
         # Import the patch module to get config
         module = importlib.import_module(normalize_patch_module(patch_module))
         config = getattr(module, config_name)
+
+        if output_dir is None:
+            output_dir = default_output_dir_for_module(module)
 
         if not isinstance(config, PatchConfig):
             print(f"Error: {config_name} in {patch_module} is not a PatchConfig", file=sys.stderr)
@@ -336,12 +355,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s veomni.patchgen.patches.qwen3_patches
-  %(prog)s veomni.patchgen.patches.qwen3_patches -o ./generated
-  %(prog)s veomni.patchgen.patches.qwen3_patches --dry-run
-  %(prog)s veomni.patchgen.patches.qwen3_patches --diff
-  %(prog)s veomni.patchgen.patches.qwen3_patches --diff --vscode
-  %(prog)s veomni.patchgen.patches.qwen3_patches --diff --save-patch changes.patch
+  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches
+  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -o /path/to/output
+  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --dry-run
+  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff
+  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --vscode
+  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --save-patch changes.patch
   %(prog)s --list
         """,
     )
@@ -349,14 +368,14 @@ Examples:
     parser.add_argument(
         "patch_module",
         nargs="?",
-        help="Patch module to use (e.g., 'veomni.patchgen.patches.qwen3_patches')",
+        help="Patch module to use (e.g., 'veomni.models.transformers.qwen3.patches.qwen3_gpu_patches')",
     )
     parser.add_argument(
         "-o",
         "--output-dir",
         type=Path,
-        default=MODULE_DIR / "generated",
-        help="Output directory (default: generated/)",
+        default=None,
+        help="Output directory (default: sibling generated/ next to patch module)",
     )
     parser.add_argument(
         "-c",
@@ -418,9 +437,6 @@ Examples:
     # Require patch_module for generation or diff
     if not args.patch_module:
         parser.error("patch_module is required unless using --list")
-
-    # Create output directory
-    args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Diff mode
     if args.diff:

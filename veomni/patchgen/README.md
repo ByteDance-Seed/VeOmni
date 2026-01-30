@@ -5,43 +5,46 @@ A code generation framework for creating patched HuggingFace modeling files. Ins
 ## Quick Start
 
 ```bash
-# Generate patched Qwen3 modeling code
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches
+# Generate patched Qwen3 GPU modeling code (writes to veomni/models/transformers/qwen3/generated/)
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches
 
 # With verbose output
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches -v
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -v
 
 # Dry run (preview without writing)
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --dry-run
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --dry-run
 
 # Custom output directory
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches -o /path/to/output
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -o /path/to/output
 
 # List available patch configurations
 python -m veomni.patchgen.run_codegen --list
 
 # Diff generated file against original HuggingFace code
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff
 
 # Open diff in VS Code
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff --vscode
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --vscode
 
 # Save diff as .patch file
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff --save-patch changes.patch
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --save-patch changes.patch
 ```
 
 ## Project Structure
 
 ```
-veomni/patchgen/
-├── patch_spec.py              # Patch specification DSL
-├── codegen.py                 # AST-based code generator
-├── run_codegen.py             # CLI runner script
-├── patches/
-│   ├── __init__.py
-│   └── qwen3_patches.py       # Example: Qwen3 patches
-└── generated/
-    └── patched_modeling_qwen3.py  # Generated output
+veomni/
+├── patchgen/
+│   ├── patch_spec.py              # Patch specification DSL
+│   ├── codegen.py                 # AST-based code generator
+│   └── run_codegen.py             # CLI runner script
+└── models/
+    └── transformers/
+        └── qwen3/
+            ├── patches/
+            │   └── qwen3_gpu_patches.py       # Qwen3 GPU patches
+            └── generated/
+                └── patched_modeling_qwen3_gpu.py  # Generated output
 ```
 
 ## Core Design
@@ -115,7 +118,7 @@ class Qwen3RMSNorm(nn.Module):
 
 ### 1. Create a Patch Configuration
 
-Create a new file in `patches/` (e.g., `patches/my_model_patches.py`):
+Create a new file under `veomni/models/transformers/qwen3/patches/` (for now we only ship Qwen3):
 
 ```python
 from veomni.patchgen.patch_spec import PatchConfig
@@ -123,8 +126,8 @@ from veomni.patchgen.patch_spec import PatchConfig
 # Define the configuration
 config = PatchConfig(
     source_module="transformers.models.qwen3.modeling_qwen3",
-    target_file="patched_modeling_qwen3.py",
-    description="Qwen3 with training optimizations",
+    target_file="patched_modeling_qwen3_gpu.py",
+    description="Qwen3 GPU patches",
 )
 ```
 
@@ -188,7 +191,7 @@ config.exclude_from_output("Qwen3ForTokenClassification")
 ### 4. Generate Code
 
 ```bash
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.my_model_patches -v
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -v
 ```
 
 ## Patch Types Reference
@@ -254,21 +257,21 @@ The generated file includes:
             ...
     ```
 
-## Example: Qwen3 Training Patches
+## Example: Qwen3 GPU Patches
 
-See `veomni/patchgen/patches/qwen3_patches.py` for a complete example that includes:
+See `veomni/models/transformers/qwen3/patches/qwen3_gpu_patches.py` for a complete example that includes:
 
-- **OptimizedRMSNorm**: Fused kernel replacement for `Qwen3RMSNorm`
-- **optimized_rotary_pos_emb**: Fused rotary position embedding
-- **ulysses_attention_forward**: Attention with sequence parallelism support
+- **LigerRMSNorm**: Fused kernel replacement for `Qwen3RMSNorm`
+- **LigerSwiGLUMLP**: Fused SwiGLU MLP replacement for `Qwen3MLP`
+- **apply_rotary_pos_emb**: LigerKernel rotary position embedding
 
 Run it:
 
 ```bash
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches -v
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -v
 ```
 
-Output: `generated/patched_modeling_qwen3.py` (~600 lines of self-contained code)
+Output: `veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py` (~600 lines of self-contained code)
 
 ## Comparing Generated vs Original Code
 
@@ -276,16 +279,16 @@ Use the `--diff` flag to see exactly what changed between the original HuggingFa
 
 ```bash
 # Show unified diff in terminal (uses delta or diff if available)
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff
 
 # Open diff in VS Code's built-in diff viewer
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff --vscode
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --vscode
 
 # Save diff to a .patch file (viewable in VS Code with syntax highlighting)
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff --save-patch changes.patch
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --save-patch changes.patch
 
 # Use Python's difflib instead of external tools
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff --no-external-diff
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --no-external-diff
 ```
 
 ### VS Code Integration
@@ -293,7 +296,7 @@ python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --di
 **Option 1: Open in VS Code diff viewer** (recommended for side-by-side comparison)
 
 ```bash
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff --vscode
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --vscode
 ```
 
 This opens VS Code's built-in diff viewer with the original HF code on the left and generated code on the right.
@@ -301,8 +304,8 @@ This opens VS Code's built-in diff viewer with the original HF code on the left 
 **Option 2: Save as .patch file** (good for sharing/reviewing)
 
 ```bash
-python -m veomni.patchgen.run_codegen veomni.patchgen.patches.qwen3_patches --diff --save-patch generated/changes.patch
-code generated/changes.patch  # Open in VS Code with syntax highlighting
+python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --save-patch veomni/models/transformers/qwen3/generated/changes.patch
+code veomni/models/transformers/qwen3/generated/changes.patch  # Open in VS Code with syntax highlighting
 ```
 
 The diff command:
@@ -341,8 +344,8 @@ from veomni.patchgen.patch_spec import create_patch_from_external
 
 patch = create_patch_from_external(
     target="Qwen3RMSNorm",
-    source_module="liger_kernel.transformers.rms_norm",
-    source_name="LigerRMSNorm",
+    replacement_module="liger_kernel.transformers.rms_norm",
+    replacement_name="LigerRMSNorm",
 )
 config.patches.append(patch)
 ```
@@ -351,11 +354,13 @@ config.patches.append(patch)
 
 ```python
 from codegen import ModelingCodeGenerator
-from veomni.patchgen.patches.qwen3_patches import config
+from veomni.models.transformers.qwen3.patches.qwen3_gpu_patches import config
 
 generator = ModelingCodeGenerator(config)
 generator.load_source()
-output = generator.generate(Path("output/my_model.py"))
+output = generator.generate(
+    Path("veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py")
+)
 ```
 
 ### Init Modification
@@ -378,11 +383,11 @@ usage: python -m veomni.patchgen.run_codegen [-h] [-o OUTPUT_DIR] [-c CONFIG_NAM
                       [patch_module]
 
 positional arguments:
-  patch_module          Patch module to use (e.g., 'veomni.patchgen.patches.qwen3_patches')
+  patch_module          Patch module to use (e.g., 'veomni.models.transformers.qwen3.patches.qwen3_gpu_patches')
 
 options:
   -h, --help            Show help message
-  -o, --output-dir      Output directory (default: generated/)
+  -o, --output-dir      Output directory (default: sibling generated/ next to patch module)
   -c, --config-name     Config variable name in the patch module (default: config)
   --list                List available patch configurations
   --dry-run             Show what would be generated without writing files
@@ -436,8 +441,8 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 
 To add support for a new model:
 
-1. Create `patches/<model>_patches.py`
+1. Create `veomni/models/transformers/<model>/patches/<model>_patches.py`
 1. Define your `PatchConfig` and patches
-1. Test with `python -m veomni.patchgen.run_codegen veomni.patchgen.patches.<model>_patches --dry-run`
-1. Generate and verify the output
+1. Test with `python -m veomni.patchgen.run_codegen veomni.models.transformers.<model>.patches.<model>_patches --dry-run`
+1. Generate and verify the output in `veomni/models/transformers/<model>/generated/`
 1. Use `--diff` to review changes against original HF code

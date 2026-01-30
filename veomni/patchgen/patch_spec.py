@@ -26,11 +26,12 @@ Supported patch types:
 
 Example usage:
 
+    # veomni/models/transformers/qwen3/patches/qwen3_gpu_patches.py
     from veomni.patchgen.patch_spec import PatchConfig, replace_class, override_method, replace_function
 
     config = PatchConfig(
         source_module="transformers.models.qwen3.modeling_qwen3",
-        target_file="patched_modeling_qwen3.py",
+        target_file="patched_modeling_qwen3_gpu.py",
     )
 
     @config.replace_class("Qwen3RMSNorm")
@@ -266,8 +267,8 @@ def get_source_code(obj: Any) -> str:
 
 def create_patch_from_external(
     target: str,
-    source_module: str,
-    source_name: str,
+    replacement_module: str,
+    replacement_name: str,
     patch_type: PatchType = PatchType.CLASS_REPLACEMENT,
     description: Optional[str] = None,
 ) -> Patch:
@@ -280,15 +281,15 @@ def create_patch_from_external(
     Usage:
         patch = create_patch_from_external(
             target="Qwen3RMSNorm",
-            source_module="liger_kernel.transformers.rms_norm",
-            source_name="LigerRMSNorm",
+            replacement_module="liger_kernel.transformers.rms_norm",
+            replacement_name="LigerRMSNorm",
         )
     """
     return Patch(
         patch_type=patch_type,
         target=target,
         replacement=None,  # Will be resolved at codegen time
-        source_module=source_module,
-        replacement_source=f"{source_module}.{source_name}",
-        description=description or f"Replace {target} with {source_name} from {source_module}",
+        source_module=replacement_module,
+        replacement_source=f"{replacement_module}.{replacement_name}",
+        description=description or f"Replace {target} with {replacement_name} from {replacement_module}",
     )

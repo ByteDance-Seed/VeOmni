@@ -34,8 +34,8 @@ config = PatchConfig(
 config.patches.append(
     create_patch_from_external(
         target="Qwen3RMSNorm",
-        source_module="liger_kernel.transformers.rms_norm",
-        source_name="LigerRMSNorm",
+        replacement_module="liger_kernel.transformers.rms_norm",
+        replacement_name="LigerRMSNorm",
         description="Use LigerKernel RMSNorm",
     )
 )
@@ -43,8 +43,8 @@ config.patches.append(
 config.patches.append(
     create_patch_from_external(
         target="Qwen3MLP",
-        source_module="liger_kernel.transformers.swiglu",
-        source_name="LigerSwiGLUMLP",
+        replacement_module="liger_kernel.transformers.swiglu",
+        replacement_name="LigerSwiGLUMLP",
         description="Use LigerKernel SwiGLU MLP",
     )
 )
