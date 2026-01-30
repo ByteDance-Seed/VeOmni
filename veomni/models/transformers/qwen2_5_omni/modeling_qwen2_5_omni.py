@@ -556,9 +556,7 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
         unpadded_dim_size = cu_seqlens[-1]
-
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             hidden_states = gather_seq_scatter_heads(
@@ -583,8 +581,8 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
                 hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
                 rotary_pos_emb = pad_tensor(rotary_pos_emb, dim=0, padding_size=sp_padding_size)
                 new_cumsum = cu_seqlens[-1] + sp_padding_size
-                cu_seqlens = torch.cat([cu_seqlens[:1], new_cumsum.unsqueeze(0)], dim=0)
-                cu_window_seqlens = torch.cat([cu_window_seqlens[:1], new_cumsum.unsqueeze(0)], dim=0)
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+                cu_window_seqlens = torch.cat([cu_window_seqlens, new_cumsum.unsqueeze(0)], dim=0)
 
             hidden_states = gather_heads_scatter_seq(
                 hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
@@ -829,7 +827,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
                         image_embeds, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
                 # --- Patch.3 ---
-
                 # --- Patch.4 ---
                 image_embeds = image_embeds[: image_mask.sum()]
                 image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -923,7 +920,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
             **kwargs,
         )
         hidden_states = outputs[0]
-
         # --- Patch.7 ---
         loss = None
         logits = None
@@ -960,8 +956,13 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
 # 1. support mixed data of video_w_audio & video_w/o_audio
 # 2. use veomni precomputed multimodal masks
 # 3. forward function for training
+# 4. fix _no_split_modules
 # ================================================================
 class Qwen2_5OmniForConditionalGeneration(_Qwen2_5OmniForConditionalGeneration):
+    # --- Patch.4 ---
+    _no_split_modules = ["Qwen2_5OmniDecoderLayer", "Qwen2_5OmniVisionBlock", "Qwen2_5OmniAudioEncoderLayer"]
+    # --- Patch.4 ---
+
     @torch.no_grad()
     # TODO: raushan, defaults should be saved in generation config
     def generate(

@@ -526,7 +526,6 @@ def main():
                 }
                 with model_fwd_context:
                     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss / len(micro_batches)
-
                 with model_bwd_context:
                     loss.backward()
 
