@@ -40,6 +40,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 
 if TYPE_CHECKING:
@@ -135,11 +136,10 @@ def process_sample(
             feature_attention_mask[valid_mask].bool()
         ]  # l, dim
 
-    if feature_attention_mask is None or input_features.shape[0] == 0:
-        audio_feature_lengths = None
-    else:
         model_inputs["input_features"] = input_features
         model_inputs["audio_feature_lengths"] = audio_feature_lengths
+    else:
+        audio_feature_lengths = None  # no video & no audio
 
     input_ids = model_inputs["input_ids"].squeeze(0)
     image_mask = input_ids == 151655
@@ -505,13 +505,25 @@ def main():
                     micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
+                # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
+                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                    micro_batch["position_ids"][:, 0, :]
+                )
+                micro_batch.update(
+                    dict(
+                        cu_seq_lens_q=cu_seq_lens_q,
+                        cu_seq_lens_k=cu_seq_lens_k,
+                        max_length_q=max_length_q,
+                        max_length_k=max_length_k,
+                    )
+                )
+
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
                     for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
                     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss / len(micro_batches)
-
                 with model_bwd_context:
                     loss.backward()
 
