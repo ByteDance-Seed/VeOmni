@@ -193,7 +193,7 @@ class DataArguments:
         default=10_000_000,
         metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
     )
-    data_type: Literal["plaintext", "conversation", "diffusion"] = field(
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -298,6 +298,8 @@ class DataArguments:
                 self.text_keys = "content_split"
             elif self.data_type == "conversation":
                 self.text_keys = "messages"
+            elif self.data_type == "classification":
+                self.text_keys = "text"
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

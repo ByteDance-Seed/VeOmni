@@ -87,7 +87,7 @@ def test_encoder_balance():
     ]
 
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         print(f"Command failed with return code {e.returncode}")
         print("STDOUT:", e.stdout)

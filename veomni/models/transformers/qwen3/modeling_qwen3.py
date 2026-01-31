@@ -19,12 +19,13 @@ from typing import Optional, Union
 
 import torch
 import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
-from transformers import Qwen3ForCausalLM, Qwen3Model
+from transformers import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import (
@@ -54,7 +55,7 @@ logger = logging.get_logger(__name__)
 # ================================================================
 # TODO: check_model_inputs wrap did not save the signature
 # @check_model_inputs
-def qwen3model_forward(
+def qwen3_model_forward(
     self: Qwen3Model,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -211,11 +212,78 @@ def qwen3forcausallm_forward(
     )
 
 
+# ================================================================
+# PATCH: Qwen3ForSequenceClassification.forward
+# 1. Support SP
+# ================================================================
+@can_return_tuple
+def qwen3forSequenceClassification_forward(
+    self: Qwen3ForSequenceClassification,
+    input_ids: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Cache] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> SequenceClassifierOutputWithPast:
+    r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the classification loss.
+
+            This head uses a single-label cross-entropy loss. In our setup, labels typically follow the
+            "token-level labels" convention: positions not supervised should be set to `-100`, and only the
+            supervised token(s) (e.g., the last valid token of each sample) carry a real class id in
+            `[0, ..., num_labels - 1]`. Tokens with label `-100` are ignored.
+
+            Note: `labels` should be provided for classification training tasks.
+
+    Returns:
+
+    """
+    outputs: BaseModelOutputWithPast = self.model(
+        input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        cache_position=cache_position,
+        **kwargs,
+    )
+    hidden_states = outputs.last_hidden_state
+
+    loss = None
+    logits = None
+    if labels is not None:
+        loss, logits = self.loss_function(
+            logits=logits,
+            labels=labels,
+            num_labels=self.num_labels,
+            hidden_states=hidden_states,
+            weights=self.score.weight,
+            **kwargs,
+        )
+    else:
+        logits = self.score(hidden_states)
+
+    return SequenceClassifierOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
 def apply_veomni_qwen3_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen3.")
 
-    hf_qwen3.Qwen3Model.forward = qwen3model_forward
+    hf_qwen3.Qwen3Model.forward = qwen3_model_forward
     hf_qwen3.Qwen3ForCausalLM.forward = qwen3forcausallm_forward
+    hf_qwen3.Qwen3ForSequenceClassification.forward = qwen3forSequenceClassification_forward
 
     if IS_CUDA_AVAILABLE:
         from .gpu_patch import apply_veomni_qwen3_gpu_patch

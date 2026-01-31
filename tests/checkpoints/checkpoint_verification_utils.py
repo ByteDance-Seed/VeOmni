@@ -48,14 +48,7 @@ def _normalize_key(key: str) -> Optional[str]:
     """
     Convert DCP key to HuggingFace format. Returns None for non-model weights.
 
-    This function mirrors the key normalization logic in scripts/merge_dcp_to_hf.py
-    to ensure consistent behavior between conversion and verification.
-
-    Conversion rules:
-    - "model.model.*" -> "model.*" (remove first "model." prefix)
-    - "model.lm_head.weight" -> "lm_head.weight" (special case)
-    - Other "model.*" keys -> log warning and strip "model." prefix
-    - Keys without "model." prefix -> None (non-model weights)
+    Rules: "model.model.*" -> "model.*", "model.lm_head.weight" -> "lm_head.weight"
     """
     if not key.startswith("model."):
         return None
@@ -77,49 +70,31 @@ def _normalize_key(key: str) -> Optional[str]:
 
 def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
     """
-    Load a DCP (Distributed Checkpoint) checkpoint from disk and extract model weights.
+    Load DCP checkpoint and extract model weights with HF-format keys.
 
-    This function uses a DIFFERENT approach than merge_dcp_to_hf.py for cross-validation:
-    1. Read metadata and get ALL keys (including optimizer states, etc.)
-    2. Pre-allocate tensors for ALL keys
-    3. Load everything in one go
-    4. Filter out non-model weights after loading
-    5. Normalize keys to HuggingFace format
-
-    This independent implementation provides cross-validation for the conversion script.
-
-    Args:
-        dcp_checkpoint_dir: Directory containing the DCP checkpoint.
-
-    Returns:
-        State dict with model weights in HuggingFace format (normalized keys).
+    Uses load-all-then-filter approach (different from merge_dcp_to_hf.py) for cross-validation.
     """
     from collections import OrderedDict
 
     from torch.distributed.checkpoint.metadata import Metadata
 
     logger.info(f"Loading DCP checkpoint from {dcp_checkpoint_dir}")
-    logger.info("Reading metadata and loading ALL tensors, then filtering for model weights")
 
-    # Step 1: Read metadata to get all keys
     reader = FileSystemReader(dcp_checkpoint_dir)
     metadata = reader.read_metadata()
 
     if not isinstance(metadata, Metadata):
         raise ValueError(f"Invalid metadata format in {dcp_checkpoint_dir}")
 
-    # Step 2: Pre-allocate placeholder tensors for ALL keys (not just model weights)
-    # Note: Some keys may have BytesStorageMetadata (non-tensor data), skip those
+    # Pre-allocate tensors (skip non-tensor metadata like BytesStorageMetadata)
     state_dict = OrderedDict()
     skipped_keys = []
 
     for dcp_key, tensor_metadata in metadata.state_dict_metadata.items():
-        # Check if this is tensor metadata (has 'properties' attribute)
         if not hasattr(tensor_metadata, "properties"):
             skipped_keys.append(dcp_key)
             continue
 
-        # Check if dtype is available
         if not hasattr(tensor_metadata.properties, "dtype"):
             logger.warning(f"Skipping key '{dcp_key}': no dtype information in metadata")
             skipped_keys.append(dcp_key)
@@ -132,9 +107,8 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
     logger.info(f"Found {len(state_dict)} tensor keys in DCP checkpoint")
     if skipped_keys:
-        logger.info(f"Skipped {len(skipped_keys)} non-tensor keys (e.g., optimizer config)")
+        logger.info(f"Skipped {len(skipped_keys)} non-tensor keys")
 
-    # Step 3: Load ALL tensors from checkpoint
     load(
         state_dict,
         checkpoint_id=dcp_checkpoint_dir,
@@ -144,7 +118,7 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
     logger.info(f"Loaded {len(state_dict)} total tensors from DCP")
 
-    # Step 4: Filter for model weights and normalize keys to HuggingFace format
+    # Filter model weights and normalize keys
     loaded_state_dict = {}
     non_model_count = 0
 
@@ -152,7 +126,6 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         hf_key = _normalize_key(dcp_key)
 
         if hf_key is None:
-            # Skip non-model keys (optimizer states, etc.)
             non_model_count += 1
             continue
 
@@ -160,8 +133,7 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
             logger.warning(f"Skipping non-tensor key: {dcp_key}")
             continue
 
-        # Handle DTensor (distributed tensor)
-        if hasattr(tensor, "full_tensor"):
+        if hasattr(tensor, "full_tensor"):  # Handle DTensor
             tensor = tensor.full_tensor()
 
         loaded_state_dict[hf_key] = tensor.detach().cpu()
@@ -173,16 +145,7 @@ def load_dcp_checkpoint(dcp_checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
 
 def load_hf_checkpoint(hf_checkpoint_dir: str, safe_serialization: bool = True) -> Dict[str, torch.Tensor]:
-    """
-    Load a HuggingFace checkpoint from disk.
-
-    Args:
-        hf_checkpoint_dir: Directory containing the HF checkpoint.
-        safe_serialization: Whether the checkpoint uses safetensors format.
-
-    Returns:
-        State dict loaded from the checkpoint.
-    """
+    """Load HuggingFace checkpoint (supports both single-file and sharded formats)."""
     if safe_serialization:
         weight_files = [f for f in os.listdir(hf_checkpoint_dir) if f.endswith(".safetensors")]
         index_file = SAFE_WEIGHTS_INDEX_NAME
@@ -227,16 +190,7 @@ def load_hf_checkpoint(hf_checkpoint_dir: str, safe_serialization: bool = True) 
 
 
 def verify_hf_checkpoint_structure(hf_checkpoint_dir: str, safe_serialization: bool = True) -> bool:
-    """
-    Verify that the HuggingFace checkpoint has the correct file structure.
-
-    Args:
-        hf_checkpoint_dir: Directory containing the saved HF checkpoint.
-        safe_serialization: Whether the checkpoint uses safetensors format.
-
-    Returns:
-        True if structure verification passes, False otherwise.
-    """
+    """Verify HF checkpoint has correct file structure (weight files and index if sharded)."""
     logger.info(f"Verifying HuggingFace checkpoint structure at {hf_checkpoint_dir}")
 
     # Check if directory exists
@@ -274,22 +228,8 @@ def verify_hf_checkpoint_weights(
     hf_checkpoint_dir: str,
     original_state_dict: Dict[str, torch.Tensor],
     safe_serialization: bool = True,
-    rtol: float = 1e-3,
-    atol: float = 5e-4,
 ) -> bool:
-    """
-    Verify that the HuggingFace checkpoint weights match the original state dict.
-
-    Args:
-        hf_checkpoint_dir: Directory containing the saved HF checkpoint.
-        original_state_dict: Original state dict to compare against (with HF-format keys).
-        safe_serialization: Whether the checkpoint uses safetensors format.
-        rtol: Relative tolerance for value comparison.
-        atol: Absolute tolerance for value comparison.
-
-    Returns:
-        True if verification passes, False otherwise.
-    """
+    """Verify HF checkpoint weights match original_state_dict (exact match, same dtype expected)."""
     logger.info(f"Verifying HuggingFace checkpoint weights at {hf_checkpoint_dir}")
 
     try:
@@ -325,15 +265,18 @@ def verify_hf_checkpoint_weights(
                 logger.error(f"Shape mismatch for key '{key}': {original_tensor.shape} vs {loaded_tensor.shape}")
                 return False
 
-            # Check values (with tolerance for dtype conversion)
-            # Convert to float for comparison to handle different dtypes
-            original_float = original_tensor.cpu().float()
-            loaded_float = loaded_tensor.cpu().float()
+            # Check dtype matches (both should be bf16 now)
+            if original_tensor.dtype != loaded_tensor.dtype:
+                logger.error(f"Dtype mismatch for key '{key}': {original_tensor.dtype} vs {loaded_tensor.dtype}")
+                return False
 
-            if not torch.allclose(original_float, loaded_float, rtol=rtol, atol=atol):
-                max_diff = (original_float - loaded_float).abs().max().item()
-                mismatches.append((key, max_diff))
-                logger.warning(f"Value mismatch for key '{key}', max diff: {max_diff}")
+            # Direct comparison since both tensors should be in the same dtype (bf16)
+            try:
+                torch.testing.assert_close(original_tensor.cpu(), loaded_tensor.cpu(), rtol=0, atol=0)
+            except AssertionError:
+                diff = (original_tensor.cpu().float() - loaded_tensor.cpu().float()).abs().max().item()
+                mismatches.append((key, diff))
+                logger.warning(f"Value mismatch for key '{key}', max diff: {diff}")
 
         if mismatches:
             logger.error(f"Found {len(mismatches)} tensor(s) with value mismatches:")
@@ -341,7 +284,7 @@ def verify_hf_checkpoint_weights(
                 logger.error(f"  - {key}: max_diff={max_diff}")
             return False
 
-        logger.info(f"✓ Verified {len(original_keys)} tensor(s) - all values match (rtol={rtol}, atol={atol})")
+        logger.info(f"✓ Verified {len(original_keys)} tensor(s) - all values match exactly")
         logger.info("✓ HuggingFace checkpoint weight verification passed!")
         return True
 
@@ -357,22 +300,8 @@ def verify_hf_checkpoint(
     hf_checkpoint_dir: str,
     original_state_dict: Dict[str, torch.Tensor],
     safe_serialization: bool = True,
-    rtol: float = 1e-3,
-    atol: float = 5e-4,
 ) -> bool:
-    """
-    Comprehensive verification of a HuggingFace checkpoint.
-
-    Args:
-        hf_checkpoint_dir: Directory containing the saved HF checkpoint.
-        original_state_dict: Original state dict to compare against (with HF-format keys).
-        safe_serialization: Whether the checkpoint uses safetensors format.
-        rtol: Relative tolerance for value comparison.
-        atol: Absolute tolerance for value comparison.
-
-    Returns:
-        True if all verifications pass, False otherwise.
-    """
+    """Comprehensive HF checkpoint verification (structure + weights)."""
     logger.info("=" * 80)
     logger.info("Starting HuggingFace checkpoint verification")
     logger.info("=" * 80)
@@ -382,8 +311,8 @@ def verify_hf_checkpoint(
         logger.error("Structure verification failed!")
         return False
 
-    # Verify weights
-    if not verify_hf_checkpoint_weights(hf_checkpoint_dir, original_state_dict, safe_serialization, rtol, atol):
+    # Verify weights (exact match, rtol/atol not used when both are bf16)
+    if not verify_hf_checkpoint_weights(hf_checkpoint_dir, original_state_dict, safe_serialization):
         logger.error("Weight verification failed!")
         return False
 
@@ -397,28 +326,11 @@ def verify_dcp_to_hf_conversion(
     dcp_checkpoint_dir: str,
     hf_checkpoint_dir: str,
     safe_serialization: bool = True,
-    rtol: float = 1e-3,
-    atol: float = 5e-4,
 ) -> bool:
     """
-    Verify DCP to HuggingFace checkpoint conversion by comparing weights.
+    Verify DCP to HF conversion by loading DCP, converting to bf16, and comparing with HF checkpoint.
 
-    This function:
-    1. Loads ALL tensors from DCP checkpoint (different approach than merge_dcp_to_hf.py)
-    2. Filters for model weights and normalizes keys to HF format
-    3. Compares with the converted HuggingFace checkpoint
-
-    This provides independent cross-validation of the conversion script.
-
-    Args:
-        dcp_checkpoint_dir: Directory containing the DCP checkpoint.
-        hf_checkpoint_dir: Directory containing the HF checkpoint.
-        safe_serialization: Whether the HF checkpoint uses safetensors format.
-        rtol: Relative tolerance for value comparison.
-        atol: Absolute tolerance for value comparison.
-
-    Returns:
-        True if verification passes, False otherwise.
+    Uses independent load-all-then-filter approach for cross-validation of merge_dcp_to_hf.py.
     """
     logger.info("=" * 80)
     logger.info("Starting DCP to HuggingFace conversion verification")
@@ -434,11 +346,14 @@ def verify_dcp_to_hf_conversion(
         traceback.print_exc()
         return False
 
-    # Verify the HF checkpoint against DCP state dict
+    # Convert DCP state dict from fp32 to bf16 to match HF checkpoint dtype
+    logger.info("Converting DCP weights from fp32 to bf16 for exact comparison...")
+    dcp_state_dict_bf16 = {key: tensor.to(torch.bfloat16) for key, tensor in dcp_state_dict.items()}
+    logger.info(f"✓ Converted {len(dcp_state_dict_bf16)} tensors to bf16")
+
+    # Verify the HF checkpoint against DCP state dict (bf16 vs bf16, exact match)
     return verify_hf_checkpoint(
         hf_checkpoint_dir=hf_checkpoint_dir,
-        original_state_dict=dcp_state_dict,
+        original_state_dict=dcp_state_dict_bf16,
         safe_serialization=safe_serialization,
-        rtol=rtol,
-        atol=atol,
     )

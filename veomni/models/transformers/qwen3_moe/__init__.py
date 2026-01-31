@@ -14,20 +14,17 @@
 from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
-@MODEL_CONFIG_REGISTRY.register("qwen3_moe")
-def register_qwen3_moe_config():
-    from .configuration_qwen3_moe import Qwen3MoeConfig
-
-    return Qwen3MoeConfig
-
-
 @MODELING_REGISTRY.register("qwen3_moe")
 def register_qwen3_moe_modeling(architecture: str):
-    from .modeling_qwen3_moe import (
+    from transformers import (
         Qwen3MoeForCausalLM,
         Qwen3MoeForQuestionAnswering,
         Qwen3MoeModel,
     )
+
+    from .modeling_qwen3_moe import apply_veomni_qwen3_moe_patch
+
+    apply_veomni_qwen3_moe_patch()
 
     if "ForCausalLM" in architecture:
         return Qwen3MoeForCausalLM

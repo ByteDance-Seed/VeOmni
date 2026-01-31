@@ -17,10 +17,10 @@
 import torch
 import torch.nn.functional as F
 import torch_npu
+import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 
 from ....ops.group_gemm.kernel.npu_group_gemm import GmmFunction
 from ....ops.npu_patch import npu_fused_operator
-from . import modeling_qwen3_moe
 
 
 def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -59,8 +59,8 @@ def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) ->
     return final_hidden_states, router_logits
 
 
-def apply_qwen3moe_npu_patch():
+def apply_qwen3_moe_npu_patch():
     # Patches for Qwen3 MoE Model
-    modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
-    modeling_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = qwen3_moe_sparse_moe_block_forward_npu
-    modeling_qwen3_moe.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu
+    hf_qwen3_moe.Qwen3MoeRMSNorm.forward = npu_fused_operator.rms_norm_forward_npu
+    # hf_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = qwen3_moe_sparse_moe_block_forward_npu
+    hf_qwen3_moe.apply_rotary_pos_emb = npu_fused_operator.apply_rotary_pos_emb_npu

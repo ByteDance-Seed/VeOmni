@@ -14,7 +14,7 @@
 
 # Patch https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py
 
-
+import copy
 from collections.abc import Callable
 from functools import lru_cache, partial
 from types import SimpleNamespace
@@ -52,6 +52,7 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
+from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -863,6 +864,7 @@ class Qwen3VLModel(_Qwen3VLModel):
 # Patch: Qwen3VLForConditionalGeneration
 # 1. wrapped Qwen3VLModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 # 2. use the unified loss function to handle Ulysses internally to reduce redudnecy code
+# 3. overwrite token ids with veomni constants
 # ================================================================
 
 
@@ -879,7 +881,12 @@ def get_position_id(main_func, self, **kwargs):
 class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
     # --- Patch.1 ---
     def get_position_id_func(self):
-        fake_model = SimpleNamespace(config=self.config)
+        fake_config = copy.copy(self.config)
+        # --- Patch.3 ---
+        fake_config.image_token_id = IMAGE_INPUT_INDEX
+        fake_config.video_token_id = VIDEO_INPUT_INDEX
+        # --- Patch.3 ---
+        fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)
 
     # --- Patch.1 ---
