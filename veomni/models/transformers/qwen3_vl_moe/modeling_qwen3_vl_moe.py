@@ -59,6 +59,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....ops import fused_moe_forward
 from ....utils import logging
+from ....utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from ....utils.device import is_torch_npu_available
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -404,6 +405,14 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
         # --- Patch.1 ---
         super().__init__(config)
 
+        if config.encoder_data_balance:
+            self.encoder_data_balance = Qwen3VLEncoderDataBalance(
+                sorting_algo_name=config.encoder_data_balance_sorting_algo,
+                spatial_merge_unit=self.visual.spatial_merge_unit
+            )
+        else:
+            self.encoder_data_balance = None
+
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
@@ -415,7 +424,13 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
+        if self.encoder_data_balance is not None:
+            # balance encoder's data
+            pixel_values, image_grid_thw = self.encoder_data_balance.balance_data(pixel_values, image_grid_thw)
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if self.encoder_data_balance is not None:
+            # recover the data distribution to fit subsequent process
+            image_embeds, deepstack_image_embeds = self.encoder_data_balance.data_bridge(image_embeds, deepstack_image_embeds)
         # --- Patch.2 ---
         # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         # image_embeds = torch.split(image_embeds, split_sizes)

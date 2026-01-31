@@ -11,6 +11,8 @@
 | model.input_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the input image | encoder |
 | model.output_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the output image | decoder |
 | model.encode_target | bool | Whether to encode the training data for the diffusion model | False |
+| model.encoder_data_balance | bool | Whether to balance encoder data (currently supported only for the Qwen3-VL MoE model) | False |
+| model.encoder_data_balance_sorting_algo | str | The sorting algorithm of encoder data balance | post_mbs_balancing_greedy_without_pad |
 
 ## Data configuration arguments
 
