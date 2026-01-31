@@ -103,14 +103,18 @@ def parallelize_model_fsdp1(
     )
     parallel_state = get_parallel_state()
 
-    if parallel_state.ep_enabled:
+    if parallel_state.ep_enabled or parallel_state.emb_enabled:
         parallel_plan = model.get_parallel_plan()
-        fqn2spec_info = parallel_plan.apply(model, parallel_state.ep_fsdp_device_mesh)
+        fqn2spec_info = parallel_plan.apply(
+            model, parallel_state.ep_fsdp_device_mesh, parallel_state.emb_fsdp_device_mesh
+        )
 
         fsdp_no_shard_states_fqn_to_module = parallel_plan.get_fsdp_no_shard_info(model)
         fsdp_no_shard_states = list(fsdp_no_shard_states_fqn_to_module.values())
         fsdp_no_shard_states_fqn = list(fsdp_no_shard_states_fqn_to_module.keys())
-        logger.info_rank0(f"Apply expert parallel to the model successfully.\nEP modules: {fsdp_no_shard_states_fqn}.")
+        logger.info_rank0(
+            f"Apply expert parallel or embed parallel to the model successfully.\nEP/Emb modules: {fsdp_no_shard_states_fqn}."
+        )
     else:
         fqn2spec_info = None
         fsdp_no_shard_states = None
@@ -183,12 +187,19 @@ def parallelize_model_fsdp1(
 
     if fsdp_no_shard_states is not None:
         # apply NO_SHARD the ignored_states, but wrap into DDP
-        if parallel_state.ep_fsdp_mesh["ep_fsdp"].size() == 1:
+        if parallel_state.ep_fsdp_device_mesh is None or parallel_state.ep_fsdp_mesh["ep_fsdp"].size() == 1:
             moe_sharding_strategy = ShardingStrategy.NO_SHARD
             ep_fsdp_device_mesh = parallel_state.fsdp_mesh
         else:
             moe_sharding_strategy = ShardingStrategy.FULL_SHARD
             ep_fsdp_device_mesh = parallel_state.ep_fsdp_mesh["ep_fsdp"]
+
+        if parallel_state.emb_fsdp_device_mesh is None or parallel_state.emb_fsdp_mesh["emb_fsdp"].size() == 1:
+            emb_fsdp_device_mesh_sharding_strategy = ShardingStrategy.NO_SHARD
+            emb_fsdp_device_mesh = parallel_state.fsdp_mesh
+        else:
+            emb_fsdp_device_mesh_sharding_strategy = ShardingStrategy.FULL_SHARD
+            emb_fsdp_device_mesh = parallel_state.emb_fsdp_mesh["emb_fsdp"]
 
         logger.info_rank0(f"Apply {moe_sharding_strategy} states on '{fsdp_no_shard_states_fqn}'.")
         fsdp_kwargs.pop("ignored_states", None)
@@ -196,8 +207,14 @@ def parallelize_model_fsdp1(
         fsdp_kwargs["sharding_strategy"] = moe_sharding_strategy
         fsdp_kwargs["device_mesh"] = ep_fsdp_device_mesh
         logger.info_rank0(f"{ep_fsdp_device_mesh=}")
-        for fqn in fsdp_no_shard_states_fqn:
+        for fqn in fsdp_no_shard_states_fqn:  # [experts, ]
             no_shard_module = get_module_from_path(model, fqn)
+            if "experts" not in fqn:
+                fsdp_kwargs["sharding_strategy"] = emb_fsdp_device_mesh_sharding_strategy
+                fsdp_kwargs["device_mesh"] = emb_fsdp_device_mesh
+            else:
+                fsdp_kwargs["sharding_strategy"] = moe_sharding_strategy
+                fsdp_kwargs["device_mesh"] = ep_fsdp_device_mesh
             if kwargs.get("init_device") == "meta":
                 key_prefix = fqn + "."
                 ep_shard_states = {
@@ -214,9 +231,11 @@ def parallelize_model_fsdp1(
             set_module_from_path(model, fqn, fsdp_module)
 
     _lazy_init(model, model)
-
+    save_hook_mesh = []
     # Apply fsdp extension to FSDP model
-    save_hook_mesh = parallel_state.ep_fsdp_device_mesh if parallel_state.ep_enabled else None
+    save_hook_mesh.append(parallel_state.ep_fsdp_device_mesh if parallel_state.ep_enabled else None)
+    save_hook_mesh.append(parallel_state.emb_fsdp_device_mesh if parallel_state.emb_enabled else None)
+
     logger.info_rank0("Register Checkpoints Extension hook to the model")
     register_checkpoint_extension(
         fsdp_model=model,
@@ -224,7 +243,7 @@ def parallelize_model_fsdp1(
         fqn2spec_info=fqn2spec_info,
     )
 
-    if parallel_state.ep_enabled:
+    if parallel_state.ep_enabled or parallel_state.emb_enabled:
         model.clip_grad_norm_ = types.MethodType(clip_grad_norm_, model)
 
     verbose_fsdp_grouping(model)
@@ -262,44 +281,69 @@ def parallelize_model_fsdp2(
     logger.info_rank0(f"target classes to shard: {target_classes}")
 
     # Step 1: Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
-    if parallel_state.ep_enabled:
+    if parallel_state.ep_enabled or parallel_state.emb_enabled:
         parallel_plan = model.get_parallel_plan()
         assert parallel_plan is not None, (
             "Expert parallelism needs parallel plan defined in the model! Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example."
         )
-        ep_fqn2spec_info = parallel_plan.apply(model, parallel_state.ep_fsdp_device_mesh)
+        fqn2spec_info = parallel_plan.apply(
+            model, parallel_state.ep_fsdp_device_mesh, parallel_state.emb_fsdp_device_mesh
+        )
         # Attach spec mapping for checkpoint load-time reconstruction
-        setattr(model, "_fqn2spec_info", ep_fqn2spec_info)
+        setattr(model, "_fqn2spec_info", fqn2spec_info)
         # ep_mesh does not really exist in EP parameters' device mesh.
         # EP parameters are loaded as local tensors to be later sharded by fully_shard
-        ep_mesh = parallel_state.ep_fsdp_device_mesh["ep"]
-        # experts_map is a dict {experts_fqn: experts_mod}
+        if parallel_state.ep_enabled:
+            ep_mesh = parallel_state.ep_fsdp_device_mesh["ep"]
+            ep_map = parallel_plan.get_ep_fsdp_no_shard_info(model)
+        else:
+            ep_mesh = None
+            ep_map = None
+
+        if parallel_state.emb_enabled:
+            emb_mesh = parallel_state.emb_fsdp_device_mesh["emb"]
+            emb_map = parallel_plan.get_emb_fsdp_no_shard_info(model)
+        else:
+            emb_mesh = None
+            emb_map = None
+
+        # experts_embeds_map is a dict {experts_fqn: experts_mod}
         # For example, Qwen3MoE keys: model.layers.N.mlp.experts
-        experts_map = parallel_plan.get_fsdp_no_shard_info(model)
+        # experts_embeds_map = parallel_plan.get_fsdp_no_shard_info(model)
 
         logger.info_rank0(f"Applied EP: expert tensors sliced along expert dimension (EP mesh: {ep_mesh})")
-        logger.info_rank0(f"Experts Map: {experts_map}")
+        logger.info_rank0(f"Applied Emb: embed tensors sliced along embed dimension (Emb mesh: {emb_mesh})")
+        logger.info_rank0(f"Experts Map: {ep_map}")
+        logger.info_rank0(f"Embeds Map: {emb_map}")
+
     else:
-        ep_fqn2spec_info = None
+        fqn2spec_info = None
         ep_mesh = None
-        experts_map = None
+        emb_mesh = None
+        ep_map = None
+        emb_map = None
 
     # Extract experts module from the layer if any, then pair them
-    layer_pairs = []
+    ep_emb_layer_pairs = []
     for layer_fqn, layer_mod in decoder_blocks:
-        if experts_map is not None:
+        ep_mod = None
+        emb_mod = None
+        if ep_map is not None:
             # extract experts module from the layer
-            experts_mod = next(
-                (exp_mod for exp_fqn, exp_mod in experts_map.items() if exp_fqn.startswith(layer_fqn + ".")),
+            ep_mod = next(
+                (exp_mod for exp_fqn, exp_mod in ep_map.items() if exp_fqn.startswith(layer_fqn + ".")),
                 None,
             )
-            layer_pairs.append((layer_fqn, layer_mod, experts_mod))
-        else:
-            # No experts module found in this layer
-            # this is often the case for models like deepseek in which some decoder layers are dense instead of MoE
-            layer_pairs.append((layer_fqn, layer_mod, None))
+        if emb_map is not None:
+            # extract embed module from the layer
+            emb_mod = next(
+                (embed_mod for embed_fqn, embed_mod in emb_map.items() if embed_fqn.startswith(layer_fqn + ".")),
+                None,
+            )
 
-    logger.info_rank0(f"layer pairs: {layer_pairs}")
+        ep_emb_layer_pairs.append((layer_fqn, layer_mod, ep_mod, emb_mod))
+
+    logger.info_rank0(f"ep/emb layer pairs: {ep_emb_layer_pairs}")
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
@@ -308,6 +352,7 @@ def parallelize_model_fsdp2(
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
+            cast_forward_inputs=False,
         )
         fsdp_kwargs["mp_policy"] = mp_policy
 
@@ -343,6 +388,18 @@ def parallelize_model_fsdp2(
 
         expert_fsdp_kwargs["shard_placement_fn"] = _experts_shard_placement_fn
 
+    # prepare emb_fsdp2 kwargs
+    if parallel_state.emb_enabled:
+        # Use the ep_fsdp dimension as DP mesh for experts (shards orthogonal to EP)
+        emb_fsdp_mesh = parallel_state.emb_fsdp_device_mesh["emb_fsdp"]
+        emb_fsdp_kwargs = dict(fsdp_kwargs)
+        emb_fsdp_kwargs["mesh"] = emb_fsdp_mesh
+
+        def _embeds_shard_placement_fn(param):
+            return Shard(1)
+
+        emb_fsdp_kwargs["shard_placement_fn"] = _embeds_shard_placement_fn
+
     # Here we have a basic assumption for the decoder layer hierarchy
     # Decoder Layer
     # | -- layers that are sharded by fully_shard(decode_layer) (e.g., Attention)
@@ -352,17 +409,18 @@ def parallelize_model_fsdp2(
     # NPU currently does not support the PreSumMul operation, so this operation is supported through the apply_hccl_premul_sum_patch.
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
-    if IS_NPU_AVAILABLE and parallel_state.ep_enabled:
+    if IS_NPU_AVAILABLE and (parallel_state.ep_enabled or parallel_state.emb_enabled):
         from veomni.ops.npu_patch.hccl_premul_sum import apply_hccl_premul_sum_patch
 
         apply_hccl_premul_sum_patch()
-    for layer_fqn, layer_mod, experts_mod in layer_pairs:
+
+    for layer_fqn, layer_mod, ep_mod, emb_mod in ep_emb_layer_pairs:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
         # ep enabled and this layer contains the expert module
-        if parallel_state.ep_enabled and experts_mod is not None:
+        if parallel_state.ep_enabled and ep_mod is not None:
             # shard expert
-            fully_shard(experts_mod, **expert_fsdp_kwargs)
+            fully_shard(ep_mod, **expert_fsdp_kwargs)
             # average EP grads across EP ranks
             # NOTE: in torch 2.8 and later we should use
             # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -371,11 +429,25 @@ def parallelize_model_fsdp2(
             logger.info(f"setting grad divide factor for ep module to {gradient_divide_factor}")
             if IS_NPU_AVAILABLE:
                 # NPU is using torch 2.7
-                experts_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
+                ep_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
             else:
                 # from torch 2.8
-                experts_mod.set_gradient_divide_factor(gradient_divide_factor)
-            layer_mod._fsdp_modules.append(experts_mod)
+                ep_mod.set_gradient_divide_factor(gradient_divide_factor)
+            layer_mod._fsdp_modules.append(ep_mod)
+
+        if parallel_state.emb_enabled and emb_mod is not None:
+            # shard expert
+            fully_shard(emb_mod, **emb_fsdp_kwargs)
+            gradient_divide_factor = parallel_state.emb_gradient_divide_factor
+            logger.info(f"setting grad divide factor for emb module to {gradient_divide_factor}")
+            if IS_NPU_AVAILABLE:
+                # NPU is using torch 2.7
+                emb_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
+            else:
+                # from torch 2.8
+                emb_mod.set_gradient_divide_factor(gradient_divide_factor)
+            layer_mod._fsdp_modules.append(emb_mod)
+
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
@@ -387,13 +459,14 @@ def parallelize_model_fsdp2(
         fully_shard(layer_mod, **fsdp_kwargs)
         layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
+
     # shard root model
     fully_shard(model, **fsdp_kwargs)
 
     # configure manual prefetching when needed
-    need_manual_prefetch = parallel_state.ep_enabled or mp_ignored_classes is not None
+    need_manual_prefetch = parallel_state.ep_enabled or parallel_state.emb_enabled or mp_ignored_classes is not None
     if need_manual_prefetch:
-        blocks = [pair[1] for pair in layer_pairs]
+        blocks = [pair[1] for pair in ep_emb_layer_pairs]
         next_blocks = blocks[1:] + [None]
         for current_block, next_block in zip(blocks, next_blocks):
             if next_block is not None:
