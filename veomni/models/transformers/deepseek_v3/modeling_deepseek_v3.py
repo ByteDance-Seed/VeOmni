@@ -2,7 +2,6 @@ from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
 import transformers.models.deepseek_v3.modeling_deepseek_v3 as hf_deepseek_v3
 from torch import nn
 from transformers.activations import ACT2FN
