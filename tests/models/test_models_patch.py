@@ -61,6 +61,13 @@ test_cases = [
         _DEFAULT_ATOL,
         id="qwen3_moe",
     ),
+    pytest.param(
+        "./tests/models/toy_config/deepseek_v3_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v3",
+    ),
 ]
 
 

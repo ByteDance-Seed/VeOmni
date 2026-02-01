@@ -53,7 +53,7 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     """
     Builds the model config.
     """
-    return get_model_config(config_path, trust_remote_code=True, **config_kwargs)
+    return get_model_config(config_path, **config_kwargs)
 
 
 def build_foundation_model(
