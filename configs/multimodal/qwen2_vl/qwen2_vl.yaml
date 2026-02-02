@@ -2,12 +2,14 @@ model:
   model_path: Qwen/Qwen2-VL-7B-Instruct
 
 data:
-  train_path: sharegpt4v_pretrain
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
   chat_template: qwen2vl
   max_seq_len: 2048
   train_size: 80000000
-  source_name: sharegpt4v_pretrain
-  mm_config:
+  mm_configs:
+    image_max_pixels: 602112 # 28 * 28 * 768
+    video_max_pixels: 602112 # 28 * 28 * 768
+    max_frames: 16
     fps: 2.0
     use_audio_in_video: false
 

@@ -47,12 +47,6 @@ if TYPE_CHECKING:
 
 logger = helper.create_logger(__name__)
 
-MAX_PIXELS = 768 * 28 * 28
-ROLE_MAPPING = {
-    "human": "user",
-    "gpt": "assistant",
-}
-
 
 def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
     vit_params, other_params = [], []
@@ -134,7 +128,6 @@ def main():
 
     logger.info_rank0("Prepare data")
     processor = build_processor(args.model.tokenizer_path)
-    processor.image_processor.max_pixels = MAX_PIXELS
     position_id_func = model.get_position_id_func()
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
@@ -187,7 +180,6 @@ def main():
         seed=args.train.seed,
         **asdict(args.data),
     )
-
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size

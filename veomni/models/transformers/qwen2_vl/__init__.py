@@ -25,7 +25,9 @@ def register_qwen2_vl_model_config():
 
 @MODELING_REGISTRY.register("qwen2_vl")
 def register_qwen2_vl_modeling(architecture: str):
-    from .modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel
+    from .modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel, apply_veomni_qwen2vl_patch
+
+    apply_veomni_qwen2vl_patch()
 
     if "ForConditionalGeneration" in architecture:
         return Qwen2VLForConditionalGeneration
