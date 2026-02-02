@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -7,11 +7,19 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MLP
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+    DeepseekV3Attention,
+    DeepseekV3MLP,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_interleave,
+    eager_attention_forward,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
@@ -181,6 +189,92 @@ logger = logging.get_logger(__name__)
 
 
 # ================================================================
+# PATCH: DeepseekV3Attention.forward
+# 1. Support for veomni attention implementation
+# ================================================================
+def deepseek_v3_attention_forward(
+    self: DeepseekV3Attention,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_values: Optional[Cache] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    batch_size, seq_length = hidden_states.shape[:-1]
+    query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
+    key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
+
+    if self.q_lora_rank is None:
+        q_states = self.q_proj(hidden_states)
+    else:
+        q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    q_states = q_states.view(query_shape).transpose(1, 2)
+    q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+    k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+    k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
+    k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+    k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
+
+    cos, sin = position_embeddings
+    if self.config.rope_interleave:  # support using interleaved weights for efficiency
+        q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
+    else:
+        q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+    k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+
+    query_states = torch.cat((q_pass, q_rot), dim=-1)
+    key_states = torch.cat((k_pass, k_rot), dim=-1)
+
+    if past_key_values is not None:
+        # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+    # --- Patch.1 ---
+    # Flash Attention requires Q/K and V to have the same head dimension on non-Hopper GPUs.
+    # For DeepSeek V3 MLA architecture where qk_head_dim != v_head_dim, we pad V to match Q/K.
+    _FA_IMPLS_NEED_PADDING = [
+        "flash_attention_2",
+        "flash_attention_3",
+        "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_3_with_sp",
+    ]
+    if self.config._attn_implementation in _FA_IMPLS_NEED_PADDING and self.qk_head_dim != self.v_head_dim:
+        value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
+    # --- Patch.1 ---
+
+    attention_interface: Callable = eager_attention_forward
+    if self.config._attn_implementation != "eager":
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    # --- Patch.1 ---
+    # Truncate the output back to the original v_head_dim after Flash Attention.
+    if self.config._attn_implementation in _FA_IMPLS_NEED_PADDING and self.qk_head_dim != self.v_head_dim:
+        attn_output = attn_output[:, :, :, : self.v_head_dim]
+    # --- Patch.1 ---
+
+    attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
+# ================================================================
 # PATCH: DeepseekV3Model.forward
 # 1. Support SP
 # ================================================================
@@ -330,6 +424,7 @@ def apply_veomni_deepseek_v3_patch():
 
     hf_deepseek_v3.DeepseekV3ForCausalLM.get_parallel_plan = lambda self: get_parallel_plan()
 
+    hf_deepseek_v3.DeepseekV3Attention.forward = deepseek_v3_attention_forward
     hf_deepseek_v3.DeepseekV3Model.forward = deepseek_v3_model_forward
     hf_deepseek_v3.DeepseekV3ForCausalLM.forward = deepseek_v3_forcausal_lm_forward
 

@@ -134,6 +134,11 @@ def test_models_patch_fwd_bwd(
 
         return result_metrics
 
+    # delete flash_attention_3 mode for hf deepseek_v3.
+    # TODO: transformers v5 fixed this, remove this after veomni support transformers v5.
+    if case_id == "deepseek_v3":
+        hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
+
     # Train HF backend models
     for idx, mode in enumerate(hf_model_modes):
         res[mode] = run_step(idx, mode)
