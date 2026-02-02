@@ -85,7 +85,7 @@ def test_encoder_balance():
         "--node-rank=0",
         "--master_addr=localhost",
         "--master_port=12345",
-        "tests/encoder_data_balance/test_balance_reverse.py",
+        "tests/parallel/encoder_data_balance/test_balance_reverse.py",
     ]
 
     try:
