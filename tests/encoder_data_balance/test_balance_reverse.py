@@ -6,9 +6,9 @@ import sys
 import torch
 import torch.distributed as dist
 
-from veomni.distributed.parallel_state import init_parallel_state, get_parallel_state
+from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
-from veomni.utils.device import get_dist_comm_backend, get_device_type, get_torch_device
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 def construct_data():
@@ -26,20 +26,21 @@ def construct_data():
 def check_recover_precision(pixel_values, image_grid_thw):
     """check the persision of recover balance"""
     if torch.distributed.get_rank() == 0:
-        print(f"check the persision of recover balance")
+        print("check the persision of recover balance")
     # initialize Qwen3VLEncoderDataBalance
     databalance = Qwen3VLEncoderDataBalance(spatial_merge_unit=1)
     # balance
     balanced_pixel_values, balanced_image_grid_thw = databalance.balance_data(pixel_values, image_grid_thw)
     # recover
     re_pixel_values, re_deepstack_feat_list = databalance.data_bridge(
-        hidden_state=balanced_pixel_values,
-        deepstack_feature_lists=[balanced_pixel_values, balanced_pixel_values]
+        hidden_state=balanced_pixel_values, deepstack_feature_lists=[balanced_pixel_values, balanced_pixel_values]
     )
 
     # check pixel_values recover percision
-    assert pixel_values.equal(re_pixel_values), (f"pixel_values != re_pixel_values, rank: {torch.distributed.get_rank()}, "
-                                                 f"check failed, in check_balance_performance_and_recover_precision()")
+    assert pixel_values.equal(re_pixel_values), (
+        f"pixel_values != re_pixel_values, rank: {torch.distributed.get_rank()}, "
+        f"check failed, in check_balance_performance_and_recover_precision()"
+    )
     dist.barrier()
     if dist.get_rank() == 0:
         print("pixel_values check pass")
@@ -48,7 +49,8 @@ def check_recover_precision(pixel_values, image_grid_thw):
     for i, ds_feat in enumerate(re_deepstack_feat_list):
         assert pixel_values.equal(ds_feat), (
             f"pixel_values != re_deepstack_feat_list[{i}], rank: {torch.distributed.get_rank()}, "
-            f"check failed, in check_balance_performance_and_recover_precision()")
+            f"check failed, in check_balance_performance_and_recover_precision()"
+        )
     dist.barrier()
     if dist.get_rank() == 0:
         print("deepstack feature check pass")
@@ -83,7 +85,7 @@ def test_encoder_balance():
         "--node-rank=0",
         "--master_addr=localhost",
         "--master_port=12345",
-        "tests/encoder_data_balance/test_balance_reverse.py"
+        "tests/encoder_data_balance/test_balance_reverse.py",
     ]
 
     try:

@@ -4,9 +4,9 @@ import torch
 
 @torch.no_grad()
 def post_mbs_balancing_greedy_without_pad(
-        all_data_lengths: torch.Tensor,
-        num_replicas: int,
-        dim: int,
+    all_data_lengths: torch.Tensor,
+    num_replicas: int,
+    dim: int,
 ) -> list[list[torch.Tensor]]:
     """
     A greedy bin-packing sorting algorithm designed for encoder data balance.
@@ -31,7 +31,7 @@ def post_mbs_balancing_greedy_without_pad(
 
     pre_fill_num = min(num_replicas, len(all_data_lengths))
     dp_group_total_length = torch.empty(num_replicas, dtype=torch.long)
-    dp_group_total_length[: pre_fill_num] = lengths_per_sequence[: pre_fill_num]
+    dp_group_total_length[:pre_fill_num] = lengths_per_sequence[:pre_fill_num]
     balanced_image_dp_batch = [[all_data_lengths[i]] if i < pre_fill_num else [] for i in range(num_replicas)]
 
     for i, sequence_lentgh in enumerate(all_data_lengths[pre_fill_num:]):
@@ -43,5 +43,5 @@ def post_mbs_balancing_greedy_without_pad(
 
 
 SORTING_ALGO_FUNC = {
-    'post_mbs_balancing_greedy_without_pad': post_mbs_balancing_greedy_without_pad,
+    "post_mbs_balancing_greedy_without_pad": post_mbs_balancing_greedy_without_pad,
 }

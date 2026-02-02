@@ -75,7 +75,7 @@ def build_foundation_model(
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
-    encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad"
+    encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -99,7 +99,7 @@ def build_foundation_model(
             logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
 
     if encoder_data_balance:
-        if config.model_type == 'qwen3_vl_moe':
+        if config.model_type == "qwen3_vl_moe":
             config.encoder_data_balance = encoder_data_balance
             config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
         else:

@@ -127,13 +127,14 @@ class ModelArguments:
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
     encoder_data_balance: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to balance encoder data for qwen3-vl model"}
+        default=False, metadata={"help": "Whether to balance encoder data for qwen3-vl model"}
     )
     encoder_data_balance_sorting_algo: Optional[str] = field(
         default="post_mbs_balancing_greedy_without_pad",
-        metadata={"help": "The sorting algorithm of encoder data balance. All viable algorithms are defined in "
-                          "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"}
+        metadata={
+            "help": "The sorting algorithm of encoder data balance. All viable algorithms are defined in "
+            "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"
+        },
     )
 
     def __post_init__(self):

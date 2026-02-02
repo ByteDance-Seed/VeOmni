@@ -1,21 +1,22 @@
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
 
-from veomni.utils import helper
 from veomni.distributed.parallel_state import get_parallel_state
+from veomni.utils import helper
 from veomni.utils.data_balance.balance_sorting_algo import SORTING_ALGO_FUNC
+
 
 logger = helper.create_logger(__name__)
 
 
 class Qwen3VLEncoderDataBalance:
     def __init__(
-            self,
-            spatial_merge_unit,
-            sorting_algo_name="post_mbs_balancing_greedy_without_pad",
+        self,
+        spatial_merge_unit,
+        sorting_algo_name="post_mbs_balancing_greedy_without_pad",
     ):
         """
         A data balance algorithm for Qwen3 VL encoder. The algorithm provides two interface functions:
@@ -37,9 +38,9 @@ class Qwen3VLEncoderDataBalance:
         self.state_buffer[data_type] = {}
         # split pixel value
         split_batch = {}
-        pixel_values_length = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
-        split_batch['pixel_values'] = pixel_values.split(pixel_values_length.tolist(), dim=0)
-        split_batch['image_grid_thw'] = grid_thw
+        pixel_values_length = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
+        split_batch["pixel_values"] = pixel_values.split(pixel_values_length.tolist(), dim=0)
+        split_batch["image_grid_thw"] = grid_thw
 
         # balanced pixel value
         balanced_datas = self.all_to_all_redistribution(
@@ -49,13 +50,15 @@ class Qwen3VLEncoderDataBalance:
         )
 
         # reorganize data to vision encoder input form
-        balanced_grid_thw = torch.cat(balanced_datas['image_grid_thw'])
-        balanced_pixel_values = torch.cat(balanced_datas['pixel_values'])
+        balanced_grid_thw = torch.cat(balanced_datas["image_grid_thw"])
+        balanced_pixel_values = torch.cat(balanced_datas["pixel_values"])
 
         return balanced_pixel_values, balanced_grid_thw
 
-    def data_bridge(self, hidden_state, deepstack_feature_lists, require_grad=True, data_type='image'):
-        recoverd_hidden_state = self.reverse_all_to_all_redistribution(hidden_state, require_grad=require_grad, data_type=data_type)
+    def data_bridge(self, hidden_state, deepstack_feature_lists, require_grad=True, data_type="image"):
+        recoverd_hidden_state = self.reverse_all_to_all_redistribution(
+            hidden_state, require_grad=require_grad, data_type=data_type
+        )
         if deepstack_feature_lists:
             recovered_deepstack_feature_lists = [
                 self.reverse_all_to_all_redistribution(df, require_grad=require_grad, data_type=data_type)
@@ -67,10 +70,10 @@ class Qwen3VLEncoderDataBalance:
         return recoverd_hidden_state, recovered_deepstack_feature_lists
 
     def all_to_all_redistribution(
-            self,
-            data_lengths: torch.Tensor,
-            datas: dict[str, torch.Tensor],
-            data_type='Unknown data',
+        self,
+        data_lengths: torch.Tensor,
+        datas: dict[str, torch.Tensor],
+        data_type="Unknown data",
     ):
         dp_rank = self.dp_group.rank()
         num_replicas = self.dp_group.size()
@@ -82,7 +85,9 @@ class Qwen3VLEncoderDataBalance:
         dist.all_gather(all_gather_bs, cur_bs, group=self.dp_group)
         # Then get all data lengths in each dp rank
         gathered_lengths = [
-            torch.empty((all_gather_bs[i], *data_lengths.shape[1:]), dtype=data_lengths.dtype, device=data_lengths.device)
+            torch.empty(
+                (all_gather_bs[i], *data_lengths.shape[1:]), dtype=data_lengths.dtype, device=data_lengths.device
+            )
             for i in range(num_replicas)
         ]
         dist.all_gather(gathered_lengths, data_lengths, group=self.dp_group)
@@ -92,10 +97,17 @@ class Qwen3VLEncoderDataBalance:
         #     dim 1: the position of sample within the corresponding dp rank
         #     dim 2: sample length
         samples_lengths = [
-            F.pad(torch.cat([
-                torch.arange(len(batch), dtype=batch.dtype, device=batch.device).view(-1, 1),
-                batch.unsqueeze(-1)
-            ], dim=-1), pad=(1, 0), value=i)
+            F.pad(
+                torch.cat(
+                    [
+                        torch.arange(len(batch), dtype=batch.dtype, device=batch.device).view(-1, 1),
+                        batch.unsqueeze(-1),
+                    ],
+                    dim=-1,
+                ),
+                pad=(1, 0),
+                value=i,
+            )
             for i, batch in enumerate(gathered_lengths)
         ]
         samples_lengths = torch.cat(samples_lengths)
@@ -116,20 +128,21 @@ class Qwen3VLEncoderDataBalance:
             # self.state_buffer store the information of shape, split, which will be used in reverse data distribution
             balanced_data_dim = ()
             balanced_data_lengths[:, 1] = data[0].shape[-1]
-            if data_name != 'pixel_values':
+            if data_name != "pixel_values":
                 balanced_data_dim = (*data[0].shape[1:],)
                 balanced_data_lengths[:, 0] = sample_num_per_rank
                 origin_data = torch.cat(reorganized_data)
                 self.state_buffer[data_type][f"{data_name}_origin_split"] = (
-                        origin_data[:, 0] * origin_data[:, 1] * origin_data[:, 2] // self.merge_down_ratio).tolist()
+                    origin_data[:, 0] * origin_data[:, 1] * origin_data[:, 2] // self.merge_down_ratio
+                ).tolist()
             else:
                 balanced_data_lengths[:, 0] = 0
                 balanced_data_lengths[:, 0].index_add_(0, rank_table[dp_rank][:, 0], rank_table[dp_rank][:, 2 + i])
                 self.state_buffer[data_type][f"{data_name}_split"] = (
-                        balanced_data_lengths[:, 0] // self.merge_down_ratio).tolist()
+                    balanced_data_lengths[:, 0] // self.merge_down_ratio
+                ).tolist()
                 self.state_buffer[data_type][f"{data_name}_origin"] = [
-                    (d.shape[0] // self.merge_down_ratio, )
-                    for d in reorganized_data
+                    (d.shape[0] // self.merge_down_ratio,) for d in reorganized_data
                 ]
                 self.state_buffer[data_type][f"{data_name}_data_list"] = torch.cat(data_list)
             # execute all to all communication to redistribute data across dp ranks
@@ -144,22 +157,22 @@ class Qwen3VLEncoderDataBalance:
             list(hidden_state.split(self.state_buffer[data_type]["pixel_values_split"])),
             self.state_buffer[data_type]["pixel_values_origin"],
             (hidden_state.shape[-1],),
-            require_grad=require_grad
+            require_grad=require_grad,
         )
         # Split the concatenated data and restoring the original ordering
         recovered_hidden_state = torch.cat(recovered_hidden_state).split(
-            self.state_buffer[data_type]["image_grid_thw_origin_split"])
+            self.state_buffer[data_type]["image_grid_thw_origin_split"]
+        )
         origin_hidden_state = [None] * len(recovered_hidden_state)
-        for i, idx in enumerate(self.state_buffer[data_type]['pixel_values_data_list']):
+        for i, idx in enumerate(self.state_buffer[data_type]["pixel_values_data_list"]):
             origin_hidden_state[idx] = recovered_hidden_state[i]
 
         return torch.cat(origin_hidden_state)
 
     def all_to_all_communication(self, data, balanced_data_lengths, data_dim, require_grad=False):
         balanced_data_cache = [
-            torch.empty(
-                (*new_length, *data_dim), dtype=data[0].dtype, device=data[0].device
-            ).squeeze(-1) for new_length in balanced_data_lengths
+            torch.empty((*new_length, *data_dim), dtype=data[0].dtype, device=data[0].device).squeeze(-1)
+            for new_length in balanced_data_lengths
         ]
         if require_grad:
             # This API is an official API that supports backward, but incurs a slight additional overhead in execution time
@@ -194,5 +207,7 @@ class Qwen3VLEncoderDataBalance:
         if sorting_algo_name in SORTING_ALGO_FUNC:
             return SORTING_ALGO_FUNC[sorting_algo_name]
         else:
-            raise ValueError(f"encoder data balance sorting algorithm name '{sorting_algo_name}' "
-                             f"does not be implemented, allowed algotighms: {list(SORTING_ALGO_FUNC.keys())}")
+            raise ValueError(
+                f"encoder data balance sorting algorithm name '{sorting_algo_name}' "
+                f"does not be implemented, allowed algotighms: {list(SORTING_ALGO_FUNC.keys())}"
+            )

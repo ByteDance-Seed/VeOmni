@@ -408,7 +408,7 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
         if config.encoder_data_balance:
             self.encoder_data_balance = Qwen3VLEncoderDataBalance(
                 sorting_algo_name=config.encoder_data_balance_sorting_algo,
-                spatial_merge_unit=self.visual.spatial_merge_unit
+                spatial_merge_unit=self.visual.spatial_merge_unit,
             )
         else:
             self.encoder_data_balance = None
@@ -430,7 +430,9 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         if self.encoder_data_balance is not None:
             # recover the data distribution to fit subsequent process
-            image_embeds, deepstack_image_embeds = self.encoder_data_balance.data_bridge(image_embeds, deepstack_image_embeds)
+            image_embeds, deepstack_image_embeds = self.encoder_data_balance.data_bridge(
+                image_embeds, deepstack_image_embeds
+            )
         # --- Patch.2 ---
         # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         # image_embeds = torch.split(image_embeds, split_sizes)
