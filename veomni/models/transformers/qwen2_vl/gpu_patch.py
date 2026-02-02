@@ -20,7 +20,7 @@ def apply_veomni_qwen2vl_gpu_patch():
 
         hf_qwen2_vl.apply_multimodal_rotary_pos_emb = liger_multimodal_rotary_pos_emb
         hf_qwen2_vl.Qwen2RMSNorm = LigerRMSNorm
-        hf_qwen2_vl.Qwen2VLAttention = LigerLayerNorm
+        hf_qwen2_vl.LayerNorm = LigerLayerNorm
         hf_qwen2_vl.Qwen2MLP = LigerSwiGLUMLP
 
         logger.info_rank0("Apply liger kernel to qwen2_vl.")
