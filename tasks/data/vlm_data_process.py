@@ -53,9 +53,9 @@ def process_sample_qwen2_5_vl(
         token_num_inputs["image"] = image_token_num
     if "videos" in sample and sample["videos"]:
         videos, _ = fetch_videos(sample["videos"], **kwargs)
-        video_inputs = processor.image_processor(images=None, videos=videos, return_tensors="pt")
+        video_inputs = processor.video_processor(videos=videos, return_tensors="pt")
         video_grid_thw = video_inputs["video_grid_thw"]
-        merge_length = processor.image_processor.merge_size**2
+        merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["video"] = video_token_num
 

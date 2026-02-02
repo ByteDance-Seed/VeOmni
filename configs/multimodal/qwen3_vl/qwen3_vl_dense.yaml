@@ -3,12 +3,15 @@ model:
   attn_implementation: flash_attention_2
 
 data:
-  train_path: sharegpt4v_pretrain
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
   data_type: conversation
   chat_template: qwen3vl
   max_seq_len: 4096
   train_size: 80000000
-  mm_config:
+  mm_configs:
+    image_max_pixels: 602112 # 28 * 28 * 768
+    video_max_pixels: 602112 # 28 * 28 * 768
+    max_frames: 16
     fps: 2.0
     use_audio_in_video: false
 
