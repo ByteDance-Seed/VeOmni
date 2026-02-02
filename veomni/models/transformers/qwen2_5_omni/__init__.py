@@ -16,7 +16,9 @@ from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_
 
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_omni")
 def register_qwen2_5_omni_config():
-    from .configuration_qwen2_5_omni import Qwen2_5OmniConfig
+    from .configuration_qwen2_5_omni import Qwen2_5OmniConfig, apply_veomni_qwen25_omni_patch
+
+    apply_veomni_qwen25_omni_patch()
 
     return Qwen2_5OmniConfig
 
@@ -25,36 +27,22 @@ def register_qwen2_5_omni_config():
 def register_qwen2_5_omni_modeling(architecture: str):
     from .modeling_qwen2_5_omni import (
         Qwen2_5OmniForConditionalGeneration,
-        Qwen2_5OmniTalkerForConditionalGeneration,
-        Qwen2_5OmniTalkerModel,
         Qwen2_5OmniThinkerForConditionalGeneration,
-        Qwen2_5OmniThinkerTextModel,
-        Qwen2_5OmniToken2WavBigVGANModel,
-        Qwen2_5OmniToken2WavDiTModel,
-        Qwen2_5OmniToken2WavModel,
+        apply_veomni_qwen25omni_patch,
     )
 
+    apply_veomni_qwen25omni_patch()
     if "ForConditionalGeneration" in architecture:
         return Qwen2_5OmniForConditionalGeneration
-    if "ThinkerTextModel" in architecture:
-        return Qwen2_5OmniThinkerTextModel
     if "ThinkerForConditionalGeneration" in architecture:
         return Qwen2_5OmniThinkerForConditionalGeneration
-    if "TalkerModel" in architecture:
-        return Qwen2_5OmniTalkerModel
-    if "TalkerForConditionalGeneration" in architecture:
-        return Qwen2_5OmniTalkerForConditionalGeneration
-    if "Token2WavDiTModel" in architecture:
-        return Qwen2_5OmniToken2WavDiTModel
-    if "Token2WavBigVGANModel" in architecture:
-        return Qwen2_5OmniToken2WavBigVGANModel
-    if "Token2WavModel" in architecture:
-        return Qwen2_5OmniToken2WavModel
     return Qwen2_5OmniForConditionalGeneration
 
 
 @MODEL_PROCESSOR_REGISTRY.register("Qwen2_5OmniProcessor")
 def register_qwen2_5_omni_processor():
-    from .processing_qwen2_5_omni import Qwen2_5OmniProcessor
+    from .processing_qwen2_5_omni import Qwen2_5OmniProcessor, apply_veomni_qwen25_omni_patch
+
+    apply_veomni_qwen25_omni_patch()
 
     return Qwen2_5OmniProcessor
