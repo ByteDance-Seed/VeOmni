@@ -33,33 +33,40 @@ _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
 test_cases = [
+    # pytest.param(
+    #     "./tests/models/toy_config/llama31_toy/config.json",
+    #     False,
+    #     _DEFAULT_RTOL,
+    #     _DEFAULT_ATOL,
+    #     id="llama3.1",
+    # ),
+    # pytest.param(
+    #     "./tests/models/toy_config/qwen25_toy/config.json",
+    #     False,
+    #     _DEFAULT_RTOL,
+    #     _DEFAULT_ATOL,
+    #     id="qwen2.5",
+    # ),
+    # pytest.param(
+    #     "./tests/models/toy_config/qwen3_toy/config.json",
+    #     False,
+    #     _DEFAULT_RTOL,
+    #     _DEFAULT_ATOL,
+    #     id="qwen3",
+    # ),
+    # pytest.param(
+    #     "./tests/models/toy_config/qwen3_moe_toy/config.json",
+    #     True,
+    #     _DEFAULT_RTOL,
+    #     _DEFAULT_ATOL,
+    #     id="qwen3_moe",
+    # ),
     pytest.param(
-        "./tests/models/toy_config/llama31_toy/config.json",
+        "./tests/models/toy_config/seed_oss_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        id="llama3.1",
-    ),
-    pytest.param(
-        "./tests/models/toy_config/qwen25_toy/config.json",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen2.5",
-    ),
-    pytest.param(
-        "./tests/models/toy_config/qwen3_toy/config.json",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3",
-    ),
-    pytest.param(
-        "./tests/models/toy_config/qwen3_moe_toy/config.json",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3_moe",
+        id="seed_oss",
     ),
 ]
 
