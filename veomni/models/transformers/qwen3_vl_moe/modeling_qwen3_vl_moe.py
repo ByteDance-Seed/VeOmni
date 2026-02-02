@@ -14,7 +14,7 @@
 
 # Patch https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl_moe/modeling_qwen3_vl_moe.py
 
-
+import copy
 from collections.abc import Callable
 from functools import partial
 from types import SimpleNamespace
@@ -49,6 +49,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling
 from transformers.utils.generic import check_model_inputs
 
+from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -59,6 +60,7 @@ from ....distributed.sequence_parallel import (
 from ....ops import fused_moe_forward
 from ....utils import logging
 from ....utils.device import is_torch_npu_available
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 logger = logging.get_logger(__name__)
@@ -193,7 +195,7 @@ def Qwen3VLMoeVisionAttention_forward(
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
     # --- Patch.1 ---
-    if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
+    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
         # --- Patch.1 ---
         # Flash Attention 2: Use cu_seqlens for variable length attention
         # --- Patch.2 ---
@@ -714,6 +716,7 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
 # Patch: Qwen3VLMoeForConditionalGeneration
 # 1. wrapped Qwen3VLMoeModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 # 2. use the unified loss function to handle Ulysses internally to reduce redudnecy code
+# 3. overwrite token ids with veomni constants
 # ================================================================
 
 
@@ -730,7 +733,12 @@ def get_position_id(main_func, self, **kwargs):
 class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
     # --- Patch.1 ---
     def get_position_id_func(self):
-        fake_model = SimpleNamespace(config=self.config)
+        fake_config = copy.copy(self.config)
+        # --- Patch.3 ---
+        fake_config.image_token_id = IMAGE_INPUT_INDEX
+        fake_config.video_token_id = VIDEO_INPUT_INDEX
+        # --- Patch.3 ---
+        fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
 
     # --- Patch.1 ---

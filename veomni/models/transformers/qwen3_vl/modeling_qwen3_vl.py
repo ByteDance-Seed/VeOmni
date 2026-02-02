@@ -14,12 +14,13 @@
 
 # Patch https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py
 
-
+import copy
 from collections.abc import Callable
-from functools import partial
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Optional, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -51,6 +52,7 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
+from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -65,6 +67,7 @@ from ....distributed.sequence_parallel.async_ulysses import (
 )
 from ....utils import logging
 from ....utils.device import IS_NPU_AVAILABLE
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 logger = logging.get_logger(__name__)
@@ -99,7 +102,7 @@ def Qwen3VLVisionAttention_forward(
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
     # --- Patch.1 ---
-    if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
+    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
         # --- Patch.1 ---
         # --- Patch.2 ---
         # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -161,11 +164,11 @@ class Qwen3VLTextAttention(_Qwen3VLTextAttention):
         """
         Forward pass for asynchronous Ulysses attention implementation.
         """
-        if self.config._attn_implementation != "flash_attention_2":
+        if self.config._attn_implementation not in VARLEN_ATTENTION_TYPES:
             raise ValueError(
-                f"Async Ulysses attention only supports 'flash_attention_2' implementation. "
+                "Async Ulysses attention only supports flash attention implementations. "
                 f"Current implementation: '{self.config._attn_implementation}'. "
-                f"Please set attn_implementation = 'flash_attention_2' or disable async Ulysses."
+                "Please set attn_implementation to a flash attention variant or disable async Ulysses."
             )
 
         unpadded_seq_len = hidden_states.size(1)
@@ -253,6 +256,139 @@ class Qwen3VLTextAttention(_Qwen3VLTextAttention):
                 cache_position=cache_position,
                 **kwargs,
             )
+
+
+# ================================================================
+# Patch: Qwen3VLVisionModel.rot_pos_emb
+# 1. use rot_pos_ids to get pos_ids, and use lru_cache to cache the result
+# ================================================================
+# --- Patch.1 ---
+# Copied and adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L431
+@lru_cache(maxsize=1024)
+def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+    if isinstance(h, torch.Tensor):
+        h = int(h.item())
+    if isinstance(w, torch.Tensor):
+        w = int(w.item())
+    if isinstance(spatial_merge_size, torch.Tensor):
+        spatial_merge_size = int(spatial_merge_size.item())
+    hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+    h_div = h // spatial_merge_size
+    w_div = w // spatial_merge_size
+    hpos_ids = hpos_ids.reshape(
+        h_div,
+        spatial_merge_size,
+        w_div,
+        spatial_merge_size,
+    )
+    hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
+    hpos_ids = hpos_ids.flatten()
+
+    wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+    wpos_ids = wpos_ids.reshape(
+        h_div,
+        spatial_merge_size,
+        w_div,
+        spatial_merge_size,
+    )
+    wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
+    wpos_ids = wpos_ids.flatten()
+
+    return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+
+def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    merge_size = self.spatial_merge_size
+
+    max_hw = int(grid_thw[:, 1:].max().item())
+    freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+    device = freq_table.device
+
+    total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
+    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+    offset = 0
+    for num_frames, height, width in grid_thw:
+        coords = rot_pos_ids(height, width, merge_size).to(device)
+
+        if num_frames > 1:
+            coords = coords.repeat(num_frames, 1)
+
+        num_tokens = coords.shape[0]
+        pos_ids[offset : offset + num_tokens] = coords
+        offset += num_tokens
+
+    embeddings = freq_table[pos_ids]  # lookup rotary embeddings
+    embeddings = embeddings.flatten(1)
+    return embeddings
+
+
+# --- Patch.1 ---
+
+
+# ================================================================
+# Patch: Qwen3VLVisionModel.fast_pos_embed_interpolate
+# 1. an efficient implementation of the fast_pos_embed_interpolate function
+# ================================================================
+# --- Patch.1 ---
+# Copied and adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L474
+def fast_pos_embed_interpolate(self, grid_thw):
+    num_grid_per_side = self.num_grid_per_side
+    m_size = self.spatial_merge_size
+    hidden_dim = self.pos_embed.embedding_dim
+
+    outputs = []
+    dtype = self.pos_embed.weight.dtype
+    for t, h, w in grid_thw:
+        h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
+        w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
+
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        # Create meshgrid view for all h, w vars
+        dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+        h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+        h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+        # original computation of weights
+        # w00 = (1 - dh_grid) * (1 - dw_grid)
+        # w01 = (1 - dh_grid) * dw_grid
+        # w10 = dh_grid * (1 - dw_grid)
+        # w11 = dh_grid * dw_grid
+        # we reuse w11 here to avoid duplicate
+        # dh_grid * dw_grid computation
+        w11 = dh_grid * dw_grid
+        w10 = dh_grid - w11
+        w01 = dw_grid - w11
+        w00 = 1 - dh_grid - w01
+
+        h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+        w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+        h_grid_idx = h_grid * num_grid_per_side
+
+        indices = (h_grid_idx + w_grid).reshape(4, -1)
+        weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+        weights = weights.to(dtype=dtype)
+
+        embeds = self.pos_embed(indices) * weights
+        combined = embeds[0] + embeds[1] + embeds[2] + embeds[3]
+        combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+
+        combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+        repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+
+        outputs.append(repeated)
+
+    return torch.cat(outputs, dim=0)
+
+
+# --- Patch.1 ---
 
 
 # ================================================================
@@ -728,6 +864,7 @@ class Qwen3VLModel(_Qwen3VLModel):
 # Patch: Qwen3VLForConditionalGeneration
 # 1. wrapped Qwen3VLModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 # 2. use the unified loss function to handle Ulysses internally to reduce redudnecy code
+# 3. overwrite token ids with veomni constants
 # ================================================================
 
 
@@ -744,7 +881,12 @@ def get_position_id(main_func, self, **kwargs):
 class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
     # --- Patch.1 ---
     def get_position_id_func(self):
-        fake_model = SimpleNamespace(config=self.config)
+        fake_config = copy.copy(self.config)
+        # --- Patch.3 ---
+        fake_config.image_token_id = IMAGE_INPUT_INDEX
+        fake_config.video_token_id = VIDEO_INPUT_INDEX
+        # --- Patch.3 ---
+        fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)
 
     # --- Patch.1 ---
@@ -830,6 +972,8 @@ def apply_veomni_qwen3vl_patch():
     hf_qwen3vl.Qwen3VLVisionAttention.forward = Qwen3VLVisionAttention_forward
     hf_qwen3vl.Qwen3VLTextAttention = Qwen3VLTextAttention
     hf_qwen3vl.Qwen3VLTextModel._deepstack_process = Qwen3VLTextModel__deepstack_process
+    hf_qwen3vl.Qwen3VLVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+    hf_qwen3vl.Qwen3VLVisionModel.rot_pos_emb = rot_pos_emb
     hf_qwen3vl.Qwen3VLVisionModel.forward = Qwen3VLVisionModel_forward
     hf_qwen3vl.Qwen3VLVisionModel.dummy_forward = Qwen3VLVisionModel_dummy_forward
     hf_qwen3vl.Qwen3VLModel = Qwen3VLModel

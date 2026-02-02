@@ -213,7 +213,7 @@ def run_data_test():
         dist.destroy_process_group()
 
 
-def build_command(dataset_type, dataloader_type):
+def build_command(dataset_type, dataloader_type, pad_packed_to_length=None, ulysses_parallel_size=2, dyn_bsz=None):
     port = 12345 + random.randint(0, 100)
 
     if dataloader_type == "rmpad":
@@ -240,12 +240,17 @@ def build_command(dataset_type, dataloader_type):
         "--train.data_parallel_mode=ddp",
         "--train.ckpt_manager=dcp",
         f"--data.datasets_type={dataset_type}",
-        "--train.ulysses_parallel_size=2",
+        f"--train.ulysses_parallel_size={ulysses_parallel_size}",
         "--train.bsz_warmup_ratio=0",
         "--train.output_dir=.tests/cache",
         f"--train.rmpad={rmpad}",
         f"--train.rmpad_with_pos_ids={rmpad_with_pos_ids}",
     ]
+    if pad_packed_to_length is not None:
+        command.append(f"--train.pad_packed_to_length={pad_packed_to_length}")
+        command.append("--train.pad_packed_input=true")
+    if dyn_bsz is not None:
+        command.append(f"--train.dyn_bsz={dyn_bsz}")
     return command
 
 
@@ -265,6 +270,24 @@ def test_data_rmpad_with_pos_ids():
     assert result.returncode == 0
 
     command = build_command("iterable", "rmpad_with_pos_ids")
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+def test_data_rmpad_with_pos_ids_padded():
+    command = build_command("mapping", "rmpad_with_pos_ids", pad_packed_to_length=32)
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+def test_data_rmpad_with_pos_ids_padded_sp():
+    command = build_command("mapping", "rmpad_with_pos_ids", pad_packed_to_length=32, ulysses_parallel_size=2)
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
+def test_data_rmpad_with_pos_ids_padded_dyn_bsz_off():
+    command = build_command("mapping", "rmpad_with_pos_ids", pad_packed_to_length=32, dyn_bsz=False)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 

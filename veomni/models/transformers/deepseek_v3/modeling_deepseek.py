@@ -53,6 +53,7 @@ from transformers.utils import (
 
 from ....ops import fused_moe_forward
 from ....utils.import_utils import is_liger_kernel_available
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 from .configuration_deepseek import DeepseekV3Config
 
 
@@ -691,7 +692,7 @@ class DeepseekV3Attention(nn.Module):
             **kwargs,
         )
 
-        if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
+        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES and self.q_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim).contiguous()
@@ -940,7 +941,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.layers = nn.ModuleList(
             [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self._use_flash_attention_2 = config._attn_implementation in VARLEN_ATTENTION_TYPES
         self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._init_rope(config)
 

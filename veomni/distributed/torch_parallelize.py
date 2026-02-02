@@ -237,6 +237,7 @@ def parallelize_model_fsdp1(
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
+    enable_reshard_after_forward: bool = True,
     enable_mixed_precision: bool = True,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
@@ -301,7 +302,7 @@ def parallelize_model_fsdp2(
     logger.info_rank0(f"layer pairs: {layer_pairs}")
 
     # Step 2: Update fsdp2 kwargs
-    fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh}
+    fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
     # mp_policy kwargs
     if enable_mixed_precision:
         mp_policy = MixedPrecisionPolicy(
@@ -441,6 +442,7 @@ def build_parallelize_model(
     enable_full_shard: bool = True,
     enable_shard_grad_op: bool = False,
     use_orig_params: bool = True,
+    enable_reshard_after_forward: bool = True,
     enable_mixed_precision: bool = True,
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
@@ -488,6 +490,7 @@ def build_parallelize_model(
                 model=model,
                 weights_path=weights_path,
                 enable_full_shard=enable_full_shard,
+                enable_reshard_after_forward=enable_reshard_after_forward,
                 enable_mixed_precision=enable_mixed_precision,
                 basic_modules=basic_modules,
                 **kwargs,

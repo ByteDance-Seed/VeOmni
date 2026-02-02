@@ -142,7 +142,7 @@ from veomni.distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
 )
 # Step1: Create a sequence parallel group
-# VeOmni will construct a sequence parllel group based on the parallel size
+# VeOmni will construct a sequence parallel group based on the parallel size
 
 # Step2: Shard input sequences
 # Suppose we get an input x of shape [batch_size, seq_len, dim]
