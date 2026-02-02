@@ -4,11 +4,6 @@
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,
-  "auto_map": {
-    "AutoConfig": "configuration_deepseek.DeepseekV3Config",
-    "AutoModel": "modeling_deepseek.DeepseekV3Model",
-    "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM"
-  },
   "bos_token_id": 0,
   "eos_token_id": 1,
   "ep_size": 1,

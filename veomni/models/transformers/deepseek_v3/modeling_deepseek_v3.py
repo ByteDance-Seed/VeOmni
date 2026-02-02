@@ -31,6 +31,10 @@ from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from ....utils.import_utils import (
     is_transformers_version_greater_or_equal_to,
 )
+from ...transformers.attention_utils import VARLEN_ATTENTION_TYPES
+
+
+logger = logging.get_logger(__name__)
 
 
 # ================================================================
@@ -185,9 +189,6 @@ class PatchDeepseekV3MoE(nn.Module):
         return hidden_states
 
 
-logger = logging.get_logger(__name__)
-
-
 # ================================================================
 # PATCH: DeepseekV3Attention.forward
 # 1. Support for veomni attention implementation
@@ -238,13 +239,7 @@ def deepseek_v3_attention_forward(
     # --- Patch.1 ---
     # Flash Attention requires Q/K and V to have the same head dimension on non-Hopper GPUs.
     # For DeepSeek V3 MLA architecture where qk_head_dim != v_head_dim, we pad V to match Q/K.
-    _FA_IMPLS_NEED_PADDING = [
-        "flash_attention_2",
-        "flash_attention_3",
-        "veomni_flash_attention_2_with_sp",
-        "veomni_flash_attention_3_with_sp",
-    ]
-    if self.config._attn_implementation in _FA_IMPLS_NEED_PADDING and self.qk_head_dim != self.v_head_dim:
+    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES and self.qk_head_dim != self.v_head_dim:
         value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
     # --- Patch.1 ---
 
@@ -265,7 +260,7 @@ def deepseek_v3_attention_forward(
 
     # --- Patch.1 ---
     # Truncate the output back to the original v_head_dim after Flash Attention.
-    if self.config._attn_implementation in _FA_IMPLS_NEED_PADDING and self.qk_head_dim != self.v_head_dim:
+    if self.config._attn_implementation in VARLEN_ATTENTION_TYPES and self.qk_head_dim != self.v_head_dim:
         attn_output = attn_output[:, :, :, : self.v_head_dim]
     # --- Patch.1 ---
 
