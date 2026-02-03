@@ -118,6 +118,8 @@ class PatchQwen3MoeExperts(nn.Module):
                 fc1_2_weight=self.up_proj,
                 fc2_weight=self.down_proj,
             )
+        else:
+            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
 
         return final_hidden_states
 

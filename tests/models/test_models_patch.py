@@ -61,6 +61,13 @@ test_cases = [
         _DEFAULT_ATOL,
         id="qwen3_moe",
     ),
+    pytest.param(
+        "./tests/models/toy_config/deepseek_v3_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v3",
+    ),
 ]
 
 
@@ -126,6 +133,11 @@ def test_models_patch_fwd_bwd(
         print_device_mem_info(f"[Memory Info] after model {idx} train_one_step:")
 
         return result_metrics
+
+    # delete flash_attention_3 mode for hf deepseek_v3.
+    # TODO: transformers v5 fixed this, remove this after veomni support transformers v5.
+    if case_id == "deepseek_v3":
+        hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
 
     # Train HF backend models
     for idx, mode in enumerate(hf_model_modes):
