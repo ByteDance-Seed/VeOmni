@@ -9,11 +9,11 @@ from ..tools.launch_utils import find_free_port
 
 MODEL_CONFIGS = {
     "qwen3_moe": {
-        "config_path": "tests/models/toy_config/qwen3_moe_toy/config.json",
+        "config_path": "tests/toy_config/qwen3_moe_toy/config.json",
         "tokenizer_path": "Qwen/Qwen3-30B-A3B",
     },
     "deepseek_v3": {
-        "config_path": "tests/models/toy_config/deepseek_v3_toy/config.json",
+        "config_path": "tests/toy_config/deepseek_v3_toy/config.json",
         "tokenizer_path": "deepseek-ai/DeepSeek-V3",
     },
 }

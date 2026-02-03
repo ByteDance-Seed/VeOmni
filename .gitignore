@@ -157,7 +157,7 @@ processor_config.json
 # nsys file
 nsysoutput/
 
-!tests/models/toy_config/**/*.json
+!tests/toy_config/**/*.json
 
 # vscode config
 .vscode/
