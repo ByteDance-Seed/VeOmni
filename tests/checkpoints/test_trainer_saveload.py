@@ -369,11 +369,11 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int):
     merge_result = subprocess.run(merge_command, shell=True, check=True)
     assert merge_result.returncode == 0
 
-    verify_dcp_to_hf_conversion(
+    assert verify_dcp_to_hf_conversion(
         dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size),
         hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size),
         safe_serialization=True,
-    )
+    ), f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}`"
 
 
 TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
