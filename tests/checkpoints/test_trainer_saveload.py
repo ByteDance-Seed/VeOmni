@@ -4,10 +4,17 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+
+try:
+    from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
+    from .utils import get_checkpoint_dir, get_checkpoint_test_command, get_hf_output_dir, get_merge_dcp_to_hf_command
+except ImportError:
+    # from utils import get_checkpoint_test_command, get_merge_dcp_to_hf_command, get_checkpoint_dir, get_hf_output_dir
+    from checkpoint_verification_utils import verify_dcp_to_hf_conversion
+
+import pytest
 import torch
 import torch.distributed as dist
-import yaml
-from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from tqdm import trange
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
@@ -88,13 +95,6 @@ def check_state_dict(lhs_dict, rhs_dict, need_flatten=False, tied_weight_key: Op
         rhs_val = rhs.to_local() if hasattr(rhs, "to_local") else rhs
 
         torch.testing.assert_close(rhs_val, lhs_val)
-
-
-def read_output_dir_from_yaml(yaml_path: str) -> str:
-    """Read output_dir from yaml config file."""
-    with open(yaml_path) as f:
-        config = yaml.safe_load(f)
-    return config.get("train", {}).get("output_dir", None)
 
 
 @dataclass
@@ -355,155 +355,31 @@ def main():
     dist.destroy_process_group()
 
 
-def test_trainer_saveload_ep8():
-    yaml_config_path = "tests/checkpoints/ep8.yaml"
-    ep8_command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/checkpoints/test_trainer_saveload.py",
-        yaml_config_path,
-    ]
-    ep8_result = subprocess.run(ep8_command, check=True)
-    assert ep8_result.returncode == 0
-
-    # Run merge_dcp_to_hf script after training completes
-    output_dir = read_output_dir_from_yaml(yaml_config_path)
-    assert output_dir is not None, f"output_dir not found in {yaml_config_path}"
-    checkpoint_dir = os.path.join(output_dir, "checkpoints", "global_step_5")
-    hf_output_dir = os.path.join(output_dir, "hf_ckpt")
-
-    merge_command = [
-        "python",
-        "scripts/merge_dcp_to_hf.py",
-        "--load-dir",
-        checkpoint_dir,
-        "--save-dir",
-        hf_output_dir,
-        "--model-assets-dir",
-        os.path.join(output_dir, "model_assets"),
-    ]
-
-    logger.info(f"Running merge_dcp_to_hf script: {' '.join(merge_command)}")
-    merge_result = subprocess.run(merge_command, check=True, capture_output=True, text=True)
-    assert merge_result.returncode == 0
-
-    # Verify the output exists
-    assert os.path.exists(hf_output_dir), f"HF checkpoint directory not found: {hf_output_dir}"
-    files = os.listdir(hf_output_dir)
-    logger.info(f"HF checkpoint files: {files}")
-    assert len(files) > 0, "No files generated in HF checkpoint directory"
-    assert "config.json" in files, "config.json not found in HF checkpoint directory"
-
-    # Verify HF checkpoint by comparing with DCP checkpoint
-    logger.info("Verifying HF checkpoint conversion...")
-    assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=checkpoint_dir,
-        hf_checkpoint_dir=hf_output_dir,
-        safe_serialization=True,
-    ), "HF checkpoint verification failed"
-
-
-def test_trainer_saveload_ep4():
-    yaml_config_path = "tests/checkpoints/ep4.yaml"
-    ep4_command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/checkpoints/test_trainer_saveload.py",
-        yaml_config_path,
-    ]
-    ep4_result = subprocess.run(ep4_command, check=True)
-    assert ep4_result.returncode == 0
-
-    # Run merge_dcp_to_hf script after training completes
-    output_dir = read_output_dir_from_yaml(yaml_config_path)
-    assert output_dir is not None, f"output_dir not found in {yaml_config_path}"
-    checkpoint_dir = os.path.join(output_dir, "checkpoints", "global_step_5")
-    hf_output_dir = os.path.join(output_dir, "hf_ckpt")
-
-    merge_command = [
-        "python",
-        "scripts/merge_dcp_to_hf.py",
-        "--load-dir",
-        checkpoint_dir,
-        "--save-dir",
-        hf_output_dir,
-        "--model-assets-dir",
-        os.path.join(output_dir, "model_assets"),
-    ]
-
-    logger.info(f"Running merge_dcp_to_hf script: {' '.join(merge_command)}")
-    merge_result = subprocess.run(merge_command, check=True, capture_output=True, text=True)
-    assert merge_result.returncode == 0
-
-    # Verify the output exists
-    assert os.path.exists(hf_output_dir), f"HF checkpoint directory not found: {hf_output_dir}"
-    files = os.listdir(hf_output_dir)
-    logger.info(f"HF checkpoint files: {files}")
-    assert len(files) > 0, "No files generated in HF checkpoint directory"
-    assert "config.json" in files, "config.json not found in HF checkpoint directory"
-
-    # Verify HF checkpoint by comparing with DCP checkpoint
-    logger.info("Verifying HF checkpoint conversion...")
-    assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=checkpoint_dir,
-        hf_checkpoint_dir=hf_output_dir,
-        safe_serialization=True,
-    ), "HF checkpoint verification failed"
-
-
-def test_trainer_saveload_no_ep():
-    yaml_config_path = "tests/checkpoints/no_ep.yaml"
-    no_ep_command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/checkpoints/test_trainer_saveload.py",
-        yaml_config_path,
-    ]
-    no_ep_result = subprocess.run(no_ep_command, check=True)
-    assert no_ep_result.returncode == 0
-
-    # Run merge_dcp_to_hf script after training completes
-    output_dir = read_output_dir_from_yaml(yaml_config_path)
-    assert output_dir is not None, f"output_dir not found in {yaml_config_path}"
-    checkpoint_dir = os.path.join(output_dir, "checkpoints", "global_step_5")
-    hf_output_dir = os.path.join(output_dir, "hf_ckpt")
-
-    merge_command = [
-        "python",
-        "scripts/merge_dcp_to_hf.py",
-        "--load-dir",
-        checkpoint_dir,
-        "--save-dir",
-        hf_output_dir,
-        "--model-assets-dir",
-        os.path.join(output_dir, "model_assets"),
-    ]
-
-    logger.info(f"Running merge_dcp_to_hf script: {' '.join(merge_command)}")
-    merge_result = subprocess.run(merge_command, check=True, capture_output=True, text=True)
-    assert merge_result.returncode == 0
-
-    # Verify the output exists
-    assert os.path.exists(hf_output_dir), f"HF checkpoint directory not found: {hf_output_dir}"
-    files = os.listdir(hf_output_dir)
-    logger.info(f"HF checkpoint files: {files}")
-    assert len(files) > 0, "No files generated in HF checkpoint directory"
-    assert "config.json" in files, "config.json not found in HF checkpoint directory"
-
-    # Verify HF checkpoint by comparing with DCP checkpoint
-    logger.info("Verifying HF checkpoint conversion...")
-    assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=checkpoint_dir,
-        hf_checkpoint_dir=hf_output_dir,
-        safe_serialization=True,
-    ), "HF checkpoint verification failed"
-
-
 if __name__ == "__main__":
     main()
+
+
+def _run_trainer_saveload_and_verify(model_name: str, ep_size: int):
+    exec_command = get_checkpoint_test_command(model_name, ep_size)
+    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size)
+
+    exec_result = subprocess.run(exec_command, shell=True, check=True)
+    assert exec_result.returncode == 0
+
+    merge_result = subprocess.run(merge_command, shell=True, check=True)
+    assert merge_result.returncode == 0
+
+    verify_dcp_to_hf_conversion(
+        dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size),
+        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size),
+        safe_serialization=True,
+    )
+
+
+TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
+TEST_EP_SIZES = [1, 4, 8]
+
+
+@pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
+def test_trainer_saveload(model_name: str, ep_size: int):
+    _run_trainer_saveload_and_verify(model_name, ep_size)
