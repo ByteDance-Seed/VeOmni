@@ -29,7 +29,7 @@ overrides = [
     { name = "torchaudio", marker = "extra == 'gpu'", specifier = "==2.9.1+cu129", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
-    { name = "torchcodec", marker = "extra == 'gpu'", specifier = ">=0.6.0,<0.8.0" },
+    { name = "torchcodec", marker = "extra == 'gpu'", specifier = "==0.8.1" },
     { name = "torchcodec", marker = "extra == 'npu'", specifier = ">=0.4.0,<0.6.0" },
     { name = "torchcodec", marker = "extra == 'npu-aarch64'", specifier = ">=0.4.0,<0.6.0" },
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.24.1+cu129", index = "https://download.pytorch.org/whl/" },
@@ -2331,16 +2331,16 @@ wheels = [
 
 [[package]]
 name = "torchcodec"
-version = "0.7.0"
+version = "0.8.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "sys_platform == 'linux'",
     "sys_platform != 'linux'",
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6a/f1/bb2b5ab929ef3f092cb6508673510ffc2aafd8324493c94a2d41f1c8a683/torchcodec-0.7.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:967a14b31e04721901ddbf965f9e9f733f328c5e98a51e22f414e25ac32e20ba", size = 3388626, upload-time = "2025-09-08T14:17:50.433Z" },
-    { url = "https://files.pythonhosted.org/packages/06/14/8ff28247988365fc47e8471e28cdfd8d037232fcf73abb67ee815ac80f1d/torchcodec-0.7.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:afb1c48b52bd4ee8f485f5a427bb4e82380590255a26b8e9e3fe099e0779287f", size = 1419444, upload-time = "2025-09-08T14:17:41.479Z" },
-    { url = "https://files.pythonhosted.org/packages/1f/80/04f23dff2c7ac406d2d6b24a52be7654a946d2fdfe158b19341a524dae20/torchcodec-0.7.0-cp311-cp311-win_amd64.whl", hash = "sha256:a68765cd29159da3cf36eb5716481c617ad9d168fe06418bcde2a9360cc7eb5e", size = 1563430, upload-time = "2025-09-08T14:17:58.571Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/59/600c8f9e7450705ae05c57ce08e94b09b9734a063f12e140a0b9ea33f5f4/torchcodec-0.8.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:2b8c8c32cb8f258b350baf566dfc2fe87e3fbbbe7805acf7195226d67a92d985", size = 3813521, upload-time = "2025-10-28T09:46:49.838Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/3f/2ced02dcfc2ce0f697c34922737abda6576f070d9d596f0722110d7f5aa4/torchcodec-0.8.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:585d198f5b092e6f4aed7f1a438a6f68ee3d4ab35816a0cce9d289271d8e6fb4", size = 1938537, upload-time = "2025-10-28T09:46:36.115Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/87/469a639cca0c0742db82be3fb80c132540b430ea152079f942bd32f03282/torchcodec-0.8.1-cp311-cp311-win_amd64.whl", hash = "sha256:1ba7dda2acd3bcd8f3a8f59b2a0faf77042456d98304f2f7d5b7d4f521ee8a53", size = 2102948, upload-time = "2025-10-28T09:47:02.389Z" },
 ]
 
 [[package]]
@@ -2606,7 +2606,7 @@ gpu = [
     { name = "nvidia-nccl-cu12", version = "2.27.5", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torch", version = "2.9.1+cu129", source = { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl" } },
     { name = "torchaudio", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/" } },
-    { name = "torchcodec", version = "0.7.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "torchcodec", version = "0.8.1", source = { registry = "https://pypi.org/simple" } },
     { name = "torchvision", version = "0.24.1+cu129", source = { registry = "https://download.pytorch.org/whl/" } },
 ]
 megatron = [
@@ -2704,7 +2704,7 @@ requires-dist = [
     { name = "torchaudio", marker = "extra == 'npu'", specifier = "==2.7.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchaudio", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
     { name = "torchcodec", marker = "extra == 'audio'" },
-    { name = "torchcodec", marker = "extra == 'gpu'", specifier = ">=0.6.0,<0.8.0" },
+    { name = "torchcodec", marker = "extra == 'gpu'", specifier = "==0.8.1" },
     { name = "torchcodec", marker = "extra == 'npu'", specifier = ">=0.4.0,<0.6.0" },
     { name = "torchcodec", marker = "extra == 'npu-aarch64'", specifier = ">=0.4.0,<0.6.0" },
     { name = "torchcodec", marker = "extra == 'video'" },

@@ -84,7 +84,7 @@ gpu = [
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
-  "torchcodec>=0.6.0,<0.8.0"
+  "torchcodec==0.8.1" # 0.8.1 is compatible with torch 2.9
 ]
 megatron = [
   "megatron-energon>=7.2.1"
@@ -132,7 +132,7 @@ override-dependencies = [
     "torch==2.9.1+cu129; (extra == 'gpu')",
     "torchaudio==2.9.1+cu129; (extra == 'gpu')",
     "torchvision==0.24.1+cu129; (extra == 'gpu')",
-    "torchcodec>=0.6.0,<0.8.0; (extra == 'gpu')",
+    "torchcodec==0.8.1; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
