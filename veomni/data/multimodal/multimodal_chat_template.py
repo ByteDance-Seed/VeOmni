@@ -14,9 +14,9 @@
 
 
 import random
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections import defaultdict
-from typing import Dict, List, Literal, Sequence
+from typing import Dict, List, Sequence
 
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizer
@@ -40,198 +40,6 @@ class MultimodalChatTemplate(ChatTemplate):
 
     def get_jinja_template(self) -> str:
         return ""
-
-    def mm_tokenize(
-        self,
-        mm_type: Literal["image", "video", "audio"],
-        token_num: int = 1,
-    ):
-        raise NotImplementedError
-
-    def tokenize(
-        self,
-        content_type: Literal["text", "image", "video", "audio"],
-        content: str,
-        token_num: int = 1,
-    ) -> List:
-        if content_type == "text":
-            input_ids = self.tokenizer(content).input_ids
-        else:
-            input_ids = self.mm_tokenize(content_type, token_num)
-        return input_ids
-
-
-class DefaultTag(ABC):
-    def mm_tokenize(
-        self,
-        mm_type: Literal["image", "video", "audio"],
-        token_num: int = 1,
-    ):
-        return [TYPE2INDEX["input"][mm_type]] * token_num
-
-
-class MMTag(ABC):
-    def mm_tokenize(
-        self,
-        mm_type: Literal["image", "video", "audio"],
-        token_num: int = 1,
-    ):
-        mm_start = f"[{mm_type.upper()}]"
-        mm_end = f"[/{mm_type.upper()}]"
-        mm_token = (
-            self.tokenizer(mm_start).input_ids
-            + [TYPE2INDEX["input"][mm_type]] * token_num
-            + self.tokenizer(mm_end).input_ids
-        )
-        return mm_token
-
-
-class PretrainTemplate(MultimodalChatTemplate):
-    """
-    Pretrain template for multimodal model.
-    Text-to-Multimodal or Multimodal-to-Text only.
-    """
-
-    def encode_messages(
-        self, messages: Sequence[Dict[str, str]], num_tokens: Dict = defaultdict(list), **kwargs
-    ) -> Dict[str, List[int]]:
-        messages = messages[:2]
-        assert messages[0][0] == "user"
-        assert messages[1][0] == "assistant"
-        messages = [message[1:] for message in messages]  # skip role
-        mm = None
-        for message in messages[0]:
-            if message[0] != "text":
-                mm = message[0]
-                break
-
-        converted_messages = []
-        if mm is None:  # text to multimodal
-            user_content = [messages[0][0]]
-            assistant_content = []
-            for message in messages[1]:
-                if message[0] != "text":
-                    assistant_content = [message]
-                    mm = message[0]
-                    break
-        else:  # multimodal to text
-            for message in messages[0]:
-                if message[0] == mm:
-                    user_content = [message]
-                    break
-            assistant_content = messages[1][:1]  # [] if eval
-
-        converted_messages = [["user"] + user_content, ["assistant"] + assistant_content]
-        mm_num_token = num_tokens[mm][0]
-
-        input_ids, labels = [], []
-        for message in converted_messages:
-            role = message[0]
-            message = message[1:]
-            if len(message) == 0:  # eval
-                break
-
-            output = self.tokenize(message[0][0], message[0][1], token_num=mm_num_token)
-
-            if role == "user":
-                labels += [IGNORE_INDEX] * len(output)
-            else:
-                output += [self.tokenizer.eos_token_id]
-                labels += output
-
-            input_ids += output
-
-        input_ids = torch.tensor(input_ids)
-        labels = torch.tensor(labels)
-
-        # mask multimodal label, set output_multimodal_token to input_ids
-        input_mask = labels == IGNORE_INDEX
-        for mm_type in num_tokens.keys():
-            mm_mask = input_ids == TYPE2INDEX["input"][mm_type]
-            input_mm_mask = input_mask & mm_mask
-            output_mm_mask = ~input_mask & mm_mask
-
-            input_ids[input_mm_mask] = TYPE2INDEX["input"][mm_type]
-            input_ids[output_mm_mask] = TYPE2INDEX["output"][mm_type]
-            labels[output_mm_mask] = IGNORE_INDEX
-
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": torch.tensor([1] * len(input_ids))}
-
-
-class SFTTemplate(MultimodalChatTemplate):
-    def encode_messages(
-        self, messages: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
-    ) -> Dict[str, List[int]]:
-        input_ids, labels = [], []
-        mm_index = dict.fromkeys(num_tokens.keys(), 0)
-        for message_list in messages:
-            role = message_list[0]
-            message_list = message_list[1:]
-            if len(message_list) == 0:  # eval
-                break
-            if role == "user":
-                if message_list[0][0] == "text":
-                    new_tuple = ("text", "[INST]" + message_list[0][1])
-                    message_list[0] = new_tuple
-                else:
-                    message_list = [("text", "[INST]")] + message_list
-
-                if message_list[-1][0] == "text":
-                    new_tuple = ("text", message_list[-1][1] + "[/INST]")
-                    message_list[-1] = new_tuple
-                else:
-                    message_list.append(("text", "[/INST]"))
-
-            content_ids = []
-            for message in message_list:
-                content_type = message[0]
-                content = message[1]
-                if content_type != "text":
-                    num_token = num_tokens[content_type][mm_index[content_type]]
-                    mm_index[content_type] += 1
-                else:
-                    num_token = None
-
-                content_ids += self.tokenize(content_type, content, num_token)
-
-            if role == "user":
-                input_ids += content_ids
-                labels += [IGNORE_INDEX] * len(content_ids)
-            else:
-                input_ids += content_ids + [self.tokenizer.eos_token_id]
-                labels += content_ids + [self.tokenizer.eos_token_id]
-
-        input_ids = torch.tensor(input_ids)
-        labels = torch.tensor(labels)
-
-        # mask multimodal label, set output_multimodal_token to input_ids
-        input_mask = labels == IGNORE_INDEX
-        for mm_type in num_tokens.keys():
-            mm_mask = input_ids == TYPE2INDEX["input"][mm_type]
-            input_mm_mask = input_mask & mm_mask
-            output_mm_mask = ~input_mask & mm_mask
-
-            input_ids[input_mm_mask] = TYPE2INDEX["input"][mm_type]
-            input_ids[output_mm_mask] = TYPE2INDEX["output"][mm_type]
-            labels[output_mm_mask] = IGNORE_INDEX
-
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": torch.tensor([1] * len(input_ids))}
-
-
-class PlainTextTemplate(DefaultTag, PretrainTemplate):
-    pass
-
-
-class PlainTextnMMTagTemplate(MMTag, PretrainTemplate):
-    pass
-
-
-class ConversationTemplate(DefaultTag, SFTTemplate):
-    pass
-
-
-class ConversationMMTagTemplate(MMTag, SFTTemplate):
-    pass
 
 
 class Qwen2VLTemplate(MultimodalChatTemplate):
@@ -1161,10 +969,6 @@ class SeedOssPretrainTemplate(LlamaPretrainTemplate):
 
 
 TEMPLATES = {
-    "conversation_default": ConversationTemplate,
-    "conversation_mmtag": ConversationMMTagTemplate,
-    "plaintext_default": PlainTextTemplate,
-    "plaintext_mmtag": PlainTextnMMTagTemplate,
     "qwen2vl": Qwen2VLChatTemplate,
     "qwen3vl": Qwen3VLChatTemplate,
     "qwen2vl_pretrain": Qwen2VLPretrainTemplate,

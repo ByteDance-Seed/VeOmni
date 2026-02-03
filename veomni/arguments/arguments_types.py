@@ -184,10 +184,6 @@ class DataArguments:
         default=None,
         metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
     )
-    train_size: int = field(
-        default=10_000_000,
-        metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
-    )
     data_type: Literal["plaintext", "conversation", "diffusion", "classification"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
@@ -204,29 +200,17 @@ class DataArguments:
         default="interleave",
         metadata={"help": "Type of the datasets for multisource training."},
     )
-    enable_multisource: bool = field(
-        default=False,
-        metadata={"help": "Whether to enable multisource training."},
-    )
     source_name: str = field(
         default=None,
         metadata={"help": "Dataset name for training. If multisource, dataset name will be loaded from yaml config."},
     )
-    data_tag: Literal["default", "mmtag"] = field(
-        default="default",
-        metadata={"help": "Dataset tag for multimodal training."},
-    )
-    drop_resume_buffer: bool = field(
-        default=False,
-        metadata={"help": "drop data in saved buffer"},
+    dyn_bsz_buffer_size: int = field(
+        default=200,
+        metadata={"help": "Buffer size for dynamic batch size."},
     )
     text_keys: str = field(
         default=None,
         metadata={"help": "Key to get text from the training data."},
-    )
-    image_keys: str = field(
-        default="images",
-        metadata={"help": "Key to get images from the training data."},
     )
     chat_template: str = field(
         default="default",
@@ -252,36 +236,13 @@ class DataArguments:
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
     )
-    shuffle_shard_nums: int = field(
-        default=1,
-        metadata={"help": "Number of shards to shuffle in byted dataset."},
-    )
-    split_nums: int = field(
-        default=1,
-        metadata={"help": "Number of splits for multisoure stream to reduce memory"},
-    )
-    predownload_factor: float = field(
-        default=0.5,
-        metadata={"help": "The factor to determine the number of samples to pre-download using byted dataset"},
-    )
-    silent_exception: bool = field(
+    silent_exception: bool = field(  # TODO: add silent_exception feature
         default=False,
-        metadata={"help": "Whether to ignore exceptions using byted dataset. Defaults to ``False``"},
+        metadata={"help": "Whether to ignore exceptions when loading data. Defaults to ``False``"},
     )
 
     def __post_init__(self):
         self.enable_multisource = self.train_path.endswith(".yaml")
-        if self.enable_multisource and self.shuffle_shard_nums != 1:
-            self.shuffle_shard_nums = 1
-            logger.info_rank0("`shuffle_shard_nums` is set to 1 when using multisource dataset.")
-
-        from ..data.data_loader import DATALOADER_REGISTRY
-        from ..data.dataset import DATASET_REGISTRY
-
-        assert self.datasets_type in DATASET_REGISTRY.valid_keys(), f"Unknown datasets type: {self.datasets_type}"
-        assert self.dataloader_type in DATALOADER_REGISTRY.valid_keys(), (
-            f"Unknown dataloader type: {self.dataloader_type}"
-        )
 
         if self.enable_multisource:
             self.dataset_name = self.multisource_datasets_type
@@ -316,6 +277,20 @@ class TrainingArguments:
         metadata={
             "help": "Specifies the parameter update strategy for training the multi-modal model. 'full' for Standard SFT, lora for LoRA."
         },
+    )
+    train_size: int = field(
+        default=10_000_000,
+        metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
+    )
+    train_sample: int = field(
+        default=10_000,
+        metadata={
+            "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
+        },
+    )
+    dyn_bsz: bool = field(
+        default=True,
+        metadata={"help": "Enable dynamic batch size for padding-free training."},
     )
     lr: float = field(
         default=5e-5,
@@ -362,14 +337,6 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Epochs to train."},
     )
-    rmpad: bool = field(
-        default=True,
-        metadata={"help": "Enable padding-free training by using the cu_seqlens."},
-    )
-    rmpad_with_pos_ids: bool = field(
-        default=False,
-        metadata={"help": "Enable padding-free training by using the position_ids."},
-    )
     pad_packed_to_length: Optional[int] = field(
         default=None,
         metadata={"help": "Pad packed sequences to a fixed length when rmpad_with_pos_ids is enabled."},
@@ -377,22 +344,6 @@ class TrainingArguments:
     pad_packed_input: bool = field(
         default=False,
         metadata={"help": "Enable padding for packed sequences when rmpad_with_pos_ids is enabled."},
-    )
-    dyn_bsz: bool = field(
-        default=True,
-        metadata={"help": "Enable dynamic batch size for padding-free training."},
-    )
-    dyn_bsz_margin: int = field(
-        default=0,
-        metadata={"help": "Number of pad tokens in dynamic batch."},
-    )
-    dyn_bsz_runtime: Literal["main", "worker"] = field(
-        default="worker",
-        metadata={"help": "Use main process or worker process to run dynamic batch size."},
-    )
-    dyn_bsz_buffer_size: int = field(
-        default=200,
-        metadata={"help": "Buffer size for dynamic batch size."},
     )
     bsz_warmup_ratio: float = field(
         default=0,
@@ -651,7 +602,6 @@ class TrainingArguments:
             assert self.data_parallel_size == self.data_parallel_replicate_size * self.data_parallel_shard_size, (
                 f"data_parallel_size should be equal to data_parallel_replicate_size: {self.data_parallel_replicate_size} * data_parallel_shard_size: {self.data_parallel_shard_size}."
             )
-
         elif self.data_parallel_replicate_size > 0:
             if self.data_parallel_size % self.data_parallel_replicate_size != 0:
                 raise ValueError("data_parallel_size should be a multiple of data_parallel_replicate_size.")
@@ -664,9 +614,6 @@ class TrainingArguments:
         else:
             self.data_parallel_replicate_size = 1
             self.data_parallel_shard_size = self.data_parallel_size
-
-        if self.rmpad and self.rmpad_with_pos_ids:
-            raise ValueError("`rmpad` and `rmpad_with_pos_ids` cannot be both True.")
 
         num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
         if num_nodes > 1:
@@ -702,8 +649,8 @@ class TrainingArguments:
         if self.gradient_accumulation_steps > 1 and self.enable_fsdp_offload:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
-        # calculate dataloader batch size (for StreamingDataset and StreamingDataLoader)
-        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker" and self.dyn_bsz:
+        # calculate dataloader batch size
+        if self.dyn_bsz:
             self.dataloader_batch_size = 1
         else:
             self.dataloader_batch_size = self.global_batch_size // self.data_parallel_size  # = micro bsz * grad accu
@@ -732,54 +679,6 @@ class TrainingArguments:
         else:
             self.profile_this_rank = False
 
-        from ..checkpoint import CHECKPOINTER_REGISTRY
-
-        assert self.ckpt_manager in CHECKPOINTER_REGISTRY.valid_keys(), f"Unknown ckpt_manager: {self.ckpt_manager}"
-
-    def compute_train_steps(
-        self, max_seq_len: Optional[int] = None, train_size: Optional[int] = None, dataset_length: Optional[int] = None
-    ) -> None:
-        """
-        Computes the training steps per epoch according to the data length.
-        """
-        if self.rmpad or self.rmpad_with_pos_ids:
-            if self.dyn_bsz:
-                assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
-                token_micro_bsz = self.micro_batch_size * max_seq_len
-                train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))
-                eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
-                self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
-            else:
-                if (
-                    dataset_length is not None
-                ):  # for dataset with __len__ attribute (e.g. mapping dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
-                    self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)
-                elif (
-                    self.max_steps is not None
-                ):  # for dataset without __len__ attribute (e.g. iterable dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
-                    self._train_steps = self.max_steps
-                else:
-                    raise ValueError(
-                        "For iterable dataset, please provide 'max_steps' or set dyn_bsz=True when removing padding."
-                    )
-        elif dataset_length is not None:
-            self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)  # assuming drop_last is true
-        elif self.max_steps is not None:
-            self._train_steps = self.max_steps
-        else:
-            raise ValueError("Please provide `dataset_length` or `max_steps`!")
-
-    @property
-    def train_steps(self) -> int:
-        if self.max_steps is not None and self._train_steps >= self.max_steps:
-            logger.warning_once(f"Set train_steps to {self.max_steps}. It should be for debug purpose only.")
-            return self.max_steps
-
-        if self._train_steps == -1:
-            raise ValueError("Please run `compute_train_steps` first!")
-
-        return self._train_steps
-
 
 @dataclass
 class VeOmniArguments:
@@ -789,7 +688,6 @@ class VeOmniArguments:
 
     def __post_init__(self):
         if self.train.pad_packed_input:
-            assert self.train.rmpad_with_pos_ids, "when using pad_packed_input, rmpad_with_pos_ids must be enabled."
             if self.train.pad_packed_to_length is None and self.data.max_seq_len is not None:
                 self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(
@@ -801,6 +699,30 @@ class VeOmniArguments:
                 )
         else:
             self.train.pad_packed_to_length = None
+
+    def compute_train_steps(self, dataset_length: Optional[int] = None):
+        if self.train.dyn_bsz:
+            assert self.data.max_seq_len is not None and self.train.train_size is not None, (
+                "data.max_seq_len and train.train_size are required."
+            )
+            train_size = int(self.train.train_size * (1 + self.train.bsz_warmup_ratio / 2))
+            self._train_steps = math.ceil(train_size / (self.train.global_batch_size * self.data.max_seq_len))
+        else:
+            if dataset_length is not None:  # mapping dataset
+                self._train_steps = math.floor(dataset_length / self.train.dataloader_batch_size)
+            else:
+                self._train_steps = math.ceil(self.train.train_sample / self.train.dataloader_batch_size)
+
+    @property
+    def train_steps(self) -> int:
+        if self.train.max_steps is not None and self._train_steps >= self.train.max_steps:
+            logger.warning_once(f"Set train_steps to {self.train.max_steps}. It should be for debug purpose only.")
+            return self.train.max_steps
+
+        if self._train_steps == -1:
+            raise ValueError("Please run `compute_train_steps` first!")
+
+        return self._train_steps
 
 
 # ================================ Infer Arguments ======================================

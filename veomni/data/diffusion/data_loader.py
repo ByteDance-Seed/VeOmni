@@ -22,7 +22,7 @@ from veomni.utils.device import get_device_type
 
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import logging
-from ..data_collator import (
+from ..data_collator_backup import (
     CollatePipeline,
     DataCollatorWithPadding,
     MakeMicroBatchCollator,

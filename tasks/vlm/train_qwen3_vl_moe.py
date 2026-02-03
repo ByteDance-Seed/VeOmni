@@ -169,7 +169,6 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,

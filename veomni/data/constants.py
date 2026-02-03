@@ -37,3 +37,6 @@ TYPE2INDEX = {
         "audio": AUDIO_OUTPUT_INDEX,
     },
 }
+
+
+MODALITY = TYPE2INDEX["input"].keys() | TYPE2INDEX["output"].keys()

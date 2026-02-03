@@ -225,7 +225,6 @@ def main():
         dyn_bsz=args.train.dyn_bsz,
         pad_packed_to_length=args.train.pad_packed_to_length,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,

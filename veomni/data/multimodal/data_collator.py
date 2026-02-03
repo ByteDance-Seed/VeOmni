@@ -24,7 +24,7 @@ from torch.utils.data._utils.collate import default_collate
 
 from ...distributed.parallel_state import get_parallel_state
 from ..constants import IGNORE_INDEX
-from ..data_collator import DataCollator, pos2culen
+from ..data_collator_backup import DataCollator, pos2culen
 
 
 MODALITY = ["image", "video", "audio"]
