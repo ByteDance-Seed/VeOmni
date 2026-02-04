@@ -7,6 +7,9 @@ from veomni.utils.device import get_device_type
 
 
 FAKE_WORLD_SIZE = 8
+WORKLOAD_CAL_RULE = {
+    "s2": lambda x: x**2
+}
 
 
 def fake_data_construct():
@@ -36,11 +39,18 @@ def fake_data_construct():
     return unbalanced_fake_data_lengths_per_dp, balanced_fake_data_lengths_per_dp
 
 
-def check_balance_sorting(rank_table, balanced_data_gt):
-    for rank in range(FAKE_WORLD_SIZE):
-        rank_table_cur_rank = torch.cat(rank_table[rank]).sort().values
-        balanced_data_gt_cur_rank = balanced_data_gt[rank].sort().values
-        torch.testing.assert_close(rank_table_cur_rank, balanced_data_gt_cur_rank)
+def check_balance_sorting(rank_table, balanced_data_gt, role="s2"):
+    # Calculate workload of ground truth data
+    gt_workloads = [WORKLOAD_CAL_RULE[role](gt).sum() for gt in balanced_data_gt]
+
+    # Check whether the load matches the given ground truth
+    # Calculate the workload of current rank
+    rank_table_cur_rank_wl = [WORKLOAD_CAL_RULE[role](torch.cat(rt)).sum() for rt in rank_table]
+
+    # Since the ground truth is a manually constructed perfectly balanced data distribution,
+    # the load on each DP group after applying the reordering algorithm must exactly match that of the ground truth;
+    # otherwise, the reordering algorithm is considered to underperform.
+    torch.testing.assert_close(rank_table_cur_rank_wl, gt_workloads)
     print("check pass!")
 
 

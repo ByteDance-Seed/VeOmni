@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Optional, Union, List, Tuple, Dict, Any
 
 import torch
 import torch.distributed as dist
@@ -15,8 +16,8 @@ logger = helper.create_logger(__name__)
 class Qwen3VLEncoderDataBalance:
     def __init__(
         self,
-        spatial_merge_unit,
-        sorting_algo_name="post_mbs_balancing_greedy_without_pad",
+        spatial_merge_unit: int,
+        sorting_algo_name: str = "post_mbs_balancing_greedy_without_pad",
     ):
         """
         A data balance algorithm for Qwen3 VL encoder. The algorithm provides two interface functions:
@@ -34,10 +35,17 @@ class Qwen3VLEncoderDataBalance:
         self.dp_group = get_parallel_state().dp_group
         logger.info_rank0("Successfully initialized Qwen3 vl encoder data balance")
 
-    def balance_data(self, pixel_values, grid_thw, data_type="image"):
+    def balance_data(
+        self,
+        pixel_values: Optional[torch.Tensor],
+        grid_thw: Optional[torch.Tensor],
+        data_type: str = "image"
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.state_buffer[data_type] = {}
         # split pixel value
         split_batch = {}
+        # Unify the type of grid_thw to long. Normal type of grid thw is int64, while dummy grid thw is int32
+        grid_thw = grid_thw.long()
         pixel_values_length = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
         split_batch["pixel_values"] = pixel_values.split(pixel_values_length.tolist(), dim=0)
         split_batch["image_grid_thw"] = grid_thw
@@ -55,7 +63,13 @@ class Qwen3VLEncoderDataBalance:
 
         return balanced_pixel_values, balanced_grid_thw
 
-    def data_bridge(self, hidden_state, deepstack_feature_lists, require_grad=True, data_type="image"):
+    def data_bridge(
+        self,
+        hidden_state: Optional[torch.Tensor],
+        deepstack_feature_lists: Optional[List],
+        require_grad: bool = True,
+        data_type: str = "image"
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         recoverd_hidden_state = self.reverse_all_to_all_redistribution(
             hidden_state, require_grad=require_grad, data_type=data_type
         )
@@ -73,8 +87,8 @@ class Qwen3VLEncoderDataBalance:
         self,
         data_lengths: torch.Tensor,
         datas: dict[str, torch.Tensor],
-        data_type="Unknown data",
-    ):
+        data_type: str = "image",
+    ) -> Dict[str, List[torch.Tensor]]:
         dp_rank = self.dp_group.rank()
         num_replicas = self.dp_group.size()
 
@@ -151,7 +165,12 @@ class Qwen3VLEncoderDataBalance:
 
         return balanced_datas
 
-    def reverse_all_to_all_redistribution(self, hidden_state, require_grad, data_type="image"):
+    def reverse_all_to_all_redistribution(
+        self,
+        hidden_state: torch.Tensor,
+        require_grad: bool,
+        data_type: str = "image"
+    ) -> torch.Tensor:
         # Redistribute the data back to its original dp rank
         recovered_hidden_state = self.all_to_all_communication(
             list(hidden_state.split(self.state_buffer[data_type]["pixel_values_split"])),
@@ -169,7 +188,13 @@ class Qwen3VLEncoderDataBalance:
 
         return torch.cat(origin_hidden_state)
 
-    def all_to_all_communication(self, data, balanced_data_lengths, data_dim, require_grad=False):
+    def all_to_all_communication(
+        self,
+        data: list[torch.Tensor],
+        balanced_data_lengths: list[tuple],
+        data_dim: tuple,
+        require_grad=False
+    ) -> List[torch.Tensor]:
         balanced_data_cache = [
             torch.empty((*new_length, *data_dim), dtype=data[0].dtype, device=data[0].device).squeeze(-1)
             for new_length in balanced_data_lengths
@@ -183,14 +208,18 @@ class Qwen3VLEncoderDataBalance:
         return balanced_data_cache
 
     @staticmethod
-    def rank_table_mapping(rank_table, dp_rank):
+    def rank_table_mapping(rank_table: list, dp_rank: int) -> Tuple[list, list]:
+        # Validate rank_table before stacking
+        for i, rt in enumerate(rank_table):
+            assert len(rt) > 0, f"rank_table[{i}] is empty (expected non-empty tensor list)"
+
         rank_table = [torch.stack(rt) for rt in rank_table]
         rank_table_for_current_rank = [rt[rt[:, 0] == dp_rank][:, 1] for rt in rank_table]
 
         return rank_table_for_current_rank, rank_table
 
     @staticmethod
-    def data_reorganization(data, data_list):
+    def data_reorganization(data: Union[torch.Tensor, list], data_list: list) -> List[Union[torch.tensor, list]]:
         if isinstance(data, torch.Tensor):
             new_data_group_per_rank = [data[new_group_idxs] for new_group_idxs in data_list]
         else:
@@ -203,7 +232,7 @@ class Qwen3VLEncoderDataBalance:
         return new_data_group_per_rank
 
     @staticmethod
-    def _set_sorting_algo(sorting_algo_name):
+    def _set_sorting_algo(sorting_algo_name: str) -> Any:
         if sorting_algo_name in SORTING_ALGO_FUNC:
             return SORTING_ALGO_FUNC[sorting_algo_name]
         else:

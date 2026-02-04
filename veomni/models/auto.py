@@ -100,8 +100,16 @@ def build_foundation_model(
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
-            config.encoder_data_balance = encoder_data_balance
-            config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
+            if get_parallel_state().sp_enabled:
+                logger.warning_rank0(
+                    "Warning: Qwen3VLEncoderDataBalance currently does not support sequence parallelism. "
+                    "The configuration of 'encoder_data_balance' is reset to False"
+                    "This issue will be addressed in a future release."
+                )
+                config.encoder_data_balance = False
+            else:
+                config.encoder_data_balance = encoder_data_balance
+                config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
         else:
             logger.warning_rank0(
                 f"Encoder data balance currently supported only for Qwen3-VL MoE, "

@@ -1,4 +1,6 @@
 # Sorting algorithm for data balance
+from typing import List
+
 import torch
 
 
@@ -7,7 +9,7 @@ def post_mbs_balancing_greedy_without_pad(
     all_data_lengths: torch.Tensor,
     num_replicas: int,
     dim: int,
-) -> list[list[torch.Tensor]]:
+) -> List[List[torch.Tensor]]:
     """
     A greedy bin-packing sorting algorithm designed for encoder data balance.
     It initializes a number of bins equal to the dp group size, and iteratively assigns data (sorted in descending order
