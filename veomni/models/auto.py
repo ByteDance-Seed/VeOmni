@@ -53,7 +53,8 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     """
     Builds the model config.
     """
-    return get_model_config(config_path, trust_remote_code=True, **config_kwargs)
+    trust_remote_code = config_kwargs.pop("trust_remote_code", True)
+    return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
 def build_foundation_model(
@@ -103,7 +104,7 @@ def build_foundation_model(
             if get_parallel_state().sp_enabled:
                 logger.warning_rank0(
                     "Warning: Qwen3VLEncoderDataBalance currently does not support sequence parallelism. "
-                    "The configuration of 'encoder_data_balance' is reset to False"
+                    "The configuration of 'encoder_data_balance' is reset to False. "
                     "This issue will be addressed in a future release."
                 )
                 config.encoder_data_balance = False

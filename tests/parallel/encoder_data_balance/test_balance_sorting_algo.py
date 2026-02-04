@@ -7,9 +7,7 @@ from veomni.utils.device import get_device_type
 
 
 FAKE_WORLD_SIZE = 8
-WORKLOAD_CAL_RULE = {
-    "s2": lambda x: x**2
-}
+WORKLOAD_CAL_RULE = {"s2": lambda x: x**2}
 
 
 def fake_data_construct():

@@ -250,8 +250,8 @@ def Qwen3VLMoeVisionAttention_forward(
 # ================================================================
 # --- Patch.1 ---
 def Qwen3VLMoeVisionModel_dummy_forward(
-        self: Qwen3VLMoeVisionModel,
-        encoder_data_balance: Qwen3VLEncoderDataBalance = None,
+    self: Qwen3VLMoeVisionModel,
+    encoder_data_balance: Qwen3VLEncoderDataBalance = None,
 ):
     if get_parallel_state().sp_enabled:
         sp_size = get_parallel_state().sp_size

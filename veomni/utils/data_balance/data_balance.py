@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Optional, Union, List, Tuple, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -36,10 +36,7 @@ class Qwen3VLEncoderDataBalance:
         logger.info_rank0("Successfully initialized Qwen3 vl encoder data balance")
 
     def balance_data(
-        self,
-        pixel_values: Optional[torch.Tensor],
-        grid_thw: Optional[torch.Tensor],
-        data_type: str = "image"
+        self, pixel_values: Optional[torch.Tensor], grid_thw: Optional[torch.Tensor], data_type: str = "image"
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.state_buffer[data_type] = {}
         # split pixel value
@@ -68,7 +65,7 @@ class Qwen3VLEncoderDataBalance:
         hidden_state: Optional[torch.Tensor],
         deepstack_feature_lists: Optional[List],
         require_grad: bool = True,
-        data_type: str = "image"
+        data_type: str = "image",
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         recoverd_hidden_state = self.reverse_all_to_all_redistribution(
             hidden_state, require_grad=require_grad, data_type=data_type
@@ -84,10 +81,7 @@ class Qwen3VLEncoderDataBalance:
         return recoverd_hidden_state, recovered_deepstack_feature_lists
 
     def all_to_all_redistribution(
-        self,
-        data_lengths: torch.Tensor,
-        datas: dict[str, torch.Tensor],
-        data_type: str = "image",
+        self, data_lengths: torch.Tensor, datas: Dict[str, torch.Tensor], data_type: str = "image"
     ) -> Dict[str, List[torch.Tensor]]:
         dp_rank = self.dp_group.rank()
         num_replicas = self.dp_group.size()
@@ -166,10 +160,7 @@ class Qwen3VLEncoderDataBalance:
         return balanced_datas
 
     def reverse_all_to_all_redistribution(
-        self,
-        hidden_state: torch.Tensor,
-        require_grad: bool,
-        data_type: str = "image"
+        self, hidden_state: torch.Tensor, require_grad: bool, data_type: str = "image"
     ) -> torch.Tensor:
         # Redistribute the data back to its original dp rank
         recovered_hidden_state = self.all_to_all_communication(
@@ -189,11 +180,7 @@ class Qwen3VLEncoderDataBalance:
         return torch.cat(origin_hidden_state)
 
     def all_to_all_communication(
-        self,
-        data: list[torch.Tensor],
-        balanced_data_lengths: list[tuple],
-        data_dim: tuple,
-        require_grad=False
+        self, data: List[torch.Tensor], balanced_data_lengths: List[tuple], data_dim: tuple, require_grad=False
     ) -> List[torch.Tensor]:
         balanced_data_cache = [
             torch.empty((*new_length, *data_dim), dtype=data[0].dtype, device=data[0].device).squeeze(-1)

@@ -75,16 +75,16 @@ npu = [
   "torchcodec>=0.4.0,<0.6.0"
 ]
 gpu = [
-  "torch==2.8.0+cu128",
-  "torchvision==0.23.0+cu128",
-  "torchaudio==2.8.0+cu128",
+  "torch==2.9.1+cu129",
+  "torchvision==0.24.1+cu129",
+  "torchaudio==2.9.1+cu129",
   "nvidia-cusparselt-cu12",
   "nvidia-nccl-cu12",
   "liger-kernel",
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
-  "torchcodec>=0.6.0,<0.8.0"
+  "torchcodec==0.8.1" # 0.8.1 is compatible with torch 2.9
 ]
 megatron = [
   "megatron-energon>=7.2.1"
@@ -129,10 +129,10 @@ override-dependencies = [
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
     # PyPI without using the cu128 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
-    "torch==2.8.0+cu128; (extra == 'gpu')",
-    "torchaudio==2.8.0+cu128; (extra == 'gpu')",
-    "torchvision==0.23.0+cu128; (extra == 'gpu')",
-    "torchcodec>=0.6.0,<0.8.0; (extra == 'gpu')",
+    "torch==2.9.1+cu129; (extra == 'gpu')",
+    "torchaudio==2.9.1+cu129; (extra == 'gpu')",
+    "torchvision==0.24.1+cu129; (extra == 'gpu')",
+    "torchcodec==0.8.1; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
@@ -145,6 +145,11 @@ override-dependencies = [
     "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
     # Fixate to a specific transformers version since upgrading transformers is a large task.
     "transformers==4.57.3",
+
+    # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
+    # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
+    # TODO: remove this override after we upgrade to torch 2.10.
+    "nvidia-cudnn-cu12==9.15.1.9",
 ]
 
 conflicts = [
@@ -167,13 +172,20 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-# Download flash-attn wheel directly to avoid build issues.
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' or extra == 'sglang'" }
-flash-attn-3 = { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.09.28/flash_attn_3-3.0.0b1%2B20250928.cu128torch280cxx11abitrue.5059fd-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"}
+# Download fa2 and fa3 wheels directly to avoid build issues.
+flash-attn = [
+  # torch 2.9+cu129
+  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.9+.
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"},
+]
+flash-attn-3 = [
+  # torch 2.9+cu129
+  { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
+]
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
 av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video'" }
 
