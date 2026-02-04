@@ -37,6 +37,9 @@ class _Logger(logging.Logger):
     def info_rank0(self, msg: str) -> None:
         self.info(msg)
 
+    def info_once(self, msg: str) -> None:
+        self.info_once(msg)
+
     def warning_rank0(self, msg: str) -> None:
         self.warning(msg)
 
