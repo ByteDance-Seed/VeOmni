@@ -199,6 +199,11 @@ class Qwen3VLTextAttention(_Qwen3VLTextAttention):
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
+
+        # TODO: check this, wehther we need to unpad sp padding?
+        cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
+        sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
+
         query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -833,9 +838,6 @@ class Qwen3VLModel(_Qwen3VLModel):
             if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()
             # --- Patch.5 ---
-
-        if get_parallel_state().sp_enabled and not get_parallel_state().async_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
 
         # --- Patch.6 ---
         kwargs.update(flash_attn_kwargs)

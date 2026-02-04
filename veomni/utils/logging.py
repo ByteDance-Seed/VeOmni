@@ -140,6 +140,16 @@ logging.Logger.warning_rank0 = warning_rank0
 
 
 @lru_cache(None)
+def info_once(self: "logging.Logger", *args, **kwargs) -> None:
+    if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        kwargs["stacklevel"] = kwargs.get("stacklevel", 1) + 1
+        self.info_rank0(*args, **kwargs)
+
+
+logging.Logger.info_once = info_once
+
+
+@lru_cache(None)
 def warning_once(self, *args, **kwargs) -> None:
     if int(os.getenv("LOCAL_RANK", "0")) == 0:
         kwargs["stacklevel"] = kwargs.get("stacklevel", 1) + 1

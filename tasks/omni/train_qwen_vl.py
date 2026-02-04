@@ -3,27 +3,21 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
 from tqdm import trange
 
-from tasks.data.vlm_data_process import (
-    process_sample_qwen2_5_vl,
-    process_sample_qwen3_vl,
-)
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
-    OmniDataCollatorWithPacking,
-    OmniDataCollatorWithPadding,
-    OmniSequenceShardCollator,
     build_dataloader,
     build_dataset,
     build_multimodal_chat_template,
 )
+from veomni.data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -39,11 +33,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
-from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
-
-if TYPE_CHECKING:
-    pass
 
 logger = helper.create_logger(__name__)
 
@@ -81,7 +71,7 @@ class MyDataArguments(DataArguments):
 
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
@@ -149,29 +139,6 @@ def main():
         )
     else:
         raise ValueError(f"Unsupported model type: {model_config.model_type}")
-    if args.train.rmpad:
-        raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
-
-    data_collate_fn = []
-    if args.train.rmpad_with_pos_ids:
-        data_collate_fn.append(OmniDataCollatorWithPacking())
-    else:
-        data_collate_fn.append(OmniDataCollatorWithPadding())
-    if get_parallel_state().sp_enabled:
-        data_collate_fn.append(
-            OmniSequenceShardCollator(
-                padding_scale={
-                    "pixel_values": processor.image_processor.merge_size**2,
-                    "pixel_values_videos": (
-                        processor.video_processor
-                        if hasattr(processor, "video_processor")
-                        else processor.image_processor
-                    ).merge_size
-                    ** 2,
-                },
-                rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            )
-        )
 
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,
@@ -183,7 +150,15 @@ def main():
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    args.compute_train_steps(dataset_length)
+
+    collate_fn_kwargs = {
+        "pad_to_length": args.train.pad_to_length,
+        "data_collate_info": {
+            "pixel_values": (0, True, 0, processor.image_processor.merge_size**2),
+            "pixel_values_videos": (0, True, 0, processor.video_processor.merge_size**2),
+        },
+    }
 
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
@@ -191,39 +166,33 @@ def main():
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
-        seed=args.train.seed,
-        collate_fn=data_collate_fn,
         max_seq_len=args.data.max_seq_len,
-        train_steps=args.train.train_steps,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
-        pad_packed_to_length=args.train.pad_packed_to_length,
+        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
+        seed=args.train.seed,
+        collate_fn_kwargs=collate_fn_kwargs,
     )
 
-    fsdp_kwargs = {}
     if args.train.freeze_vit:
         model.visual.requires_grad_(False)
-        if args.train.data_parallel_mode == "fsdp1":
-            fsdp_kwargs["use_orig_params"] = True
 
     model = build_parallelize_model(
         model,
+        init_device=args.train.init_device,
         weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_reshard_after_forward=args.train.enable_reshard_after_forward,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
-        init_device=args.train.init_device,
         enable_fsdp_offload=args.train.enable_fsdp_offload,
-        fsdp_kwargs=fsdp_kwargs,
-        basic_modules=model._no_split_modules,
+        basic_modules=model._no_split_modules + args.model.basic_modules,
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
@@ -237,7 +206,7 @@ def main():
     )
     lr_scheduler = build_lr_scheduler(
         optimizer,
-        train_steps=args.train.train_steps * args.train.num_train_epochs,
+        train_steps=args.train_steps * args.train.num_train_epochs,
         lr=args.train.lr,
         lr_min=args.train.lr_min,
         lr_decay_style=args.train.lr_decay_style,
@@ -275,8 +244,6 @@ def main():
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         enable_multisource=args.data.enable_multisource,
         dataloader=train_dataloader,
         data_path=args.data.train_path,
@@ -287,8 +254,8 @@ def main():
         state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
         Checkpointer.load(args.train.load_checkpoint_path, state)
         global_step = state["extra_state"]["global_step"]
-        start_epoch = global_step // args.train.train_steps
-        start_step = global_step % args.train.train_steps
+        start_epoch = global_step // args.train_steps
+        start_step = global_step % args.train_steps
         lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
         train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
         environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
@@ -309,14 +276,14 @@ def main():
             train_dataloader.set_epoch(epoch)
 
         data_loader_tqdm = trange(
-            args.train.train_steps,
+            args.train_steps,
             desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
-            total=args.train.train_steps,
+            total=args.train_steps,
             initial=start_step,
             disable=args.train.local_rank != 0,
         )
         data_iterator = iter(train_dataloader)
-        for _ in range(start_step, args.train.train_steps):
+        for _ in range(start_step, args.train_steps):
             global_step += 1
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -350,19 +317,6 @@ def main():
                     micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
-                # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-                    micro_batch["position_ids"][:, 0, :]
-                )
-                micro_batch.update(
-                    dict(
-                        cu_seq_lens_q=cu_seq_lens_q,
-                        cu_seq_lens_k=cu_seq_lens_k,
-                        max_length_q=max_length_q,
-                        max_length_k=max_length_k,
-                    )
-                )
-
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
                     for k, v in micro_batch.items()
@@ -371,8 +325,10 @@ def main():
                 with model_fwd_context:
                     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss
 
-                loss, _ = mean_global_loss(loss, micro_batch_token_len, micro_batches_token_len)
-
+                loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
+                    loss, micro_batch_token_len, micro_batches_token_len
+                )
+                loss = torch.stack(list(loss_dict.values())).sum()
                 with model_bwd_context:
                     loss.backward()
 
@@ -400,7 +356,12 @@ def main():
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
                     train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                        {
+                            "training/total_loss": total_loss,
+                            "training/foundation_loss": total_loss,
+                            "training/grad_norm": grad_norm,
+                            "training/lr": lr,
+                        }
                     )
                     wandb.log(train_metrics, step=global_step)
 

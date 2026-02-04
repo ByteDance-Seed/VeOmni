@@ -4,7 +4,7 @@ model:
   attn_implementation: flash_attention_2
 
 data:
-  train_path: sharegpt4v_pretrain
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
   data_type: conversation
   chat_template: qwen3vl
   max_seq_len: 4096

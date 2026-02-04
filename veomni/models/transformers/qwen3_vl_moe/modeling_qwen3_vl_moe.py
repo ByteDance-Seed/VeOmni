@@ -687,9 +687,6 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                 position_ids = position_ids.transpose(0, 1).contiguous()
             # --- Patch.6 ---
 
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-
         # --- Patch.7 ---
         kwargs.update(text_flash_attn_kwargs)
         # --- Patch.7 ---

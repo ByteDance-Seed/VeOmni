@@ -54,9 +54,7 @@ def add_flash_attention_kwargs_from_position_ids(
     position_ids = batch["position_ids"]
     if position_ids.dim() == 3:  # bs, dim, seq_len
         position_ids = position_ids[:, 0, :]
-    (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-        batch["position_ids"]
-    )
+    (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(position_ids)
 
     batch["cu_seq_lens_q"] = cu_seq_lens_q
     batch["cu_seq_lens_k"] = cu_seq_lens_k
