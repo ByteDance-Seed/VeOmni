@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 from torch import nn
-from transformers import Qwen3MoeConfig, Qwen3MoeModel
+from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -243,7 +243,7 @@ def qwen3_moe_model_forward(
 # 1. Support use with fuse cross_entropy loss function.
 # ================================================================
 def qwen3_moe_forcausal_lm_forward(
-    self,
+    self: Qwen3MoeForCausalLM,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
