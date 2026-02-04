@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List
 
 import torch
 
+from ...utils.constants import TYPE2INDEX
 from ...utils.import_utils import is_video_audio_available
-from ..constants import TYPE2INDEX
 from .image_utils import fetch_images
 from .preprocess import conv_preprocess
 

@@ -47,7 +47,6 @@ from transformers.utils import (
     is_torchdynamo_compiling,
 )
 
-from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -57,6 +56,7 @@ from ....distributed.sequence_parallel import (
     unpad_tensor,
 )
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 

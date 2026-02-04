@@ -19,7 +19,6 @@ from veomni.data import (
     build_dataloader,
     build_dataset,
 )
-from veomni.data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.data.multimodal.audio_utils import fetch_audios
 from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.preprocess import conv_preprocess
@@ -34,6 +33,7 @@ from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,

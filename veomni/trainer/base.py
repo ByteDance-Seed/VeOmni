@@ -183,12 +183,16 @@ class BaseTrainer(Stateful, ABC):
         self.tokenizer = build_tokenizer(self.args.model.tokenizer_path)
         return [self.tokenizer]
 
+    def build_data_collate_info(self):
+        return {}
+
     def build_collaten_fn_kwargs(self):
         if self.args.data.data_type == "classification":
             seq_classification = True
         else:
             seq_classification = False
         return {
+            "data_collate_info": self.build_data_collate_info(),
             "pad_to_length": self.args.train.pad_to_length,
             "seq_classification": seq_classification,
         }

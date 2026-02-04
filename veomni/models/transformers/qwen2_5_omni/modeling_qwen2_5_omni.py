@@ -43,7 +43,6 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniVisionEncoder as _Qwen2_5OmniVisionEncoder,
 )
 
-from ....data.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -54,6 +53,7 @@ from ....distributed.sequence_parallel import (
     unpad_tensor,
 )
 from ....utils import logging
+from ....utils.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 

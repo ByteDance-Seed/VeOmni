@@ -3,7 +3,7 @@ import types
 import pytest
 import torch
 
-from veomni.data.constants import IGNORE_INDEX
+from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 

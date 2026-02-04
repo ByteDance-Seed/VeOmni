@@ -8,12 +8,12 @@ from transformers import ProcessorMixin
 from ..arguments import DataArguments, ModelArguments, TrainingArguments
 from ..data import build_multimodal_chat_template
 from ..data.chat_template import ChatTemplate
-from ..data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ..data.multimodal import conv_preprocess
 from ..data.multimodal.image_utils import fetch_images
 from ..data.multimodal.video_utils import fetch_videos, fetch_videos_metadata
 from ..models import build_processor
 from ..utils import helper
+from ..utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from .base import BaseTrainer
 
 

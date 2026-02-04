@@ -3,8 +3,8 @@ from typing import Union
 
 import torch
 
-from ..data.constants import IGNORE_INDEX
 from ..distributed.parallel_state import get_parallel_state
+from .constants import IGNORE_INDEX
 from .dist_utils import all_reduce
 
 

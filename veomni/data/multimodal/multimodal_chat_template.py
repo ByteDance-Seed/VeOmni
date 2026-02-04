@@ -22,8 +22,8 @@ import torch
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from ...utils import logging
+from ...utils.constants import IGNORE_INDEX, TYPE2INDEX
 from ..chat_template import ChatmlTemplate, ChatTemplate
-from ..constants import IGNORE_INDEX, TYPE2INDEX
 
 
 logger = logging.get_logger(__name__)

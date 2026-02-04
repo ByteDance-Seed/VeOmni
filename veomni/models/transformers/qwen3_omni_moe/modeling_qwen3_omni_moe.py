@@ -70,7 +70,6 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import OutputRecorder, TransformersKwargs, check_model_inputs
 
-from ....data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -80,6 +79,7 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
+from ....utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
 
 if is_flash_attn_2_available():

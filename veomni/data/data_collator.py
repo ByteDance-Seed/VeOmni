@@ -20,11 +20,13 @@ from typing import Any, Dict, List, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch.utils.data._utils.collate import default_collate
+from transformers.modeling_outputs import ModelOutput
 
 from ..distributed.parallel_state import get_parallel_state
+from ..distributed.sequence_parallel import gather_outputs
 from ..utils import logging
-from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
-from .constants import IGNORE_INDEX, MODALITY
+from ..utils.constants import IGNORE_INDEX, MODALITY
+from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 
 
 logger = logging.get_logger(__name__)
@@ -428,3 +430,36 @@ class MainCollator(DataCollator):
 
         log_str += "=" * (25 + 18 * len(fields)) + "\n"
         return log_str
+
+
+@dataclass
+class PostCollator(DataCollator):
+    def __init__(self):
+        self.postforward_pipeline = []
+        self.compute_seqlens_func = SeqlensComputePostCollator()
+        self.postforward_pipeline.append(PackingPostCollator())
+
+    def __call__(self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]):
+        seq_lens = self.compute_seqlens_func(micro_batch)
+        for postforward_func in self.postforward_pipeline:
+            outputs = postforward_func(outputs, seq_lens)
+        return outputs
+
+
+@dataclass
+class SeqlensComputePostCollator(DataCollator):
+    def __call__(self, micro_batch: Dict[str, torch.Tensor]):
+        seq_lens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        return seq_lens
+
+
+@dataclass
+class PackingPostCollator(DataCollator):
+    def __call__(self, outputs: ModelOutput, seq_lens):
+        logits = outputs.logits
+        if get_parallel_state().sp_enabled:
+            logits = gather_outputs(logits, gather_dim=0, group=get_parallel_state().sp_group)
+            logits = logits[: sum(seq_lens)]  # remove sp padding
+        logits_list = logits.split(seq_lens, dim=0)
+        outputs.logits = logits_list
+        return outputs
