@@ -901,11 +901,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, dim, l -> dim, bs, l
         # --- Patch.6 ---
 
-        # --- Patch.3 ---
-        if get_parallel_state().sp_enabled:
-            position_ids = slice_input_tensor(position_ids, dim=-1)
-        # --- Patch.3 ---
-
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,

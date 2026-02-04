@@ -384,11 +384,6 @@ class Qwen2VLModel(_Qwen2VLModel):
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, 3, l -> 3, bs, l
         # --- Patch.3 ---
 
-        # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-        # --- Patch.1 ---
-
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,

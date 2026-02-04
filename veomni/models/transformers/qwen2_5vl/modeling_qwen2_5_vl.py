@@ -510,11 +510,6 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, dim, l -> dim, bs, l
             # --- Patch.5 ---
 
-        # --- Patch.3 ---
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-        # --- Patch.3 ---
-
         # --- Patch.6 ---
         kwargs.update(flash_attn_kwargs)
         # --- Patch.6 ---
