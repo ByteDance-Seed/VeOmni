@@ -192,12 +192,8 @@ class VLMTrainer(BaseTrainer):
 
     def freeze_module(self):
         args: Arguments = self.args
-        fsdp_kwargs = {}
         if args.train.freeze_vit:
             self.model.visual.requires_grad_(False)
-            if args.train.data_parallel_mode == "fsdp1":
-                fsdp_kwargs["use_orig_params"] = True
-        return fsdp_kwargs
 
     def build_param_groups(self):
         args: Arguments = self.args

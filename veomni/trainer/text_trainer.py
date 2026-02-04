@@ -6,7 +6,7 @@ from ..data import (
 from ..data.data_transform import process_pretrain_example, process_sft_example
 from ..models import build_tokenizer
 from ..utils import helper
-from .base import Arguments, BaseTrainer
+from .base import BaseTrainer, VeOmniArguments
 
 
 logger = helper.create_logger(__name__)
@@ -14,7 +14,7 @@ logger = helper.create_logger(__name__)
 
 class TextTrainer(BaseTrainer):
     def build_model_assets(self):
-        args: Arguments = self.args
+        args: VeOmniArguments = self.args
         self.tokenizer = build_tokenizer(args.model.tokenizer_path)
         if args.data.data_type == "plaintext":
             return [self.tokenizer]
@@ -23,7 +23,7 @@ class TextTrainer(BaseTrainer):
             return [self.chat_template]
 
     def build_data_transform(self):
-        args: Arguments = self.args
+        args: VeOmniArguments = self.args
         if args.data.data_type == "plaintext":
             data_transform = partial(
                 process_pretrain_example,

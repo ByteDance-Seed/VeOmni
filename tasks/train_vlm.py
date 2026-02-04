@@ -1,6 +1,5 @@
 from veomni.arguments import parse_args
-from veomni.trainer import VLMTrainer
-from veomni.trainer.vlm_trainer import Arguments
+from veomni.trainer.vlm_trainer import Arguments, VLMTrainer
 
 
 if __name__ == "__main__":

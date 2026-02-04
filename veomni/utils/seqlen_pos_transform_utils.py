@@ -97,3 +97,15 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
     max_length_k = max_length_q
 
     return (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)
+
+
+def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """
+    cu_seqlens: shape (B+1,), monotonic non-decreasing.
+    padding at the tail is represented by consecutive +1 increments:
+      ..., n, n+1, n+2, ... , n+padlen (sp padding / pad_to_length padding)
+    Return: 1D tensor of valid seqlens (exclude tail padding segments).
+    """
+    diff = cu_seqlens[1:] - cu_seqlens[:-1]
+    pad = int((torch.flip(diff == 1, (0,)).cumprod(0)).sum().item())
+    return diff[:-pad] if pad else diff

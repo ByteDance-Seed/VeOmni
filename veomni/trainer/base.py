@@ -15,7 +15,7 @@ Features:
 import json
 from abc import ABC
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from typing import Any, Dict, List
 
 import torch
@@ -27,7 +27,7 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
-from ..arguments import DataArguments, ModelArguments, TrainingArguments, save_args
+from ..arguments import VeOmniArguments, save_args
 from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
@@ -60,17 +60,9 @@ from .callbacks import (
     TrainerState,
     WandbTraceCallback,
 )
-from .preforward import Preforward
 
 
 logger = logging.get_logger(__name__)
-
-
-@dataclass
-class Arguments:
-    model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 class BaseTrainer(Stateful, ABC):
@@ -98,7 +90,7 @@ class BaseTrainer(Stateful, ABC):
     """
 
     # Core configs
-    args: Arguments
+    args: VeOmniArguments
     device: torch.device
 
     # Data
@@ -134,7 +126,12 @@ class BaseTrainer(Stateful, ABC):
     callbacks: CallbackHandler
     state: TrainerState
 
-    def __init__(self, args: Arguments):
+    # Training states
+    train_steps: int = 0  # total training steps
+    start_epoch: int = 0  # start epoch
+    start_step: int = 0  # start step
+
+    def __init__(self, args: VeOmniArguments):
         """
         Initialize the trainer.
 
@@ -146,7 +143,7 @@ class BaseTrainer(Stateful, ABC):
                 train: TrainingArguments
         """
 
-        self.args: Arguments = args
+        self.args: VeOmniArguments = args
         logger.info_rank0(json.dumps(asdict(self.args), indent=2))
 
         self._setup()
@@ -166,8 +163,6 @@ class BaseTrainer(Stateful, ABC):
         self._build_training_context()
         # Initialize callbacks
         self._init_callbacks()
-        # preforward & postforward
-        self._build_preforward_postforward()
 
         # Call post-initialization hook for subclasses
         self.post_init()
@@ -176,8 +171,7 @@ class BaseTrainer(Stateful, ABC):
         pass
 
     def freeze_module(self):
-        fsdp_kwargs = {}
-        return fsdp_kwargs
+        pass
 
     def build_param_groups(self):
         return None
@@ -188,6 +182,16 @@ class BaseTrainer(Stateful, ABC):
     def build_model_assets(self):
         self.tokenizer = build_tokenizer(self.args.model.tokenizer_path)
         return [self.tokenizer]
+
+    def build_collaten_fn_kwargs(self):
+        if self.args.data.data_type == "classification":
+            seq_classification = True
+        else:
+            seq_classification = False
+        return {
+            "pad_to_length": self.args.train.pad_to_length,
+            "seq_classification": seq_classification,
+        }
 
     def _setup(self):
         self._init_distributed()
@@ -244,49 +248,49 @@ class BaseTrainer(Stateful, ABC):
         self.model_assets = [self.model_config]
         self.model_assets.extend(self.build_model_assets())
 
-        # freeze module and init fsdp_kwargs for building parallelized model
-        self.fsdp_kwargs = self.freeze_module()
+        # freeze module
+        self.freeze_module()
 
         helper.print_device_mem_info("VRAM usage after building model")
 
     def build_training_dataset(self):
-        args: Arguments = self.args
+        args: VeOmniArguments = self.args
         data_transform = self.build_data_transform()
         # Build dataset
         self.train_dataset = build_dataset(
             dataset_name=args.data.dataset_name,
             transform=data_transform,
-            dataloader_batch_size=args.train.dataloader_batch_size,
             seed=args.train.seed,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
         if args.data.datasets_type == "mapping":
             dataset_length = dataset_length / args.train.data_parallel_size
-        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
-        self.train_steps = args.train.train_steps
+        args.compute_train_steps(dataset_length)
+        self.train_steps = args.train_steps
 
     def build_training_dataloader(self):
-        args: Arguments = self.args
+        args: VeOmniArguments = self.args
+        collate_fn_kwargs = self.build_collaten_fn_kwargs()
         self.train_dataloader = build_dataloader(
             dataloader_type=args.data.dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
             global_batch_size=args.train.global_batch_size,
             dataloader_batch_size=args.train.dataloader_batch_size,
-            seed=args.train.seed,
-            collate_fn=[],
             max_seq_len=args.data.max_seq_len,
-            train_steps=args.train.train_steps,
-            rmpad=args.train.rmpad,
-            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+            train_steps=args.train_steps,
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+            dyn_bsz=args.train.dyn_bsz,
+            dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             num_workers=args.data.num_workers,
             drop_last=args.data.drop_last,
             pin_memory=args.data.pin_memory,
             prefetch_factor=args.data.prefetch_factor,
+            seed=args.train.seed,
+            build_collate_fn=True,
+            collate_fn_kwargs=collate_fn_kwargs,
         )
 
     def _build_data(self):
@@ -296,7 +300,7 @@ class BaseTrainer(Stateful, ABC):
         # TODO: val dataset & dataloader
 
     def _build_parallelized_model(self):
-        args: Arguments = self.args
+        args: VeOmniArguments = self.args
 
         # Parallelize model
         self.model = build_parallelize_model(
@@ -304,10 +308,10 @@ class BaseTrainer(Stateful, ABC):
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
             enable_full_shard=args.train.enable_full_shard,
+            enable_reshard_after_forward=args.train.enable_reshard_after_forward,
             enable_mixed_precision=args.train.enable_mixed_precision,
             enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
             enable_fsdp_offload=args.train.enable_fsdp_offload,
-            fsdp_kwargs=self.fsdp_kwargs,
             basic_modules=self.model._no_split_modules + args.model.basic_modules,
             enable_reentrant=args.train.enable_reentrant,
             enable_forward_prefetch=args.train.enable_forward_prefetch,
@@ -316,7 +320,7 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_optimizer_and_scheduler(self):
         """Build optimizer and learning rate scheduler."""
-        args: Arguments = self.args
+        args: VeOmniArguments = self.args
 
         param_groups = self.build_param_groups()
 
@@ -333,7 +337,7 @@ class BaseTrainer(Stateful, ABC):
         # Build lr scheduler
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
-            train_steps=args.train.train_steps * args.train.num_train_epochs,
+            train_steps=args.train_steps * args.train.num_train_epochs,
             lr=args.train.lr,
             lr_min=args.train.lr_min,
             lr_decay_style=args.train.lr_decay_style,
@@ -350,6 +354,19 @@ class BaseTrainer(Stateful, ABC):
             self.args.train.activation_gpu_limit,
         )
 
+    def _model_reshard(self, micro_step: int, num_micro_steps: int):
+        """Reshard model after backward pass."""
+        args: VeOmniArguments = self.args
+        if (
+            args.train.data_parallel_mode == "fsdp2"
+            and not args.train.enable_reshard_after_backward
+            and num_micro_steps > 1
+        ):
+            if micro_step == 0:
+                self.model.set_reshard_after_backward(False)
+            elif micro_step == num_micro_steps - 1:
+                self.model.set_reshard_after_backward(True)
+
     def _init_callbacks(self):
         """Initialize callbacks."""
         callbacks = [
@@ -364,23 +381,15 @@ class BaseTrainer(Stateful, ABC):
         self.callbacks = CallbackHandler(callbacks)
         self.state = TrainerState()
 
-    def _build_preforward_postforward(self):
-        """Build preforward and postforward hooks."""
-        self.pre_forward = Preforward(
-            rmpad_with_pos_ids=self.args.train.rmpad_with_pos_ids,
-            attn_implementation=self.args.model.attn_implementation,
-        )
-        self.post_forward = lambda x: None  # postforward only used for rl_trainer
-
     def add_callback(self, callback: Callback):
         self.callbacks.add(callback)
 
     def fit(self):
-        args: Arguments = self.args
+        args: VeOmniArguments = self.args
         self.callbacks.call("on_train_begin", self.state)
         logger.info(
             f"Rank{args.train.local_rank} Start training. "
-            f"Train_steps: {args.train.train_steps}. "
+            f"Train_steps: {args.train_steps}. "
             f"Epochs: {args.train.num_train_epochs}."
         )
 
@@ -394,7 +403,7 @@ class BaseTrainer(Stateful, ABC):
             # Create a batch generator
             data_iterator = iter(self.train_dataloader)
 
-            for _ in range(self.start_step, args.train.train_steps):
+            for _ in range(self.start_step, args.train_steps):
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:
@@ -418,8 +427,6 @@ class BaseTrainer(Stateful, ABC):
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
-        micro_batch = self.pre_forward(micro_batch)
-
         micro_batch = {
             k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in micro_batch.items()
@@ -475,14 +482,15 @@ class BaseTrainer(Stateful, ABC):
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        # token num for fixed_ce_loss
+        # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
-
+        num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
-        for micro_batch in micro_batches:
+        for micro_step, micro_batch in enumerate(micro_batches):
+            self._model_reshard(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
-            # token num for fixed_ce_loss
+            # token num for fixed_ce_loss in postforward
             self.micro_batch_token_len = count_loss_token(micro_batch)
             loss, loss_dict = self.forward_backward_step(micro_batch)
 

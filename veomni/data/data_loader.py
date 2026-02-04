@@ -26,6 +26,7 @@ from ..utils.registry import Registry
 from .data_collator import (
     MainCollator,
     MakeMicroBatchCollator,
+    NoopDataCollator,
     UnpackDataCollator,
 )
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
@@ -67,11 +68,15 @@ def build_native_dataloader(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     seed: int = 0,
+    build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = {},
 ) -> "DistributedDataloader":
     parallel_state = get_parallel_state()
 
-    collate_fn = MainCollator(**collate_fn_kwargs)
+    if build_collate_fn:
+        collate_fn = MainCollator(**collate_fn_kwargs)
+    else:
+        collate_fn = NoopDataCollator()
     num_micro_batch = global_batch_size // (
         micro_batch_size * parallel_state.dp_size
     )  # num_micro_batch = num accumulation steps

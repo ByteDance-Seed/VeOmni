@@ -33,8 +33,6 @@ from transformers.utils import (
     can_return_tuple,
 )
 
-from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel import slice_position_embedding
 from ....utils import logging
 from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from ....utils.import_utils import (
@@ -108,10 +106,10 @@ def qwen3_model_forward(
     # create position embeddings to be shared across the decoder layers
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-    # --- Patch.1 ---
-    sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-    # --- Patch.1 ---
+    # # --- Patch.1 ---
+    # sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
+    # position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
+    # # --- Patch.1 ---
 
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         hidden_states = decoder_layer(

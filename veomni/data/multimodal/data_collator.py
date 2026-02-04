@@ -23,8 +23,9 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data._utils.collate import default_collate
 
 from ...distributed.parallel_state import get_parallel_state
+from ...utils.seqlen_pos_transform_utils import pos2culen
 from ..constants import IGNORE_INDEX
-from ..data_collator_backup import DataCollator, pos2culen
+from ..data_collator import DataCollator
 
 
 MODALITY = ["image", "video", "audio"]

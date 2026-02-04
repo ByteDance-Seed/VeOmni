@@ -10,12 +10,12 @@ from .base import Callback, TrainerState
 
 
 if TYPE_CHECKING:
-    from ..base import Arguments, BaseTrainer
+    from ..base import BaseTrainer, VeOmniArguments
 
 
 class WandbTraceCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        args: "Arguments" = self.trainer.args
+        args: "VeOmniArguments" = self.trainer.args
         if args.train.global_rank == 0 and args.train.use_wandb:
             import wandb
 
@@ -26,7 +26,7 @@ class WandbTraceCallback(Callback):
             )
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        args: "Arguments" = self.trainer.args
+        args: "VeOmniArguments" = self.trainer.args
 
         if args.train.global_rank == 0 and args.train.use_wandb:
             import wandb
@@ -36,7 +36,7 @@ class WandbTraceCallback(Callback):
 
 class ProfileTraceCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        args: "Arguments" = self.trainer.args
+        args: "VeOmniArguments" = self.trainer.args
         if args.train.profile_this_rank:
             self.profiler = helper.create_profiler(
                 start_step=args.train.profile_start_step,
@@ -50,7 +50,7 @@ class ProfileTraceCallback(Callback):
             self.profiler.start()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        args: "Arguments" = self.trainer.args
+        args: "VeOmniArguments" = self.trainer.args
         if args.train.profile_this_rank:
             if state.global_step <= args.train.profile_end_step:
                 self.profiler.step()
@@ -63,7 +63,7 @@ class EnvironMeterCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
 
-        args: "Arguments" = self.trainer.args
+        args: "VeOmniArguments" = self.trainer.args
         self.trainer.environ_meter = helper.EnvironMeter(
             config=trainer.model_config,
             global_batch_size=args.train.global_batch_size,
@@ -75,8 +75,7 @@ class EnvironMeterCallback(Callback):
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
-            for sample in micro_batch:
-                self.trainer.environ_meter.add(sample)
+            self.trainer.environ_meter.add(micro_batch)
         self.start_time = time.time()
 
     def on_step_end(
@@ -108,11 +107,11 @@ class EnvironMeterCallback(Callback):
 
 class TqdmCallback(Callback):
     def on_epoch_begin(self, state: TrainerState, **kwargs) -> None:
-        args: "Arguments" = self.trainer.args
+        args: "VeOmniArguments" = self.trainer.args
         self.data_loader_tqdm = trange(
-            args.train.train_steps,
+            args.train_steps,
             desc=f"Epoch {state.epoch + 1}/{args.train.num_train_epochs}",
-            total=args.train.train_steps,
+            total=args.train_steps,
             initial=self.trainer.start_step,
             disable=args.train.local_rank != 0,
         )

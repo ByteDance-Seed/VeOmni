@@ -127,9 +127,19 @@ class DataCollator(ABC):
 
 
 @dataclass
+class NoopDataCollator(DataCollator):
+    """
+    Data collator with no operation, used when collating in preforward.
+    """
+
+    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> List[Dict[str, "torch.Tensor"]]:
+        return features
+
+
+@dataclass
 class UnpackDataCollator(DataCollator):
     """
-    Data collator to unpack examples, used in dynamic batch dataloader at worker process.
+    Data collator to unpack examples, used in dynamic batch dataloader.
     """
 
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:

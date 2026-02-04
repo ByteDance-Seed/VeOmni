@@ -337,13 +337,9 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Epochs to train."},
     )
-    pad_packed_to_length: Optional[int] = field(
-        default=None,
-        metadata={"help": "Pad packed sequences to a fixed length when rmpad_with_pos_ids is enabled."},
-    )
-    pad_packed_input: bool = field(
+    pad_to_length: bool = field(
         default=False,
-        metadata={"help": "Enable padding for packed sequences when rmpad_with_pos_ids is enabled."},
+        metadata={"help": "Pad packed sequences to a fixed length when using dynamic batch size."},
     )
     bsz_warmup_ratio: float = field(
         default=0,
@@ -687,18 +683,16 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
-        if self.train.pad_packed_input:
-            if self.train.pad_packed_to_length is None and self.data.max_seq_len is not None:
-                self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
-                logger.info_rank0(
-                    f"pad_packed_input is set to true without pad_packed_to_length, setting pad_packed_to_length to train.micro_batch_size * data.max_seq_len = {self.train.pad_packed_to_length}"
-                )
-            if self.train.pad_packed_to_length < self.train.micro_batch_size * self.data.max_seq_len:
+        if self.train.pad_to_length:
+            if not self.train.dyn_bsz:
                 logger.warning_rank0(
-                    "pad_packed_to_length is smaller than train.micro_batch_size * data.max_seq_len, the actual input size can be larger than pad_packed_to_length"
+                    "pad_to_length is enabled without dyn_bsz, which is not supported. "
+                    "Please set pad_to_length to False or enable dyn_bsz."
                 )
-        else:
-            self.train.pad_packed_to_length = None
+                self.train.pad_to_length = None
+            else:
+                self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
+                logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:

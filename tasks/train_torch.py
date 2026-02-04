@@ -11,7 +11,6 @@ import torch.distributed as dist
 import wandb
 from tqdm import trange
 
-# from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.arguments import VeOmniArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
@@ -39,13 +38,6 @@ from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 
 
 logger = helper.create_logger(__name__)
-
-
-# @dataclass
-# class Arguments:
-#     model: "ModelArguments" = field(default_factory=ModelArguments)
-#     data: "DataArguments" = field(default_factory=DataArguments)
-#     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 def main():
@@ -111,28 +103,29 @@ def main():
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    args.compute_train_steps(dataset_length)
 
+    collate_fn_kwargs = {
+        "pad_to_length": args.train.pad_to_length,
+    }
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
-        seed=args.train.seed,
         max_seq_len=args.data.max_seq_len,
-        train_steps=args.train.train_steps,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
+        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        pad_packed_to_length=args.train.pad_packed_to_length,
-        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
+        seed=args.train.seed,
+        collate_fn_kwargs=collate_fn_kwargs,
     )
 
     logger.info_rank0("Prepare model")
@@ -175,7 +168,7 @@ def main():
 
     lr_scheduler = build_lr_scheduler(
         optimizer,
-        train_steps=args.train.train_steps * args.train.num_train_epochs,
+        train_steps=args.train_steps * args.train.num_train_epochs,
         lr=args.train.lr,
         lr_min=args.train.lr_min,
         lr_decay_style=args.train.lr_decay_style,
@@ -214,8 +207,6 @@ def main():
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
         enable_multisource=args.data.enable_multisource,
         dataloader=train_dataloader,
@@ -226,8 +217,8 @@ def main():
         state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
         Checkpointer.load(args.train.load_checkpoint_path, state)
         global_step = state["extra_state"]["global_step"]
-        start_epoch = global_step // args.train.train_steps
-        start_step = global_step % args.train.train_steps
+        start_epoch = global_step // args.train_steps
+        start_step = global_step % args.train_steps
         lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
         train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
         environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
@@ -244,21 +235,21 @@ def main():
     )
     model.train()
     logger.info(
-        f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
+        f"rank{args.train.local_rank} Start training, train_steps: {args.train_steps}, epochs: {args.train.num_train_epochs}"
     )
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
         data_loader_tqdm = trange(
-            args.train.train_steps,
+            args.train_steps,
             desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
-            total=args.train.train_steps,
+            total=args.train_steps,
             initial=start_step,
             disable=args.train.local_rank != 0,
         )
         data_iterator = iter(train_dataloader)
-        for _ in range(start_step, args.train.train_steps):
+        for _ in range(start_step, args.train_steps):
             global_step += 1
 
             try:
@@ -301,8 +292,10 @@ def main():
                 with model_fwd_context:
                     loss = model(**micro_batch, use_cache=False).loss
 
-                loss, _ = mean_global_loss(loss, micro_batch_token_num, micro_batches_token_num)
-
+                loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
+                    loss, micro_batch_token_num, micro_batches_token_num
+                )
+                loss = torch.stack(list(loss_dict.values())).sum()
                 with model_bwd_context:
                     loss.backward()
 
@@ -332,7 +325,12 @@ def main():
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
                     train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                        {
+                            "training/total_loss": total_loss,
+                            "training/foundation_loss": total_loss,
+                            "training/grad_norm": grad_norm,
+                            "training/lr": lr,
+                        }
                     )
                     wandb.log(train_metrics, step=global_step)
 
