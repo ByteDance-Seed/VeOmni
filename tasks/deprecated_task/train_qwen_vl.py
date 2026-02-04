@@ -17,7 +17,7 @@ from veomni.data import (
     build_dataset,
     build_multimodal_chat_template,
 )
-from veomni.data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl
+from veomni.data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl, process_sample_qwen_omni
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -55,6 +55,10 @@ class MyTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the vit parameters."},
+    )
+    freeze_audio_tower: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the audio tower parameters."},
     )
     vit_lr: float = field(
         default=1e-6,
@@ -115,11 +119,15 @@ def main():
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
-
     logger.info_rank0("Prepare data")
     processor = build_processor(args.model.tokenizer_path)
-    position_id_func = model.get_position_id_func()
-    chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
+
+    if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        model.disable_talker()
+        position_id_func = model.thinker.get_position_id_func()
+    else:
+        position_id_func = model.get_position_id_func()
+        chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
     if model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
         transform = partial(
@@ -134,6 +142,13 @@ def main():
             process_sample_qwen3_vl,
             processor=processor,
             chat_template=chat_template,
+            position_id_func=position_id_func,
+            **args.data.mm_configs,
+        )
+    elif model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        transform = partial(
+            process_sample_qwen_omni,
+            processor=processor,
             position_id_func=position_id_func,
             **args.data.mm_configs,
         )
@@ -160,6 +175,15 @@ def main():
         },
     }
 
+    if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        collate_fn_kwargs["data_collate_info"].update(
+            {
+                "audio_feature_lengths": (0, False, None, None),
+                "input_features": (0, True, 0, 1),
+                "audio_mask": (-1, False, 0, 1),
+            }
+        )
+
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
         dataset=train_dataset,
@@ -181,7 +205,15 @@ def main():
     )
 
     if args.train.freeze_vit:
-        model.visual.requires_grad_(False)
+        if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            model.thinker.visual.requires_grad_(False)
+            model.thinker.visual.merger.requires_grad_(True)
+        else:
+            model.visual.requires_grad_(False)
+
+    if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        model.thinker.audio_tower.requires_grad_(False)
+        model.thinker.audio_tower.proj.requires_grad_(True)
 
     model = build_parallelize_model(
         model,

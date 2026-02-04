@@ -105,7 +105,6 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "pixel_values_videos": DataCollateInfo(0, True, 0, 4),
     "image_mask": DataCollateInfo(-1, False, 0, 1),
     "video_mask": DataCollateInfo(-1, False, 0, 1),
-    "audio_mask": DataCollateInfo(-1, False, 0, 1),
     "image_grid_hw": DataCollateInfo(0, False, None, None),
     "image_grid_thw": DataCollateInfo(0, False, None, None),
     "video_grid_thw": DataCollateInfo(0, False, None, None),
