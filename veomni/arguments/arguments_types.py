@@ -184,6 +184,16 @@ class DataArguments:
         default=None,
         metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
     )
+    train_size: int = field(
+        default=10_000_000,
+        metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
+    )
+    train_sample: int = field(
+        default=10_000,
+        metadata={
+            "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
+        },
+    )
     data_type: Literal["plaintext", "conversation", "diffusion", "classification"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
@@ -276,16 +286,6 @@ class TrainingArguments:
         default="full",
         metadata={
             "help": "Specifies the parameter update strategy for training the multi-modal model. 'full' for Standard SFT, lora for LoRA."
-        },
-    )
-    train_size: int = field(
-        default=10_000_000,
-        metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
-    )
-    train_sample: int = field(
-        default=10_000,
-        metadata={
-            "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
     dyn_bsz: bool = field(
@@ -696,16 +696,16 @@ class VeOmniArguments:
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:
-            assert self.data.max_seq_len is not None and self.train.train_size is not None, (
-                "data.max_seq_len and train.train_size are required."
+            assert self.data.max_seq_len is not None and self.data.train_size is not None, (
+                "data.max_seq_len and data.train_size are required."
             )
-            train_size = int(self.train.train_size * (1 + self.train.bsz_warmup_ratio / 2))
+            train_size = int(self.data.train_size * (1 + self.train.bsz_warmup_ratio / 2))
             self._train_steps = math.ceil(train_size / (self.train.global_batch_size * self.data.max_seq_len))
         else:
             if dataset_length is not None:  # mapping dataset
                 self._train_steps = math.floor(dataset_length / self.train.dataloader_batch_size)
             else:
-                self._train_steps = math.ceil(self.train.train_sample / self.train.dataloader_batch_size)
+                self._train_steps = math.ceil(self.data.train_sample / self.train.dataloader_batch_size)
 
     @property
     def train_steps(self) -> int:

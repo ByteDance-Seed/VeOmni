@@ -198,6 +198,9 @@ class BaseTrainer(Stateful, ABC):
             "seq_classification": seq_classification,
         }
 
+    def build_model_config_kwargs(self):
+        return {}
+
     def _setup(self):
         self._init_distributed()
 
@@ -246,6 +249,7 @@ class BaseTrainer(Stateful, ABC):
             attn_implementation=self.args.model.attn_implementation,
             moe_implementation=self.args.model.moe_implementation,
             init_device=self.args.train.init_device,
+            config_kwargs=self.build_model_config_kwargs(),
         )
         self.model_config = self.model.config
 
