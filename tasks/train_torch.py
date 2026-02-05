@@ -304,20 +304,10 @@ def main():
 
                 loss, _ = mean_global_loss(loss, micro_batch_token_num, micro_batches_token_num)
 
-                # DynamicBatchSizeDataLoader adds padding batches when data is exhausted and drop_last=False; 
-                # these data should not participate in gradient updates
-                # multiplying loss by is_real_data makes sure all ranks execute same computation graph
-                is_real_data = torch.tensor(
-                    0.0 if micro_batch.get("padding_flag", False) else 1.0,
-                    device=loss.device,
-                    dtype=loss.dtype
-                )
-                masked_loss = loss * is_real_data
-
                 with model_bwd_context:
-                    masked_loss.backward()
+                    loss.backward()
 
-                total_loss += masked_loss.item()
+                total_loss += loss.item()
                 del micro_batch
 
             grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
