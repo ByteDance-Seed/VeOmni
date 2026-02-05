@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 from torch import nn
-from transformers import Qwen3MoeConfig
+from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import (
@@ -169,7 +169,7 @@ class PatchQwen3MoeSparseMoeBlock(nn.Module):
 # 1. Support use with fuse cross_entropy loss function.
 # ================================================================
 def qwen3_moe_forcausal_lm_forward(
-    self,
+    self: Qwen3MoeForCausalLM,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
