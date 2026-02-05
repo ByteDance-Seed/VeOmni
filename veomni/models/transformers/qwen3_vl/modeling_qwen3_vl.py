@@ -583,7 +583,7 @@ class Qwen3VLModel(_Qwen3VLModel):
         return special_image_mask, special_video_mask
 
     @auto_docstring
-    @check_model_inputs()
+    @check_model_inputs
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -884,7 +884,7 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
     # --- Patch.1 ---
 
-    @check_model_inputs()
+    @check_model_inputs
     def forward(
         self,
         input_ids: torch.LongTensor = None,
