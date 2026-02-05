@@ -689,7 +689,7 @@ class VeOmniArguments:
                     "pad_to_length is enabled without dyn_bsz, which is not supported. "
                     "Please set pad_to_length to False or enable dyn_bsz."
                 )
-                self.train.pad_to_length = None
+                self.train.pad_to_length = False
             else:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")

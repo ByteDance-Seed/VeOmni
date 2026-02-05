@@ -179,7 +179,7 @@ class PrecomputePositionIDsCollator(DataCollator):
 @dataclass
 class PackingCollator(DataCollator):
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
-    pad_to_length: int = None
+    pad_to_length: int = False
     seq_classification: bool = (
         False  # whether the training task is sequence classification, if true, do not mask boundary labels
     )
@@ -348,7 +348,7 @@ class SequenceParallelCollator(DataCollator):
 @dataclass
 class MainCollator(DataCollator):
     data_collate_info: Dict[str, Union[DataCollateInfo, tuple, Dict]] = field(default_factory=lambda: {})
-    pad_to_length: int = None
+    pad_to_length: bool = False
     seq_classification: bool = False
 
     """
@@ -358,7 +358,7 @@ class MainCollator(DataCollator):
         data_collate_info:
             User config to override the default collate info.
         pad_to_length:
-            Whether to pad sequence to a fixed length. Default is None.
+            Whether to pad sequence to a fixed length. Default is False.
         seq_classification:
             If True, sequence classification task. Default is False.
     """
