@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_multimodal_chat_template
-from ..data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl
+from ..data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl, process_sample_qwen_omni
 from ..models import build_processor
 from ..utils import helper
 from .base import BaseTrainer
@@ -19,6 +19,10 @@ class MyTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the vit parameters."},
+    )
+    freeze_audio_tower: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the audio tower parameters."},
     )
     vit_lr: float = field(
         default=1e-6,
@@ -44,13 +48,38 @@ class Arguments(VeOmniArguments):
 class VLMTrainer(BaseTrainer):
     def build_model_assets(self):
         self.processor = build_processor(self.args.model.tokenizer_path, max_pixels=MAX_PIXELS)
-        self.chat_template = build_multimodal_chat_template(self.args.data.chat_template, self.processor.tokenizer)
-        return [self.chat_template]
+        if self.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
+            self.chat_template = build_multimodal_chat_template(self.args.data.chat_template, self.processor.tokenizer)
+            return [self.processor, self.chat_template]
+        else:
+            self.chat_template = None
+            return [self.processor]
+
+    def build_data_collate_info(self):
+        if self.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            return {
+                "audio_feature_lengths": (0, False, None, None),
+                "input_features": (0, True, 0, 1),
+                "audio_mask": (-1, False, 0, 1),
+            }
+        else:
+            return {}
 
     def freeze_module(self):
         args: Arguments = self.args
+        if self.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            self.model.disable_talker()
+
         if args.train.freeze_vit:
-            self.model.visual.requires_grad_(False)
+            if self.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+                self.model.thinker.visual.requires_grad_(False)
+                self.model.thinker.visual.merger.requires_grad_(True)
+            else:
+                self.model.visual.requires_grad_(False)
+
+        if args.train.freeze_audio_tower and self.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            self.model.thinker.audio_tower.requires_grad_(False)
+            self.model.thinker.audio_tower.proj.requires_grad_(True)
 
     def build_param_groups(self):
         args: Arguments = self.args
@@ -66,11 +95,16 @@ class VLMTrainer(BaseTrainer):
 
     def build_data_transform(self):
         args: Arguments = self.args
-        position_id_func = self.model.get_position_id_func()
+
         if self.model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
             process_function = process_sample_qwen3_vl
-        elif self.model_config.model_type == "qwen2_5_vl":
+            position_id_func = self.model.get_position_id_func()
+        elif self.model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
             process_function = process_sample_qwen2_5_vl
+            position_id_func = self.model.get_position_id_func()
+        elif self.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            process_function = process_sample_qwen_omni
+            position_id_func = self.model.thinker.get_position_id_func()
         else:
             raise NotImplementedError(f"Unsupported model type: {self.model_config.model_type}.")
         data_transform = partial(

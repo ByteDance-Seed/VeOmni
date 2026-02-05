@@ -48,6 +48,7 @@ from ..utils.device import (
     synchronize,
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss
+from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     Callback,
     CallbackHandler,
@@ -254,7 +255,7 @@ class BaseTrainer(Stateful, ABC):
 
         # freeze module
         self.freeze_module()
-
+        pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
     def build_training_dataset(self):

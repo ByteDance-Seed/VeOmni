@@ -782,10 +782,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
                 valid_mask = audio_feature_lengths != 0
                 # filter videos without audios, the origin invalid audio_feature_lengths only used for get_rope_index, now filter them out
                 audio_feature_lengths = audio_feature_lengths[valid_mask]
-
-                if (
-                    input_features.shape[0] == 0
-                ):  # input_features is (0, dim) when no audio in all videos, we do not forward audio_tower
+                if input_features.shape[0] == 0:
+                    # input_features is (0, dim) when no audio in all videos, we do not forward audio_tower
                     input_features = None
             # --- Patch.2 ---
 
