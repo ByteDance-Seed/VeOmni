@@ -14,7 +14,13 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     if isinstance(batches, dict):
         batches = [batches]
     token_len = defaultdict(int)
+    token_len["foundation_tokens"] = torch.tensor(0)
+    token_len["image_decoder_tokens"] = torch.tensor(0)
     for batch in batches:
+        # DynamicBatchSizeDataLoader adds padding batches when data is exhausted and drop_last=False; 
+        # these should not be counted
+        if batch.get("padding_flag", False):
+            continue
         token_len["foundation_tokens"] += torch.sum(batch["labels"] != IGNORE_INDEX)  # text tokens
         if "image_output_mask" in batch:
             token_len["image_decoder_tokens"] += torch.sum(batch["image_output_mask"])  # image generation tokens
