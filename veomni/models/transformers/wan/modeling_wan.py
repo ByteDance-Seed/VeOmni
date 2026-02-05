@@ -614,11 +614,13 @@ class WanModel(PreTrainedModel):
             .reshape(f * h * w, 1, -1)
             .to(x.device)
         )
-        cos = freqs.real.squeeze().contiguous()
-        sin = freqs.imag.squeeze().contiguous()
 
         if get_parallel_state().ulysses_enabled:
             x = slice_input_tensor_scale_grad(x, dim=1)
+            freqs = slice_input_tensor_scale_grad(freqs, dim=0)
+
+        cos = freqs.real.squeeze().contiguous()
+        sin = freqs.imag.squeeze().contiguous()
 
         for block in self.blocks:
             if self.training and self.gradient_checkpointing:

@@ -5,8 +5,8 @@ from veomni.utils.helper import get_cache_dir
 
 
 local_test_cases = [
-    pytest.param("./tests/models/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
-    pytest.param("./tests/models/toy_config/janus_siglip_toy", False, True, [], ["config", "model", "processor"]),
+    pytest.param("./tests/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
+    pytest.param("./tests/toy_config/janus_siglip_toy", False, True, [], ["config", "model", "processor"]),
 ]
 
 
