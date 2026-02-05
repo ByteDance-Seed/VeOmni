@@ -75,8 +75,22 @@ class MyDataArguments(DataArguments):
 
 
 @dataclass
+class MyModelArguments(ModelArguments):
+    encoder_data_balance: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to balance encoder data for qwen3-vl model"}
+    )
+    encoder_data_balance_sorting_algo: Optional[str] = field(
+        default="post_mbs_balancing_greedy_without_pad",
+        metadata={
+            "help": "The sorting algorithm of encoder data balance. All viable algorithms are defined in "
+            "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"
+        },
+    )
+
+
+@dataclass
 class Arguments(VeOmniArguments):
-    model: "ModelArguments" = field(default_factory=ModelArguments)
+    model: "MyModelArguments" = field(default_factory=MyModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
@@ -116,6 +130,8 @@ def main():
         init_device=args.train.init_device,
         moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
+        encoder_data_balance=args.model.encoder_data_balance,
+        encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")

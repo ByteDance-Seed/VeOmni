@@ -5,8 +5,9 @@ from typing import Dict, Optional
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_multimodal_chat_template
 from ..data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl, process_sample_qwen_omni
-from ..models import build_processor
+from ..models import build_foundation_model, build_processor
 from ..utils import helper
+from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
 
 
@@ -39,8 +40,22 @@ class MyDataArguments(DataArguments):
 
 
 @dataclass
+class MyModelArguments(ModelArguments):
+    encoder_data_balance: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to balance encoder data for qwen3-vl model"}
+    )
+    encoder_data_balance_sorting_algo: Optional[str] = field(
+        default="post_mbs_balancing_greedy_without_pad",
+        metadata={
+            "help": "The sorting algorithm of encoder data balance. All viable algorithms are defined in "
+            "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"
+        },
+    )
+
+
+@dataclass
 class Arguments(VeOmniArguments):
-    model: "ModelArguments" = field(default_factory=ModelArguments)
+    model: "MyModelArguments" = field(default_factory=MyModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
@@ -115,3 +130,28 @@ class VLMTrainer(BaseTrainer):
             **args.data.mm_configs,
         )
         return data_transform
+
+    def _build_model(self):
+        args: Arguments = self.args
+        logger.info_rank0("Build model")
+        self.model = build_foundation_model(
+            config_path=args.model.config_path,
+            weights_path=args.model.model_path,
+            torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+            attn_implementation=args.model.attn_implementation,
+            moe_implementation=args.model.moe_implementation,
+            init_device=args.train.init_device,
+            config_kwargs=self.build_model_config_kwargs(),
+            encoder_data_balance=args.model.encoder_data_balance,
+            encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+        )
+        self.model_config = self.model.config
+
+        # model assets
+        self.model_assets = [self.model_config]
+        self.model_assets.extend(self.build_model_assets())
+
+        # freeze module
+        self.freeze_module()
+        pretty_print_trainable_parameters(self.model)
+        helper.print_device_mem_info("VRAM usage after building model")
