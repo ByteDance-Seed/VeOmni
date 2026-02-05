@@ -75,6 +75,8 @@ def build_foundation_model(
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
+    encoder_data_balance: Optional[bool] = False,
+    encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -96,6 +98,27 @@ def build_foundation_model(
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
         if moe_implementation == "eager":
             logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
+
+    if encoder_data_balance:
+        if config.model_type == "qwen3_vl_moe":
+            if get_parallel_state().sp_enabled:
+                logger.warning_rank0(
+                    "Warning: Qwen3VLEncoderDataBalance currently does not support sequence parallelism. "
+                    "The configuration of 'encoder_data_balance' is reset to False. "
+                    "This issue will be addressed in a future release."
+                )
+                config.encoder_data_balance = False
+            else:
+                config.encoder_data_balance = encoder_data_balance
+                config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
+        else:
+            logger.warning_rank0(
+                f"Encoder data balance currently supported only for Qwen3-VL MoE, "
+                f"current model type: {config.model_type}, reset encoder_data_balance = False"
+            )
+            config.encoder_data_balance = False
+    else:
+        config.encoder_data_balance = False
 
     loader: Optional[BaseModelLoader] = get_loader(config)
 

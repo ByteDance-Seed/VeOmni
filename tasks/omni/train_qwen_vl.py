@@ -122,6 +122,8 @@ def main():
         init_device=args.train.init_device,
         moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
+        encoder_data_balance=args.model.encoder_data_balance,
+        encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")

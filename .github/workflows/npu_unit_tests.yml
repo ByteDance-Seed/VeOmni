@@ -91,6 +91,8 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
