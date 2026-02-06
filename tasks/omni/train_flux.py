@@ -162,6 +162,8 @@ def main():
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     Checkpointer = build_checkpointer(
         dist_backend=args.train.data_parallel_mode,
