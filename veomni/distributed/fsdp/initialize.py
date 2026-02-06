@@ -55,6 +55,7 @@ def parallel_load_safetensors(
             elif ignore_param_name is not None:
                 if param_name in ignore_param_name:
                     continue
+
             safetensors2param.setdefault(filename, []).append(param_name)
     else:
         # in this case, the model is small and we can load it all at once
@@ -85,6 +86,7 @@ def parallel_load_safetensors(
             for file in files:
                 for param_name in safetensors2param[file]:
                     shard_states[param_name] = rank
+
     return shard_states
 
 
@@ -141,7 +143,7 @@ def parallel_init_fsdp_fn(
         else:
             assert isinstance(spec_info.placement, Shard)
             size = list(param.shape)
-            size[spec_info.placement.dim] *= spec_info.ep_mesh.size()
+            size[spec_info.placement.dim] *= spec_info.rowshard_mesh.size()
             return torch.empty(size, dtype=param.dtype, device=device)
 
     def copy_to_local(param: torch.Tensor, full_data: torch.Tensor, spec_info: SpecInfo):
@@ -157,8 +159,8 @@ def parallel_init_fsdp_fn(
             param.data.copy_(full_data)
         else:
             assert isinstance(spec_info.placement, Shard)
-            local_data = full_data.chunk(spec_info.ep_mesh.size(), dim=spec_info.placement.dim)[
-                spec_info.ep_mesh.get_local_rank()
+            local_data = full_data.chunk(spec_info.rowshard_mesh.size(), dim=spec_info.placement.dim)[
+                spec_info.rowshard_mesh.get_local_rank()
             ]
             param.data.copy_(local_data.contiguous())
         param.spec_info = spec_info
@@ -168,7 +170,7 @@ def parallel_init_fsdp_fn(
         element_size = param.element_size()
         param_size = element_size * numel
         if hasattr(state, "spec_info") and isinstance(state.spec_info.placement, Shard):
-            param_size *= state.spec_info.ep_mesh.size()
+            param_size *= state.spec_info.rowshard_mesh.size()
             return param_size >= size_gb * (1024**3)
         else:
             return False
@@ -176,7 +178,7 @@ def parallel_init_fsdp_fn(
     def chunk_and_broadcast_data(param, full_data, spec_info):
         device = param.device
         placement = spec_info.placement
-        ep_size = spec_info.ep_mesh.size()
+        ep_size = spec_info.rowshard_mesh.size()
         global_size = list(param.data.size())
 
         global_size[placement.dim] *= ep_size
@@ -195,16 +197,16 @@ def parallel_init_fsdp_fn(
         for chunk_id in range(ep_size):
             broadcast_buffer.copy_(chunk_loaded_data[chunk_id].contiguous())
             dist.broadcast(broadcast_buffer, src=dist.get_rank())
-        param.data.copy_(chunk_loaded_data[spec_info.ep_mesh.get_local_rank()].contiguous())
+        param.data.copy_(chunk_loaded_data[spec_info.rowshard_mesh.get_local_rank()].contiguous())
         param.spec_info = spec_info
         del broadcast_buffer
 
     def receive_broadcasted_chunk_data(param, broadcast_src, spec_info):
         device = param.device
         chunk_received_data = torch.empty_like(param.data, device=device)
-        for chunk_id in range(spec_info.ep_mesh.size()):
+        for chunk_id in range(spec_info.rowshard_mesh.size()):
             dist.broadcast(chunk_received_data, src=broadcast_src)
-            if chunk_id == spec_info.ep_mesh.get_local_rank():
+            if chunk_id == spec_info.rowshard_mesh.get_local_rank():
                 param.data.copy_(chunk_received_data)
         param.spec_info = spec_info
         del chunk_received_data
@@ -238,7 +240,7 @@ def parallel_init_fsdp_fn(
                 if hasattr(state, "spec_info"):
                     shard = state.spec_info.placement
                     if isinstance(shard, Shard):
-                        size[shard.dim] *= state.spec_info.ep_mesh.size()
+                        size[shard.dim] *= state.spec_info.rowshard_mesh.size()
                 shard_states[param_name] = torch.nn.Parameter(
                     torch.randn(size, dtype=state.dtype, device=device, requires_grad=state.requires_grad)
                     * initializer_range
