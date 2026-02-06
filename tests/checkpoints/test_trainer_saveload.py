@@ -17,8 +17,6 @@ import torch
 import torch.distributed as dist
 from tqdm import trange
 
-from veomni.utils.save_safetensor_utils import save_hf_safetensor
-
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader, build_dummy_dataset
@@ -30,6 +28,7 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 """
@@ -425,6 +424,7 @@ TEST_EP_SIZES = [1, 4, 8]
 @pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
 def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
+
 
 @pytest.mark.parametrize("ep_size", TEST_EP_SIZES)
 def test_trainer_save_hf_safetensor(ep_size: int):

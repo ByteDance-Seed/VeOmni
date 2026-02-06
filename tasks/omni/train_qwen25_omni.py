@@ -29,7 +29,6 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets
-from veomni.utils.save_safetensor_utils import save_hf_safetensor
 from veomni.models.transformers.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
@@ -41,6 +40,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 

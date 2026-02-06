@@ -22,7 +22,6 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import save_model_assets
-from veomni.utils.save_safetensor_utils import save_hf_safetensor
 from veomni.models.transformers.flux.encode_flux import (
     encode_prompt,
     from_diffusers,
@@ -45,6 +44,7 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.utils.dit_utils import EnvironMeter, save_model_weights
 from veomni.utils.lora_utils import add_lora_to_model, freeze_parameters
 from veomni.utils.recompute_utils import convert_ops_to_objects
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 logger = helper.create_logger(__name__)
@@ -589,7 +589,6 @@ def main():
 
     dist.barrier()
     dist.destroy_process_group()
-
 
 
 if __name__ == "__main__":
