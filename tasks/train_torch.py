@@ -37,7 +37,11 @@ from veomni.utils.device import (
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 from veomni.utils.save_safetensor_utils import save_hf_safetensor
+from packaging.version import parse
 
+TORCH_GT_29 = parse(torch.__version__) >= parse("2.9")
+if TORCH_GT_29:
+    from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
 logger = helper.create_logger(__name__)
 
