@@ -413,24 +413,15 @@ def deepseek_v3_forcausal_lm_forward(
 # ================================================================
 def deepseek_v3_pretrained_model_init_weights(self: DeepseekV3PreTrainedModel, module):
     """Custom _init_weights to handle PatchDeepseekV3NaiveMoe and PatchDeepseekV3TopkRouter."""
-    std = self.config.initializer_range
 
-    # Handle custom MoE modules with nn.Parameter
+    super(DeepseekV3PreTrainedModel, self)._init_weights(module)
+
     if isinstance(module, PatchDeepseekV3NaiveMoe):
-        _init_weight(module.gate_proj, std=std)
-        _init_weight(module.up_proj, std=std)
-        _init_weight(module.down_proj, std=std)
+        _init_weight(module.gate_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.up_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.down_proj, mean=0.0, std=self.config.initializer_range)
     elif isinstance(module, PatchDeepseekV3TopkRouter):
-        _init_weight(module.weight, std=std)
-    # Fallback to default initialization for standard modules
-    elif isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-        module.weight.data.normal_(mean=0.0, std=std)
-        if module.bias is not None:
-            module.bias.data.zero_()
-    elif isinstance(module, nn.Embedding):
-        module.weight.data.normal_(mean=0.0, std=std)
-        if module.padding_idx is not None:
-            module.weight.data[module.padding_idx].zero_()
+        _init_weight(module.weight, mean=0.0, std=self.config.initializer_range)
 
 
 def apply_veomni_deepseek_v3_patch():

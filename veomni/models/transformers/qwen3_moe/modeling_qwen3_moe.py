@@ -334,26 +334,18 @@ def qwen3_moe_forcausal_lm_forward(
 # PATCH: Qwen3MoePreTrainedModel._init_weights
 # 1. Support init weights for PatchQwen3MoeExperts and PatchQwen3MoeTopKRouter.
 # ================================================================
+@torch.no_grad()
 def qwen3_moe_pretrained_model_init_weights(self: Qwen3MoePreTrainedModel, module):
     """Custom _init_weights to handle PatchQwen3MoeExperts and PatchQwen3MoeTopKRouter."""
-    std = self.config.initializer_range
 
-    # Handle custom MoE modules with nn.Parameter
+    super(Qwen3MoePreTrainedModel, self)._init_weights(module)
+
     if isinstance(module, PatchQwen3MoeExperts):
-        _init_weight(module.gate_proj, std=std)
-        _init_weight(module.up_proj, std=std)
-        _init_weight(module.down_proj, std=std)
+        _init_weight(module.gate_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.up_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.down_proj, mean=0.0, std=self.config.initializer_range)
     elif isinstance(module, PatchQwen3MoeTopKRouter):
-        _init_weight(module.weight, std=std)
-    # Fallback to default initialization for standard modules
-    elif isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-        module.weight.data.normal_(mean=0.0, std=std)
-        if module.bias is not None:
-            module.bias.data.zero_()
-    elif isinstance(module, nn.Embedding):
-        module.weight.data.normal_(mean=0.0, std=std)
-        if module.padding_idx is not None:
-            module.weight.data[module.padding_idx].zero_()
+        _init_weight(module.weight, mean=0.0, std=self.config.initializer_range)
 
 
 def apply_veomni_qwen3_moe_patch():
