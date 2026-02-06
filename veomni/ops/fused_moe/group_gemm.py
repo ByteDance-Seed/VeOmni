@@ -328,7 +328,7 @@ def group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
     else:
-        if get_device_capability()[0] > 8:
+        if get_device_capability()[0] >= 8:
             # enable torch cutlass grouped mm for compute capability for Hopper and later generations
             final_hidden_states = torch_fused_moe_forward(
                 num_experts,
