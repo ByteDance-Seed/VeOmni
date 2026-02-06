@@ -18,6 +18,7 @@ from ...distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, token
 from ...distributed.parallel_state import get_parallel_state
 from ..group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from .torch_fused_moe import torch_fused_moe_forward
 
 
 class FusedMoeExpertFunction(torch.autograd.Function):
@@ -267,7 +268,6 @@ class FusedMoeExpertFunction(torch.autograd.Function):
 
 
 def group_gemm_fused_moe_forward(
-    module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -327,13 +327,25 @@ def group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
     else:
-        final_hidden_states = FusedMoeExpertFunction.apply(
-            num_experts,
-            routing_weights,
-            selected_experts,
-            hidden_states,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-        )
+        if torch.cuda.get_device_capability()[0] > 8:
+            # enable torch cutlass grouped mm for compute capability for Hopper and later generations
+            final_hidden_states = torch_fused_moe_forward(
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
+                fc1_1_weight,
+                fc1_2_weight,
+                fc2_weight,
+            )
+        else:
+            final_hidden_states = FusedMoeExpertFunction.apply(
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
+                fc1_1_weight,
+                fc1_2_weight,
+                fc2_weight,
+            )
     return final_hidden_states
