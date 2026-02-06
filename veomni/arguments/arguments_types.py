@@ -377,6 +377,12 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Enable gradient checkpointing."},
     )
+    debug_gradient_checkpointing: bool = field(
+        default=False,
+        metadata={
+            "help": "Debug gradient checkpointing: https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled."
+        },
+    )
     enable_reentrant: bool = field(
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},

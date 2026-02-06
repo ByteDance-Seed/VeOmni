@@ -106,6 +106,9 @@ def main():
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
+
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
     init_parallel_state(
