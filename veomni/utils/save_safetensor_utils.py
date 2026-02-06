@@ -27,7 +27,7 @@ def save_hf_safetensor(
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     train_architecture: Optional[str],
-    **kwargs,
+    output_dir: Optional[str] = None,
 ):
     """Save model weights in HuggingFace safetensors format.
 
@@ -36,13 +36,13 @@ def save_hf_safetensor(
         model_assets: Model assets (e.g., config, tokenizer) to save alongside weights.
         ckpt_manager: Checkpoint manager type.
         train_architecture: Training architecture type. If "lora", only LoRA weights are saved.
-        **kwargs: Additional keyword arguments passed to ckpt_to_state_dict (e.g., output_dir).
+        output_dir: Output directory for checkpoint conversion. Required only by omnistore ckpt_manager.
     """
     hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
     model_state_dict = ckpt_to_state_dict(
         save_checkpoint_path=save_checkpoint_path,
         ckpt_manager=ckpt_manager,
-        **kwargs,
+        output_dir=output_dir,
     )
     if train_architecture == "lora":
         model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
