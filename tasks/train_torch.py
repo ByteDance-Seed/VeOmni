@@ -36,7 +36,11 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
+from packaging.version import parse
 
+TORCH_GT_29 = parse(torch.__version__) >= parse("2.9")
+if TORCH_GT_29:
+    from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
 logger = helper.create_logger(__name__)
 
@@ -387,14 +391,35 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
-        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
-            ckpt_manager=args.train.ckpt_manager,
-        )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+    if args.train.save_hf_weights and args.train.save_safetensor_path is not None:
+        if TORCH_GT_29:
+            storage_writer = HuggingFaceStorageWriter(
+                path=args.train.save_safetensor_path,
+                save_distributed=True,
+                fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                enable_consolidation=True,
+                thread_count_consolidation=5,
+            )
+
+            logger.info_rank0("Starting HuggingFace safetensors save...")
+            dist.barrier()
+            start_time = time.time()
+            Checkpointer.save(
+                path=args.train.save_safetensor_path,
+                state={"model": model},
+                storage_writer=storage_writer,
+            )
+            elapsed_time = time.time() - start_time
+            logger.info_rank0(f"HuggingFace safetensors save took {elapsed_time:.2f} seconds")
+        else:
+            if args.train.global_rank == 0:
+                hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+                model_state_dict = ckpt_to_state_dict(
+                    save_checkpoint_path=save_checkpoint_path,
+                    ckpt_manager=args.train.ckpt_manager,
+                )
+                save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+                logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

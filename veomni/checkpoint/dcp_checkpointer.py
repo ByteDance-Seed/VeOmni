@@ -27,6 +27,8 @@ from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.device import empty_cache, synchronize
 from .checkpointer import CheckpointerBase
 
+from torch.distributed.checkpoint import HuggingFaceStorageWriter
+
 
 logger = logging.get_logger(__name__)
 
@@ -288,9 +290,27 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_state = {"model": ModelState(state["model"])}
-        if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+        if isinstance(storage_writer, HuggingFaceStorageWriter):
+            for param in state["model"].parameters():
+                if param.data.dtype == torch.float32:
+                    param.data = param.data.to(torch.bfloat16)
+            # Use flat state dict so DCP FQNs match the original HF weight_map keys
+            # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
+            save_state = ModelState(state["model"]).state_dict()
+            # Remove tied weights not present in the HF weight_map
+            # (e.g. lm_head.weight is tied to model.embed_tokens.weight via tie_word_embeddings)
+            if storage_writer.fqn_to_index_mapping is not None:
+                filtered_state = {}
+                for k, v in save_state.items():
+                    if k in storage_writer.fqn_to_index_mapping:
+                        filtered_state[k] = v
+                    else:
+                        logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
+                save_state = filtered_state
+        else:
+            save_state = {"model": ModelState(state["model"])}
+            if "optimizer" in state:
+                save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
