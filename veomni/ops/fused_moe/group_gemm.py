@@ -16,6 +16,7 @@ import torch
 
 from ...distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
 from ...distributed.parallel_state import get_parallel_state
+from ...utils.device import get_device_capability
 from ..group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
 from .torch_fused_moe import torch_fused_moe_forward
@@ -327,7 +328,7 @@ def group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
     else:
-        if torch.cuda.get_device_capability()[0] > 8:
+        if get_device_capability()[0] > 8:
             # enable torch cutlass grouped mm for compute capability for Hopper and later generations
             final_hidden_states = torch_fused_moe_forward(
                 num_experts,
