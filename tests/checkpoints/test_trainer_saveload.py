@@ -26,7 +26,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device, synchronize
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 
 
@@ -163,21 +163,6 @@ def main():
 
     logger.info_rank0("Prepare model")
 
-    # TODO: fix nan bug in optimizer when experts is small like 16/32 in NPU
-    if IS_NPU_AVAILABLE and args.train.expert_parallel_size > 1:
-        if "qwen3_moe" in args.model.config_path:
-            config_kwargs = {
-                "num_experts": 128,
-            }
-        elif "deepseek_v3" in args.model.config_path:
-            config_kwargs = {
-                "n_routed_experts": 128,
-            }
-        else:
-            config_kwargs = {}
-    else:
-        config_kwargs = {}
-
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
@@ -185,7 +170,6 @@ def main():
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,
-        config_kwargs=config_kwargs,
     )
 
     model_config = model.config
