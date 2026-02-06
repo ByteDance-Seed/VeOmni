@@ -855,21 +855,10 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
-        # SP: gather hidden_states after encoder layers for post-processing
-        if get_parallel_state().sp_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
-            sp_padding_size = hidden_states.size(0) - unpadded_seq_len
-            if sp_padding_size > 0:
-                hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
-
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
-
-        # SP: slice output for downstream processing
-        if get_parallel_state().sp_enabled:
-            hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
 
         return BaseModelOutput(last_hidden_state=hidden_states)
 
@@ -2270,7 +2259,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         assert "video_mask" in kwargs, "video_mask should have already been computed in process_sample"
         image_mask = kwargs["image_mask"]
         video_mask = kwargs["video_mask"]
-        audio_mask = kwargs["audio_mask"]  # Assuming audio_mask is also pre-computed
+        assert "audio_mask" in kwargs, "audio_mask should have already been computed in process_sample"
+        audio_mask = kwargs["audio_mask"]
 
         # Modification: Pop flash attention kwargs for ViT, they should only be used for language model
         # Qwen3L ViT input images seq lens should be computed during ViT forward using grid_thw
