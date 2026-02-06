@@ -17,6 +17,8 @@ import torch
 import torch.distributed as dist
 from tqdm import trange
 
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
+
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader, build_dummy_dataset
@@ -335,6 +337,24 @@ def main():
 
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+
+    # After training on all epochs, save model in huggingface's format and verify against DCP checkpoint
+    if Checkpointer.dcp_save_future is not None:
+        Checkpointer.dcp_save_future.result()
+    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
+        save_hf_safetensor(
+            save_checkpoint_path=save_checkpoint_path,
+            model_assets=[model_config],
+            ckpt_manager=args.train.ckpt_manager,
+            train_architecture=args.train.train_architecture,
+        )
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        assert verify_dcp_to_hf_conversion(
+            dcp_checkpoint_dir=save_checkpoint_path,
+            hf_checkpoint_dir=hf_weights_path,
+            safe_serialization=True,
+        ), "HF safetensors verification failed: saved weights don't match DCP checkpoint"
+    dist.barrier()
 
     # resume states from checkpoints and compare them with the ones before saving
     state = {"model": model, "optimizer": optimizer, "extra_state": {}}
