@@ -23,6 +23,7 @@ import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
+from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
@@ -214,6 +215,9 @@ class BaseTrainer(Stateful, ABC):
         # Save arguments
         if self.args.train.global_rank == 0:
             save_args(self.args, self.args.train.output_dir)
+
+        # Gradient checkpointing debug
+        set_checkpoint_debug_enabled(self.args.train.debug_gradient_checkpointing)
 
     def _init_distributed(self):
         device_str = f"{get_device_type()}:{self.args.train.local_rank}"

@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 import wandb
+from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from tqdm import trange
 
 from veomni.arguments import VeOmniArguments, parse_args, save_args
@@ -60,7 +61,7 @@ def main():
         save_args(args, args.train.output_dir)
 
     # Gradient checkpointing debug
-    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
+    set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     # Model checkpointer
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
