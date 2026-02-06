@@ -307,6 +307,11 @@ class DistributedCheckpointer(CheckpointerBase):
                     else:
                         logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
                 save_state = filtered_state
+            else:
+                logger.warning_rank0(
+                    "fqn_to_index_mapping is None, HuggingFaceStorageWriter will save "
+                    "all model weights into a single safetensors file."
+                )
         else:
             save_state = {"model": ModelState(state["model"])}
             if "optimizer" in state:

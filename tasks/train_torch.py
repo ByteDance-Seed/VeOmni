@@ -413,7 +413,7 @@ def main():
             logger.info_rank0(f"HuggingFace safetensors save took {elapsed_time:.2f} seconds")
         else:
             if args.train.global_rank == 0:
-                hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+                hf_weights_path = args.train.save_safetensor_path
                 model_state_dict = ckpt_to_state_dict(
                     save_checkpoint_path=save_checkpoint_path,
                     ckpt_manager=args.train.ckpt_manager,
