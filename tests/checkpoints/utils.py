@@ -40,6 +40,7 @@ def get_model_assets_dir(model_name, ep_size):
 def get_checkpoint_test_command(
     model_name,
     ep_size,
+    save_hf_weights=False,
 ):
     config_path = MODEL_CONFIGS[model_name]["config_path"]
     tokenizer_path = MODEL_CONFIGS[model_name]["tokenizer_path"]
@@ -73,6 +74,7 @@ def get_checkpoint_test_command(
         "--train.max_steps 5",
         "--train.ckpt_manager dcp",
         "--train.save_async True",
+        f"--train.save_hf_weights {save_hf_weights}",
     ]
 
     exec_script = " \\\n".join(params)

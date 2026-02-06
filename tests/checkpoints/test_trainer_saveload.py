@@ -28,6 +28,7 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 """
@@ -336,6 +337,24 @@ def main():
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
+    # After training on all epochs, save model in huggingface's format and verify against DCP checkpoint
+    if Checkpointer.dcp_save_future is not None:
+        Checkpointer.dcp_save_future.result()
+    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
+        save_hf_safetensor(
+            save_checkpoint_path=save_checkpoint_path,
+            model_assets=[model_config],
+            ckpt_manager=args.train.ckpt_manager,
+            train_architecture=args.train.train_architecture,
+        )
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        assert verify_dcp_to_hf_conversion(
+            dcp_checkpoint_dir=save_checkpoint_path,
+            hf_checkpoint_dir=hf_weights_path,
+            safe_serialization=True,
+        ), "HF safetensors verification failed: saved weights don't match DCP checkpoint"
+    dist.barrier()
+
     # resume states from checkpoints and compare them with the ones before saving
     state = {"model": model, "optimizer": optimizer, "extra_state": {}}
     subdirs = [d for d in os.listdir(save_checkpoint_path) if d.startswith("global_step_")]
@@ -392,6 +411,12 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int):
     ), f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}`"
 
 
+def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
+    exec_command = get_checkpoint_test_command(model_name, ep_size, save_hf_weights=True)
+    exec_result = subprocess.run(exec_command, shell=True, check=True)
+    assert exec_result.returncode == 0
+
+
 TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
 TEST_EP_SIZES = [1, 4, 8]
 
@@ -399,3 +424,9 @@ TEST_EP_SIZES = [1, 4, 8]
 @pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
 def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
+
+
+@pytest.mark.parametrize("ep_size", TEST_EP_SIZES)
+def test_trainer_save_hf_safetensor(ep_size: int):
+    # only test save hf safetensor on qwen3_moe to save resources
+    _run_trainer_save_hf_safetensor("qwen3_moe", ep_size)
