@@ -12,7 +12,7 @@ from torch import distributed as dist
 from tqdm import trange
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     OmniDataCollatorWithPacking,
     OmniDataCollatorWithPadding,
@@ -28,6 +28,7 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import save_model_assets, save_model_weights
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
@@ -540,14 +541,13 @@ def main():
     helper.empty_cache()
     # save model in huggingface's format
     if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
-        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
+        save_hf_safetensor(
             save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
+            model_assets=model_assets,
             ckpt_manager=args.train.ckpt_manager,
+            train_architecture=args.train.train_architecture,
+            output_dir=args.train.output_dir,
         )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {args.train.output_dir} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

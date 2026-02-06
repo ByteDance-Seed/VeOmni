@@ -14,7 +14,7 @@ from transformers import (
 )
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.checkpoint import build_checkpointer
 from veomni.data.diffusion.data_loader import build_dit_dataloader
 from veomni.data.diffusion.dataset import build_text_image_dataset
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
@@ -22,6 +22,7 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import save_model_assets
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 from veomni.models.transformers.flux.encode_flux import (
     encode_prompt,
     from_diffusers,
@@ -538,7 +539,13 @@ def main():
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
                 if args.train.global_rank == 0:
-                    save_hf_weights(args, save_checkpoint_path, model_assets)
+                    save_hf_safetensor(
+                        save_checkpoint_path=save_checkpoint_path,
+                        model_assets=model_assets,
+                        ckpt_manager=args.train.ckpt_manager,
+                        train_architecture=args.train.train_architecture,
+                        output_dir=args.train.output_dir,
+                    )
 
         data_loader_tqdm.close()
         epoch_time = time.time() - epoch_start_time
@@ -567,7 +574,13 @@ def main():
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
             if args.train.global_rank == 0:
-                save_hf_weights(args, save_checkpoint_path, model_assets)
+                save_hf_safetensor(
+                    save_checkpoint_path=save_checkpoint_path,
+                    model_assets=model_assets,
+                    ckpt_manager=args.train.ckpt_manager,
+                    train_architecture=args.train.train_architecture,
+                    output_dir=args.train.output_dir,
+                )
 
     synchronize()
     # release memory
@@ -577,22 +590,6 @@ def main():
     dist.barrier()
     dist.destroy_process_group()
 
-
-def save_hf_weights(args, save_checkpoint_path, model_assets):
-    hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-    model_state_dict = ckpt_to_state_dict(
-        save_checkpoint_path=save_checkpoint_path,
-        output_dir=args.train.output_dir,
-        ckpt_manager=args.train.ckpt_manager,
-    )
-    if args.train.train_architecture == "lora":
-        model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
-    save_model_weights(
-        hf_weights_path,
-        model_state_dict,
-        model_assets=model_assets,
-    )
-    logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
 
 if __name__ == "__main__":
