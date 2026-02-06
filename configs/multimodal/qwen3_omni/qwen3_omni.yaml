@@ -8,7 +8,6 @@ data:
   data_type: conversation
   max_seq_len: 8196
   train_size: 80000000
-  source_name: sharegpt4v_captioner_sft
   num_workers: 0
   mm_configs:
     scale_factor: 28
