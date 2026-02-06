@@ -4474,6 +4474,10 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
         return thinker_outputs
 
 
+def apply_veomni_qwen3_omni_moe_patch():
+    logger.info_rank0("Apply VeOmni patch to Qwen3_Omni_MoE.")
+
+
 __all__ = [
     "Qwen3OmniMoeForConditionalGeneration",
     "Qwen3OmniMoeThinkerTextModel",
@@ -4488,4 +4492,5 @@ __all__ = [
     "Qwen3OmniMoeCode2WavTransformerModel",
     "Qwen3OmniMoeTalkerCodePredictorModel",
     "Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration",
+    "apply_veomni_qwen3_omni_moe_patch",
 ]
