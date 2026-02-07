@@ -248,10 +248,13 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # v projection grad
         grad_v_input = grad_v @ v_weight
         grad_v_weight = grad_v.transpose(-1, -2) @ hidden_states
-        if v_bias is not None and ctx.needs_input_grad[7]:
+        if v_bias is not None and ctx.needs_input_grad[8]:
             grad_v_bias = grad_v.sum(0)
 
-        # qk normalization backward (if needed)
+        # k grad communication collect
+        grad_k = grad_k_res()
+
+        # k normalization backward (if needed)
         if norm_type is not None:
             if norm_type == "rmsnorm":
                 grad_k, grad_norm_k_weight = fused_layer_norm_cuda.rms_backward_affine(
@@ -280,9 +283,6 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         else:
             grad_norm_k_weight = None
 
-        # k grad communication collect
-        grad_k = grad_k_res()
-
         grad_q = grad_output[0].contiguous()
         # q grad communication launch
 
@@ -298,7 +298,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # k projection grad
         grad_k_input = grad_k @ k_weight
         grad_k_weight = grad_k.transpose(-1, -2) @ hidden_states
-        if k_bias is not None and ctx.needs_input_grad[5]:
+        if k_bias is not None and ctx.needs_input_grad[6]:
             grad_k_bias = grad_k.sum(0)
 
         # q grad communication collect
@@ -336,7 +336,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # q projection grad
         grad_q_input = grad_q @ q_weight
         grad_q_weight = grad_q.transpose(-1, -2) @ hidden_states
-        if q_bias is not None and ctx.needs_input_grad[3]:
+        if q_bias is not None and ctx.needs_input_grad[4]:
             grad_q_bias = grad_q.sum(0)
 
         # grad
@@ -427,7 +427,7 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
         )
 
         grad_proj_weight = grad_output[0].transpose(-1, -2) @ (hidden_states)
-        if proj_bias is not None and ctx.needs_input_grad[3]:
+        if proj_bias is not None and ctx.needs_input_grad[4]:
             grad_proj_bias = grad_output[0].sum(0)
 
         # output grad communication collect
