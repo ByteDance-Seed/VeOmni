@@ -74,10 +74,13 @@ from ....data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDE
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
+    gather_outputs,
     gather_seq_scatter_heads,
     reduce_sequence_parallel_loss,
+    slice_input_tensor,
     slice_position_embedding,
     sp_pad_and_slice,
+    unpad_tensor,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
 
@@ -736,6 +739,18 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
     def set_input_embeddings(self, value: nn.Module):
         self.conv1 = value
 
+    def dummy_forward(self):
+        if getattr(self, "_dummy_data", None) is None:
+            input_features = torch.randn((4, 128), dtype=self.dtype, device=self.device)
+            feature_lens = torch.tensor([4], dtype=torch.int64, device=self.device)
+            aftercnn_lens = torch.tensor([2], dtype=torch.int64, device=self.device)
+            self._dummy_data = {
+                "input_features": input_features,
+                "feature_lens": feature_lens,
+                "aftercnn_lens": aftercnn_lens,
+            }
+        return self(**self._dummy_data)
+
     def _prepare_attention_mask(self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
         # Flash Attention 2 doesn't need a 4D mask and relies on `cu_seqlens/max_seqlen`
         # NOTE: the created attention masl only approximates the ragged FA2 attention by
@@ -768,6 +783,13 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
             mel length after cnn
         """
+        if get_parallel_state().sp_enabled:
+            unpadded_dim_len = torch.sum(feature_lens)
+            input_features = gather_outputs(input_features, gather_dim=0, group=get_parallel_state().sp_group)
+            sp_padding_size = input_features.size(0) - unpadded_dim_len
+            if sp_padding_size > 0:
+                input_features = unpad_tensor(input_features, dim=0, padding_size=sp_padding_size)
+
         aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -815,6 +837,16 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
                 cu_chunk_lens += [remainder]
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
+        # SP: slice hidden_states before encoder layers for distributed computation
+        if get_parallel_state().sp_enabled:
+            unpadded_seq_len = cu_seqlens[-1]
+            hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
+            # Compute padding size and add to cu_seqlens if needed
+            pad_seq_len = hidden_states.size(0) * get_parallel_state().sp_size - unpadded_seq_len
+            if pad_seq_len > 0:
+                new_cumsum = cu_seqlens[-1] + pad_seq_len
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
@@ -827,6 +859,7 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
+
         return BaseModelOutput(last_hidden_state=hidden_states)
 
     def padded_and_mask_function(self, tensor_list, tensor_len, padding_value=0, padding_side="right"):
@@ -2075,22 +2108,14 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
-        # TODO audio sp support
-        if get_parallel_state().sp_enabled:
-            raise NotImplementedError("audio sp is not supported yet.")
-        if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
-        else:
-            audio_feature_lengths = None
-
-        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+        audio_feat_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
+        feature_lens = audio_feature_lengths
         audio_outputs = self.audio_tower(
             input_features,
             feature_lens=feature_lens,
+            aftercnn_lens=audio_feat_lengths,
         )
         audio_features = audio_outputs.last_hidden_state
-
         return audio_features
 
     # We don't use this but compute the image and video masks in advance in process_sample
@@ -2153,7 +2178,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         image_grid_thw=None,
         video_grid_thw=None,
         attention_mask=None,
-        feature_attention_mask=None,
         audio_feature_lengths=None,
         position_ids=None,
         past_key_values=None,
@@ -2235,6 +2259,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         assert "video_mask" in kwargs, "video_mask should have already been computed in process_sample"
         image_mask = kwargs["image_mask"]
         video_mask = kwargs["video_mask"]
+        assert "audio_mask" in kwargs, "audio_mask should have already been computed in process_sample"
+        audio_mask = kwargs["audio_mask"]
 
         # Modification: Pop flash attention kwargs for ViT, they should only be used for language model
         # Qwen3L ViT input images seq lens should be computed during ViT forward using grid_thw
@@ -2252,14 +2278,29 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         # 2. Merge text , audios , image and video
         if input_features is not None:
+            valid_mask = audio_feature_lengths != 0
+            audio_feature_lengths = audio_feature_lengths[valid_mask]
+            if input_features.shape[0] == 0:
+                input_features = None
+
+        if input_features is not None:
             audio_features = self.get_audio_features(
                 input_features,
-                feature_attention_mask=feature_attention_mask,
                 audio_feature_lengths=audio_feature_lengths,
             )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
+            if get_parallel_state().sp_enabled:
+                # audio_features gathered in audio_tower
+                audio_features = gather_seq_scatter_heads(
+                    audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                )
+            audio_features = audio_features[: audio_mask.sum()]
+            audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+        elif get_parallel_state().fsdp_enabled:
+            fake_embeds = self.audio_tower.dummy_forward().last_hidden_state.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
 
         # Initialize fake_deepstack to None
         fake_deepstack = None
@@ -2460,11 +2501,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 deepstack_visual_embeds = fake_deepstack
             else:
                 deepstack_visual_embeds = None
-
-        if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-        else:
-            audio_feature_lengths = None
 
         if attention_mask is not None and position_ids is None:
             if (
@@ -4438,6 +4474,10 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
         return thinker_outputs
 
 
+def apply_veomni_qwen3_omni_moe_patch():
+    logger.info_rank0("Apply VeOmni patch to Qwen3_Omni_MoE.")
+
+
 __all__ = [
     "Qwen3OmniMoeForConditionalGeneration",
     "Qwen3OmniMoeThinkerTextModel",
@@ -4452,4 +4492,5 @@ __all__ = [
     "Qwen3OmniMoeCode2WavTransformerModel",
     "Qwen3OmniMoeTalkerCodePredictorModel",
     "Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration",
+    "apply_veomni_qwen3_omni_moe_patch",
 ]
