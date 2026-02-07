@@ -1,4 +1,3 @@
-from collections import defaultdict
 from typing import Union
 
 import torch
@@ -12,10 +11,13 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
     if isinstance(batches, dict):
         batches = [batches]
-    token_len = defaultdict(int)
+    token_len = {
+        "foundation_tokens": torch.tensor(0),
+        "image_decoder_tokens": torch.tensor(0),
+    }
 
     def _count(obj):
-        if isinstance(obj, dict):
+        if isinstance(obj, dict) and not obj.get("padding_flag", False):
             token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
 
             if "image_output_mask" in obj:
