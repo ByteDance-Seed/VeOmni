@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 from torch import nn
-from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeModel
+from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeModel, Qwen3MoePreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -131,7 +131,7 @@ class PatchQwen3MoeTopKRouter(nn.Module):
         self.num_experts = config.num_experts
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_dim = config.hidden_size
-        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -150,14 +150,6 @@ class PatchQwen3MoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.experts = PatchQwen3MoeExperts(config)
         self.gate = PatchQwen3MoeTopKRouter(config)
-
-        # --- Patch.2 ---
-        _init_weight(self.experts.gate_proj)
-        _init_weight(self.experts.up_proj)
-        _init_weight(self.experts.down_proj)
-
-        _init_weight(self.gate.weight)
-        # --- Patch.2 ---
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -338,6 +330,24 @@ def qwen3_moe_forcausal_lm_forward(
     )
 
 
+# ================================================================
+# PATCH: Qwen3MoePreTrainedModel._init_weights
+# 1. Support init weights for PatchQwen3MoeExperts and PatchQwen3MoeTopKRouter.
+# ================================================================
+@torch.no_grad()
+def qwen3_moe_pretrained_model_init_weights(self: Qwen3MoePreTrainedModel, module):
+    """Custom _init_weights to handle PatchQwen3MoeExperts and PatchQwen3MoeTopKRouter."""
+
+    super(Qwen3MoePreTrainedModel, self)._init_weights(module)
+
+    if isinstance(module, PatchQwen3MoeExperts):
+        _init_weight(module.gate_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.up_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.down_proj, mean=0.0, std=self.config.initializer_range)
+    elif isinstance(module, PatchQwen3MoeTopKRouter):
+        _init_weight(module.weight, mean=0.0, std=self.config.initializer_range)
+
+
 def apply_veomni_qwen3_moe_patch():
     logger.info_rank0("Apply VeOmni patch to qwen3_moe.")
 
@@ -348,6 +358,7 @@ def apply_veomni_qwen3_moe_patch():
 
     hf_qwen3_moe.Qwen3MoeModel.forward = qwen3_moe_model_forward
     hf_qwen3_moe.Qwen3MoeForCausalLM.forward = qwen3_moe_forcausal_lm_forward
+    hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = qwen3_moe_pretrained_model_init_weights
 
     if IS_CUDA_AVAILABLE:
         from .gpu_patch import apply_veomni_qwen3_moe_gpu_patch
