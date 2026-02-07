@@ -43,7 +43,6 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniVisionEncoder as _Qwen2_5OmniVisionEncoder,
 )
 
-from ....data.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -54,6 +53,7 @@ from ....distributed.sequence_parallel import (
     unpad_tensor,
 )
 from ....utils import logging
+from ....utils.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -782,10 +782,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
                 valid_mask = audio_feature_lengths != 0
                 # filter videos without audios, the origin invalid audio_feature_lengths only used for get_rope_index, now filter them out
                 audio_feature_lengths = audio_feature_lengths[valid_mask]
-
-                if (
-                    input_features.shape[0] == 0
-                ):  # input_features is (0, dim) when no audio in all videos, we do not forward audio_tower
+                if input_features.shape[0] == 0:
+                    # input_features is (0, dim) when no audio in all videos, we do not forward audio_tower
                     input_features = None
             # --- Patch.2 ---
 
@@ -900,11 +898,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
             if position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, dim, l -> dim, bs, l
         # --- Patch.6 ---
-
-        # --- Patch.3 ---
-        if get_parallel_state().sp_enabled:
-            position_ids = slice_input_tensor(position_ids, dim=-1)
-        # --- Patch.3 ---
 
         outputs = self.model(
             attention_mask=attention_mask,

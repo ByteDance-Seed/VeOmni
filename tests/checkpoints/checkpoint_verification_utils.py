@@ -18,13 +18,14 @@ Utilities for verifying checkpoint conversions between DCP and HuggingFace forma
 """
 
 import json
-import logging
 import os
 from typing import Dict, Optional
 
 import torch
 from torch.distributed.checkpoint import FileSystemReader, load
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME
+
+from veomni.utils import logging
 
 
 try:
@@ -34,14 +35,7 @@ try:
 except ImportError:
     SAFETENSORS_AVAILABLE = False
 
-
-# Setup logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 
 def _normalize_key(key: str) -> Optional[str]:

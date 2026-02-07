@@ -1,37 +1,35 @@
 import json
 import os
 import time
-from dataclasses import asdict
-from datetime import timedelta
+from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
+from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from tqdm import trange
 
-# from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
-from veomni.arguments import VeOmniArguments, parse_args, save_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
-    build_chat_template,
     build_dataloader,
     build_dataset,
+    build_multimodal_chat_template,
 )
-from veomni.data.data_transform import process_pretrain_example, process_sft_example
+from veomni.data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl, process_sample_qwen_omni
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
+from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
     get_torch_device,
-    is_nccl_backend,
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
@@ -41,25 +39,69 @@ from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 logger = helper.create_logger(__name__)
 
 
-# @dataclass
-# class Arguments:
-#     model: "ModelArguments" = field(default_factory=ModelArguments)
-#     data: "DataArguments" = field(default_factory=DataArguments)
-#     train: "TrainingArguments" = field(default_factory=TrainingArguments)
+def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
+    vit_params, other_params = [], []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if "visual" in name:
+                vit_params.append(param)
+            else:
+                other_params.append(param)
+
+    return [{"params": vit_params, "lr": vit_lr}, {"params": other_params, "lr": default_lr}]
+
+
+@dataclass
+class MyTrainingArguments(TrainingArguments):
+    freeze_vit: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the vit parameters."},
+    )
+    freeze_audio_tower: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the audio tower parameters."},
+    )
+    vit_lr: float = field(
+        default=1e-6,
+        metadata={"help": "Maximum learning rate for vit parameters."},
+    )
+
+
+@dataclass
+class MyDataArguments(DataArguments):
+    mm_configs: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for multimodal input."},
+    )
+
+
+@dataclass
+class MyModelArguments(ModelArguments):
+    encoder_data_balance: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to balance encoder data for qwen3-vl model"}
+    )
+    encoder_data_balance_sorting_algo: Optional[str] = field(
+        default="post_mbs_balancing_greedy_without_pad",
+        metadata={
+            "help": "The sorting algorithm of encoder data balance. All viable algorithms are defined in "
+            "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"
+        },
+    )
+
+
+@dataclass
+class Arguments(VeOmniArguments):
+    model: "MyModelArguments" = field(default_factory=MyModelArguments)
+    data: "MyDataArguments" = field(default_factory=MyDataArguments)
+    train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
 
 def main():
-    nccl_timeout = os.getenv("NCCL_TIMEOUT", None)
-    pg_nccl_timeout = None
-    if nccl_timeout is not None and is_nccl_backend():
-        pg_nccl_timeout = timedelta(seconds=int(nccl_timeout))
-    logger.info(f"Process_group timeout: {nccl_timeout}")
-    dist.init_process_group(backend=get_dist_comm_backend(), timeout=pg_nccl_timeout)
-
-    args = parse_args(VeOmniArguments)
+    args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
+    dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
@@ -68,9 +110,8 @@ def main():
         save_args(args, args.train.output_dir)
 
     # Gradient checkpointing debug
-    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
+    set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
-    # Model checkpointer
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
     init_parallel_state(
@@ -83,27 +124,56 @@ def main():
         cp_size=args.train.context_parallel_size,
         ulysses_size=args.train.ulysses_parallel_size,
         dp_mode=args.train.data_parallel_mode,
+        async_enabled=args.train.async_enabled,
     )
 
+    logger.info_rank0("Prepare model")
+    model = build_foundation_model(
+        config_path=args.model.config_path,
+        weights_path=args.model.model_path,
+        init_device=args.train.init_device,
+        moe_implementation=args.model.moe_implementation,
+        attn_implementation=args.model.attn_implementation,
+        encoder_data_balance=args.model.encoder_data_balance,
+        encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+    )
+    model_config = model.config
+    helper.print_device_mem_info("VRAM usage after building model")
     logger.info_rank0("Prepare data")
-    tokenizer = build_tokenizer(args.model.tokenizer_path)
-    if args.data.data_type == "plaintext":
+    processor = build_processor(args.model.tokenizer_path)
+
+    if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        model.disable_talker()
+        position_id_func = model.thinker.get_position_id_func()
+    else:
+        position_id_func = model.get_position_id_func()
+        chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
+
+    if model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
         transform = partial(
-            process_pretrain_example,
-            tokenizer=tokenizer,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
-        )
-    elif args.data.data_type == "conversation":
-        chat_template = build_chat_template(args.data.chat_template, tokenizer)
-        transform = partial(
-            process_sft_example,
+            process_sample_qwen2_5_vl,
+            processor=processor,
             chat_template=chat_template,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
+            position_id_func=position_id_func,
+            **args.data.mm_configs,
+        )
+    elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+        transform = partial(
+            process_sample_qwen3_vl,
+            processor=processor,
+            chat_template=chat_template,
+            position_id_func=position_id_func,
+            **args.data.mm_configs,
+        )
+    elif model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        transform = partial(
+            process_sample_qwen_omni,
+            processor=processor,
+            position_id_func=position_id_func,
+            **args.data.mm_configs,
         )
     else:
-        raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
+        raise ValueError(f"Unsupported model type: {model_config.model_type}")
 
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,
@@ -115,7 +185,24 @@ def main():
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    args.compute_train_steps(dataset_length)
+
+    collate_fn_kwargs = {
+        "pad_to_length": args.train.pad_to_length,
+        "data_collate_info": {
+            "pixel_values": (0, True, 0, processor.image_processor.merge_size**2),
+            "pixel_values_videos": (0, True, 0, processor.video_processor.merge_size**2),
+        },
+    }
+
+    if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        collate_fn_kwargs["data_collate_info"].update(
+            {
+                "audio_feature_lengths": (0, False, None, None),
+                "input_features": (0, True, 0, 1),
+                "audio_mask": (-1, False, 0, 1),
+            }
+        )
 
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
@@ -123,36 +210,31 @@ def main():
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
-        seed=args.train.seed,
         max_seq_len=args.data.max_seq_len,
-        train_steps=args.train.train_steps,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
+        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        pad_packed_to_length=args.train.pad_packed_to_length,
-        dyn_bsz_margin=args.train.dyn_bsz_margin,
-        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
+        seed=args.train.seed,
+        collate_fn_kwargs=collate_fn_kwargs,
     )
 
-    logger.info_rank0("Prepare model")
-    model = build_foundation_model(
-        config_path=args.model.config_path,
-        weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-        attn_implementation=args.model.attn_implementation,
-        moe_implementation=args.model.moe_implementation,
-        init_device=args.train.init_device,
-    )
-    model_config = model.config
-    helper.print_device_mem_info("VRAM usage after building model")
+    if args.train.freeze_vit:
+        if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            model.thinker.visual.requires_grad_(False)
+            model.thinker.visual.merger.requires_grad_(True)
+        else:
+            model.visual.requires_grad_(False)
 
-    get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
+    if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        model.thinker.audio_tower.requires_grad_(False)
+        model.thinker.audio_tower.proj.requires_grad_(True)
+
     model = build_parallelize_model(
         model,
         init_device=args.train.init_device,
@@ -166,21 +248,17 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
-
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
         weight_decay=args.train.weight_decay,
-        fused=True,
+        fused=False,
         optimizer_type=args.train.optimizer,
+        param_groups=get_param_groups(model, args.train.lr, args.train.vit_lr),
     )
-    if get_optimizer_pre_hook is not None:
-        optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)
-        optimizer.register_step_pre_hook(optimizer_pre_hook)
-
     lr_scheduler = build_lr_scheduler(
         optimizer,
-        train_steps=args.train.train_steps * args.train.num_train_epochs,
+        train_steps=args.train_steps * args.train.num_train_epochs,
         lr=args.train.lr,
         lr_min=args.train.lr_min,
         lr_decay_style=args.train.lr_decay_style,
@@ -198,8 +276,7 @@ def main():
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
-        # save model_assets before training
-        model_assets = [model_config, tokenizer if args.data.data_type == "plaintext" else chat_template]
+        model_assets = [model_config, processor]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
     if args.train.profile_this_rank:
@@ -219,24 +296,21 @@ def main():
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-        empty_cache_steps=args.train.empty_cache_steps,
         enable_multisource=args.data.enable_multisource,
         dataloader=train_dataloader,
         data_path=args.data.train_path,
+        empty_cache_steps=args.train.empty_cache_steps,
     )
 
     if args.train.load_checkpoint_path:
         state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
         Checkpointer.load(args.train.load_checkpoint_path, state)
         global_step = state["extra_state"]["global_step"]
-        start_epoch = global_step // args.train.train_steps
-        start_step = global_step % args.train.train_steps
+        start_epoch = global_step // args.train_steps
+        start_step = global_step % args.train_steps
         lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
         train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
         environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
-        torch.set_rng_state(state["extra_state"]["torch_rng_state"])
         if start_step == 0:  # resume at the end of epoch
             iter(train_dataloader)  # clear resume state and prefetch data
 
@@ -248,24 +322,21 @@ def main():
         args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit
     )
     model.train()
-    logger.info(
-        f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
-    )
+    logger.info_rank0("Start training")
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
         data_loader_tqdm = trange(
-            args.train.train_steps,
+            args.train_steps,
             desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
-            total=args.train.train_steps,
+            total=args.train_steps,
             initial=start_step,
             disable=args.train.local_rank != 0,
         )
         data_iterator = iter(train_dataloader)
-        for _ in range(start_step, args.train.train_steps):
+        for _ in range(start_step, args.train_steps):
             global_step += 1
-
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
@@ -278,8 +349,7 @@ def main():
             total_loss = 0
             synchronize()
             start_time = time.time()
-
-            micro_batches_token_num = count_loss_token(micro_batches)
+            micro_batches_token_len = count_loss_token(micro_batches)
             num_micro_steps = len(micro_batches)
 
             for micro_step, micro_batch in enumerate(micro_batches):
@@ -293,7 +363,7 @@ def main():
                     elif micro_step == num_micro_steps - 1:
                         model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch)
-                micro_batch_token_num = count_loss_token(micro_batch)
+                micro_batch_token_len = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
                     micro_batch.pop("cur_token_num", None)
@@ -303,11 +373,14 @@ def main():
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
                     for k, v in micro_batch.items()
                 }
+
                 with model_fwd_context:
-                    loss = model(**micro_batch, use_cache=False).loss
+                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss
 
-                loss, _ = mean_global_loss(loss, micro_batch_token_num, micro_batches_token_num)
-
+                loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
+                    loss, micro_batch_token_len, micro_batches_token_len
+                )
+                loss = torch.stack(list(loss_dict.values())).sum()
                 with model_bwd_context:
                     loss.backward()
 
@@ -319,8 +392,6 @@ def main():
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            if hasattr(grad_norm, "full_tensor"):
-                grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
             total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
@@ -337,7 +408,12 @@ def main():
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
                     train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                        {
+                            "training/total_loss": total_loss,
+                            "training/foundation_loss": total_loss,
+                            "training/grad_norm": grad_norm,
+                            "training/lr": lr,
+                        }
                     )
                     wandb.log(train_metrics, step=global_step)
 
@@ -357,11 +433,9 @@ def main():
                         "lr_scheduler": lr_scheduler.state_dict(),
                         "train_dataloader": train_dataloader.state_dict(),
                         "environ_meter": environ_meter.state_dict(),
-                        "torch_rng_state": torch.get_rng_state(),
                     },
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
@@ -379,7 +453,6 @@ def main():
                     "lr_scheduler": lr_scheduler.state_dict(),
                     "train_dataloader": train_dataloader.state_dict(),
                     "environ_meter": environ_meter.state_dict(),
-                    "torch_rng_state": torch.get_rng_state(),
                 },
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
@@ -391,14 +464,16 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
-        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
-            ckpt_manager=args.train.ckpt_manager,
-        )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+    if args.train.global_rank == 0:
+        if args.train.save_hf_weights and save_checkpoint_path is not None:
+            hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+            model_state_dict = ckpt_to_state_dict(
+                save_checkpoint_path=save_checkpoint_path,
+                output_dir=args.train.output_dir,
+                ckpt_manager=args.train.ckpt_manager,
+            )
+            save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+            logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

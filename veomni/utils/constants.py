@@ -11,3 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+IGNORE_INDEX = -100
+
+# input index
+IMAGE_INPUT_INDEX = -200
+VIDEO_INPUT_INDEX = -300
+AUDIO_INPUT_INDEX = -400
+# output index
+IMAGE_OUTPUT_INDEX = -201
+VIDEO_OUTPUT_INDEX = -301
+AUDIO_OUTPUT_INDEX = -401
+
+
+TYPE2INDEX = {
+    "input": {
+        "image": IMAGE_INPUT_INDEX,
+        "video": VIDEO_INPUT_INDEX,
+        "audio": AUDIO_INPUT_INDEX,
+    },
+    "output": {
+        "image": IMAGE_OUTPUT_INDEX,
+        "video": VIDEO_OUTPUT_INDEX,
+        "audio": AUDIO_OUTPUT_INDEX,
+    },
+}
+
+
+MODALITY = TYPE2INDEX["input"].keys() | TYPE2INDEX["output"].keys()

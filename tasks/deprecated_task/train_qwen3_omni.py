@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 import torch
 import torch.distributed as dist
 import wandb
+from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from tqdm import trange
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
@@ -19,7 +20,6 @@ from veomni.data import (
     build_dataloader,
     build_dataset,
 )
-from veomni.data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.data.multimodal.audio_utils import fetch_audios
 from veomni.data.multimodal.image_utils import fetch_images
 from veomni.data.multimodal.preprocess import conv_preprocess
@@ -34,6 +34,7 @@ from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -213,7 +214,7 @@ def main():
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
     # Gradient checkpointing debug
-    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
+    set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -355,7 +356,6 @@ def main():
         dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,

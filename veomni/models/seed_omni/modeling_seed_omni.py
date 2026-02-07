@@ -24,7 +24,6 @@ from torch import nn
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from ...data.constants import IGNORE_INDEX
 from ...distributed.parallel_plan import ParallelPlan
 from ...distributed.parallel_state import get_parallel_state
 from ...distributed.sequence_parallel import (
@@ -32,6 +31,7 @@ from ...distributed.sequence_parallel import (
     gather_seq_scatter_heads,
 )
 from ...utils import logging
+from ...utils.constants import IGNORE_INDEX
 from ..loader import get_model_class
 from .configuration_seed_omni import SeedOmniConfig, SeedOmniDecoderConfig, SeedOmniEncoderConfig
 from .decoder import BaseDecoderModelMixin, BaseDecoderOutput

@@ -368,7 +368,7 @@ def parallelize_model_fsdp2(
             # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
             # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
             gradient_divide_factor = parallel_state.ep_gradient_divide_factor
-            logger.info(f"setting grad divide factor for ep module to {gradient_divide_factor}")
+            logger.info_once(f"setting grad divide factor for ep module to {gradient_divide_factor}")
             if IS_NPU_AVAILABLE:
                 # NPU is using torch 2.7
                 experts_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
