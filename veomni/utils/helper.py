@@ -148,6 +148,7 @@ class EnvironMeter:
         self.gc_steps = gc_steps
         self.world_size = dist.get_world_size()
         self.consume_tokens = 0
+        self.consume_chunks = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
@@ -170,7 +171,7 @@ class EnvironMeter:
             gc.disable()
 
     def state_dict(self) -> Dict[str, Any]:
-        state_dict = {"consume_tokens": self.consume_tokens}
+        state_dict = {"consume_tokens": self.consume_tokens, "consume_chunks": self.consume_chunks}
         if self.enable_multisource:
             state_dict.update({"multisource_tracker": self.multisource_tracker.state_dict()})
 
@@ -178,6 +179,7 @@ class EnvironMeter:
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.consume_tokens = state_dict["consume_tokens"]
+        self.consume_chunks = state_dict["consume_chunks"]
         if self.enable_multisource:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
@@ -201,7 +203,6 @@ class EnvironMeter:
             )
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
-
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
@@ -215,6 +216,7 @@ class EnvironMeter:
         avg_sample_seq_len = batch_tokens / real_global_batch_size
         tokens_per_second = batch_tokens / delta_time
         self.consume_tokens += batch_tokens
+        self.consume_chunks += real_global_batch_size
 
         # cuda memory
         allocated_memory = get_torch_device().max_memory_allocated()
@@ -236,6 +238,7 @@ class EnvironMeter:
             "tokens_per_second(M)": tokens_per_second / 1e6,
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
+            "consumed_chunk_num": self.consume_chunks,
             "max_memory_allocated(GB)": allocated_memory / (1024**3),
             "max_memory_reserved(GB)": reserved_memory / (1024**3),
             "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),

@@ -92,7 +92,7 @@ def build_native_dataloader(
             f"dp_size: {parallel_state.dp_size}, sp_size: {parallel_state.sp_size}, "
             f"global_batch_size: {global_batch_size}, micro_batch_size: {micro_batch_size}, "
             f"num_micro_batch: {num_micro_batch}.\n"
-            f"train_steps: {train_steps}, bsz_warmup_steps: {bsz_warmup_steps},"
+            f"train_steps: {train_steps}, bsz_warmup_steps: {bsz_warmup_steps}, "
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
 

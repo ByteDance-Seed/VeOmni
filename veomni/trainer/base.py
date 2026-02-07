@@ -157,10 +157,6 @@ class BaseTrainer(Stateful, ABC):
         self._build_parallelized_model()
         # Build optimizer and lr scheduler
         self._build_optimizer_and_scheduler()
-        # Initialize training states
-        self.train_steps = 0
-        self.start_epoch = 0
-        self.start_step = 0
         # Build training context
         self._build_training_context()
         # Initialize callbacks
@@ -218,6 +214,14 @@ class BaseTrainer(Stateful, ABC):
 
         # Gradient checkpointing debug
         set_checkpoint_debug_enabled(self.args.train.debug_gradient_checkpointing)
+
+    def _destroy_distributed(self):
+        # Clean up optimizer and lr scheduler
+        del self.optimizer, self.lr_scheduler
+        helper.empty_cache()
+
+        dist.barrier()
+        dist.destroy_process_group()
 
     def _init_distributed(self):
         device_str = f"{get_device_type()}:{self.args.train.local_rank}"
@@ -402,8 +406,10 @@ class BaseTrainer(Stateful, ABC):
         self.callbacks.call("on_train_begin", self.state)
         logger.info(
             f"Rank{args.train.local_rank} Start training. "
-            f"Train_steps: {args.train_steps}. "
-            f"Epochs: {args.train.num_train_epochs}."
+            f"Start step: {self.start_step}. "
+            f"Train steps: {args.train_steps}. "
+            f"Start epoch: {self.start_epoch}. "
+            f"Train epochs: {args.train.num_train_epochs}."
         )
 
         for epoch in range(self.start_epoch, args.train.num_train_epochs):
@@ -431,12 +437,8 @@ class BaseTrainer(Stateful, ABC):
         self.callbacks.call("on_train_end", self.state)
 
         synchronize()
-        # Clean up optimizer and lr scheduler
-        del self.optimizer, self.lr_scheduler
-        helper.empty_cache()
 
-        dist.barrier()
-        dist.destroy_process_group()
+        self._destroy_distributed()
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""

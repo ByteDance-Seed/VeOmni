@@ -1,6 +1,6 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List
 
 
 if TYPE_CHECKING:
@@ -17,10 +17,12 @@ class Callback(ABC):
     def __init__(self, trainer: "BaseTrainer") -> None:
         self.trainer = trainer
 
-    def on_step_begin(self, state: TrainerState, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
         pass
 
-    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+    def on_step_end(
+        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+    ) -> None:
         pass
 
     def on_epoch_begin(self, state: TrainerState, **kwargs) -> None:
