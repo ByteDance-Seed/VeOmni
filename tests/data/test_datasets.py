@@ -229,7 +229,6 @@ def dummy_multisource_dataset_ci():
     with open(tmp_yaml_path, "w") as f:
         yaml.safe_dump(multisource_config, f)
 
-    tmp_yaml_path = "/home/tiger/.cache/veomni/tmp.yaml"
     yield tmp_yaml_path
 
     del multisource_datasets
