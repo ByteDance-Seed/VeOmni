@@ -27,7 +27,6 @@ _fused_moe_forward = None
 
 
 def fused_moe_forward(
-    module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -47,7 +46,6 @@ def fused_moe_forward(
     )
 
     return _fused_moe_forward(
-        module,
         num_experts,
         routing_weights,
         selected_experts,

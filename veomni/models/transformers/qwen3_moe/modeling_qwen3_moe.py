@@ -109,7 +109,6 @@ class PatchQwen3MoeExperts(nn.Module):
             top_k_weights = top_k_weights.to(final_hidden_states.dtype)
 
             final_hidden_states = fused_moe_forward(
-                module=self,
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights,
                 selected_experts=top_k_index,
