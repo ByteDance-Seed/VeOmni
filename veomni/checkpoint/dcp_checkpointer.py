@@ -605,9 +605,7 @@ def _process_shard(
     del metadata
     del reader
     gc.collect()
-    # Clear CUDA cache if available
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    empty_cache()
     return processed_dict
 
 
