@@ -61,6 +61,7 @@ def main():
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
