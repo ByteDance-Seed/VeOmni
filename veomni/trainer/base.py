@@ -204,6 +204,9 @@ class BaseTrainer(Stateful, ABC):
         # Set random seed
         helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
 
+        # Enable high precision for bf16
+        helper.enable_high_precision_for_bf16()
+
         # Enable third party logging
         if self.args.train.local_rank == 0:
             helper.enable_third_party_logging()
