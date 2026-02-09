@@ -211,6 +211,7 @@ def qwen3forcausallm_forward(
         attentions=outputs.attentions,
     )
 
+
 # ================================================================
 # PATCH: Qwen3ForSequenceClassification.forward
 # 1. Support SP
