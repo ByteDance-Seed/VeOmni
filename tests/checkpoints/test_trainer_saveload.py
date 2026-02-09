@@ -98,6 +98,22 @@ def check_state_dict(lhs_dict, rhs_dict, need_flatten=False, tied_weight_key: Op
         torch.testing.assert_close(rhs_val, lhs_val)
 
 
+def capture_param_dtypes(model):
+    """Capture a snapshot of {param_name: dtype} for the model."""
+    return {name: param.data.dtype for name, param in model.named_parameters()}
+
+
+def assert_param_dtypes_unchanged(model, original_dtypes):
+    """Assert that model parameter dtypes have not been mutated."""
+    for name, param in model.named_parameters():
+        current_dtype = param.data.dtype
+        expected_dtype = original_dtypes[name]
+        assert current_dtype == expected_dtype, (
+            f"Parameter '{name}' dtype was mutated: expected {expected_dtype}, got {current_dtype}. "
+            f"This indicates an in-place dtype conversion side effect during save."
+        )
+
+
 @dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
@@ -324,19 +340,31 @@ def main():
     # After training on all epochs, save model in huggingface's format and verify against DCP checkpoint
     if Checkpointer.dcp_save_future is not None:
         Checkpointer.dcp_save_future.result()
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
+        # Capture param dtypes before HF save to detect in-place mutation
+        dtypes_before_hf_save = capture_param_dtypes(model)
+
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         save_hf_safetensor(
             save_checkpoint_path=save_checkpoint_path,
             model_assets=[model_config],
             ckpt_manager=args.train.ckpt_manager,
             train_architecture=args.train.train_architecture,
+            model=model,
+            save_safetensor_path=hf_weights_path,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
-        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        assert verify_dcp_to_hf_conversion(
-            dcp_checkpoint_dir=save_checkpoint_path,
-            hf_checkpoint_dir=hf_weights_path,
-            safe_serialization=True,
-        ), "HF safetensors verification failed: saved weights don't match DCP checkpoint"
+
+        # Assert model parameter dtypes were not mutated by the save operation
+        assert_param_dtypes_unchanged(model, dtypes_before_hf_save)
+        logger.info_rank0("HuggingFaceStorageWriter dtype preservation check PASSED!")
+
+        if args.train.global_rank == 0:
+            assert verify_dcp_to_hf_conversion(
+                dcp_checkpoint_dir=save_checkpoint_path,
+                hf_checkpoint_dir=hf_weights_path,
+                safe_serialization=True,
+            ), "HF safetensors verification failed: saved weights don't match DCP checkpoint"
     dist.barrier()
 
     # resume states from checkpoints and compare them with the ones before saving

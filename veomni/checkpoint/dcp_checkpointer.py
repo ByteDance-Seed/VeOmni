@@ -291,12 +291,19 @@ class DistributedCheckpointer(CheckpointerBase):
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
         if isinstance(storage_writer, HuggingFaceStorageWriter):
-            for param in state["model"].parameters():
-                if param.data.dtype == torch.float32:
-                    param.data = param.data.to(torch.bfloat16)
             # Use flat state dict so DCP FQNs match the original HF weight_map keys
             # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
             save_state = ModelState(state["model"]).state_dict()
+            # Convert float32 tensors to bfloat16 on a copy of the state dict,
+            # so the original model parameters remain unchanged.
+            converted_state = {}
+            for k, v in save_state.items():
+                if v.dtype == torch.float32:
+                    logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
+                    converted_state[k] = v.to(torch.bfloat16)
+                else:
+                    converted_state[k] = v
+            save_state = converted_state
             # Remove tied weights not present in the HF weight_map
             # (e.g. lm_head.weight is tied to model.embed_tokens.weight via tie_word_embeddings)
             if storage_writer.fqn_to_index_mapping is not None:
