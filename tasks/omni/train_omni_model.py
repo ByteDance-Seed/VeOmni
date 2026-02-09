@@ -103,6 +103,7 @@ def main():
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group()
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 

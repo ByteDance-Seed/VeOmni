@@ -54,6 +54,7 @@ def main():
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
@@ -187,6 +188,8 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                id=args.train.wandb_id,
+                resume="allow" if args.train.wandb_id else None,
                 settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
