@@ -71,6 +71,7 @@ jobs:
         run: |
           uv run pytest -s -x tests/e2e/test_e2e_training.py
           uv run pytest -s -x tests/e2e/test_e2e_parallel.py
+          uv run pytest -s -x tests/e2e/tests/e2e/test_e2e_fsdp2.py
 
   cleanup:
     runs-on: ubuntu-latest
