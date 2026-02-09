@@ -85,7 +85,9 @@ class ModelArguments:
     )
     safetensor_idx_path: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."},
+        metadata={
+            "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
+        },
     )
     foundation: Dict[str, str] = field(
         default_factory=dict,
@@ -163,9 +165,7 @@ class ModelArguments:
         if self.safetensor_idx_path is not None:
             with open(self.safetensor_idx_path) as f:
                 weight_map = json.load(f)["weight_map"]
-            self.fqn_to_index_mapping = {
-                fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()
-            }
+            self.fqn_to_index_mapping = {fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()}
 
         if self.attn_implementation == "flash_attention_2":
             logger.info_rank0(
@@ -740,11 +740,9 @@ class TrainingArguments:
         # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
         # │   ├── global_step_100/
         # │   └── global_step_200/
-        # ├── hf_ckpt/          # Exported HF model weights
         # ├── model_assets/
         # └── step2token.json
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
-        self.save_safetensor_path = os.path.join(self.output_dir, "hf_ckpt")
         self.step2token_path = os.path.join(self.output_dir, "step2token.json")
         self.model_assets_dir = os.path.join(self.output_dir, "model_assets")
 

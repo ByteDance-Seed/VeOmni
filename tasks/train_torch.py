@@ -38,6 +38,7 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
+
 logger = helper.create_logger(__name__)
 
 
@@ -396,13 +397,14 @@ def main():
     helper.empty_cache()
     # save model in huggingface's format
     if args.train.save_hf_weights and save_checkpoint_path is not None:
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         save_hf_safetensor(
-            save_checkpoint_path=save_checkpoint_path,
-            model_assets=model_assets,
+            save_hf_safetensor_path=hf_weights_path,
             ckpt_manager=args.train.ckpt_manager,
+            model_assets=model_assets,
             train_architecture=args.train.train_architecture,
+            save_checkpoint_path=save_checkpoint_path,
             model=model,
-            save_safetensor_path=args.train.save_safetensor_path,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
 

@@ -10,6 +10,12 @@ from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
 )
+
+from ..utils.import_utils import is_torch_version_greater_than
+
+
+if is_torch_version_greater_than("2.9"):
+    from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE
 from torch.distributed.checkpoint.state_dict import (
@@ -26,8 +32,6 @@ from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.device import empty_cache, synchronize
 from .checkpointer import CheckpointerBase
-
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
 
 logger = logging.get_logger(__name__)

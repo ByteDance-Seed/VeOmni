@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import time
 from typing import Dict, Optional, Sequence
 
@@ -70,13 +69,13 @@ def _save_hf_safetensor_distributed(
 
 def _save_hf_safetensor_legacy(
     save_checkpoint_path: str,
+    save_hf_safetensor_path: str,
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     train_architecture: Optional[str],
     output_dir: Optional[str],
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
-    hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
     model_state_dict = ckpt_to_state_dict(
         save_checkpoint_path=save_checkpoint_path,
         ckpt_manager=ckpt_manager,
@@ -84,18 +83,20 @@ def _save_hf_safetensor_legacy(
     )
     if train_architecture == "lora":
         model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
-    save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-    logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")
+    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
+    logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
 def save_hf_safetensor(
-    save_checkpoint_path: Optional[str] = None,
-    model_assets: Optional[Sequence] = None,
+    save_hf_safetensor_path: Optional[str] = None,
     ckpt_manager: Optional[str] = None,
+    model_assets: Optional[Sequence] = None,
     train_architecture: Optional[str] = None,
+    # Legacy only
+    save_checkpoint_path: Optional[str] = None,
     output_dir: Optional[str] = None,
+    # Distributed only
     model: Optional[torch.nn.Module] = None,
-    save_safetensor_path: Optional[str] = None,
     fqn_to_index_mapping: Optional[Dict[str, int]] = None,
 ):
     """Save model weights in HuggingFace safetensors format.
@@ -106,25 +107,27 @@ def save_hf_safetensor(
     - Legacy mode: Loads from checkpoint and converts to safetensors on rank 0.
 
     Args:
-        save_checkpoint_path: Path to the distributed checkpoint (legacy mode).
+        save_hf_safetensor_path: Output path for saved HuggingFace safetensors.
+        ckpt_manager: Checkpoint manager type. Used for routing (distributed when "dcp")
+            and passed to legacy ``ckpt_to_state_dict``.
         model_assets: Model assets (e.g., config, tokenizer) to save alongside weights.
-        ckpt_manager: Checkpoint manager type.
-        train_architecture: Training architecture type. If "lora", uses legacy mode.
-        output_dir: Output directory for checkpoint conversion. Required only by omnistore ckpt_manager.
-        model: Live FSDP model for distributed save.
-        save_safetensor_path: Output path for distributed save.
-        fqn_to_index_mapping: Maps FQNs to safetensors file indices for multi-file output.
+        train_architecture: Training architecture type. Used for routing (legacy when "lora")
+            and to filter LoRA weights in legacy mode.
+        save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
+        output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
+            Required by non-dcp checkpoint managers (e.g., omnistore).
+        model: [Distributed only] Live FSDP model for distributed save.
+        fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
+            for multi-file output.
     """
-    use_distributed = (
-        is_torch_version_greater_than("2.9")
-        and train_architecture != "lora"
-        and ckpt_manager == "dcp"
-    )
+    use_distributed = is_torch_version_greater_than("2.9") and train_architecture != "lora" and ckpt_manager == "dcp"
 
     if use_distributed:
-        _save_hf_safetensor_distributed(model, save_safetensor_path, fqn_to_index_mapping, model_assets)
+        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
     else:
         # Legacy path is rank-0 only
         if dist.is_initialized() and dist.get_rank() != 0:
             return
-        _save_hf_safetensor_legacy(save_checkpoint_path, model_assets, ckpt_manager, train_architecture, output_dir)
+        _save_hf_safetensor_legacy(
+            save_checkpoint_path, save_hf_safetensor_path, model_assets, ckpt_manager, train_architecture, output_dir
+        )

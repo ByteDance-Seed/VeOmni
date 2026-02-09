@@ -346,12 +346,12 @@ def main():
 
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         save_hf_safetensor(
-            save_checkpoint_path=save_checkpoint_path,
-            model_assets=[model_config],
+            save_hf_safetensor_path=hf_weights_path,
             ckpt_manager=args.train.ckpt_manager,
+            model_assets=[model_config],
             train_architecture=args.train.train_architecture,
+            save_checkpoint_path=save_checkpoint_path,
             model=model,
-            save_safetensor_path=hf_weights_path,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
 
