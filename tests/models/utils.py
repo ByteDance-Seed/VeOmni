@@ -3,60 +3,27 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Callable, Dict, Optional
 
 import torch
-import torch.nn.functional as F
 from rich.console import Console
 from rich.table import Table
 from transformers import set_seed
 
-from veomni.models import build_foundation_model
-from veomni.optim import build_optimizer
-from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_torch_npu_available
-
-
-def build_base_model_optim(
-    config_path: str,
-    attn_implementation: str = "eager",
-    moe_implementation: str = "eager",
-):
-    model = build_foundation_model(
-        config_path=config_path,
-        weights_path=None,
-        torch_dtype="bfloat16",
-        attn_implementation=attn_implementation,
-        moe_implementation=moe_implementation,
-        init_device=get_device_type(),
-    )
-
-    optimizer = build_optimizer(
-        model,
-        lr=0.0001,
-        weight_decay=0,
-        fused=True,
-        optimizer_type="adamw",
-        no_decay_modules=[],
-        no_decay_params=[],
-    )
-
-    return model, optimizer
 
 
 @dataclass(frozen=True)
 class ModelMode:
     modeling_backend: str
     attn_implementation: str
-    attn_case: str
     sync_weight_func: Optional[Callable] = None
     moe_implementation: str = "eager"  # 修正类型匹配
     use_liger_kernel: bool = False
 
     def __str__(self):
-        return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]_[{self.attn_case}]"
+        return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]]"
 
 
-# For each attn_case: HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
+# HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
 # On NPU skip FA3.
-_BASE_ATTN_CASES = ["padded_bsh", "position_ids"]
 _HF_ATTN = ["eager", "flash_attention_2", "flash_attention_3"]
 _VEOMNI_ATTN = [
     "eager",
@@ -73,8 +40,8 @@ def _skip_fa3_npu(attn_impl: str) -> bool:
     return attn_impl in ("flash_attention_3", "veomni_flash_attention_3_with_sp")
 
 
-def _append_veomni_modes(modes: list, attn_case: str, moe_implementation: str = "eager"):
-    """Append VeOmni modes for one attn_case; every attn uses _USE_LIGER_KERNEL (True/False)."""
+def _append_veomni_modes(modes: list, moe_implementation: str = "eager"):
+    """Append VeOmni modes for case; every attn uses _USE_LIGER_KERNEL (True/False)."""
     for veomni_attn in _VEOMNI_ATTN:
         if _skip_fa3_npu(veomni_attn):
             continue
@@ -83,7 +50,6 @@ def _append_veomni_modes(modes: list, attn_case: str, moe_implementation: str = 
                 ModelMode(
                     "veomni",
                     veomni_attn,
-                    attn_case,
                     moe_implementation=moe_implementation,
                     use_liger_kernel=use_liger,
                 )
@@ -93,23 +59,21 @@ def _append_veomni_modes(modes: list, attn_case: str, moe_implementation: str = 
 def _base_model_modes():
     """Base (non-MoE) model modes; all use sync_weight_func=None by default."""
     modes = []
-    for attn_case in _BASE_ATTN_CASES:
-        for hf_attn in _HF_ATTN:
-            if _skip_fa3_npu(hf_attn):
-                continue
-            modes.append(ModelMode("hf", hf_attn, attn_case))
-        _append_veomni_modes(modes, attn_case)
+    for hf_attn in _HF_ATTN:
+        if _skip_fa3_npu(hf_attn):
+            continue
+        modes.append(ModelMode("hf", hf_attn))
+    _append_veomni_modes(modes)
     return modes
 
 
 def _moe_model_modes():
     """MoE model modes: same attn variants with moe_implementation=fused."""
     modes = []
-    for attn_case in _BASE_ATTN_CASES:
-        for hf_attn in _HF_ATTN:
-            if _skip_fa3_npu(hf_attn):
-                continue
-        _append_veomni_modes(modes, attn_case, moe_implementation="fused")
+    for hf_attn in _HF_ATTN:
+        if _skip_fa3_npu(hf_attn):
+            continue
+    _append_veomni_modes(modes, moe_implementation="fused")
     return modes
 
 
@@ -141,83 +105,22 @@ def prepare_model_modes(
     return hf_model_modes, veomni_model_modes
 
 
-def prepare_data(bsz, max_seq_len, seq_lens):
-    def _get_dummy_inputs(data_type, bsz, max_seq_len, seq_lens, seed=42):
-        if seq_lens.ndim != 1 or seq_lens.shape[0] != bsz:
-            raise ValueError("seq_lens shape must be (batch_size,)")
-        if torch.any(seq_lens > max_seq_len):
-            raise ValueError(f"seq_lens must not contain elements > {max_seq_len}. {max_seq_len=}")
-
+def prepare_data(max_seq_len):
+    def _get_dummy_inputs(max_seq_len, seed=42):
         set_seed(seed)
-        input_ids = torch.randint(0, 1024, (bsz, max_seq_len))
-        attention_mask = torch.ones_like(input_ids)
-        positions = torch.arange(max_seq_len).expand(bsz, -1)
-        padding_cutoff = (max_seq_len - seq_lens).unsqueeze(1)
-        # left padding
-        attention_mask[positions < padding_cutoff] = 0
+        input_ids = torch.randint(0, 1024, (1, torch.randint(1, max_seq_len, (1,)).item()))
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "labels": input_ids.clone(),
+        }
 
-        if data_type == "cu_seqlens":
-            input_ids = torch.cat([input_ids[i, :l] for i, l in enumerate(seq_lens)])
-            cu_seqlens = F.pad(seq_lens, pad=(1, 0)).cumsum_(-1).int()
+    class DummyDataLoader:
+        def __iter__(self):
+            yield _get_dummy_inputs(max_seq_len=max_seq_len, seed=42)
+            yield _get_dummy_inputs(max_seq_len=max_seq_len, seed=43)
 
-            return {
-                "input_ids": input_ids,
-                "cu_seqlens": cu_seqlens,
-                "attention_mask": torch.ones_like(input_ids),
-                "labels": input_ids.clone(),
-            }
-
-        elif data_type == "position_ids":
-            position_ids_list = []
-            for i in range(input_ids.size(0)):
-                valid_token_count = attention_mask[i].sum().item()
-                position_ids = torch.arange(valid_token_count)
-                position_ids_list.append(position_ids)
-            position_ids = torch.cat(position_ids_list).unsqueeze(0)
-            input_ids = torch.cat([input_ids[i, :l] for i, l in enumerate(seq_lens)]).unsqueeze(0)
-
-            return {
-                "input_ids": input_ids,
-                "position_ids": position_ids,
-                "labels": input_ids.clone(),
-            }
-
-        elif data_type == "padded_bsh":
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": input_ids.clone(),
-            }
-
-        else:
-            raise ValueError(f"Invalid data_type: {data_type}")
-
-    dummy_data = {
-        "cu_seqlens": _get_dummy_inputs(
-            data_type="cu_seqlens", bsz=bsz, max_seq_len=max_seq_len, seq_lens=seq_lens, seed=42
-        ),
-        "position_ids": _get_dummy_inputs(
-            data_type="position_ids", bsz=bsz, max_seq_len=max_seq_len, seq_lens=seq_lens, seed=42
-        ),
-        "padded_bsh": _get_dummy_inputs(
-            data_type="padded_bsh", bsz=bsz, max_seq_len=max_seq_len, seq_lens=seq_lens, seed=42
-        ),
-    }
-
-    return dummy_data
-
-
-def train_one_step(model, optimizer, inputs):
-    for k, v in inputs.items():
-        inputs[k] = v.to(get_device_type())
-
-    optimizer.zero_grad()
-    loss = model(**inputs, use_cache=False).loss.mean()
-    loss.backward()
-    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
-    optimizer.step()
-
-    return loss, gnorm
+    return DummyDataLoader()
 
 
 def print_all_values(output_dict, value_key: str, model_type: str = ""):
@@ -255,27 +158,17 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
     for task, output in outputs_dict.items():
         if task == base_task:
             continue
-        try:
-            torch.testing.assert_close(
-                output["loss"],
-                base_output["loss"],
-                rtol=rtol,
-                atol=atol,
-            )
-        except AssertionError:
-            print_all_values(outputs_dict, "loss")
-            raise AssertionError("Loss not match")
-
-        try:
-            torch.testing.assert_close(
-                output["gnorm"],
-                base_output["gnorm"],
-                rtol=rtol,
-                atol=atol,
-            )
-        except AssertionError:
-            print_all_values(outputs_dict, "gnorm")
-            raise AssertionError("Gnorm not match")
+        for key in output.keys():
+            try:
+                torch.testing.assert_close(
+                    output[key],
+                    base_output[key],
+                    rtol=rtol,
+                    atol=atol,
+                )
+            except AssertionError:
+                print_all_values(outputs_dict, key)
+                raise AssertionError(f"{key} not match")
 
 
 def apply_veomni_loss_unpatch():

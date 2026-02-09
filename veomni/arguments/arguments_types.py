@@ -578,9 +578,9 @@ class TrainingArguments:
 
     def __post_init__(self):
         self._train_steps = -1
-        self.local_rank = int(os.getenv("LOCAL_RANK"))
-        self.global_rank = int(os.getenv("RANK"))
-        self.world_size = int(os.getenv("WORLD_SIZE"))
+        self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+        self.global_rank = int(os.getenv("RANK", 0))
+        self.world_size = int(os.getenv("WORLD_SIZE", 1))
         if (
             self.world_size
             % (

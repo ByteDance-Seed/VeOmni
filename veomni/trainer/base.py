@@ -232,7 +232,8 @@ class BaseTrainer(Stateful, ABC):
         self.device = torch.device(device_str)
 
         # Initialize distributed process group
-        dist.init_process_group(backend=get_dist_comm_backend())
+        if not dist.is_initialized():
+            dist.init_process_group(backend=get_dist_comm_backend())
 
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
