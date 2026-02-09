@@ -159,6 +159,11 @@ class ModelArguments:
             default_idx_path = os.path.join(self.model_path, "model.safetensors.index.json")
             if os.path.exists(default_idx_path):
                 self.safetensor_idx_path = default_idx_path
+            else:
+                logger.warning_rank0(
+                    f"safetensor index file not found at {default_idx_path}, "
+                    "saved safetensor will be a single file instead of sharded."
+                )
 
         # Parse fqn_to_index_mapping from safetensor index json
         self.fqn_to_index_mapping = None
@@ -166,6 +171,10 @@ class ModelArguments:
             with open(self.safetensor_idx_path) as f:
                 weight_map = json.load(f)["weight_map"]
             self.fqn_to_index_mapping = {fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()}
+        if self.fqn_to_index_mapping is None:
+            logger.warning_rank0(
+                "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
+            )
 
         if self.attn_implementation == "flash_attention_2":
             logger.info_rank0(
