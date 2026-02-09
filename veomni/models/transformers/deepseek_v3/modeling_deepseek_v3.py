@@ -16,6 +16,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3Attention,
     DeepseekV3MLP,
+    DeepseekV3PreTrainedModel,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_interleave,
     eager_attention_forward,
@@ -147,11 +148,6 @@ class PatchDeepseekV3MoE(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
         self.top_k = config.num_experts_per_tok
-
-        _init_weight(self.experts.gate_proj)
-        _init_weight(self.experts.up_proj)
-        _init_weight(self.experts.down_proj)
-        _init_weight(self.gate.weight)
 
     def route_tokens_to_experts(self, router_logits):
         router_logits = router_logits.sigmoid()
@@ -411,6 +407,23 @@ def deepseek_v3_forcausal_lm_forward(
     )
 
 
+# ================================================================
+# PATCH: DeepseekV3PreTrainedModel._init_weights
+# 1. Support init weights for PatchDeepseekV3NaiveMoe and PatchDeepseekV3TopkRouter.
+# ================================================================
+def deepseek_v3_pretrained_model_init_weights(self: DeepseekV3PreTrainedModel, module):
+    """Custom _init_weights to handle PatchDeepseekV3NaiveMoe and PatchDeepseekV3TopkRouter."""
+
+    super(DeepseekV3PreTrainedModel, self)._init_weights(module)
+
+    if isinstance(module, PatchDeepseekV3NaiveMoe):
+        _init_weight(module.gate_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.up_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.down_proj, mean=0.0, std=self.config.initializer_range)
+    elif isinstance(module, PatchDeepseekV3TopkRouter):
+        _init_weight(module.weight, mean=0.0, std=self.config.initializer_range)
+
+
 def apply_veomni_deepseek_v3_patch():
     logger.info_rank0("Apply VeOmni patch to deepseek_v3.")
 
@@ -422,6 +435,7 @@ def apply_veomni_deepseek_v3_patch():
     hf_deepseek_v3.DeepseekV3Attention.forward = deepseek_v3_attention_forward
     hf_deepseek_v3.DeepseekV3Model.forward = deepseek_v3_model_forward
     hf_deepseek_v3.DeepseekV3ForCausalLM.forward = deepseek_v3_forcausal_lm_forward
+    hf_deepseek_v3.DeepseekV3PreTrainedModel._init_weights = deepseek_v3_pretrained_model_init_weights
 
     if IS_CUDA_AVAILABLE:
         from .gpu_patch import apply_veomni_deepseek_v3_gpu_patch
