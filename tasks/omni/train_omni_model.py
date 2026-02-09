@@ -12,7 +12,7 @@ from torch import distributed as dist
 from tqdm import trange
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     OmniDataCollatorWithPacking,
     OmniDataCollatorWithPadding,
@@ -34,6 +34,7 @@ from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 logger = helper.create_logger(__name__)
@@ -541,14 +542,13 @@ def main():
     helper.empty_cache()
     # save model in huggingface's format
     if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
-        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
+        save_hf_safetensor(
             save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
+            model_assets=model_assets,
             ckpt_manager=args.train.ckpt_manager,
+            train_architecture=args.train.train_architecture,
+            output_dir=args.train.output_dir,
         )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {args.train.output_dir} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()
