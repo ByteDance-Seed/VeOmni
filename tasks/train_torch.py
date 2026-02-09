@@ -37,11 +37,6 @@ from veomni.utils.device import (
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 from veomni.utils.save_safetensor_utils import save_hf_safetensor
-from packaging.version import parse
-
-TORCH_GT_29 = parse(torch.__version__) >= parse("2.9")
-if TORCH_GT_29:
-    from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
 logger = helper.create_logger(__name__)
 
@@ -195,6 +190,7 @@ def main():
         lr_start=args.train.lr_start,
     )
 
+    model_assets = None
     if args.train.global_rank == 0:
         if args.train.use_wandb:
             wandb.init(
@@ -399,12 +395,15 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
         save_hf_safetensor(
             save_checkpoint_path=save_checkpoint_path,
             model_assets=model_assets,
             ckpt_manager=args.train.ckpt_manager,
             train_architecture=args.train.train_architecture,
+            model=model,
+            save_safetensor_path=args.train.save_safetensor_path,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
 
     dist.barrier()
