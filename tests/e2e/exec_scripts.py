@@ -9,7 +9,7 @@ def qwen3_0p6b_base_tulu_sft_script():
     params = [
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4321",
         "tasks/train_text.py",
-        "configs/sft/qwen3_sft.yaml",
+        "configs/text/qwen3.yaml",
         f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
         f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
         "--train.output_dir Qwen3-0.6B-Base-sft",
@@ -28,7 +28,7 @@ def qwen3_0p6b_base_tulu_sft_no_reshard_script():
     params = [
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4321",
         "tasks/train_text.py",
-        "configs/sft/qwen3_sft.yaml",
+        "configs/text/qwen3.yaml",
         f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
         f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
         "--train.output_dir Qwen3-0.6B-Base-sft-no-reshard",
@@ -49,7 +49,7 @@ def qwen3_0p6b_base_tulu_sft_padded_script():
     params = [
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4322",
         "tasks/train_text.py",
-        "configs/sft/qwen3_sft.yaml",
+        "configs/text/qwen3.yaml",
         f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
         f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
         "--train.output_dir Qwen3-0.6B-Base-sft-padded",
