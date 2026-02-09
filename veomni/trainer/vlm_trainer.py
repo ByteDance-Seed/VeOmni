@@ -4,7 +4,11 @@ from typing import Dict, Optional
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_multimodal_chat_template
-from ..data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl, process_sample_qwen_omni
+from ..data.multimodal.data_transform import (
+    process_sample_qwen2_5_vl,
+    process_sample_qwen3_vl,
+    process_sample_qwen_omni,
+)
 from ..models import build_foundation_model, build_processor
 from ..utils import helper
 from ..utils.model_utils import pretty_print_trainable_parameters

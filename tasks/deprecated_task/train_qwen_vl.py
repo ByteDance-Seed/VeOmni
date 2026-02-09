@@ -18,7 +18,11 @@ from veomni.data import (
     build_dataset,
     build_multimodal_chat_template,
 )
-from veomni.data.data_transform import process_sample_qwen2_5_vl, process_sample_qwen3_vl, process_sample_qwen_omni
+from veomni.data.multimodal.data_transform import (
+    process_sample_qwen2_5_vl,
+    process_sample_qwen3_vl,
+    process_sample_qwen_omni,
+)
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
