@@ -4,9 +4,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from ...checkpoint import CheckpointerBase, build_checkpointer, ckpt_to_state_dict
-from ...models import save_model_assets, save_model_weights
+from ...checkpoint import CheckpointerBase, build_checkpointer
+from ...models import save_model_assets
 from ...utils import helper
+from ...utils.save_safetensor_utils import save_hf_safetensor
 from .base import Callback, TrainerState
 
 
@@ -134,13 +135,13 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             self.trainer.checkpointer.save_future.result()
 
         if args.train.global_rank == 0:
-            hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-            model_state_dict = ckpt_to_state_dict(
+            save_hf_safetensor(
                 save_checkpoint_path=save_checkpoint_path,
+                model_assets=self.trainer.model_assets,
                 ckpt_manager=args.train.ckpt_manager,
+                train_architecture=args.train.train_architecture,
+                output_dir=args.train.output_dir,
             )
-            save_model_weights(hf_weights_path, model_state_dict, model_assets=self.trainer.model_assets)
-            logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
         # Empty cache and barrier
         helper.empty_cache()

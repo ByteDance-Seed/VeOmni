@@ -12,7 +12,7 @@ from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from tqdm import trange
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args, save_args
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_dataloader,
     build_dataset,
@@ -23,7 +23,7 @@ from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
+from veomni.models import build_foundation_model, build_processor, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.device import (
@@ -34,6 +34,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 logger = helper.create_logger(__name__)
@@ -467,14 +468,13 @@ def main():
     # save model in huggingface's format
     if args.train.global_rank == 0:
         if args.train.save_hf_weights and save_checkpoint_path is not None:
-            hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-            model_state_dict = ckpt_to_state_dict(
+            save_hf_safetensor(
                 save_checkpoint_path=save_checkpoint_path,
-                output_dir=args.train.output_dir,
+                model_assets=model_assets,
                 ckpt_manager=args.train.ckpt_manager,
+                train_architecture=args.train.train_architecture,
+                output_dir=args.train.output_dir,
             )
-            save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-            logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()
