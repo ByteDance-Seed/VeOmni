@@ -3,29 +3,25 @@ import os
 import random
 import re
 from dataclasses import dataclass
+from typing import Dict
 
 import numpy as np
 import pandas as pd
+import torch
 import torch.distributed as dist
 from datasets import Dataset
+from rich.console import Console
+from rich.table import Table
 
 from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.utils.helper import get_cache_dir
 
 
 def parse_training_log(log_content) -> pd.DataFrame:
-    r"""
-    regex
-    1. Epoch\s+(?P<epoch>\d+)/(?P<total_epochs>\d+)  ->  Epoch 1/3
-    2. .*?\|\s+(?P<step>\d+)/(?P<total_steps>\d+)    ->  1/46 (ignore bar)
-    3. .*?loss:\s+(?P<loss>[\d\.]+)                  ->  loss: 1.34
-    4. .*?grad_norm:\s+(?P<grad_norm>[\d\.]+)        ->  grad_norm: 7.52
-    5. .*?lr:\s+(?P<lr>[\d\.eE+-]+)                  ->  lr: 1.00e-04
-    """
     pattern = re.compile(
-        r"Epoch\s+(?P<epoch>\d+)/(?P<total_epochs>\d+)"
-        r".*?\|\s+(?P<step>\d+)/(?P<total_steps>\d+)"
-        r".*?loss:\s+(?P<loss>[\d\.]+)"
+        r"Epoch\s+(?P<epoch>\d+)/(?P<total_epochs>\d+):"
+        r".*?(?P<step>\d+)/(?P<total_steps>\d+)"
+        r".*?total_loss:\s+(?P<loss>[\d\.]+)"
         r".*?grad_norm:\s+(?P<grad_norm>[\d\.]+)"
         r".*?lr:\s+(?P<lr>[\d\.eE+-]+)"
     )
@@ -34,7 +30,6 @@ def parse_training_log(log_content) -> pd.DataFrame:
 
     for match in pattern.finditer(log_content):
         row = match.groupdict()
-
         parsed_row = {
             "epoch": int(row["epoch"]),
             "total_epochs": int(row["total_epochs"]),
@@ -44,7 +39,6 @@ def parse_training_log(log_content) -> pd.DataFrame:
             "grad_norm": float(row["grad_norm"]),
             "lr": float(row["lr"]),
         }
-
         parsed_row["global_step"] = (parsed_row["epoch"] - 1) * parsed_row["total_steps"] + parsed_row["step"]
         data.append(parsed_row)
 
@@ -194,10 +188,50 @@ def prepare_exec_cmd(
                 "--train.save_steps=0",
                 "--train.save_hf_weights=False",
                 "--train.max_steps=5",
-                f"--train.output_dir={os.path.join(output_dir, str(mode))}",
+                f"--train.output_dir={os.path.join(output_dir, f'{model_name}_{task}_{mode}')}",
                 f"--model.model_path={model_path}",
             ]
             task_name = f"{model_name}_{task}_{mode}"
             command_list.append((task_name, command))
 
     return command_list
+
+
+def print_all_values(output_dict, value_key: str, model_type: str = ""):
+    console = Console()
+    table = Table(title=f"Alignment Result: [bold magenta]{model_type} {value_key}[/bold magenta]")
+
+    table.add_column("Task", style="cyan", justify="left")
+
+    table.add_column(value_key.upper(), style="bold green", justify="right")
+
+    for task_name, output in output_dict.items():
+        row_cells = []
+        row_cells.append(task_name)
+
+        val_list = output.get(value_key)
+        row_cells.append(", ".join([f"{v:.8f}" for v in val_list]))
+
+        table.add_row(*row_cells)
+
+    console.print(table)
+
+
+def compare_multi_items(model_name: str, outputs_dict: Dict, rtol=0.01, atol=0.01):
+    base_task = next(iter(outputs_dict))
+    base_output = outputs_dict[base_task]
+
+    for task, output in outputs_dict.items():
+        if task == base_task:
+            continue
+        for key in output.keys():
+            try:
+                torch.testing.assert_close(
+                    output[key],
+                    base_output[key],
+                    rtol=rtol,
+                    atol=atol,
+                )
+            except AssertionError:
+                print_all_values(outputs_dict, key, model_name)
+                raise AssertionError(f"{key} not match")

@@ -70,6 +70,7 @@ jobs:
       - name: Run e2e training test
         run: |
           uv run pytest -s -x tests/e2e/test_e2e_training.py
+          uv run pytest -s -x tests/e2e/test_e2e_parallel.py
 
   cleanup:
     runs-on: ubuntu-latest

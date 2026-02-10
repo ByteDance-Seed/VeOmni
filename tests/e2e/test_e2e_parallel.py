@@ -1,12 +1,11 @@
+import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from tests.e2e.utils import DummyDataset, parse_training_log, prepare_exec_cmd
-from tests.models.utils import compare_multi_items
+from tests.e2e.utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
 
@@ -21,12 +20,6 @@ def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
         init_device=get_device_type(),
     )
     model.save_pretrained(output_path)
-
-
-def _run_and_parse(cmd: str) -> Any:
-    res = subprocess.run(cmd, check=True)
-    df = parse_training_log(res.stdout)
-    return df
 
 
 _DEFAULT_RTOL = 1e-2
@@ -107,9 +100,18 @@ def test_text_parallel_align(
     )
 
     res = {}
+    log_keys = []
     for task_name, cmd in command_list:
         print(f"{'-' * 10} {task_name} {'-' * 10}")
+        subprocess.run(cmd, check=True)
+        with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
+            output = json.load(f)
+        if not log_keys:
+            log_keys = set(output.keys())
+        else:
+            assert log_keys == set(output.keys())
+        res[task_name] = output
 
-        df = _run_and_parse(cmd)
-        res[task_name] = df
-    compare_multi_items(res, rtol=rtol, atol=atol)
+    for key in log_keys:
+        print_all_values(res, key, model_type=model_name)
+    compare_multi_items(model_name, res, rtol=rtol, atol=atol)
