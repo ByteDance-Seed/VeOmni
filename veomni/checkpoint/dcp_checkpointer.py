@@ -10,14 +10,6 @@ from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
 )
-
-from ..utils.import_utils import is_torch_version_greater_than
-
-
-if is_torch_version_greater_than("2.9"):
-    from torch.distributed.checkpoint import HuggingFaceStorageWriter
-else:
-    HuggingFaceStorageWriter = None
 from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE
 from torch.distributed.checkpoint.state_dict import (
@@ -296,60 +288,14 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_using_hf_storage_writer = HuggingFaceStorageWriter is not None and isinstance(
-            storage_writer, HuggingFaceStorageWriter
-        )
-        if save_using_hf_storage_writer:
-            # When saving HF safetensor files, only sync mode is supported
-            assert not save_async, "Async save is not supported for HuggingFaceStorageWriter."
-            # Use flat state dict so DCP FQNs match the original HF weight_map keys
-            # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
-            save_state = ModelState(state["model"]).state_dict()
-            # Convert float32 tensors to bfloat16 on a copy of the state dict,
-            # so the original model parameters remain unchanged.
-            converted_state = {}
-            for k, v in save_state.items():
-                if v.dtype == torch.float32:
-                    logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
-                    converted_state[k] = v.to(torch.bfloat16)
-                else:
-                    converted_state[k] = v
-            save_state = converted_state
-            # Remove tied weights not present in the HF weight_map
-            # (e.g. lm_head.weight is tied to model.embed_tokens.weight via tie_word_embeddings)
-            if storage_writer.fqn_to_index_mapping is not None:
-                filtered_state = {}
-                for k, v in save_state.items():
-                    if k in storage_writer.fqn_to_index_mapping:
-                        filtered_state[k] = v
-                    else:
-                        logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
-                save_state = filtered_state
-            else:
-                logger.warning_rank0(
-                    "fqn_to_index_mapping is None, HuggingFaceStorageWriter will save "
-                    "all model weights into a single safetensors file."
-                )
-        else:
-            save_state = {"model": ModelState(state["model"])}
-            if "optimizer" in state:
-                save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+        save_state = {"model": ModelState(state["model"])}
+        if "optimizer" in state:
+            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
 
         cls.execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
-
-        # Clean up the intermediate per-shard directory created by HuggingFaceStorageWriter.
-        # Safe to delete here because we enforce synchronous save for HuggingFaceStorageWriter,
-        # so all ranks have finished writing by this point.
-        if save_using_hf_storage_writer:
-            sharded_dir = os.path.join(checkpoint_dir, "sharded")
-            if os.path.isdir(sharded_dir) and dist.get_rank() == 0:
-                import shutil
-
-                shutil.rmtree(sharded_dir)
-                logger.info_rank0(f"Removed intermediate sharded directory: {sharded_dir}")
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 

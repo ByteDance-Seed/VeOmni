@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import time
 from typing import Dict, Optional, Sequence
 
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
@@ -25,6 +27,52 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 
 
 logger = helper.create_logger(__name__)
+
+
+def get_model_save_state(
+    model: torch.nn.Module,
+    fqn_to_index_mapping: Optional[Dict[str, int]],
+) -> Dict[str, torch.Tensor]:
+    """Build a flat state dict suitable for HuggingFace safetensors saving.
+
+    1. Extracts a flat state dict via ``ModelState`` (FQNs match HF weight_map keys).
+    2. Casts float32 tensors to bfloat16 on copies (original model dtypes are preserved).
+    3. Filters out tied weights not present in ``fqn_to_index_mapping``.
+    """
+    from veomni.checkpoint.dcp_checkpointer import ModelState
+
+    # Use flat state dict so DCP FQNs match the original HF weight_map keys
+    # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
+    save_state = ModelState(model).state_dict()
+
+    # Convert float32 tensors to bfloat16 on a copy of the state dict,
+    # so the original model parameters remain unchanged.
+    converted_state = {}
+    for k, v in save_state.items():
+        if v.dtype == torch.float32:
+            logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
+            converted_state[k] = v.to(torch.bfloat16)
+        else:
+            converted_state[k] = v
+    save_state = converted_state
+
+    # Remove tied weights not present in the HF weight_map
+    # (e.g. lm_head.weight is tied to model.embed_tokens.weight via tie_word_embeddings)
+    if fqn_to_index_mapping is not None:
+        filtered_state = {}
+        for k, v in save_state.items():
+            if k in fqn_to_index_mapping:
+                filtered_state[k] = v
+            else:
+                logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
+        save_state = filtered_state
+    else:
+        logger.warning_rank0(
+            "fqn_to_index_mapping is None, HuggingFaceStorageWriter will save "
+            "all model weights into a single safetensors file."
+        )
+
+    return save_state
 
 
 def _save_hf_safetensor_distributed(
@@ -39,8 +87,6 @@ def _save_hf_safetensor_distributed(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-
     storage_writer = HuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
@@ -49,14 +95,18 @@ def _save_hf_safetensor_distributed(
         thread_count_consolidation=5,
     )
 
+    save_state = get_model_save_state(model, fqn_to_index_mapping)
+
     logger.info_rank0("Starting distributed HuggingFace safetensors save...")
     dist.barrier()
     start_time = time.time()
-    DistributedCheckpointer.save(
-        path=save_path,
-        state={"model": model},
+    dcp.save(
+        state_dict=save_state,
         storage_writer=storage_writer,
     )
+    if dist.is_initialized():
+        dist.barrier()
+    gc.collect()
     elapsed_time = time.time() - start_time
     logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
 

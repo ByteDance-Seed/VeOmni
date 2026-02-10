@@ -159,11 +159,6 @@ class ModelArguments:
             default_idx_path = os.path.join(self.model_path, "model.safetensors.index.json")
             if os.path.exists(default_idx_path):
                 self.safetensor_idx_path = default_idx_path
-            else:
-                logger.warning_rank0(
-                    f"safetensor index file not found at {default_idx_path}, "
-                    "saved safetensor will be a single file instead of sharded."
-                )
 
         # Parse fqn_to_index_mapping from safetensor index json
         self.fqn_to_index_mapping = None
@@ -749,6 +744,7 @@ class TrainingArguments:
         # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
         # │   ├── global_step_100/
         # │   └── global_step_200/
+        # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
         # ├── model_assets/
         # └── step2token.json
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
