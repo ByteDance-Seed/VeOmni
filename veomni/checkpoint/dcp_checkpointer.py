@@ -16,6 +16,8 @@ from ..utils.import_utils import is_torch_version_greater_than
 
 if is_torch_version_greater_than("2.9"):
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
+else:
+    HuggingFaceStorageWriter = None
 from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE
 from torch.distributed.checkpoint.state_dict import (
