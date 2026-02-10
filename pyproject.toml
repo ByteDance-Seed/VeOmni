@@ -24,12 +24,12 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   "diffusers>=0.30.0,<=0.31.0",
-  # Use a broad specifier here so that both the stable pin (from
-  # dependency-group "transformers-stable") and the experimental extra
-  # can satisfy this requirement.  The actual version is controlled by
-  # the "transformers-stable" default dependency-group (==4.57.3) or
-  # by the "transformers5-exp" optional extra (==5.1.0).
-  "transformers>=4.57.3",
+  # Comment out transformers version for pip user compatibility (not to accidentally install v5 which is still WIP
+  # and experimental)
+  # For uv user: The actual version is controlled by the "transformers-stable" default
+  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.1.0).
+  # For pip user: please install 4.57.3 manually via pip install transformers==4.57.3.
+  # "transformers==4.57.3",
   "psutil",
   "timm",
   "wandb",
