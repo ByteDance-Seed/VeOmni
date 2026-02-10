@@ -296,7 +296,7 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        if isinstance(storage_writer, HuggingFaceStorageWriter):
+        if HuggingFaceStorageWriter is not None and isinstance(storage_writer, HuggingFaceStorageWriter):
             # Use flat state dict so DCP FQNs match the original HF weight_map keys
             # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
             save_state = ModelState(state["model"]).state_dict()
