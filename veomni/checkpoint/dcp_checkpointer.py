@@ -296,7 +296,12 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        if HuggingFaceStorageWriter is not None and isinstance(storage_writer, HuggingFaceStorageWriter):
+        save_using_hf_storage_writer = HuggingFaceStorageWriter is not None and isinstance(
+            storage_writer, HuggingFaceStorageWriter
+        )
+        if save_using_hf_storage_writer:
+            # When saving HF safetensor files, only sync mode is supported
+            assert not save_async, "Async save is not supported for HuggingFaceStorageWriter."
             # Use flat state dict so DCP FQNs match the original HF weight_map keys
             # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
             save_state = ModelState(state["model"]).state_dict()
@@ -334,6 +339,17 @@ class DistributedCheckpointer(CheckpointerBase):
             storage_writer = cls._create_storage_writer(checkpoint_dir)
 
         cls.execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
+
+        # Clean up the intermediate per-shard directory created by HuggingFaceStorageWriter.
+        # Safe to delete here because we enforce synchronous save for HuggingFaceStorageWriter,
+        # so all ranks have finished writing by this point.
+        if save_using_hf_storage_writer:
+            sharded_dir = os.path.join(checkpoint_dir, "sharded")
+            if os.path.isdir(sharded_dir) and dist.get_rank() == 0:
+                import shutil
+
+                shutil.rmtree(sharded_dir)
+                logger.info_rank0(f"Removed intermediate sharded directory: {sharded_dir}")
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
