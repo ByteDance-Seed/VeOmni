@@ -2,21 +2,44 @@ version = 1
 revision = 3
 requires-python = "==3.11.*"
 resolution-markers = [
-    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')",
-    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
 ]
 conflicts = [[
     { package = "veomni", extra = "gpu" },
     { package = "veomni", extra = "npu" },
     { package = "veomni", extra = "npu-aarch64" },
+], [
+    { package = "veomni", extra = "transformers5-exp" },
+    { package = "veomni", group = "transformers-stable" },
 ]]
 
 [manifest]
@@ -35,7 +58,6 @@ overrides = [
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.24.1+cu129", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
-    { name = "transformers", specifier = "==4.57.3" },
 ]
 
 [[manifest.dependency-metadata]]
@@ -51,7 +73,8 @@ name = "accelerate"
 version = "1.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "huggingface-hub" },
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "huggingface-hub", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
     { name = "numpy" },
     { name = "packaging" },
     { name = "psutil" },
@@ -147,12 +170,34 @@ wheels = [
 ]
 
 [[package]]
+name = "annotated-doc"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/ba/046ceea27344560984e26a590f90bc7f4a75b06701f653222458922b558c/annotated_doc-0.0.4.tar.gz", hash = "sha256:fbcda96e87e9c92ad167c2e53839e57503ecfda18804ea28102353485033faa4", size = 7288, upload-time = "2025-11-10T22:07:42.062Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/d3/26bf1008eb3d2daa8ef4cacc7f3bfdc11818d111f7e2d0201bc6e3b49d45/annotated_doc-0.0.4-py3-none-any.whl", hash = "sha256:571ac1dc6991c450b25a9c2d84a3705e2ae7a53467b5d111c24fa8baabbed320", size = 5303, upload-time = "2025-11-10T22:07:40.673Z" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ee/67/531ea369ba64dcff5ec9c3402f9f51bf748cec26dde048a2f973a4eea7f5/annotated_types-0.7.0.tar.gz", hash = "sha256:aff07c09a53a08bc8cfccb9c85b05f1aa9a2a6f23728d790723543408344ce89", size = 16081, upload-time = "2024-05-20T21:33:25.928Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/78/b6/6307fbef88d9b5ee7421e68d78a9f162e0da4900bc5f5793f6d3d0e34fb8/annotated_types-0.7.0-py3-none-any.whl", hash = "sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53", size = 13643, upload-time = "2024-05-20T21:33:24.1Z" },
+]
+
+[[package]]
+name = "anyio"
+version = "4.12.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "idna", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "typing-extensions", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/96/f0/5eb65b2bb0d09ac6776f2eb54adee6abe8228ea05b20a5ad0e4945de8aac/anyio-4.12.1.tar.gz", hash = "sha256:41cfcc3a4c85d3f05c932da7c26d0201ac36f72abd4435ba90d0464a3ffed703", size = 228685, upload-time = "2026-01-06T11:45:21.246Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/0e/27be9fdef66e72d64c0cdc3cc2823101b80585f8119b5c112c2e8f5f7dab/anyio-4.12.1-py3-none-any.whl", hash = "sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c", size = 113592, upload-time = "2026-01-06T11:45:19.497Z" },
 ]
 
 [[package]]
@@ -255,7 +300,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -308,7 +353,7 @@ name = "click"
 version = "8.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/46/61/de6cd827efad202d7057d93e0fed9294b96952e188f7384832791c7b2254/click-8.3.0.tar.gz", hash = "sha256:e7b8232224eba16f4ebe410c25ced9f7875cb5f3263ffc93cc3e8da705e229c4", size = 276943, upload-time = "2025-09-18T17:32:23.696Z" }
 wheels = [
@@ -333,7 +378,8 @@ dependencies = [
     { name = "dill" },
     { name = "filelock" },
     { name = "fsspec", extra = ["http"] },
-    { name = "huggingface-hub" },
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "huggingface-hub", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
     { name = "multiprocess" },
     { name = "numpy" },
     { name = "packaging" },
@@ -376,7 +422,8 @@ version = "0.31.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
-    { name = "huggingface-hub" },
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "huggingface-hub", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
     { name = "importlib-metadata" },
     { name = "numpy" },
     { name = "pillow" },
@@ -530,6 +577,15 @@ wheels = [
 ]
 
 [[package]]
+name = "h11"
+version = "0.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/ee/02a2c011bdab74c6fb3c75474d40b3052059d95df7e73351460c8588d963/h11-0.16.0.tar.gz", hash = "sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1", size = 101250, upload-time = "2025-04-24T03:35:25.427Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl", hash = "sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86", size = 37515, upload-time = "2025-04-24T03:35:24.344Z" },
+]
+
+[[package]]
 name = "hf-transfer"
 version = "0.1.9"
 source = { registry = "https://pypi.org/simple" }
@@ -552,36 +608,119 @@ wheels = [
 
 [[package]]
 name = "hf-xet"
-version = "1.1.10"
+version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/74/31/feeddfce1748c4a233ec1aa5b7396161c07ae1aa9b7bdbc9a72c3c7dd768/hf_xet-1.1.10.tar.gz", hash = "sha256:408aef343800a2102374a883f283ff29068055c111f003ff840733d3b715bb97", size = 487910, upload-time = "2025-09-12T20:10:27.12Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/6e/0f11bacf08a67f7fb5ee09740f2ca54163863b07b70d579356e9222ce5d8/hf_xet-1.2.0.tar.gz", hash = "sha256:a8c27070ca547293b6890c4bf389f713f80e8c478631432962bb7f4bc0bd7d7f", size = 506020, upload-time = "2025-10-24T19:04:32.129Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f7/a2/343e6d05de96908366bdc0081f2d8607d61200be2ac802769c4284cc65bd/hf_xet-1.1.10-cp37-abi3-macosx_10_12_x86_64.whl", hash = "sha256:686083aca1a6669bc85c21c0563551cbcdaa5cf7876a91f3d074a030b577231d", size = 2761466, upload-time = "2025-09-12T20:10:22.836Z" },
-    { url = "https://files.pythonhosted.org/packages/31/f9/6215f948ac8f17566ee27af6430ea72045e0418ce757260248b483f4183b/hf_xet-1.1.10-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:71081925383b66b24eedff3013f8e6bbd41215c3338be4b94ba75fd75b21513b", size = 2623807, upload-time = "2025-09-12T20:10:21.118Z" },
-    { url = "https://files.pythonhosted.org/packages/15/07/86397573efefff941e100367bbda0b21496ffcdb34db7ab51912994c32a2/hf_xet-1.1.10-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6b6bceb6361c80c1cc42b5a7b4e3efd90e64630bcf11224dcac50ef30a47e435", size = 3186960, upload-time = "2025-09-12T20:10:19.336Z" },
-    { url = "https://files.pythonhosted.org/packages/01/a7/0b2e242b918cc30e1f91980f3c4b026ff2eedaf1e2ad96933bca164b2869/hf_xet-1.1.10-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:eae7c1fc8a664e54753ffc235e11427ca61f4b0477d757cc4eb9ae374b69f09c", size = 3087167, upload-time = "2025-09-12T20:10:17.255Z" },
-    { url = "https://files.pythonhosted.org/packages/4a/25/3e32ab61cc7145b11eee9d745988e2f0f4fafda81b25980eebf97d8cff15/hf_xet-1.1.10-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:0a0005fd08f002180f7a12d4e13b22be277725bc23ed0529f8add5c7a6309c06", size = 3248612, upload-time = "2025-09-12T20:10:24.093Z" },
-    { url = "https://files.pythonhosted.org/packages/2c/3d/ab7109e607ed321afaa690f557a9ada6d6d164ec852fd6bf9979665dc3d6/hf_xet-1.1.10-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:f900481cf6e362a6c549c61ff77468bd59d6dd082f3170a36acfef2eb6a6793f", size = 3353360, upload-time = "2025-09-12T20:10:25.563Z" },
-    { url = "https://files.pythonhosted.org/packages/ee/0e/471f0a21db36e71a2f1752767ad77e92d8cde24e974e03d662931b1305ec/hf_xet-1.1.10-cp37-abi3-win_amd64.whl", hash = "sha256:5f54b19cc347c13235ae7ee98b330c26dd65ef1df47e5316ffb1e87713ca7045", size = 2804691, upload-time = "2025-09-12T20:10:28.433Z" },
+    { url = "https://files.pythonhosted.org/packages/96/2d/22338486473df5923a9ab7107d375dbef9173c338ebef5098ef593d2b560/hf_xet-1.2.0-cp37-abi3-macosx_10_12_x86_64.whl", hash = "sha256:46740d4ac024a7ca9b22bebf77460ff43332868b661186a8e46c227fdae01848", size = 2866099, upload-time = "2025-10-24T19:04:15.366Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/8c/c5becfa53234299bc2210ba314eaaae36c2875e0045809b82e40a9544f0c/hf_xet-1.2.0-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:27df617a076420d8845bea087f59303da8be17ed7ec0cd7ee3b9b9f579dff0e4", size = 2722178, upload-time = "2025-10-24T19:04:13.695Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/92/cf3ab0b652b082e66876d08da57fcc6fa2f0e6c70dfbbafbd470bb73eb47/hf_xet-1.2.0-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3651fd5bfe0281951b988c0facbe726aa5e347b103a675f49a3fa8144c7968fd", size = 3320214, upload-time = "2025-10-24T19:04:03.596Z" },
+    { url = "https://files.pythonhosted.org/packages/46/92/3f7ec4a1b6a65bf45b059b6d4a5d38988f63e193056de2f420137e3c3244/hf_xet-1.2.0-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:d06fa97c8562fb3ee7a378dd9b51e343bc5bc8190254202c9771029152f5e08c", size = 3229054, upload-time = "2025-10-24T19:04:01.949Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/dd/7ac658d54b9fb7999a0ccb07ad863b413cbaf5cf172f48ebcd9497ec7263/hf_xet-1.2.0-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:4c1428c9ae73ec0939410ec73023c4f842927f39db09b063b9482dac5a3bb737", size = 3413812, upload-time = "2025-10-24T19:04:24.585Z" },
+    { url = "https://files.pythonhosted.org/packages/92/68/89ac4e5b12a9ff6286a12174c8538a5930e2ed662091dd2572bbe0a18c8a/hf_xet-1.2.0-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a55558084c16b09b5ed32ab9ed38421e2d87cf3f1f89815764d1177081b99865", size = 3508920, upload-time = "2025-10-24T19:04:26.927Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/44/870d44b30e1dcfb6a65932e3e1506c103a8a5aea9103c337e7a53180322c/hf_xet-1.2.0-cp37-abi3-win_amd64.whl", hash = "sha256:e6584a52253f72c9f52f9e549d5895ca7a471608495c4ecaa6cc73dba2b24d69", size = 2905735, upload-time = "2025-10-24T19:04:35.928Z" },
+]
+
+[[package]]
+name = "httpcore"
+version = "1.0.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "h11", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8", size = 85484, upload-time = "2025-04-24T22:06:22.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55", size = 78784, upload-time = "2025-04-24T22:06:20.566Z" },
+]
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "certifi", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "httpcore", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "idna", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
 ]
 
 [[package]]
 name = "huggingface-hub"
-version = "0.35.1"
+version = "0.36.2"
 source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "hf-xet", marker = "platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "packaging" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "tqdm" },
-    { name = "typing-extensions" },
+resolution-markers = [
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f6/42/0e7be334a6851cd7d51cc11717cb95e89333ebf0064431c0255c56957526/huggingface_hub-0.35.1.tar.gz", hash = "sha256:3585b88c5169c64b7e4214d0e88163d4a709de6d1a502e0cd0459e9ee2c9c572", size = 461374, upload-time = "2025-09-23T13:43:47.074Z" }
+dependencies = [
+    { name = "filelock", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "fsspec", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "hf-xet", marker = "(platform_machine == 'aarch64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (platform_machine == 'amd64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (platform_machine == 'arm64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (platform_machine == 'x86_64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (platform_machine == 'aarch64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable') or (platform_machine == 'amd64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable') or (platform_machine == 'arm64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable') or (platform_machine == 'x86_64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "packaging", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "pyyaml", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "requests", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "tqdm", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "typing-extensions", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7c/b7/8cb61d2eece5fb05a83271da168186721c450eb74e3c31f7ef3169fa475b/huggingface_hub-0.36.2.tar.gz", hash = "sha256:1934304d2fb224f8afa3b87007d58501acfda9215b334eed53072dd5e815ff7a", size = 649782, upload-time = "2026-02-06T09:24:13.098Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f1/60/4acf0c8a3925d9ff491dc08fe84d37e09cfca9c3b885e0db3d4dedb98cea/huggingface_hub-0.35.1-py3-none-any.whl", hash = "sha256:2f0e2709c711e3040e31d3e0418341f7092910f1462dd00350c4e97af47280a8", size = 563340, upload-time = "2025-09-23T13:43:45.343Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/af/48ac8483240de756d2438c380746e7130d1c6f75802ef22f3c6d49982787/huggingface_hub-0.36.2-py3-none-any.whl", hash = "sha256:48f0c8eac16145dfce371e9d2d7772854a4f591bcb56c9cf548accf531d54270", size = 566395, upload-time = "2026-02-06T09:24:11.133Z" },
+]
+
+[[package]]
+name = "huggingface-hub"
+version = "1.4.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+]
+dependencies = [
+    { name = "filelock", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "fsspec", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "hf-xet", marker = "(platform_machine == 'AMD64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'AMD64' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'aarch64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'aarch64' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'amd64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'amd64' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'arm64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'arm64' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'x86_64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'x86_64' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'AMD64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'AMD64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'aarch64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'aarch64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'amd64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'amd64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'arm64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'arm64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable') or (platform_machine == 'x86_64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (platform_machine == 'x86_64' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "httpx", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "packaging", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "pyyaml", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "shellingham", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "tqdm", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "typer-slim", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "typing-extensions", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/fc/eb9bc06130e8bbda6a616e1b80a7aa127681c448d6b49806f61db2670b61/huggingface_hub-1.4.1.tar.gz", hash = "sha256:b41131ec35e631e7383ab26d6146b8d8972abc8b6309b963b306fbcca87f5ed5", size = 642156, upload-time = "2026-02-06T09:20:03.013Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d5/ae/2f6d96b4e6c5478d87d606a1934b5d436c4a2bce6bb7c6fdece891c128e3/huggingface_hub-1.4.1-py3-none-any.whl", hash = "sha256:9931d075fb7a79af5abc487106414ec5fba2c0ae86104c0c62fd6cae38873d18", size = 553326, upload-time = "2026-02-06T09:20:00.728Z" },
 ]
 
 [[package]]
@@ -730,8 +869,7 @@ name = "liger-kernel"
 version = "0.6.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "triton", version = "3.5.1", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "triton", version = "3.5.1", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/31/23/be0b4dcac42d77f99406c906567cde22a7a3d71b3f3ffdfda2ac6153ec36/liger_kernel-0.6.2.tar.gz", hash = "sha256:5c5bcffffa769bc26ae838f5a4954170dd5cacde036abb1b383039f39fa5fd69", size = 3679495, upload-time = "2025-08-22T00:15:28.456Z" }
 wheels = [
@@ -1003,6 +1141,8 @@ version = "12.8.3.14"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')",
+    "sys_platform != 'darwin' and sys_platform != 'linux'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ed/63/684a6f72f52671ea222c12ecde9bdf748a0ba025e2ad3ec374e466c26eb6/nvidia_cublas_cu12-12.8.3.14-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:93a4e0e386cc7f6e56c822531396de8170ed17068a1e18f987574895044cd8c3", size = 604900717, upload-time = "2025-01-23T17:52:55.486Z" },
@@ -1015,10 +1155,8 @@ name = "nvidia-cublas-cu12"
 version = "12.9.1.4"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "sys_platform == 'linux'",
+    "sys_platform != 'linux'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/82/6c/90d3f532f608a03a13c1d6c16c266ffa3828e8011b1549d3b61db2ad59f5/nvidia_cublas_cu12-12.9.1.4-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:7a950dae01add3b415a5a5cdc4ec818fb5858263e9cca59004bb99fdbbd3a5d6", size = 575006342, upload-time = "2025-06-05T20:04:16.902Z" },
@@ -1109,8 +1247,8 @@ name = "nvidia-cudnn-cu12"
 version = "9.15.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or extra == 'extra-6-veomni-gpu'" },
+    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-gpu' or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fe/d8/448f16a767828d3fa76ac2b16d150febde5c9c2f8baa962a35976dde29c8/nvidia_cudnn_cu12-9.15.1.9-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:2520692ef9d7804f4f02c8f3a127b24d568bb944ab1ccee0ab946a64699acf36", size = 646656709, upload-time = "2025-11-12T20:21:46.842Z" },
@@ -1126,7 +1264,7 @@ resolution-markers = [
     "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/72/95/6157cb45a49f5090a470de42353a22a0ed5b13077886dca891b4b0e350fe/nvidia_cufft_cu12-11.3.3.41-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:68509dcd7e3306e69d0e2d8a6d21c8b25ed62e6df8aac192ce752f17677398b5", size = 193108626, upload-time = "2025-01-23T17:55:49.192Z" },
@@ -1142,7 +1280,7 @@ resolution-markers = [
     "sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" } },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9b/2b/76445b0af890da61b501fde30650a1a4bd910607261b209cccb5235d3daa/nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1a28c9b12260a1aa7a8fd12f5ebd82d027963d635ba82ff39a1acfa7c4c0fbcf", size = 200822453, upload-time = "2025-06-05T20:05:27.889Z" },
@@ -1208,9 +1346,9 @@ resolution-markers = [
     "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')" },
-    { name = "nvidia-cusparse-cu12", version = "12.5.7.53", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')" },
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')" },
+    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusparse-cu12", version = "12.5.7.53", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8c/ce/4214a892e804b20bf66d04f04a473006fc2d3dac158160ef85f1bc906639/nvidia_cusolver_cu12-11.7.2.55-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:0fd9e98246f43c15bee5561147ad235dfdf2d037f5d07c9d41af3f7f72feb7cc", size = 260094827, upload-time = "2025-01-23T17:58:17.586Z" },
@@ -1226,9 +1364,9 @@ resolution-markers = [
     "sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparse-cu12", version = "12.5.10.65", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cusparse-cu12", version = "12.5.10.65", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" } },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/03/99/686ff9bf3a82a531c62b1a5c614476e8dfa24a9d89067aeedf3592ee4538/nvidia_cusolver_cu12-11.7.5.82-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:62efa83e4ace59a4c734d052bb72158e888aa7b770e1a5f601682f16fe5b4fd2", size = 337869834, upload-time = "2025-06-05T20:06:53.125Z" },
@@ -1244,7 +1382,7 @@ resolution-markers = [
     "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2e/a2/313db0453087f5324a5900380ca2e57e050c8de76f407b5e11383dc762ae/nvidia_cusparse_cu12-12.5.7.53-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d869c6146ca80f4305b62e02d924b4aaced936f8173e3cef536a67eed2a91af1", size = 291963692, upload-time = "2025-01-23T17:59:40.325Z" },
@@ -1260,7 +1398,7 @@ resolution-markers = [
     "sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" } },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5e/6f/8710fbd17cdd1d0fc3fea7d36d5b65ce1933611c31e1861da330206b253a/nvidia_cusparse_cu12-12.5.10.65-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:221c73e7482dd93eda44e65ce567c031c07e2f93f6fa0ecd3ba876a195023e83", size = 366359408, upload-time = "2025-06-05T20:07:42.501Z" },
@@ -1309,22 +1447,11 @@ wheels = [
 
 [[package]]
 name = "nvidia-nccl-cu12"
-version = "2.27.3"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "sys_platform != 'linux'",
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4b/7b/8354b784cf73b0ba51e566b4baba3ddd44fe8288a3d39ef1e06cd5417226/nvidia_nccl_cu12-2.27.3-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9ddf1a245abc36c550870f26d537a9b6087fb2e2e3d6e0ef03374c6fd19d984f", size = 322397768, upload-time = "2025-06-03T21:57:30.234Z" },
-    { url = "https://files.pythonhosted.org/packages/5c/5b/4e4fff7bad39adf89f735f2bc87248c81db71205b62bcc0d5ca5b606b3c3/nvidia_nccl_cu12-2.27.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:adf27ccf4238253e0b826bce3ff5fa532d65fc42322c8bfdfaf28024c0fbe039", size = 322364134, upload-time = "2025-06-03T21:58:04.013Z" },
-]
-
-[[package]]
-name = "nvidia-nccl-cu12"
 version = "2.27.5"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "sys_platform == 'linux'",
+    "sys_platform != 'linux'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/1c/857979db0ef194ca5e21478a0612bcdbbe59458d7694361882279947b349/nvidia_nccl_cu12-2.27.5-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:31432ad4d1fb1004eb0c56203dc9bc2178a1ba69d1d9e02d64a6938ab5e40e7a", size = 322400625, upload-time = "2025-06-26T04:11:04.496Z" },
@@ -1683,7 +1810,7 @@ name = "pytest"
 version = "7.4.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -1970,6 +2097,15 @@ wheels = [
 ]
 
 [[package]]
+name = "shellingham"
+version = "1.5.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/15/8b3609fd3830ef7b27b655beb4b4e9c62313a4e8da8c676e142cc210d58e/shellingham-1.5.4.tar.gz", hash = "sha256:8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de", size = 10310, upload-time = "2023-10-24T04:13:40.426Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/f9/0595336914c5619e5f28a1fb793285925a8cd4b432c9da0a987836c7f822/shellingham-1.5.4-py2.py3-none-any.whl", hash = "sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686", size = 9755, upload-time = "2023-10-24T04:13:38.866Z" },
+]
+
+[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2071,7 +2207,8 @@ name = "timm"
 version = "1.0.16"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "huggingface-hub" },
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "huggingface-hub", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
     { name = "pyyaml" },
     { name = "safetensors" },
 ]
@@ -2085,7 +2222,8 @@ name = "tokenizers"
 version = "0.22.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "huggingface-hub" },
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "huggingface-hub", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/46/fb6854cec3278fbfa4a75b50232c77622bc517ac886156e6afbfa4d8fc6e/tokenizers-0.22.1.tar.gz", hash = "sha256:61de6522785310a309b3407bac22d99c4db5dba349935e99e4d15ea2226af2d9", size = 363123, upload-time = "2025-09-19T09:49:23.424Z" }
 wheels = [
@@ -2113,12 +2251,12 @@ resolution-markers = [
     "sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform == 'darwin'" },
-    { name = "fsspec", marker = "sys_platform == 'darwin'" },
-    { name = "jinja2", marker = "sys_platform == 'darwin'" },
-    { name = "networkx", marker = "sys_platform == 'darwin'" },
-    { name = "sympy", marker = "sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
+    { name = "filelock", marker = "sys_platform == 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "fsspec", marker = "sys_platform == 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "jinja2", marker = "sys_platform == 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "networkx", marker = "sys_platform == 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "sympy", marker = "sys_platform == 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torch-2.7.1-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:68a352c7f435abb5cb47e2c032dcd1012772ae2bacb6fc8b83b0c1b11874ab3a" },
@@ -2156,27 +2294,27 @@ resolution-markers = [
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform != 'darwin'" },
-    { name = "fsspec", marker = "sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "sys_platform != 'darwin'" },
-    { name = "networkx", marker = "sys_platform != 'darwin'" },
-    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cuda-cupti-cu12", version = "12.8.57", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cuda-nvrtc-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cuda-runtime-cu12", version = "12.8.57", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cudnn-cu12", marker = "sys_platform != 'darwin'" },
-    { name = "nvidia-cufft-cu12", version = "11.3.3.41", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cufile-cu12", version = "1.13.0.11", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-curand-cu12", version = "10.3.9.55", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cusolver-cu12", version = "11.7.2.55", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cusparse-cu12", version = "12.5.7.53", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cusparselt-cu12", version = "0.6.3", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu12", version = "2.26.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-nvtx-cu12", version = "12.8.55", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "sympy", marker = "sys_platform != 'darwin'" },
-    { name = "triton", version = "3.3.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
+    { name = "filelock", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "fsspec", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "jinja2", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "networkx", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cuda-cupti-cu12", version = "12.8.57", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cuda-nvrtc-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cuda-runtime-cu12", version = "12.8.57", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cudnn-cu12", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cufft-cu12", version = "11.3.3.41", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cufile-cu12", version = "1.13.0.11", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-curand-cu12", version = "10.3.9.55", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusolver-cu12", version = "11.7.2.55", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusparse-cu12", version = "12.5.7.53", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusparselt-cu12", version = "0.6.3", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nccl-cu12", version = "2.26.2", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvtx-cu12", version = "12.8.55", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "sympy", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "triton", version = "3.3.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cu128/torch-2.7.1%2Bcu128-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:3a0954c54fd7cb9f45beab1272dece2a05b0e77023c1da33ba32a7919661260f" },
@@ -2197,23 +2335,23 @@ dependencies = [
     { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx" },
-    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cuda-cupti-cu12", version = "12.9.79", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cuda-nvrtc-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cuda-runtime-cu12", version = "12.9.79", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cuda-cupti-cu12", version = "12.9.79", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cuda-nvrtc-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cuda-runtime-cu12", version = "12.9.79", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "nvidia-cudnn-cu12" },
-    { name = "nvidia-cufft-cu12", version = "11.4.1.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cufile-cu12", version = "1.14.1.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-curand-cu12", version = "10.3.10.19", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusolver-cu12", version = "11.7.5.82", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparse-cu12", version = "12.5.10.65", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparselt-cu12", version = "0.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu12", version = "2.27.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvshmem-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvtx-cu12", version = "12.9.79", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufft-cu12", version = "11.4.1.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cufile-cu12", version = "1.14.1.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-curand-cu12", version = "10.3.10.19", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusolver-cu12", version = "11.7.5.82", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusparse-cu12", version = "12.5.10.65", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusparselt-cu12", version = "0.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nccl-cu12", version = "2.27.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvshmem-cu12", marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvtx-cu12", version = "12.9.79", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "sympy" },
-    { name = "triton", version = "3.5.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "triton", version = "3.5.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "typing-extensions" },
 ]
 wheels = [
@@ -2317,12 +2455,24 @@ name = "torchcodec"
 version = "0.5"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')",
-    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/84/9f/8e0ae96b2560050eb1a8780dabbe3d192cf99e62a5ce2a128684bfd6f5d6/torchcodec-0.5-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d582981f251979d4432a1606d2bfbc8d56b98a701957afbaf4cafe7569b19c68", size = 3307718, upload-time = "2025-07-23T17:43:52.805Z" },
@@ -2364,8 +2514,8 @@ resolution-markers = [
     "sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or sys_platform == 'darwin'" },
-    { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or sys_platform == 'darwin'" },
+    { name = "numpy", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or sys_platform == 'darwin' or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or sys_platform == 'darwin' or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:4addf626e2b57fc22fd6d329cf1346d474497672e6af8383b7b5b636fba94a53" },
@@ -2378,14 +2528,22 @@ name = "torchvision"
 version = "0.22.1+cpu"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')",
-    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
-    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
-    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
 ]
 dependencies = [
-    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "pillow", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "pillow", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:4e0cbc165a472605d0c13da68ae22e84b17a6b815d5e600834777823e1bcb658" },
@@ -2413,7 +2571,7 @@ name = "tqdm"
 version = "4.67.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a8/4b/29b4ef32e036bb34e4ab51796dd745cdba7ed47ad142a9f4a1eb8e0c744d/tqdm-4.67.1.tar.gz", hash = "sha256:f8aef9c52c08c13a65f30ea34f4e5aac3fd1a34959879d7e59e63027286627f2", size = 169737, upload-time = "2024-11-24T20:12:22.481Z" }
 wheels = [
@@ -2424,21 +2582,75 @@ wheels = [
 name = "transformers"
 version = "4.57.3"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable'",
+]
 dependencies = [
-    { name = "filelock" },
-    { name = "huggingface-hub" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "pyyaml" },
-    { name = "regex" },
-    { name = "requests" },
-    { name = "safetensors" },
-    { name = "tokenizers" },
-    { name = "tqdm" },
+    { name = "filelock", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "numpy", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "packaging", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "pyyaml", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "regex", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "requests", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "safetensors", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "tokenizers", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "tqdm", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/dd/70/d42a739e8dfde3d92bb2fff5819cbf331fe9657323221e79415cd5eb65ee/transformers-4.57.3.tar.gz", hash = "sha256:df4945029aaddd7c09eec5cad851f30662f8bd1746721b34cc031d70c65afebc", size = 10139680, upload-time = "2025-11-25T15:51:30.139Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6a/6b/2f416568b3c4c91c96e5a365d164f8a4a4a88030aa8ab4644181fdadce97/transformers-4.57.3-py3-none-any.whl", hash = "sha256:c77d353a4851b1880191603d36acb313411d3577f6e2897814f333841f7003f4", size = 11993463, upload-time = "2025-11-25T15:51:26.493Z" },
+]
+
+[[package]]
+name = "transformers"
+version = "5.1.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable')",
+    "sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+    "sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers5-exp' and extra != 'group-6-veomni-transformers-stable'",
+]
+dependencies = [
+    { name = "huggingface-hub", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "numpy", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "packaging", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "pyyaml", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "regex", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "safetensors", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "tokenizers", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "tqdm", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "typer-slim", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c9/1d/a7d91500a6c02ec76058bc9e65fcdec1bdb8882854dec8e4adf12d0aa8b0/transformers-5.1.0.tar.gz", hash = "sha256:c60d6180e5845ea1b4eed38d7d1b06fcc4cc341c6b7fa5c1dc767d7e25fe0139", size = 8531810, upload-time = "2026-02-05T15:41:42.932Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/66/57042d4b0f1ede8046d7ae6409bf3640df996e9cbc3fe20467aa29badc54/transformers-5.1.0-py3-none-any.whl", hash = "sha256:de534b50c9b2ce6217fc56421075a1734241fb40704fdc90f50f6a08fc533d59", size = 10276537, upload-time = "2026-02-05T15:41:40.358Z" },
 ]
 
 [[package]]
@@ -2450,24 +2662,10 @@ resolution-markers = [
     "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "setuptools", marker = "sys_platform == 'linux'" },
+    { name = "setuptools", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/21/2f/3e56ea7b58f80ff68899b1dbe810ff257c9d177d288c6b0f55bf2fe4eb50/triton-3.3.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b31e3aa26f8cb3cc5bf4e187bf737cbacf17311e1112b781d4a059353dfd731b", size = 155689937, upload-time = "2025-05-29T23:39:44.182Z" },
-]
-
-[[package]]
-name = "triton"
-version = "3.4.0"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "sys_platform != 'linux'",
-]
-dependencies = [
-    { name = "setuptools", marker = "sys_platform != 'linux'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/39/43325b3b651d50187e591eefa22e236b2981afcebaefd4f2fc0ea99df191/triton-3.4.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7b70f5e6a41e52e48cfc087436c8a28c17ff98db369447bcaff3b887a3ab4467", size = 155531138, upload-time = "2025-07-30T19:58:29.908Z" },
 ]
 
 [[package]]
@@ -2476,6 +2674,7 @@ version = "3.5.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "sys_platform == 'linux'",
+    "sys_platform != 'linux'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dc/dc/6ce44d055f2fc2403c4ec6b3cfd3a9b25f57b7d95efadccdea91497f8e81/triton-3.5.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:da47169e30a779bade679ce78df4810fca6d78a955843d2ddb11f226adc517dc", size = 159928005, upload-time = "2025-11-11T17:51:50.008Z" },
@@ -2490,7 +2689,8 @@ dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
     { name = "numpy" },
-    { name = "transformers" },
+    { name = "transformers", version = "4.57.3", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "transformers", version = "5.1.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
     { name = "tyro" },
 ]
 wheels = [
@@ -2507,6 +2707,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c7/68/71c1a15b5f65f40e91b65da23b8224dad41349894535a97f63a52e462196/typeguard-4.4.4.tar.gz", hash = "sha256:3a7fd2dffb705d4d0efaed4306a704c89b9dee850b688f060a8b1615a79e5f74", size = 75203, upload-time = "2025-06-18T09:56:07.624Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1b/a9/e3aee762739c1d7528da1c3e06d518503f8b6c439c35549b53735ba52ead/typeguard-4.4.4-py3-none-any.whl", hash = "sha256:b5f562281b6bfa1f5492470464730ef001646128b180769880468bd84b68b09e", size = 34874, upload-time = "2025-06-18T09:56:05.999Z" },
+]
+
+[[package]]
+name = "typer-slim"
+version = "0.21.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+    { name = "click", marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a5/ca/0d9d822fd8a4c7e830cba36a2557b070d4b4a9558a0460377a61f8fb315d/typer_slim-0.21.2.tar.gz", hash = "sha256:78f20d793036a62aaf9c3798306142b08261d4b2a941c6e463081239f062a2f9", size = 120497, upload-time = "2026-02-10T19:33:45.836Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/03/e09325cfc40a33a82b31ba1a3f1d97e85246736856a45a43b19fcb48b1c2/typer_slim-0.21.2-py3-none-any.whl", hash = "sha256:4705082bb6c66c090f60e47c8be09a93158c139ce0aa98df7c6c47e723395e5f", size = 56790, upload-time = "2026-02-10T19:33:47.221Z" },
 ]
 
 [[package]]
@@ -2576,7 +2789,8 @@ dependencies = [
     { name = "tiktoken" },
     { name = "timm" },
     { name = "torchdata" },
-    { name = "transformers" },
+    { name = "transformers", version = "4.57.3", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "transformers", version = "5.1.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-npu-aarch64' and extra != 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'group-6-veomni-transformers-stable')" },
     { name = "wandb" },
 ]
 
@@ -2602,8 +2816,7 @@ gpu = [
     { name = "hf-transfer" },
     { name = "liger-kernel" },
     { name = "nvidia-cusparselt-cu12", version = "0.7.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-nccl-cu12", version = "2.27.3", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "nvidia-nccl-cu12", version = "2.27.5", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "nvidia-nccl-cu12", version = "2.27.5", source = { registry = "https://pypi.org/simple" } },
     { name = "torch", version = "2.9.1+cu129", source = { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl" } },
     { name = "torchaudio", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/" } },
     { name = "torchcodec", version = "0.8.1", source = { registry = "https://pypi.org/simple" } },
@@ -2624,14 +2837,17 @@ npu = [
 npu-aarch64 = [
     { name = "decorator" },
     { name = "scipy" },
-    { name = "torch", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform != 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torch", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform != 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "torch-npu" },
-    { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "torchaudio", version = "2.7.1+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'linux' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "torchaudio", version = "2.7.1+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "torchcodec", version = "0.5", source = { registry = "https://pypi.org/simple" } },
-    { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'linux' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+]
+transformers5-exp = [
+    { name = "transformers", version = "5.1.0", source = { registry = "https://pypi.org/simple" } },
 ]
 trl = [
     { name = "trl" },
@@ -2658,6 +2874,9 @@ test = [
     { name = "expecttest" },
     { name = "pytest" },
     { name = "rich" },
+]
+transformers-stable = [
+    { name = "transformers", version = "4.57.3", source = { registry = "https://pypi.org/simple" } },
 ]
 
 [package.metadata]
@@ -2712,11 +2931,12 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.24.1+cu129", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
-    { name = "transformers", specifier = "==4.57.3" },
+    { name = "transformers", specifier = ">=4.57.3" },
+    { name = "transformers", marker = "extra == 'transformers5-exp'", specifier = "==5.1.0" },
     { name = "trl", marker = "extra == 'trl'", specifier = "<=0.9.6" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "audio", "video", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl"]
+provides-extras = ["dev", "audio", "video", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl", "transformers5-exp"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2735,6 +2955,7 @@ test = [
     { name = "pytest" },
     { name = "rich" },
 ]
+transformers-stable = [{ name = "transformers", specifier = "==4.57.3" }]
 
 [[package]]
 name = "virtualenv"
