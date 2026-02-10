@@ -29,6 +29,7 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 logger = helper.create_logger(__name__)
 
 
+@torch.no_grad()
 def get_model_save_state(
     model: torch.nn.Module,
     fqn_to_index_mapping: Optional[Dict[str, int]],
@@ -104,6 +105,7 @@ def _save_hf_safetensor_distributed(
         state_dict=save_state,
         storage_writer=storage_writer,
     )
+    del save_state  # Free copied tensors (e.g. fp32->bf16) to reduce peak memory
     if dist.is_initialized():
         dist.barrier()
     gc.collect()
