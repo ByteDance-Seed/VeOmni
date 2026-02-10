@@ -98,6 +98,10 @@ trl = [
   "trl<=0.9.6"
 ]
 
+# Experimental dep to install transformers 5.x.
+# Note that transformers 5.x support is experimental and WIP.
+# See https://github.com/ByteDance-Seed/VeOmni/issues/468 for the progress.
+# Usage: `uv sync --no-group transformers-stable --extra transformers5-exp --extra <other extra>`.
 transformers5-exp = [
   "transformers==5.1.0"
 ]
