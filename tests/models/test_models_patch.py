@@ -10,7 +10,7 @@ from veomni import _safe_apply_patches
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
-from veomni.utils.device import empty_cache, synchronize
+from veomni.utils.device import empty_cache, get_device_type, synchronize
 from veomni.utils.loss_utils import count_loss_token
 
 from ..tools.common_utils import print_device_mem_info
@@ -172,7 +172,10 @@ def test_models_patch_fwd_bwd(
     model_config = ModelArguments(config_path=config_path)
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
-        output_dir="./test_models_patch", enable_mixed_precision=False, enable_full_determinism=True
+        output_dir="./test_models_patch",
+        enable_mixed_precision=False,
+        enable_full_determinism=True,
+        init_device=get_device_type(),
     )
 
     trainer_config = VeOmniArguments(
