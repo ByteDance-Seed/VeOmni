@@ -17,7 +17,7 @@ import pytest
 
 from tests.e2e.utils import DummyDataset, compare_multi_items, print_all_values
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import get_device_type
+from veomni.utils.device import get_device_type, get_torch_device
 
 NPROC_PER_NODE = 8
 _DEFAULT_RTOL = 1e-2
@@ -118,7 +118,7 @@ def test_fsdp2_equivalence(
     dummy_text_dataset: str,
 ):
     """Test that FSDP2 with different Ulysses SP sizes produces equivalent results."""
-    gpu_count = get_device_type().device_count()
+    gpu_count = get_torch_device().device_count()
     if gpu_count < NPROC_PER_NODE:
         pytest.skip(f"Requires {NPROC_PER_NODE} GPUs, found {gpu_count}")
 

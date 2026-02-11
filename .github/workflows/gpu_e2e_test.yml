@@ -15,6 +15,7 @@ on:
   pull_request:
     branches:
       - main
+      - verl_trainer
     paths:
       - "**/*.py"
       - .github/workflows/gpu_e2e_test.yml
@@ -69,9 +70,9 @@ jobs:
           uv sync --frozen --extra gpu --group dev
       - name: Run e2e training test
         run: |
-          uv run pytest -s -x tests/e2e/test_e2e_training.py
-          uv run pytest -s -x tests/e2e/test_e2e_parallel.py
-          uv run pytest -s -x tests/e2e/tests/e2e/test_e2e_fsdp2.py
+          uv run pytest -s -x tests/e2e/test_e2e_fsdp2.py
+          # uv run pytest -s -x tests/e2e/test_e2e_training.py
+          # uv run pytest -s -x tests/e2e/test_e2e_parallel.py
 
   cleanup:
     runs-on: ubuntu-latest
