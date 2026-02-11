@@ -1,6 +1,7 @@
 import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 
 from ....utils import logging
+from ....utils.env import get_env
 from ....utils.import_utils import is_liger_kernel_available
 
 
@@ -12,7 +13,7 @@ def apply_veomni_qwen3_moe_gpu_patch():
     # PATCH: apply_rotary_pos_emb, Qwen3MoeRMSNorm, Qwen3MoeMLP
     # 1. Patch with Liger Kernel
     # ================================================================
-    if is_liger_kernel_available():
+    if is_liger_kernel_available() and get_env("USE_LIGER_KERNEL") == "1":
         from liger_kernel.transformers.rms_norm import LigerRMSNorm
         from liger_kernel.transformers.rope import liger_rotary_pos_emb
         from liger_kernel.transformers.swiglu import LigerSwiGLUMLP

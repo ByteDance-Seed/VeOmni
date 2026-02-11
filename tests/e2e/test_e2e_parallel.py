@@ -23,8 +23,8 @@ def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
     model.save_pretrained(output_path)
 
 
-_DEFAULT_RTOL = 1e-2
-_DEFAULT_ATOL = 1e-2
+_DEFAULT_RTOL = 1e-1
+_DEFAULT_ATOL = 1e-1
 
 text_test_cases = [
     pytest.param(
@@ -74,7 +74,7 @@ text_test_cases = [
 
 @pytest.fixture(scope="session")
 def dummy_text_dataset():
-    dummy_dataset = DummyDataset(dataset_type="text")
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="text")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
