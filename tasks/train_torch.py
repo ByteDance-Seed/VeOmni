@@ -19,7 +19,14 @@ from veomni.data import (
     build_dataloader,
     build_dataset,
 )
-from veomni.data.data_transform import process_pretrain_example, process_sft_example
+from veomni.data.data_collator import (
+    CollatePipeline,
+    DataCollatorWithPacking,
+    DataCollatorWithPadding,
+    DataCollatorWithPositionIDs,
+    TextSequenceShardCollator,
+)
+from veomni.data.data_transform import process_classification_example, process_pretrain_example, process_sft_example
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -104,6 +111,12 @@ def main():
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
         )
+    elif args.data.data_type == "classification":
+        transform = partial(
+            process_classification_example,
+            tokenizer=tokenizer,
+            max_seq_len=args.data.max_seq_len,
+        )
     else:
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
@@ -119,6 +132,34 @@ def main():
         dataset_length = dataset_length / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
+    if args.data.data_type == "classification":
+        collate_fn_list = []
+        if args.train.rmpad_with_pos_ids:
+            collate_fn_list.append(DataCollatorWithPositionIDs(mask_boundary_labels=False))
+        elif args.train.rmpad:
+            logger.info_rank0(
+                "[INFO] rmpad_with_pos_ids is disabled.For better training, consider setting rmpad_with_pos_ids=True."
+            )
+            collate_fn_list.append(DataCollatorWithPacking())
+        else:
+            logger.info_rank0(
+                "[INFO] rmpad_with_pos_ids is disabled.For better training, consider setting rmpad_with_pos_ids=True."
+            )
+            collate_fn_list.append(DataCollatorWithPadding())
+        parallel_state = get_parallel_state()
+        if parallel_state.sp_enabled:
+            collate_fn_list.append(
+                TextSequenceShardCollator(
+                    rmpad=args.train.rmpad,
+                    rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+                    shift_labels=False,
+                    mask_boundary_labels=False,
+                )
+            )
+        collate_fn = CollatePipeline(collate_fn_list)
+    else:
+        collate_fn = None
+
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
         dataset=train_dataset,
@@ -130,6 +171,7 @@ def main():
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        collate_fn=collate_fn,
         dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
@@ -203,7 +245,12 @@ def main():
             )
 
         # save model_assets before training
-        model_assets = [model_config, tokenizer if args.data.data_type == "plaintext" else chat_template]
+        model_assets = [
+            model_config,
+            tokenizer
+            if args.data.data_type == "plaintext" or args.data.data_type == "classification"
+            else chat_template,
+        ]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
     if args.train.profile_this_rank:
