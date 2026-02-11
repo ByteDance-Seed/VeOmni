@@ -23,6 +23,42 @@ def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
     model.save_pretrained(output_path)
 
 
+def main(task_name: str, model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, train_path: str):
+    test_path = f"./{model_name}"
+    os.makedirs(test_path, exist_ok=True)
+
+    _materialize_weights_dir(config_path, test_path)
+
+    test_tasks = [task_name]
+    command_list = prepare_exec_cmd(
+        test_tasks,
+        model_name,
+        config_path,
+        model_path=test_path,
+        train_path=train_path,
+        output_dir=test_path,
+        is_moe=is_moe,
+    )
+    res = {}
+    log_keys = []
+    for task_name, cmd in command_list:
+        print(f"{'-' * 10} {task_name} {'-' * 10}")
+        subprocess.run(cmd, check=True)
+        with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
+            output = json.load(f)
+        if not log_keys:
+            log_keys = set(output.keys())
+        else:
+            assert log_keys == set(output.keys())
+        res[task_name] = output
+
+    for key in log_keys:
+        print_all_values(res, key, model_type=model_name)
+    compare_multi_items(model_name, res, rtol=rtol, atol=atol)
+
+    shutil.rmtree(test_path)
+
+
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
@@ -71,6 +107,47 @@ text_test_cases = [
     ),
 ]
 
+vlm_test_cases = [
+    pytest.param(
+        "qwen2vl",
+        "./tests/toy_config/qwen2vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
+    pytest.param(
+        "qwen25vl",
+        "./tests/toy_config/qwen25vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
+    pytest.param(
+        "qwen3vl",
+        "./tests/toy_config/qwen3vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
+    pytest.param(
+        "qwen3vlmoe",
+        "./tests/toy_config/qwen3vlmoe_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
+]
+
+omnilm_test_cases = [
+    pytest.param(
+        "qwen25_omni",
+        "./tests/toy_config/qwen25omni_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
+]
+
 
 @pytest.fixture(scope="session")
 def dummy_text_dataset():
@@ -80,40 +157,62 @@ def dummy_text_dataset():
     del dummy_dataset
 
 
+@pytest.fixture(scope="session")
+def dummy_vlm_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwenvl")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_omni_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwenomni")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", text_test_cases)
 def test_text_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_text_dataset
 ):
-    test_path = f"./{model_name}"
-    os.makedirs(test_path, exist_ok=True)
-
-    _materialize_weights_dir(config_path, test_path)
-
-    test_tasks = ["train_text_test"]
-    command_list = prepare_exec_cmd(
-        test_tasks,
-        model_name,
-        config_path,
-        model_path=test_path,
-        train_path=dummy_text_dataset,
-        output_dir=test_path,
+    main(
+        task_name="train_text_test",
+        model_name=model_name,
+        config_path=config_path,
         is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_text_dataset,
     )
-    res = {}
-    log_keys = []
-    for task_name, cmd in command_list:
-        print(f"{'-' * 10} {task_name} {'-' * 10}")
-        subprocess.run(cmd, check=True)
-        with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
-            output = json.load(f)
-        if not log_keys:
-            log_keys = set(output.keys())
-        else:
-            assert log_keys == set(output.keys())
-        res[task_name] = output
 
-    for key in log_keys:
-        print_all_values(res, key, model_type=model_name)
-    compare_multi_items(model_name, res, rtol=rtol, atol=atol)
 
-    shutil.rmtree(test_path)
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", vlm_test_cases)
+def test_vlm_parallel_align(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_vlm_dataset
+):
+    main(
+        task_name="train_vlm_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_vlm_dataset,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", omnilm_test_cases)
+def test_omnilm_parallel_align(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_omni_dataset
+):
+    main(
+        task_name="train_vlm_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_omni_dataset,
+    )
