@@ -24,7 +24,12 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   "diffusers>=0.30.0,<=0.31.0",
-  "transformers==4.57.3",
+  # Comment out transformers version for pip user compatibility (not to accidentally install v5 which is still WIP
+  # and experimental)
+  # For uv user: The actual version is controlled by the "transformers-stable" default
+  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.1.0).
+  # For pip user: please install 4.57.3 manually via pip install transformers==4.57.3.
+  # "transformers==4.57.3",
   "psutil",
   "timm",
   "wandb",
@@ -93,6 +98,14 @@ trl = [
   "trl<=0.9.6"
 ]
 
+# Experimental dep to install transformers 5.x.
+# Note that transformers 5.x support is experimental and WIP.
+# See https://github.com/ByteDance-Seed/VeOmni/issues/468 for the progress.
+# Usage: `uv sync --no-group transformers-stable --extra transformers5-exp --extra <other extra>`.
+transformers5-exp = [
+  "transformers==5.1.0"
+]
+
 [dependency-groups]
 # Follow the best practice in https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies
 # to manage dev dependencies (i.e., dependencies that are only used in development) like
@@ -110,6 +123,20 @@ test = [
   "pytest",
   "expecttest",
 ]
+# Pin the default transformers version via a dependency group.
+# This is a default group (see default-groups below), so `uv sync` will
+# always install transformers==4.57.3 unless the user opts out with
+# `--no-group transformers-stable` (and opts in to `--extra transformers5-exp`).
+#
+# Why a dependency group instead of override-dependencies?
+# uv's override-dependencies replaces ALL occurrences of a package name globally.
+# When using `extra` markers in overrides (e.g. `extra != 'transformers5-exp'`),
+# uv converts them to impossible markers like `python_version < '0'`, which
+# silently removes transformers from the dependency tree entirely.
+# See: https://github.com/astral-sh/uv/issues/11153
+transformers-stable = [
+  "transformers==4.57.3"
+]
 
 [tool.uv]
 # This locks the uv version so that we have a consistent uv behavior across the board.
@@ -123,6 +150,12 @@ no-build-isolation-package = [
     "flash-attn",
     "flash-attn-3",
 ]
+
+# The "transformers-stable" dependency group is synced by default, ensuring
+# that `uv sync` (with no extra flags) installs transformers==4.57.3.
+# To use transformers 5, run:
+#   uv sync --no-group transformers-stable --extra transformers5-exp
+default-groups = ["transformers-stable"]
 
 override-dependencies = [
     # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
@@ -143,8 +176,12 @@ override-dependencies = [
     "torchaudio==2.7.1+cpu; (extra == 'npu')",
     "torchvision==0.22.1+cpu; (extra == 'npu')",
     "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
-    # Fixate to a specific transformers version since upgrading transformers is a large task.
-    "transformers==4.57.3",
+
+    # NOTE: The transformers overrides that were previously here have been removed.
+    # They used `extra != 'transformers5-exp'` markers which uv converts to
+    # `python_version < '0'` (always false), silently removing transformers
+    # from the dependency tree. The version pinning is now handled by the
+    # "transformers-stable" default dependency group + conflicts declaration.
 
     # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
     # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
@@ -157,6 +194,13 @@ conflicts = [
     { extra = "gpu" },
     { extra = "npu" },
     { extra = "npu_aarch64" },
+  ],
+  # transformers version conflicts: the "transformers-stable" dependency group
+  # pins to 4.x while the "transformers5-exp" extra pins to 5.x.
+  # Declaring them as conflicting allows uv to resolve both forks independently.
+  [
+    { group = "transformers-stable" },
+    { extra = "transformers5-exp" },
   ],
 ]
 

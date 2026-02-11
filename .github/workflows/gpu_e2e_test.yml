@@ -12,12 +12,16 @@ on:
     paths:
       - "**/*.py"
       - .github/workflows/gpu_e2e_test.yml
+      - "pyproject.toml"
+      - "uv.lock"
   pull_request:
     branches:
       - main
     paths:
       - "**/*.py"
       - .github/workflows/gpu_e2e_test.yml
+      - "pyproject.toml"
+      - "uv.lock"
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
