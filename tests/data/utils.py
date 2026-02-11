@@ -5,7 +5,8 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from datasets import Dataset
+from torch.utils.data import Dataset, IterableDataset
+from datasets import Dataset as HuggingFaceDataset
 
 from veomni.utils import helper
 from veomni.utils.device import get_device_type
@@ -14,7 +15,82 @@ from veomni.utils.helper import get_cache_dir
 
 logger = helper.create_logger(__name__)
 
+class DummyMappingDataset(Dataset):
+    """Mapping-style dataset that generates dummy data based on index."""
 
+    def __init__(self, size: int = 100):
+        """
+        Args:
+            size: Total number of samples in the dataset
+        """
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        """Generate data following the same pattern as DummyDataset.generate_data"""
+        if idx < 0 or idx >= self.size:
+            raise IndexError(f"Index {idx} out of range [0, {self.size})")
+
+        # Follow the same generation pattern: index + 1
+        index = idx + 1
+        input_ids = torch.tensor([index] * index, dtype=torch.long)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "labels": input_ids.clone()
+        }
+
+
+class DummyIterableDataset(IterableDataset):
+    """Iterable dataset that reads from DummyMappingDataset sequentially or with shuffle."""
+
+    def __init__(self, mapping_dataset: DummyMappingDataset, shuffle: bool = False, seed: int = 42):
+        """
+        Args:
+            mapping_dataset: The underlying DummyMappingDataset to read from
+            shuffle: Whether to shuffle the reading order
+            seed: Random seed for shuffling
+        """
+        self.mapping_dataset = mapping_dataset
+        self.shuffle = shuffle
+        self.seed = seed
+        self.output_refetch_idx = False  # Will be set by DynamicBatchingSizeDataset if needed
+        self._current_idx = 0  # Track current position in iteration
+
+        # Generate index permutation at initialization if shuffle is enabled
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed)
+            self.indices = torch.randperm(len(self.mapping_dataset), generator=generator).tolist()
+        else:
+            self.indices = list(range(len(self.mapping_dataset)))
+
+    def __iter__(self):
+        """Iterate through the dataset in order or shuffled order."""
+        while self._current_idx < len(self.indices):
+            idx = self.indices[self._current_idx]
+            self._current_idx += 1
+            if self.output_refetch_idx:
+                yield (self.mapping_dataset[idx], idx)
+            else:
+                yield self.mapping_dataset[idx]
+
+    def get_item(self, idx):
+        return self.mapping_dataset[idx]
+
+    def state_dict(self):
+        """Save the current iteration state."""
+        return {
+            "current_idx": self._current_idx,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Restore the iteration state."""
+        self._current_idx = state_dict["current_idx"]
+
+    
 class DummyDataset:
     def __init__(self, size=100, num_shard=2, dataset_name: str = "test_dataset") -> None:
         self.size = size
@@ -43,7 +119,7 @@ class DummyDataset:
         index = 0
         for i in range(0, self.size, batch_len):
             print(f"Generating {index}th parquet file")
-            ds = Dataset.from_generator(
+            ds = HuggingFaceDataset.from_generator(
                 self.generate_data,
                 gen_kwargs={"index_list": list(range(i + 1, i + batch_len + 1))},
                 keep_in_memory=True,
