@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -76,7 +77,7 @@ def dummy_text_dataset():
     dummy_dataset = DummyDataset(dataset_type="text")
     train_path = dummy_dataset.save_path
     yield train_path
-    # del dummy_dataset
+    del dummy_dataset
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", text_test_cases)
@@ -98,7 +99,6 @@ def test_text_parallel_align(
         output_dir=test_path,
         is_moe=is_moe,
     )
-
     res = {}
     log_keys = []
     for task_name, cmd in command_list:
@@ -115,3 +115,5 @@ def test_text_parallel_align(
     for key in log_keys:
         print_all_values(res, key, model_type=model_name)
     compare_multi_items(model_name, res, rtol=rtol, atol=atol)
+
+    shutil.rmtree(test_path)

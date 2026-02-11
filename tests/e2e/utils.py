@@ -131,8 +131,8 @@ class ModelMode:
         return f"_[sp-{self.sp_size}]_[ep-{self.ep_size}]"
 
 
-_SP_SIZE = [1, 4]
-_EP_SIZE = [1, 4]
+_SP_SIZE = [1, 2]
+_EP_SIZE = [1, 2]
 
 
 def _base_model_modes():
@@ -168,7 +168,7 @@ def prepare_exec_cmd(
             command = [
                 "torchrun",
                 "--nnodes=1",
-                "--nproc_per_node=8",
+                f"--nproc_per_node={mode.sp_size * 4}",
                 f"--master_port={port}",
                 f"tests/e2e/{task}.py",
                 f"--model.config_path={config_path}",
