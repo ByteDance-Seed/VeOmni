@@ -2,8 +2,8 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from veomni.data.constants import IGNORE_INDEX
 from veomni.data.data_transform import process_classification_example
+from veomni.utils.constants import IGNORE_INDEX
 
 
 class DummyTokenizer:
