@@ -96,14 +96,12 @@ def process_sft_example(
 
 
 def process_classification_example(
-    example: Dict[str, Any],
+    example: dict[str, Any],
     tokenizer: "PreTrainedTokenizer",
     max_seq_len: int,
-    text_keys: Union[str, List[str]] = "text",
+    text_keys: Union[str, list[str]] = "text",
     label_key: str = "label",
-    *,
-    label_offset: int = 0,
-) -> List[Dict[str, "torch.Tensor"]]:
+) -> list[dict[str, "torch.Tensor"]]:
     """
     Convert a single raw example into one classification training sample.
 
@@ -130,14 +128,7 @@ def process_classification_example(
             Key in `example` that contains the raw input text.
 
         label_key:
-            Key in `example` that contains the class id. The value should
-            be int-like; `label_offset` can be used to shift from 1-based
-            to 0-based labels.
-
-        label_offset:
-            Offset applied to the raw label, useful when labels are
-            stored as 1..N in the dataset. The final label is:
-                label = int(example[label_key]) - label_offset
+            Key in `example` that contains the class id. The value should be int-like.
 
     Returns:
         A list with exactly one sample dict:
@@ -165,29 +156,27 @@ def process_classification_example(
     if label_key not in example:
         raise ValueError(f"Missing label key '{label_key}' in example.")
     try:
-        label_val = int(example[label_key]) - int(label_offset)
+        label_val = int(example[label_key])
     except Exception as e:
         raise ValueError(f"Label '{example[label_key]}' is not an int-like value.") from e
-    if label_val < 0:
-        raise ValueError(f"label ({label_val}) became negative after applying label_offset={label_offset}.")
 
     # 3) tokenize
-    tokens: List[int] = tokenizer.encode(text, add_special_tokens=True)
+    tokens: list[int] = tokenizer.encode(text, add_special_tokens=True)
 
     # 4) build samples
-    examples: List[Dict[str, "torch.Tensor"]] = []
+    examples: list[dict[str, torch.Tensor]] = []
 
-    def build_sample(seq: List[int]) -> Dict[str, "torch.Tensor"]:
+    def build_sample(seq: list[int]) -> dict[str, "torch.Tensor"]:
         L = len(seq)
         token_labels = torch.full((L,), IGNORE_INDEX, dtype=torch.long)
         token_labels[L - 1] = label_val
 
-        sample: Dict[str, "torch.Tensor"] = {
+        sample: dict[str, torch.Tensor] = {
             "input_ids": torch.tensor(seq, dtype=torch.long),
             "attention_mask": torch.ones(len(seq), dtype=torch.long),
             "labels": token_labels,
-            "position_ids": torch.arange(len(seq), dtype=torch.long),
         }
+        sample["position_ids"] = torch.arange(len(seq), dtype=torch.long)
         return sample
 
     if len(tokens) > max_seq_len:
