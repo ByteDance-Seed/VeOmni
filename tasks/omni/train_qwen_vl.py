@@ -254,6 +254,7 @@ def main():
         lr_start=args.train.lr_start,
     )
 
+    model_assets = None
     if args.train.global_rank == 0:
         if args.train.use_wandb:
             wandb.init(
@@ -459,15 +460,18 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0:
-        if args.train.save_hf_weights and save_checkpoint_path is not None:
-            save_hf_safetensor(
-                save_checkpoint_path=save_checkpoint_path,
-                model_assets=model_assets,
-                ckpt_manager=args.train.ckpt_manager,
-                train_architecture=args.train.train_architecture,
-                output_dir=args.train.output_dir,
-            )
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
+            ckpt_manager=args.train.ckpt_manager,
+            model_assets=model_assets,
+            train_architecture=args.train.train_architecture,
+            save_checkpoint_path=save_checkpoint_path,
+            output_dir=args.train.output_dir,
+            model=model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+        )
 
     dist.barrier()
     dist.destroy_process_group()
