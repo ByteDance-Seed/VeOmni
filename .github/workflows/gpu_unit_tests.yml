@@ -83,6 +83,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/omni/test_qwen3_omni_moe.py
       - name: Run fsdp2/ep+fsdp2 clip grad norm test
         run: |
           uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
