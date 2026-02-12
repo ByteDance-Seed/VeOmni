@@ -134,14 +134,17 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
             self.trainer.checkpointer.save_future.result()
 
-        if args.train.global_rank == 0:
-            save_hf_safetensor(
-                save_checkpoint_path=save_checkpoint_path,
-                model_assets=self.trainer.model_assets,
-                ckpt_manager=args.train.ckpt_manager,
-                train_architecture=args.train.train_architecture,
-                output_dir=args.train.output_dir,
-            )
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
+            model_assets=self.trainer.model_assets,
+            ckpt_manager=args.train.ckpt_manager,
+            train_architecture=args.train.train_architecture,
+            output_dir=args.train.output_dir,
+            save_checkpoint_path=save_checkpoint_path,
+            model=self.trainer.model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+        )
 
         # Empty cache and barrier
         helper.empty_cache()

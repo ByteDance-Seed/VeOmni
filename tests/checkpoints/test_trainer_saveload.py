@@ -1,5 +1,6 @@
 import copy
 import os
+import shutil
 import subprocess
 from typing import Dict, Optional
 
@@ -7,14 +8,14 @@ import pytest
 import torch
 import yaml
 
-
-try:
-    from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
-    from .utils import get_checkpoint_dir, get_checkpoint_test_command, get_hf_output_dir, get_merge_dcp_to_hf_command
-except Exception as _:
-    # from utils import get_checkpoint_test_command, get_merge_dcp_to_hf_command, get_checkpoint_dir, get_hf_output_dir
-    from checkpoint_verification_utils import verify_dcp_to_hf_conversion
-
+from tests.checkpoints.checkpoint_verification_utils import verify_dcp_to_hf_conversion
+from tests.checkpoints.utils import (
+    get_checkpoint_dir,
+    get_checkpoint_test_command,
+    get_hf_output_dir,
+    get_merge_dcp_to_hf_command,
+    get_output_dir,
+)
 from veomni.arguments import parse_args
 from veomni.data import build_dummy_dataset
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -22,6 +23,8 @@ from veomni.trainer.callbacks.base import Callback, CallbackHandler, TrainerStat
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
 from veomni.utils import helper
 
+
+os.environ["NCCL_DEBUG"] = "OFF"
 
 # To prevent DCP from complaining "too many open files"
 # see: https://github.com/pytorch/pytorch/issues/11201
@@ -67,6 +70,22 @@ def read_output_dir_from_yaml(yaml_path: str) -> str:
     with open(yaml_path) as f:
         config = yaml.safe_load(f)
     return config.get("train", {}).get("output_dir", None)
+
+
+def capture_param_dtypes(model):
+    """Capture a snapshot of {param_name: dtype} for the model."""
+    return {name: param.data.dtype for name, param in model.named_parameters()}
+
+
+def assert_param_dtypes_unchanged(model, original_dtypes):
+    """Assert that model parameter dtypes have not been mutated."""
+    for name, param in model.named_parameters():
+        current_dtype = param.data.dtype
+        expected_dtype = original_dtypes[name]
+        assert current_dtype == expected_dtype, (
+            f"Parameter '{name}' dtype was mutated: expected {expected_dtype}, got {current_dtype}. "
+            f"This indicates an in-place dtype conversion side effect during save."
+        )
 
 
 class TrainerTest(BaseTrainer):
@@ -144,7 +163,9 @@ class HuggingfaceCkptCallbackTest(HuggingfaceCkptCallback):
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
         state.global_step = self.trainer.dcp_global_step
+        dtypes_before_hf_save = capture_param_dtypes(self.trainer.model)
         self._save_checkpoint(state)
+        assert_param_dtypes_unchanged(self.trainer.model, dtypes_before_hf_save)
         self.trainer.hf_weights_path = os.path.join(
             self.trainer.args.train.save_checkpoint_path, f"global_step_{state.global_step}", "hf_ckpt"
         )
@@ -165,8 +186,6 @@ class CheckCallback(Callback):
                 hf_checkpoint_dir=self.trainer.hf_weights_path,
                 safe_serialization=True,
             ), "HF checkpoint verification failed"
-
-            # shutil.rmtree(self.trainer.args.train.output_dir)
 
 
 def main():
@@ -195,11 +214,15 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int):
         safe_serialization=True,
     ), f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}`"
 
+    shutil.rmtree(get_output_dir(model_name, ep_size))
+
 
 def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
     exec_command = get_checkpoint_test_command(model_name, ep_size, save_hf_weights=True)
     exec_result = subprocess.run(exec_command, shell=True, check=True)
     assert exec_result.returncode == 0
+
+    shutil.rmtree(get_output_dir(model_name, ep_size))
 
 
 TEST_MODELS = ["qwen3_moe", "deepseek_v3"]

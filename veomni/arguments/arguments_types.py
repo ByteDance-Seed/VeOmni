@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -82,6 +83,12 @@ class ModelArguments:
         default=None,
         metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
     )
+    safetensor_idx_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
+        },
+    )
     foundation: Dict[str, str] = field(
         default_factory=dict,
         metadata={"help": "Foundation model extra config."},
@@ -136,6 +143,23 @@ class ModelArguments:
 
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
+
+        # Auto-resolve safetensor_idx_path from model_path if not specified
+        if self.safetensor_idx_path is None and self.model_path is not None:
+            default_idx_path = os.path.join(self.model_path, "model.safetensors.index.json")
+            if os.path.exists(default_idx_path):
+                self.safetensor_idx_path = default_idx_path
+
+        # Parse fqn_to_index_mapping from safetensor index json
+        self.fqn_to_index_mapping = None
+        if self.safetensor_idx_path is not None:
+            with open(self.safetensor_idx_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            self.fqn_to_index_mapping = {fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()}
+        if self.fqn_to_index_mapping is None:
+            logger.warning_rank0(
+                "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
+            )
 
         if self.attn_implementation == "flash_attention_2":
             logger.info_rank0(
@@ -669,6 +693,13 @@ class TrainingArguments:
             )
 
         # save paths
+        # output_dir/
+        # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
+        # │   ├── global_step_100/
+        # │   └── global_step_200/
+        # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
+        # ├── model_assets/
+        # └── step2token.json
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
         self.step2token_path = os.path.join(self.output_dir, "step2token.json")
         self.model_assets_dir = os.path.join(self.output_dir, "model_assets")
