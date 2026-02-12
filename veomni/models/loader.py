@@ -24,17 +24,31 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
-    AutoModelForVision2Seq,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedModel,
 )
-from transformers.modeling_utils import no_init_weights
+
+
+# transformers v5 deleted the AutoModelForVision2Seq class, so we use AutoModelForImageTextToText as a fallback
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = AutoModelForImageTextToText
 
 from ..utils import logging
 from ..utils.env import get_env
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from ..utils.registry import Registry
 from .module_utils import init_empty_weights, load_model_weights
+
+
+# `no_init_weights` was moved to `transformers.initialization` in:
+# https://github.com/huggingface/transformers/pull/42957
+if is_transformers_version_greater_or_equal_to("5.0.0"):
+    from transformers.initialization import no_init_weights
+else:
+    from transformers.modeling_utils import no_init_weights
 
 
 MODELING_REGISTRY = Registry("Modeling")
