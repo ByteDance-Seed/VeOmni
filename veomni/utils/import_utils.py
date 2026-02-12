@@ -83,6 +83,11 @@ def is_torch_version_greater_than(value: str) -> bool:
     return _get_package_version("torch") >= version.parse(value)
 
 
+def get_transformers_version() -> "Version":
+    """Return the installed transformers version as a packaging.version.Version."""
+    return _get_package_version("transformers")
+
+
 @lru_cache
 def is_transformers_version_greater_or_equal_to(value: str) -> bool:
     return _get_package_version("transformers") >= version.parse(value)

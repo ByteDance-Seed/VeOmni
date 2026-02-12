@@ -95,6 +95,9 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
+      - name: Run utils tests
+        run: |
+          uv run --frozen pytest -s -x tests/utils
 
   cleanup:
     runs-on: ubuntu-latest
