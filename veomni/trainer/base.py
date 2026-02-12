@@ -40,7 +40,6 @@ from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import init_parallel_state
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
 from ..utils.device import (
@@ -470,7 +469,7 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
-        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.batch_invariant):
+        with self.model_fwd_context:
             outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
         loss: torch.Tensor
@@ -478,7 +477,7 @@ class BaseTrainer(Stateful, ABC):
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
         # Backward pass
-        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.batch_invariant):
+        with self.model_bwd_context:
             loss.backward()
 
         del micro_batch

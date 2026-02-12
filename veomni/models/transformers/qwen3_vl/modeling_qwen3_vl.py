@@ -621,11 +621,13 @@ class Qwen3VLModel(_Qwen3VLModel):
         image_mask = kwargs.get("image_mask", None)
         video_mask = kwargs.get("video_mask", None)
 
-        # if None, all gather sp group input_ids and calculate mask
+        # if None, calculate mask
         if video_mask is None and image_mask is None:
-            input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
-            dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-            image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=0))
+            if get_parallel_state().sp_enabled:
+                input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+                dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+                input_ids = torch.cat(input_ids_list, dim=0)
+            image_mask, video_mask = self.get_placeholder_mask(input_ids)
         # --- Patch.3 ---
 
         # --- Patch.6 ---

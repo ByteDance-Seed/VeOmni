@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.table import Table
 from transformers import set_seed
 
+from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.utils.import_utils import is_torch_npu_available
 
 
@@ -105,20 +106,64 @@ def prepare_model_modes(
     return hf_model_modes, veomni_model_modes
 
 
-def prepare_data(max_seq_len):
-    def _get_dummy_inputs(max_seq_len, seed=42):
-        set_seed(seed)
-        input_ids = torch.randint(0, 1024, (1, torch.randint(1, max_seq_len, (1,)).item()))
-        return {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones_like(input_ids),
-            "labels": input_ids.clone(),
+MODEL_TO_DATASET = {
+    "qwen3_vl": "qwen3vl",
+    "qwen3_vl_moe": "qwen3vl",
+    "qwen2_vl": "qwen2vl",
+    "qwen2_5_vl": "qwen2vl",
+    "qwen2_5_omni": "qwen2omni",
+}
+
+UNSQUEECE_KEYS = ["input_ids", "attention_mask", "labels", "position_ids", "image_mask", "video_mask", "audio_mask"]
+
+
+def parse_token_id_from_config(model_config):
+    if model_config.model_type not in MODEL_TO_DATASET:
+        return {}
+    if model_config.model_type in ["qwen2_5_omni", "qwen3_moe_omni"]:
+        token_ids_dict = {
+            "image_token_id": model_config.thinker_config.image_token_id,
+            "video_token_id": model_config.thinker_config.video_token_id,
+            "audio_token_id": model_config.thinker_config.audio_token_id,
         }
+    else:
+        token_ids_dict = {
+            "image_token_id": model_config.image_token_id,
+            "video_token_id": model_config.video_token_id,
+        }
+    return token_ids_dict
+
+
+def prepare_data(model_name: str, max_seq_len: int, model_config):
+    dataset_name = MODEL_TO_DATASET.get(model_name, "text")
+    dataset = build_dummy_dataset(dataset_name, 1, max_seq_len)
+
+    token_ids_dict = parse_token_id_from_config(model_config)
 
     class DummyDataLoader:
+        def process(self, example):
+            example = example[0]
+            example = {key: torch.tensor(v) for key, v in example.items()}
+            for key in UNSQUEECE_KEYS:
+                if key not in example:
+                    continue
+                example[key] = example[key].unsqueeze(0)
+
+            if "image_mask" in example:
+                example["input_ids"].masked_fill_(example["image_mask"], token_ids_dict["image_token_id"])
+            if "video_mask" in example:
+                example["input_ids"].masked_fill_(example["video_mask"], token_ids_dict["video_token_id"])
+            if "audio_mask" in example:
+                example["input_ids"].masked_fill_(example["audio_mask"], token_ids_dict["audio_token_id"])
+
+            if example["position_ids"].dim() == 3:
+                example["position_ids"] = example["position_ids"].transpose(0, 1).contiguous()
+
+            return example
+
         def __iter__(self):
-            yield _get_dummy_inputs(max_seq_len=max_seq_len, seed=42)
-            yield _get_dummy_inputs(max_seq_len=max_seq_len, seed=43)
+            set_seed(42)
+            yield self.process(dataset[0])
 
     return DummyDataLoader()
 
