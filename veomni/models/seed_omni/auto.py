@@ -16,14 +16,22 @@
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 import torch
-from transformers.modeling_utils import no_init_weights
 
 from ...distributed.parallel_state import get_parallel_state
+from ...utils.import_utils import is_transformers_version_greater_or_equal_to
 from ..auto import build_config, build_foundation_model, build_processor, build_tokenizer
 from ..module_utils import init_empty_weights, load_model_weights
 from .configuration_seed_omni import SeedOmniConfig
 from .modeling_seed_omni import SeedOmniModel
 from .processing_seed_omni import SeedOmniProcessor
+
+
+# `no_init_weights` was moved to `transformers.initialization` in:
+# https://github.com/huggingface/transformers/pull/42957
+if is_transformers_version_greater_or_equal_to("5.0.0"):
+    from transformers.initialization import no_init_weights
+else:
+    from transformers.modeling_utils import no_init_weights
 
 
 if TYPE_CHECKING:
