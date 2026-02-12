@@ -30,6 +30,7 @@ from transformers import (
 )
 
 
+# transformers v5 deleted the AutoModelForVision2Seq class, so we use AutoModelForImageTextToText as a fallback
 try:
     from transformers import AutoModelForVision2Seq
 except ImportError:
