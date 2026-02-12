@@ -44,7 +44,7 @@ class DummyTextDataset(Dataset):
 
 
 class DummyQwenVLDataset(Dataset):
-    def __init__(self, size: int, seq_length: int):
+    def __init__(self, size: int, seq_length: int, patch_size: int = 14):
         """
         Args:
             size (int): Nums of datasets
@@ -61,11 +61,11 @@ class DummyQwenVLDataset(Dataset):
         video_seq_length = self.seq_length - self.text_seqlen - image_t * image_token_num
         video_t = video_seq_length // image_token_num
 
-        self.image_size = [324 * image_t, 1176]
+        self.image_size = [324 * image_t, patch_size * patch_size * 2 * 3]
         self.image_grid_thw = torch.tensor([[1, 18, 18]] * image_t, dtype=torch.long)
         self.image_seqlen = image_t * image_token_num
 
-        self.video_size = [324 * video_t, 1176]
+        self.video_size = [324 * video_t, patch_size * patch_size * 2 * 3]
         self.video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
         self.video_seqlen = video_t * image_token_num
 
@@ -103,7 +103,7 @@ class DummyQwenVLDataset(Dataset):
 
 
 class DummyQwenOmniDataset(Dataset):
-    def __init__(self, size: int, seq_length: int):
+    def __init__(self, size: int, seq_length: int, patch_size: int = 14):
         """
         Args:
             size (int): Nums of datasets
@@ -117,7 +117,7 @@ class DummyQwenOmniDataset(Dataset):
 
         input_image_token_num = 81
         input_image_t = 2
-        self.input_image_size = [324 * input_image_t, 1176]
+        self.input_image_size = [324 * input_image_t, patch_size * patch_size * 2 * 3]
         self.input_image_grid_thw = torch.tensor([[1, 18, 18]] * input_image_t, dtype=torch.long)
         self.input_image_seq_length = input_image_t * input_image_token_num
 
@@ -132,7 +132,7 @@ class DummyQwenOmniDataset(Dataset):
         self.text_seq_length = rest_seq_length // 4
         self.video_seq_length = rest_seq_length - self.text_seq_length
         video_t = self.video_seq_length // input_image_token_num
-        self.input_video_size = [324 * video_t, 1176]
+        self.input_video_size = [324 * video_t, patch_size * patch_size * 2 * 3]
         self.input_video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
 
         self.seq_length = (
@@ -180,7 +180,7 @@ class DummyQwenOmniDataset(Dataset):
 
 
 class DummyUGDataset(Dataset):
-    def __init__(self, size: int, seq_length: int):
+    def __init__(self, size: int, seq_length: int, patch_size: int = 14):
         """
         Args:
             size (int): Nums of datasets
@@ -194,7 +194,7 @@ class DummyUGDataset(Dataset):
 
         input_image_token_num = 81
         input_image_t = 2
-        self.input_image_size = [324 * input_image_t, 1176]
+        self.input_image_size = [324 * input_image_t, patch_size * patch_size * 2 * 3]
         self.input_image_grid_thw = torch.tensor([[1, 18, 18]] * input_image_t, dtype=torch.long)
         self.input_image_seq_length = input_image_t * input_image_token_num
 
@@ -216,7 +216,7 @@ class DummyUGDataset(Dataset):
         self.text_seq_length = rest_seq_length // 4
         self.video_seq_length = rest_seq_length - self.text_seq_length
         video_t = self.video_seq_length // input_image_token_num
-        self.input_video_size = [324 * video_t, 1176]
+        self.input_video_size = [324 * video_t, patch_size * patch_size * 2 * 3]
         self.input_video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
 
         self.seq_length = (
@@ -276,10 +276,14 @@ class DummyUGDataset(Dataset):
 def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset":
     if task_type == "text":
         return DummyTextDataset(size=size, seq_length=max_seq_len)
-    elif task_type == "qwenvl":
-        return DummyQwenVLDataset(size=size, seq_length=max_seq_len)
-    elif task_type == "qwenomni":
-        return DummyQwenOmniDataset(size=size, seq_length=max_seq_len)
+    elif task_type == "qwen2vl":
+        return DummyQwenVLDataset(size=size, seq_length=max_seq_len, patch_size=14)
+    elif task_type == "qwen3vl":
+        return DummyQwenVLDataset(size=size, seq_length=max_seq_len, patch_size=16)
+    elif task_type == "qwen2omni":
+        return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=14)
+    elif task_type == "qwen3omni":
+        return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=16)
     elif task_type == "ug":
         return DummyUGDataset(size=size, seq_length=max_seq_len)
     else:

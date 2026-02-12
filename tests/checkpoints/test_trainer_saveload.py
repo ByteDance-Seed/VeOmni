@@ -8,14 +8,18 @@ import pytest
 import torch
 import yaml
 
-from tests.checkpoints.checkpoint_verification_utils import verify_dcp_to_hf_conversion
-from tests.checkpoints.utils import (
-    get_checkpoint_dir,
-    get_checkpoint_test_command,
-    get_hf_output_dir,
-    get_merge_dcp_to_hf_command,
-    get_output_dir,
-)
+
+try:
+    from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
+    from .utils import (
+        get_checkpoint_dir,
+        get_checkpoint_test_command,
+        get_hf_output_dir,
+        get_merge_dcp_to_hf_command,
+        get_output_dir,
+    )
+except Exception as _:
+    from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from veomni.arguments import parse_args
 from veomni.data import build_dummy_dataset
 from veomni.trainer.base import BaseTrainer, VeOmniArguments

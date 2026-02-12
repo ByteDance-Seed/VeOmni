@@ -5,8 +5,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 
-from tests.e2e.utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
 
@@ -107,7 +107,7 @@ text_test_cases = [
     ),
 ]
 
-vlm_test_cases = [
+qwen2vl_test_cases = [
     pytest.param(
         "qwen2vl",
         "./tests/toy_config/qwen2vl_toy",
@@ -122,6 +122,9 @@ vlm_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
     ),
+]
+
+qwen3vl_test_cases = [
     pytest.param(
         "qwen3vl",
         "./tests/toy_config/qwen3vl_toy",
@@ -138,7 +141,7 @@ vlm_test_cases = [
     ),
 ]
 
-omnilm_test_cases = [
+qwen2omni_test_cases = [
     pytest.param(
         "qwen25_omni",
         "./tests/toy_config/qwen25omni_toy",
@@ -158,16 +161,24 @@ def dummy_text_dataset():
 
 
 @pytest.fixture(scope="session")
-def dummy_vlm_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwenvl")
+def dummy_qwen2vl_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen2vl")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
 
 
 @pytest.fixture(scope="session")
-def dummy_omni_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwenomni")
+def dummy_qwen3vl_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen3vl")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_qwen2omni_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen2omni")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
@@ -188,9 +199,9 @@ def test_text_parallel_align(
     )
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", vlm_test_cases)
-def test_vlm_parallel_align(
-    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_vlm_dataset
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2vl_test_cases)
+def test_qwen2vl_parallel_align(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2vl_dataset
 ):
     main(
         task_name="train_vlm_test",
@@ -199,13 +210,13 @@ def test_vlm_parallel_align(
         is_moe=is_moe,
         rtol=rtol,
         atol=atol,
-        train_path=dummy_vlm_dataset,
+        train_path=dummy_qwen2vl_dataset,
     )
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", omnilm_test_cases)
-def test_omnilm_parallel_align(
-    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_omni_dataset
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen3vl_test_cases)
+def test_qwen3vl_parallel_align(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen3vl_dataset
 ):
     main(
         task_name="train_vlm_test",
@@ -214,5 +225,20 @@ def test_omnilm_parallel_align(
         is_moe=is_moe,
         rtol=rtol,
         atol=atol,
-        train_path=dummy_omni_dataset,
+        train_path=dummy_qwen3vl_dataset,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2omni_test_cases)
+def test_qwen2omni_parallel_align(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2omni_dataset
+):
+    main(
+        task_name="train_vlm_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_qwen2omni_dataset,
     )

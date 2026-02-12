@@ -470,7 +470,7 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
-        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_full_determinism):
+        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.batch_invariant):
             outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
         loss: torch.Tensor
@@ -478,7 +478,7 @@ class BaseTrainer(Stateful, ABC):
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
         # Backward pass
-        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_full_determinism):
+        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.batch_invariant):
             loss.backward()
 
         del micro_batch
