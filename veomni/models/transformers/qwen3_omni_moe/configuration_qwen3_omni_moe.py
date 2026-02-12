@@ -25,6 +25,12 @@ class Qwen3OmniMoeConfig(_Qwen3OmniMoeConfig):
         self,
         **kwargs,
     ):
+        """
+        Modification:
+            Qwen3OmniMoe didn't set tie_word_embeddings, so it is set to True by default.
+            However, Qwen3OmniMoe model didn't set get_output_embeddings, so the `embed_tokens` can't tie with `lm_head`
+            Logically, `tie_word_embeddings=False`
+        """
         kwargs.pop("tie_word_embeddings", None)
         super().__init__(tie_word_embeddings=False, **kwargs)
 

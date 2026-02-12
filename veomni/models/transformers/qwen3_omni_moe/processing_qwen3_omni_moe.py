@@ -56,7 +56,7 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
         use_audio_in_video = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
         fps = output_kwargs["videos_kwargs"].get("fps", 1.0)
 
-        # --- VeOmni Patch: use truthy check instead of `is not None` ---
+        # Modification: use truthy check instead of `is not None` ---
         if audio:
             output_kwargs["audio_kwargs"]["padding"] = True
             audio_inputs = self.feature_extractor(audio, **output_kwargs["audio_kwargs"])
@@ -67,7 +67,7 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
             audio_inputs = {}
             audio_lengths = iter([])
 
-        # --- VeOmni Patch: use truthy check instead of `is not None` ---
+        # Modification: use truthy check instead of `is not None` ---
         if images:
             images_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
             image_grid_thw = iter(images_inputs["image_grid_thw"])
@@ -75,7 +75,7 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
             images_inputs = {}
             image_grid_thw = iter([])
 
-        # --- VeOmni Patch: use truthy check instead of `is not None` ---
+        # Modification: use truthy check instead of `is not None` ---
         if videos:
             videos = make_batched_videos(videos)
             videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
