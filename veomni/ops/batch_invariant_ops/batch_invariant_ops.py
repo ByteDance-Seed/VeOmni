@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ...utils.device import get_compute_units
+
 
 __all__ = [
     "set_batch_invariant_mode",
@@ -120,30 +122,6 @@ def matmul_kernel_persistent(
             accumulator += bias
         c = accumulator.to(c_ptr.dtype.element_ty)
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-def get_compute_units():
-    """
-    Returns the number of streaming multiprocessors (SMs) or equivalent compute units
-    for the available accelerator. Assigns the value to NUM_SMS.
-    """
-    NUM_SMS = None
-    device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-
-    # Use match/case for device-specific logic (Python 3.10+)
-    match device_type:
-        case "cuda":
-            device_properties = torch.cuda.get_device_properties(0)
-            NUM_SMS = device_properties.multi_processor_count
-        case "xpu":
-            device_properties = torch.xpu.get_device_properties(0)
-            NUM_SMS = device_properties.max_compute_units
-        case _:
-            print("No CUDA or XPU device available. Using CPU.")
-            # For CPU, you might want to use the number of CPU cores
-            NUM_SMS = torch.get_num_threads()
-
-    return NUM_SMS
 
 
 def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
