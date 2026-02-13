@@ -166,6 +166,9 @@ def prepare_exec_cmd(
         for mode in model_modes:
             port = 12345 + random.randint(0, 100)
             command = [
+                "env",
+                "CUDA_LAUNCH_BLOCKING=1",
+                "VEOMNI_USE_LIGER_KERNEL=0",
                 "torchrun",
                 "--nnodes=1",
                 f"--nproc_per_node={mode.sp_size * 4}",
@@ -188,6 +191,7 @@ def prepare_exec_cmd(
                 "--train.save_steps=0",
                 "--train.save_hf_weights=False",
                 "--train.enable_full_determinism=True",
+                "--train.enable_batch_invariant_mode=True",
                 "--train.max_steps=5",
                 f"--train.output_dir={os.path.join(output_dir, f'{model_name}_{task}_{mode}')}",
                 f"--model.model_path={model_path}",

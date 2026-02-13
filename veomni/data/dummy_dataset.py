@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import Dataset
 
 from ..utils import logging
+from ..utils.constants import IGNORE_INDEX
 
 
 logger = logging.get_logger(__name__)
@@ -41,6 +42,7 @@ class DummyTextDataset(Dataset):
         attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
         position_ids = torch.arange(0, self.seq_length)
         labels = input_ids.clone()
+        labels[0] = IGNORE_INDEX
         return [
             {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "position_ids": position_ids}
         ]
@@ -86,6 +88,7 @@ class DummyQwenVLDataset(Dataset):
         input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
         attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
         labels = input_ids.clone()
+        labels[0] = IGNORE_INDEX
         position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
         pixel_values = torch.rand(self.image_size, dtype=torch.float32)
         pixel_values_videos = torch.rand(self.video_size, dtype=torch.float32)
@@ -161,6 +164,7 @@ class DummyQwenOmniDataset(Dataset):
         input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
         attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
         labels = input_ids.clone()
+        labels[0] = IGNORE_INDEX
         position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
         image_features = torch.rand(self.input_image_size, dtype=torch.float32)
         audio_features = torch.rand(self.input_audio_size, dtype=torch.float32)
