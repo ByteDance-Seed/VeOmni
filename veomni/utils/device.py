@@ -108,3 +108,10 @@ def is_nccl_backend() -> bool:
 def is_hccl_backend() -> bool:
     """Check if the distributed communication backend is HCCL."""
     return get_dist_comm_backend() == "hccl"
+
+
+def get_device_capability() -> tuple[int, int] | None:
+    """Get device compute capability if available."""
+    if IS_CUDA_AVAILABLE:
+        return torch.cuda.get_device_capability()
+    return None
