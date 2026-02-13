@@ -76,6 +76,8 @@ class VeomniFlopsCounter:
             "qwen3_moe": self._estimate_qwen3_moe_flops,
             "llama": self._estimate_llama_flops,
             "qwen2": self._estimate_qwen2_flops,
+            # qwen3_next
+            "qwen3_next": self._estimate_qwen3_next_flops,
             # qwen3 reused _estimate_qwen2_flops func because the only model structure diff between qwen2 dense and qwen3 dense is that
             # qwen3 has additional RMSNorm layers for q and k.
             # RMSNorm layers have minimal impact at the MFU and can be ignored.
@@ -516,6 +518,60 @@ class VeomniFlopsCounter:
         vit_flops = dense_N_flops + attn_qkv_flops
 
         return vit_flops
+
+    def _estimate_qwen3_next_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """
+        Estimate the FLOPS of the Qwen3 Next model.
+        """
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        moe_intermediate_size = self.config.moe_intermediate_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        shared_moe_intermediate_size = self.config.shared_expert_intermediate_size
+        moe_num_expert = self.config.num_experts
+        moe_topk = self.config.num_experts_per_tok
+        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+        full_attention_interval = self.config.full_attention_interval
+        linear_num_key_heads = self.config.linear_num_key_heads
+        linear_num_value_heads = self.config.linear_num_value_heads
+        linear_key_head_dim = self.config.linear_key_head_dim
+        linear_value_head_dim = self.config.linear_value_head_dim
+        linear_conv_kernel_dim = self.config.linear_conv_kernel_dim
+        linear_k_size = linear_num_key_heads * linear_key_head_dim
+        linear_v_size = linear_num_value_heads * linear_value_head_dim
+        num_full_attn_layers = num_hidden_layers // full_attention_interval
+        # moe per layer parm
+        # TopkGate layer and gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
+        moe_gata_N = hidden_size * moe_num_expert
+        moe_sharedexpertmlp_N = hidden_size * shared_moe_intermediate_size * 3
+        moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
+        moe_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N) * num_hidden_layers
+        # attn per layer parm
+        # (1 full_attention layer + 3 linear_attention layer) * (num_hidden_layers // full_attention_interval)
+        full_attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+        linear_attn_size = 2 * linear_k_size + 2 * linear_v_size + 2 * linear_num_value_heads + linear_v_size
+        conv_N = linear_conv_kernel_dim * (2 * linear_k_size + linear_v_size)
+        linear_attn_linear_N = hidden_size * linear_attn_size + conv_N
+        attn_linear_N = (full_attn_linear_N + 3 * linear_attn_linear_N) * num_full_attn_layers
+
+        # lm head param
+        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # non-attn all_layer & all_token fwd & bwd flops
+        dense_N_flops = 6 * (moe_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+        # attn all_layer & all_token fwd & bwd flops, only count full attention layers
+        seqlen_square_sum = 0
+        for seqlen in batch_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
+        # all_layer & all_token fwd & bwk flops
+        flops_all_token = dense_N_flops + attn_qkv_flops
+        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        return flops_achieved
 
     def estimate_flops(self, batch_seqlens, delta_time, **kwargs):
         """
