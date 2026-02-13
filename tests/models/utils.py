@@ -248,9 +248,13 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
     console.print(table)
 
 
-def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
+def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01, gnorm_rtol=None, gnorm_atol=None):
     base_task = next(iter(outputs_dict))
     base_output = outputs_dict[base_task]
+
+    # Use separate tolerances for gnorm if provided, otherwise fall back to loss tolerances.
+    _gnorm_rtol = gnorm_rtol if gnorm_rtol is not None else rtol
+    _gnorm_atol = gnorm_atol if gnorm_atol is not None else atol
 
     for task, output in outputs_dict.items():
         if task == base_task:
@@ -270,8 +274,8 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
             torch.testing.assert_close(
                 output["gnorm"],
                 base_output["gnorm"],
-                rtol=rtol,
-                atol=atol,
+                rtol=_gnorm_rtol,
+                atol=_gnorm_atol,
             )
         except AssertionError:
             print_all_values(outputs_dict, "gnorm")
