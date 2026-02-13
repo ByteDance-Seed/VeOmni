@@ -55,6 +55,13 @@ test_cases = [
         id="qwen3",
     ),
     pytest.param(
+        "./tests/toy_config/qwen3next_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_next",
+    ),
+    pytest.param(
         "./tests/toy_config/qwen3_moe_toy/config.json",
         True,
         0.5,
