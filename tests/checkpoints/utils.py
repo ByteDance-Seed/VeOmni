@@ -1,4 +1,3 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
 # Checkpoint trainer save/load test scripts (exec_scripts style).
 # One base_config; per-model only config_path/tokenizer_path; each model tests 3 EP cases.
 

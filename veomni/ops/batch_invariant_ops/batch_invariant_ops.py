@@ -1,3 +1,7 @@
+"""
+Copy and modified from https://github.com/thinking-machines-lab/batch_invariant_ops
+"""
+
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict

@@ -1,3 +1,7 @@
+"""
+Copy and modified from https://github.com/thinking-machines-lab/batch_invariant_ops
+"""
+
 import contextlib
 
 from ...utils.device import IS_CUDA_AVAILABLE

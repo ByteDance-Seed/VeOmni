@@ -302,10 +302,6 @@ class TrainingArguments:
     output_dir: str = field(
         metadata={"help": "Path to save model checkpoints."},
     )
-    vit_lr: float = field(
-        default=5e-5,
-        metadata={"help": "Maximum learning rate specifically for the **Vision Transformer (ViT) encoder** weights."},
-    )
     train_architecture: Literal["full", "lora"] = field(
         default="full",
         metadata={
@@ -493,6 +489,10 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
     )
+    async_enabled: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to enable async ulysses."},
+    )
     context_parallel_size: int = field(
         default=1,
         metadata={"help": "Ring-attn context parallel size."},
@@ -518,11 +518,11 @@ class TrainingArguments:
         metadata={"help": "Number of epochs between two checkpoint saves."},
     )
     hf_save_steps: int = field(
-        default=None,
+        default=0,
         metadata={"help": "Number of steps between two hf model weights save."},
     )
     hf_save_epochs: int = field(
-        default=None,
+        default=0,
         metadata={"help": "Number of epochs between two hf model weights save."},
     )
     eval_steps: int = field(
@@ -598,10 +598,6 @@ class TrainingArguments:
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
-    )
-    async_enabled: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether or not to enable async ulysses."},
     )
 
     def __post_init__(self):
