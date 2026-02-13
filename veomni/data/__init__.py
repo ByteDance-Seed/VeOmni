@@ -32,6 +32,7 @@ from .multimodal.data_collator import (
     OmniSequenceShardCollator,
 )
 from .multimodal.multimodal_chat_template import build_multimodal_chat_template
+from .simple_multisource_dataset import build_simple_multisource_dataset
 
 
 __all__ = [
@@ -51,4 +52,5 @@ __all__ = [
     "OmniDataCollatorWithPadding",
     "OmniSequenceShardCollator",
     "build_dataset",
+    "build_simple_multisource_dataset",
 ]
