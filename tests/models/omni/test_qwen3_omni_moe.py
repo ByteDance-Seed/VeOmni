@@ -390,7 +390,7 @@ def _run_fwd_bwd_comparison(test_name, dummy_data, config_path, config):
 
     Shared logic for audio-only, audio+image, and audio+video tests.
     """
-    rtol, atol = 0.5, 0.02  # MoE tolerances
+    rtol, atol = 1e-3, 1e-3  # MoE loss tolerances (tightened from 0.5/0.02)
 
     # Prepare VeOmni model modes (MoE: base eager + fused)
     _, all_veomni_modes = prepare_model_modes(is_moe=True)
@@ -438,7 +438,7 @@ def _run_fwd_bwd_comparison(test_name, dummy_data, config_path, config):
     assert len(res) == 1 + len(all_veomni_modes)
     print_all_values(res, "loss", config.model_type)
     print_all_values(res, "gnorm", config.model_type)
-    compare_multi_items(res, rtol=rtol, atol=atol)
+    compare_multi_items(res, rtol=rtol, atol=atol, gnorm_rtol=0, gnorm_atol=0)
 
     _release_device_memory()
     print_device_mem_info(f"[Memory Info] after {test_name}:")
