@@ -61,6 +61,7 @@ from veomni.distributed.sequence_parallel import (
 # Modification: use VeOmni GradientCheckpointingLayer
 from veomni.models.module_utils import GradientCheckpointingLayer
 from veomni.ops import fused_moe_forward
+from veomni.utils.device import get_device_id
 from veomni.utils.import_utils import is_torch_npu_available
 
 
@@ -632,7 +633,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
                 activation=self.activation,
-                device=torch.cuda.current_device(),
+                device=get_device_id(),
                 dtype=config.dtype if config.dtype is not None else torch.get_current_dtype(),
             )
         )
