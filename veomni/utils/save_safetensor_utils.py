@@ -190,6 +190,7 @@ def save_hf_safetensor(
     if use_distributed:
         _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
     else:
+        # Legacy path is rank-0 only
         if not is_rank_0:
             return
         _save_hf_safetensor_legacy(
