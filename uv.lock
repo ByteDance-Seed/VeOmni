@@ -491,6 +491,18 @@ wheels = [
 ]
 
 [[package]]
+name = "fla-core"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f1/de/0d6bd5664ba2e711cabdde11ccb41ddcdd866c531e40900af3601bd7b8c6/fla_core-0.4.1.tar.gz", hash = "sha256:38ab28966eeadc2141b29e87c2bf72a8a4851e00af9d25bbbc3596b1fb53450d", size = 319608, upload-time = "2025-12-24T18:07:37.669Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f6/43/945ef69eb48a14c30fd7323d3e0b560c821ae71e6d3ef979e06a901bc3b9/fla_core-0.4.1-py3-none-any.whl", hash = "sha256:93c6afe4c80fc7bc705fa8aeea6a46d2cf2d77383f9619a41863c7114c801bab", size = 437282, upload-time = "2025-12-24T18:07:34.41Z" },
+]
+
+[[package]]
 name = "flash-attn"
 version = "2.8.3+cu129torch2.9"
 source = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl" }
@@ -511,6 +523,20 @@ wheels = [
 
 [package.metadata]
 requires-dist = [{ name = "torch" }]
+
+[[package]]
+name = "flash-linear-attention"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fla-core" },
+    { name = "transformers", version = "4.57.3", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "transformers", version = "5.1.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp') or (extra == 'extra-6-veomni-gpu' and extra != 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/46/83/7d8ec7ffb5229080b1c9b772338ff588cbd63282ac355ede2a12a6e174a8/flash_linear_attention-0.4.1.tar.gz", hash = "sha256:127ee7273ed15ac17f72bcf4c75e1051719d8fbe0a2d1d047e59406f36d81ee2", size = 158280, upload-time = "2025-12-24T18:07:38.812Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/63/d5/6327559a9d5b9243b10c3984f1bcef256ed2ad06d105a3bb8f7b2979659c/flash_linear_attention-0.4.1-py3-none-any.whl", hash = "sha256:d18bdfe9d1f4b424676444eac9d50fb8433b70e5d4e0e0878b20bcbcdbea57ce", size = 287415, upload-time = "2025-12-24T18:07:35.815Z" },
+]
 
 [[package]]
 name = "frozenlist"
@@ -2819,6 +2845,7 @@ dit = [
 gpu = [
     { name = "flash-attn" },
     { name = "flash-attn-3" },
+    { name = "flash-linear-attention" },
     { name = "hf-transfer" },
     { name = "liger-kernel" },
     { name = "nvidia-cusparselt-cu12", version = "0.7.1", source = { registry = "https://pypi.org/simple" } },
@@ -2900,6 +2927,7 @@ requires-dist = [
     { name = "expecttest", marker = "extra == 'dev'", specifier = ">=0.3.0,<0.4" },
     { name = "flash-attn", marker = "extra == 'gpu'", url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl" },
     { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl" },
+    { name = "flash-linear-attention", marker = "extra == 'gpu'" },
     { name = "hf-transfer", marker = "extra == 'gpu'" },
     { name = "librosa", marker = "extra == 'audio'", specifier = ">=0.11.0,<0.12" },
     { name = "librosa", marker = "extra == 'video'", specifier = ">=0.11.0,<0.12" },
