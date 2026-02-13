@@ -449,6 +449,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable full determinism."},
     )
+    enable_batch_invariant_mode: bool = field(
+        default=False,
+        metadata={"help": "Enable batch invariant mode."},
+    )
     empty_cache_steps: int = field(
         default=500,
         metadata={"help": "Number of steps between two empty cache operations."},
