@@ -192,7 +192,9 @@ def Qwen2_5OmniPreTrainedModelForConditionalGeneration_get_rope_index(
 
                 elif min_ed == ed_video:
                     # --- Patch.1 ---
-                    if audio_seqlens[audio_idx] == 0:
+                    if audio_seqlens is None:
+                        use_audio_in_video = False
+                    elif audio_seqlens[audio_idx] == 0:
                         use_audio_in_video = False
                         audio_idx += 1
                     else:
