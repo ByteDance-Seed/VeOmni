@@ -10,7 +10,7 @@ from veomni import _safe_apply_patches
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
-from veomni.utils.device import empty_cache, get_device_type, synchronize
+from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
 from veomni.utils.loss_utils import count_loss_token
 
@@ -123,69 +123,69 @@ _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
 test_cases = [
-    # pytest.param(
-    #     "./tests/toy_config/llama31_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="llama3.1",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/qwen25_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="qwen2.5",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/qwen3_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="qwen3",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/qwen3_moe_toy",
-    #     True,
-    #     0.5,
-    #     0.02,
-    #     id="qwen3_moe",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/seed_oss_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="seed_oss",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/deepseek_v3_toy",
-    #     True,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="deepseek_v3",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/qwen2vl_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="qwen2_vl",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/qwen25vl_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="qwen2_5_vl",
-    # ),
-    # pytest.param(
-    #     "./tests/toy_config/qwen3vl_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="qwen3_vl",
-    # ),
+    pytest.param(
+        "./tests/toy_config/llama31_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="llama3.1",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen25_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2.5",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3_moe_toy",
+        True,
+        0.5,
+        0.02,
+        id="qwen3_moe",
+    ),
+    pytest.param(
+        "./tests/toy_config/seed_oss_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="seed_oss",
+    ),
+    pytest.param(
+        "./tests/toy_config/deepseek_v3_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v3",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen2vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2_vl",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen25vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2_5_vl",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_vl",
+    ),
     pytest.param(
         "./tests/toy_config/qwen25omni_toy",
         False,
@@ -223,6 +223,10 @@ def test_models_patch_fwd_bwd(
     # hf qwen2_5_omni fa3 error
     if case_id == "qwen2_5_omni":
         hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
+
+        if IS_NPU_AVAILABLE:
+            # npu not support torch.kaiser_window init in Token2WavBigVGANModel
+            return
 
     model_config = ModelArguments(config_path=config_path)
     data_config = DataArguments(train_path="")
