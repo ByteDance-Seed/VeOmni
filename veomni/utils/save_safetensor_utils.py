@@ -23,6 +23,7 @@ import torch.distributed.checkpoint as dcp
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
 from veomni.utils import helper
+from veomni.utils.device import synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
 
 
@@ -87,16 +88,6 @@ def _save_hf_safetensor_distributed(
     All ranks must call this function.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
-
-    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-
-    # Wait for any pending async DCP save to complete before starting HF safetensor save
-    if DistributedCheckpointer.dcp_save_future is not None:
-        logger.info_rank0("Waiting for pending async DCP save to complete before HF safetensor save...")
-        DistributedCheckpointer.dcp_save_future.result()
-        DistributedCheckpointer.dcp_save_future = None
-        if dist.is_initialized():
-            dist.barrier()
 
     storage_writer = HuggingFaceStorageWriter(
         path=save_path,
@@ -164,6 +155,11 @@ def save_hf_safetensor(
 ):
     """Save model weights in HuggingFace safetensors format.
 
+    This function is self-contained w.r.t. synchronization: it calls ``synchronize()`` at
+    entry to flush pending GPU operations before reading tensor data, and calls
+    ``dist.barrier()`` before returning to ensure all ranks complete the save. Callers
+    do not need to add external synchronization around this function.
+
     Supports two modes:
     - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-LoRA): Uses HuggingFaceStorageWriter
       for efficient distributed save directly from the live FSDP model. Must be called on all ranks.
@@ -185,14 +181,35 @@ def save_hf_safetensor(
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.
     """
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
     use_distributed = is_torch_version_greater_than("2.9") and train_architecture != "lora" and ckpt_manager == "dcp"
+
+    # Ensure all GPU operations are complete before reading tensor data for saving
+    synchronize()
+
+    # Wait for any pending async DCP save
+    if ckpt_manager == "dcp" and DistributedCheckpointer.dcp_save_future is not None:
+        logger.info_rank0("Waiting for pending async DCP save to complete before HF safetensor save...")
+        DistributedCheckpointer.dcp_save_future.result()
+        DistributedCheckpointer.dcp_save_future = None
+        if dist.is_initialized():
+            dist.barrier()
 
     if use_distributed:
         _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
     else:
-        # Legacy path is rank-0 only
-        if not is_rank_0:
-            return
-        _save_hf_safetensor_legacy(
-            save_checkpoint_path, save_hf_safetensor_path, model_assets, ckpt_manager, train_architecture, output_dir
-        )
+        # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
+        if is_rank_0:
+            _save_hf_safetensor_legacy(
+                save_checkpoint_path,
+                save_hf_safetensor_path,
+                model_assets,
+                ckpt_manager,
+                train_architecture,
+                output_dir,
+            )
+
+    # Ensure all ranks finish saving before anyone proceeds
+    if dist.is_initialized():
+        dist.barrier()
