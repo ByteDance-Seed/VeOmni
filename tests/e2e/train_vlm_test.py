@@ -11,6 +11,8 @@ from veomni.trainer.vlm_trainer import Arguments, VLMTrainer
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["VEOMNI_USE_LIGER_KERNEL"] = "0"
 
 
 def process_dummy_example(

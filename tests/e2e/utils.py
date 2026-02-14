@@ -166,9 +166,6 @@ def prepare_exec_cmd(
         for mode in model_modes:
             port = 12345 + random.randint(0, 100)
             command = [
-                "env",
-                "CUDA_LAUNCH_BLOCKING=1",
-                "VEOMNI_USE_LIGER_KERNEL=0",
                 "torchrun",
                 "--nnodes=1",
                 f"--nproc_per_node={mode.sp_size * 4}",
