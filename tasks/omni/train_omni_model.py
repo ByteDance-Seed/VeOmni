@@ -551,6 +551,7 @@ def main():
             train_architecture=args.train.train_architecture,
             save_checkpoint_path=save_checkpoint_path,
             output_dir=args.train.output_dir,
+            is_rank_0=args.train.global_rank == 0,
             model=model,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
