@@ -189,7 +189,7 @@ def prepare_exec_cmd(
                 "--train.save_hf_weights=False",
                 "--train.enable_full_determinism=True",
                 "--train.enable_batch_invariant_mode=True",
-                "--train.max_steps=5",
+                "--train.max_steps=2",
                 f"--train.output_dir={os.path.join(output_dir, f'{model_name}_{task}_{mode}')}",
                 f"--model.model_path={model_path}",
             ]

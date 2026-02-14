@@ -59,19 +59,17 @@ class DummyQwenVLDataset(Dataset):
         self.seq_length = seq_length
         self.vocab_size = 1024
 
-        image_token_num = 81
+        image_token_num = 4
         image_t = 2
+        video_t = 10
+        self.text_seqlen = self.seq_length - image_t * image_token_num - video_t * image_token_num
 
-        self.text_seqlen = seq_length // 4
-        video_seq_length = self.seq_length - self.text_seqlen - image_t * image_token_num
-        video_t = video_seq_length // image_token_num
-
-        self.image_size = [324 * image_t, patch_size * patch_size * 2 * 3]
-        self.image_grid_thw = torch.tensor([[1, 18, 18]] * image_t, dtype=torch.long)
+        self.image_size = [16 * image_t, patch_size * patch_size * 2 * 3]
+        self.image_grid_thw = torch.tensor([[1, 4, 4]] * image_t, dtype=torch.long)
         self.image_seqlen = image_t * image_token_num
 
-        self.video_size = [324 * video_t, patch_size * patch_size * 2 * 3]
-        self.video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
+        self.video_size = [16 * video_t, patch_size * patch_size * 2 * 3]
+        self.video_grid_thw = torch.tensor([[video_t, 4, 4]], dtype=torch.long)
         self.video_seqlen = video_t * image_token_num
 
         self.seq_length = self.text_seqlen + self.image_seqlen + self.video_seqlen
@@ -121,10 +119,10 @@ class DummyQwenOmniDataset(Dataset):
         self.seq_length = seq_length
         self.vocab_size = 1024
 
-        input_image_token_num = 81
+        input_image_token_num = 4
         input_image_t = 2
-        self.input_image_size = [324 * input_image_t, patch_size * patch_size * 2 * 3]
-        self.input_image_grid_thw = torch.tensor([[1, 18, 18]] * input_image_t, dtype=torch.long)
+        self.input_image_size = [16 * input_image_t, patch_size * patch_size * 2 * 3]
+        self.input_image_grid_thw = torch.tensor([[1, 4, 4]] * input_image_t, dtype=torch.long)
         self.input_image_seq_length = input_image_t * input_image_token_num
 
         audio_token_num = 100
@@ -136,12 +134,12 @@ class DummyQwenOmniDataset(Dataset):
 
         rest_seq_length = self.seq_length - (self.input_image_seq_length + self.input_audio_seq_length)
 
-        self.text_seq_length = rest_seq_length // 4
-        self.video_seq_length = rest_seq_length - self.text_seq_length
-        video_t = self.video_seq_length // input_image_token_num
-        self.input_video_size = [324 * video_t, patch_size * patch_size * 2 * 3]
-        self.input_video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
+        video_t = 10
+
+        self.input_video_size = [16 * video_t, patch_size * patch_size * 2 * 3]
+        self.input_video_grid_thw = torch.tensor([[video_t, 4, 4]], dtype=torch.long)
         self.video_seq_length = video_t * input_image_token_num
+        self.text_seq_length = rest_seq_length - self.video_seq_length
 
         self.seq_length = (
             self.text_seq_length + self.input_image_seq_length + self.input_audio_seq_length + self.video_seq_length
