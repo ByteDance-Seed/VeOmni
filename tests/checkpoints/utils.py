@@ -62,7 +62,7 @@ def get_checkpoint_test_command(
         f"--train.expert_parallel_size {ep_size}",
         "--train.global_batch_size 8",
         "--train.micro_batch_size 1",
-        "--train.lr 3.0e-4",
+        "--train.lr 1.0e-7",
         "--train.lr_warmup_ratio 0.007",
         "--train.lr_decay_style constant",
         "--train.lr_decay_ratio 1.0",
