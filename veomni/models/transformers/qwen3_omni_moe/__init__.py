@@ -35,8 +35,7 @@ def register_qwen3_omni_moe_modeling(architecture: str):
     )
 
     apply_veomni_qwen3_omni_moe_patch()
-    if "ForConditionalGeneration" in architecture:
-        return Qwen3OmniMoeForConditionalGeneration
+    # More specific checks must come first to avoid early match by the generic "ForConditionalGeneration"
     if "ThinkerTextModel" in architecture:
         return Qwen3OmniMoeThinkerTextModel
     if "ThinkerForConditionalGeneration" in architecture:
@@ -45,6 +44,8 @@ def register_qwen3_omni_moe_modeling(architecture: str):
         return Qwen3OmniMoeTalkerModel
     if "TalkerForConditionalGeneration" in architecture:
         return Qwen3OmniMoeTalkerForConditionalGeneration
+    if "ForConditionalGeneration" in architecture:
+        return Qwen3OmniMoeForConditionalGeneration
     return Qwen3OmniMoeForConditionalGeneration
 
 
