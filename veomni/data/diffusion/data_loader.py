@@ -23,8 +23,7 @@ from veomni.utils.device import get_device_type
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import logging
 from ..data_collator import (
-    CollatePipeline,
-    DataCollatorWithPadding,
+    MainCollator,
     MakeMicroBatchCollator,
 )
 from ..data_loader import DistributedDataloader
@@ -62,14 +61,7 @@ def build_dit_dataloader(
         f"dp_size: {parallel_state.dp_size}, sp_size: {parallel_state.sp_size}."
     )
 
-    if collate_fn is None:
-        collate_fn_list = []
-        collate_fn_list.append(DataCollatorWithPadding())
-
-        collate_fn = CollatePipeline(collate_fn_list)
-
-    if isinstance(collate_fn, list):
-        collate_fn = CollatePipeline(collate_fn)
+    collate_fn = MainCollator()
 
     collate_fn = MakeMicroBatchCollator(num_micro_batch=num_micro_batch, internal_data_collator=collate_fn)
 

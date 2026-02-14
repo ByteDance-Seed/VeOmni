@@ -18,10 +18,9 @@ import torch
 import torch.nn.functional as F
 import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 from torch import nn
-from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeModel, Qwen3MoePreTrainedModel
+from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoePreTrainedModel
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import (
     MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
@@ -31,8 +30,6 @@ from transformers.utils import (
     TransformersKwargs,
 )
 
-from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops import fused_moe_forward
 from ....utils import logging
 from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
@@ -157,77 +154,6 @@ class PatchQwen3MoeSparseMoeBlock(nn.Module):
         router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
         final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
-
-
-# ================================================================
-# PATCH: Qwen3MoeModel.forward
-# 1. Support SP
-# ================================================================
-def qwen3_moe_model_forward(
-    self: Qwen3MoeModel,
-    input_ids: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[Cache] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    use_cache: Optional[bool] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    **kwargs: Unpack[TransformersKwargs],
-) -> MoeModelOutputWithPast:
-    if (input_ids is None) ^ (inputs_embeds is not None):
-        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-    if use_cache and past_key_values is None:
-        past_key_values = DynamicCache(config=self.config)
-
-    if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids)
-
-    if cache_position is None:
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-        )
-    if position_ids is None:
-        position_ids = cache_position.unsqueeze(0)
-
-    mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
-    causal_mask = mask_function(
-        config=self.config,
-        input_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        cache_position=cache_position,
-        past_key_values=past_key_values,
-        position_ids=position_ids,
-    )
-
-    hidden_states = inputs_embeds
-
-    # create position embeddings to be shared across the decoder layers
-    position_embeddings = self.rotary_emb(hidden_states, position_ids)
-    # --- Patch.1 ---
-    sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-    # --- Patch.1 ---
-
-    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-        hidden_states = decoder_layer(
-            hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=causal_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-    hidden_states = self.norm(hidden_states)
-
-    return MoeModelOutputWithPast(  # only diff with Mistral is the output type, we need MoE
-        last_hidden_state=hidden_states,
-        past_key_values=past_key_values,
-    )
 
 
 # ================================================================
@@ -356,7 +282,6 @@ def apply_veomni_qwen3_moe_patch():
 
     hf_qwen3_moe.Qwen3MoeForCausalLM.get_parallel_plan = lambda self: get_parallel_plan()
 
-    hf_qwen3_moe.Qwen3MoeModel.forward = qwen3_moe_model_forward
     hf_qwen3_moe.Qwen3MoeForCausalLM.forward = qwen3_moe_forcausal_lm_forward
     hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = qwen3_moe_pretrained_model_init_weights
 

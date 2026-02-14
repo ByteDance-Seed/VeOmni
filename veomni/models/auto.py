@@ -42,11 +42,11 @@ def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
 
 
-def build_processor(processor_path: str) -> "ProcessorMixin":
+def build_processor(processor_path: str, **kwargs) -> "ProcessorMixin":
     """
     Builds the processor.
     """
-    return get_model_processor(processor_path, padding_side="right", trust_remote_code=True)
+    return get_model_processor(processor_path, padding_side="right", trust_remote_code=True, **kwargs)
 
 
 def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":

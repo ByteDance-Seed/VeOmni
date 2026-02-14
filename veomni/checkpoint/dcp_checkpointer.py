@@ -1,5 +1,21 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import gc
 import os
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -9,16 +25,15 @@ from torch.distributed._tensor import DeviceMesh, DTensor, Shard
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
+    load,
 )
-from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
-from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
@@ -254,7 +269,7 @@ class DistributedCheckpointer(CheckpointerBase):
     Distributed checkpointer for torch.distributed.checkpoint
     """
 
-    dcp_save_future: Optional[Any] = None
+    save_future: Optional[Any] = None
     # Dedicated process group for async saves (created on first use)
     _async_process_group: Optional[Any] = None
 
@@ -359,14 +374,14 @@ class DistributedCheckpointer(CheckpointerBase):
             if cls._async_process_group is None:
                 cls._async_process_group = dist.new_group(backend="gloo")
 
-            if cls.dcp_save_future is not None:
+            if cls.save_future is not None:
                 logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-                cls.dcp_save_future.result()
-                cls.dcp_save_future = None
+                cls.save_future.result()
+                cls.save_future = None
                 # block until all the ranks resolve their previous dcp async saving
                 dist.barrier()
 
-            cls.dcp_save_future = dcp.async_save(
+            cls.save_future = dcp.async_save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
                 process_group=cls._async_process_group,
@@ -431,6 +446,184 @@ class DistributedCheckpointer(CheckpointerBase):
         state["extra_state"] = torch.load(extra_state_path, weights_only=False)
 
 
+def get_dtype_size(dtype: torch.dtype) -> int:
+    """Return size in bytes for a given dtype."""
+    size_map = {
+        torch.float32: 4,
+        torch.float16: 2,
+        torch.bfloat16: 2,
+        torch.int64: 8,
+        torch.int32: 4,
+        torch.int16: 2,
+        torch.int8: 1,
+        torch.uint8: 1,
+        torch.bool: 1,
+    }
+    return size_map.get(dtype, 4)
+
+
+def _normalize_key(key: str) -> Optional[str]:
+    """
+    Convert DCP key to HuggingFace format. Returns None for non-model weights.
+
+    Conversion rules:
+    - "model.model.*" -> "model.*" (remove first "model." prefix)
+    - "model.lm_head.weight" -> "lm_head.weight" (special case)
+    - Other "model.*" keys -> log warning and strip "model." prefix
+    """
+    if not key.startswith("model."):
+        return None
+
+    if key.startswith("model.model."):
+        # Standard case: model.model.* -> model.*
+        return key[6:]  # Remove first "model." prefix
+    elif key == "model.lm_head.weight":
+        # Special case: model.lm_head.weight -> lm_head.weight
+        return "lm_head.weight"
+    else:
+        # Other keys with single "model." prefix - log and strip prefix
+        logger.warning(
+            f"Found key with single 'model.' prefix that doesn't match expected patterns: '{key}'. "
+            f"Converting to '{key[6:]}' by stripping 'model.' prefix."
+        )
+        return key[6:]
+
+
+def _get_sharding_plan(
+    checkpoint_path: Union[str, os.PathLike],
+    shard_size: int = None,
+    save_dtype: Optional[Union[str, torch.dtype]] = None,
+):
+    """
+    Create sharding plan from checkpoint metadata without loading weights.
+
+    Returns:
+        shards: List of {hf_key: dcp_key} dicts per shard
+        total_size: Total size in bytes
+        all_dcp_keys: All valid DCP model keys
+    """
+    reader = FileSystemReader(checkpoint_path)
+    metadata = reader.read_metadata()
+
+    if not isinstance(metadata, Metadata):
+        raise ValueError(f"Invalid metadata format in {checkpoint_path}")
+
+    # Collect model tensors and calculate sizes
+    tensor_infos = []
+    all_dcp_keys = []
+
+    for key, tensor_meta in metadata.state_dict_metadata.items():
+        hf_key = _normalize_key(key)
+        if hf_key:
+            # Determine dtype for size calculation
+            if save_dtype:
+                dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
+            else:
+                if not hasattr(tensor_meta.properties, "dtype"):
+                    raise ValueError(
+                        f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
+                    )
+                dtype = tensor_meta.properties.dtype
+
+            # Calculate tensor size in bytes
+            numel = 1
+            for dim in tensor_meta.size:
+                numel *= dim
+
+            byte_size = numel * get_dtype_size(dtype)
+
+            tensor_infos.append({"dcp_key": key, "hf_key": hf_key, "size": byte_size, "metadata": tensor_meta})
+            all_dcp_keys.append(key)
+
+    # Sort by key name for deterministic output
+    tensor_infos.sort(key=lambda x: x["hf_key"])
+
+    # Pack tensors into shards
+    shards = []
+    current_shard = {}
+    current_shard_size = 0
+    total_size = 0
+
+    for info in tensor_infos:
+        size = info["size"]
+        total_size += size
+
+        # Start new shard if adding this tensor exceeds shard_size (unless current shard is empty)
+        if shard_size is not None and current_shard and (current_shard_size + size > shard_size):
+            shards.append(current_shard)
+            current_shard = {}
+            current_shard_size = 0
+
+        current_shard[info["hf_key"]] = info["dcp_key"]
+        current_shard_size += size
+
+    if current_shard:
+        shards.append(current_shard)
+    if shard_size is None:
+        assert len(shards) == 1, "Shard size None should result in a single shard"
+        shards = shards[0]
+    return shards, total_size, all_dcp_keys
+
+
+def _process_shard(
+    shard_keys: Dict[str, str],
+    checkpoint_path: str,
+    save_dtype: Optional[Union[str, torch.dtype]] = None,
+) -> str:
+    reader = FileSystemReader(checkpoint_path)
+    metadata = reader.read_metadata()
+
+    state_dict = OrderedDict()
+    dcp_keys_to_load = list(shard_keys.values())
+
+    for dcp_key in dcp_keys_to_load:
+        tensor_metadata = metadata.state_dict_metadata[dcp_key]
+        if not hasattr(tensor_metadata.properties, "dtype"):
+            raise ValueError(
+                f"Cannot determine dtype for tensor '{dcp_key}': metadata does not contain dtype information"
+            )
+        state_dict[dcp_key] = torch.empty(
+            tensor_metadata.size,
+            dtype=tensor_metadata.properties.dtype,
+        )
+
+    # Load partial checkpoint
+    load(
+        state_dict,
+        checkpoint_id=checkpoint_path,
+        storage_reader=FileSystemReader(checkpoint_path),
+        no_dist=True,
+    )
+
+    # Cast and rename tensors
+    processed_dict = OrderedDict()
+    target_dtype = None
+    if save_dtype:
+        target_dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
+
+    for hf_key, dcp_key in shard_keys.items():
+        tensor = state_dict[dcp_key]
+
+        if hasattr(tensor, "full_tensor"):
+            tensor = tensor.full_tensor()
+
+        if target_dtype:
+            tensor = tensor.to(dtype=target_dtype)
+
+        # Explicitly move to CPU and detach to avoid memory retention
+        processed_dict[hf_key] = tensor.cpu().detach().clone()
+        # Delete the original tensor immediately
+        del tensor
+
+    # Clean up state_dict and force garbage collection
+    del state_dict
+    del metadata
+    del reader
+    gc.collect()
+    empty_cache()
+    return processed_dict
+
+
 def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> STATE_DICT_TYPE:
     """
     Given a directory containing a DCP checkpoint, this function will convert it into a
@@ -442,18 +635,8 @@ def dcp_to_torch_state_dict(save_checkpoint_path: Union[str, os.PathLike]) -> ST
     .. warning::
         To avoid OOM, it's recommended to only run this function on a single rank.
     """
+    shard, _, _ = _get_sharding_plan(save_checkpoint_path)
 
-    # Load the state_dict from the DCP checkpoint
-    state_dict: STATE_DICT_TYPE = {}
+    processed_dict = _process_shard(shard, save_checkpoint_path)
 
-    _load_state_dict(
-        state_dict,
-        storage_reader=FileSystemReader(save_checkpoint_path),
-        planner=_EmptyStateDictLoadPlanner(),
-        no_dist=True,
-    )
-    if "state" in state_dict:
-        # this happens when the model state dicts are flatten during saving
-        state_dict = state_dict["state"]
-
-    return state_dict["model"]
+    return processed_dict

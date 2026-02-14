@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from transformers.generation import GenerationMixin
 
-from .....data.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from .....utils.constants import AUDIO_INPUT_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....transformers.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniPreTrainedModelForConditionalGeneration,
     Qwen2_5OmniThinkerCausalLMOutputWithPast,

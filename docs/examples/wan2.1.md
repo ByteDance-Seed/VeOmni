@@ -23,14 +23,14 @@ You can adjust parameter **num_files and video specifications (T, H, W)** in the
 ## Start training on GPU
 
 ```shell
-bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \
+bash train.sh tasks/dit/train_wan.py configs/dit/wan_sft.yaml \
     --model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer
 ```
 
 ## Start training on NPU
 
 ```shell
-bash train.sh tasks/omni/train_wan.py configs/dit/wan_sft.yaml \
+bash train.sh tasks/dit/train_wan.py configs/dit/wan_sft.yaml \
     --model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer \
     --train.init_device npu
 ```

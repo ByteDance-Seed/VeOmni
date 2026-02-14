@@ -49,7 +49,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling
 from transformers.utils.generic import check_model_inputs
 
-from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -59,6 +58,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....ops import fused_moe_forward
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from ....utils.device import is_torch_npu_available
 from ..attention_utils import VARLEN_ATTENTION_TYPES
@@ -716,9 +716,6 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
             if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()
             # --- Patch.6 ---
-
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
 
         # --- Patch.7 ---
         kwargs.update(text_flash_attn_kwargs)

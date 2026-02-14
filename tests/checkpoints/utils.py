@@ -1,4 +1,3 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
 # Checkpoint trainer save/load test scripts (exec_scripts style).
 # One base_config; per-model only config_path/tokenizer_path; each model tests 3 EP cases.
 
@@ -62,10 +61,7 @@ def get_checkpoint_test_command(
         f"--train.expert_parallel_size {ep_size}",
         "--train.global_batch_size 8",
         "--train.micro_batch_size 1",
-        "--train.rmpad false",
-        "--train.rmpad_with_pos_ids true",
-        "--train.dyn_bsz_margin 0",
-        "--train.lr 3.0e-4",
+        "--train.lr 1e-7",
         "--train.lr_warmup_ratio 0.007",
         "--train.lr_decay_style constant",
         "--train.lr_decay_ratio 1.0",

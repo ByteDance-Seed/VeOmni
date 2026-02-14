@@ -52,7 +52,6 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
-from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -66,6 +65,7 @@ from ....distributed.sequence_parallel.async_ulysses import (
     async_ulysses_qkv_projection,
 )
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -199,6 +199,11 @@ class Qwen3VLTextAttention(_Qwen3VLTextAttention):
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
+
+        # TODO: check this, wehther we need to unpad sp padding?
+        cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
+        sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
+
         query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -616,11 +621,13 @@ class Qwen3VLModel(_Qwen3VLModel):
         image_mask = kwargs.get("image_mask", None)
         video_mask = kwargs.get("video_mask", None)
 
-        # if None, all gather sp group input_ids and calculate mask
+        # if None, calculate mask
         if video_mask is None and image_mask is None:
-            input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
-            dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-            image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=0))
+            if get_parallel_state().sp_enabled:
+                input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+                dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+                input_ids = torch.cat(input_ids_list, dim=0)
+            image_mask, video_mask = self.get_placeholder_mask(input_ids)
         # --- Patch.3 ---
 
         # --- Patch.6 ---
@@ -833,9 +840,6 @@ class Qwen3VLModel(_Qwen3VLModel):
             if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()
             # --- Patch.5 ---
-
-        if get_parallel_state().sp_enabled and not get_parallel_state().async_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
 
         # --- Patch.6 ---
         kwargs.update(flash_attn_kwargs)

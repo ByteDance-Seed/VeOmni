@@ -21,7 +21,6 @@ from veomni.data import (
     build_dataset,
     build_multimodal_chat_template,
 )
-from veomni.data.constants import IGNORE_INDEX
 from veomni.data.multimodal.multimodal_transform import encode_multimodal_sample
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -31,6 +30,7 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
@@ -260,7 +260,6 @@ def main():
         dyn_bsz=args.train.dyn_bsz,
         pad_packed_to_length=args.train.pad_packed_to_length,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
