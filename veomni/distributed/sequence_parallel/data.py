@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from ...data.constants import IGNORE_INDEX
 from ...distributed.parallel_state import get_parallel_state
+from ...utils.constants import IGNORE_INDEX
 from .comm import get_ulysses_sequence_parallel_group, get_unified_sequence_parallel_group
 from .ulysses import _Gather, _Slice
 from .utils import pad_tensor, unpadding_tensor_for_seqeunce_parallel

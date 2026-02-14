@@ -91,10 +91,11 @@ def _save_hf_safetensor_distributed(
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
     # Wait for any pending async DCP save to complete before starting HF safetensor save
-    if DistributedCheckpointer.dcp_save_future is not None:
+    # TODO: maybe use other async checkpointer besides DCP
+    if DistributedCheckpointer.save_future is not None:
         logger.info_rank0("Waiting for pending async DCP save to complete before HF safetensor save...")
-        DistributedCheckpointer.dcp_save_future.result()
-        DistributedCheckpointer.dcp_save_future = None
+        DistributedCheckpointer.save_future.result()
+        DistributedCheckpointer.save_future = None
         if dist.is_initialized():
             dist.barrier()
 

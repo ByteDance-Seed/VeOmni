@@ -18,13 +18,14 @@ Utilities for verifying checkpoint conversions between DCP and HuggingFace forma
 """
 
 import json
-import logging
 import os
 from typing import Dict, Optional
 
 import torch
 from torch.distributed.checkpoint import FileSystemReader, load
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME
+
+from veomni.utils import logging
 
 
 try:
@@ -34,14 +35,7 @@ try:
 except ImportError:
     SAFETENSORS_AVAILABLE = False
 
-
-# Setup logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 
 def _normalize_key(key: str) -> Optional[str]:
@@ -245,9 +239,9 @@ def verify_hf_checkpoint_weights(
             extra_keys = loaded_keys - original_keys
             logger.error("Key mismatch detected!")
             if missing_keys:
-                logger.error(f"Missing keys ({len(missing_keys)}): {sorted(missing_keys)[:10]}...")
+                logger.error(f"Missing keys ({len(missing_keys)}): {sorted(missing_keys)}")
             if extra_keys:
-                logger.error(f"Extra keys ({len(extra_keys)}): {sorted(extra_keys)[:10]}...")
+                logger.error(f"Extra keys ({len(extra_keys)}): {sorted(extra_keys)}")
             return False
 
         logger.info(f"✓ All {len(original_keys)} keys match between original and loaded checkpoints")
@@ -274,13 +268,19 @@ def verify_hf_checkpoint_weights(
             try:
                 torch.testing.assert_close(original_tensor.cpu(), loaded_tensor.cpu(), rtol=0, atol=0)
             except AssertionError:
-                diff = (original_tensor.cpu().float() - loaded_tensor.cpu().float()).abs().max().item()
-                mismatches.append((key, diff))
-                logger.warning(f"Value mismatch for key '{key}', max diff: {diff}")
+                orig_cpu = original_tensor.cpu().float()
+                load_cpu = loaded_tensor.cpu().float()
+                diff = (orig_cpu - load_cpu).abs()
+                max_diff = diff.max().item()
+                mismatches.append((key, max_diff))
+                logger.warning(f"Value mismatch for key '{key}', max diff: {max_diff}")
+                logger.warning(f"  original tensor: {original_tensor.cpu()}")
+                logger.warning(f"  loaded   tensor: {loaded_tensor.cpu()}")
+                logger.warning(f"  abs diff       : {diff}")
 
         if mismatches:
             logger.error(f"Found {len(mismatches)} tensor(s) with value mismatches:")
-            for key, max_diff in mismatches[:10]:  # Show first 10
+            for key, max_diff in mismatches:
                 logger.error(f"  - {key}: max_diff={max_diff}")
             return False
 

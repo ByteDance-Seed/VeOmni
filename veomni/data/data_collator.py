@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data._utils.collate import default_collate
+from transformers.modeling_outputs import ModelOutput
 
 from ..distributed.parallel_state import get_parallel_state
-from ..utils.seqlen_pos_transform_utils import len2culen, pos2culen, prepare_fa_kwargs_from_position_ids
-from .constants import IGNORE_INDEX
+from ..distributed.sequence_parallel import gather_outputs
+from ..utils import logging
+from ..utils.constants import IGNORE_INDEX, MODALITY
+from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+
+
+logger = logging.get_logger(__name__)
 
 
 def add_flash_attention_kwargs_from_position_ids(
@@ -47,9 +51,10 @@ def add_flash_attention_kwargs_from_position_ids(
     Returns:
         Tuple of (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k) for additional use.
     """
-    (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-        batch["position_ids"]
-    )
+    position_ids = batch["position_ids"]
+    if position_ids.dim() == 3:  # bs, dim, seq_len
+        position_ids = position_ids[:, 0, :]
+    (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(position_ids)
 
     batch["cu_seq_lens_q"] = cu_seq_lens_q
     batch["cu_seq_lens_k"] = cu_seq_lens_k
@@ -57,6 +62,53 @@ def add_flash_attention_kwargs_from_position_ids(
     batch["max_length_k"] = max_length_k
 
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
+
+
+@dataclass
+class DataCollateInfo:
+    pack_dim: int = field(
+        default=0,
+        metadata={"help": "Dim to pack in batch. Default is 0. If -1, pack in last dim and unsqueeze(0)"},
+    )
+    sp_slice: bool = field(
+        default=False,
+        metadata={"help": "Whether to sp slice in batch. Default is False"},
+    )
+    sp_pad_value: int = field(
+        default=None,
+        metadata={"help": "sp_pad value of a sequence in batch. concat instead of pad if None. Default is None"},
+    )
+    sp_pad_scale: int = field(
+        default=1,
+        metadata={"help": "sp_pad scale of a sequence in batch. Default is 1"},
+    )
+
+    def __post_init__(self):
+        assert self.pack_dim is not None, "pack_dim must be specified"
+        if self.sp_slice:
+            assert self.sp_pad_value is not None and self.sp_pad_scale is not None, (
+                "sp_pad_value and sp_pad_scale must be specified when sp_slice is True"
+            )
+
+        assert (self.sp_pad_value is None) == (self.sp_pad_scale is None), (
+            "sp_pad_value and sp_pad_scale must be specified together or None"
+        )
+
+
+# pack_dim, sp_slice, sp_pad_value, sp_pad_scale
+DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
+    "input_ids": DataCollateInfo(-1, True, 0, 1),
+    "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "attention_mask": DataCollateInfo(-1, False, 1, 1),
+    "position_ids": DataCollateInfo(-1, False, 0, 1),
+    "pixel_values": DataCollateInfo(0, True, 0, 4),
+    "pixel_values_videos": DataCollateInfo(0, True, 0, 4),
+    "image_mask": DataCollateInfo(-1, False, 0, 1),
+    "video_mask": DataCollateInfo(-1, False, 0, 1),
+    "image_grid_hw": DataCollateInfo(0, False, None, None),
+    "image_grid_thw": DataCollateInfo(0, False, None, None),
+    "video_grid_thw": DataCollateInfo(0, False, None, None),
+}
 
 
 @dataclass
@@ -73,179 +125,10 @@ class DataCollator(ABC):
         ...
 
 
-class CollatePipeline:
-    def __init__(self, data_collators: Optional[Union[Callable, List[Callable]]] = None):
-        """
-        Args:
-            data_collators: a list of data collators or a single data collator
-        """
-
-        if not isinstance(data_collators, (list, tuple)):
-            data_collators = [data_collators]
-        self.data_collators = data_collators
-
-    def __call__(self, batch: Sequence[Dict[str, Any]]):
-        """
-        process data batch through data collators.
-
-        Args:
-            batch: the original input data batch
-
-        Returns:
-            batch: the processed data batch
-
-        """
-        for data_collator in self.data_collators:
-            batch = data_collator(batch)
-        return batch
-
-
-@dataclass
-class DataCollatorWithPadding(DataCollator):
-    """
-    Data collator with padding.
-    """
-
-    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
-        batch = defaultdict(list)
-
-        # batching features
-        for feature in features:
-            for key in feature.keys():
-                batch[key].append(feature[key])
-
-        for key in batch.keys():
-            # process padding features
-            if key in ["input_ids", "attention_mask", "position_ids", "images_seq_mask"]:
-                batch[key] = pad_sequence(batch[key], batch_first=True, padding_value=0)
-            elif key in ["labels", "labels_image"]:
-                batch[key] = pad_sequence(batch[key], batch_first=True, padding_value=IGNORE_INDEX)
-            else:
-                batch[key] = default_collate(batch[key])
-
-        return batch
-
-
-@dataclass
-class DataCollatorWithPacking(DataCollator):
-    """
-    Data collator with packing.
-    """
-
-    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
-        seqlens = torch.tensor([len(feature["input_ids"]) for feature in features], dtype=torch.long)
-        batch = {"cu_seqlens": len2culen(seqlens)}
-        for input_name in features[0].keys():
-            if input_name in ("input_ids", "attention_mask", "labels"):
-                batch[input_name] = torch.cat([feature[input_name] for feature in features])
-            else:
-                batch[input_name] = default_collate([feature[input_name] for feature in features])
-
-        return batch
-
-
-@dataclass
-class DataCollatorWithPositionIDs(DataCollator):
-    """
-    Data collator with packing by position ids.
-
-    Args:
-        mask_boundary_labels:
-            If True, mask labels at packed subsequence boundary token positions (default behavior).
-            Turn it off for sequence classification tasks.
-    """
-
-    mask_boundary_labels: bool = True
-
-    def __post_init__(self):
-        self.sp_enabled = get_parallel_state().sp_enabled
-
-    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
-        batch = {}
-        for input_name in features[0].keys():
-            if input_name in ("input_ids", "attention_mask", "labels", "position_ids"):
-                batch[input_name] = torch.cat([feature[input_name] for feature in features], dim=-1).unsqueeze(0)
-            else:
-                batch[input_name] = default_collate([feature[input_name] for feature in features])
-
-        if "position_ids" not in batch:
-            batch["position_ids"] = torch.cat(
-                [torch.arange(len(feature["input_ids"])) for feature in features]
-            ).unsqueeze(0)
-
-        # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
-        if not self.sp_enabled:
-            # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
-            # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
-            cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
-        else:
-            # Still need cu_seq_lens_q for label masking even when sp_enabled.
-            # Flash-attn kwargs are injected later in TextSequenceShardCollator after SP padding/slicing.
-            (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
-
-        if self.mask_boundary_labels and "labels" in batch:
-            batch["labels"][:, cu_seq_lens_q[1:-1]] = IGNORE_INDEX
-
-        return batch
-
-
-@dataclass
-class DataCollatorWithPositionIDsAndPadding(DataCollator):
-    """
-    Data collator with packing by position ids and fixed-length padding.
-
-    Padding values are fixed to avoid config drift:
-    - input_ids: 0
-    - labels: IGNORE_INDEX
-    - position_ids: 0
-    - attention_mask: 1
-    """
-
-    pad_to_length: int
-    position_id_pad_value: int = 0
-    attention_mask_pad_value: int = 1
-
-    def __post_init__(self):
-        self.base_collator = DataCollatorWithPositionIDs()
-
-    def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
-        batch = self.base_collator(features)
-        seq_len = batch["input_ids"].shape[-1]
-        assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
-
-        pad_len = self.pad_to_length - seq_len
-        if pad_len == 0:
-            return batch
-
-        def pad_last_dim(tensor: "torch.Tensor", pad_value: int) -> "torch.Tensor":
-            pad_shape = list(tensor.shape)
-            pad_shape[-1] = pad_len
-            pad = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
-            return torch.cat([tensor, pad], dim=-1)
-
-        batch["input_ids"] = pad_last_dim(batch["input_ids"], 0)
-        if "attention_mask" in batch:
-            batch["attention_mask"] = pad_last_dim(batch["attention_mask"], self.attention_mask_pad_value)
-        if "labels" in batch:
-            batch["labels"] = pad_last_dim(batch["labels"], IGNORE_INDEX)
-        if "position_ids" in batch:
-            pad_shape = list(batch["position_ids"].shape)
-            pad_shape[-1] = pad_len
-            pad = torch.arange(pad_len, device=batch["position_ids"].device, dtype=batch["position_ids"].dtype)
-            pad = pad.expand(pad_shape)
-            batch["position_ids"] = torch.cat([batch["position_ids"], pad], dim=-1)
-
-        # Update flash-attn kwargs to match the padded length.
-        if "position_ids" in batch and not self.base_collator.sp_enabled:
-            add_flash_attention_kwargs_from_position_ids(batch)
-
-        return batch
-
-
 @dataclass
 class NoopDataCollator(DataCollator):
     """
-    Data collator with no operation, used in dynamic batch dataloader at main process.
+    Data collator with no operation, used when collating in preforward.
     """
 
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> List[Dict[str, "torch.Tensor"]]:
@@ -255,7 +138,7 @@ class NoopDataCollator(DataCollator):
 @dataclass
 class UnpackDataCollator(DataCollator):
     """
-    Data collator to unpack examples, used in dynamic batch dataloader at worker process.
+    Data collator to unpack examples, used in dynamic batch dataloader.
     """
 
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
@@ -284,124 +167,296 @@ class MakeMicroBatchCollator(DataCollator):
 
 
 @dataclass
-class TextSequenceShardCollator(DataCollator):
-    """
-    Data collator to chunk inputs according to sequence parallelism.
-    Args:
-        rmpad: whether the samples is packing or not.
-        rmpad_with_pos_ids: whether the samples is packing by position ids or not.
-        pad_token_id: the id of the padding token.
-        shift_labels:
-            If true, shift labels so that each token is trained to predict the next token (default behavior).
-            Turn it off for sequence classification token-level labels.
-        mask_boundary_labels:
-            If True, mask labels at packed subsequence boundary token positions (default behavior).
-            Turn it off for sequence classification token-level labels.
-    """
+class PrecomputePositionIDsCollator(DataCollator):
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        for feature in features:
+            if "position_ids" not in feature:
+                # default position_ids is 0 ~ seq_len - 1 for text models
+                feature["position_ids"] = torch.arange(feature["input_ids"].size(-1), dtype=torch.int64)
+        return features
 
-    rmpad: bool
-    rmpad_with_pos_ids: bool
-    pad_token_id: int = 0
 
-    shift_labels: bool = True
-    mask_boundary_labels: bool = True
+@dataclass
+class PackingCollator(DataCollator):
+    collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
+    pad_to_length: int = False
+    seq_classification: bool = (
+        False  # whether the training task is sequence classification, if true, do not mask boundary labels
+    )
+
+    def __post_init__(self):
+        self.sp_enabled = get_parallel_state().sp_enabled
+
+    def pad_feature_to_length(
+        self,
+        feature: Union[torch.Tensor, List[torch.Tensor]],
+        dim: int = -1,
+        pad_value: int = 0,
+        pad_size: int = 0,
+    ) -> torch.Tensor:
+        pad_shape = list(feature.shape)
+        pad_shape[dim] = pad_size
+        pad = torch.full(pad_shape, fill_value=pad_value, dtype=feature.dtype, device=feature.device)
+        return torch.cat((feature, pad), dim=dim)
+
+    def pad_batch_to_length(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        seq_len = batch["input_ids"].shape[-1]
+        assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
+
+        pad_len = self.pad_to_length - seq_len
+        if pad_len == 0:
+            return batch
+
+        keys_to_pad = ["input_ids", "attention_mask", "labels", "position_ids"]
+        for key in keys_to_pad:
+            if key in batch:
+                batch[key] = self.pad_feature_to_length(
+                    batch[key],
+                    dim=self.collate_infos[key].pack_dim,
+                    pad_value=self.collate_infos[key].sp_pad_value,
+                    pad_size=pad_len,
+                )
+        return batch
+
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        batch = defaultdict(list)
+        for feature in features:
+            for key in feature.keys():
+                batch[key].append(feature[key])
+
+        for key in batch.keys():
+            collate_info: DataCollateInfo = self.collate_infos.get(key, None)
+            if collate_info is None:
+                try:
+                    if key.split("_")[0] in MODALITY:
+                        batch[key] = torch.cat(batch[key], dim=0)
+                    else:
+                        batch[key] = default_collate(batch[key])
+                except Exception:
+                    # use List of tensor, for example: num, height, width, c in different resolution
+                    pass
+            else:
+                pack_dim = collate_info.pack_dim
+
+                # first token of packed sequence must be IGNORE_INDEX
+                if key == "labels" and not self.seq_classification:
+                    for i in range(1, len(batch[key])):
+                        batch[key][i][0] = IGNORE_INDEX
+
+                batch[key] = torch.cat(batch[key], dim=pack_dim)
+                if pack_dim == -1:
+                    batch[key] = batch[key].unsqueeze(0)
+
+        if self.pad_to_length:
+            batch = self.pad_batch_to_length(batch)
+
+        if not self.sp_enabled:
+            add_flash_attention_kwargs_from_position_ids(batch)
+        return batch
+
+
+@dataclass
+class SequenceParallelCollator(DataCollator):
+    collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
+    seq_classification: bool = (
+        False  # whether the training task is sequence classification, if true, do not shift labels
+    )
 
     def __post_init__(self):
         self.sp_size = get_parallel_state().sp_size
         self.sp_rank = get_parallel_state().sp_rank
 
-    def sp_slice(self, tensor: "torch.Tensor", dim: int = -1) -> "torch.Tensor":
-        """
-        Slices a tensor along the specified dimension for sequence parallelism.
-        """
-        seq_length = tensor.size(dim)
-        sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
-        return tensor.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
+    def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if isinstance(feature, list):
+            assert dim == 0, f"Only support dim=0 for {key} as it is a List"
+            seq_length = len(feature)
+            sp_chunk_size = seq_length // self.sp_size
+            return feature[self.sp_rank * sp_chunk_size : (self.sp_rank + 1) * sp_chunk_size]
+        else:
+            seq_length = feature.size(dim)
+            sp_chunk_size = seq_length // self.sp_size
+            return feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
 
     def sp_padding(
-        self, tensor: "torch.Tensor", dim: int = -1, pad_value: int = 0, pad_length: int = 0, sequential: bool = False
-    ) -> "torch.Tensor":
-        """
-        Pads a tensor with pad_length to aligns tensor with sp size.
-        """
-        if pad_length == 0:
-            return tensor
-
-        pad_shape = list(tensor.shape)
-        pad_shape[dim] = pad_length
-        # For position_ids to create one single sequence for all padded tokens
-        if sequential:
-            # seq: [pad_length]
-            seq = torch.arange(pad_length, device=tensor.device, dtype=tensor.dtype)
-
-            # We want to broadcast seq along every dimension except `dim`.
-            # view_shape: [1, 1, ..., pad_length(at dim), ..., 1]  (ndim entries)
-            view_shape = [1] * tensor.ndim
-            view_shape[dim] = pad_length
-
-            # seq.view(view_shape): [1, 1, ..., pad_length, ..., 1]
-            # expand to pad_shape:   [s0, s1, ..., pad_length, ..., s{n-1}]
-            pad = seq.view(view_shape).expand(pad_shape)
+        self,
+        key: str,
+        feature: Union[torch.Tensor, List[torch.Tensor]],
+        dim: int = -1,
+        pad_value: int = 0,
+        pad_scale: int = 1,
+    ) -> torch.Tensor:
+        if isinstance(feature, List):
+            assert dim == 0, f"Only support dim=0 for {key} as {key} is a List of Tensor"
+            seq_length = len(feature)
         else:
-            pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
-        return torch.cat((tensor, pad), dim=dim)
+            seq_length = feature.size(dim)
 
-    def __call__(self, batch: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
-        input_ids = batch.pop("input_ids")
-        if self.shift_labels:
-            labels = batch.pop("labels")[..., 1:].contiguous()  # shift labels
+        scale_sp_size = self.sp_size * pad_scale
+        sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
+        pad_size = sp_chunk_size * scale_sp_size - seq_length
+        if pad_size == 0:
+            return feature
+
+        if isinstance(feature, List):
+            # if feature is uncatable, pad pad_size num feature[-1] to the List
+            feature += [feature[-1]] * pad_size
+            return feature
+        else:
+            pad_shape = list(feature.shape)
+            pad_shape[dim] = pad_size
+            pad = torch.full(pad_shape, fill_value=pad_value, dtype=feature.dtype, device=feature.device)
+            return torch.cat((feature, pad), dim=dim)
+
+    def __call__(self, batch: Dict[str, Union[torch.Tensor, List[torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        if not self.seq_classification:
+            # shift labels
+            labels = batch["labels"][..., 1:].contiguous()
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
-        else:
-            labels = batch.pop("labels").contiguous()
+            batch["labels"] = labels
 
-        if self.mask_boundary_labels:
-            if self.rmpad_with_pos_ids:  # mask the last token of each sequence
-                cu_seqlens = pos2culen(batch["position_ids"])
-                labels[:, cu_seqlens[1:-1] - 1] = IGNORE_INDEX
-            elif self.rmpad:
-                labels = labels.view(-1)
-                labels[batch["cu_seqlens"][1:-1] - 1] = IGNORE_INDEX
-            else:
-                if "position_ids" not in batch:  # we should calculate the position ids before chunking
-                    batch["position_ids"] = torch.arange(0, input_ids.size(-1)).unsqueeze(0)
-        else:
-            if (not self.rmpad_with_pos_ids) and (not self.rmpad) and ("position_ids" not in batch):
-                batch["position_ids"] = torch.arange(0, input_ids.size(-1), device=input_ids.device).unsqueeze(0)
-
-        # sp padding
-        seq_length = input_ids.size(-1)
-        sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
-        pad_length = sp_chunk_size * self.sp_size - seq_length
-
-        input_ids = self.sp_padding(input_ids, dim=-1, pad_value=self.pad_token_id, pad_length=pad_length)
-        labels = self.sp_padding(labels, dim=-1, pad_value=IGNORE_INDEX, pad_length=pad_length)
-
-        if self.rmpad_with_pos_ids:
-            batch["attention_mask"] = self.sp_padding(
-                batch["attention_mask"], dim=-1, pad_value=1, pad_length=pad_length
-            )
-        else:
-            batch["attention_mask"] = self.sp_padding(
-                batch["attention_mask"], dim=-1, pad_value=0, pad_length=pad_length
-            )
-
-        if self.rmpad:
-            if pad_length > 0:
-                batch["cu_seqlens"] = F.pad(
-                    batch["cu_seqlens"], (0, 1), "constant", batch["cu_seqlens"][-1].item() + pad_length
+        for key in batch.keys():
+            collate_info: DataCollateInfo = self.collate_infos.get(key, None)
+            if collate_info is None:
+                continue
+            pack_dim = collate_info.pack_dim
+            sp_slice = collate_info.sp_slice
+            sp_pad_value = collate_info.sp_pad_value
+            sp_pad_scale = collate_info.sp_pad_scale
+            if sp_pad_value is not None:
+                # sp padding
+                batch[key] = self.sp_padding(
+                    key,
+                    batch[key],
+                    dim=pack_dim,
+                    pad_value=sp_pad_value,
+                    pad_scale=sp_pad_scale,
                 )
-        else:
-            # For position_ids to create one single sequence for all padded tokens by pass sequential=True
-            batch["position_ids"] = self.sp_padding(
-                batch["position_ids"], dim=-1, pad_value=0, pad_length=pad_length, sequential=True
-            )
 
-        # sp slice
-        batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
-        batch["labels"] = self.sp_slice(labels, dim=-1)
+            if sp_slice and key != "position_ids":  # position_ids should be sp sliced after precompute fa kwargs
+                # sp slice
+                batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
-        # Calculate these info from position_ids here when SP_enable to use padded position_ids
-        if not self.rmpad:
-            add_flash_attention_kwargs_from_position_ids(batch)
+        add_flash_attention_kwargs_from_position_ids(batch)
+
+        batch["position_ids"] = self.sp_slice(
+            "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
+        )
 
         return batch
+
+
+@dataclass
+class MainCollator(DataCollator):
+    data_collate_info: Dict[str, Union[DataCollateInfo, tuple, Dict]] = field(default_factory=lambda: {})
+    pad_to_length: bool = False
+    seq_classification: bool = False
+
+    """
+    Data collator pipeline with a unified collate info.
+
+    Args:
+        data_collate_info:
+            User config to override the default collate info.
+        pad_to_length:
+            Whether to pad sequence to a fixed length. Default is False.
+        seq_classification:
+            If True, sequence classification task. Default is False.
+    """
+
+    def __post_init__(self):
+        self.preforward_pipeline = []
+        self.collate_infos: Dict[str, DataCollateInfo] = {}
+
+        full_info = DEFAULT_DATA_COLLATE_INFO.copy()
+        full_info.update(self.data_collate_info)
+
+        for name, params in full_info.items():
+            if isinstance(params, DataCollateInfo):
+                self.collate_infos[name] = params
+            elif isinstance(params, dict):
+                self.collate_infos[name] = DataCollateInfo(**params)
+            elif isinstance(params, tuple):
+                self.collate_infos[name] = DataCollateInfo(*params)
+
+        """attention_mask always pad 1
+        VeOmni sp slice `input_ids` & `labels` while keeps the full sequence of `attention_mask`. This leads to wrong behavior of `create_causal_mask` in transformers.
+        `create_causal_mask` will slice the `attention_mask` to `attention_mask[-len(input_ids):]`.
+        refer to https://github.com/huggingface/transformers/blob/bdc85cb85c8772d37aa29ce447860b44d7fad6ef/src/transformers/masking_utils.py#L770
+        So VeOmni make sure attention_mask is all_ones when using flash_attn, and precalculate the position_ids & cu_seqlens & max_seqlens.
+        """
+        assert self.collate_infos["attention_mask"].sp_pad_value == 1
+
+        self.preforward_pipeline.append(PrecomputePositionIDsCollator())
+        self.preforward_pipeline.append(
+            PackingCollator(
+                collate_infos=self.collate_infos,
+                pad_to_length=self.pad_to_length,
+                seq_classification=self.seq_classification,
+            )
+        )
+        if get_parallel_state().sp_enabled:
+            self.preforward_pipeline.append(
+                SequenceParallelCollator(collate_infos=self.collate_infos, seq_classification=self.seq_classification)
+            )
+        logger.info_rank0(self.log_collate_infos())
+
+    def __call__(self, micro_batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        for preforward_func in self.preforward_pipeline:
+            micro_batch = preforward_func(micro_batch)
+        return micro_batch
+
+    def log_collate_infos(self) -> None:
+        sample_info = next(iter(self.collate_infos.values()))
+        fields = list(asdict(sample_info).keys())
+
+        header = ["name"] + fields
+
+        row_format = "{:<25}" + "{:<18}" * len(fields)
+
+        log_str = ""
+        log_str += "\n" + "=" * (25 + 18 * len(fields)) + "\n"
+        log_str += "Main Collate Configuration\n"
+        log_str += "-" * (25 + 18 * len(fields)) + "\n"
+
+        log_str += row_format.format(*header) + "\n"
+        log_str += "-" * (25 + 18 * len(fields)) + "\n"
+
+        for name, info in self.collate_infos.items():
+            row_data = [name] + [str(getattr(info, f)) for f in fields]
+            log_str += row_format.format(*row_data) + "\n"
+
+        log_str += "=" * (25 + 18 * len(fields)) + "\n"
+        return log_str
+
+
+@dataclass
+class PostCollator(DataCollator):
+    def __init__(self):
+        self.postforward_pipeline = []
+        self.compute_seqlens_func = SeqlensComputePostCollator()
+        self.postforward_pipeline.append(PackingPostCollator())
+
+    def __call__(self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]):
+        seq_lens = self.compute_seqlens_func(micro_batch)
+        for postforward_func in self.postforward_pipeline:
+            outputs = postforward_func(outputs, seq_lens)
+        return outputs
+
+
+@dataclass
+class SeqlensComputePostCollator(DataCollator):
+    def __call__(self, micro_batch: Dict[str, torch.Tensor]):
+        seq_lens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        return seq_lens
+
+
+@dataclass
+class PackingPostCollator(DataCollator):
+    def __call__(self, outputs: ModelOutput, seq_lens):
+        logits = outputs.logits
+        if get_parallel_state().sp_enabled:
+            logits = gather_outputs(logits, gather_dim=0, group=get_parallel_state().sp_group)
+            logits = logits[: sum(seq_lens)]  # remove sp padding
+        logits_list = logits.split(seq_lens, dim=0)
+        outputs.logits = logits_list
+        return outputs

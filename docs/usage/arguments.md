@@ -24,7 +24,6 @@
 | data.dataloader_type | str: {"native"} | Type of the dataloader | native |
 | data.datasets_type | str: {"mapping", "iterable"} | Dataset type. `IterativeDataset` or `MappingDataset`, or your custom datsets | mapping |
 | data.text_keys | str: {"content_split", "messages"} | The key corresponding to the text samples in the data dictionary. Generally, it is "content_split" for pretraining and "messages" for SFT. | content_split |
-| data.image_keys | str | The key corresponding to the image samples in the data dictionary. Generally, it is "images". | images |
 | data.chat_template | str | Name of the chat template. | default |
 | data.max_seq_len | int | Maximum training length. | 2048 |
 | data.num_workers | int | Number of multi-process loaders for the dataloader. | 4 |
@@ -46,8 +45,6 @@
 | train.num_train_epochs | int | Number of training epochs.                                                                                                                                                     | 1 |
 | train.rmpad | bool | Whether to use rmpad training based on cu_seqlens.                                                                                                                             | False |
 | train.rmpad_with_pos_ids | bool | Whether to use rmpad training based on position_ids.                                                                                                                           | False |
-| train.dyn_bsz_margin | int | Number of pad tokens in the dynamic batch.                                                                                                                                     | 0 |
-| train.dyn_bsz_runtime | str: {"main", "worker"} | Running process of the dynamic batch.                                                                                                                                          | worker |
 | train.bsz_warmup_ratio | float | Proportion of batch size warmup in the total number of steps.                                                                                                                  | 0 |
 | train.lr_warmup_ratio | float | Proportion of learning rate warmup in the total number of steps.                                                                                                               | 0 |
 | train.lr_decay_style | str: {"constant", "linear", "cosine"} | Name of the learning rate scheduler.                                                                                                                                           | cosine |
