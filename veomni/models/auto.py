@@ -164,4 +164,6 @@ def build_foundation_model(
 
         model.forward = wrapped_forward
 
+    assert not model.use_kernels
+
     return model
