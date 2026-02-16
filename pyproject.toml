@@ -27,7 +27,7 @@ dependencies = [
   # Comment out transformers version for pip user compatibility (not to accidentally install v5 which is still WIP
   # and experimental)
   # For uv user: The actual version is controlled by the "transformers-stable" default
-  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.1.0).
+  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.2.0).
   # For pip user: please install 4.57.3 manually via pip install transformers==4.57.3.
   # "transformers==4.57.3",
   "psutil",
@@ -103,7 +103,7 @@ trl = [
 # See https://github.com/ByteDance-Seed/VeOmni/issues/468 for the progress.
 # Usage: `uv sync --no-group transformers-stable --extra transformers5-exp --extra <other extra>`.
 transformers5-exp = [
-  "transformers==5.1.0"
+  "transformers==5.2.0"
 ]
 
 [dependency-groups]

@@ -83,7 +83,7 @@ def run_checkpointer_test():
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         init_device=args.train.init_device,
         enable_fsdp_offload=args.train.enable_fsdp_offload,
-        basic_modules=model._no_split_modules + args.model.basic_modules,
+        basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)),
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
