@@ -100,7 +100,8 @@ def _save_hf_safetensor_distributed(
     save_state = get_model_save_state(model, fqn_to_index_mapping)
 
     logger.info_rank0("Starting distributed HuggingFace safetensors save...")
-    dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
     start_time = time.time()
     dcp.save(
         state_dict=save_state,
@@ -110,6 +111,7 @@ def _save_hf_safetensor_distributed(
     if dist.is_initialized():
         dist.barrier()
     gc.collect()
+    helper.empty_cache()
     elapsed_time = time.time() - start_time
     logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
 
