@@ -254,7 +254,8 @@ def parallelize_model_fsdp2(
     parallel_state = get_parallel_state()
 
     # Step 0: Get target classes to shard later
-    target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
+    model_no_split_modules = getattr(model, "_no_split_modules", None) or []
+    target_classes = set(model_no_split_modules) | set(basic_modules or [])
     # Make a list of tuples that contains layer's name and module
     decoder_blocks: List[Tuple[str, nn.Module]] = [
         (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
