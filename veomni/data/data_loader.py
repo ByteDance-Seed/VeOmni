@@ -31,10 +31,11 @@ from .data_collator import (
     DataCollatorWithPositionIDs,
     DataCollatorWithPositionIDsAndPadding,
     MakeMicroBatchCollator,
+    NoopDataCollator,
     TextSequenceShardCollator,
     UnpackDataCollator,
 )
-from .dynamic_batching import DynamicBatchSizeDataLoader
+from .dynamic_batching import DynamicBatchingSizeDataset, DynamicBatchSizeDataLoader
 
 
 if TYPE_CHECKING:
@@ -72,9 +73,11 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
+    dyn_bsz_in_worker_loop: bool = True,
     pad_packed_to_length: Optional[int] = None,
     dyn_bsz_buffer_size: int = 500,
     dyn_bsz_margin: int = 0,
+    dyn_bsz_dataset_save_by_idx: bool = True,
     collate_fn: Optional[Union[Callable, List[Callable]]] = None,
     num_workers: int = 8,
     drop_last: bool = True,
@@ -122,14 +125,25 @@ def build_native_dataloader(
         collate_fn = CollatePipeline(collate_fn)
 
     if use_rmpad and dyn_bsz:
-        batching_strategy = TextBatchingStrategy(
-            token_micro_bsz=token_micro_bsz - dyn_bsz_margin * max_seq_len,
-            buffer_size=dyn_bsz_buffer_size,
-            bsz_warmup_steps=bsz_warmup_steps if bsz_warmup_steps else -1,
-            bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
-        )
         dyn_bsz_collate_fn = collate_fn
-        collate_fn = UnpackDataCollator()
+        if dyn_bsz_in_worker_loop:
+            batching_strategy = TextBatchingStrategy(
+                token_micro_bsz=token_micro_bsz - dyn_bsz_margin * max_seq_len,
+                buffer_size=dyn_bsz_buffer_size,
+                bsz_warmup_steps=bsz_warmup_steps if bsz_warmup_steps else -1,
+                bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
+            )
+            collate_fn = UnpackDataCollator()
+        else:
+            dataset = DynamicBatchingSizeDataset(
+                dataset=dataset,
+                micro_batch_seq_length=token_micro_bsz,
+                ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
+                get_length_fn=lambda x: int(x["attention_mask"].sum()),
+                dynamic_batching_collate_fn=dyn_bsz_collate_fn,
+                save_by_idx=dyn_bsz_dataset_save_by_idx,
+            )
+            collate_fn = NoopDataCollator()
     else:
         collate_fn = MakeMicroBatchCollator(num_micro_batch=num_micro_batch, internal_data_collator=collate_fn)
 
@@ -155,13 +169,14 @@ def build_native_dataloader(
         prefetch_factor=prefetch_factor,
     )
     if use_rmpad and dyn_bsz:
-        dataloader = DynamicBatchSizeDataLoader(
-            dataloader,
-            batching_strategy=batching_strategy,
-            collate_fn=dyn_bsz_collate_fn,
-            num_micro_batch=num_micro_batch,
-            length=train_steps,
-            drop_last=drop_last,
-        )
+        if dyn_bsz_in_worker_loop:
+            dataloader = DynamicBatchSizeDataLoader(
+                dataloader,
+                batching_strategy=batching_strategy,
+                collate_fn=dyn_bsz_collate_fn,
+                num_micro_batch=num_micro_batch,
+                length=train_steps,
+                drop_last=drop_last,
+            )
 
     return dataloader

@@ -17,16 +17,18 @@ import copy
 import sys
 import traceback
 from collections import deque
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, Iterator, Optional
+from typing import Any, Callable, Dict, Generator, Iterator, Optional
 
 from torch.utils.data import IterableDataset
 
+from veomni.data.batching_strategy import BaseBatchingStrategy
 from veomni.data.data_collator import DataCollatorWithPositionIDs
 
 from ..utils import logging
 
 
 logger = logging.get_logger(__name__)
+
 
 class DynamicBatchingSizeDataset(IterableDataset):
     """Dynamic batching dataset that yields micro batches based on token count.
@@ -55,7 +57,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         micro_batch_seq_length: int,
         ready_for_micro_batch_threshold: int,
         dynamic_batching_collate_fn: Optional[Callable] = DataCollatorWithPositionIDs(),
-        save_by_idx: bool = False,
+        save_by_idx: bool = True,
         get_length_fn: Optional[Callable] = len,
         force_generate_long_sequence: bool = True,
     ) -> None:
@@ -85,11 +87,16 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self.save_by_idx = save_by_idx
         self.force_generate_long_sequence = force_generate_long_sequence
 
-        if self.save_by_idx and not (hasattr(self.dataset, "get_item") and hasattr(self.dataset, "output_refetch_idx")):
-            raise ValueError("save_by_idx is True, but dataset does not have get_item method or output_refetch_idx attribute to resume samples in buffers based on idx")
+        if self.save_by_idx and not (
+            hasattr(self.dataset, "get_item") and hasattr(self.dataset, "output_refetch_idx")
+        ):
+            raise ValueError(
+                "save_by_idx is True, but dataset does not have get_item method or output_refetch_idx attribute to resume samples in buffers based on idx"
+            )
         self.dataset.output_refetch_idx = self.save_by_idx
 
         self._buffer = []
+        self._buffer_of_refetch_idx = []
         self._buffer_token_count = 0
         self._data_iter = None
 
@@ -119,23 +126,27 @@ class DynamicBatchingSizeDataset(IterableDataset):
 
                 length = self.get_length_fn(item)
                 if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
-                    logger.warning(f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence.")
+                    logger.warning(
+                        f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
+                    )
                     continue
 
+                self._buffer.append((item, length))
                 if self.save_by_idx:
-                    self._buffer.append((item, length, refetch_idx))
-                else:
-                    self._buffer.append((item, length))
+                    self._buffer_of_refetch_idx.append(refetch_idx)
 
                 self._buffer_token_count += self._buffer[-1][1]
 
-                if len(self._buffer) >= self.ready_for_micro_batch_threshold and self._buffer_token_count >= self.micro_batch_seq_length:
+                if (
+                    len(self._buffer) >= self.ready_for_micro_batch_threshold
+                    and self._buffer_token_count >= self.micro_batch_seq_length
+                ):
                     micro_batch = self._get_micro_batch()
                     micro_batch = self.dynamic_batching_collate_fn(micro_batch)
                     if micro_batch is not None:
                         yield micro_batch
                     else:
-                        logging.warn('dynamic_batching_collate_fn returned None, skip this micro_batch')
+                        logging.warn("dynamic_batching_collate_fn returned None, skip this micro_batch")
 
             except Exception as e:
                 if isinstance(e, StopIteration):
@@ -145,11 +156,10 @@ class DynamicBatchingSizeDataset(IterableDataset):
                         if micro_batch is not None:
                             yield micro_batch
                         else:
-                            logging.warn('dynamic_batching_collate_fn returned None, skip this micro_batch')
+                            logging.warn("dynamic_batching_collate_fn returned None, skip this micro_batch")
                     return
                 else:
-                    logger.error(
-                        f'DynamicBatchDataset iter data exception: {e} \n{traceback.format_exc()}')
+                    logger.error(f"DynamicBatchDataset iter data exception: {e} \n{traceback.format_exc()}")
                     raise
 
     def _get_micro_batch(self):
@@ -172,7 +182,9 @@ class DynamicBatchingSizeDataset(IterableDataset):
         for idx, item in enumerate(self._buffer):
             sample, length = item[0], item[1]
 
-            if length + seq_length > self.micro_batch_seq_length and not (seq_length == 0 and self.force_generate_long_sequence):
+            if length + seq_length > self.micro_batch_seq_length and not (
+                seq_length == 0 and self.force_generate_long_sequence
+            ):
                 continue
 
             micro_batch.append(sample)
@@ -186,10 +198,11 @@ class DynamicBatchingSizeDataset(IterableDataset):
         # Remove selected items from buffer (iterate backwards to maintain indices)
         for idx in reversed(selected_indices):
             del self._buffer[idx]
+            if self.save_by_idx:
+                del self._buffer_of_refetch_idx[idx]
 
         assert len(micro_batch) > 0
         return micro_batch
-
 
     def state_dict(self):
         """Get the state dictionary for checkpointing.
@@ -209,16 +222,20 @@ class DynamicBatchingSizeDataset(IterableDataset):
             "save_by_idx": self.save_by_idx,
             "buffer_token_count": self._buffer_token_count,
         }
+
+        # the state_dict might be called frequently with StatefulDataloaders(see more details of snapshot_every_n_steps)
+        # so we try to not include extra calculations here.
         if self.save_by_idx:
-            state['buffer'] = [item[2] for item in self._buffer]
+            state["buffer"] = copy.copy(self._buffer_of_refetch_idx)
         else:
-            state['buffer'] = self._buffer
+            # deepcopy buffer so that it can be transfered through multiple processes
+            state["buffer"] = copy.deepcopy(self._buffer)
 
         if hasattr(self.dataset, "state_dict"):
-            state['dynamic_batch_upstream_dataset_state'] = self.dataset.state_dict()
+            state["dynamic_batch_upstream_dataset_state"] = self.dataset.state_dict()
 
         return state
-    
+
     def load_state_dict(self, state_dict):
         """Load state from a checkpoint.
 
@@ -240,17 +257,18 @@ class DynamicBatchingSizeDataset(IterableDataset):
         prev_save_by_idx = state_dict["save_by_idx"]
         if prev_save_by_idx:
             self._buffer = []
+            self._buffer_of_refetch_idx = []
             for idx in state_dict["buffer"]:
                 item = self.dataset.get_item(idx)
                 length = self.get_length_fn(item)
+                self._buffer.append((item, length))
                 if self.save_by_idx:
-                    self._buffer.append((item, length, idx))
-                else:
-                    self._buffer.append((item, length))
+                    self._buffer_of_refetch_idx.append(idx)
         else:
             self._buffer = state_dict["buffer"]
-            if self.save_by_idx and self._buffer:
-                raise ValueError("save_by_idx is True, but previous buffer does not contain indices")
+            if self.save_by_idx and len(self._buffer) > 0:
+                raise ValueError("save_by_idx is True, but previous buffer contains valid samples instead of indices")
+            self._buffer_of_refetch_idx = []
 
         self._buffer_token_count = state_dict["buffer_token_count"]
         # Verify buffer_token_count matches the sum of token lengths
@@ -262,8 +280,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
         )
         del state_dict["buffer"]
 
-        if 'dynamic_batch_upstream_dataset_state' in state_dict:
-            self.dataset.load_state_dict(state_dict['dynamic_batch_upstream_dataset_state'])
+        if "dynamic_batch_upstream_dataset_state" in state_dict:
+            self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the upstream dataset.

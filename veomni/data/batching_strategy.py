@@ -109,6 +109,7 @@ class IdentityPacker:
             else self.token_micro_bsz
         )
 
+
 class BaseBatchingStrategy:
     """
     Base class for batching strategy.
@@ -125,6 +126,7 @@ class BaseBatchingStrategy:
 
     def empty(self) -> bool:
         raise NotImplementedError("should implement `empty`")
+
 
 class TextBatchingStrategy(BaseBatchingStrategy):
     """ "

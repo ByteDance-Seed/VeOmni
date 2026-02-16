@@ -5,8 +5,8 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import Dataset, IterableDataset
 from datasets import Dataset as HuggingFaceDataset
+from torch.utils.data import Dataset, IterableDataset
 
 from veomni.utils import helper
 from veomni.utils.device import get_device_type
@@ -14,6 +14,7 @@ from veomni.utils.helper import get_cache_dir
 
 
 logger = helper.create_logger(__name__)
+
 
 class DummyMappingDataset(Dataset):
     """Mapping-style dataset that generates dummy data based on index."""
@@ -36,11 +37,7 @@ class DummyMappingDataset(Dataset):
         # Follow the same generation pattern: index + 1
         index = idx + 1
         input_ids = torch.tensor([index] * index, dtype=torch.long)
-        return {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones_like(input_ids),
-            "labels": input_ids.clone()
-        }
+        return {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "labels": input_ids.clone()}
 
 
 class DummyIterableDataset(IterableDataset):
@@ -68,10 +65,46 @@ class DummyIterableDataset(IterableDataset):
             self.indices = list(range(len(self.mapping_dataset)))
 
     def __iter__(self):
-        """Iterate through the dataset in order or shuffled order."""
-        while self._current_idx < len(self.indices):
-            idx = self.indices[self._current_idx]
-            self._current_idx += 1
+        """Iterate through the dataset in order or shuffled order with rank and worker sharding.
+
+        Sharding strategy:
+        - First shard by rank (for distributed training)
+        - Then shard by worker (for multi-worker DataLoader)
+        - Each rank+worker combination gets a unique subset of data
+
+        Example with 2 ranks, 2 workers, 8 samples:
+        - Rank 0, Worker 0: indices 0, 4
+        - Rank 0, Worker 1: indices 1, 5
+        - Rank 1, Worker 0: indices 2, 6
+        - Rank 1, Worker 1: indices 3, 7
+        """
+        import torch.distributed as dist
+
+        # Get worker info for multi-worker DataLoader
+        worker_info = torch.utils.data.get_worker_info()
+
+        # Get distributed info
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+
+        # Calculate which indices this rank+worker should process
+        if worker_info is not None:
+            # Multi-worker case: shard by rank first, then by worker
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+        else:
+            num_workers = 1
+            worker_id = 0
+        total_workers = world_size * num_workers
+        start_idx = self._current_idx if self._current_idx > 0 else rank * num_workers + worker_id
+
+        for i in range(start_idx, len(self.indices), total_workers):
+            idx = self.indices[i]
+            self._current_idx = i + total_workers
             if self.output_refetch_idx:
                 yield (self.mapping_dataset[idx], idx)
             else:
@@ -90,7 +123,7 @@ class DummyIterableDataset(IterableDataset):
         """Restore the iteration state."""
         self._current_idx = state_dict["current_idx"]
 
-    
+
 class DummyDataset:
     def __init__(self, size=100, num_shard=2, dataset_name: str = "test_dataset") -> None:
         self.size = size
