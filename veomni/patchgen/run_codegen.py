@@ -55,6 +55,32 @@ PACKAGE_NAME = __package__ or "veomni.patchgen"
 PATCHES_PACKAGE = "veomni.models.transformers.qwen3.patches"
 
 
+def build_unified_diff(
+    original_source: str,
+    generated_source: str,
+    source_module: str,
+    target_file: str,
+    context_lines: int = 3,
+) -> str:
+    """Build unified diff text between source module code and generated code."""
+    module_path = source_module.replace(".", "/") + ".py"
+    original_lines = original_source.splitlines(keepends=True)
+    generated_lines = generated_source.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        original_lines,
+        generated_lines,
+        fromfile=f"a/{module_path}",
+        tofile=f"b/{target_file}",
+        n=context_lines,
+    )
+    return "".join(diff)
+
+
+def default_diff_path(output_dir: Path, target_file: str) -> Path:
+    """Return default .diff path in the output directory for a generated target file."""
+    return output_dir / Path(target_file).with_suffix(".diff").name
+
+
 def list_patch_configs(models_dir: Path = MODELS_DIR) -> list[str]:
     """List all available patch configurations under veomni/models/transformers."""
     configs = []
@@ -166,6 +192,7 @@ def run_codegen(
         if dry_run:
             print("\n[DRY RUN] Would generate:")
             print(f"  Output: {output_dir / config.target_file}")
+            print(f"  Diff:   {default_diff_path(output_dir, config.target_file)}")
             print(f"  Source lines: ~{len(generator.source_code.splitlines())}")
             print(f"  Patches to apply: {len(config.patches)}")
             return generator.source_code
@@ -176,6 +203,17 @@ def run_codegen(
 
         print(f"\n✓ Generated: {output_path}")
         print(f"  Lines: {len(output.splitlines())}")
+
+        diff_output = build_unified_diff(
+            original_source=generator.source_code,
+            generated_source=output,
+            source_module=config.source_module,
+            target_file=config.target_file,
+        )
+        diff_path = default_diff_path(output_dir, config.target_file)
+        diff_path.write_text(diff_output)
+        print(f"✓ Diff: {diff_path}")
+        print(f"  Lines: {len(diff_output.splitlines())}")
 
         return output
 
@@ -265,17 +303,13 @@ def run_diff(
                 return 1
 
         # Generate unified diff
-        original_lines = original_source.splitlines(keepends=True)
-        generated_lines = generated_source.splitlines(keepends=True)
-
-        diff = difflib.unified_diff(
-            original_lines,
-            generated_lines,
-            fromfile=f"a/{module_path}",
-            tofile=f"b/{config.target_file}",
-            n=context_lines,
+        diff_output = build_unified_diff(
+            original_source=original_source,
+            generated_source=generated_source,
+            source_module=config.source_module,
+            target_file=config.target_file,
+            context_lines=context_lines,
         )
-        diff_output = "".join(diff)
 
         # Save to patch file
         if save_patch:

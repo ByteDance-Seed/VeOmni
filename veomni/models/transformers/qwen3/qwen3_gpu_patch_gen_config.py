@@ -127,7 +127,7 @@ def qwen3_model_forward_patched(
         # Prepare mask arguments
         mask_kwargs = {
             "config": self.config,
-            "input_embeds": inputs_embeds,
+            "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
             "cache_position": cache_position,
             "past_key_values": past_key_values,
@@ -175,17 +175,17 @@ def qwen3_model_forward_patched(
 )
 def qwen3forcausallm_forward_patched(
     self,
-    input_ids=None,
-    attention_mask=None,
-    position_ids=None,
-    past_key_values=None,
-    inputs_embeds=None,
-    labels=None,
-    use_cache=None,
-    cache_position=None,
-    logits_to_keep=0,
-    **kwargs,
-):
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    labels: torch.LongTensor | None = None,
+    use_cache: bool | None = None,
+    cache_position: torch.LongTensor | None = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    **kwargs: Unpack[TransformersKwargs],
+) -> CausalLMOutputWithPast:
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,

@@ -280,6 +280,7 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
+exclude = ["veomni/models/transformers/**/generated/*.py"]
 
 [tool.pytest.ini_options]
 markers = [

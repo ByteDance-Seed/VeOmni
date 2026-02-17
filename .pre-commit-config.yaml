@@ -27,3 +27,4 @@ repos:
           - id: ruff
             args: [--fix]
           - id: ruff-format
+            exclude: ^veomni/models/transformers/.*/generated/.*\.py$

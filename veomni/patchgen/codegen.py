@@ -569,6 +569,30 @@ class ModelingCodeGenerator:
 
         return "\n".join(lines)
 
+    def _indent_preserved_source(self, preserved_source: str, target_indent: int) -> list[str]:
+        """
+        Re-indent preserved source lines to target indentation.
+
+        Args:
+            preserved_source: Source text to re-indent
+            target_indent: Number of spaces for the first non-empty line
+
+        Returns:
+            Re-indented lines
+        """
+        preserved_lines = preserved_source.splitlines()
+        first_non_empty = next((line for line in preserved_lines if line.strip()), "")
+        preserved_indent = len(first_non_empty) - len(first_non_empty.lstrip())
+
+        indented_lines = []
+        for line in preserved_lines:
+            if line.strip():
+                stripped = line[preserved_indent:] if len(line) >= preserved_indent else line.lstrip()
+                indented_lines.append(" " * target_indent + stripped)
+            else:
+                indented_lines.append("")
+        return indented_lines
+
     def _replace_method_body_with_preserved(self, class_source: str, method_name: str, preserved_source: str) -> str:
         """
         Replace a method in the class source with its comment-preserved version.
@@ -600,6 +624,16 @@ class ModelingCodeGenerator:
         if not class_def:
             return class_source
 
+        source_lines = class_source.splitlines()
+
+        # Find class indentation from class definition line
+        class_start = class_def.lineno - 1
+        if class_start < len(source_lines):
+            class_line = source_lines[class_start]
+            class_indent = len(class_line) - len(class_line.lstrip())
+        else:
+            class_indent = 0
+
         # Find the method in the class
         method_node = None
         for item in class_def.body:
@@ -607,44 +641,43 @@ class ModelingCodeGenerator:
                 method_node = item
                 break
 
-        if not method_node:
-            return class_source
-
-        # Get the line boundaries of the method in the unparsed source
-        source_lines = class_source.splitlines()
-        method_start = method_node.lineno - 1  # 0-indexed
-        method_end = (
-            method_node.end_lineno
-            if hasattr(method_node, "end_lineno") and method_node.end_lineno
-            else method_start + 1
-        )
-
-        # Determine the indentation of the method in the class
-        if method_start < len(source_lines):
-            original_line = source_lines[method_start]
-            indent = len(original_line) - len(original_line.lstrip())
-        else:
-            indent = 4  # Default class method indent
-
-        # Indent the preserved source to match the class method indentation
-        preserved_lines = preserved_source.splitlines()
-        # Determine the current indentation of the preserved source
-        first_non_empty = next((line for line in preserved_lines if line.strip()), "")
-        preserved_indent = len(first_non_empty) - len(first_non_empty.lstrip())
-
-        # Re-indent the preserved source
-        indented_preserved_lines = []
-        for line in preserved_lines:
-            if line.strip():
-                # Remove existing indent and add new indent
-                stripped = line[preserved_indent:] if len(line) >= preserved_indent else line.lstrip()
-                indented_preserved_lines.append(" " * indent + stripped)
+        if method_node:
+            # Replace existing method body while preserving untouched class formatting.
+            method_start = method_node.lineno - 1  # 0-indexed
+            method_end = (
+                method_node.end_lineno
+                if hasattr(method_node, "end_lineno") and method_node.end_lineno
+                else method_start + 1
+            )
+            if method_start < len(source_lines):
+                original_line = source_lines[method_start]
+                method_indent = len(original_line) - len(original_line.lstrip())
             else:
-                indented_preserved_lines.append("")
+                method_indent = class_indent + 4
 
-        # Replace the method in the class source
-        new_source_lines = source_lines[:method_start] + indented_preserved_lines + source_lines[method_end:]
+            indented_preserved_lines = self._indent_preserved_source(preserved_source, method_indent)
+            new_source_lines = source_lines[:method_start] + indented_preserved_lines + source_lines[method_end:]
+            return "\n".join(new_source_lines)
 
+        # If the method does not exist, inject it while preserving class formatting.
+        # Prefer replacing a single `pass` body when present.
+        pass_node = next((item for item in class_def.body if isinstance(item, ast.Pass)), None)
+        method_indent = class_indent + 4
+        indented_preserved_lines = self._indent_preserved_source(preserved_source, method_indent)
+
+        if pass_node is not None:
+            pass_start = pass_node.lineno - 1
+            pass_end = (
+                pass_node.end_lineno if hasattr(pass_node, "end_lineno") and pass_node.end_lineno else pass_start + 1
+            )
+            new_source_lines = source_lines[:pass_start] + indented_preserved_lines + source_lines[pass_end:]
+            return "\n".join(new_source_lines)
+
+        # Otherwise append to the class body.
+        new_source_lines = source_lines.copy()
+        if new_source_lines and new_source_lines[-1].strip():
+            new_source_lines.append("")
+        new_source_lines.extend(indented_preserved_lines)
         return "\n".join(new_source_lines)
 
     def _generate_class_source(self, class_node: ast.ClassDef, patches: dict[str, Patch]) -> str:
@@ -680,11 +713,10 @@ class ModelingCodeGenerator:
             lines.append(f"# [MODIFIED CLASS] {class_name}")
             lines.append(f"# Methods patched: {', '.join(methods_patched)}")
             lines.append(f"# {'=' * 70}")
-            # For classes with method overrides, we use AST unparse because
-            # we need to combine original class structure with new methods.
-            # However, ast.unparse() strips comments, so we need to replace
-            # the method bodies with the source-preserved versions.
-            class_source = ast_to_source(modified_class)
+            # Preserve original class formatting/comments for untouched methods,
+            # and replace only the patched methods in-place.
+            end_line = get_node_end_line(class_node, self.source_lines)
+            class_source = extract_source_segment(self.source_lines, class_node.lineno, end_line)
 
             # Replace the unparsed method bodies with comment-preserved versions
             for method_name, preserved_source in method_replacement_sources.items():
