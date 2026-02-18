@@ -55,7 +55,7 @@ def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace:
     if implementation == "veomni_flash_attention_2_with_sp":
         try:
             from flash_attn import flash_attn_func, flash_attn_varlen_func
-        except Exception as e:
+        except ImportError as e:
             raise ImportError(
                 "VeOmni attention implementation `veomni_flash_attention_2_with_sp` requires "
                 "`flash_attn` (FA2) to be importable."
@@ -63,7 +63,7 @@ def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace:
     elif implementation == "veomni_flash_attention_3_with_sp":
         try:
             from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
-        except Exception as e:
+        except ImportError as e:
             raise ImportError(
                 "VeOmni attention implementation `veomni_flash_attention_3_with_sp` requires "
                 "`flash_attn_interface` (FA3) to be importable."
@@ -97,7 +97,7 @@ def _patch_transformers_hub_kernel_loader_for_veomni():
 
     try:
         import transformers.integrations.hub_kernels as hub_kernels
-    except Exception as e:
+    except ImportError as e:
         logger.warning_rank0(f"Failed to patch Transformers hub kernel loader for VeOmni attention: {e}")
         return
 

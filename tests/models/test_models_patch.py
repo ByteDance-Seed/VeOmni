@@ -34,11 +34,46 @@ _DEFAULT_ATOL = 1e-2
 
 test_cases = [
     pytest.param(
+        "./tests/toy_config/llama31_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="llama3.1",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen25_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2.5",
+    ),
+    pytest.param(
         "./tests/toy_config/qwen3_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3_moe_toy/config.json",
+        True,
+        0.5,
+        0.02,
+        id="qwen3_moe",
+    ),
+    pytest.param(
+        "./tests/toy_config/seed_oss_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="seed_oss",
+    ),
+    pytest.param(
+        "./tests/toy_config/deepseek_v3_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v3",
     ),
 ]
 
