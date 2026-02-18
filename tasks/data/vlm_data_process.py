@@ -179,10 +179,17 @@ def get_omni_token_ids(processor: "ProcessorMixin") -> tuple[int, int, int]:
     """
     tokenizer = getattr(processor, "tokenizer", processor)
     vocab = tokenizer.get_vocab()
-    # Qwen2.5-Omni uses <|IMAGE|>/<|VIDEO|>/<|AUDIO|>; Qwen3-Omni uses <|image_pad|>/<|video_pad|>/<|audio_pad|>
-    image_token_id = vocab.get("<|image_pad|>", vocab.get("<|IMAGE|>", 151655))
-    video_token_id = vocab.get("<|video_pad|>", vocab.get("<|VIDEO|>", 151656))
-    audio_token_id = vocab.get("<|audio_pad|>", vocab.get("<|AUDIO|>", 151646))
+    # Qwen2.5-Omni uses <|IMAGE|>/<|VIDEO|>/<|AUDIO|>; https://huggingface.co/Qwen/Qwen2.5-Omni-7B/blob/main/tokenizer_config.json
+    # Qwen3-Omni uses <|image_pad|>/<|video_pad|>/<|audio_pad|>; https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
+    image_token_id = vocab.get("<|image_pad|>", vocab.get("<|IMAGE|>"))
+    video_token_id = vocab.get("<|video_pad|>", vocab.get("<|VIDEO|>"))
+    audio_token_id = vocab.get("<|audio_pad|>", vocab.get("<|AUDIO|>"))
+    if image_token_id is None:
+        raise ValueError("Cannot find image token (<|image_pad|> or <|IMAGE|>) in tokenizer vocab.")
+    if video_token_id is None:
+        raise ValueError("Cannot find video token (<|video_pad|> or <|VIDEO|>) in tokenizer vocab.")
+    if audio_token_id is None:
+        raise ValueError("Cannot find audio token (<|audio_pad|> or <|AUDIO|>) in tokenizer vocab.")
     return image_token_id, video_token_id, audio_token_id
 
 
@@ -247,13 +254,15 @@ def _process_sample_omni(
     else:
         audio_audios = []
 
+    video_audios_iter = iter(video_audios)
+    audio_audios_iter = iter(audio_audios)
     audios = []
     for item in input_conversations:
         for content in item["content"]:
             if content["type"] == "video":
-                audios.append(video_audios.pop(0))
+                audios.append(next(video_audios_iter))
             elif content["type"] == "audio":
-                audios.append(audio_audios.pop(0))
+                audios.append(next(audio_audios_iter))
 
     model_inputs = processor(
         text=text,
@@ -305,8 +314,14 @@ def _process_sample_omni(
     model_inputs["attention_mask"] = model_inputs["attention_mask"].squeeze(0)
 
     labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
-    user_start_index = torch.where(input_ids == 872)[0].tolist()  # "user" 872
-    assistant_start_index = torch.where(input_ids == 77091)[0].tolist()  # "assistant" 77091
+    tokenizer = getattr(processor, "tokenizer", processor)
+    vocab = tokenizer.get_vocab()
+    user_token_id = vocab.get("user")
+    assistant_token_id = vocab.get("assistant")
+    if user_token_id is None or assistant_token_id is None:
+        raise ValueError("Cannot find user/assistant tokens in tokenizer vocab.")
+    user_start_index = torch.where(input_ids == user_token_id)[0].tolist()
+    assistant_start_index = torch.where(input_ids == assistant_token_id)[0].tolist()
     user_start_index.append(len(input_ids) + 1)
     user_i = 0
     for assis_i in assistant_start_index:
