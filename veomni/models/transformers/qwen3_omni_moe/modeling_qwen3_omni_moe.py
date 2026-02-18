@@ -80,6 +80,7 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
+from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
 if is_flash_attn_2_available():
@@ -741,7 +742,7 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         # NOTE: the created attention masl only approximates the ragged FA2 attention by
         # allowing bidirectional attention within `cu_seqlens` blocks, and not attending between
         # blocks. Though it will not be a 100% match for FA2's `varlen` path
-        if self.config._attn_implementation == "flash_attention_2":
+        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
             return None
 
         seq_length = inputs_tensor.shape[0]
@@ -935,8 +936,8 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if self.config._attn_implementation == "flash_attention_2":
-            # Flash Attention 2: Use cu_seqlens for variable length attention
+        if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
+            # Flash Attention: Use cu_seqlens for variable length attention
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
@@ -4438,9 +4439,23 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
         return thinker_outputs
 
 
+# ================================================================
+# Patch: Qwen3OmniMoePreTrainedModel.get_parallel_plan
+# 1. add parallel plan for expert parallelism
+# ================================================================
+# --- Patch.1 ---
+def _get_parallel_plan(self):
+    from .parallel_plan import get_parallel_plan
+
+    return get_parallel_plan()
+
+
+# --- Patch.1 ---
+
+
 def apply_veomni_qwen3_omni_moe_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen3_Omni_MoE.")
-    # Do nothing right now.
+    Qwen3OmniMoePreTrainedModel.get_parallel_plan = _get_parallel_plan
 
 
 __all__ = [
