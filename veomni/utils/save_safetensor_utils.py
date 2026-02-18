@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import gc
+import os
+import shutil
+import tempfile
 import time
 from typing import Dict, Optional, Sequence
 
@@ -82,10 +85,16 @@ def _save_hf_safetensor_distributed(
     save_path: str,
     fqn_to_index_mapping: Optional[Dict[str, int]],
     model_assets: Optional[Sequence],
+    is_rank_0: bool = False,
 ):
     """Distributed HuggingFace safetensors save using HuggingFaceStorageWriter (PyTorch >= 2.9).
 
     All ranks must call this function.
+
+    save_path can be a local path or a mount path. HuggingFaceStorageWriter first writes
+    each rank's shard to save_path, then rank 0 consolidates all shards and writes the
+    output to a local temp directory (to avoid EOPNOTSUPP on mounted filesystems), and
+    finally copies the consolidated files back to save_path.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
@@ -96,6 +105,17 @@ def _save_hf_safetensor_distributed(
         enable_consolidation=True,
         thread_count_consolidation=5,
     )
+
+    # Redirect consolidation output to a local temp dir instead of the mount path to avoid
+    # memoryview write issues (EOPNOTSUPP) on mounted filesystems.
+    # - Consolidated output goes to local temp dir (rank 0 only, via finish())
+    # Note: Only rank 0 executes storage_writer.finish()
+    # so consolidated_output_path is only used on rank 0
+    local_tmp_dir = None
+    if is_rank_0:
+        local_tmp_dir = tempfile.mkdtemp(prefix="veomni_hf_save_")
+        storage_writer.consolidated_output_path = local_tmp_dir
+        logger.info(f"Redirected consolidated_output_path to rank 0 local temp dir: {local_tmp_dir}")
 
     save_state = get_model_save_state(model, fqn_to_index_mapping)
 
@@ -115,8 +135,24 @@ def _save_hf_safetensor_distributed(
     elapsed_time = time.time() - start_time
     logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
 
+    # Rank 0: copy consolidated files from local temp to mount path, then clean up
+    if is_rank_0:
+        os.makedirs(save_path, exist_ok=True)
+        copy_start = time.time()
+        for filename in os.listdir(local_tmp_dir):
+            src_file = os.path.join(local_tmp_dir, filename)
+            dst_file = os.path.join(save_path, filename)
+            if os.path.isfile(src_file):
+                shutil.copy2(src_file, dst_file)
+        copy_elapsed = time.time() - copy_start
+        logger.info_rank0(
+            f"Copied consolidated safetensors from {local_tmp_dir} to {save_path} in {copy_elapsed:.2f}s"
+        )
+        # Clean up local temp dir
+        shutil.rmtree(local_tmp_dir, ignore_errors=True)
+
     # Save model assets (config, tokenizer, etc.) on rank 0
-    if model_assets and (not dist.is_initialized() or dist.get_rank() == 0):
+    if model_assets and is_rank_0:
         save_model_assets(save_path, model_assets)
 
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_path} successfully!")
@@ -199,7 +235,7 @@ def save_hf_safetensor(
             dist.barrier()
 
     if use_distributed:
-        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
+        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, is_rank_0)
     else:
         # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
