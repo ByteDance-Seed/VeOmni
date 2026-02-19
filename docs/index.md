@@ -54,6 +54,13 @@ key_features/ulysses.md
 key_features/preprocessor_registry.md
 ```
 
+```{toctree}
+:maxdepth: 1
+:caption: Transformers v5 Updates
+
+transformers_v5/index.md
+```
+
 ---
 
 ## Citation

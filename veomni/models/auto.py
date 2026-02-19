@@ -26,6 +26,7 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
 
 
@@ -163,5 +164,14 @@ def build_foundation_model(
             return original_forward(*args, **kwargs)
 
         model.forward = wrapped_forward
+
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        assert not getattr(model, "use_kernels", False), (
+            "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "
+            "to avoid unexpected kernel loading side effects."
+        )
+
+    model_class_path = f"{model.__class__.__module__}.{model.__class__.__name__}"
+    logger.info_rank0(f"Built foundation model class: {model_class_path}")
 
     return model

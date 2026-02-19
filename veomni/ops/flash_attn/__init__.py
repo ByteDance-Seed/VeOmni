@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from types import SimpleNamespace
+from typing import Callable, Optional
 
 import torch
 from transformers.modeling_flash_attention_utils import (
@@ -26,10 +27,94 @@ from ...distributed.sequence_parallel import (
     gather_seq_scatter_heads,
 )
 from ...utils import logging
+from ...utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 logger = logging.get_logger(__name__)
 _flash_attention_forward = None
+_original_load_and_register_attn_kernel: Callable | None = None
+_veomni_hub_kernel_loader_patch_applied = False
+
+_VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
+    "veomni_flash_attention_2_with_sp": "flash_attention_2",
+    "veomni_flash_attention_3_with_sp": "flash_attention_3",
+}
+
+
+def _is_veomni_custom_flash_attention(implementation: str | None) -> bool:
+    return implementation in _VEOMNI_FLASH_ATTN_IMPL_MAPPING
+
+
+def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace:
+    """
+    Build a local kernel-like object for VeOmni custom attention names.
+
+    This object mimics the minimal interface expected by Transformers `_lazy_imports`,
+    i.e. it exposes `flash_attn_func` and `flash_attn_varlen_func`.
+    """
+    if implementation == "veomni_flash_attention_2_with_sp":
+        try:
+            from flash_attn import flash_attn_func, flash_attn_varlen_func
+        except ImportError as e:
+            raise ImportError(
+                "VeOmni attention implementation `veomni_flash_attention_2_with_sp` requires "
+                "`flash_attn` (FA2) to be importable."
+            ) from e
+    elif implementation == "veomni_flash_attention_3_with_sp":
+        try:
+            from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+        except ImportError as e:
+            raise ImportError(
+                "VeOmni attention implementation `veomni_flash_attention_3_with_sp` requires "
+                "`flash_attn_interface` (FA3) to be importable."
+            ) from e
+    else:
+        raise ValueError(f"Unknown VeOmni flash attention implementation: {implementation}")
+
+    return SimpleNamespace(
+        flash_attn_func=flash_attn_func,
+        flash_attn_varlen_func=flash_attn_varlen_func,
+    )
+
+
+def _patch_transformers_hub_kernel_loader_for_veomni():
+    """
+    Patch Transformers hub-kernel loader to support VeOmni custom attention names.
+
+    See docs/transformers_v5/veomni_flash_attention_kernel_adapter.md for
+    background, failure mode, and design details.
+
+    Transformers>=5 may route custom flash names through
+    `transformers.integrations.hub_kernels.load_and_register_attn_kernel`.
+    VeOmni names are not hub kernel identifiers, so we intercept and provide
+    local FA2/FA3 functions directly.
+    """
+    global _veomni_hub_kernel_loader_patch_applied
+    global _original_load_and_register_attn_kernel
+
+    if _veomni_hub_kernel_loader_patch_applied:
+        return
+
+    try:
+        import transformers.integrations.hub_kernels as hub_kernels
+    except ImportError as e:
+        logger.warning_rank0(f"Failed to patch Transformers hub kernel loader for VeOmni attention: {e}")
+        return
+
+    _original_load_and_register_attn_kernel = getattr(hub_kernels, "load_and_register_attn_kernel", None)
+    if not callable(_original_load_and_register_attn_kernel):
+        logger.warning_rank0("Transformers hub kernel loader is unavailable; VeOmni attention loader patch skipped.")
+        return
+
+    def _veomni_load_and_register_attn_kernel(
+        attn_implementation: str, attention_wrapper: Callable | None = None
+    ) -> SimpleNamespace | object:
+        if _is_veomni_custom_flash_attention(attn_implementation):
+            return _load_veomni_local_flash_kernel(attn_implementation)
+        return _original_load_and_register_attn_kernel(attn_implementation, attention_wrapper)
+
+    hub_kernels.load_and_register_attn_kernel = _veomni_load_and_register_attn_kernel
+    _veomni_hub_kernel_loader_patch_applied = True
 
 
 def transformers_flash_attention_forward(
@@ -199,6 +284,8 @@ def flash_attention_forward(
 
 
 def apply_veomni_attention_patch():
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        _patch_transformers_hub_kernel_loader_for_veomni()
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", flash_attention_forward)
     global _flash_attention_forward
