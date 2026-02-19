@@ -4,13 +4,13 @@ from ....distributed.parallel_plan import ParallelPlan
 
 
 def get_parallel_plan():
-    # NOTE: Expert Parallelism (EP) with FSDP2 is NOT ready for this model yet.
-    # This parallel plan is only added to prevent errors during model initialization.
-    # TODO: Implement proper EP support for Qwen3OmniMoe.
+    # Thinker experts use stacked 3-D weight tensors (num_experts, out, in),
+    # so EP shards along dim-0 (the expert dimension).
+    # NOTE: Talker training is not supported yet. Only thinker EP is planned here.
     ep_plan = {
-        "thinker.model.layers.*.mlp.experts.*.gate_proj.weight": Shard(0),
-        "thinker.model.layers.*.mlp.experts.*.up_proj.weight": Shard(0),
-        "thinker.model.layers.*.mlp.experts.*.down_proj.weight": Shard(0),
+        "thinker.model.layers.*.mlp.experts.gate_proj": Shard(0),
+        "thinker.model.layers.*.mlp.experts.up_proj": Shard(0),
+        "thinker.model.layers.*.mlp.experts.down_proj": Shard(0),
     }
     parallel_plan = ParallelPlan(
         ep_plan=ep_plan,
