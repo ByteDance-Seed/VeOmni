@@ -417,25 +417,70 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                         image_idx += 1
                         remain_images -= 1
 
-                    # Video Only
+                    # Video Only (token-level) — may still have audio track depending on audio_seqlens
                     elif min_ed == ed_vision_start and input_ids[ed_vision_start + 1] == video_token_id:
-                        grid_t = video_grid_thw[video_idx][0]
-                        grid_hs = video_grid_thw[:, 1]
-                        grid_ws = video_grid_thw[:, 2]
-                        t_index = (
-                            torch.arange(grid_t) * second_per_grids[video_idx].cpu().float() * position_id_per_seconds
-                        ).float()
-                        llm_pos_ids = self.get_llm_pos_ids_for_vision(
-                            st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
-                        )
-                        video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
-                        llm_pos_ids_list.append(llm_pos_ids)
+                        # --- Patch: support mixed data of video_w_audio & video_w/o_audio ---
+                        # The original HF implementation uses a global `use_audio_in_video` flag,
+                        # which cannot handle a batch where some videos have audio and others don't.
+                        # We adopt the same per-video check as Qwen2.5-Omni (modeling_qwen2_5_omni.py):
+                        # audio_seqlens has one entry per video (0 means no audio track for that video).
+                        # NOTE: index by audio_idx (not video_idx) since pure-audio tokens before this
+                        # video will have already advanced audio_idx independently of video_idx.
+                        if audio_seqlens is not None:
+                            if audio_seqlens[audio_idx] == 0:
+                                use_audio_in_video = False
+                                audio_idx += 1  # consume the zero-length placeholder ONLY when there is no audio
+                            else:
+                                use_audio_in_video = True
+                        else:
+                            use_audio_in_video = False
+                        # --- Patch end ---
 
-                        st += int(text_len + bos_len + video_len + eos_len)
-                        video_idx += 1
-                        remain_videos -= 1
+                        if not use_audio_in_video:
+                            grid_t = video_grid_thw[video_idx][0]
+                            grid_hs = video_grid_thw[:, 1]
+                            grid_ws = video_grid_thw[:, 2]
+                            t_index = (
+                                torch.arange(grid_t)
+                                * second_per_grids[video_idx].cpu().float()
+                                * position_id_per_seconds
+                            ).float()
+                            llm_pos_ids = self.get_llm_pos_ids_for_vision(
+                                st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                            )
+                            video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+                            llm_pos_ids_list.append(llm_pos_ids)
 
-                    # Audio in Video
+                            st += int(text_len + bos_len + video_len + eos_len)
+                            video_idx += 1
+                            remain_videos -= 1
+                        else:
+                            # Video with audio track: interleave video and audio position ids
+                            audio_len = _get_feat_extract_output_lengths(audio_seqlens[audio_idx])
+                            audio_llm_pos_ids = torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
+                            grid_t = video_grid_thw[video_idx][0]
+                            grid_hs = video_grid_thw[:, 1]
+                            grid_ws = video_grid_thw[:, 2]
+                            t_index = (
+                                torch.arange(grid_t)
+                                * second_per_grids[video_idx].cpu().float()
+                                * position_id_per_seconds
+                            ).float()
+                            video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
+                                st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                            )
+                            interleaved_pos_ids = torch.cat((video_llm_pos_ids, audio_llm_pos_ids), dim=1)
+                            sorted_indices = torch.argsort(interleaved_pos_ids[0], stable=True)
+                            llm_pos_ids_list.append(interleaved_pos_ids[:, sorted_indices])
+                            video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+
+                            st += int(text_len + bos_len + audio_len + video_len + eos_len)
+                            audio_idx += 1
+                            video_idx += 1
+                            remain_videos -= 1
+                            remain_audios -= 1
+
+                    # Audio in Video (token-level: <vision_start><audio_start>...) — kept for HF compatibility
                     elif min_ed == ed_vision_start and ed_vision_start + 1 == ed_audio_start:
                         audio_len = _get_feat_extract_output_lengths(audio_seqlens[audio_idx])
                         audio_llm_pos_ids = torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
@@ -449,25 +494,9 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                         video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
                             st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                         )
-                        video_data_index, audio_data_index = 0, 0
-                        while (
-                            video_data_index < video_llm_pos_ids.shape[-1]
-                            and audio_data_index < audio_llm_pos_ids.shape[-1]
-                        ):
-                            if video_llm_pos_ids[0][video_data_index] <= audio_llm_pos_ids[0][audio_data_index]:
-                                llm_pos_ids_list.append(video_llm_pos_ids[:, video_data_index : video_data_index + 1])
-                                video_data_index += 1
-                            else:
-                                llm_pos_ids_list.append(audio_llm_pos_ids[:, audio_data_index : audio_data_index + 1])
-                                audio_data_index += 1
-                        if video_data_index < video_llm_pos_ids.shape[-1]:
-                            llm_pos_ids_list.append(
-                                video_llm_pos_ids[:, video_data_index : video_llm_pos_ids.shape[-1]]
-                            )
-                        if audio_data_index < audio_llm_pos_ids.shape[-1]:
-                            llm_pos_ids_list.append(
-                                audio_llm_pos_ids[:, audio_data_index : audio_llm_pos_ids.shape[-1]]
-                            )
+                        interleaved_pos_ids = torch.cat((video_llm_pos_ids, audio_llm_pos_ids), dim=1)
+                        sorted_indices = torch.argsort(interleaved_pos_ids[0], stable=True)
+                        llm_pos_ids_list.append(interleaved_pos_ids[:, sorted_indices])
                         video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
 
                         st += int(text_len + bos_len + audio_len + video_len + eos_len)
