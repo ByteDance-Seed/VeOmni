@@ -33,22 +33,34 @@ logger = logging.get_logger(__name__)
 class DynamicBatchingSizeDataset(IterableDataset):
     """Dynamic batching dataset that yields micro batches based on token count.
 
-    Unlike DynamicBatchSizeDataLoader which constructs micro batches from items fetched
-    from a dataloader in the main process, DynamicBatchingSizeDataset provides a
-    dataset-like interface to yield micro batches, which can be applied to multi-worker
-    dataloaders.
+    Unlike ``DynamicBatchSizeDataLoader``, which constructs micro batches in the
+    main process after fetching from a plain DataLoader, ``DynamicBatchingSizeDataset``
+    performs batching inside each DataLoader worker process.
+    It is also compatible with ``StatefulDataLoader``'s per-worker ``state_dict()`` /
+    ``load_state_dict()`` mechanism, enabling exact checkpoint / resume for dynamic-batching workloads.
 
-    This dataset buffers samples and creates batches when the total token count reaches
-    the specified threshold, enabling efficient variable-length sequence batching.
+    Internally each worker maintains a sample buffer.  A micro batch is emitted once
+    the buffer holds at least ``ready_for_micro_batch_threshold`` samples **and** their
+    combined token count reaches ``micro_batch_seq_length``.  When the upstream dataset
+    is exhausted, remaining buffer contents are drained and emitted as final batches
+    regardless of the threshold.
 
     Attributes:
-        dataset: The underlying iterable dataset to batch.
-        dynamic_batching_collate_fn: Function to collate samples into a batch.
-        ready_for_micro_batch_threshold: Minimum number of samples in buffer before batching.
-        micro_batch_seq_length: Target total token count per batch.
-        get_length_fn: Function to get the length (token count) of a sample.
-        save_by_idx: Whether to save sample indices for checkpoint resumption.
-        force_generate_long_sequence: If True, when a sample is longer than micro_batch_seq_length, force to generate a micro batch with this sample.
+        dataset: The upstream iterable dataset to read samples from.
+        dynamic_batching_collate_fn: Callable that collates a list of samples into a
+            single micro batch.
+        ready_for_micro_batch_threshold: Minimum number of samples that must be in the
+            buffer before a microbatch can be formed.
+        micro_batch_seq_length: Target total token count per micro batch (soft upper
+            bound; may be exceeded by a single overlong sample when
+            ``force_generate_long_sequence`` is True).
+        get_length_fn: Function that returns the token count of a single sample.
+        save_by_idx: Whether to checkpoint the buffer as sample indices (smaller checkpoint size)
+            rather than full sample tensors.
+        force_generate_long_sequence: If True, a sample whose length alone exceeds
+            ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
+            being silently discarded.  Prevents training stalls on datasets that contain
+            very long sequences.
     """
 
     def __init__(
@@ -74,10 +86,14 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 Requires dataset to have get_item method and output_refetch_idx attribute.
             get_length_fn: Function to compute the length (token count) of a sample.
                 Defaults to len.
-            force_generate_long_sequence: If True, when a sample is longer than micro_batch_seq_length, force to generate a micro batch with this sample.
+            force_generate_long_sequence: If True, a sample whose length alone exceeds
+                ``micro_batch_seq_length`` is emitted as a single-sample batch rather
+                than being skipped.  If False, such samples are logged and dropped.
 
         Raises:
-            ValueError: If save_by_idx is True but dataset lacks required methods.
+            ValueError: If ``save_by_idx`` is True but ``dataset`` does not expose the
+                ``get_item()`` method and ``output_refetch_idx`` attribute required to
+                reconstruct the buffer from indices on resume.
         """
         self.dataset = dataset
         self.dynamic_batching_collate_fn = dynamic_batching_collate_fn
@@ -163,17 +179,23 @@ class DynamicBatchingSizeDataset(IterableDataset):
                     raise
 
     def _get_micro_batch(self):
-        """Construct a micro batch from buffered samples.
+        """Construct a micro batch from buffered samples using a greedy first-fit strategy.
 
-        Selects samples from the buffer to create a batch with total token count
-        not exceeding micro_batch_seq_length. Samples that don't fit are kept in
-        the buffer for the next batch.
+        Iterates the buffer in order and greedily adds each sample whose length fits
+        within the remaining token budget (``micro_batch_seq_length - seq_length``).
+        Samples that do not fit are left in the buffer for subsequent batches.
+
+        Special case: when the buffer's first sample alone exceeds
+        ``micro_batch_seq_length`` and ``force_generate_long_sequence`` is True, that
+        sample is taken unconditionally (``seq_length == 0`` guard) so that the dataset
+        never stalls on an overlong sequence.
 
         Returns:
-            list: A list of samples forming the micro batch.
+            list: Non-empty list of samples forming the micro batch.
 
         Raises:
-            AssertionError: If no samples could be selected for the batch.
+            AssertionError: If no sample could be selected (should never happen under
+                normal operation).
         """
         micro_batch = []
         seq_length = 0
@@ -251,7 +273,11 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 - dynamic_batch_upstream_dataset_state: Upstream dataset state (optional).
 
         Raises:
-            AssertionError: If restored buffer_token_count doesn't match actual token count.
+            AssertionError: If the restored ``buffer_token_count`` does not match the
+                sum of token lengths recomputed from the reconstructed buffer.
+            ValueError: If ``save_by_idx`` is True on the current instance but the
+                checkpoint buffer holds some full samples instead of indices (incompatible
+                checkpoint format).
         """
         # prev_save_by_idx does not have to be equal to self.save_by_idx, however, we still need to resume the buffer according to it.
         prev_save_by_idx = state_dict["save_by_idx"]

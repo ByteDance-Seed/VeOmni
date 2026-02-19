@@ -1,21 +1,35 @@
 """Tests for DynamicBatchingSizeDataset functionality.
 
-This module tests the DynamicBatchingSizeDataset class using DummyIterableDataset
-and DummyMappingDataset. It validates that DynamicBatchingSizeDataset can properly:
+This module tests the ``DynamicBatchingSizeDataset`` class using ``DummyIterableDataset``.
+It validates that ``DynamicBatchingSizeDataset`` can properly:
 
-1. Batch samples based on token count (micro_batch_seq_length)
-2. Handle buffer management with ready_for_micro_batch_threshold
-3. Work with both shuffled and non-shuffled iterable datasets
-4. Support state_dict save/load for checkpointing in distributed environments
+1. Batch samples based on token count (``micro_batch_seq_length``).
+2. Handle buffer management with ``ready_for_micro_batch_threshold``.
+3. Work with both shuffled and non-shuffled iterable datasets.
+4. Drain remaining buffer contents after the upstream dataset is exhausted.
+5. Reject invalid construction arguments (``save_by_idx`` without ``get_item``).
+6. Save and restore buffer state for exact checkpoint / resume in distributed
+   environments, both by storing full samples and by storing only indices.
 
 The test suite includes:
-    - Unit tests that can run without distributed setup:
-        - test_dynamic_batching_basic
-    - End-to-end tests that require multi-GPU distributed environments:
-        - test_dynamic_batching_dataset_shuffled
-        - test_dynamic_batching_dataset_no_shuffle
+
+    Unit tests (run without distributed setup, CPU-compatible):
+        - ``test_dynamic_batching_basic`` – core batching logic and expected batch
+          contents for shuffled and non-shuffled data.
+        - ``test_force_long_sequence`` – overlong samples are emitted rather than
+          dropped when ``force_generate_long_sequence=True``.
+        - ``test_last_batch_on_dataset_end`` – remaining buffer items are yielded
+          after upstream exhaustion.
+        - ``test_dynamic_batching_without_get_item`` – ``ValueError`` is raised when
+          ``save_by_idx=True`` but the dataset lacks ``get_item``.
+
+    End-to-end distributed tests (require ``torchrun`` with 2 processes):
+        - ``test_dynamic_batching_dataset_distributed`` – parametrised over
+          ``shuffle × save_by_idx`` (4 combinations), verifying that resumed
+          batches are byte-for-byte identical to the original run.
 """
 
+import argparse
 import os
 import subprocess
 import sys
@@ -279,7 +293,7 @@ def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
 
 
 def test_dynamic_batching_without_get_item():
-    """Test DynamicBatchingSizeDataset initialization without get_item povided.
+    """Test DynamicBatchingSizeDataset initialization without get_item provided.
 
     Tests that DynamicBatchingSizeDataset cannot be initialized with save_by_idx=True
     when the dataset doesn't have get_item method.
@@ -316,7 +330,7 @@ def test_dynamic_batching_without_get_item():
 def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx):
     """Test DynamicBatchingSizeDataset in distributed setting.
 
-    Runs main_distributed_test() by torchrun with or without data shuffling
+    Runs _main_distributed_test() by torchrun with or without data shuffling
     and with or without save_by_idx for checkpoint buffer saving.
 
     Args:
@@ -358,7 +372,7 @@ def build_command(shuffle=True, save_by_idx=True):
         "--data.train_size=2000",
         "--data.max_seq_len=16",
         "--train.micro_batch_size=2",
-        f"--data.shuffle={str(shuffle).lower()}",
+        f"--shuffle={str(shuffle).lower()}",
         "--train.global_batch_size=16",
         "--train.data_parallel_mode=ddp",
         "--train.ckpt_manager=dcp",
@@ -366,8 +380,8 @@ def build_command(shuffle=True, save_by_idx=True):
         "--train.rmpad=false",
         "--train.rmpad_with_pos_ids=true",
         "--train.dyn_bsz=true",
-        "--train.dyn_bsz_in_worker_loop=false",
-        f"--train.dyn_bsz_dataset_save_by_idx={str(save_by_idx).lower()}",
+        "--dyn_bsz_in_dataloader=false",
+        f"--save_by_idx={str(save_by_idx).lower()}",
         "--train.seed=42",
     ]
     return command
@@ -389,12 +403,11 @@ class Arguments:
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
-def main_distributed_test():
-    """
-    Tests:
-    - Dynamic batching with shuffled iterable dataset
-    - Checkpoint save/load with buffer state
-    - Multi-process distributed training
+def _main_distributed_test():
+    """Entry point for the distributed test launched by ``torchrun``.
+
+    It wraps ``_run_distributed_test()` and in the testing it is supposed to be
+    triggered by test_dynamic_batching_dataset_distributed().
     """
     # Patch empty_cache to avoid AttributeError on CPU
     with patch("veomni.utils.device.empty_cache", _mock_empty_cache):
@@ -402,7 +415,35 @@ def main_distributed_test():
 
 
 def _run_distributed_test():
-    """Internal function that runs the actual distributed test."""
+    """Run a full checkpoint-resume cycle and assert batch reproducibility.
+
+    Procedure
+    ---------
+    1. **Parse CLI flags**
+    2. **Initialise torch distributed state**
+    3. **Build a StatefulDataLoader** wrapping ``DummyIterableDataset`` →
+       ``DynamicBatchingSizeDataset`` with ``num_workers=2``.
+    4. **First pass (2 epochs)** – iterate the dataloader for both epochs.  Batches
+       before the designated save point (``epoch=1, step=2``) are discarded; batches
+       *after* that point are stored in ``batches_after_save_step`` as ground truth.
+       At the save point a checkpoint is written via ``Checkpointer.save()``,
+       capturing model weights, ``dataloader.state_dict()``, and
+       ``environ_meter.state_dict()``.
+    5. **Load checkpoint** – ``Checkpointer.load()`` restores all state; the
+       dataloader, dataset and environ-meter are restored through ``load_state_dict()``.
+    6. **Second pass (resume)** – iterate from the saved epoch / step through the
+       end of both epochs, collecting resumed batches in ``batch_after_resume``.
+    7. **Assert equality** – verify that ``batches_after_save_step`` and
+       ``batch_after_resume`` have the same length and that every tensor in every
+       micro-batch is identical element-wise.
+    """
+    _parser = argparse.ArgumentParser()
+    _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
+    _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
+    _parser.add_argument("--dyn_bsz_in_dataloader", type=lambda x: x.lower() == "true", default=True)
+    test_args, remaining_argv = _parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + remaining_argv
+
     args = parse_args(Arguments)
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
@@ -433,8 +474,7 @@ def _run_distributed_test():
 
     # Create DummyMappingDataset and DummyIterableDataset
     mapping_dataset = DummyMappingDataset(size=DATASET_SIZE)
-    shuffle = getattr(args.data, "shuffle", True)
-    iterable_dataset = DummyIterableDataset(mapping_dataset, shuffle=shuffle, seed=args.train.seed)
+    iterable_dataset = DummyIterableDataset(mapping_dataset, shuffle=test_args.shuffle, seed=args.train.seed)
 
     # Compute train_steps based on dataset size
     dataset_length = len(mapping_dataset)
@@ -452,11 +492,11 @@ def _run_distributed_test():
         train_steps=train_steps,
         rmpad=args.train.rmpad,
         dyn_bsz=args.train.dyn_bsz,
-        dyn_bsz_in_worker_loop=args.train.dyn_bsz_in_worker_loop,
+        dyn_bsz_in_dataloader=test_args.dyn_bsz_in_dataloader,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         dyn_bsz_buffer_size=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dyn_bsz_dataset_save_by_idx=args.train.dyn_bsz_dataset_save_by_idx,
+        dyn_bsz_dataset_save_by_idx=test_args.save_by_idx,
         num_workers=2,
         drop_last=False,
         pin_memory=args.data.pin_memory,
@@ -472,7 +512,6 @@ def _run_distributed_test():
         empty_cache_steps=args.train.empty_cache_steps,
     )
 
-    batches_before_save_step = []
     batches_after_save_step = []
     epoch_num = 2  # Run 2 epochs
     start_epoch, start_step, global_step = 0, 0, 0
@@ -504,18 +543,16 @@ def _run_distributed_test():
 
             # Print batch info for debugging
             """
-            logger.info(f"[rank{rank}] epoch:{epoch} step:{local_step} global_step:{global_step} num_micro_batches:{len(micro_batches)}")
+            logger.error(f"[rank{rank}] epoch:{epoch} step:{local_step} global_step:{global_step} num_micro_batches:{len(micro_batches)} dataset_iter: {dataloader.dataset._data_iter}")
             for micro_idx, micro_batch in enumerate(micro_batches):
                 # Extract sample indices from input_ids (each sample has all same values)
                 input_ids = micro_batch["input_ids"].squeeze(0)  # Remove batch dim
                 input_ids = set(input_ids.tolist())
-                logger.info(f"[rank{rank}] epoch:{epoch} step:{local_step} global_step:{global_step} micro_batch[{micro_idx}]: {input_ids}")
+                logger.error(f"[rank{rank}] epoch:{epoch} step:{local_step} global_step:{global_step} micro_batch[{micro_idx}]: {input_ids}")
             """
 
             if epoch > save_epoch or (epoch == save_epoch and local_step > save_step):
                 batches_after_save_step.append(micro_batches)
-            else:
-                batches_before_save_step.append(micro_batches)
 
             for _, micro_batch in enumerate(micro_batches):
                 environ_meter.add(micro_batch)
@@ -623,4 +660,4 @@ def _run_distributed_test():
 
 
 if __name__ == "__main__":
-    main_distributed_test()
+    _main_distributed_test()

@@ -420,21 +420,9 @@ class TrainingArguments:
         default="worker",
         metadata={"help": "Use main process or worker process to run dynamic batch size."},
     )
-    dyn_bsz_in_worker_loop: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether the dynamic batch construction is in DataLoader's worker loop or in Dataset's iterator."
-        },
-    )
     dyn_bsz_buffer_size: int = field(
         default=200,
         metadata={"help": "Buffer size for dynamic batch size."},
-    )
-    dyn_bsz_dataset_save_by_idx: bool = field(
-        default=True,
-        metadata={
-            "help": "When dyn_bsz_in_worker_loop is False, it is to decide whether to save buffer by index for checkpointing in DynamicBatchingSizeDataset."
-        },
     )
     bsz_warmup_ratio: float = field(
         default=0,
@@ -740,15 +728,9 @@ class TrainingArguments:
 
         # calculate dataloader batch size
         # for:
-        #   - DynamicBatchingSizeDataset and StatefulDataLoader
         #   - StreamingDataset and StreamingDataLoader
-        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz:
-            if self.dyn_bsz_in_worker_loop:
-                self.dataloader_batch_size = 1
-            else:
-                self.dataloader_batch_size = self.global_batch_size // (
-                    self.micro_batch_size * self.data_parallel_size
-                )
+        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker" and self.dyn_bsz:
+            self.dataloader_batch_size = 1
         else:
             self.dataloader_batch_size = self.global_batch_size // self.data_parallel_size  # = micro bsz * grad accu
 

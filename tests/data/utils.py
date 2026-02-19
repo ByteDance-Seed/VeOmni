@@ -17,12 +17,16 @@ logger = helper.create_logger(__name__)
 
 
 class DummyMappingDataset(Dataset):
-    """Mapping-style dataset that generates dummy data based on index."""
+    """Mapping-style dataset that generates deterministic dummy samples by index.
+
+    * Sample at 0-based index ``i`` contains **i + 1** tokens, each with value
+      ``i + 1``.  For example index 0 → ``[1]``, index 4 → ``[5, 5, 5, 5, 5]``.
+    """
 
     def __init__(self, size: int = 100):
         """
         Args:
-            size: Total number of samples in the dataset
+            size: Total number of samples in the dataset.
         """
         self.size = size
 
@@ -30,7 +34,22 @@ class DummyMappingDataset(Dataset):
         return self.size
 
     def __getitem__(self, idx):
-        """Generate data following the same pattern as DummyDataset.generate_data"""
+        """Return the dummy sample at position *idx*.
+
+        Args:
+            idx: 0-based integer index into the dataset.
+
+        Returns:
+            dict with keys:
+
+            * ``"input_ids"`` – 1-D ``LongTensor`` of length ``idx + 1``, filled
+              with the scalar value ``idx + 1``.
+            * ``"attention_mask"`` – all-ones tensor of the same shape.
+            * ``"labels"`` – clone of ``input_ids``.
+
+        Raises:
+            IndexError: If ``idx`` is outside ``[0, size)``.
+        """
         if idx < 0 or idx >= self.size:
             raise IndexError(f"Index {idx} out of range [0, {self.size})")
 
@@ -41,14 +60,34 @@ class DummyMappingDataset(Dataset):
 
 
 class DummyIterableDataset(IterableDataset):
-    """Iterable dataset that reads from DummyMappingDataset sequentially or with shuffle."""
+    """Iterable wrapper around ``DummyMappingDataset`` with built-in sharding and optional shuffle.
+
+    Designed to tested with ``DynamicBatchingSizeDataset`` and ``StatefulDataLoader`` checkpointing:
+
+    * **Sharding** – samples are distributed across distributed ranks *and* DataLoader
+      workers using a round-robin interleave strategy (rank-major, then worker-minor),
+      so each dataloader worker on each rank sees a disjoint, deterministic subset of the data.
+    * **Shuffle** – when ``shuffle=True``, a fixed ``torch.randperm`` generated from
+      ``seed`` at construction time is used so that the shuffled order is reproducible
+      and consistent across checkpoint / resume cycles.
+    * **Index output** – when ``output_refetch_idx`` is set to ``True`` (by
+      ``DynamicBatchingSizeDataset`` when ``save_by_idx=True``), each ``__iter__``
+      yield is a ``(sample_dict, original_index)`` tuple instead of a bare dict,
+      allowing the consumer to store the indices instead of the full samples when saving checkpoints,
+      and reconstruct the buffer from indices on resume.
+    * **State dict** – ``state_dict()`` / ``load_state_dict()`` persist
+      ``_current_idx`` so that ``StatefulDataLoader`` can snapshot and restore the
+      exact position of the iterator.
+    """
 
     def __init__(self, mapping_dataset: DummyMappingDataset, shuffle: bool = False, seed: int = 42):
         """
         Args:
-            mapping_dataset: The underlying DummyMappingDataset to read from
-            shuffle: Whether to shuffle the reading order
-            seed: Random seed for shuffling
+            mapping_dataset: The upstream ``DummyMappingDataset`` to read from.
+            shuffle: Whether to shuffle the reading order.  Shuffling is performed
+                once at construction time using ``seed`` so that it is stable across
+                distributed workers.
+            seed: Random seed used to generate the permutation when ``shuffle=True``.
         """
         self.mapping_dataset = mapping_dataset
         self.shuffle = shuffle
@@ -111,6 +150,18 @@ class DummyIterableDataset(IterableDataset):
                 yield self.mapping_dataset[idx]
 
     def get_item(self, idx):
+        """Fetch a single sample by its original dataset index.
+
+        Used by ``DynamicBatchingSizeDataset.load_state_dict()`` to reconstruct
+        buffer contents when ``save_by_idx=True``: the saved indices are passed
+        back here one-by-one to rebuild the exact pre-checkpoint buffer.
+
+        Args:
+            idx: 0-based integer index into the underlying ``DummyMappingDataset``.
+
+        Returns:
+            Sample as returned by ``DummyMappingDataset.__getitem__``.
+        """
         return self.mapping_dataset[idx]
 
     def state_dict(self):

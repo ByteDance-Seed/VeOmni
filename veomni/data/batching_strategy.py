@@ -92,24 +92,6 @@ class DynBszBuffer:
             self.append(item)
 
 
-class IdentityPacker:
-    def __init__(self, token_micro_bsz, bsz_warmup_steps, bsz_warmup_init_mbtoken):
-        self.token_micro_bsz = token_micro_bsz
-        self.bsz_warmup_steps = bsz_warmup_steps
-        self.bsz_warmup_init_mbtoken = bsz_warmup_init_mbtoken
-
-    def __call__(self, samples):
-        return samples
-
-    def get_token_num_to_request(self, cur_step, warmup):
-        return (
-            (self.token_micro_bsz - self.bsz_warmup_init_mbtoken) * cur_step // self.bsz_warmup_steps
-            + self.bsz_warmup_init_mbtoken
-            if warmup
-            else self.token_micro_bsz
-        )
-
-
 class BaseBatchingStrategy:
     """
     Base class for batching strategy.
@@ -126,6 +108,24 @@ class BaseBatchingStrategy:
 
     def empty(self) -> bool:
         raise NotImplementedError("should implement `empty`")
+
+
+class IdentityPacker:
+    def __init__(self, token_micro_bsz, bsz_warmup_steps, bsz_warmup_init_mbtoken):
+        self.token_micro_bsz = token_micro_bsz
+        self.bsz_warmup_steps = bsz_warmup_steps
+        self.bsz_warmup_init_mbtoken = bsz_warmup_init_mbtoken
+
+    def __call__(self, samples):
+        return samples
+
+    def get_token_num_to_request(self, cur_step, warmup):
+        return (
+            (self.token_micro_bsz - self.bsz_warmup_init_mbtoken) * cur_step // self.bsz_warmup_steps
+            + self.bsz_warmup_init_mbtoken
+            if warmup
+            else self.token_micro_bsz
+        )
 
 
 class TextBatchingStrategy(BaseBatchingStrategy):
