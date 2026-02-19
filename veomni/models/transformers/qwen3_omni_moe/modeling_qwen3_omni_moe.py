@@ -455,7 +455,7 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                             video_idx += 1
                             remain_videos -= 1
                         else:
-                            # Video with audio track: interleave video and audio position ids
+                            # --- Patch: Video with audio track: interleave video and audio position ids
                             audio_len = _get_feat_extract_output_lengths(audio_seqlens[audio_idx])
                             audio_llm_pos_ids = torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
                             grid_t = video_grid_thw[video_idx][0]
@@ -469,16 +469,38 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                             video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
                                 st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                             )
-                            interleaved_pos_ids = torch.cat((video_llm_pos_ids, audio_llm_pos_ids), dim=1)
-                            sorted_indices = torch.argsort(interleaved_pos_ids[0], stable=True)
-                            llm_pos_ids_list.append(interleaved_pos_ids[:, sorted_indices])
+                            video_data_index, audio_data_index = 0, 0
+                            while (
+                                video_data_index < video_llm_pos_ids.shape[-1]
+                                and audio_data_index < audio_llm_pos_ids.shape[-1]
+                            ):
+                                if video_llm_pos_ids[0][video_data_index] <= audio_llm_pos_ids[0][audio_data_index]:
+                                    llm_pos_ids_list.append(
+                                        video_llm_pos_ids[:, video_data_index : video_data_index + 1]
+                                    )
+                                    video_data_index += 1
+                                else:
+                                    llm_pos_ids_list.append(
+                                        audio_llm_pos_ids[:, audio_data_index : audio_data_index + 1]
+                                    )
+                                    audio_data_index += 1
+                            if video_data_index < video_llm_pos_ids.shape[-1]:
+                                llm_pos_ids_list.append(
+                                    video_llm_pos_ids[:, video_data_index : video_llm_pos_ids.shape[-1]]
+                                )
+                            if audio_data_index < audio_llm_pos_ids.shape[-1]:
+                                llm_pos_ids_list.append(
+                                    audio_llm_pos_ids[:, audio_data_index : audio_llm_pos_ids.shape[-1]]
+                                )
                             video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
 
                             st += int(text_len + bos_len + audio_len + video_len + eos_len)
+
                             audio_idx += 1
                             video_idx += 1
                             remain_videos -= 1
                             remain_audios -= 1
+                            # --- Patch end ---
 
                     # Audio in Video (token-level: <vision_start><audio_start>...) — kept for HF compatibility
                     elif min_ed == ed_vision_start and ed_vision_start + 1 == ed_audio_start:
@@ -494,9 +516,25 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                         video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
                             st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                         )
-                        interleaved_pos_ids = torch.cat((video_llm_pos_ids, audio_llm_pos_ids), dim=1)
-                        sorted_indices = torch.argsort(interleaved_pos_ids[0], stable=True)
-                        llm_pos_ids_list.append(interleaved_pos_ids[:, sorted_indices])
+                        video_data_index, audio_data_index = 0, 0
+                        while (
+                            video_data_index < video_llm_pos_ids.shape[-1]
+                            and audio_data_index < audio_llm_pos_ids.shape[-1]
+                        ):
+                            if video_llm_pos_ids[0][video_data_index] <= audio_llm_pos_ids[0][audio_data_index]:
+                                llm_pos_ids_list.append(video_llm_pos_ids[:, video_data_index : video_data_index + 1])
+                                video_data_index += 1
+                            else:
+                                llm_pos_ids_list.append(audio_llm_pos_ids[:, audio_data_index : audio_data_index + 1])
+                                audio_data_index += 1
+                        if video_data_index < video_llm_pos_ids.shape[-1]:
+                            llm_pos_ids_list.append(
+                                video_llm_pos_ids[:, video_data_index : video_llm_pos_ids.shape[-1]]
+                            )
+                        if audio_data_index < audio_llm_pos_ids.shape[-1]:
+                            llm_pos_ids_list.append(
+                                audio_llm_pos_ids[:, audio_data_index : audio_llm_pos_ids.shape[-1]]
+                            )
                         video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
 
                         st += int(text_len + bos_len + audio_len + video_len + eos_len)
@@ -2521,6 +2559,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        # --- Patch: handle pre-computed position_ids from data preprocessing ---
+        # During training with rmpad_with_pos_ids, position_ids are computed in vlm_data_process.py
+        # and stored as (dim=3, L) per sample, then collated to (bs, 3, L) by the data collator.
+        # The downstream model expects (3, bs, L), so we transpose here.
+        # This mirrors Patch.6 in modeling_qwen2_5_omni.py.
+        elif position_ids is not None:
+            if position_ids.ndim == 3 and position_ids.shape[1] == 3:
+                position_ids = position_ids.transpose(0, 1).contiguous()  # bs, 3, l -> 3, bs, l
+        # --- Patch end ---
 
         # Modification: Restore flash attention kwargs for language model to avoid CPU-GPU sync
         kwargs.update(flash_attn_kwargs)
