@@ -80,6 +80,7 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
+from ....ops import fused_moe_forward
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -4219,6 +4220,12 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
     config_class = Qwen3OmniMoeConfig
 
     def __init__(self, config: Qwen3OmniMoeConfig):
+        # [VeOmni Patch.3] Propagate _moe_implementation from top-level config to thinker_config
+        # and then to text_config before the thinker model is built.
+        # (mirrors qwen3_vl_moe's Qwen3VLMoeModel.__init__ pattern)
+        moe_implementation = getattr(config, "_moe_implementation", "eager")
+        config.thinker_config._moe_implementation = moe_implementation
+        config.thinker_config.text_config._moe_implementation = moe_implementation
         super().__init__(config)
 
         self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration._from_config(config.thinker_config)
@@ -4516,6 +4523,166 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
 
 
 # ================================================================
+# Patch: Qwen3OmniMoeThinkerTextSparseMoeBlock
+# 1. Replace nn.ModuleList experts with stacked-weight Experts module
+#    to support fused MoE forward and Expert Parallelism (EP)
+# ================================================================
+class Qwen3OmniMoeThinkerTextExperts(nn.Module):
+    """Stacked expert weights for Thinker MoE layers.
+
+    Weights are stored as 3-D tensors (num_experts, out_features, in_features)
+    so that a single fused grouped-GEMM kernel (or EP Shard) can be applied.
+    Shape convention (same as fused_moe_forward expectation):
+        gate_proj / up_proj : (num_experts, intermediate_size, hidden_size)
+        down_proj            : (num_experts, hidden_size,       intermediate_size)
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.moe_implementation = getattr(config, "_moe_implementation", "eager")
+
+        # Stacked weight tensors – loaded from merged checkpoints
+        self.gate_proj = nn.Parameter(torch.empty(self.num_experts, self.intermediate_size, self.hidden_size))
+        self.up_proj = nn.Parameter(torch.empty(self.num_experts, self.intermediate_size, self.hidden_size))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, self.intermediate_size))
+
+    # --- Patch.1 ---
+    def fused_forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused grouped-GEMM forward (training only)."""
+        # hidden_states: (num_tokens, hidden_size)  [already flattened by caller]
+        return fused_moe_forward(
+            module=self,
+            num_experts=self.num_experts,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            hidden_states=hidden_states,
+            fc1_1_weight=self.gate_proj,  # (num_experts, intermediate_size, hidden_size)
+            fc1_2_weight=self.up_proj,  # (num_experts, intermediate_size, hidden_size)
+            fc2_weight=self.down_proj,  # (num_experts, hidden_size,       intermediate_size)
+        )
+
+    # --- Patch.1 ---
+
+    def eager_forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Eager (loop-per-expert) forward – used for inference / non-fused path."""
+        ps = get_parallel_state()
+        if ps.ep_enabled:
+            raise NotImplementedError(
+                "eager_forward does not support Expert Parallelism (EP). Use the fused EP path instead."
+            )
+
+        num_tokens, hidden_dim = hidden_states.shape
+        final_hidden_states = torch.zeros_like(hidden_states)
+
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            # expert_idx is shape [1] from nonzero(); use .item() for scalar indexing into 3-D weights
+            e = expert_idx.item()
+            idx, top_x = torch.where(expert_mask[e])
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            # gate_proj / up_proj shape: (num_experts, intermediate_size, hidden_size)
+            g = current_state @ self.gate_proj[e].t()
+            u = current_state @ self.up_proj[e].t()
+            out = self.act_fn(g) * u
+            out = out @ self.down_proj[e].t()
+            final_hidden_states.index_add_(0, top_x, (out * routing_weights[top_x, idx, None]).to(hidden_states.dtype))
+        return final_hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.training and self.moe_implementation == "fused":
+            return self.fused_forward(hidden_states, routing_weights, selected_experts)
+        return self.eager_forward(hidden_states, routing_weights, selected_experts)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        """Only supports merged (stacked) checkpoint format.
+
+        Merged format (from merged checkpoints):
+            <prefix>gate_proj  shape (num_experts, intermediate_size, hidden_size)
+            <prefix>up_proj    shape (num_experts, intermediate_size, hidden_size)
+            <prefix>down_proj  shape (num_experts, hidden_size,       intermediate_size)
+        """
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            per_expert_key_0 = f"{prefix}0.{proj}.weight"
+            if per_expert_key_0 in state_dict:
+                raise ValueError(
+                    f"HF per-expert weight format detected (found '{per_expert_key_0}'). "
+                    "Only merged (stacked) checkpoint format is supported. "
+                    "Please convert your checkpoint using the merge script first."
+                )
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+
+# ================================================================
+# Patch: Qwen3OmniMoeThinkerTextSparseMoeBlock
+# 1. Replace nn.ModuleList experts with Qwen3OmniMoeThinkerTextExperts
+#    (stacked weights) so that fused MoE forward and EP are supported
+# 2. Propagate _moe_implementation from thinker config to text_config
+#    before Qwen3OmniMoeThinkerTextModel is built
+# ================================================================
+# --- Patch.2 ---
+def Qwen3OmniMoeThinkerTextSparseMoeBlock_init(self: Qwen3OmniMoeThinkerTextSparseMoeBlock, config) -> None:
+    # Call grandparent (nn.Module) init to avoid re-running the original __init__
+    nn.Module.__init__(self)
+    self.num_experts = config.num_experts
+    self.top_k = config.num_experts_per_tok
+    self.norm_topk_prob = config.norm_topk_prob
+
+    self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+    # --- Patch.2: use stacked Experts instead of nn.ModuleList ---
+    self.experts = Qwen3OmniMoeThinkerTextExperts(config)
+
+
+def Qwen3OmniMoeThinkerTextSparseMoeBlock_forward(
+    self: Qwen3OmniMoeThinkerTextSparseMoeBlock, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hidden_dim)
+
+    router_logits = self.gate(hidden_states)
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    if self.norm_topk_prob:
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.to(hidden_states.dtype)
+
+    # --- Patch.2 ---
+    final_hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
+    # --- Patch.2 ---
+
+    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    return final_hidden_states, router_logits
+
+
+# --- Patch.2 ---
+
+
+# ================================================================
 # Patch: Qwen3OmniMoePreTrainedModel.get_parallel_plan
 # 1. add parallel plan for expert parallelism
 # ================================================================
@@ -4531,7 +4698,15 @@ def _get_parallel_plan(self):
 
 def apply_veomni_qwen3_omni_moe_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen3_Omni_MoE.")
+    # --- Patch.1 ---
     Qwen3OmniMoePreTrainedModel.get_parallel_plan = _get_parallel_plan
+    # --- Patch.1 ---
+    # --- Patch.2 ---
+    # Replace nn.ModuleList experts with stacked-weight module + fused forward
+    # TODO: Add talker fused MoE support once talker text output is enabled
+    Qwen3OmniMoeThinkerTextSparseMoeBlock.__init__ = Qwen3OmniMoeThinkerTextSparseMoeBlock_init
+    Qwen3OmniMoeThinkerTextSparseMoeBlock.forward = Qwen3OmniMoeThinkerTextSparseMoeBlock_forward
+    # --- Patch.2 ---
 
 
 __all__ = [
