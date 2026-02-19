@@ -1,0 +1,34 @@
+model:
+  model_path: Qwen3-Embedding-0.6B
+  # This model can be downloaded from huggingface.
+  # The architectures setting in the config should be changed to Qwen3ForSequenceClassification,
+  # and num_labels should be added to the config.
+  attn_implementation: flash_attention_2
+data:
+  train_path: ag_news
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: classification
+  max_seq_len: 8192
+train:
+  output_dir: Qwen3-Embedding-0.6B-AGNews-Classification
+  data_parallel_mode: fsdp2
+  enable_full_shard: true
+  init_device: meta
+  enable_rank0_init: false
+  global_batch_size: 32
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: true
+  dyn_bsz: false
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  max_steps: 200
+  num_train_epochs: 1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  ulysses_parallel_size: 2
+  wandb_project: VeOmni
+  wandb_name: Qwen3-embedding-classification
