@@ -20,14 +20,8 @@ python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu
 # List available patch configurations
 python -m veomni.patchgen.run_codegen --list
 
-# Diff generated file against original HuggingFace code
+# Save unified diff alongside generated modeling code
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
-
-# Open diff in VS Code
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff --vscode
-
-# Save diff as .patch file
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff --save-patch changes.patch
 ```
 
 ## Project Structure
@@ -275,44 +269,17 @@ Output: `veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.p
 
 ## Comparing Generated vs Original Code
 
-Use the `--diff` flag to see exactly what changed between the original HuggingFace code and your generated file:
+Use the `--diff` flag to save a unified diff file next to the generated modeling file:
 
 ```bash
-# Show unified diff in terminal (uses delta or diff if available)
+# Generate patched modeling code and save a .diff file in output directory
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
-
-# Open diff in VS Code's built-in diff viewer
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff --vscode
-
-# Save diff to a .patch file (viewable in VS Code with syntax highlighting)
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff --save-patch changes.patch
-
-# Use Python's difflib instead of external tools
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff --no-external-diff
 ```
 
-### VS Code Integration
-
-**Option 1: Open in VS Code diff viewer** (recommended for side-by-side comparison)
-
-```bash
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff --vscode
-```
-
-This opens VS Code's built-in diff viewer with the original HF code on the left and generated code on the right.
-
-**Option 2: Save as .patch file** (good for sharing/reviewing)
-
-```bash
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff --save-patch veomni/models/transformers/qwen3/generated/changes.patch
-code veomni/models/transformers/qwen3/generated/changes.patch  # Open in VS Code with syntax highlighting
-```
-
-The diff command:
+With `--diff`, `run_codegen` writes:
 
 - Compares the generated file against the original HuggingFace source
-- Uses `delta` (if installed) for side-by-side colored terminal output
-- Falls back to standard `diff` or Python's `difflib`
+- Saves unified diff as `<generated_modeling_name>.diff` in the output directory
 - Shows exactly which classes, methods, and functions were modified
 
 Example output:
@@ -378,8 +345,7 @@ def modified_init(original_init, self, config, layer_idx):
 
 ```
 usage: python -m veomni.patchgen.run_codegen [-h] [-o OUTPUT_DIR] [-c CONFIG_NAME] [--list]
-                      [--dry-run] [--diff] [--no-external-diff] [--vscode]
-                      [--save-patch FILE] [-v]
+                      [--dry-run] [--diff] [-v]
                       [patch_module]
 
 positional arguments:
@@ -391,10 +357,7 @@ options:
   -c, --config-name     Config variable name in the patch module (default: config)
   --list                List available patch configurations
   --dry-run             Show what would be generated without writing files
-  --diff                Show diff between generated file and original HF code
-  --no-external-diff    Use Python difflib instead of external diff tools
-  --vscode              Open diff in VS Code's built-in diff viewer
-  --save-patch FILE     Save diff to a .patch file
+  --diff                Save a unified .diff file alongside generated modeling code
   -v, --verbose         Print detailed progress
 ```
 

@@ -20,26 +20,24 @@ common configurations. It can be used as a CLI tool or imported.
 
 Usage:
     # Generate from a specific patch configuration
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
 
     # Generate to a specific output directory
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -o /path/to/output
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o /path/to/output
 
     # List available patch configurations
     python -m veomni.patchgen.run_codegen --list
 
     # Dry run (show what would be generated without writing)
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --dry-run
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --dry-run
 
-    # Diff generated file against original HuggingFace code
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff
+    # Generate modeling code and save unified diff alongside it
+    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
 """
 
 import argparse
 import difflib
 import importlib
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -150,6 +148,7 @@ def run_codegen(
     output_dir: Optional[Path],
     config_name: str = "config",
     dry_run: bool = False,
+    save_diff: bool = False,
     verbose: bool = False,
 ) -> Optional[str]:
     """
@@ -160,6 +159,7 @@ def run_codegen(
         output_dir: Directory to write generated files (defaults to sibling generated/ next to patch module)
         config_name: Name of the config variable in the module
         dry_run: If True, don't write files
+        save_diff: If True, save a unified diff alongside the generated modeling file
         verbose: If True, print detailed progress
 
     Returns:
@@ -192,7 +192,8 @@ def run_codegen(
         if dry_run:
             print("\n[DRY RUN] Would generate:")
             print(f"  Output: {output_dir / config.target_file}")
-            print(f"  Diff:   {default_diff_path(output_dir, config.target_file)}")
+            if save_diff:
+                print(f"  Diff:   {default_diff_path(output_dir, config.target_file)}")
             print(f"  Source lines: ~{len(generator.source_code.splitlines())}")
             print(f"  Patches to apply: {len(config.patches)}")
             return generator.source_code
@@ -204,16 +205,17 @@ def run_codegen(
         print(f"\n✓ Generated: {output_path}")
         print(f"  Lines: {len(output.splitlines())}")
 
-        diff_output = build_unified_diff(
-            original_source=generator.source_code,
-            generated_source=output,
-            source_module=config.source_module,
-            target_file=config.target_file,
-        )
-        diff_path = default_diff_path(output_dir, config.target_file)
-        diff_path.write_text(diff_output)
-        print(f"✓ Diff: {diff_path}")
-        print(f"  Lines: {len(diff_output.splitlines())}")
+        if save_diff:
+            diff_output = build_unified_diff(
+                original_source=generator.source_code,
+                generated_source=output,
+                source_module=config.source_module,
+                target_file=config.target_file,
+            )
+            diff_path = default_diff_path(output_dir, config.target_file)
+            diff_path.write_text(diff_output)
+            print(f"✓ Diff: {diff_path}")
+            print(f"  Lines: {len(diff_output.splitlines())}")
 
         return output
 
@@ -232,169 +234,16 @@ def run_codegen(
         return None
 
 
-def run_diff(
-    patch_module: str,
-    output_dir: Optional[Path],
-    config_name: str = "config",
-    use_external_diff: bool = True,
-    context_lines: int = 3,
-    save_patch: Optional[Path] = None,
-    open_in_vscode: bool = False,
-) -> int:
-    """
-    Show diff between generated code and original HuggingFace code.
-
-    Args:
-        patch_module: Module path containing the PatchConfig
-        output_dir: Directory where generated files are stored
-        config_name: Name of the config variable in the module
-        use_external_diff: If True, try to use external diff tool (delta, diff)
-        context_lines: Number of context lines for unified diff
-        save_patch: If provided, save the diff to this file path
-        open_in_vscode: If True, open diff in VS Code
-
-    Returns:
-        0 on success, 1 on error
-    """
-    try:
-        # Import the patch module to get config
-        module = importlib.import_module(normalize_patch_module(patch_module))
-        config = getattr(module, config_name)
-
-        if output_dir is None:
-            output_dir = default_output_dir_for_module(module)
-
-        if not isinstance(config, PatchConfig):
-            print(f"Error: {config_name} in {patch_module} is not a PatchConfig", file=sys.stderr)
-            return 1
-
-        # Get the generated file path
-        generated_path = output_dir / config.target_file
-        if not generated_path.exists():
-            print(f"Error: Generated file not found: {generated_path}", file=sys.stderr)
-            print(f"Run 'python run_codegen.py {patch_module}' first to generate it.")
-            return 1
-
-        # Get original HF source
-        from .codegen import get_module_source
-
-        original_source = get_module_source(config.source_module)
-
-        # Read generated file
-        generated_source = generated_path.read_text()
-
-        # Create original file path for reference
-        module_path = config.source_module.replace(".", "/") + ".py"
-
-        # Write original to a persistent temp file (needed for VS Code)
-        original_tmp_path = output_dir / f"_original_{config.target_file}"
-        original_tmp_path.write_text(original_source)
-
-        # Open in VS Code
-        if open_in_vscode:
-            if shutil.which("code"):
-                print("Opening diff in VS Code:")
-                print(f"  Left (Original):  {original_tmp_path}")
-                print(f"  Right (Generated): {generated_path}")
-                subprocess.run(["code", "--diff", str(original_tmp_path), str(generated_path)])
-                return 0
-            else:
-                print("Error: 'code' command not found. Install VS Code and add to PATH.", file=sys.stderr)
-                return 1
-
-        # Generate unified diff
-        diff_output = build_unified_diff(
-            original_source=original_source,
-            generated_source=generated_source,
-            source_module=config.source_module,
-            target_file=config.target_file,
-            context_lines=context_lines,
-        )
-
-        # Save to patch file
-        if save_patch:
-            save_patch.parent.mkdir(parents=True, exist_ok=True)
-            save_patch.write_text(diff_output)
-            print(f"Saved patch file: {save_patch}")
-            print(f"  Open in VS Code: code {save_patch}")
-            return 0
-
-        # Try external diff tools for terminal output
-        if use_external_diff:
-            diff_tools = ["delta", "diff"]
-            diff_tool = None
-            for tool in diff_tools:
-                if shutil.which(tool):
-                    diff_tool = tool
-                    break
-
-            if diff_tool:
-                try:
-                    if diff_tool == "delta":
-                        cmd = [
-                            "delta",
-                            "--side-by-side",
-                            "--file-modified-label",
-                            str(generated_path),
-                            str(original_tmp_path),
-                            str(generated_path),
-                        ]
-                    else:
-                        cmd = [
-                            "diff",
-                            "-u",
-                            f"--label=Original: {module_path}",
-                            f"--label=Generated: {generated_path}",
-                            str(original_tmp_path),
-                            str(generated_path),
-                        ]
-
-                    print("Comparing:")
-                    print(f"  Original:  {config.source_module}")
-                    print(f"  Generated: {generated_path}")
-                    print()
-
-                    result = subprocess.run(cmd)
-                    return 0 if result.returncode in (0, 1) else result.returncode
-                finally:
-                    # Clean up temp file for terminal diff
-                    original_tmp_path.unlink(missing_ok=True)
-
-        # Fallback to Python's difflib
-        print("Comparing:")
-        print(f"  Original:  {config.source_module}")
-        print(f"  Generated: {generated_path}")
-        print()
-
-        if diff_output:
-            print(diff_output)
-        else:
-            print("No differences found.")
-
-        # Clean up
-        original_tmp_path.unlink(missing_ok=True)
-        return 0
-
-    except ImportError as e:
-        print(f"Error importing {patch_module}: {e}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Modeling Code Generator - Generate patched HuggingFace modeling code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches
-  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches -o /path/to/output
-  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --dry-run
-  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff
-  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --vscode
-  %(prog)s veomni.models.transformers.qwen3.patches.qwen3_gpu_patches --diff --save-patch changes.patch
+  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
+  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o /path/to/output
+  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --dry-run
+  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
   %(prog)s --list
         """,
     )
@@ -402,7 +251,7 @@ Examples:
     parser.add_argument(
         "patch_module",
         nargs="?",
-        help="Patch module to use (e.g., 'veomni.models.transformers.qwen3.patches.qwen3_gpu_patches')",
+        help="Patch module to use (e.g., 'veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config')",
     )
     parser.add_argument(
         "-o",
@@ -430,23 +279,7 @@ Examples:
     parser.add_argument(
         "--diff",
         action="store_true",
-        help="Show diff between generated file and original HuggingFace code",
-    )
-    parser.add_argument(
-        "--no-external-diff",
-        action="store_true",
-        help="Use Python difflib instead of external diff tools (delta, diff)",
-    )
-    parser.add_argument(
-        "--vscode",
-        action="store_true",
-        help="Open diff in VS Code's built-in diff viewer (requires --diff)",
-    )
-    parser.add_argument(
-        "--save-patch",
-        type=Path,
-        metavar="FILE",
-        help="Save diff to a .patch file for viewing in VS Code (requires --diff)",
+        help="Save a unified .diff file alongside the generated modeling code",
     )
     parser.add_argument(
         "-v",
@@ -468,20 +301,9 @@ Examples:
             print("  (none found)")
         return 0
 
-    # Require patch_module for generation or diff
+    # Require patch_module for generation
     if not args.patch_module:
         parser.error("patch_module is required unless using --list")
-
-    # Diff mode
-    if args.diff:
-        return run_diff(
-            patch_module=normalize_patch_module(args.patch_module),
-            output_dir=args.output_dir,
-            config_name=args.config_name,
-            use_external_diff=not args.no_external_diff,
-            save_patch=args.save_patch,
-            open_in_vscode=args.vscode,
-        )
 
     # Run generation
     result = run_codegen(
@@ -489,6 +311,7 @@ Examples:
         output_dir=args.output_dir,
         config_name=args.config_name,
         dry_run=args.dry_run,
+        save_diff=args.diff,
         verbose=args.verbose,
     )
 
