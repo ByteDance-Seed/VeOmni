@@ -417,25 +417,92 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                         image_idx += 1
                         remain_images -= 1
 
-                    # Video Only
+                    # Video Only (token-level) — may still have audio track depending on audio_seqlens
                     elif min_ed == ed_vision_start and input_ids[ed_vision_start + 1] == video_token_id:
-                        grid_t = video_grid_thw[video_idx][0]
-                        grid_hs = video_grid_thw[:, 1]
-                        grid_ws = video_grid_thw[:, 2]
-                        t_index = (
-                            torch.arange(grid_t) * second_per_grids[video_idx].cpu().float() * position_id_per_seconds
-                        ).float()
-                        llm_pos_ids = self.get_llm_pos_ids_for_vision(
-                            st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
-                        )
-                        video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
-                        llm_pos_ids_list.append(llm_pos_ids)
+                        # --- Patch: support mixed data of video_w_audio & video_w/o_audio ---
+                        # The original HF implementation uses a global `use_audio_in_video` flag,
+                        # which cannot handle a batch where some videos have audio and others don't.
+                        # We adopt the same per-video check as Qwen2.5-Omni (modeling_qwen2_5_omni.py):
+                        # audio_seqlens has one entry per video (0 means no audio track for that video).
+                        # NOTE: index by audio_idx (not video_idx) since pure-audio tokens before this
+                        # video will have already advanced audio_idx independently of video_idx.
+                        if audio_seqlens is not None:
+                            if audio_seqlens[audio_idx] == 0:
+                                use_audio_in_video = False
+                                audio_idx += 1  # consume the zero-length placeholder ONLY when there is no audio
+                            else:
+                                use_audio_in_video = True
+                        else:
+                            use_audio_in_video = False
+                        # --- Patch end ---
 
-                        st += int(text_len + bos_len + video_len + eos_len)
-                        video_idx += 1
-                        remain_videos -= 1
+                        if not use_audio_in_video:
+                            grid_t = video_grid_thw[video_idx][0]
+                            grid_hs = video_grid_thw[:, 1]
+                            grid_ws = video_grid_thw[:, 2]
+                            t_index = (
+                                torch.arange(grid_t)
+                                * second_per_grids[video_idx].cpu().float()
+                                * position_id_per_seconds
+                            ).float()
+                            llm_pos_ids = self.get_llm_pos_ids_for_vision(
+                                st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                            )
+                            video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+                            llm_pos_ids_list.append(llm_pos_ids)
 
-                    # Audio in Video
+                            st += int(text_len + bos_len + video_len + eos_len)
+                            video_idx += 1
+                            remain_videos -= 1
+                        else:
+                            # --- Patch: Video with audio track: interleave video and audio position ids
+                            audio_len = _get_feat_extract_output_lengths(audio_seqlens[audio_idx])
+                            audio_llm_pos_ids = torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
+                            grid_t = video_grid_thw[video_idx][0]
+                            grid_hs = video_grid_thw[:, 1]
+                            grid_ws = video_grid_thw[:, 2]
+                            t_index = (
+                                torch.arange(grid_t)
+                                * second_per_grids[video_idx].cpu().float()
+                                * position_id_per_seconds
+                            ).float()
+                            video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
+                                st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                            )
+                            video_data_index, audio_data_index = 0, 0
+                            while (
+                                video_data_index < video_llm_pos_ids.shape[-1]
+                                and audio_data_index < audio_llm_pos_ids.shape[-1]
+                            ):
+                                if video_llm_pos_ids[0][video_data_index] <= audio_llm_pos_ids[0][audio_data_index]:
+                                    llm_pos_ids_list.append(
+                                        video_llm_pos_ids[:, video_data_index : video_data_index + 1]
+                                    )
+                                    video_data_index += 1
+                                else:
+                                    llm_pos_ids_list.append(
+                                        audio_llm_pos_ids[:, audio_data_index : audio_data_index + 1]
+                                    )
+                                    audio_data_index += 1
+                            if video_data_index < video_llm_pos_ids.shape[-1]:
+                                llm_pos_ids_list.append(
+                                    video_llm_pos_ids[:, video_data_index : video_llm_pos_ids.shape[-1]]
+                                )
+                            if audio_data_index < audio_llm_pos_ids.shape[-1]:
+                                llm_pos_ids_list.append(
+                                    audio_llm_pos_ids[:, audio_data_index : audio_llm_pos_ids.shape[-1]]
+                                )
+                            video_len = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+
+                            st += int(text_len + bos_len + audio_len + video_len + eos_len)
+
+                            audio_idx += 1
+                            video_idx += 1
+                            remain_videos -= 1
+                            remain_audios -= 1
+                            # --- Patch end ---
+
+                    # Audio in Video (token-level: <vision_start><audio_start>...) — kept for HF compatibility
                     elif min_ed == ed_vision_start and ed_vision_start + 1 == ed_audio_start:
                         audio_len = _get_feat_extract_output_lengths(audio_seqlens[audio_idx])
                         audio_llm_pos_ids = torch.arange(audio_len).view(1, -1).expand(3, -1) + st_idx
@@ -2082,8 +2149,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
             input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
-        else:
-            audio_feature_lengths = None
 
         feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
         audio_outputs = self.audio_tower(
@@ -2231,11 +2296,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # Modification: we use the pre-computed image and video mask to support ulysses
+        # Modification: we use the pre-computed image, video, and audio masks to support ulysses
         assert "image_mask" in kwargs, "image_mask should have already been computed in process_sample"
         assert "video_mask" in kwargs, "video_mask should have already been computed in process_sample"
+        assert "audio_mask" in kwargs, "audio_mask should have already been computed in process_sample"
         image_mask = kwargs["image_mask"]
         video_mask = kwargs["video_mask"]
+        audio_mask = kwargs["audio_mask"]
 
         # Modification: Pop flash attention kwargs for ViT, they should only be used for language model
         # Qwen3L ViT input images seq lens should be computed during ViT forward using grid_thw
@@ -2259,8 +2326,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 audio_feature_lengths=audio_feature_lengths,
             )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+            audio_mask_expanded = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            inputs_embeds = inputs_embeds.masked_scatter(audio_mask_expanded, audio_features)
 
         # Initialize fake_deepstack to None
         fake_deepstack = None
@@ -2492,6 +2559,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        # --- Patch: handle pre-computed position_ids from data preprocessing ---
+        # During training with rmpad_with_pos_ids, position_ids are computed in vlm_data_process.py
+        # and stored as (dim=3, L) per sample, then collated to (bs, 3, L) by the data collator.
+        # The downstream model expects (3, bs, L), so we transpose here.
+        # This mirrors Patch.6 in modeling_qwen2_5_omni.py.
+        elif position_ids is not None:
+            if position_ids.ndim == 3 and position_ids.shape[1] == 3:
+                position_ids = position_ids.transpose(0, 1).contiguous()  # bs, 3, l -> 3, bs, l
+        # --- Patch end ---
 
         # Modification: Restore flash attention kwargs for language model to avoid CPU-GPU sync
         kwargs.update(flash_attn_kwargs)
