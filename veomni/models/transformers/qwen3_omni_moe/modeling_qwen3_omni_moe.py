@@ -2111,8 +2111,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
             input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
-        else:
-            audio_feature_lengths = None
 
         feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
         audio_outputs = self.audio_tower(
@@ -2260,11 +2258,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # Modification: we use the pre-computed image and video mask to support ulysses
+        # Modification: we use the pre-computed image, video, and audio masks to support ulysses
         assert "image_mask" in kwargs, "image_mask should have already been computed in process_sample"
         assert "video_mask" in kwargs, "video_mask should have already been computed in process_sample"
+        assert "audio_mask" in kwargs, "audio_mask should have already been computed in process_sample"
         image_mask = kwargs["image_mask"]
         video_mask = kwargs["video_mask"]
+        audio_mask = kwargs["audio_mask"]
 
         # Modification: Pop flash attention kwargs for ViT, they should only be used for language model
         # Qwen3L ViT input images seq lens should be computed during ViT forward using grid_thw
@@ -2288,8 +2288,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 audio_feature_lengths=audio_feature_lengths,
             )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+            audio_mask_expanded = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            inputs_embeds = inputs_embeds.masked_scatter(audio_mask_expanded, audio_features)
 
         # Initialize fake_deepstack to None
         fake_deepstack = None
