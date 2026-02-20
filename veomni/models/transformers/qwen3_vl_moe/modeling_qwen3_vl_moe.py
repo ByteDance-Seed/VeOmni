@@ -102,7 +102,6 @@ class Qwen3VLMoeTextExperts(_Qwen3VLMoeTextExperts):
         down_proj_t = self.down_proj.transpose(1, 2).contiguous()  # (num_experts, hidden_size, expert_dim)
 
         next_states = fused_moe_forward(
-            module=self,
             num_experts=self.num_experts,
             routing_weights=routing_weights,  # Use compact top-k weights
             selected_experts=router_indices,

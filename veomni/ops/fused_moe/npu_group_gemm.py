@@ -188,7 +188,6 @@ def alltoall_combine(
 
 
 def npu_fused_moe_forward(
-    module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,

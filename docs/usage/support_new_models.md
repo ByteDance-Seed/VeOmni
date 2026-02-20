@@ -296,7 +296,6 @@ elif self.training and self.moe_implementation == "fused":
     down_proj_t = self.down_proj.transpose(1, 2).contiguous()
 
     next_states = fused_moe_forward(
-        module=self,
         num_experts=self.num_experts,
         routing_weights=routing_weights_topk,
         selected_experts=router_indices,
