@@ -297,5 +297,6 @@ def apply_veomni_attention_patch():
         _patch_transformers_hub_kernel_loader_for_veomni()
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", flash_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_4_with_sp", flash_attention_forward)
     global _flash_attention_forward
     _flash_attention_forward = transformers_flash_attention_forward
