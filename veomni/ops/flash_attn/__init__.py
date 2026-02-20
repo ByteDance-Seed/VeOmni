@@ -38,6 +38,7 @@ _veomni_hub_kernel_loader_patch_applied = False
 _VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
     "veomni_flash_attention_2_with_sp": "flash_attention_2",
     "veomni_flash_attention_3_with_sp": "flash_attention_3",
+    "veomni_flash_attention_4_with_sp": "flash_attention_4",
 }
 
 
@@ -67,6 +68,14 @@ def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace:
             raise ImportError(
                 "VeOmni attention implementation `veomni_flash_attention_3_with_sp` requires "
                 "`flash_attn_interface` (FA3) to be importable."
+            ) from e
+    elif implementation == "veomni_flash_attention_4_with_sp":
+        try:
+            from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+        except ImportError as e:
+            raise ImportError(
+                "VeOmni attention implementation `veomni_flash_attention_4_with_sp` requires "
+                "`flash_attn.cute` (FA4) to be importable."
             ) from e
     else:
         raise ValueError(f"Unknown VeOmni flash attention implementation: {implementation}")
