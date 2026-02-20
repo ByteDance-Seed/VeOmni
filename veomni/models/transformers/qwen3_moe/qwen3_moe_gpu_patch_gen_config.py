@@ -234,6 +234,6 @@ def qwen3_moe_forcausal_lm_forward_patched(
     description="Register Qwen3Moe expert parallel plan for v5 generated modeling",
 )
 def qwen3_moe_get_parallel_plan_patched(self):
-    from .parallel_plan import get_parallel_plan as _get_parallel_plan
+    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
