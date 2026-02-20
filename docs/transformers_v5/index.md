@@ -6,10 +6,12 @@ This section documents VeOmni's compatibility work for HuggingFace `transformers
 
 - [Flash Attention custom-name handling](veomni_flash_attention_kernel_adapter.md): explains why `_lazy_imports` failed for VeOmni custom attention names and how the local hub-kernel loader adapter resolves it.
 - [Qwen3 patchgen workflow](patchgen.md): explains the modeling code generation workflow used for Qwen3 GPU patches and regeneration.
+- [MoE experts registration](moe_experts_registration.md): explains how VeOmni registers `veomni_fused_moe` via `ALL_EXPERTS_FUNCTIONS`, why `_experts_implementation` is set post-init in Transformers v5, and how post-build verification works.
 
 ```{toctree}
 :maxdepth: 1
 
 veomni_flash_attention_kernel_adapter.md
 patchgen.md
+moe_experts_registration.md
 ```
