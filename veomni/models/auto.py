@@ -68,8 +68,10 @@ def build_foundation_model(
             "sdpa",
             "flash_attention_2",
             "flash_attention_3",
+            "flash_attention_4",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
@@ -130,7 +132,20 @@ def build_foundation_model(
         "trust_remote_code": True,
     }
 
-    if attn_implementation not in ("veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"):
+    if attn_implementation in (
+        "flash_attention_4",
+        "veomni_flash_attention_4_with_sp",
+    ) and not is_transformers_version_greater_or_equal_to("5.0.0"):
+        raise RuntimeError(
+            f"attn_implementation '{attn_implementation}' requires Transformers>=5.0.0. "
+            "Install it with: uv sync --extra gpu --extra fa4 --extra transformers5-exp --no-group transformers-stable"
+        )
+
+    if attn_implementation not in (
+        "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_4_with_sp",
+    ):
         logger.warning_rank0(
             f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use veomni_flash_attention_2_with_sp or veomni_flash_attention_3_with_sp for SP."
         )
