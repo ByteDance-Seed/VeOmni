@@ -732,7 +732,9 @@ class TrainingArguments:
         if self.gradient_accumulation_steps > 1 and self.enable_fsdp_offload:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
-        # calculate dataloader batch size (for StreamingDataset and StreamingDataLoader)
+        # calculate dataloader batch size
+        # for:
+        #   - StreamingDataset and StreamingDataLoader
         if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker" and self.dyn_bsz:
             self.dataloader_batch_size = 1
         else:

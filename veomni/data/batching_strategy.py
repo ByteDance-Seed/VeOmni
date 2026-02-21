@@ -94,11 +94,11 @@ class DynBszBuffer:
 
 class BaseBatchingStrategy:
     """
-    Base class for batching strategy.s
+    Base class for batching strategy.
     """
 
-    def is_full_filled(self) -> bool:
-        raise NotImplementedError("should implement `is_full_filled`")
+    def is_ready_for_micro_batch(self) -> bool:
+        raise NotImplementedError("should implement `is_ready_for_micro_batch`")
 
     def put_item(self, item: Dict[str, Any]):
         raise NotImplementedError("should implement `put_item`")
@@ -160,7 +160,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
             bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
         )
 
-    def is_full_filled(self) -> bool:
+    def is_ready_for_micro_batch(self) -> bool:
         return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
 
     def put_item(self, item: Dict[str, Any]):
