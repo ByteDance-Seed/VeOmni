@@ -80,6 +80,7 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
+from ....ops import fused_moe_forward
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -4219,6 +4220,13 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
     config_class = Qwen3OmniMoeConfig
 
     def __init__(self, config: Qwen3OmniMoeConfig):
+        # --- Patch.3 ---
+        # Propagate _moe_implementation from top-level config to thinker_config
+        # and then to text_config before the thinker model is built.
+        moe_implementation = getattr(config, "_moe_implementation", "eager")
+        config.thinker_config._moe_implementation = moe_implementation
+        config.thinker_config.text_config._moe_implementation = moe_implementation
+        # --- Patch.3 ---
         super().__init__(config)
 
         self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration._from_config(config.thinker_config)
@@ -4516,8 +4524,126 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
 
 
 # ================================================================
-# Patch: Qwen3OmniMoePreTrainedModel.get_parallel_plan
-# 1. add parallel plan for expert parallelism
+# Patch.2: Qwen3OmniMoeThinkerTextSparseMoeBlock
+#   - eager mode: keep original nn.ModuleList experts, strict original logic,
+#     raise error if EP is enabled.
+#   - fused mode: replace experts with Qwen3OmniMoeThinkerExperts (stacked
+#     weights) to support fused MoE kernel and Expert Parallelism (EP).
+#     The sub-module is named "experts" so that parameter FQNs match the
+#     merged checkpoint layout: *.mlp.experts.{gate,up,down}_proj.
+# ================================================================
+# --- Patch.2 ---
+class Qwen3OmniMoeThinkerExperts(nn.Module):
+    """Stacked expert weights for fused MoE forward in Qwen3-Omni-MoE thinker layers.
+
+    Stores all expert weights as 3-D tensors (num_experts, out, in) so that
+    the fused MoE kernel and Expert Parallelism can operate on them directly.
+    The parameter names match the merged-checkpoint convention:
+      *.mlp.experts.gate_proj, *.mlp.experts.up_proj, *.mlp.experts.down_proj
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        num_experts = config.num_experts
+        intermediate_size = config.moe_intermediate_size
+        hidden_size = config.hidden_size
+        # Shape convention (same as fused_moe_forward expectation):
+        #   gate_proj / up_proj : (num_experts, intermediate_size, hidden_size)
+        #   down_proj            : (num_experts, hidden_size,       intermediate_size)
+        self.gate_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.up_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor:
+        return fused_moe_forward(
+            module=self,
+            num_experts=num_experts,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            hidden_states=hidden_states,
+            fc1_1_weight=self.gate_proj,  # (num_experts, intermediate_size, hidden_size)
+            fc1_2_weight=self.up_proj,  # (num_experts, intermediate_size, hidden_size)
+            fc2_weight=self.down_proj,  # (num_experts, hidden_size,       intermediate_size)
+        )
+
+
+def Qwen3OmniMoeThinkerTextSparseMoeBlock_init(self: Qwen3OmniMoeThinkerTextSparseMoeBlock, config) -> None:
+    # Call grandparent (nn.Module) init to avoid re-running the original __init__
+    nn.Module.__init__(self)
+    self.num_experts = config.num_experts
+    self.top_k = config.num_experts_per_tok
+    self.norm_topk_prob = config.norm_topk_prob
+    self._moe_implementation = getattr(config, "_moe_implementation", "eager")
+
+    self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+
+    if self._moe_implementation == "fused":
+        # experts sub-module holds stacked weights; its name "experts" ensures
+        # parameter FQNs align with the merged checkpoint and parallel_plan.
+        self.experts = Qwen3OmniMoeThinkerExperts(config)
+    elif self._moe_implementation == "eager":
+        self.experts = nn.ModuleList(
+            [
+                Qwen3OmniMoeThinkerTextMLP(config, intermediate_size=config.moe_intermediate_size)
+                for _ in range(self.num_experts)
+            ]
+        )
+    else:
+        raise ValueError(f"Invalid _moe_implementation: {self._moe_implementation!r}. Expected 'eager' or 'fused'.")
+
+
+def Qwen3OmniMoeThinkerTextSparseMoeBlock_forward(
+    self: Qwen3OmniMoeThinkerTextSparseMoeBlock, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hidden_dim)
+    # router_logits: (batch * sequence_length, n_experts)
+    router_logits = self.gate(hidden_states)
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    if self.norm_topk_prob:
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.to(hidden_states.dtype)
+
+    if self._moe_implementation == "eager":
+        ps = get_parallel_state()
+        if ps.ep_enabled:
+            raise NotImplementedError(
+                "eager MoE does not support Expert Parallelism (EP). Set _moe_implementation='fused' to use EP."
+            )
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+    else:
+        # fused: delegate entirely to Qwen3OmniMoeThinkerExperts
+        final_hidden_states = self.experts(hidden_states, routing_weights, selected_experts, self.num_experts)
+
+    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    return final_hidden_states, router_logits
+
+
+# --- Patch.2 ---
+
+
+# ================================================================
+# Patch.1: Qwen3OmniMoePreTrainedModel.get_parallel_plan
+#   Add parallel plan for expert parallelism.
 # ================================================================
 # --- Patch.1 ---
 def _get_parallel_plan(self):
@@ -4531,7 +4657,13 @@ def _get_parallel_plan(self):
 
 def apply_veomni_qwen3_omni_moe_patch():
     logger.info_rank0("Apply VeOmni patch to Qwen3_Omni_MoE.")
+    # --- Patch.1 ---
     Qwen3OmniMoePreTrainedModel.get_parallel_plan = _get_parallel_plan
+    # --- Patch.1 ---
+    # --- Patch.2 ---
+    Qwen3OmniMoeThinkerTextSparseMoeBlock.__init__ = Qwen3OmniMoeThinkerTextSparseMoeBlock_init
+    Qwen3OmniMoeThinkerTextSparseMoeBlock.forward = Qwen3OmniMoeThinkerTextSparseMoeBlock_forward
+    # --- Patch.2 ---
 
 
 __all__ = [
