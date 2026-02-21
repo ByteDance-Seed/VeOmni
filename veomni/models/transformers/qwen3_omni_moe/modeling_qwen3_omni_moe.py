@@ -4525,10 +4525,79 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
 
 # ================================================================
 # Patch.2: Qwen3OmniMoeThinkerTextSparseMoeBlock
-#   Replace nn.ModuleList experts with stacked-weight parameters
-#   to support fused MoE forward and Expert Parallelism (EP).
+#   Replace nn.ModuleList experts with a stacked-weight sub-module
+#   (self.experts) to support fused MoE forward and Expert Parallelism (EP).
+#   The sub-module is named "experts" so that parameter FQNs match the
+#   merged checkpoint layout: *.mlp.experts.{gate,up,down}_proj.
 # ================================================================
 # --- Patch.2 ---
+class Qwen3OmniMoeThinkerExperts(nn.Module):
+    """Stacked expert weights for Qwen3-Omni-MoE thinker layers.
+
+    Stores all expert weights as 3-D tensors (num_experts, out, in) so that
+    the fused MoE kernel and Expert Parallelism can operate on them directly.
+    The parameter names match the merged-checkpoint convention:
+      *.mlp.experts.gate_proj, *.mlp.experts.up_proj, *.mlp.experts.down_proj
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        num_experts = config.num_experts
+        intermediate_size = config.moe_intermediate_size
+        hidden_size = config.hidden_size
+        # Shape convention (same as fused_moe_forward expectation):
+        #   gate_proj / up_proj : (num_experts, intermediate_size, hidden_size)
+        #   down_proj            : (num_experts, hidden_size,       intermediate_size)
+        self.gate_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.up_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self.act_fn = ACT2FN[config.hidden_act]
+        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor:
+        if self._moe_implementation == "eager":
+            ps = get_parallel_state()
+            if ps.ep_enabled:
+                raise NotImplementedError(
+                    "eager_forward does not support Expert Parallelism (EP). Use the fused EP path instead."
+                )
+
+            final_hidden_states = torch.zeros_like(hidden_states)
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            for expert_idx in expert_hit:
+                e = expert_idx.item()
+                idx, top_x = torch.where(expert_mask[e])
+                current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
+                g = current_state @ self.gate_proj[e].t()
+                u = current_state @ self.up_proj[e].t()
+                out = self.act_fn(g) * u
+                out = out @ self.down_proj[e].t()
+                final_hidden_states.index_add_(
+                    0, top_x, (out * routing_weights[top_x, idx, None]).to(hidden_states.dtype)
+                )
+        elif self._moe_implementation == "fused":
+            final_hidden_states = fused_moe_forward(
+                module=self,
+                num_experts=num_experts,
+                routing_weights=routing_weights,
+                selected_experts=selected_experts,
+                hidden_states=hidden_states,
+                fc1_1_weight=self.gate_proj,  # (num_experts, intermediate_size, hidden_size)
+                fc1_2_weight=self.up_proj,  # (num_experts, intermediate_size, hidden_size)
+                fc2_weight=self.down_proj,  # (num_experts, hidden_size,       intermediate_size)
+            )
+        else:
+            raise ValueError(f"Invalid moe_implementation: {self._moe_implementation}")
+        return final_hidden_states
+
+
 def Qwen3OmniMoeThinkerTextSparseMoeBlock_init(self: Qwen3OmniMoeThinkerTextSparseMoeBlock, config) -> None:
     # Call grandparent (nn.Module) init to avoid re-running the original __init__
     nn.Module.__init__(self)
@@ -4538,16 +4607,9 @@ def Qwen3OmniMoeThinkerTextSparseMoeBlock_init(self: Qwen3OmniMoeThinkerTextSpar
     self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
     self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-    # Replace nn.ModuleList with stacked weight tensors.
-    # Shape convention (same as fused_moe_forward expectation):
-    #   gate_proj / up_proj : (num_experts, intermediate_size, hidden_size)
-    #   down_proj            : (num_experts, hidden_size,       intermediate_size)
-    intermediate_size = config.moe_intermediate_size
-    hidden_size = config.hidden_size
-    self.gate_proj = nn.Parameter(torch.empty(self.num_experts, intermediate_size, hidden_size))
-    self.up_proj = nn.Parameter(torch.empty(self.num_experts, intermediate_size, hidden_size))
-    self.down_proj = nn.Parameter(torch.empty(self.num_experts, hidden_size, intermediate_size))
-    self.act_fn = ACT2FN[config.hidden_act]
+    # experts sub-module holds stacked weights; its name "experts" ensures
+    # parameter FQNs align with the merged checkpoint and parallel_plan.
+    self.experts = Qwen3OmniMoeThinkerExperts(config)
 
 
 def Qwen3OmniMoeThinkerTextSparseMoeBlock_forward(
@@ -4560,56 +4622,11 @@ def Qwen3OmniMoeThinkerTextSparseMoeBlock_forward(
 
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
+    if self.norm_topk_prob:
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
-    if self._moe_implementation == "eager":
-        ps = get_parallel_state()
-        if ps.ep_enabled:
-            raise NotImplementedError(
-                "eager_forward does not support Expert Parallelism (EP). Use the fused EP path instead."
-            )
-
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-        # Loop over all available experts in the model and perform the computation on each expert
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            e = expert_idx.item()
-            idx, top_x = torch.where(expert_mask[e])
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            g = current_state @ self.gate_proj[e].t()
-            u = current_state @ self.up_proj[e].t()
-            out = self.act_fn(g) * u
-            out = out @ self.down_proj[e].t()
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, (out * routing_weights[top_x, idx, None]).to(hidden_states.dtype))
-    elif self._moe_implementation == "fused":
-        final_hidden_states = fused_moe_forward(
-            module=self,
-            num_experts=self.num_experts,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            hidden_states=hidden_states,
-            fc1_1_weight=self.gate_proj,  # (num_experts, intermediate_size, hidden_size)
-            fc1_2_weight=self.up_proj,  # (num_experts, intermediate_size, hidden_size)
-            fc2_weight=self.down_proj,  # (num_experts, hidden_size,       intermediate_size)
-        )
-
+    final_hidden_states = self.experts(hidden_states, routing_weights, selected_experts, self.num_experts)
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits
 
