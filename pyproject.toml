@@ -278,6 +278,8 @@ exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts"]
 target-version = "py311"
 line-length = 119
 indent-width = 4
+extend-exclude = ["veomni/models/transformers/**/generated/*.py"]
+force-exclude = true
 
 [tool.ruff.lint]
 ignore = ["C901", "E501", "E741", "W605", "C408"]

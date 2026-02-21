@@ -11,20 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("qwen3_moe")
 def register_qwen3_moe_modeling(architecture: str):
-    from transformers import (
-        Qwen3MoeForCausalLM,
-        Qwen3MoeForQuestionAnswering,
-        Qwen3MoeModel,
-    )
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        from .generated.patched_modeling_qwen3_moe_gpu import (
+            Qwen3MoeForCausalLM,
+            Qwen3MoeForQuestionAnswering,
+            Qwen3MoeModel,
+        )
+    else:
+        from transformers import (
+            Qwen3MoeForCausalLM,
+            Qwen3MoeForQuestionAnswering,
+            Qwen3MoeModel,
+        )
 
-    from .modeling_qwen3_moe import apply_veomni_qwen3_moe_patch
+        from .modeling_qwen3_moe import apply_veomni_qwen3_moe_patch
 
-    apply_veomni_qwen3_moe_patch()
+        apply_veomni_qwen3_moe_patch()
 
     if "ForCausalLM" in architecture:
         return Qwen3MoeForCausalLM
