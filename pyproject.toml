@@ -89,13 +89,20 @@ gpu = [
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
-  "torchcodec==0.8.1" # 0.8.1 is compatible with torch 2.9
+  "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
+  "cuda-python==12.9.1",
+  "torch-c-dlpack-ext"
 ]
 megatron = [
   "megatron-energon>=7.2.1"
 ]
 trl = [
   "trl<=0.9.6"
+]
+
+fa4 = [
+  "flash-attn-cute",
+  "nvidia-cutlass-dsl>=4.4.0"
 ]
 
 # Experimental dep to install transformers 5.x.
@@ -230,6 +237,10 @@ flash-attn-3 = [
   # torch 2.9+cu129
   { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
+# FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
+# Pinned to 02/20/2026 latest main commit.
+flash-attn-cute = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "6079a9bf4cfd7af8e7586afea6c49a97ebddf46e" }
+
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
 av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video'" }
 
