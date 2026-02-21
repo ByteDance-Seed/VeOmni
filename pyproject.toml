@@ -209,6 +209,11 @@ conflicts = [
     { group = "transformers-stable" },
     { extra = "transformers5-exp" },
   ],
+  # FA4 only works for transformers v5
+  [
+    { group = "transformers-stable" },
+    { extra = "fa4" },
+  ],
 ]
 
 [tool.uv.sources]

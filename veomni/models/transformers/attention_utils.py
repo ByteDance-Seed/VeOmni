@@ -16,6 +16,8 @@
 VARLEN_ATTENTION_TYPES = (
     "flash_attention_2",
     "flash_attention_3",
+    "flash_attention_4",
     "veomni_flash_attention_2_with_sp",
     "veomni_flash_attention_3_with_sp",
+    "veomni_flash_attention_4_with_sp",
 )
