@@ -14,7 +14,6 @@ from ..utils import (
     ModelMode,
     build_base_model_optim,
     compare_multi_items,
-    prepare_model_modes,
     print_all_values,
     set_environ_param,
 )
@@ -416,6 +415,31 @@ def _convert_hf_state_dict_to_fused(state_dict: dict, config) -> dict:
     return new_sd
 
 
+def _qwen3_omni_moe_veomni_modes():
+    """Return a minimal set of VeOmni modes for Qwen3-Omni-MoE CI tests.
+
+    Uses only eager attn (no liger) and fused MoE (no liger) to keep GPU memory
+    usage low on 40/80 GB cards.  FA2/FA3 and liger-kernel coverage is provided
+    by generic MoE tests elsewhere.
+    """
+    return [
+        ModelMode(
+            modeling_backend="veomni",
+            attn_implementation="eager",
+            attn_case="padded_bsh",
+            moe_implementation="eager",
+            use_liger_kernel=False,
+        ),
+        ModelMode(
+            modeling_backend="veomni",
+            attn_implementation="eager",
+            attn_case="padded_bsh",
+            moe_implementation="fused",
+            use_liger_kernel=False,
+        ),
+    ]
+
+
 def _run_fwd_bwd_comparison(test_name, dummy_data, config_path, config):
     """Run HF vs VeOmni forward/backward comparison for a given set of dummy data.
 
@@ -423,8 +447,7 @@ def _run_fwd_bwd_comparison(test_name, dummy_data, config_path, config):
     """
     rtol, atol = 0.5, 0.02  # MoE tolerances
 
-    # Prepare VeOmni model modes (MoE: base eager + fused)
-    _, all_veomni_modes = prepare_model_modes(is_moe=True)
+    all_veomni_modes = _qwen3_omni_moe_veomni_modes()
 
     print_device_mem_info(f"[Memory Info] start {test_name}:")
 
