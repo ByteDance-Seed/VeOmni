@@ -25,14 +25,15 @@ def register_qwen3_omni_moe_config():
 
 @MODELING_REGISTRY.register("qwen3_omni_moe")
 def register_qwen3_omni_moe_modeling(architecture: str):
-    from .modeling_qwen3_omni_moe import (
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeForConditionalGeneration,
         Qwen3OmniMoeTalkerForConditionalGeneration,
         Qwen3OmniMoeTalkerModel,
         Qwen3OmniMoeThinkerForConditionalGeneration,
         Qwen3OmniMoeThinkerTextModel,
-        apply_veomni_qwen3_omni_moe_patch,
     )
+
+    from .modeling_qwen3_omni_moe import apply_veomni_qwen3_omni_moe_patch
 
     apply_veomni_qwen3_omni_moe_patch()
     if "ThinkerTextModel" in architecture:
