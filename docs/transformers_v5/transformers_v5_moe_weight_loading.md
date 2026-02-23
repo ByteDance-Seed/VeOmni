@@ -5,105 +5,131 @@ This note documents VeOmni MoE weight-loading expectations for `transformers>=5.
 ## Background
 
 Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
-For VeOmni qwen3_moe, we use a simpler path:
+
+For VeOmni qwen3_moe transformers v5 path, we use a simpler path:
 - patch experts behavior in generated modeling;
 - call `veomni.ops.fused_moe_forward(...)` explicitly in the patched forward;
 - keep `_moe_implementation` (`eager` or `fused`) as runtime selection.
 
-## Qwen3Moe Handling
+## Survey: Qwen MoE Weight Formats
 
-For qwen3_moe, VeOmni keeps split expert tensors:
+Reference mapping from HF:
+- https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/conversion_mapping.py
+
+### qwen3_moe
+
+- Sample checkpoint: https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507
+- HF safetensor expert layout (per-expert split keys):
+
+```text
+model.layers.0.mlp.experts.0.gate_proj.weight  [I, H]
+model.layers.0.mlp.experts.0.up_proj.weight    [I, H]
+model.layers.0.mlp.experts.0.down_proj.weight  [H, I]
+```
+
+- Transformers v5 modeling layout:
+
+```python
+self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+```
+
+Handling summary:
+- safetensor keys are per expert, while v5 expects merged expert tensors;
+- for VeOmni qwen3_moe training, run offline merge first via `scripts/moe_ckpt_merge/moe_merge.py`.
+
+### qwen3_vl_moe
+
+- Sample checkpoint: https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
+- HF safetensor layout:
+
+```text
+model.language_model.layers.0.mlp.experts.gate_up_proj  [num_experts, H, 2 * I]
+model.language_model.layers.0.mlp.experts.down_proj     [num_experts, I, H]
+```
+
+- Transformers v5 modeling layout:
+
+```python
+self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+```
+
+Handling summary:
+- v5 layout is transposed vs the safetensor dimension order for these tensors;
+- tensor transpose/conversion is required before direct v5 loading.
+
+### qwen3_5_moe
+
+- Sample checkpoint: https://huggingface.co/Qwen/Qwen3.5-397B-A17B
+- HF safetensor layout:
+
+```text
+model.language_model.layers.0.mlp.experts.gate_up_proj  [num_experts, 2 * I, H]
+model.language_model.layers.0.mlp.experts.down_proj     [num_experts, H, I]
+```
+
+- Transformers v5 modeling layout:
+
+```python
+self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+```
+
+Handling summary:
+- no special remap/transpose needed for shape semantics.
+
+## Qwen3Moe Handling in VeOmni
+
+For qwen3_moe, VeOmni keeps split expert tensors in patched modeling:
 - `gate_proj`
 - `up_proj`
 - `down_proj`
 
-This differs from the native Transformers v5 merged `gate_up_proj` layout.
+This differs from native Transformers v5 `gate_up_proj` layout.
 
 Checkpoint loading behavior:
-- VeOmni does not do runtime remapping from legacy per-expert keys.
-- HuggingFace safetensor checkpoints often store MoE expert weights in per-expert form (for example `...experts.0.gate_proj.weight`).
+- VeOmni does not do runtime remapping from legacy per-expert keys;
+- HuggingFace safetensor checkpoints commonly store expert weights in per-expert form.
 
 To avoid loading/mapping issues, merge weights offline before training:
 - `scripts/moe_ckpt_merge/moe_merge.py`
 
-## Surveys of MoE weight formatting
+## VeOmni Fused MoE Op Interface
 
+VeOmni fused MoE entrypoint:
+- `veomni.ops.fused_moe.fused_moe_forward(...)`
 
-- qwen3_moe
-  - Sample HF checkpoint link: https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507
-  - expert safetensor format:
-  ```
-  # Per expert split weight
-  # Gate/up: [I, H]
-  # Down: [H, I]
-  model.layers.0.mlp.experts.0.down_proj.weight	[H, I]
-  model.layers.0.mlp.experts.0.gate_proj.weight	[I, H]
-  model.layers.0.mlp.experts.0.up_proj.weight [I, H]
-  ```
-  - transformers v5 modeling format: [Link](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L226-L227)
-    ```
-        # Merged stacked gate_up + merged down
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+Current signature:
 
-    ```
-  - transformers 4.57.3 format [Link](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L226-L227)
-    ```
-        # Module list
-        self.experts = nn.ModuleList(
-            [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
-        )
+```python
+fused_moe_forward(
+    module: torch.nn.Module,
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_1_weight: torch.Tensor,
+    fc1_2_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+)
+```
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-    ```
-  - Conclusion: safetensor format needs to be merged (and transposed) to match transformers v5 modeling format
+Expected tensor interface:
+- `hidden_states`: token-major hidden states used by experts, shape `[num_tokens, hidden_dim]`;
+- `routing_weights`: router top-k probabilities, shape `[num_tokens, top_k]`;
+- `selected_experts`: router top-k expert indices, shape `[num_tokens, top_k]`;
+- `fc1_1_weight` (gate): shape `[num_experts, intermediate_dim, hidden_dim]`;
+- `fc1_2_weight` (up): shape `[num_experts, intermediate_dim, hidden_dim]`;
+- `fc2_weight` (down): shape `[num_experts, hidden_dim, intermediate_dim]`.
 
+Important constraints:
+- op expects split gate/up tensors (`fc1_1_weight` and `fc1_2_weight`), not a merged `gate_up_proj` tensor;
+- needs to be `.continuous()`.
 
-- qwen3_vl_moe
-  - Sample HF checkpoint link: https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
-  - expert safetensor format:
-  ```
-  # Merged MoE weight
-  # gate_up: [num_experts, H, 2 * I]
-  # down: [num_experts, I, H]
-  model.language_model.layers.0.mlp.experts.gate_up_proj	[128, 2048, 1536]
-  model.language_model.layers.0.mlp.experts.down_proj	[128, 768, 2048]
-  ```
-  - transformers v5 modeling format: [Link](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/qwen3_vl_moe/modeling_qwen3_vl_moe.py#L88-L89)
-    ```
-        # Merged stacked gate_up + merged down
-        # !!!NOTE!!!: The dimension (1,2) of gate_up_proj was transposed between 4.57 and v5 which causes
-        # a mismatch to the safetensor format.
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
-    ```
-  - transformers 4.57.3 modeling format [Link](https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl_moe/modeling_qwen3_vl_moe.py#L74-L75)
-    ```
-        # Merged stacked gate_up + merged down
-        # !!!NOTE!!!: The dimension (1,2) of gate_up_proj was transposed between 4.57 and v5.
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim))
-        self.down_proj = nn.Parameter(torch.empty((self.num_experts, self.expert_dim, self.hidden_size)))
-    ```
-  - Conclusion: safetensor format needs to be transposed to match transformers v5 modeling format
+## Future Work: Align with Transformers v5 weight formatting
 
+To align with transformers v5 weight formatting, we need to do the following things
 
-- qwen3_5_moe
-  - Sample HF checkpoint link: https://huggingface.co/Qwen/Qwen3.5-397B-A17B
-  - expert safetensor format:
-  ```
-  # Merged MoE weight
-  # gate_up: [num_experts, 2 * I, H]
-  # down: [num_experts, H, I]
-  model.language_model.layers.0.mlp.experts.gate_up_proj	[512, 2048, 4096]
-  model.language_model.layers.0.mlp.experts.down_proj	[512, 4096, 1024]
-  ```
-  - transformers v5 modeling format: [Link](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py#L819-L820)
-
-  ```
-  self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
-  self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
-  ```
-  - no transformers 4.57 modeling (the model was added after v5)
-  - Conclusion: No special handling needed. transformers v5 modeling tensor dimension matches safetensor format
+- Write a new fused moe kernel that takes the transformers v5 `gate_up_proj` and `down` as layout;
+- Find a way to load (or pre-merge) from safetensor with a different layout from transformers v5.
