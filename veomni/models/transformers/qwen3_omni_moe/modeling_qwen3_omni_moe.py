@@ -13,7 +13,8 @@
 # limitations under the License.
 #
 # Patch for transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe
-# Adds support for: Sequence Parallelism (SP), FSDP, Liger kernel, pre-computed masks,
+# Adds support for: Sequence Parallelism (SP), FSDP, Expert Parallelism (EP),
+# Liger kernel, fused MoE, pre-computed masks,
 # VeOmni data constants, and multiprocessing-compatible position ID generation.
 
 from functools import partial
@@ -21,32 +22,30 @@ from types import SimpleNamespace
 from typing import Optional, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe as hf_qwen3_omni_moe
 from torch.nn import CrossEntropyLoss
-from transformers import (
-    Qwen3OmniMoeForConditionalGeneration,
-    Qwen3OmniMoeTalkerForConditionalGeneration,
-    Qwen3OmniMoeTalkerModel,
-    Qwen3OmniMoeThinkerForConditionalGeneration,
-    Qwen3OmniMoeThinkerTextModel,
-)
 from transformers.cache_utils import DynamicCache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast
 from transformers.processing_utils import Unpack
 
 from ....data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
+    gather_outputs,
     gather_seq_scatter_heads,
     reduce_sequence_parallel_loss,
+    slice_input_tensor,
     slice_position_embedding,
     sp_pad_and_slice,
+    unpad_tensor,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
+from ....ops import fused_moe_forward
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
 
@@ -170,6 +169,123 @@ def qwen3_omni_moe_vision_encoder_dummy_forward(
         grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
         dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
     return self(**dummy_data)
+
+
+# ================================================================
+# PATCH: Qwen3OmniMoeAudioEncoder.forward
+# 1. SP support: gather input_features along time dim, strip SP padding before chunking
+# 2. SP support: slice hidden_states before encoder layers, extend cu_seqlens for padded tail
+# ================================================================
+def qwen3_omni_moe_audio_encoder_forward(
+    self: hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder,
+    input_features,
+    feature_lens=None,
+    aftercnn_lens=None,
+):
+    aftercnn_lens = hf_qwen3_omni_moe._get_feat_extract_output_lengths(feature_lens)
+    chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+
+    chunk_lengths = torch.tensor(
+        [self.n_window * 2] * chunk_num.sum(),
+        dtype=torch.long,
+        device=feature_lens.device,
+    )
+    tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+    chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+    chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+
+    # --- Patch.1 ---
+    # Modification: SP support — input_features is (num_mel_bins, total_len);
+    # gather along the time dimension (dim=1) and strip any SP padding before chunking.
+    if get_parallel_state().sp_enabled:
+        unpadded_input_len = torch.sum(chunk_lengths)
+        input_features = gather_outputs(input_features, gather_dim=1, group=get_parallel_state().sp_group)
+        sp_input_padding = input_features.size(1) - unpadded_input_len
+        if sp_input_padding > 0:
+            input_features = unpad_tensor(input_features, dim=1, padding_size=sp_input_padding)
+    # --- Patch.1 ---
+
+    chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+    padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+    feature_lens_after_cnn = hf_qwen3_omni_moe._get_feat_extract_output_lengths(chunk_lengths)
+    padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
+        [torch.ones(length, dtype=torch.bool, device=padded_feature.device) for length in feature_lens_after_cnn],
+        batch_first=True,
+    )
+    padded_feature = padded_feature.unsqueeze(1)
+    # Split to chunk to avoid OOM during convolution
+    padded_embeds = []
+    for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+        padded_embed = F.gelu(self.conv2d1(chunk))
+        padded_embed = F.gelu(self.conv2d2(padded_embed))
+        padded_embed = F.gelu(self.conv2d3(padded_embed))
+        padded_embeds.append(padded_embed)
+    padded_embed = torch.cat(padded_embeds, dim=0)
+    b, c, f, t = padded_embed.size()
+    padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
+
+    positional_embedding = (
+        self.positional_embedding.positional_embedding[: padded_embed.shape[1], :].unsqueeze(0).to(padded_embed.dtype)
+    )
+    padded_embed = padded_embed + positional_embedding
+    hidden_states = padded_embed[padded_mask_after_cnn]
+    cu_chunk_lens = [0]
+    window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
+    for cnn_len in aftercnn_lens:
+        cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
+        remainder = cnn_len % window_aftercnn
+        if remainder != 0:
+            cu_chunk_lens += [remainder]
+    cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+
+    # --- Patch.2 ---
+    # Modification: SP support — slice hidden_states along seq dim (dim=0) before encoder layers.
+    # Track total unpadded length to compute SP padding size for cu_seqlens extension.
+    if get_parallel_state().sp_enabled:
+        unpadded_hidden_len = cu_seqlens[-1]
+        hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
+        # Extend cu_seqlens to cover the padded tail on the last rank if needed
+        pad_seq_len = hidden_states.size(0) * get_parallel_state().sp_size - unpadded_hidden_len
+        if pad_seq_len > 0:
+            cu_seqlens = torch.cat([cu_seqlens, (cu_seqlens[-1] + pad_seq_len).unsqueeze(0)], dim=0)
+    # --- Patch.2 ---
+
+    for encoder_layer in self.layers:
+        layer_outputs = encoder_layer(
+            hidden_states,
+            cu_seqlens,
+        )
+        hidden_states = layer_outputs[0]
+
+    hidden_states = self.ln_post(hidden_states)
+    hidden_states = self.proj1(hidden_states)
+    hidden_states = self.act(hidden_states)
+    hidden_states = self.proj2(hidden_states)
+    return BaseModelOutput(last_hidden_state=hidden_states)
+
+
+# ================================================================
+# PATCH: Qwen3OmniMoeAudioEncoder.dummy_forward (NEW)
+# Prevent FSDP reduce-scatter hang when some ranks have no audio data
+# while others get valid audio data
+# ================================================================
+def qwen3_omni_moe_audio_encoder_dummy_forward(
+    self: hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder,
+):
+    """
+    Dummy forward to avoid FSDP reduce-scatter hang when some ranks have no audio data.
+    input_features shape is (num_mel_bins, total_len), feature_lens is (num_audios,).
+    """
+    if getattr(self, "_dummy_data", None) is None:
+        # Minimal valid input: one audio clip of length n_window*2 (smallest non-zero chunk)
+        min_len = self.n_window * 2
+        input_features = torch.zeros((self.num_mel_bins, min_len), dtype=self.dtype, device=self.device)
+        feature_lens = torch.tensor([min_len], dtype=torch.long, device=self.device)
+        self._dummy_data = {
+            "input_features": input_features,
+            "feature_lens": feature_lens,
+        }
+    return self(**self._dummy_data)
 
 
 # ================================================================
@@ -411,7 +527,9 @@ def qwen3_omni_moe_thinker_get_position_id_func(
 
 # ================================================================
 # PATCH: Qwen3OmniMoeThinkerForConditionalGeneration.get_audio_features
-# 1. Raise NotImplementedError when SP is enabled (audio SP not yet supported)
+# 1. Remove NotImplementedError for SP (audio SP is now handled inside audio_tower)
+# 2. Support feature_attention_mask unpacking into flat (num_mel_bins, total_len) format
+# 3. Handle pre-processed 2D input compatibility mode
 # ================================================================
 def qwen3_omni_moe_thinker_get_audio_features(
     self: hf_qwen3_omni_moe.Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -430,14 +548,20 @@ def qwen3_omni_moe_thinker_get_audio_features(
         audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
             The length of feature shape of each audio in LLM.
     """
-    # TODO audio sp support
-    if get_parallel_state().sp_enabled:
-        raise NotImplementedError("audio sp is not supported yet.")
+    # Modification: unpack feature_attention_mask into flat (num_mel_bins, total_len) format
+    # expected by the audio_tower, then delegate. SP is handled inside audio_tower.
     if feature_attention_mask is not None:
         audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
         input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+    else:
+        # Compatibility: handle pre-processed (total_len, num_mel_bins) input without mask
+        if input_features.ndim == 2 and input_features.size(-1) == self.audio_tower.num_mel_bins:
+            input_features = input_features.transpose(0, 1)  # -> (num_mel_bins, total_len)
 
-    feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+    if audio_feature_lengths is not None:
+        feature_lens = audio_feature_lengths
+    else:
+        feature_lens = torch.tensor([input_features.size(1)], dtype=torch.long, device=input_features.device)
     audio_outputs = self.audio_tower(
         input_features,
         feature_lens=feature_lens,
@@ -449,14 +573,15 @@ def qwen3_omni_moe_thinker_get_audio_features(
 
 # ================================================================
 # PATCH: Qwen3OmniMoeThinkerForConditionalGeneration.forward
-# 1. Use pre-computed image_mask/video_mask from kwargs (avoid all-gather for complete mask in SP)
+# 1. Use pre-computed image_mask/video_mask/audio_mask from kwargs (avoid all-gather for complete mask in SP)
 # 2. Pop flash attention kwargs for ViT (ViT computes its own cu_seqlens from grid_thw)
-# 3. SP: gather_seq_scatter_heads for input/image/video embeddings
-# 4. Dummy ViT forward for FSDP when pixel_values is None
+# 3. SP: gather_seq_scatter_heads for input/image/video/audio embeddings
+# 4. Dummy ViT/audio forward for FSDP when pixel_values/input_features is None
 # 5. SP: gather_heads_scatter_seq after multimodal merging
 # 6. SP: all_gather deepstack embeddings + rank-specific slicing
 # 7. FSDP: fake_deepstack handling when both pixel_values and pixel_values_videos are None
 # 8. Custom loss computation with Liger kernel + SP loss reduction
+# 9. Handle pre-computed position_ids from data preprocessing (bs, 3, L) -> (3, bs, L)
 # ================================================================
 def qwen3_omni_moe_thinker_forward(
     self: hf_qwen3_omni_moe.Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -546,8 +671,27 @@ def qwen3_omni_moe_thinker_forward(
             audio_feature_lengths=audio_feature_lengths,
         )
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-        audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
-        inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+        # --- Patch.3 ---
+        # Modification: SP patch — audio_tower returns sliced-seq features; gather along seq and
+        # scatter along hidden dim to match inputs_embeds layout during fill-back.
+        if self.training and get_parallel_state().sp_enabled:
+            audio_features = gather_seq_scatter_heads(
+                audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+            )
+        # --- Patch.3 ---
+        # Modification: drop any padding tokens beyond the actual audio placeholder count
+        n_audio_tokens = audio_mask.sum().long().item()
+        audio_features = audio_features[:n_audio_tokens]
+        audio_mask_expanded = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        inputs_embeds = inputs_embeds.masked_scatter(audio_mask_expanded, audio_features)
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.5 ---
+        # Modification: dummy audio tower forward to keep FSDP reduce-scatter in sync when
+        # some ranks have no audio data while others do.
+        fake_audio = self.audio_tower.dummy_forward().last_hidden_state.mean() * 0.0
+        fake_audio = fake_audio.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_audio
+        # --- Patch.5 ---
 
     # Initialize fake_deepstack to None
     fake_deepstack = None
@@ -791,6 +935,15 @@ def qwen3_omni_moe_thinker_forward(
             position_ids = position_ids.view(1, -1).expand(batch_size, -1)
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+    # --- Patch.9 ---
+    # Modification: handle pre-computed position_ids from data preprocessing
+    # During training with rmpad_with_pos_ids, position_ids are computed in vlm_data_process.py
+    # and stored as (dim=3, L) per sample, then collated to (bs, 3, L) by the data collator.
+    # The downstream model expects (3, bs, L), so we transpose here.
+    elif position_ids is not None:
+        if position_ids.ndim == 3 and position_ids.shape[1] == 3:
+            position_ids = position_ids.transpose(0, 1).contiguous()  # bs, 3, l -> 3, bs, l
+    # --- Patch.9 ---
 
     # --- Patch.2 ---
     # Modification: Restore flash attention kwargs for language model to avoid CPU-GPU sync
@@ -867,7 +1020,7 @@ def qwen3_omni_moe_thinker_forward(
 
 
 # ================================================================
-# PATCH: Qwen3OmniMoeForConditionalGeneration.forward
+# PATCH: Qwen3OmniMoeForConditionalGeneration.__init__
 # 1. Simplified for training: only forward thinker, skip talker/code2wav
 # ================================================================
 def qwen3_omni_moe_for_conditional_generation_forward(
@@ -879,6 +1032,162 @@ def qwen3_omni_moe_for_conditional_generation_forward(
     )
     # TODO: talker_outputs
     return thinker_outputs
+
+
+# ================================================================
+# PATCH: Qwen3OmniMoeForConditionalGeneration.__init__
+# 1. Propagate _moe_implementation from top-level config to thinker_config
+#    and then to text_config before the thinker model is built.
+# ================================================================
+def qwen3_omni_moe_for_conditional_generation_init(
+    self: hf_qwen3_omni_moe.Qwen3OmniMoeForConditionalGeneration,
+    config,
+):
+    # --- Patch.3 ---
+    # Propagate _moe_implementation from top-level config to thinker_config
+    # and then to text_config before the thinker model is built.
+    moe_implementation = getattr(config, "_moe_implementation", "eager")
+    config.thinker_config._moe_implementation = moe_implementation
+    config.thinker_config.text_config._moe_implementation = moe_implementation
+    # --- Patch.3 ---
+    super(hf_qwen3_omni_moe.Qwen3OmniMoeForConditionalGeneration, self).__init__(config)
+
+    self.thinker = hf_qwen3_omni_moe.Qwen3OmniMoeThinkerForConditionalGeneration._from_config(config.thinker_config)
+    self.has_talker = config.enable_audio_output
+    if self.has_talker:
+        self.enable_talker()
+    self.post_init()
+
+
+# ================================================================
+# NEW: Qwen3OmniMoeThinkerExperts
+# Stacked expert weights for fused MoE forward in Qwen3-Omni-MoE thinker layers.
+# Used when _moe_implementation == "fused".
+# ================================================================
+class Qwen3OmniMoeThinkerExperts(nn.Module):
+    """Stacked expert weights for fused MoE forward in Qwen3-Omni-MoE thinker layers.
+
+    Stores all expert weights as 3-D tensors (num_experts, out, in) so that
+    the fused MoE kernel and Expert Parallelism can operate on them directly.
+    The parameter names match the merged-checkpoint convention:
+      *.mlp.experts.gate_proj, *.mlp.experts.up_proj, *.mlp.experts.down_proj
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        from transformers.activations import ACT2FN
+
+        num_experts = config.num_experts
+        intermediate_size = config.moe_intermediate_size
+        hidden_size = config.hidden_size
+        # Shape convention (same as fused_moe_forward expectation):
+        #   gate_proj / up_proj : (num_experts, intermediate_size, hidden_size)
+        #   down_proj            : (num_experts, hidden_size,       intermediate_size)
+        self.gate_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.up_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor:
+        return fused_moe_forward(
+            module=self,
+            num_experts=num_experts,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            hidden_states=hidden_states,
+            fc1_1_weight=self.gate_proj,  # (num_experts, intermediate_size, hidden_size)
+            fc1_2_weight=self.up_proj,  # (num_experts, intermediate_size, hidden_size)
+            fc2_weight=self.down_proj,  # (num_experts, hidden_size,       intermediate_size)
+        )
+
+
+# ================================================================
+# PATCH: Qwen3OmniMoeThinkerTextSparseMoeBlock.__init__ and forward
+# 1. Support eager mode: original nn.ModuleList experts (raises error if EP enabled)
+# 2. Support fused mode: Qwen3OmniMoeThinkerExperts with stacked weights for fused MoE kernel and EP
+# ================================================================
+def qwen3_omni_moe_thinker_sparse_moe_block_init(
+    self: hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextSparseMoeBlock,
+    config,
+) -> None:
+    # Call grandparent (nn.Module) init to avoid re-running the original __init__
+    nn.Module.__init__(self)
+    self.num_experts = config.num_experts
+    self.top_k = config.num_experts_per_tok
+    self.norm_topk_prob = config.norm_topk_prob
+    self._moe_implementation = getattr(config, "_moe_implementation", "eager")
+
+    self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+
+    if self._moe_implementation == "fused":
+        # experts sub-module holds stacked weights; its name "experts" ensures
+        # parameter FQNs align with the merged checkpoint and parallel_plan.
+        self.experts = Qwen3OmniMoeThinkerExperts(config)
+    elif self._moe_implementation == "eager":
+        self.experts = nn.ModuleList(
+            [
+                hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextMLP(config, intermediate_size=config.moe_intermediate_size)
+                for _ in range(self.num_experts)
+            ]
+        )
+    else:
+        raise ValueError(f"Invalid _moe_implementation: {self._moe_implementation!r}. Expected 'eager' or 'fused'.")
+
+
+def qwen3_omni_moe_thinker_sparse_moe_block_forward(
+    self: hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextSparseMoeBlock,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hidden_dim)
+    # router_logits: (batch * sequence_length, n_experts)
+    router_logits = self.gate(hidden_states)
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    if self.norm_topk_prob:
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.to(hidden_states.dtype)
+
+    if self._moe_implementation == "eager":
+        ps = get_parallel_state()
+        if ps.ep_enabled:
+            raise NotImplementedError(
+                "eager MoE does not support Expert Parallelism (EP). Set _moe_implementation='fused' to use EP."
+            )
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+    else:
+        # fused: delegate entirely to Qwen3OmniMoeThinkerExperts
+        final_hidden_states = self.experts(hidden_states, routing_weights, selected_experts, self.num_experts)
+
+    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    return final_hidden_states, router_logits
+
+
+# ================================================================
+# NEW: _get_parallel_plan
+# Provides parallel execution plan for FSDP/SP/EP coordination
+# ================================================================
+def _get_parallel_plan(self):
+    from .parallel_plan import get_parallel_plan
+
+    return get_parallel_plan()
 
 
 # ================================================================
@@ -894,15 +1203,30 @@ def apply_veomni_qwen3_omni_moe_patch():
         "Qwen3OmniMoeVisionBlock",
     ]
 
+    # --- Patch.1 ---
+    # Patch parallel plan support
+    hf_qwen3_omni_moe.Qwen3OmniMoePreTrainedModel.get_parallel_plan = _get_parallel_plan
+    # --- Patch.1 ---
+
     # Patch VisionEncoder
     hf_qwen3_omni_moe.Qwen3OmniMoeVisionEncoder.forward = qwen3_omni_moe_vision_encoder_forward
     hf_qwen3_omni_moe.Qwen3OmniMoeVisionEncoder.dummy_forward = qwen3_omni_moe_vision_encoder_dummy_forward
+
+    # Patch AudioEncoder
+    hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder.forward = qwen3_omni_moe_audio_encoder_forward
+    hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder.dummy_forward = qwen3_omni_moe_audio_encoder_dummy_forward
 
     # Patch ThinkerTextModel
     hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextModel.forward = qwen3_omni_moe_thinker_text_model_forward
     hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextModel._deepstack_process = (
         qwen3_omni_moe_thinker_text_model_deepstack_process
     )
+
+    # --- Patch.2 ---
+    # Patch MoE block (eager/fused modes, EP support)
+    hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextSparseMoeBlock.__init__ = qwen3_omni_moe_thinker_sparse_moe_block_init
+    hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextSparseMoeBlock.forward = qwen3_omni_moe_thinker_sparse_moe_block_forward
+    # --- Patch.2 ---
 
     # Patch ThinkerForConditionalGeneration
     hf_qwen3_omni_moe.Qwen3OmniMoeThinkerForConditionalGeneration.__init__ = qwen3_omni_moe_thinker_init
@@ -914,15 +1238,6 @@ def apply_veomni_qwen3_omni_moe_patch():
     )
     hf_qwen3_omni_moe.Qwen3OmniMoeThinkerForConditionalGeneration.forward = qwen3_omni_moe_thinker_forward
 
-    # Patch ForConditionalGeneration (training-only simplified forward)
+    # Patch ForConditionalGeneration
+    hf_qwen3_omni_moe.Qwen3OmniMoeForConditionalGeneration.__init__ = qwen3_omni_moe_for_conditional_generation_init
     hf_qwen3_omni_moe.Qwen3OmniMoeForConditionalGeneration.forward = qwen3_omni_moe_for_conditional_generation_forward
-
-
-__all__ = [
-    "Qwen3OmniMoeForConditionalGeneration",
-    "Qwen3OmniMoeThinkerTextModel",
-    "Qwen3OmniMoeThinkerForConditionalGeneration",
-    "Qwen3OmniMoeTalkerForConditionalGeneration",
-    "Qwen3OmniMoeTalkerModel",
-    "apply_veomni_qwen3_omni_moe_patch",
-]
