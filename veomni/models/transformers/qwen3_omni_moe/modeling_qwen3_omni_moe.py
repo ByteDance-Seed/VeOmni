@@ -897,7 +897,7 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
         # Modification: SP support — slice hidden_states along seq dim (dim=0) before encoder layers.
-        # Track total unpadded length from cu_seqlens for unpadding after gather.
+        # Track total unpadded length to compute SP padding size for cu_seqlens extension.
         if get_parallel_state().sp_enabled:
             unpadded_hidden_len = cu_seqlens[-1]
             hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
@@ -914,22 +914,10 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
-        # Modification: SP support — gather hidden_states back across ranks, then strip padding.
-        if get_parallel_state().sp_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
-            sp_hidden_padding = hidden_states.size(0) - unpadded_hidden_len
-            if sp_hidden_padding > 0:
-                hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_hidden_padding)
-
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
-
-        # Modification: SP support — slice final audio tokens along seq dim for downstream injection.
-        if get_parallel_state().sp_enabled:
-            hidden_states = sp_pad_and_slice(hidden_states, dim=0, pad_value=0)
-
         return BaseModelOutput(last_hidden_state=hidden_states)
 
     def dummy_forward(self):
