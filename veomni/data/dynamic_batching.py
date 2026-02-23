@@ -59,8 +59,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
             rather than full sample tensors.
         force_generate_long_sequence: If True, a sample whose length alone exceeds
             ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
-            being silently discarded.  Prevents training stalls on datasets that contain
-            very long sequences.
+            being silently discarded. This is not supported yet.
     """
 
     def __init__(
@@ -71,7 +70,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         dynamic_batching_collate_fn: Optional[Callable] = DataCollatorWithPositionIDs(),
         save_by_idx: bool = True,
         get_length_fn: Optional[Callable] = len,
-        force_generate_long_sequence: bool = True,
+        force_generate_long_sequence: bool = False,
     ) -> None:
         """Initialize the DynamicBatchingSizeDataset.
 
@@ -87,8 +86,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
             get_length_fn: Function to compute the length (token count) of a sample.
                 Defaults to len.
             force_generate_long_sequence: If True, a sample whose length alone exceeds
-                ``micro_batch_seq_length`` is emitted as a single-sample batch rather
-                than being skipped.  If False, such samples are logged and dropped.
+                ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
+                being silently discarded. This is not supported yet.
 
         Raises:
             ValueError: If ``save_by_idx`` is True but ``dataset`` does not expose the
@@ -101,6 +100,11 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self.micro_batch_seq_length = micro_batch_seq_length
         self.get_length_fn = get_length_fn
         self.save_by_idx = save_by_idx
+        self._data_iter = None
+
+        if force_generate_long_sequence:
+            raise ValueError("force_generate_long_sequence is not supported yet.")
+
         self.force_generate_long_sequence = force_generate_long_sequence
 
         if self.save_by_idx and not (
@@ -114,7 +118,6 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self._buffer = []
         self._buffer_of_refetch_idx = []
         self._buffer_token_count = 0
-        self._data_iter = None
 
     def __iter__(self):
         """Iterate over the dataset and yield dynamically batched micro batches.
@@ -130,29 +133,10 @@ class DynamicBatchingSizeDataset(IterableDataset):
             Exception: Re-raises any exception other than StopIteration encountered
                 during iteration.
         """
-        if not self._data_iter:
-            self._data_iter = iter(self.dataset)
+        self._data_iter = iter(self.dataset)
 
         while True:
             try:
-                item = next(self._data_iter)
-
-                if self.save_by_idx:
-                    item, refetch_idx = item[0], item[1]
-
-                length = self.get_length_fn(item)
-                if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
-                    logger.warning(
-                        f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
-                    )
-                    continue
-
-                self._buffer.append((item, length))
-                if self.save_by_idx:
-                    self._buffer_of_refetch_idx.append(refetch_idx)
-
-                self._buffer_token_count += self._buffer[-1][1]
-
                 if (
                     len(self._buffer) >= self.ready_for_micro_batch_threshold
                     and self._buffer_token_count >= self.micro_batch_seq_length
@@ -163,6 +147,24 @@ class DynamicBatchingSizeDataset(IterableDataset):
                         yield micro_batch
                     else:
                         logging.warn("dynamic_batching_collate_fn returned None, skip this micro_batch")
+
+                item = next(self._data_iter)
+                if self.save_by_idx:
+                    item, refetch_idx = item[0], item[1]
+
+                length = self.get_length_fn(item)
+                if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
+                    # TODO: record the count of discarded long examples for monitoring
+                    logger.warning(
+                        f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
+                    )
+                    continue
+
+                self._buffer.append((item, length))
+                if self.save_by_idx:
+                    self._buffer_of_refetch_idx.append(refetch_idx)
+
+                self._buffer_token_count += self._buffer[-1][1]
 
             except Exception as e:
                 if isinstance(e, StopIteration):
@@ -199,26 +201,28 @@ class DynamicBatchingSizeDataset(IterableDataset):
         """
         micro_batch = []
         seq_length = 0
-        selected_indices = []
+        indices_to_remove_from_buffer = []
 
         for idx, item in enumerate(self._buffer):
             sample, length = item[0], item[1]
 
-            if length + seq_length > self.micro_batch_seq_length and not (
-                seq_length == 0 and self.force_generate_long_sequence
-            ):
-                continue
+            if length + seq_length > self.micro_batch_seq_length:
+                if seq_length > 0:
+                    continue
+                elif not self.force_generate_long_sequence:
+                    # Usually it is impossible to reach this branch because too long samples would not be added to the buffer if force_generate_long_sequence is False.
+                    continue
 
             micro_batch.append(sample)
             seq_length += length
             self._buffer_token_count -= length
-            selected_indices.append(idx)
+            indices_to_remove_from_buffer.append(idx)
 
             if seq_length >= self.micro_batch_seq_length:
                 break
 
         # Remove selected items from buffer (iterate backwards to maintain indices)
-        for idx in reversed(selected_indices):
+        for idx in reversed(indices_to_remove_from_buffer):
             del self._buffer[idx]
             if self.save_by_idx:
                 del self._buffer_of_refetch_idx[idx]
@@ -242,13 +246,14 @@ class DynamicBatchingSizeDataset(IterableDataset):
         """
         state = {
             "save_by_idx": self.save_by_idx,
-            "buffer_token_count": self._buffer_token_count,
+            # Make sure we store an integer instead of any tensor
+            "buffer_token_count": int(self._buffer_token_count),
         }
 
         # the state_dict might be called frequently with StatefulDataloaders(see more details of snapshot_every_n_steps)
         # so we try to not include extra calculations here.
         if self.save_by_idx:
-            state["buffer"] = copy.copy(self._buffer_of_refetch_idx)
+            state["buffer"] = copy.deepcopy(self._buffer_of_refetch_idx)
         else:
             # deepcopy buffer so that it can be transfered through multiple processes
             state["buffer"] = copy.deepcopy(self._buffer)

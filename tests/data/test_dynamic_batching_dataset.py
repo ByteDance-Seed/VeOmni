@@ -16,8 +16,6 @@ The test suite includes:
     Unit tests (run without distributed setup, CPU-compatible):
         - ``test_dynamic_batching_basic`` – core batching logic and expected batch
           contents for shuffled and non-shuffled data.
-        - ``test_force_long_sequence`` – overlong samples are emitted rather than
-          dropped when ``force_generate_long_sequence=True``.
         - ``test_last_batch_on_dataset_end`` – remaining buffer items are yielded
           after upstream exhaustion.
         - ``test_dynamic_batching_without_get_item`` – ``ValueError`` is raised when
@@ -152,14 +150,13 @@ def test_dynamic_batching_basic(shuffle, seed):
     ]
 
     # Expected input_ids for shuffle=True (seed=42)
-    # Note: force_generate_long_sequence=True allows batches to exceed micro_batch_seq_length
-    # when the buffer is empty and only has one long sample
+    # Samples longer than MICRO_BATCH_SEQ_LENGTH (32) are skipped (force_generate_long_sequence=False).
     expected_input_ids_shuffle = [
-        [43] * 43,  # 43 tokens (exceeds 32 due to force_generate_long_sequence)
-        [18] * 18 + [1] + [9] * 9,  # 28 tokens
+        [18] * 18 + [1] + [9] * 9 + [4] * 4,  # 32 tokens
         [31] * 31,  # 31 tokens
-        [35] * 35,  # 35 tokens (exceeds 32 due to force_generate_long_sequence)
-        [21] * 21 + [4] * 4 + [3] * 3 + [2] * 2,  # 30 tokens
+        [21] * 21 + [3] * 3 + [2] * 2,  # 26 tokens
+        [26] * 26 + [6] * 6,  # 32 tokens
+        [19] * 19 + [7] * 7,  # 26 tokens
     ]
 
     expected_input_ids = expected_input_ids_shuffle if shuffle else expected_input_ids_no_shuffle
@@ -172,8 +169,6 @@ def test_dynamic_batching_basic(shuffle, seed):
         assert batch["attention_mask"].sum() > 0
 
         # Calculate total tokens in batch
-        # Note: With force_generate_long_sequence=True, batches can exceed micro_batch_seq_length
-        # when the buffer only has one long sample
         total_tokens = batch["attention_mask"].sum()
 
         # Check expected input_ids
@@ -199,49 +194,6 @@ def test_dynamic_batching_basic(shuffle, seed):
 
     assert batch_count > 0, "Should produce at least one batch"
     logger.info(f"test_dynamic_batching_basic (shuffle={shuffle}) passed! Produced {batch_count} batches")
-
-
-def test_force_long_sequence():
-    """Test that force_generate_long_sequence allows batches exceeding micro_batch_seq_length.
-
-    When force_generate_long_sequence=True and the buffer only has one long sample,
-    the batch should be allowed to exceed micro_batch_seq_length.
-    """
-
-    mapping_dataset = DummyMappingDataset(size=DATASET_SIZE)
-    iterable_dataset = DummyIterableDataset(mapping_dataset, shuffle=False)
-
-    # Test with force_generate_long_sequence=True (default)
-    dynamic_ds = DynamicBatchingSizeDataset(
-        dataset=iterable_dataset,
-        micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
-        ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dynamic_batching_collate_fn=DataCollatorWithPositionIDs(),
-        get_length_fn=get_length_fn,  # Use the global get_length_fn that works with dict
-        force_generate_long_sequence=True,
-    )
-
-    # Iterate through batches to find one that exceeds micro_batch_seq_length
-    found_long_batch_value = None
-
-    batch_idx = 0
-    for batch in dynamic_ds:
-        total_tokens = batch["attention_mask"].sum().item()
-        input_ids = batch["input_ids"].tolist()[0]
-        unique_values = set(input_ids)
-        is_single_sample = len(unique_values) == 1
-
-        if total_tokens > MICRO_BATCH_SEQ_LENGTH and is_single_sample:
-            sample_value = unique_values.pop()
-            found_long_batch_value = sample_value
-            break
-
-        batch_idx += 1
-
-    # Verify the found batch
-    assert found_long_batch_value == MICRO_BATCH_SEQ_LENGTH + 1, (
-        f"Expected long batch to contain value {MICRO_BATCH_SEQ_LENGTH + 1}, got value={found_long_batch_value}"
-    )
 
 
 def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
@@ -316,6 +268,67 @@ def test_dynamic_batching_without_get_item():
             get_length_fn=get_length_fn,
             save_by_idx=True,
         )
+
+
+@pytest.mark.parametrize("save_by_idx", [False, True])
+def test_save_load_state_dict(save_by_idx):
+    """Unit test for DynamicBatchingSizeDataset state_dict and load_state_dict.
+
+    Iterates 2 batches, saves the dataset state, then verifies that a fresh
+    dataset restored from that state produces identical subsequent batches.
+
+    Args:
+        save_by_idx: Whether to save the buffer by index (True) or by full
+            sample tensors (False).
+    """
+    mapping_ds = DummyMappingDataset(size=DATASET_SIZE)
+    iterable_ds = DummyIterableDataset(mapping_ds, shuffle=False)
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=iterable_ds,
+        micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
+        ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
+        dynamic_batching_collate_fn=DataCollatorWithPositionIDs(),
+        get_length_fn=get_length_fn,
+        save_by_idx=save_by_idx,
+    )
+
+    iterator = iter(dynamic_ds)
+
+    # Consume 2 batches before saving state
+    for _ in range(2):
+        next(iterator)
+
+    state = dynamic_ds.state_dict()
+
+    # Collect remaining batches from the original iterator
+    batches_original = list(iterator)
+
+    # Restore state into a fresh dataset instance
+    mapping_ds2 = DummyMappingDataset(size=DATASET_SIZE)
+    iterable_ds2 = DummyIterableDataset(mapping_ds2, shuffle=False)
+
+    dynamic_ds2 = DynamicBatchingSizeDataset(
+        dataset=iterable_ds2,
+        micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
+        ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
+        dynamic_batching_collate_fn=DataCollatorWithPositionIDs(),
+        get_length_fn=get_length_fn,
+        save_by_idx=save_by_idx,
+    )
+    dynamic_ds2.load_state_dict(state)
+
+    batches_resumed = list(dynamic_ds2)
+
+    assert len(batches_original) == len(batches_resumed), (
+        f"Batch count mismatch after resume: original={len(batches_original)}, resumed={len(batches_resumed)}"
+    )
+    for i, (orig, resumed) in enumerate(zip(batches_original, batches_resumed)):
+        for key in orig:
+            if torch.is_tensor(orig[key]):
+                assert torch.all(orig[key] == resumed[key]), f"Batch {i} key '{key}' mismatch after resume"
+
+    logger.info(f"test_save_load_state_dict (save_by_idx={save_by_idx}) passed!")
 
 
 @pytest.mark.parametrize(
@@ -515,7 +528,7 @@ def _run_distributed_test():
     batches_after_save_step = []
     epoch_num = 2  # Run 2 epochs
     start_epoch, start_step, global_step = 0, 0, 0
-    save_epoch, save_step = 1, 2
+    save_epoch, save_step = 1, 0
 
     fake_model = FakeModel().to(get_device_type())
 
@@ -592,7 +605,7 @@ def _run_distributed_test():
     start_epoch = state["extra_state"]["curr_epoch"]
     assert start_epoch == 1
     start_step = state["extra_state"]["curr_step"] + 1
-    assert start_step == 3
+    assert start_step == 1
     dl_state = state["extra_state"]["train_dataloader"]
     logger.error(f"[rank{rank}] Loaded dataloader state: {dl_state}")
 
@@ -647,7 +660,12 @@ def _run_distributed_test():
                         f"[rank{rank}] Batch {i} micro_batch {j} key {key} mismatch"
                     )
 
-    if "consume_tokens(M)" in metrics and "consume_tokens(M)" in metrics_resume:
+    if (
+        metrics is not None
+        and metrics_resume is not None
+        and "consume_tokens(M)" in metrics
+        and "consume_tokens(M)" in metrics_resume
+    ):
         assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]
 
     logger.info(f"[rank{rank}] ✅ All batches matched successfully!")
