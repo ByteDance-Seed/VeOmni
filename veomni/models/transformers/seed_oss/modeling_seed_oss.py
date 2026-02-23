@@ -63,6 +63,7 @@ def seed_oss_model_forward(
     if use_cache and past_key_values is None:
         past_key_values = DynamicCache(config=self.config)
 
+
     if cache_position is None:
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         cache_position: torch.Tensor = torch.arange(
