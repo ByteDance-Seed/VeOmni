@@ -125,11 +125,19 @@ Expected tensor interface:
 
 Important constraints:
 - op expects split gate/up tensors (`fc1_1_weight` and `fc1_2_weight`), not a merged `gate_up_proj` tensor;
-- needs to be `.continuous()`.
+- needs to be `.contiguous()`.
 
-## Future Work: Align with Transformers v5 weight formatting
+## Future Work: Align with Transformers v5 Weight Formatting
 
-To align with transformers v5 weight formatting, we need to do the following things
+To reduce integration friction and runtime overhead, we should converge toward v5-native MoE weight handling.
 
-- Write a new fused moe kernel that takes the transformers v5 `gate_up_proj` and `down` as layout;
-- Find a way to load (or pre-merge) from safetensor with a different layout from transformers v5.
+- For models whose safetensor layout is already close to Transformers v5 (for example, `qwen3_5_moe`), add fused-op support for v5-native MoE tensors directly.
+  This avoids extra offline remapping and avoids runtime reshape/copy steps such as `.contiguous()` in expert forward paths.
+
+- For models with layout mismatch (for example, `qwen3_moe`), we still need to choose one stable strategy:
+  1. Offline remap to v5 format before training.
+  2. Runtime remap during model loading.
+
+  - Tradeoffs:
+    1. Offline remap: lower runtime complexity and more predictable execution, but adds preprocessing burden and user error risk.
+    2. Runtime remap: less user preprocessing and easier onboarding, but adds loader complexity and may introduce runtime variability.
