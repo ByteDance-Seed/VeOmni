@@ -24,10 +24,6 @@ from transformers import (
 )
 
 from ..distributed.parallel_state import get_parallel_state
-from ..ops.fused_moe import (
-    VEOMNI_FUSED_MOE_EXPERTS_IMPL,
-    veomni_fused_moe_experts_forward,
-)
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from ..utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -38,36 +34,6 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
 
 logger = logging.get_logger(__name__)
-MOE_EXPERTS_DISPATCH_CHECK_MODEL_TYPES = ("qwen3_moe",)
-
-
-def _get_moe_experts_module_for_dispatch_check(model: "PreTrainedModel"):
-    model_type = getattr(model.config, "model_type", "unknown")
-    base_model = getattr(model, "model", model)
-    layers = getattr(base_model, "layers", None)
-    if layers is None or len(layers) == 0:
-        raise AssertionError(f"Expected `{model_type}` model to expose non-empty decoder `layers`, but it does not.")
-    first_layer = layers[0]
-    mlp = getattr(first_layer, "mlp", None)
-    experts = getattr(mlp, "experts", None)
-    if experts is None:
-        raise AssertionError(f"Expected `{model_type}` decoder layer to expose `mlp.experts`, but it does not.")
-    return experts
-
-
-def _verify_fused_moe_experts_dispatch(model: "PreTrainedModel"):
-    model_type = getattr(model.config, "model_type", None)
-    if model_type not in MOE_EXPERTS_DISPATCH_CHECK_MODEL_TYPES:
-        return
-    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
-
-    experts_module = _get_moe_experts_module_for_dispatch_check(model)
-    experts_forward = ALL_EXPERTS_FUNCTIONS.get_interface(VEOMNI_FUSED_MOE_EXPERTS_IMPL, experts_module.forward)
-    assert experts_forward is veomni_fused_moe_experts_forward, (
-        f"{model_type} experts dispatch is not using VeOmni fused MoE forward. "
-        f"Expected `veomni_fused_moe_experts_forward`, got `{experts_forward.__module__}.{experts_forward.__name__}`."
-    )
-    logger.info_rank0(f"Verified {model_type} experts dispatch uses VeOmni fused MoE forward.")
 
 
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
@@ -133,12 +99,6 @@ def build_foundation_model(
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
         if moe_implementation == "eager":
             logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
-        elif is_transformers_version_greater_or_equal_to("5.0.0"):
-            # For transformers v5, fused MoE is integrated through the experts backend registry
-            # (`config._experts_implementation`) instead of replacing experts classes/functions.
-            # We intentionally set this after model construction below: HF init-time validation
-            # only allows eager/grouped_mm/batched_mm during `PreTrainedModel` initialization.
-            config._veomni_experts_implementation = VEOMNI_FUSED_MOE_EXPERTS_IMPL
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
@@ -186,16 +146,6 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
-
-    if moe_implementation == "fused" and is_transformers_version_greater_or_equal_to("5.0.0"):
-        # Set custom experts backend after model construction: HF init-time validation currently only accepts
-        # eager/grouped_mm/batched_mm, but dispatch at forward time supports registered custom keys.
-        model.config._experts_implementation = getattr(
-            config,
-            "_veomni_experts_implementation",
-            VEOMNI_FUSED_MOE_EXPERTS_IMPL,
-        )
-        _verify_fused_moe_experts_dispatch(model)
 
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
