@@ -79,6 +79,10 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.moe_intermediate_size
+        # VeOmni keeps split expert weights here (gate_proj/up_proj/down_proj),
+        # which differs from transformers v5 native gate_up_proj layout.
+        # HuggingFace safetensor checkpoints often store expert weights per expert;
+        # run scripts/moe_ckpt_merge/moe_merge.py to merge weights before training.
         self.gate_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
         self.up_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
