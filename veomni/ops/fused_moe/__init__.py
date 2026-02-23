@@ -18,7 +18,10 @@ import torch
 
 from ...utils import logging
 from ...utils.env import get_env
-from ...utils.import_utils import is_fused_moe_available, is_torch_npu_available
+from ...utils.import_utils import (
+    is_fused_moe_available,
+    is_torch_npu_available,
+)
 
 
 logger = logging.get_logger(__name__)
