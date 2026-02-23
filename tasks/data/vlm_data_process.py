@@ -13,6 +13,7 @@ Functions:
 
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
+import numpy as np
 import torch
 
 from veomni.data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -254,15 +255,27 @@ def _process_sample_omni(
     else:
         audio_audios = []
 
+    # Whisper STFT requires input length > n_fft/2 (pad=200, so need len > 200).
+    # Use n_fft=400 as the minimum safe length; pad short/empty audio with silence.
+    _WHISPER_MIN_AUDIO_LEN = 400
+
+    def _ensure_min_audio_len(audio):
+        if audio is None:
+            return np.zeros(_WHISPER_MIN_AUDIO_LEN, dtype=np.float32)
+        if len(audio) < _WHISPER_MIN_AUDIO_LEN:
+            pad_len = _WHISPER_MIN_AUDIO_LEN - len(audio)
+            audio = np.concatenate([audio, np.zeros(pad_len, dtype=audio.dtype)])
+        return audio
+
     video_audios_iter = iter(video_audios)
     audio_audios_iter = iter(audio_audios)
     audios = []
     for item in input_conversations:
         for content in item["content"]:
             if content["type"] == "video":
-                audios.append(next(video_audios_iter))
+                audios.append(_ensure_min_audio_len(next(video_audios_iter)))
             elif content["type"] == "audio":
-                audios.append(next(audio_audios_iter))
+                audios.append(_ensure_min_audio_len(next(audio_audios_iter)))
 
     model_inputs = processor(
         text=text,

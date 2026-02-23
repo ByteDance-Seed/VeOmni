@@ -74,10 +74,13 @@ from ....data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDE
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
+    gather_outputs,
     gather_seq_scatter_heads,
     reduce_sequence_parallel_loss,
+    slice_input_tensor,
     slice_position_embedding,
     sp_pad_and_slice,
+    unpad_tensor,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops import fused_moe_forward
@@ -849,6 +852,15 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
 
+        # Modification: SP support — input_features is (num_mel_bins, total_len);
+        # gather along the time dimension (dim=1) and strip any SP padding before chunking.
+        if get_parallel_state().sp_enabled:
+            unpadded_input_len = torch.sum(chunk_lengths)
+            input_features = gather_outputs(input_features, gather_dim=1, group=get_parallel_state().sp_group)
+            sp_input_padding = input_features.size(1) - unpadded_input_len
+            if sp_input_padding > 0:
+                input_features = unpad_tensor(input_features, dim=1, padding_size=sp_input_padding)
+
         chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
         padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
@@ -884,6 +896,16 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
                 cu_chunk_lens += [remainder]
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
+        # Modification: SP support — slice hidden_states along seq dim (dim=0) before encoder layers.
+        # Track total unpadded length to compute SP padding size for cu_seqlens extension.
+        if get_parallel_state().sp_enabled:
+            unpadded_hidden_len = cu_seqlens[-1]
+            hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
+            # Extend cu_seqlens to cover the padded tail on the last rank if needed
+            pad_seq_len = hidden_states.size(0) * get_parallel_state().sp_size - unpadded_hidden_len
+            if pad_seq_len > 0:
+                cu_seqlens = torch.cat([cu_seqlens, (cu_seqlens[-1] + pad_seq_len).unsqueeze(0)], dim=0)
+
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
@@ -897,6 +919,22 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)
         return BaseModelOutput(last_hidden_state=hidden_states)
+
+    def dummy_forward(self):
+        """
+        Dummy forward to avoid FSDP reduce-scatter hang when some ranks have no audio data.
+        input_features shape is (num_mel_bins, total_len), feature_lens is (num_audios,).
+        """
+        if getattr(self, "_dummy_data", None) is None:
+            # Minimal valid input: one audio clip of length n_window*2 (smallest non-zero chunk)
+            min_len = self.n_window * 2
+            input_features = torch.zeros((self.num_mel_bins, min_len), dtype=self.dtype, device=self.device)
+            feature_lens = torch.tensor([min_len], dtype=torch.long, device=self.device)
+            self._dummy_data = {
+                "input_features": input_features,
+                "feature_lens": feature_lens,
+            }
+        return self(**self._dummy_data)
 
     def padded_and_mask_function(self, tensor_list, tensor_len, padding_value=0, padding_side="right"):
         """
@@ -2144,20 +2182,25 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
-        # TODO audio sp support
-        if get_parallel_state().sp_enabled:
-            raise NotImplementedError("audio sp is not supported yet.")
+        # Modification: unpack feature_attention_mask into flat (num_mel_bins, total_len) format
+        # expected by the audio_tower, then delegate. SP is handled inside audio_tower.
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
             input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+        else:
+            # Compatibility: handle pre-processed (total_len, num_mel_bins) input without mask
+            if input_features.ndim == 2 and input_features.size(-1) == self.audio_tower.num_mel_bins:
+                input_features = input_features.transpose(0, 1)  # -> (num_mel_bins, total_len)
 
-        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+        if audio_feature_lengths is not None:
+            feature_lens = audio_feature_lengths
+        else:
+            feature_lens = torch.tensor([input_features.size(1)], dtype=torch.long, device=input_features.device)
         audio_outputs = self.audio_tower(
             input_features,
             feature_lens=feature_lens,
         )
         audio_features = audio_outputs.last_hidden_state
-
         return audio_features
 
     # We don't use this but compute the image and video masks in advance in process_sample
@@ -2327,8 +2370,23 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 audio_feature_lengths=audio_feature_lengths,
             )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            # Modification: SP patch — audio_tower returns sliced-seq features; gather along seq and
+            # scatter along hidden dim to match inputs_embeds layout during fill-back.
+            if self.training and get_parallel_state().sp_enabled:
+                audio_features = gather_seq_scatter_heads(
+                    audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                )
+            # Modification: drop any padding tokens beyond the actual audio placeholder count
+            n_audio_tokens = audio_mask.sum().long().item()
+            audio_features = audio_features[:n_audio_tokens]
             audio_mask_expanded = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask_expanded, audio_features)
+        elif get_parallel_state().fsdp_enabled:
+            # Modification: dummy audio tower forward to keep FSDP reduce-scatter in sync when
+            # some ranks have no audio data while others do.
+            fake_audio = self.audio_tower.dummy_forward().last_hidden_state.mean() * 0.0
+            fake_audio = fake_audio.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_audio
 
         # Initialize fake_deepstack to None
         fake_deepstack = None
