@@ -38,6 +38,10 @@ Handling summary:
 - safetensor keys are per expert, while v5 expects merged expert tensors;
 - for VeOmni qwen3_moe training, run offline merge first via `scripts/moe_ckpt_merge/moe_merge.py`.
 
+Other Qwen3 family models with similar layout like qwen3_moe (i.e., per-expert split keys in safetensors):
+- Qwen3 Next: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct
+- Qwen3 Omni: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct
+
 ### qwen3_vl_moe
 
 - Sample checkpoint: https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
