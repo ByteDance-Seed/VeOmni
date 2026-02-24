@@ -149,6 +149,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
     self: Qwen2_5_VisionTransformerPretrainedModel,
     hidden_states: torch.Tensor,
     grid_thw: torch.Tensor,
+    _vision_dp: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -157,10 +158,16 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
             The final hidden states of the model.
         grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
             The temporal, height and width of feature shape of each image in LLM.
+        _vision_dp: When True, skip patch-level SP logic (Vision DP handles
+            distribution at the image level instead).
 
     Returns:
         `torch.Tensor`: hidden_states.
     """
+    # When _vision_dp=True, this forward receives only this rank's assigned
+    # images (complete, not split). Skip all SP pad/slice/all-to-all operations.
+    use_sp = get_parallel_state().sp_enabled and not _vision_dp
+
     hidden_states = self.patch_embed(hidden_states)
     rotary_pos_emb = self.rot_pos_emb(grid_thw)
     window_index, cu_window_seqlens = self.get_window_index(grid_thw)
@@ -183,7 +190,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
 
     # --- Patch.1 ---
     unpadded_dim_size = cu_seqlens[-1]
-    if get_parallel_state().sp_enabled:
+    if use_sp:
         hidden_states = gather_seq_scatter_heads(
             hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
         )
@@ -201,7 +208,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
     rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
 
-    if get_parallel_state().sp_enabled:
+    if use_sp:
         if sp_padding_size > 0:
             # --- Patch.1 ---
             hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
@@ -253,7 +260,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
     reverse_indices = torch.argsort(window_index)
 
     # --- Patch.1 ---
-    if get_parallel_state().sp_enabled:
+    if use_sp:
         sp_padding_size = hidden_states.size(0) - unpadded_dim_size
         hidden_states = gather_seq_scatter_heads(
             hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
@@ -265,7 +272,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
     hidden_states = hidden_states[reverse_indices, :]
 
     # --- Patch.1 ---
-    if get_parallel_state().sp_enabled:
+    if use_sp:
         if sp_padding_size > 0:
             hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
         hidden_states = gather_heads_scatter_seq(
@@ -283,7 +290,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
 # ================================================================
 # --- Patch.1 ---
 def Qwen2_5_VisionTransformerPretrainedModel_dummy_forward(self: Qwen2_5_VisionTransformerPretrainedModel):
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and not getattr(self.__class__, "_vision_dp_patched", False):
         if getattr(self, "_sp_dummy_data", None) is None:
             sp_size = get_parallel_state().sp_size
             pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
@@ -426,10 +433,13 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
             )
         # --- Patch.3 ---
 
+        _vision_dp_active = getattr(self.visual.__class__, "_vision_dp_patched", False)
+
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             # --- Patch.3 ---
-            if get_parallel_state().sp_enabled:
+            # When Vision DP is active, image_embeds are already all-gathered
+            if get_parallel_state().sp_enabled and not _vision_dp_active:
                 image_embeds = gather_seq_scatter_heads(
                     image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
@@ -448,7 +458,8 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
             # --- Patch.3 ---
-            if get_parallel_state().sp_enabled:
+            # When Vision DP is active, video_embeds are already all-gathered
+            if get_parallel_state().sp_enabled and not _vision_dp_active:
                 video_embeds = gather_seq_scatter_heads(
                     video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
@@ -692,7 +703,7 @@ class Qwen2_5_VLForConditionalGeneration(_Qwen2_5_VLForConditionalGeneration):
         )
 
 
-def apply_veomni_qwen25_vl_patch():
+def apply_veomni_qwen25_vl_patch(vision_dp: bool = False):
     logger.info_rank0("Apply VeOmni patch to Qwen2.5_VL.")
     hf_qwen25vl.Qwen2_5_VLVisionAttention.forward = Qwen2_5_VLVisionAttention_forward
     hf_qwen25vl.Qwen2_5_VisionTransformerPretrainedModel.forward = Qwen2_5_VisionTransformerPretrainedModel_forward
@@ -701,3 +712,23 @@ def apply_veomni_qwen25_vl_patch():
     )
     hf_qwen25vl.Qwen2_5_VLModel = Qwen2_5_VLModel
     hf_qwen25vl.Qwen2_5_VLForConditionalGeneration = Qwen2_5_VLForConditionalGeneration
+
+    if vision_dp:
+        apply_vision_dp_patch_qwen25()
+
+
+def apply_vision_dp_patch_qwen25():
+    """Apply Vision DP to Qwen2.5-VL VisionTransformer.
+
+    Eliminates 4 all-to-all operations in the ViT forward by distributing
+    whole images instead of splitting patches across SP ranks.
+    """
+    from ...distributed.sequence_parallel.vision_dp import create_dp_vision_forward
+
+    cls = hf_qwen25vl.Qwen2_5_VisionTransformerPretrainedModel
+    if getattr(cls, "_vision_dp_patched", False):
+        return
+    original = cls.forward
+    cls.forward = create_dp_vision_forward(original)
+    cls._vision_dp_patched = True
+    logger.info_rank0("Applied Vision DP patch to Qwen2_5_VisionTransformerPretrainedModel.forward")

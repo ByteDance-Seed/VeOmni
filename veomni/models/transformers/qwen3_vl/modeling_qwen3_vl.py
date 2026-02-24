@@ -401,7 +401,11 @@ def fast_pos_embed_interpolate(self, grid_thw):
 # 6. move cu_seqlens to cpu when using NPU to avoid per layer CPU-GPU sync when using FA
 # ================================================================
 def Qwen3VLVisionModel_forward(
-    self: Qwen3VLVisionModel, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
+    self: Qwen3VLVisionModel,
+    hidden_states: torch.Tensor,
+    grid_thw: torch.Tensor,
+    _vision_dp: bool = False,
+    **kwargs,
 ) -> torch.Tensor:
     """
     Args:
@@ -409,16 +413,22 @@ def Qwen3VLVisionModel_forward(
             The final hidden states of the model.
         grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
             The temporal, height and width of feature shape of each image in LLM.
+        _vision_dp: When True, skip patch-level SP logic (Vision DP handles
+            distribution at the image level instead).
 
     Returns:
         `torch.Tensor`: hidden_states.
     """
+    # When _vision_dp=True, this forward receives only this rank's assigned
+    # images (complete, not split). Skip all SP pad/slice operations.
+    use_sp = get_parallel_state().sp_enabled and not _vision_dp
+
     hidden_states = self.patch_embed(hidden_states)
 
     pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 
     # --- Patch.1 ---
-    if get_parallel_state().sp_enabled:
+    if use_sp:
         # We need to do padding here because of hidden_states did padding with pad_scale=4
         pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
     # --- Patch.1 ---
@@ -448,7 +458,7 @@ def Qwen3VLVisionModel_forward(
     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
 
-    if get_parallel_state().sp_enabled:
+    if use_sp:
         # --- Patch.3 ---
         cos, sin = position_embeddings
         cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
@@ -502,7 +512,7 @@ def Qwen3VLVisionModel_forward(
 # ================================================================
 # --- Patch.1 ---
 def Qwen3VLVisionModel_dummy_forward(self):
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and not getattr(self.__class__, "_vision_dp_patched", False):
         sp_size = get_parallel_state().sp_size
         pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
         # If using SP, pixel_values is sliced but grid_thw is not
@@ -643,11 +653,15 @@ class Qwen3VLModel(_Qwen3VLModel):
         # Initialize fake_deepstack to None
         fake_deepstack = None
 
+        _vision_dp_active = getattr(self.visual.__class__, "_vision_dp_patched", False)
+
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
 
             # --- Patch.3 ---
-            if get_parallel_state().sp_enabled:
+            # When Vision DP is active, image_embeds are already all-gathered
+            # by the dp_vision_forward wrapper — skip the gather here.
+            if get_parallel_state().sp_enabled and not _vision_dp_active:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 image_embeds = gather_seq_scatter_heads(
                     image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
@@ -697,8 +711,8 @@ class Qwen3VLModel(_Qwen3VLModel):
         if pixel_values_videos is not None:
             # --- Patch.3 ---
             video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            # sequence parallel patch for video embeds
-            if get_parallel_state().sp_enabled:
+            # When Vision DP is active, video_embeds are already all-gathered
+            if get_parallel_state().sp_enabled and not _vision_dp_active:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 video_embeds = gather_seq_scatter_heads(
                     video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
@@ -967,7 +981,7 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         )
 
 
-def apply_veomni_qwen3vl_patch():
+def apply_veomni_qwen3vl_patch(vision_dp: bool = False):
     logger.info_rank0("Apply VeOmni patch to Qwen3_VL.")
     hf_qwen3vl.Qwen3VLVisionAttention.forward = Qwen3VLVisionAttention_forward
     hf_qwen3vl.Qwen3VLTextAttention = Qwen3VLTextAttention
@@ -979,7 +993,30 @@ def apply_veomni_qwen3vl_patch():
     hf_qwen3vl.Qwen3VLModel = Qwen3VLModel
     hf_qwen3vl.Qwen3VLForConditionalGeneration = Qwen3VLForConditionalGeneration
 
+    if vision_dp:
+        apply_vision_dp_patch()
+
     if IS_NPU_AVAILABLE:
         from .npu_patch import apply_qwen3vl_npu_patch
 
         apply_qwen3vl_npu_patch()
+
+
+def apply_vision_dp_patch():
+    """Apply Vision DP monkey-patch to VisionModel.forward.
+
+    Instead of patch-level SP (which requires all-to-all per ViT layer for
+    window attention models), Vision DP distributes *whole images* across SP
+    ranks and only needs a single all-gather after the ViT.
+
+    Safe to call multiple times — each class is only patched once.
+    """
+    from ...distributed.sequence_parallel.vision_dp import create_dp_vision_forward
+
+    cls = hf_qwen3vl.Qwen3VLVisionModel
+    if getattr(cls, "_vision_dp_patched", False):
+        return
+    original = cls.forward
+    cls.forward = create_dp_vision_forward(original)
+    cls._vision_dp_patched = True
+    logger.info_rank0("Applied Vision DP patch to Qwen3VLVisionModel.forward")
