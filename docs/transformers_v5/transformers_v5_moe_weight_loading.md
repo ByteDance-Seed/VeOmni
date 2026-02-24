@@ -1,15 +1,110 @@
 # Transformers v5 MoE Weight Loading
 
-This note documents VeOmni MoE weight-loading expectations for `transformers>=5.0.0`.
+This note documents the current VeOmni behavior for MoE weights with `transformers>=5.0.0`.
 
-## Background
+## Current Design
 
-Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
+### qwen3_moe modeling format
 
-For VeOmni qwen3_moe transformers v5 path, we use a simpler path:
-- patch experts behavior in generated modeling;
-- call `veomni.ops.fused_moe_forward(...)` explicitly in the patched forward;
-- keep `_moe_implementation` (`eager` or `fused`) as runtime selection.
+For qwen3_moe on transformers v5, patched modeling uses:
+- `gate_up_proj`: `[E, 2*I, H]` (in `[gate, up]` order)
+- `down_proj`: `[E, H, I]`
+
+VeOmni currently replaces the whole `Qwen3MoeExperts` class in patchgen output and keeps `_moe_implementation`
+(`eager` or `fused`) as runtime selection.
+
+### fused path behavior and TODO
+
+The fused MoE path still consumes split gate/up weights. In forward:
+- `gate_weight = gate_up_proj[:, :I, :]`
+- `up_weight = gate_up_proj[:, I:, :]`
+
+Both slices are materialized with `.contiguous()` before calling `fused_moe_forward(...)`, because the current
+group-gemm fused MoE implementation expects contiguous weight tensors.
+
+TODO:
+- Add a fused MoE op interface that accepts stacked `gate_up_proj` directly to remove runtime split and
+  `.contiguous()` copies.
+
+## Runtime Checkpoint Conversion Flow (qwen3_moe Example)
+
+Runtime conversion is model-specific and incremental.
+
+### 1) Registration
+
+In `veomni/models/transformers/qwen3_moe/__init__.py`, for `transformers>=5.0.0`, qwen3_moe model classes are
+registered with:
+- `model_cls._create_checkpoint_tensor_converter = create_qwen3_moe_checkpoint_tensor_converter`
+
+### 2) Loader hook point
+
+In `veomni/models/module_utils.py`:
+- loader resolves converter once via `get_hf_checkpoint_tensor_converter(model)`;
+- each checkpoint tensor is passed through `maybe_convert_hf_checkpoint_tensor(...)`;
+- converter can return:
+  - a converted tensor (`HfConvertedCheckpointTensor`) to dispatch immediately, or
+  - `None` to keep accumulating until enough source tensors are seen.
+
+This is used in both regular loading and rank0-broadcast loading paths.
+
+### 3) qwen3_moe converter behavior
+
+In `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`:
+- handles keys matching per-expert regex:
+  - `model.layers.{L}.mlp.experts.{E}.(gate_proj|up_proj|down_proj).weight`
+- validates layer/expert indices and input tensor shapes against config (`num_hidden_layers`, `num_experts`,
+  `hidden_size`, `moe_intermediate_size`);
+- accumulates tensors per layer until all experts are available;
+- emits:
+  - `model.layers.{L}.mlp.experts.gate_up_proj` as `cat([stack(gate), stack(up)], dim=1)` -> `[E, 2*I, H]`
+  - `model.layers.{L}.mlp.experts.down_proj` as `stack(down)` -> `[E, H, I]`
+- drops per-layer accumulation buffers immediately after emission to reduce CPU memory.
+
+Because conversion is incremental, per-expert tensors can arrive in arbitrary order and across multiple safetensor
+files; emission happens when a layer has all required experts for a target tensor.
+
+## SOP: Add Runtime Conversion for a New Model
+
+Use this checklist when a model’s checkpoint tensor format differs from `transformers>=5` modeling layout.
+
+1. Add a model-local converter implementation
+- Create `<model>/checkpoint_tensor_converter.py`.
+- Implement converter with:
+  - `can_handle(name: str) -> bool`
+  - `convert(name: str, tensor: torch.Tensor) -> HfConvertedCheckpointTensor | None`
+- Keep logic self-contained for that model.
+
+2. Validate aggressively from config
+- Validate key patterns (layer/expert indices).
+- Validate source tensor shapes against config dimensions.
+- Raise clear errors on mismatch.
+
+3. Emit v5-native target tensors
+- Emit final state-dict names and shapes that exactly match model parameters in patched/generated modeling.
+- Return `None` while accumulating partial inputs.
+
+4. Register converter factory on model classes
+- In model `__init__.py`, set `_create_checkpoint_tensor_converter` for relevant model classes.
+- Guard registration with transformers version checks when behavior is v5-specific.
+
+5. Verify both load paths
+- Ensure behavior works for:
+  - direct checkpoint loading
+  - rank0 load + broadcast path
+- Confirm no unexpected keys/missing keys for converted parameters.
+
+6. Add unit tests with fake safetensors
+- Cover:
+  - in-order and out-of-order key arrival
+  - multi-shard-style arrival patterns
+  - invalid shape/index error paths
+  - exact emitted names and tensor shapes
+
+7. Document model-specific rules
+- Update `docs/transformers_v5/` with:
+  - source checkpoint key format
+  - target modeling tensor format
+  - conversion strategy and current limitations.
 
 ## Survey: Qwen MoE Weight Formats
 
@@ -82,54 +177,6 @@ self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, sel
 
 Handling summary:
 - no special remap/transpose needed for shape semantics.
-
-## Qwen3Moe Handling in VeOmni
-
-For qwen3_moe, VeOmni keeps split expert tensors in patched modeling:
-- `gate_proj`
-- `up_proj`
-- `down_proj`
-
-This differs from native Transformers v5 `gate_up_proj` layout.
-
-Checkpoint loading behavior:
-- VeOmni does not do runtime remapping from legacy per-expert keys;
-- HuggingFace safetensor checkpoints commonly store expert weights in per-expert form.
-
-To avoid loading/mapping issues, merge weights offline before training:
-- `scripts/moe_ckpt_merge/moe_merge.py`
-
-## VeOmni Fused MoE Op Interface
-
-VeOmni fused MoE entrypoint:
-- `veomni.ops.fused_moe.fused_moe_forward(...)`
-
-Current signature:
-
-```python
-fused_moe_forward(
-    module: torch.nn.Module,
-    num_experts: int,
-    routing_weights: torch.Tensor,
-    selected_experts: torch.Tensor,
-    hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
-    fc2_weight: torch.Tensor,
-)
-```
-
-Expected tensor interface:
-- `hidden_states`: token-major hidden states used by experts, shape `[num_tokens, hidden_dim]`;
-- `routing_weights`: router top-k probabilities, shape `[num_tokens, top_k]`;
-- `selected_experts`: router top-k expert indices, shape `[num_tokens, top_k]`;
-- `fc1_1_weight` (gate): shape `[num_experts, intermediate_dim, hidden_dim]`;
-- `fc1_2_weight` (up): shape `[num_experts, intermediate_dim, hidden_dim]`;
-- `fc2_weight` (down): shape `[num_experts, hidden_dim, intermediate_dim]`.
-
-Important constraints:
-- op expects split gate/up tensors (`fc1_1_weight` and `fc1_2_weight`), not a merged `gate_up_proj` tensor;
-- needs to be `.contiguous()`.
 
 ## Future Work: Align with Transformers v5 Weight Formatting
 
