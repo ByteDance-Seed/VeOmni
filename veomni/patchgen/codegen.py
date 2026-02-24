@@ -118,6 +118,19 @@ def get_node_end_line(node: ast.AST, source_lines: list[str]) -> int:
         return node.lineno + 10  # Rough estimate
 
 
+def get_node_start_line(node: ast.AST) -> int:
+    """
+    Get the start line of an AST node, including decorators when present.
+
+    For decorated classes/functions this returns the first decorator line.
+    """
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.decorator_list:
+        decorator_lines = [decorator.lineno for decorator in node.decorator_list if hasattr(decorator, "lineno")]
+        if decorator_lines:
+            return min(decorator_lines)
+    return node.lineno
+
+
 class ImportCollector(ast.NodeVisitor):
     """
     Collects all import statements from an AST.
@@ -309,29 +322,64 @@ class ModelingCodeGenerator:
 
         This handles:
         - Converting relative imports to absolute imports
+        - Dropping configured imported names from source imports
+        - Adding custom post-import code blocks
         - Adding additional imports from the patch config
         """
         output_lines = []
+        drop_imported_names = self.config.drop_imported_names
+
+        def _should_keep_alias(alias: ast.alias) -> bool:
+            if not drop_imported_names:
+                return True
+
+            candidates = {alias.name, alias.name.rsplit(".", 1)[-1]}
+            if alias.asname:
+                candidates.add(alias.asname)
+
+            return candidates.isdisjoint(drop_imported_names)
 
         for node in import_nodes:
             if isinstance(node, ast.ImportFrom):
+                filtered_names = [alias for alias in node.names if _should_keep_alias(alias)]
+                if not filtered_names:
+                    continue
+
+                filtered_node = ast.ImportFrom(module=node.module, names=filtered_names, level=node.level)
+
                 # Handle relative imports - convert to absolute
-                if node.level > 0:
+                if filtered_node.level > 0:
                     # Try to resolve to absolute import
                     # The base module is self.config.source_module
                     base_parts = self.config.source_module.split(".")
-                    if node.level <= len(base_parts):
-                        absolute_module = ".".join(base_parts[: -node.level])
-                        if node.module:
-                            absolute_module = f"{absolute_module}.{node.module}"
-                        new_node = ast.ImportFrom(module=absolute_module, names=node.names, level=0)
+                    if filtered_node.level <= len(base_parts):
+                        absolute_module = ".".join(base_parts[: -filtered_node.level])
+                        if filtered_node.module:
+                            absolute_module = f"{absolute_module}.{filtered_node.module}"
+                        new_node = ast.ImportFrom(module=absolute_module, names=filtered_node.names, level=0)
                         output_lines.append(ast_to_source(new_node))
                     else:
-                        output_lines.append(ast_to_source(node))
+                        output_lines.append(ast_to_source(filtered_node))
                 else:
-                    output_lines.append(ast_to_source(node))
+                    output_lines.append(ast_to_source(filtered_node))
             else:
-                output_lines.append(ast_to_source(node))
+                filtered_names = [alias for alias in node.names if _should_keep_alias(alias)]
+                if not filtered_names:
+                    continue
+                filtered_node = ast.Import(names=filtered_names)
+                output_lines.append(ast_to_source(filtered_node))
+
+        # Add custom post-import blocks from config
+        if self.config.post_import_blocks:
+            output_lines.append("")
+            output_lines.append("# Additional import blocks for patches")
+            for block in self.config.post_import_blocks:
+                block = textwrap.dedent(block).strip()
+                if block:
+                    output_lines.append(block)
+                    output_lines.append("")
+            if output_lines and output_lines[-1] == "":
+                output_lines.pop()
 
         # Add additional imports from config
         if self.config.additional_imports:
@@ -407,7 +455,8 @@ class ModelingCodeGenerator:
                 lines.append(f"# Could not get source for {patch.replacement.__name__}")
                 lines.append("# Using original class as fallback")
                 end_line = get_node_end_line(original_class, self.source_lines)
-                lines.append(extract_source_segment(self.source_lines, original_class.lineno, end_line))
+                start_line = get_node_start_line(original_class)
+                lines.append(extract_source_segment(self.source_lines, start_line, end_line))
         elif patch.replacement_source:
             # External replacement - generate import and alias
             lines.append(f"# Import from: {patch.replacement_source}")
@@ -415,7 +464,8 @@ class ModelingCodeGenerator:
             lines.append(f"from {module} import {name} as {original_class.name}")
         else:
             end_line = get_node_end_line(original_class, self.source_lines)
-            lines.append(extract_source_segment(self.source_lines, original_class.lineno, end_line))
+            start_line = get_node_start_line(original_class)
+            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
 
         return "\n".join(lines)
 
@@ -562,10 +612,12 @@ class ModelingCodeGenerator:
             else:
                 lines.append("# Could not get source for replacement")
                 end_line = get_node_end_line(original_func, self.source_lines)
-                lines.append(extract_source_segment(self.source_lines, original_func.lineno, end_line))
+                start_line = get_node_start_line(original_func)
+                lines.append(extract_source_segment(self.source_lines, start_line, end_line))
         else:
             end_line = get_node_end_line(original_func, self.source_lines)
-            lines.append(extract_source_segment(self.source_lines, original_func.lineno, end_line))
+            start_line = get_node_start_line(original_func)
+            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
 
         return "\n".join(lines)
 
@@ -716,7 +768,8 @@ class ModelingCodeGenerator:
             # Preserve original class formatting/comments for untouched methods,
             # and replace only the patched methods in-place.
             end_line = get_node_end_line(class_node, self.source_lines)
-            class_source = extract_source_segment(self.source_lines, class_node.lineno, end_line)
+            start_line = get_node_start_line(class_node)
+            class_source = extract_source_segment(self.source_lines, start_line, end_line)
 
             # Replace the unparsed method bodies with comment-preserved versions
             for method_name, preserved_source in method_replacement_sources.items():
@@ -726,7 +779,8 @@ class ModelingCodeGenerator:
         else:
             # No patches - use original source with comments preserved
             end_line = get_node_end_line(class_node, self.source_lines)
-            lines.append(extract_source_segment(self.source_lines, class_node.lineno, end_line))
+            start_line = get_node_start_line(class_node)
+            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
 
         return "\n".join(lines)
 
@@ -741,7 +795,8 @@ class ModelingCodeGenerator:
 
         # No patches - use original source with comments preserved
         end_line = get_node_end_line(func_node, self.source_lines)
-        return extract_source_segment(self.source_lines, func_node.lineno, end_line)
+        start_line = get_node_start_line(func_node)
+        return extract_source_segment(self.source_lines, start_line, end_line)
 
     def generate(self, output_path: Optional[Path] = None) -> str:
         """
