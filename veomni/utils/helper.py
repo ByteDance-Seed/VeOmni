@@ -664,7 +664,16 @@ def create_profiler(
         if VEOMNI_UPLOAD_CMD:
             try:
                 logger.info_rank0(f"upload trace file {trace_file}")
-                command2 = f"{VEOMNI_UPLOAD_CMD} {trace_file}"
+                if IS_NPU_AVAILABLE:
+                    import gzip
+                    import shutil
+
+                    npu_trace_file = f"{trace_file}/ASCEND_PROFILER_OUTPUT/trace_view.json"
+                    with open(npu_trace_file, "rb") as f_in, gzip.open(f"{npu_trace_file}.gz", "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                    command2 = f"{VEOMNI_UPLOAD_CMD} {npu_trace_file}.gz"
+                else:
+                    command2 = f"{VEOMNI_UPLOAD_CMD} {trace_file}"
                 subprocess.run(command2, shell=True, check=True, executable="/bin/bash")
             except Exception as e:
                 logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
