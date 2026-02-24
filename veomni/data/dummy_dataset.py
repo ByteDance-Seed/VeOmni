@@ -193,6 +193,35 @@ class DummyQwenOmniDataset(Dataset):
         ]
 
 
+class DummyQwen3OmniMoeDataset(DummyQwenOmniDataset):
+    def __init__(
+        self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
+    ):
+        super().__init__(size, seq_length, patch_size, temporal_patch_size, merge_size)
+        self.audio_seq_length = self._get_feat_extract_output_lengths(self.audio_seq_length * 4)
+        self.seq_length = self.text_seqlen + self.image_seqlen + self.audio_seq_length + self.video_seqlen
+        mask = torch.zeros((self.seq_length,), dtype=torch.bool)
+        start_index = self.text_seqlen
+        self.image_mask = mask.clone()
+        self.image_mask[start_index : start_index + self.image_seqlen] = 1
+        self.audio_mask = mask.clone()
+        start_index += self.image_seqlen
+        self.audio_mask[start_index : start_index + self.audio_seq_length] = 1
+        self.video_mask = mask.clone()
+        start_index += self.audio_seq_length
+        self.video_mask[start_index : start_index + self.video_seqlen] = 1
+
+    def _get_feat_extract_output_lengths(self, input_lengths):
+        """
+        Computes the output length of the convolutional layers and the output length of the audio encoder
+        """
+
+        input_lengths_leave = input_lengths % 100
+        feat_lengths = (input_lengths_leave - 1) // 2 + 1
+        output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+        return output_lengths
+
+
 class DummyUGDataset(Dataset):
     def __init__(
         self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
@@ -302,7 +331,7 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset
     elif task_type == "qwen2omni":
         return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=14)
     elif task_type == "qwen3omni":
-        return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=16)
+        return DummyQwen3OmniMoeDataset(size=size, seq_length=max_seq_len, patch_size=16)
     elif task_type == "ug":
         return DummyUGDataset(size=size, seq_length=max_seq_len)
     else:

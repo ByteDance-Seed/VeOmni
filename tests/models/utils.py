@@ -112,6 +112,7 @@ MODEL_TO_DATASET = {
     "qwen2_vl": "qwen2vl",
     "qwen2_5_vl": "qwen2vl",
     "qwen2_5_omni": "qwen2omni",
+    "qwen3_omni_moe": "qwen3omni",
 }
 
 UNSQUEECE_KEYS = ["input_ids", "attention_mask", "labels", "position_ids", "image_mask", "video_mask", "audio_mask"]
@@ -120,7 +121,7 @@ UNSQUEECE_KEYS = ["input_ids", "attention_mask", "labels", "position_ids", "imag
 def parse_token_id_from_config(model_config):
     if model_config.model_type not in MODEL_TO_DATASET:
         return {}
-    if model_config.model_type in ["qwen2_5_omni", "qwen3_moe_omni"]:
+    if model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
         token_ids_dict = {
             "image_token_id": model_config.thinker_config.image_token_id,
             "video_token_id": model_config.thinker_config.video_token_id,

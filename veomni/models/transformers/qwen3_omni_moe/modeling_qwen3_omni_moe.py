@@ -456,6 +456,7 @@ class Qwen3OmniMoeVisionEncoder(hf_qwen3_omni_moe.Qwen3OmniMoeVisionEncoder):
 # 1. [SP] Gather input_features along the time dim and strip SP padding before chunking
 # 2. [SP] Slice hidden_states before encoder layers; extend cu_seqlens for the padded tail
 # 3. [FSDP] dummy_forward to prevent reduce-scatter hang when some ranks have no audio data
+# 4. [data] input_features shape: (seq_len, dim)
 # ================================================================
 class Qwen3OmniMoeAudioEncoder(hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder):
     def forward(
@@ -464,6 +465,10 @@ class Qwen3OmniMoeAudioEncoder(hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder):
         feature_lens=None,
         aftercnn_lens=None,
     ):
+        # --- Patch.4 ---
+        input_features = input_features.permute(1, 0)  # len, 128 -> 128, len
+        # --- Patch.4 ---
+
         aftercnn_lens = hf_qwen3_omni_moe._get_feat_extract_output_lengths(feature_lens)
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -855,6 +860,7 @@ def get_position_id(main_func, self, **kwargs):
 # 10.[Loss]  Delegate loss to ForCausalLMLoss
 # 11.[PosIDs] Transpose pre-computed position_ids from (bs, 3, L) to (3, bs, L)
 # 12.[RoPE]  get_rope_index supports per-video use_audio_in_video via audio_seqlens
+# 13.[Data] support veomni data format
 # ================================================================
 class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoeThinkerForConditionalGeneration):
     def get_position_id_func(self):
@@ -881,39 +887,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
     def get_audio_features(
         self,
         input_features: torch.FloatTensor,
-        feature_attention_mask: Optional[torch.LongTensor] = None,
         audio_feature_lengths: Optional[torch.LongTensor] = None,
     ):
-        """
-        Encodes audios into continuous embeddings that can be forwarded to the language model.
-
-        Args:
-            input_features (`torch.FloatTensor`):
-                The tensors corresponding to the input audios.
-            feature_attention_mask (`torch.LongTensor`, *optional*):
-                Mask to avoid performing attention on padding feature indices. Mask values selected in `[0, 1]`:
-            audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
-                The length of feature shape of each audio in LLM.
-        """
-        if feature_attention_mask is not None:
-            # Unpack into flat (num_mel_bins, total_len) format expected by audio_tower; SP is handled inside.
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
-        else:
-            # Compatibility: handle pre-processed (total_len, num_mel_bins) input without mask.
-            if input_features.ndim == 2 and input_features.size(-1) == self.audio_tower.num_mel_bins:
-                input_features = input_features.transpose(0, 1)  # -> (num_mel_bins, total_len)
-
-        if audio_feature_lengths is not None:
-            feature_lens = audio_feature_lengths
-        else:
-            feature_lens = torch.tensor([input_features.size(1)], dtype=torch.long, device=input_features.device)
         audio_outputs = self.audio_tower(
             input_features,
-            feature_lens=feature_lens,
+            feature_lens=audio_feature_lengths,
         )
         audio_features = audio_outputs.last_hidden_state
-
         return audio_features
 
     def forward(
@@ -925,7 +905,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
         image_grid_thw=None,
         video_grid_thw=None,
         attention_mask=None,
-        feature_attention_mask=None,
+        # --- Patch.13 ---
+        # feature_attention_mask=None,
+        # --- Patch.13 ---
         audio_feature_lengths=None,
         position_ids=None,
         past_key_values=None,
@@ -993,11 +975,20 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
 
+        # --- Patch.13 ---
+        if input_features is not None:
+            valid_mask = audio_feature_lengths != 0
+            # filter videos without audios, the origin invalid audio_feature_lengths only used for get_rope_index, now filter them out
+            audio_feature_lengths = audio_feature_lengths[valid_mask]
+            if input_features.shape[0] == 0:
+                # input_features is (0, dim) when no audio in all videos, we do not forward audio_tower
+                input_features = None
+        # --- Patch.13 ---
+
         # 2. Merge text, audios, image and video
         if input_features is not None:
             audio_features = self.get_audio_features(
                 input_features,
-                feature_attention_mask=feature_attention_mask,
                 audio_feature_lengths=audio_feature_lengths,
             )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1176,11 +1167,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             if fake_deepstack is not None:
                 deepstack_visual_embeds = fake_deepstack
 
-        if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-        else:
-            audio_feature_lengths = None
-
         if attention_mask is not None and position_ids is None:
             if (
                 cache_position is None
@@ -1193,7 +1179,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
                     image_grid_thw,
                     video_grid_thw,
                     attention_mask,
-                    use_audio_in_video,
+                    # --- Patch.2 ---
+                    # use_audio_in_video,
+                    # --- Patch.2 ---
                     audio_feature_lengths,
                     video_second_per_grid,
                 )

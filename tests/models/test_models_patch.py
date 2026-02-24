@@ -104,7 +104,12 @@ class TrainerTest(BaseTrainer):
                 batch["input_features"]
                 .reshape(len(audio_feature_lengths), audio_feature_lengths.max(), -1)
                 .permute(0, 2, 1)
+                .to(dtype=self.model.dtype)
             )
+        elif self.model_config.model_type in ["qwen3_omni_moe"] and get_env("MODELING_BACKEND") == "veomni":
+            batch["input_features"] = batch["input_features"].to(
+                dtype=self.model.dtype
+            )  # qwen3 omni didn't handle dtype in audio_forward
 
         loss, loss_dict = super().forward_backward_step(batch)
         grad_norm = veomni_clip_grad_norm(self.model, args.train.max_grad_norm)
@@ -199,6 +204,13 @@ test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_vl_moe",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3omni_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_omni_moe",
     ),
 ]
 
