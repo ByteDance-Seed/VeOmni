@@ -144,40 +144,6 @@ def main(raw_hf_path, merge_hf_path):
     for group in moe_groups:
         _merge_experts_for_group(new_state_dict, group)
 
-    if hasattr(config, "num_experts"):
-        # qwen3moe
-        num_experts = config.num_experts
-    elif hasattr(config, "n_routed_experts"):
-        # deepseek
-        num_experts = config.n_routed_experts
-    else:
-        raise RuntimeError("could not find how many experts to assign")
-    num_hidden_layers = config.num_hidden_layers
-
-    if hasattr(config, "first_k_dense_replace"):
-        # deepseek first k dense layer
-        moe_layer_start_idx = config.first_k_dense_replace
-    else:
-        # moe layer only in the model
-        moe_layer_start_idx = 0
-
-    for i in range(moe_layer_start_idx, num_hidden_layers):
-        gate_proj = []
-        for j in range(num_experts):
-            gate_proj.append(new_state_dict.pop(f"model.layers.{i}.mlp.experts.{j}.gate_proj.weight"))
-
-        new_state_dict[f"model.layers.{i}.mlp.experts.gate_proj"] = torch.stack(gate_proj)
-        up_proj = []
-        for j in range(num_experts):
-            up_proj.append(new_state_dict.pop(f"model.layers.{i}.mlp.experts.{j}.up_proj.weight"))
-
-        new_state_dict[f"model.layers.{i}.mlp.experts.up_proj"] = torch.stack(up_proj)
-        down_proj = []
-        for j in range(num_experts):
-            down_proj.append(new_state_dict.pop(f"model.layers.{i}.mlp.experts.{j}.down_proj.weight"))
-
-        new_state_dict[f"model.layers.{i}.mlp.experts.down_proj"] = torch.stack(down_proj)
-
     model_assets = [config, tokenizer]
     save_model_weights(merge_hf_path, new_state_dict, model_assets=model_assets)
 
