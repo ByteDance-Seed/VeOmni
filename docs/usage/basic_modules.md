@@ -281,7 +281,7 @@ model = build_parallelize_model(
     enable_gradient_checkpointing=args.train.enable_gradient_checkpointing, # enable gradient checkpointing
     init_device=args.train.init_device, # model init device
     enable_fsdp_offload=args.train.enable_fsdp_offload, # enable fsdp offload
-    basic_modules=model._no_split_modules + args.model.basic_modules, # FSDP basic modules
+    basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
 )
 ```
 

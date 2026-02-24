@@ -32,6 +32,8 @@ from transformers.video_utils import make_batched_videos
 # Patch: Qwen3OmniMoeProcessor
 # 1. Use truthy check `if audio:` instead of `if audio is not None:`
 #    to properly handle empty lists from VeOmni data format
+# 2. Accept `audios` (qwen2_5_omni style) and `input_audios` (VeOmni data pipeline)
+#    as aliases for `audio`, must be popped before `_merge_kwargs` to avoid unknown kwarg warning
 # ================================================================
 class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
     def __call__(
@@ -44,6 +46,11 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
     ) -> BatchFeature:
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
+
+        # Accept `audios` and `input_audios` as aliases for `audio`.
+        # Must be popped before `_merge_kwargs` to avoid unknown kwarg warning.
+        if audio is None:
+            audio = kwargs.pop("audios", None) or kwargs.pop("input_audios", None)
 
         output_kwargs = self._merge_kwargs(
             Qwen3OmniMoeProcessorKwargs,

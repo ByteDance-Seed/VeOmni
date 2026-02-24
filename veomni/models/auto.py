@@ -26,6 +26,7 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
 
 
@@ -67,8 +68,10 @@ def build_foundation_model(
             "sdpa",
             "flash_attention_2",
             "flash_attention_3",
+            "flash_attention_4",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
@@ -129,7 +132,20 @@ def build_foundation_model(
         "trust_remote_code": True,
     }
 
-    if attn_implementation not in ("veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"):
+    if attn_implementation in (
+        "flash_attention_4",
+        "veomni_flash_attention_4_with_sp",
+    ) and not is_transformers_version_greater_or_equal_to("5.0.0"):
+        raise RuntimeError(
+            f"attn_implementation '{attn_implementation}' requires Transformers>=5.0.0. "
+            "Install it with: uv sync --extra gpu --extra fa4 --extra transformers5-exp --no-group transformers-stable"
+        )
+
+    if attn_implementation not in (
+        "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_4_with_sp",
+    ):
         logger.warning_rank0(
             f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use veomni_flash_attention_2_with_sp or veomni_flash_attention_3_with_sp for SP."
         )
@@ -163,5 +179,14 @@ def build_foundation_model(
             return original_forward(*args, **kwargs)
 
         model.forward = wrapped_forward
+
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        assert not getattr(model, "use_kernels", False), (
+            "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "
+            "to avoid unexpected kernel loading side effects."
+        )
+
+    model_class_path = f"{model.__class__.__module__}.{model.__class__.__name__}"
+    logger.info_rank0(f"Built foundation model class: {model_class_path}")
 
     return model

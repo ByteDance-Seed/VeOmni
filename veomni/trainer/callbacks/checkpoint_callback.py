@@ -158,6 +158,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             save_checkpoint_path=save_checkpoint_path,
             model=self.trainer.model,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+            is_rank_0=args.train.global_rank == 0,
         )
 
         # Empty cache and barrier

@@ -27,7 +27,7 @@ dependencies = [
   # Comment out transformers version for pip user compatibility (not to accidentally install v5 which is still WIP
   # and experimental)
   # For uv user: The actual version is controlled by the "transformers-stable" default
-  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.1.0).
+  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.2.0).
   # For pip user: please install 4.57.3 manually via pip install transformers==4.57.3.
   # "transformers==4.57.3",
   "psutil",
@@ -89,7 +89,9 @@ gpu = [
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
-  "torchcodec==0.8.1" # 0.8.1 is compatible with torch 2.9
+  "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
+  "cuda-python==12.9.1",
+  "torch-c-dlpack-ext"
 ]
 megatron = [
   "megatron-energon>=7.2.1"
@@ -98,12 +100,17 @@ trl = [
   "trl<=0.9.6"
 ]
 
+fa4 = [
+  "flash-attn-cute",
+  "nvidia-cutlass-dsl>=4.4.0"
+]
+
 # Experimental dep to install transformers 5.x.
 # Note that transformers 5.x support is experimental and WIP.
 # See https://github.com/ByteDance-Seed/VeOmni/issues/468 for the progress.
 # Usage: `uv sync --no-group transformers-stable --extra transformers5-exp --extra <other extra>`.
 transformers5-exp = [
-  "transformers==5.1.0"
+  "transformers==5.2.0"
 ]
 
 [dependency-groups]
@@ -202,6 +209,11 @@ conflicts = [
     { group = "transformers-stable" },
     { extra = "transformers5-exp" },
   ],
+  # FA4 only works for transformers v5
+  [
+    { group = "transformers-stable" },
+    { extra = "fa4" },
+  ],
 ]
 
 [tool.uv.sources]
@@ -230,6 +242,10 @@ flash-attn-3 = [
   # torch 2.9+cu129
   { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
+# FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
+# Pinned to 02/20/2026 latest main commit.
+flash-attn-cute = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "6079a9bf4cfd7af8e7586afea6c49a97ebddf46e" }
+
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
 av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video'" }
 
@@ -262,6 +278,8 @@ exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts"]
 target-version = "py311"
 line-length = 119
 indent-width = 4
+extend-exclude = ["veomni/models/transformers/**/generated/*.py"]
+force-exclude = true
 
 [tool.ruff.lint]
 ignore = ["C901", "E501", "E741", "W605", "C408"]
@@ -280,6 +298,7 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
+exclude = ["veomni/models/transformers/**/generated/*.py"]
 
 [tool.pytest.ini_options]
 markers = [

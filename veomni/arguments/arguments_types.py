@@ -119,6 +119,7 @@ class ModelArguments:
             "sdpa",
             "flash_attention_2",
             "flash_attention_3",
+            "flash_attention_4",
             "native-sparse",
         ]
     ] = field(
@@ -171,6 +172,11 @@ class ModelArguments:
                 "Replacing ModelArgument attn_implementation from 'flash_attention_3' to 'veomni_flash_attention_3_with_sp'"
             )
             self.attn_implementation = "veomni_flash_attention_3_with_sp"
+        if self.attn_implementation == "flash_attention_4":
+            logger.info_rank0(
+                "Replacing ModelArgument attn_implementation from 'flash_attention_4' to 'veomni_flash_attention_4_with_sp'"
+            )
+            self.attn_implementation = "veomni_flash_attention_4_with_sp"
 
         suppoerted_encoder_types = ["image", "video", "audio"]
         for encoder_type, encoder_args in self.encoders.items():

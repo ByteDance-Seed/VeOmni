@@ -11,9 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+Sample transformation module for Vision-Language Models (VLMs).
+
+This module provides process_sample functions for different VLM variants,
+extracted from training scripts for better extensibility and reusability.
+
+Functions:
+    process_sample_qwen2_5_vl: Process samples for Qwen2.5-VL models
+    process_sample_qwen3_vl: Process samples for Qwen3-VL models
+    get_omni_token_ids: Resolve image/video/audio pad token IDs from processor vocab
+    process_sample_qwen_omni: Process samples for Qwen2.5-Omni and Qwen3-Omni-MoE models
+"""
 
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
+import numpy as np
 import torch
 
 from ...utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -165,20 +178,55 @@ def process_sample_qwen3_vl(
     return [tokenized_example]
 
 
-def process_sample_qwen_omni(
+QWEN_OMNI_SYSTEM_MESSAGE = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating text and speech."
+)
+
+
+def get_omni_token_ids(processor: "ProcessorMixin") -> tuple[int, int, int]:
+    """
+    Resolve (image_token_id, video_token_id, audio_token_id) by reading from the processor's
+    tokenizer vocab. Supports both Qwen2.5-Omni and Qwen3-Omni-MoE:
+      Qwen2.5-Omni:   image=151655 (<|IMAGE|>),     video=151656 (<|VIDEO|>),     audio=151646 (<|AUDIO|>)
+      Qwen3-Omni-MoE: image=151655 (<|image_pad|>), video=151656 (<|video_pad|>), audio=151675 (<|audio_pad|>)
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    vocab = tokenizer.get_vocab()
+    # Qwen2.5-Omni uses <|IMAGE|>/<|VIDEO|>/<|AUDIO|>; https://huggingface.co/Qwen/Qwen2.5-Omni-7B/blob/main/tokenizer_config.json
+    # Qwen3-Omni uses <|image_pad|>/<|video_pad|>/<|audio_pad|>; https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
+    image_token_id = vocab.get("<|image_pad|>", vocab.get("<|IMAGE|>"))
+    video_token_id = vocab.get("<|video_pad|>", vocab.get("<|VIDEO|>"))
+    audio_token_id = vocab.get("<|audio_pad|>", vocab.get("<|AUDIO|>"))
+    if image_token_id is None:
+        raise ValueError("Cannot find image token (<|image_pad|> or <|IMAGE|>) in tokenizer vocab.")
+    if video_token_id is None:
+        raise ValueError("Cannot find video token (<|video_pad|> or <|VIDEO|>) in tokenizer vocab.")
+    if audio_token_id is None:
+        raise ValueError("Cannot find audio token (<|audio_pad|> or <|AUDIO|>) in tokenizer vocab.")
+    return image_token_id, video_token_id, audio_token_id
+
+
+def _process_sample_omni(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
     position_id_func: "Callable",
+    image_token_id: int,
+    video_token_id: int,
+    audio_token_id: int,
     **kwargs,
-):
-    SYSTEM_MESSAGE = (
-        "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
-        "capable of perceiving auditory and visual inputs, as well as generating text and speech."
-    )
+) -> list[Dict[str, Any]]:
+    """
+    Shared implementation for Omni model sample processing (Qwen2.5-Omni and Qwen3-Omni-MoE).
+    Token IDs for image/video/audio placeholders are passed explicitly to support
+    different tokenizer vocabs across model versions.
+    """
     source = (
         kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
+    conversations = (
+        sample["conversations"] if ("conversations" in sample and len(sample["conversations"]) > 0) else sample
+    )
     conversations = conv_preprocess(source, conversations, **kwargs)
     input_conversations = [
         {
@@ -186,7 +234,7 @@ def process_sample_qwen_omni(
             "content": [
                 {
                     "type": "text",
-                    "text": SYSTEM_MESSAGE,
+                    "text": QWEN_OMNI_SYSTEM_MESSAGE,
                 },
             ],
         },
@@ -220,13 +268,27 @@ def process_sample_qwen_omni(
     else:
         audio_audios = []
 
+    # Whisper STFT requires input length > n_fft/2 (pad=200, so need len > 200).
+    # Use n_fft=400 as the minimum safe length; pad short/empty audio with silence.
+    _WHISPER_MIN_AUDIO_LEN = 400
+
+    def _ensure_min_audio_len(audio):
+        if audio is None:
+            return np.zeros(_WHISPER_MIN_AUDIO_LEN, dtype=np.float32)
+        if len(audio) < _WHISPER_MIN_AUDIO_LEN:
+            pad_len = _WHISPER_MIN_AUDIO_LEN - len(audio)
+            audio = np.concatenate([audio, np.zeros(pad_len, dtype=audio.dtype)])
+        return audio
+
+    video_audios_iter = iter(video_audios)
+    audio_audios_iter = iter(audio_audios)
     audios = []
     for item in input_conversations:
         for content in item["content"]:
             if content["type"] == "video":
-                audios.append(video_audios.pop(0))
+                audios.append(_ensure_min_audio_len(next(video_audios_iter)))
             elif content["type"] == "audio":
-                audios.append(audio_audios.pop(0))
+                audios.append(_ensure_min_audio_len(next(audio_audios_iter)))
 
     model_inputs = processor(
         text=text,
@@ -253,9 +315,9 @@ def process_sample_qwen_omni(
         audio_feature_lengths = None  # no video & no audio
 
     input_ids = model_inputs["input_ids"].squeeze(0)
-    image_mask = input_ids == 151655
-    video_mask = input_ids == 151656
-    audio_mask = input_ids == 151646
+    image_mask = input_ids == image_token_id
+    video_mask = input_ids == video_token_id
+    audio_mask = input_ids == audio_token_id
     input_ids[image_mask] = IMAGE_INPUT_INDEX
     input_ids[video_mask] = VIDEO_INPUT_INDEX
     input_ids[audio_mask] = AUDIO_INPUT_INDEX
@@ -278,8 +340,14 @@ def process_sample_qwen_omni(
     model_inputs["attention_mask"] = model_inputs["attention_mask"].squeeze(0)
 
     labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
-    user_start_index = torch.where(input_ids == 872)[0].tolist()  # "user" 872
-    assistant_start_index = torch.where(input_ids == 77091)[0].tolist()  # "assistant" 77091
+    tokenizer = getattr(processor, "tokenizer", processor)
+    vocab = tokenizer.get_vocab()
+    user_token_id = vocab.get("user")
+    assistant_token_id = vocab.get("assistant")
+    if user_token_id is None or assistant_token_id is None:
+        raise ValueError("Cannot find user/assistant tokens in tokenizer vocab.")
+    user_start_index = torch.where(input_ids == user_token_id)[0].tolist()
+    assistant_start_index = torch.where(input_ids == assistant_token_id)[0].tolist()
     user_start_index.append(len(input_ids) + 1)
     user_i = 0
     for assis_i in assistant_start_index:
@@ -288,3 +356,21 @@ def process_sample_qwen_omni(
         labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
     model_inputs["labels"] = labels
     return [model_inputs]
+
+
+def process_sample_qwen_omni(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    position_id_func: "Callable",
+    **kwargs,
+):
+    """
+    Processes multimodal example for Qwen-Omni family models (Qwen2.5-Omni and Qwen3-Omni-MoE).
+    Token IDs are resolved dynamically from the processor vocab to support both variants:
+      Qwen2.5-Omni:   image=151655 (<|IMAGE|>),     video=151656 (<|VIDEO|>),     audio=151646 (<|AUDIO|>)
+      Qwen3-Omni-MoE: image=151655 (<|image_pad|>), video=151656 (<|video_pad|>), audio=151675 (<|audio_pad|>)
+    """
+    image_token_id, video_token_id, audio_token_id = get_omni_token_ids(processor)
+    return _process_sample_omni(
+        sample, processor, position_id_func, image_token_id, video_token_id, audio_token_id, **kwargs
+    )
