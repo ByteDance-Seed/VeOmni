@@ -20,15 +20,16 @@ python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5.qwen3_5
 Language-model focused patches from qwen3_next example:
 1. Disable use_cache when gradient checkpointing is enabled.
 2. Slice RoPE position embeddings for sequence parallel.
-3. Use VeOmni fused loss path in Qwen3_5ForCausalLM.forward.
+3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
 """
 
 import torch
 import torch.nn.functional as F
 from transformers.cache_utils import Cache
 from transformers.masking_utils import create_causal_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5CausalLMOutputWithPast,
     Qwen3_5DynamicCache,
     Qwen3_5ModelOutputWithPast,
     apply_mask_to_padding_states,
@@ -351,34 +352,48 @@ def qwen3_5_text_model_forward_patched(
 
 
 @config.override_method(
-    "Qwen3_5ForCausalLM.forward",
-    description="Support fused cross entropy path in Qwen3_5ForCausalLM.forward",
+    "Qwen3_5ForConditionalGeneration.forward",
+    description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
 )
-def qwen3_5_forcausal_lm_forward_patched(
+def qwen3_5_forconditional_generation_forward_patched(
     self,
-    input_ids: torch.LongTensor | None = None,
+    input_ids: torch.LongTensor = None,
     attention_mask: torch.Tensor | None = None,
     position_ids: torch.LongTensor | None = None,
     past_key_values: Cache | None = None,
     inputs_embeds: torch.FloatTensor | None = None,
     labels: torch.LongTensor | None = None,
-    use_cache: bool | None = None,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.FloatTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> CausalLMOutputWithPast:
-    outputs: BaseModelOutputWithPast = self.model(
+) -> tuple | Qwen3_5CausalLMOutputWithPast:
+    # Modification: VeOmni currently supports text-only Qwen3_5.
+    # TODO(veomni): add vision input support for pixel_values/pixel_values_videos.
+    if pixel_values is not None or pixel_values_videos is not None:
+        raise ValueError(
+            "Qwen3_5ForConditionalGeneration currently supports text-only inputs in VeOmni; "
+            "`pixel_values` and `pixel_values_videos` are not supported yet."
+        )
+
+    outputs = self.model(
         input_ids=input_ids,
-        attention_mask=attention_mask,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
         position_ids=position_ids,
+        attention_mask=attention_mask,
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
-        use_cache=use_cache,
         cache_position=cache_position,
         **kwargs,
     )
 
-    hidden_states = outputs.last_hidden_state
+    hidden_states = outputs[0]
     # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     hidden_states = hidden_states[:, slice_indices, :]
@@ -389,7 +404,7 @@ def qwen3_5_forcausal_lm_forward_patched(
         loss, logits = self.loss_function(
             logits=logits,
             labels=labels,
-            vocab_size=self.config.vocab_size,
+            vocab_size=self.config.text_config.vocab_size,
             hidden_states=hidden_states,
             weights=self.lm_head.weight,
             **kwargs,
@@ -397,10 +412,11 @@ def qwen3_5_forcausal_lm_forward_patched(
     else:
         logits = self.lm_head(hidden_states)
 
-    return CausalLMOutputWithPast(
+    return Qwen3_5CausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
+        rope_deltas=outputs.rope_deltas,
     )
