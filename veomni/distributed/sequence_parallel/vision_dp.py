@@ -147,6 +147,7 @@ def prepare_local_vision_inputs(
     grid_thw: torch.Tensor,
     image_assignments: list[list[int]],
     dp_rank: int,
+    patch_counts: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """Extract pixel values and grid_thw for this DP rank's assigned images.
 
@@ -155,6 +156,8 @@ def prepare_local_vision_inputs(
         grid_thw: Grid dimensions per image, shape (num_images, 3).
         image_assignments: Per-rank image index assignments.
         dp_rank: This rank's index in the DP group.
+        patch_counts: Pre-computed patch counts per image (avoids redundant
+            GPU→CPU sync when grid_thw is on GPU). Computed from grid_thw if None.
 
     Returns:
         Tuple of (local_pixel_values, local_grid_thw, local_indices).
@@ -176,8 +179,9 @@ def prepare_local_vision_inputs(
     first_img_idx = local_indices[0]
     last_img_idx = local_indices[-1]
 
-    # Compute patch offsets using cumsum
-    patch_counts = get_image_patch_counts(grid_thw)
+    # Use pre-computed patch_counts to avoid redundant GPU→CPU transfer
+    if patch_counts is None:
+        patch_counts = get_image_patch_counts(grid_thw)
     patch_counts_tensor = torch.tensor(patch_counts, device=grid_thw.device, dtype=torch.long)
     offsets = torch.cat(
         (
@@ -329,9 +333,9 @@ def create_dp_vision_forward(original_forward):
 
         image_assignments, _ = assign_images_to_dp_ranks(patch_counts, dp_size)
 
-        # Step 2: Extract local inputs
+        # Step 2: Extract local inputs (pass pre-computed patch_counts to avoid GPU→CPU sync)
         local_pixels, local_grid_thw, local_indices = prepare_local_vision_inputs(
-            hidden_states, grid_thw, image_assignments, dp_rank
+            hidden_states, grid_thw, image_assignments, dp_rank, patch_counts=patch_counts
         )
 
         # Step 3: Process local images (pass _vision_dp=True to skip SP patches)
