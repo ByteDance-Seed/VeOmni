@@ -286,7 +286,9 @@ def Qwen2_5OmniPreTrainedModelForConditionalGeneration_get_rope_index(
                         audio_idx += 1
                         video_idx += 1
                         remain_videos -= 1
-                        remain_audios -= 1
+                        # --- Patch.1 ---
+                        # remain_audios -= 1
+                        # --- Patch.1 ---
 
             if st < len(input_tokens):
                 st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
