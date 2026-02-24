@@ -49,7 +49,7 @@ class DummyTextDataset(Dataset):
 
 
 class DummyQwenVLDataset(Dataset):
-    def __init__(self, size: int, seq_length: int, patch_size: int = 14):
+    def __init__(self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2,  merge_size: int = 2):
         """
         Args:
             size (int): Nums of datasets
@@ -59,25 +59,27 @@ class DummyQwenVLDataset(Dataset):
         self.seq_length = seq_length
         self.vocab_size = 1024
 
-        image_token_num = 4
         image_t = 2
         video_t = 10
-        self.text_seqlen = self.seq_length - image_t * image_token_num - video_t * image_token_num
+        h, w = 4, 4
+        channel_size = 3
 
-        self.image_size = [16 * image_t, patch_size * patch_size * 2 * 3]
-        self.image_grid_thw = torch.tensor([[1, 4, 4]] * image_t, dtype=torch.long)
-        self.image_seqlen = image_t * image_token_num
+        self.image_size = [image_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.image_grid_thw = torch.tensor([[1, h, w]] * image_t, dtype=torch.long)
+        self.image_seqlen = h * w // (merge_size ** 2) * image_t
 
-        self.video_size = [16 * video_t, patch_size * patch_size * 2 * 3]
-        self.video_grid_thw = torch.tensor([[video_t, 4, 4]], dtype=torch.long)
-        self.video_seqlen = video_t * image_token_num
+        self.video_size = [video_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.video_grid_thw = torch.tensor([[video_t, h, w]], dtype=torch.long)
+        self.video_seqlen = h * w // (merge_size ** 2) * video_t
+
+        self.text_seqlen = self.seq_length - self.image_seqlen - self.video_seqlen
 
         self.seq_length = self.text_seqlen + self.image_seqlen + self.video_seqlen
         mask = torch.zeros((self.seq_length,), dtype=torch.bool)
         self.image_mask = mask.clone()
-        self.image_mask[: self.image_seqlen] = 1
+        self.image_mask[:self.image_seqlen] = 1
         self.video_mask = mask.clone()
-        self.video_mask[-self.video_seqlen :] = 1
+        self.video_mask[-self.video_seqlen:] = 1
 
     def __len__(self) -> int:
         return self.size
@@ -107,7 +109,7 @@ class DummyQwenVLDataset(Dataset):
 
 
 class DummyQwenOmniDataset(Dataset):
-    def __init__(self, size: int, seq_length: int, patch_size: int = 14):
+    def __init__(self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2):
         """
         Args:
             size (int): Nums of datasets
@@ -119,41 +121,43 @@ class DummyQwenOmniDataset(Dataset):
         self.seq_length = seq_length
         self.vocab_size = 1024
 
-        input_image_token_num = 4
-        input_image_t = 2
-        self.input_image_size = [16 * input_image_t, patch_size * patch_size * 2 * 3]
-        self.input_image_grid_thw = torch.tensor([[1, 4, 4]] * input_image_t, dtype=torch.long)
-        self.input_image_seq_length = input_image_t * input_image_token_num
+        h, w = 4, 4
+        image_t = 2
+        video_t = 10
+        channel_size = 3
+
+        self.image_size = [image_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.image_grid_thw = torch.tensor([[1, h, w]] * image_t, dtype=torch.long)
+        self.image_seqlen = h * w // (merge_size ** 2) * image_t
 
         audio_token_num = 100
         audio_num = 2
-        self.input_audio_size = [4 * audio_token_num * audio_num, 128]
-        self.input_audio_feature_lengths = torch.tensor([4 * audio_token_num] * audio_num, dtype=torch.long)
-        self.input_audio_seq_length = audio_num * audio_token_num
+        self.audio_size = [4 * audio_token_num * audio_num, 128]
+        self.audio_feature_lengths = torch.tensor([4 * audio_token_num] * audio_num, dtype=torch.long)
+        self.audio_seq_length = audio_num * audio_token_num
         self.feature_attention_mask = torch.ones((audio_num, 4 * audio_token_num), dtype=torch.long)
 
-        rest_seq_length = self.seq_length - (self.input_image_seq_length + self.input_audio_seq_length)
+        rest_seq_length = self.seq_length - (self.image_seqlen + self.audio_seq_length)
 
-        video_t = 10
-
-        self.input_video_size = [16 * video_t, patch_size * patch_size * 2 * 3]
-        self.input_video_grid_thw = torch.tensor([[video_t, 4, 4]], dtype=torch.long)
-        self.video_seq_length = video_t * input_image_token_num
-        self.text_seq_length = rest_seq_length - self.video_seq_length
+        self.video_size = [video_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.video_grid_thw = torch.tensor([[video_t, h, w]], dtype=torch.long)
+        self.video_seqlen = h * w // (merge_size ** 2) * video_t
+        
+        self.text_seqlen = rest_seq_length - self.video_seqlen
 
         self.seq_length = (
-            self.text_seq_length + self.input_image_seq_length + self.input_audio_seq_length + self.video_seq_length
+            self.text_seqlen + self.image_seqlen + self.audio_seq_length + self.video_seqlen
         )
         mask = torch.zeros((self.seq_length,), dtype=torch.bool)
-        start_index = self.text_seq_length
+        start_index = self.text_seqlen
         self.image_mask = mask.clone()
-        self.image_mask[start_index : start_index + self.input_image_seq_length] = 1
+        self.image_mask[start_index : start_index + self.image_seqlen] = 1
         self.audio_mask = mask.clone()
-        start_index += self.input_image_seq_length
-        self.audio_mask[start_index : start_index + self.input_audio_seq_length] = 1
+        start_index += self.image_seqlen
+        self.audio_mask[start_index : start_index + self.audio_seq_length] = 1
         self.video_mask = mask.clone()
-        start_index += self.input_audio_seq_length
-        self.video_mask[start_index : start_index + self.video_seq_length] = 1
+        start_index += self.audio_seq_length
+        self.video_mask[start_index : start_index + self.video_seqlen] = 1
 
     def __len__(self) -> int:
         return self.size
@@ -164,9 +168,9 @@ class DummyQwenOmniDataset(Dataset):
         labels = input_ids.clone()
         labels[0] = IGNORE_INDEX
         position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
-        image_features = torch.rand(self.input_image_size, dtype=torch.float32)
-        audio_features = torch.rand(self.input_audio_size, dtype=torch.float32)
-        video_features = torch.rand(self.input_video_size, dtype=torch.float32)
+        image_features = torch.rand(self.image_size, dtype=torch.float32)
+        audio_features = torch.rand(self.audio_size, dtype=torch.float32)
+        video_features = torch.rand(self.video_size, dtype=torch.float32)
         return [
             {
                 "input_ids": input_ids,
@@ -179,16 +183,16 @@ class DummyQwenOmniDataset(Dataset):
                 "image_mask": self.image_mask,
                 "audio_mask": self.audio_mask,
                 "video_mask": self.video_mask,
-                "image_grid_thw": self.input_image_grid_thw,
-                "video_grid_thw": self.input_video_grid_thw,
-                "audio_feature_lengths": self.input_audio_feature_lengths,
+                "image_grid_thw": self.image_grid_thw,
+                "video_grid_thw": self.video_grid_thw,
+                "audio_feature_lengths": self.audio_feature_lengths,
                 "feature_attention_mask": self.feature_attention_mask,
             }
         ]
 
 
 class DummyUGDataset(Dataset):
-    def __init__(self, size: int, seq_length: int, patch_size: int = 14):
+    def __init__(self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2):
         """
         Args:
             size (int): Nums of datasets
@@ -200,11 +204,15 @@ class DummyUGDataset(Dataset):
         self.seq_length = seq_length
         self.vocab_size = 1024
 
-        input_image_token_num = 81
-        input_image_t = 2
-        self.input_image_size = [324 * input_image_t, patch_size * patch_size * 2 * 3]
-        self.input_image_grid_thw = torch.tensor([[1, 18, 18]] * input_image_t, dtype=torch.long)
-        self.input_image_seq_length = input_image_t * input_image_token_num
+        
+        h, w = 18, 18
+        image_t = 2
+        video_t = 10
+        channel_size = 3
+
+        self.input_image_size = [image_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.input_image_grid_thw = torch.tensor([[1, h, w]] * image_t, dtype=torch.long)
+        self.input_image_seq_length = image_t * h * w // (merge_size ** 2)
 
         audio_token_num = 100
         audio_num = 2
@@ -221,11 +229,11 @@ class DummyUGDataset(Dataset):
             self.input_image_seq_length + self.input_audio_seq_length + self.output_image_seq_length
         )
 
-        self.text_seq_length = rest_seq_length // 4
-        self.video_seq_length = rest_seq_length - self.text_seq_length
-        video_t = self.video_seq_length // input_image_token_num
-        self.input_video_size = [324 * video_t, patch_size * patch_size * 2 * 3]
-        self.input_video_grid_thw = torch.tensor([[video_t, 18, 18]], dtype=torch.long)
+        self.input_video_size = [video_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.input_video_grid_thw = torch.tensor([[video_t, h, w]], dtype=torch.long)
+        self.video_seq_length = video_t * h * w // (merge_size ** 2)
+
+        self.text_seq_length = rest_seq_length - self.video_seq_length
 
         self.seq_length = (
             self.text_seq_length
