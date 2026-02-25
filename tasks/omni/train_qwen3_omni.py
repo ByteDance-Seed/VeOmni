@@ -27,7 +27,7 @@ from veomni.distributed.parallel_state import get_parallel_state, init_parallel_
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets
 from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoePreTrainedModelForConditionalGeneration,
+    Qwen3OmniMoeForConditionalGeneration,
 )
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
@@ -94,7 +94,7 @@ def main():
     )
 
     logger.info_rank0("Prepare model")
-    model: Qwen3OmniMoePreTrainedModelForConditionalGeneration = build_foundation_model(
+    model: Qwen3OmniMoeForConditionalGeneration = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
