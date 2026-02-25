@@ -33,14 +33,8 @@ from transformers.utils import (
 from ....ops import fused_moe_forward
 from ....utils import logging
 from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import (
-    is_liger_kernel_available,
-    is_transformers_version_greater_or_equal_to,
-)
+from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
-
-if is_liger_kernel_available():
-    pass
 
 logger = logging.get_logger(__name__)
 

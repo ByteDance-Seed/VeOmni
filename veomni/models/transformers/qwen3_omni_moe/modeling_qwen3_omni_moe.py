@@ -1287,6 +1287,33 @@ def _get_parallel_plan(_self):
 
 
 # ================================================================
+# PATCH: Qwen3OmniMoePreTrainedModel
+# 1. Support init weight function for experts and gate. Also will be
+#    align with transformers v5.0.0, just temporary in transformers v4.57.3.
+# ================================================================
+def _init_weight(
+    tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0, generator: torch.Generator | None = None
+) -> torch.Tensor:
+    if not getattr(tensor, "_is_hf_initialized", False):
+        return torch.nn.init.normal_(tensor, mean=mean, std=std, generator=generator)
+    return tensor
+
+
+@torch.no_grad()
+def qwen3_omni_moe_pretrained_model_init_weights(self: hf_qwen3_omni_moe.Qwen3OmniMoePreTrainedModel, module):
+    """Custom _init_weights to handle Qwen3OmniMoeThinkerExperts"""
+
+    super(hf_qwen3_omni_moe.Qwen3OmniMoePreTrainedModel, self)._init_weights(module)
+
+    if isinstance(module, Qwen3OmniMoeThinkerExperts) or isinstance(
+        module, hf_qwen3_omni_moe.Qwen3OmniMoeThinkerTextMLP
+    ):
+        _init_weight(module.gate_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.up_proj, mean=0.0, std=self.config.initializer_range)
+        _init_weight(module.down_proj, mean=0.0, std=self.config.initializer_range)
+
+
+# ================================================================
 # apply_veomni_qwen3_omni_moe_patch
 # Central entry point to apply all VeOmni patches to HF Qwen3OmniMoe classes
 # ================================================================
@@ -1305,6 +1332,8 @@ def apply_veomni_qwen3_omni_moe_patch():
 
     # Patch parallel plan support
     hf_qwen3_omni_moe.Qwen3OmniMoePreTrainedModel.get_parallel_plan = _get_parallel_plan
+    # Patch init weights
+    hf_qwen3_omni_moe.Qwen3OmniMoePreTrainedModel._init_weights = qwen3_omni_moe_pretrained_model_init_weights
 
     # Patch VisionAttention forward
     hf_qwen3_omni_moe.Qwen3OmniMoeVisionAttention.forward = Qwen3OmniMoeVisionAttention_forward
