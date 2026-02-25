@@ -223,9 +223,7 @@ def _process_sample_omni(
     source = (
         kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # source_name if use multisource_dataset
-    conversations = (
-        sample["conversations"] if ("conversations" in sample and len(sample["conversations"]) > 0) else sample
-    )
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
     input_conversations = [
         {

@@ -89,7 +89,7 @@ def is_transformers_version_greater_or_equal_to(value: str) -> bool:
 
 
 def is_veomni_patch_available() -> bool:
-    return False
+    return _PACKAGE_FLAGS["veomni_patch"]
 
 
 def is_linux_aarch64_platform() -> bool:

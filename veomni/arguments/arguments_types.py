@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
+from ..utils.env import get_env
 
 
 logger = logging.get_logger(__name__)
@@ -162,21 +163,22 @@ class ModelArguments:
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
             )
 
-        if self.attn_implementation == "flash_attention_2":
-            logger.info_rank0(
-                "Replacing ModelArgument attn_implementation from 'flash_attention_2' to 'veomni_flash_attention_2_with_sp'"
-            )
-            self.attn_implementation = "veomni_flash_attention_2_with_sp"
-        if self.attn_implementation == "flash_attention_3":
-            logger.info_rank0(
-                "Replacing ModelArgument attn_implementation from 'flash_attention_3' to 'veomni_flash_attention_3_with_sp'"
-            )
-            self.attn_implementation = "veomni_flash_attention_3_with_sp"
-        if self.attn_implementation == "flash_attention_4":
-            logger.info_rank0(
-                "Replacing ModelArgument attn_implementation from 'flash_attention_4' to 'veomni_flash_attention_4_with_sp'"
-            )
-            self.attn_implementation = "veomni_flash_attention_4_with_sp"
+        if get_env("MODELING_BACKEND") == "veomni":
+            if self.attn_implementation == "flash_attention_2":
+                logger.info_rank0(
+                    "Replacing ModelArgument attn_implementation from 'flash_attention_2' to 'veomni_flash_attention_2_with_sp'"
+                )
+                self.attn_implementation = "veomni_flash_attention_2_with_sp"
+            if self.attn_implementation == "flash_attention_3":
+                logger.info_rank0(
+                    "Replacing ModelArgument attn_implementation from 'flash_attention_3' to 'veomni_flash_attention_3_with_sp'"
+                )
+                self.attn_implementation = "veomni_flash_attention_3_with_sp"
+            if self.attn_implementation == "flash_attention_4":
+                logger.info_rank0(
+                    "Replacing ModelArgument attn_implementation from 'flash_attention_4' to 'veomni_flash_attention_4_with_sp'"
+                )
+                self.attn_implementation = "veomni_flash_attention_4_with_sp"
 
         suppoerted_encoder_types = ["image", "video", "audio"]
         for encoder_type, encoder_args in self.encoders.items():
@@ -686,6 +688,8 @@ class TrainingArguments:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # calculate dataloader batch size
+        # for:
+        #   - StreamingDataset and StreamingDataLoader
         if self.dyn_bsz:
             self.dataloader_batch_size = 1
         else:

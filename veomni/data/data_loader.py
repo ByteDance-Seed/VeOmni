@@ -29,7 +29,7 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
+from .dynamic_batching import DynamicBatchingSizeDataset, DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
 DATALOADER_REGISTRY = Registry("dataloader")
@@ -62,6 +62,9 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
+    dyn_bsz_in_dataloader: bool = True,  # If True, dynamic batching is handled in the main process via DynamicBatchSizeDataLoader (legacy).
+    # If False, batching is done inside each DataLoader worker via DynamicBatchingSizeDataset, which supports StatefulDataLoader checkpoint/resume.
+    dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_in_dataloader is False.
     dyn_bsz_buffer_size: int = 500,
     num_workers: int = 8,
     drop_last: bool = True,
@@ -95,15 +98,27 @@ def build_native_dataloader(
             f"train_steps: {train_steps}, bsz_warmup_steps: {bsz_warmup_steps}, "
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
-
-        batching_strategy = TextBatchingStrategy(
-            token_micro_bsz=batching_token_len,
-            buffer_size=dyn_bsz_buffer_size,
-            bsz_warmup_steps=bsz_warmup_steps,
-            bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
-        )
         dyn_bsz_collate_fn = collate_fn
-        collate_fn = UnpackDataCollator()
+        if dyn_bsz_in_dataloader:
+            batching_strategy = TextBatchingStrategy(
+                token_micro_bsz=batching_token_len,
+                buffer_size=dyn_bsz_buffer_size,
+                bsz_warmup_steps=bsz_warmup_steps,
+                bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
+            )
+
+            collate_fn = UnpackDataCollator()
+        else:
+            dataloader_batch_size = num_micro_batch
+            dataset = DynamicBatchingSizeDataset(
+                dataset=dataset,
+                micro_batch_seq_length=batching_token_len,
+                ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
+                get_length_fn=lambda x: int(x["attention_mask"].sum()),
+                dynamic_batching_collate_fn=dyn_bsz_collate_fn,
+                save_by_idx=dyn_bsz_dataset_save_by_idx,
+            )
+            collate_fn = NoopDataCollator()
     else:
         logger.info_rank0(
             f"Use fixed_sample_batching -->\n"
@@ -136,7 +151,7 @@ def build_native_dataloader(
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
     )
-    if dyn_bsz:
+    if dyn_bsz and dyn_bsz_in_dataloader:
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
             batching_strategy=batching_strategy,

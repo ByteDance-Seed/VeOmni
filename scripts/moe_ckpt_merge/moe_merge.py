@@ -9,7 +9,7 @@ from safetensors.torch import safe_open
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from veomni.models import build_tokenizer, save_model_weights
+from veomni.models import build_processor, build_tokenizer, save_model_weights
 
 
 @dataclass
@@ -128,6 +128,10 @@ def main(raw_hf_path, merge_hf_path):
 
     config = AutoConfig.from_pretrained(raw_hf_path)
     tokenizer = build_tokenizer(raw_hf_path)
+    try:
+        processor = build_processor(raw_hf_path)
+    except Exception:
+        processor = None
 
     safetensor_files = list(glob(os.path.join(raw_hf_path, "*.safetensors")))
     safetensor_files.sort()
@@ -144,7 +148,7 @@ def main(raw_hf_path, merge_hf_path):
     for group in moe_groups:
         _merge_experts_for_group(new_state_dict, group)
 
-    model_assets = [config, tokenizer]
+    model_assets = [asset for asset in [config, tokenizer, processor] if asset is not None]
     save_model_weights(merge_hf_path, new_state_dict, model_assets=model_assets)
 
 
