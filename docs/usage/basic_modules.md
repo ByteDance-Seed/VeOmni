@@ -220,8 +220,6 @@ train_dataloader = build_dataloader(
     max_seq_len=args.data.max_seq_len, # max sequence length
     collate_fn=None, # you can pass your custom collate_fn
     train_steps=args.train.train_steps, # train steps, calculate by args.train.compute_train_steps
-    rmpad=args.train.rmpad, # remove padding
-    rmpad_with_pos_ids=args.train.rmpad_with_pos_ids, # remove padding with position ids
     dyn_bsz=args.train.dyn_bsz, # enable dynamic batching
     bsz_warmup_ratio=args.train.bsz_warmup_ratio, # bsz warmup ratio
     bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken, # bsz warmup init micro batch token
@@ -235,13 +233,7 @@ train_dataloader = build_dataloader(
 
 ### Collate Function
 VeOmni default supports three types of collate function for text task(source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)):
-1. `DataCollatorWithPadding` (enable when `rmpad` is False and `rmpad_with_pos_ids` is False)
-2. `DataCollatorWithPacking` (enable when `rmpad` is True and `rmpad_with_pos_ids` is False)
-3. `DataCollatorWithPositionIDs` (enable when `rmpad` is False and `rmpad_with_pos_ids` is True)
-
-For Omni model task:
-1. `OmniDataCollatorWithPacking` (for when `rmpad_with_pos_ids` is True)
-2. `OmniDataCollatorWithPadding` (for `rmpad` is False and `rmpad_with_pos_ids` is False)
+TODO
 
 See detail in source code: [veomni/data/multimodal/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/data_collator.py) and how to use it in the [train_omni_model.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_omni_model.py)
 

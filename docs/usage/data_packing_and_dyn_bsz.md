@@ -1,6 +1,6 @@
-# Usage of rmpad_with_pos_ids and dyn_bsz
+# Usage of dyn_bsz
 
-## Background of rmpad_with_pos_ids
+## Background of VeOmni data packing
 
 In LLM or VLM training, we usually adopt batch training, and the sequence lengths of different samples often vary, for example:
 
@@ -20,7 +20,7 @@ This approach introduces several serious problems:
 1. **A large amount of meaningless computation**. Transformer attention and FFN layers still perform computations on PAD tokens.
 2. **Unnecessary memory consumption**. Padding tokens also occupy GPU memory.
 
-The core idea of rmpad_with_pos_ids is:
+The core idea of VeOmni data packing is:
 
 Before computation, remove padding tokens from the tensors and perform computation only on real tokens.
 
@@ -32,7 +32,7 @@ The specific procedure is as follows:
 
 ## Background of dyn_bsz
 
-In distributed training, rmpad_with_pos_ids may cause the sequence lengths to be different across ranks. Suppose there are two ranks: S1 and S2 are on rank0, and S3 and S4 are on rank1:
+In distributed training, data packing may cause the sequence lengths to be different across ranks. Suppose there are two ranks: S1 and S2 are on rank0, and S3 and S4 are on rank1:
 
 * Rank0: [A B C D E F]
 * Rank1: [G H I J]
@@ -45,11 +45,11 @@ So the difference is:
 
 **dyn_bsz ON: batch size varies to hit a token budget.**
 
-**dyn_bsz OFF: batch size is fixed, but still uses position_ids packing (no padding) when rmpad_with_pos_ids.**
+**dyn_bsz OFF: batch size is fixed, but still uses position_ids packing (no padding).**
 
 ## Usage
 
-### rmpad_with_pos_ids = True, dyn_bsz = ON (Recommended for Pretraining)
+### dyn_bsz = True (Recommended for Pretraining)
 
 Goal: pack multiple samples into one long sequence and choose how many samples to fit per batch based on token budget.
 
@@ -61,9 +61,9 @@ Example packed batch (one micro‑batch):
 
 dyn_bsz decides how many samples to pack so total tokens ~ target budget. If your target is, say, 10 tokens, it packs all 4 here.
 
-### rmpad_with_pos_ids = True, dyn_bsz = OFF (Recommended for SFT)
+### dyn_bsz = False (Recommended for SFT)
 
-Goal: still pack with position_ids, but batch size is fixed in number of samples, not by tokens.
+Goal: still pack with position_ids, but batch size is fixed in number of samples, not by tokens. The num of samples in a batch is determined by the `micro_batch_size`.
 
 Example fixed batch size = 2 samples:
 
@@ -75,10 +75,9 @@ Example fixed batch size = 2 samples:
 * position_ids = [0 1 2 0]
 
 ## Padding packed inputs (pad_packed_input)
-
-When `rmpad_with_pos_ids` is enabled, `pad_packed_input` can pad the packed sequence to a fixed length
-(`pad_packed_to_length`). This is useful to avoid uneven lengths that can trigger kernel recompilation.
+`pad_to_length` can pad the packed sequence to a fixed length. This is useful to avoid uneven lengths that can trigger kernel recompilation.
 - Related GitHub issue: [#402](https://github.com/ByteDance-Seed/VeOmni/issues/402)
+`pad_to_length` is useful only when `dyn_bsz` = True, all the packed sequences in a batch will be padded to the `max_seq_len`.
 
 Important details:
 

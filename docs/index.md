@@ -23,8 +23,10 @@ get_started/installation/install_ascend.md
 :maxdepth: 1
 :caption: Usage
 
-usage/basic_modules.md
+
 usage/arguments.md
+usage/basic_modules.md
+usage/data_packing_and_dyn_bsz.md
 usage/support_new_models.md
 usage/checkpoint_conversion.md
 ```

@@ -11,12 +11,9 @@ import wandb
 from torch import distributed as dist
 from tqdm import trange
 
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import (
-    OmniDataCollatorWithPacking,
-    OmniDataCollatorWithPadding,
-    OmniSequenceShardCollator,
     build_dataloader,
     build_dataset,
     build_multimodal_chat_template,
@@ -30,7 +27,6 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
@@ -91,7 +87,7 @@ class MyTrainingArguments(TrainingArguments):
 
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
@@ -162,77 +158,6 @@ def main():
         scale_factor=args.data.scale_factor,
     )
 
-    if args.train.rmpad:
-        raise ValueError("Qwen2-VL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
-
-    data_collate_fn = []
-
-    # TODO: config by model
-    if args.train.rmpad_with_pos_ids:
-        data_collate_fn.append(
-            OmniDataCollatorWithPacking(
-                packing_features=[
-                    "input_ids",
-                    "attention_mask",
-                    "labels",
-                    "position_ids",
-                    "image_input_mask",
-                    "image_output_mask",
-                ],
-                concat_features=[
-                    "image_input_features",
-                    "image_input_grid_thw",
-                    "image_output_features",
-                    "image_output_grid_thw",
-                ],
-            )
-        )
-    else:
-        data_collate_fn.append(
-            OmniDataCollatorWithPadding(
-                concat_features={
-                    "image_input_features": 0,
-                    "image_input_grid_thw": 0,
-                    "image_output_features": 0,
-                    "image_output_grid_thw": 0,
-                },
-                padding_features={
-                    "input_ids": 0,
-                    "attention_mask": 0,
-                    "labels": IGNORE_INDEX,
-                    "position_ids": 0,
-                    "image_input_mask": False,
-                    "image_output_mask": False,
-                },
-            )
-        )
-    if get_parallel_state().sp_enabled:
-        data_collate_fn.append(
-            OmniSequenceShardCollator(
-                sp_slice_features={
-                    "input_ids": -1,
-                    "labels": -1,
-                    "image_input_features": 0,
-                    "image_output_features": 0,
-                },
-                padding_features={
-                    "input_ids": 0,
-                    "attention_mask": 0,
-                    "labels": IGNORE_INDEX,
-                    "position_ids": 0,
-                    "image_input_features": 0,
-                    "image_output_features": 0,
-                    "image_input_mask": False,
-                    "image_output_mask": False,
-                },
-                padding_scale={
-                    "image_input_features": 4,
-                    "image_output_features": 1,
-                },
-                rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            )
-        )
-
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,
         transform=transform,
@@ -243,7 +168,30 @@ def main():
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    args.compute_train_steps(dataset_length)
+
+    data_collate_info = {
+        # image
+        "image_input_features": (0, True, 0, 4),  # 4 = merge_size ** 2
+        "image_output_features": (0, True, 0, 1),
+        "image_input_mask": (-1, False, 0, 1),
+        "image_output_mask": (-1, False, 0, 1),
+        # video
+        "video_input_features": (0, True, 0, 4),  # 4 = merge_size ** 2
+        "video_output_features": (0, True, 0, 1),
+        "video_input_mask": (-1, False, 0, 1),
+        "video_output_mask": (-1, False, 0, 1),
+        # audio
+        "audio_input_features": (0, True, 0, 1),  # 4 = merge_size ** 2
+        "audio_output_features": (0, True, 0, 1),
+        "audio_input_mask": (-1, False, 0, 1),
+        "audio_output_mask": (-1, False, 0, 1),
+    }
+
+    collate_fn_kwargs = {
+        "pad_to_length": args.train.pad_to_length,
+        "data_collate_info": data_collate_info,
+    }
 
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
@@ -251,20 +199,18 @@ def main():
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
-        seed=args.train.seed,
-        collate_fn=data_collate_fn,
         max_seq_len=args.data.max_seq_len,
-        train_steps=args.train.train_steps,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
-        pad_packed_to_length=args.train.pad_packed_to_length,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
+        seed=args.train.seed,
+        collate_fn_kwargs=collate_fn_kwargs,
     )
 
     freeze_any = False
@@ -359,8 +305,6 @@ def main():
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
         enable_multisource=args.data.enable_multisource,
         dataloader=train_dataloader,

@@ -1195,7 +1195,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         elif position_ids is not None:
-            # [PosIDs] During training with rmpad_with_pos_ids, position_ids are computed per sample as
+            # [PosIDs] As VeOmni pack data to one sequence, position_ids are computed per sample as
             # (3, L) and collated to (bs, 3, L). Transpose to (3, bs, L) as the model expects.
             if position_ids.ndim == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()  # (bs, 3, L) -> (3, bs, L)
