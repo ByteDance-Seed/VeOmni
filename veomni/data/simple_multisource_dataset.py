@@ -43,6 +43,7 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted",
         max_seq_len: Optional[int] = None,
         overlong_strategy: Literal["drop", "truncate"] = "drop",
+        output_refetch_idx: bool = False,
     ) -> None:
         self._datasets = list(datasets)
         self._weights = np.asarray(weights, dtype=np.float64)
@@ -61,12 +62,15 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
             if self._source_names is not None:
                 self._source_ids = [str(name) for name in self._source_names]
             else:
-                self._source_ids = [f"source_{idx}" for idx in range(self._ds_num)]
+                self._source_ids = [
+                    self._datasets[idx].get_name() if hasattr(self._datasets[idx], "get_name") else f"source_{idx}"
+                    for idx in range(self._ds_num)
+                ]
+        self._id2dataset = dict(zip(self._source_ids, self._datasets))
         self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
         self._avg_len_count = [0 for _ in range(self._ds_num)]
         self._global_sample_idx = 0
         self._random_state = np.random.RandomState(seed=self._seed)
-        self._seeded_in_worker = False
         self._iters: List[Any] = []
         self._epoch = 0
         if self._weights.shape[0] != self._ds_num:
@@ -84,10 +88,57 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         if self._overlong_strategy not in ("drop", "truncate"):
             raise ValueError("overlong_strategy must be 'drop' or 'truncate'")
 
+        parallel_state = get_parallel_state()
+        self.dp_rank = max(0, int(getattr(parallel_state, "dp_rank", 0)))
+        self.dp_size = max(1, int(getattr(parallel_state, "dp_size", 1)))
+
+        self.output_refetch_idx = output_refetch_idx
+
+        self._just_resumed = False
+
+    @property
+    def output_refetch_idx(self) -> bool:
+        return self._output_refetch_idx
+
+    @output_refetch_idx.setter
+    def output_refetch_idx(self, value: bool) -> None:
+        if value:
+            for source_id, dataset in self._id2dataset.items():
+                if not (hasattr(dataset, "get_item") and hasattr(dataset, "output_refetch_idx")):
+                    raise ValueError(
+                        f"output_refetch_idx is True, but dataset '{source_id}' does not have "
+                        f"get_item method or output_refetch_idx attribute to resume samples "
+                        f"in buffers based on idx"
+                    )
+        self._output_refetch_idx = value
+        for dataset in self._datasets:
+            if hasattr(dataset, "output_refetch_idx"):
+                dataset.output_refetch_idx = value
+
+    def get_item(self, refetch_idx):
+        """Fetch a single sample by its source ID and index within that source.
+
+        Used by ``DynamicBatchingSizeDataset.load_state_dict()`` to reconstruct
+        buffer contents when ``save_by_idx=True``: the saved ``(source_id, idx)``
+        pairs are passed back here one-by-one to rebuild the exact pre-checkpoint buffer.
+
+        Args:
+            refetch_idx: A ``(source_id, idx)`` tuple where ``source_id`` identifies
+                the sub-dataset in ``_id2dataset`` and ``idx`` is the 0-based integer
+                index within that sub-dataset.
+
+        Returns:
+            Sample as returned by the corresponding sub-dataset's ``getitem(idx)``.
+        """
+        id, idx = refetch_idx
+        return self._id2dataset[id].getitem(idx)
+
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch number and update the random state seed."""
         self._epoch = epoch
-        self._seeded_in_worker = False  # Force re-seeding in __iter__ with new epoch
+        for dataset in self._datasets:
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(epoch)
 
     def __iter__(self):
         """
@@ -96,18 +147,19 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         - The main `__iter__` loop should simply `yield queue.get()`.
         """
         worker_info = get_worker_info()
-        parallel_state = get_parallel_state()
-        dp_rank = max(0, int(getattr(parallel_state, "dp_rank", 0)))
-        dp_size = max(1, int(getattr(parallel_state, "dp_size", 1)))
-        if not self._seeded_in_worker:
-            worker_id = worker_info.id if worker_info is not None else 0
-            base_seed = worker_info.seed if worker_info is not None else self._seed
-            seed_seq = np.random.SeedSequence([base_seed, self._epoch, dp_rank, worker_id])
+        worker_id = worker_info.id if worker_info is not None else 0
+        if not self._just_resumed or not self._random_state:
+            seed_seq = np.random.SeedSequence([self._seed, self._epoch, self.dp_rank, worker_id])
             current_seed = int(seed_seq.generate_state(1, dtype=np.uint32)[0])
             self._random_state = np.random.RandomState(current_seed)
-            self._seeded_in_worker = True
+            self._exhausted = [False for _ in range(self._ds_num)]
+            self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
+            self._avg_len_count = [0 for _ in range(self._ds_num)]
+            self._global_sample_idx = 0
+        else:
+            self._just_resumed = False
+
         self._iters = [iter(ds) for ds in self._datasets]
-        self._exhausted = [False for _ in range(self._ds_num)]
         while True:
             ds_idx = self._random_state.choice(self._ds_num, p=self._runtime_weights())
             try:
@@ -116,6 +168,10 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
                 return
             if sample is None:
                 continue
+
+            if self._output_refetch_idx:
+                sample, refetch_idx = sample[0], sample[1]
+
             sample = self._attach_meta(sample, ds_idx)
             sample = self._apply_transforms(sample)
             if sample is None:
@@ -128,9 +184,12 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
                 self._avg_len_sum[ds_idx] += token_len
                 self._avg_len_count[ds_idx] += 1
             self._global_sample_idx += 1
-            if not self._sharded and self._global_sample_idx % dp_size != dp_rank:
+            if not self._sharded and self._global_sample_idx % self.dp_size != self.dp_rank:
                 continue
-            yield sample
+            if self._output_refetch_idx:
+                yield sample, (self._source_ids[ds_idx], refetch_idx)
+            else:
+                yield sample
 
     def _runtime_weights(self) -> np.ndarray:
         if self._level == "sample":
@@ -369,6 +428,8 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
                 load_state_fn(ds_state)
             elif callable(setstate_fn):
                 setstate_fn(ds_state)
+
+        self._just_resumed = True
 
 
 @DATASET_REGISTRY.register("simple_multisource")

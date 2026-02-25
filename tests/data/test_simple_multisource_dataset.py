@@ -12,12 +12,12 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
-from utils import DummyDataset, FakeModel, compare_global_batch, compare_metrics
+from utils import DummyIterableDataset, DummyMappingDataset, FakeModel, compare_global_batch, compare_metrics
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
-from veomni.data import build_dataloader, build_dataset
-from veomni.data.simple_multisource_dataset import SimpleMultiSourceIterableDataset
+from veomni.data import build_dataloader
+from veomni.data.simple_multisource_dataset import SimpleMultiSourceIterableDataset, _build_source_id
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -86,40 +86,39 @@ def run_data_test():
 
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
-    multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in multisource_names]
-    multisource_path = [dataset.save_path for dataset in multisource_datasets]
 
-    multisource_config = dict(
-        sources=multisource_path,
-        names=multisource_names,
-        schedule=[
-            dict(
-                schedule_type="const",
-                weights=multisource_weights,
-            )
-        ],
-    )
-
-    tmp_yaml_path = os.path.join(get_cache_dir("./tmp_simple_ms.yaml"), "tmp_simple_ms.yaml")
-
-    if dist.get_rank() == 0:
-        with open(tmp_yaml_path, "w") as f:
-            yaml.safe_dump(multisource_config, f)
-    logger.info_rank0(f"[{rank}] multisource_config saved in {tmp_yaml_path}")
-    dist.barrier()
+    # Build DummyIterableDataset instances directly (bypasses HuggingFace shuffle bug)
+    iterable_datasets = [
+        DummyIterableDataset(DummyMappingDataset(size=100), shuffle=True, seed=args.train.seed + i)
+        for i in range(len(multisource_names))
+    ]
 
     args.data.enable_multisource = True
-    train_dataset = build_dataset(
-        dataset_name="simple_multisource",
-        train_path=tmp_yaml_path,
-        datasets_type="iterable",
-        transform=process_dummy_example_no_truncate,
+    train_dataset = SimpleMultiSourceIterableDataset(
+        datasets=iterable_datasets,
+        weights=multisource_weights,
         seed=args.train.seed,
         level="token",
+        transforms=process_dummy_example_no_truncate,
+        source_names=multisource_names,
+        sharded=True,
         stopping_strategy="all_exhausted",
         max_seq_len=args.data.max_seq_len,
         overlong_strategy="truncate",
     )
+
+    # YAML config for EnvironMeter's MultiSourceInfoTracker
+    multisource_config = dict(
+        sources=multisource_names,
+        names=multisource_names,
+        schedule=[dict(schedule_type="const", weights=multisource_weights)],
+    )
+    tmp_yaml_path = os.path.join(get_cache_dir("./tmp_simple_ms.yaml"), "tmp_simple_ms.yaml")
+    if dist.get_rank() == 0:
+        with open(tmp_yaml_path, "w") as f:
+            yaml.safe_dump(multisource_config, f)
+    dist.barrier()
+
     state = cast(SimpleMultiSourceIterableDataset, train_dataset).state_dict()
     assert state["version"] == 2
     assert state["topology"]["stopping_strategy"] == "all_exhausted"
@@ -173,14 +172,14 @@ def run_data_test():
     epoch_num = 3
     train_steps = args.train.train_steps
     start_epoch, start_step, global_step = 0, 0, 0
-    save_step = int(args.train.train_steps * 2)
+    save_epoch, save_step = 1, args.train.train_steps - 1
 
     fake_model = FakeModel().to(get_device_type())
     for epoch in range(start_epoch, epoch_num):
         dataloader.set_epoch(epoch)
         data_iterator = iter(dataloader)
         start_time = time.time()
-        for _ in range(start_step, args.train.train_steps):
+        for local_step in range(start_step, args.train.train_steps):
             global_step += 1
             try:
                 micro_batches = next(data_iterator)
@@ -211,7 +210,7 @@ def run_data_test():
                     assert torch.all(micro_batch["attention_mask"] == 1)
                     assert torch.all(micro_batch["labels"] == micro_batch["input_ids"])
 
-            if global_step > save_step:
+            if epoch > save_epoch or (epoch == save_epoch and local_step > save_step):
                 gt_global_batch_list.append(micro_batches)
 
             for micro_step, micro_batch in enumerate(micro_batches):
@@ -222,10 +221,12 @@ def run_data_test():
 
             delta_time = time.time() - start_time
             metrics = environ_meter.step(delta_time, global_step=global_step)
-            if global_step == save_step:
+            if epoch == save_epoch and local_step == save_step:
                 state = {
                     "model": fake_model,
                     "extra_state": {
+                        "curr_epoch": epoch,
+                        "curr_step": local_step,
                         "global_step": global_step,
                         "train_dataloader": dataloader.state_dict(),
                         "environ_meter": environ_meter.state_dict(),
@@ -238,23 +239,22 @@ def run_data_test():
     Checkpointer.load(save_checkpoint_path, state)
     dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
     environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
+    start_epoch = state["extra_state"]["curr_epoch"]
+    assert start_epoch == save_epoch
+    start_step = state["extra_state"]["curr_step"] + 1  # resume from the next step
+    assert start_step == save_step + 1
     global_step = state["extra_state"]["global_step"]
-    start_epoch = global_step // train_steps
-    start_step = global_step % train_steps
-
-    if start_step == 0:
-        iter(dataloader)
 
     pred_global_batch_list = []
 
     for epoch in range(start_epoch, epoch_num):
         dataloader.set_epoch(epoch)
-        data_iter = iter(dataloader)
+        data_iterator = iter(dataloader)
         for _ in range(start_step, train_steps):
             global_step += 1
-            global_batch = next(data_iter)
+            global_batch = next(data_iterator)
 
-            if global_step > save_step:
+            if epoch > save_epoch or (epoch == save_epoch and local_step > save_step):
                 pred_global_batch_list.append(global_batch)
 
             start_time = time.time()
@@ -273,8 +273,6 @@ def run_data_test():
 
     if dist.is_initialized():
         dist.barrier()
-
-    del multisource_datasets
 
     if not dist.is_initialized() or dist.get_rank() == 0:
         os.remove(tmp_yaml_path)
@@ -310,8 +308,6 @@ def _make_simple_dataset(
 
 
 def test_source_id_stability():
-    from veomni.data.simple_multisource_dataset import _build_source_id
-
     a1 = _build_source_id("path/a", "name")
     a2 = _build_source_id("path/a", "name")
     b1 = _build_source_id("path/a", "name2")

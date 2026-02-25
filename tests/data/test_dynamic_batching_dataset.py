@@ -584,6 +584,7 @@ def _run_distributed_test():
                     "extra_state": {
                         "curr_epoch": epoch,
                         "curr_step": local_step,
+                        "global_step": global_step,
                         "train_dataloader": dataloader.state_dict(),
                         "environ_meter": environ_meter.state_dict(),
                     },
@@ -603,9 +604,10 @@ def _run_distributed_test():
     dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
     environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
     start_epoch = state["extra_state"]["curr_epoch"]
-    assert start_epoch == 1
+    assert start_epoch == save_epoch
     start_step = state["extra_state"]["curr_step"] + 1
-    assert start_step == 1
+    assert start_step == save_step + 1
+    global_step = state["extra_state"]["global_step"]
     dl_state = state["extra_state"]["train_dataloader"]
     logger.error(f"[rank{rank}] Loaded dataloader state: {dl_state}")
 

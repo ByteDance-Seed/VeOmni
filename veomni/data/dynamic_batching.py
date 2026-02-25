@@ -101,25 +101,32 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self.ready_for_micro_batch_threshold = ready_for_micro_batch_threshold
         self.micro_batch_seq_length = micro_batch_seq_length
         self.get_length_fn = get_length_fn
+
         self.save_by_idx = save_by_idx
-        self._data_iter = None
 
         if force_generate_long_sequence:
             raise ValueError("force_generate_long_sequence is not supported yet.")
-
         self.force_generate_long_sequence = force_generate_long_sequence
-
-        if self.save_by_idx and not (
-            hasattr(self.dataset, "get_item") and hasattr(self.dataset, "output_refetch_idx")
-        ):
-            raise ValueError(
-                "save_by_idx is True, but dataset does not have get_item method or output_refetch_idx attribute to resume samples in buffers based on idx"
-            )
-        self.dataset.output_refetch_idx = self.save_by_idx
 
         self._buffer = []
         self._buffer_of_refetch_idx = []
         self._buffer_token_count = 0
+
+        self._just_resumed = False  # Flag to indicate if the dataset has just been resumed from a checkpoint, used to skip buffer checks on the first iteration after resume.
+
+    @property
+    def save_by_idx(self) -> bool:
+        return self._save_by_idx
+
+    @save_by_idx.setter
+    def save_by_idx(self, value: bool) -> None:
+        if value and not (hasattr(self.dataset, "get_item") and hasattr(self.dataset, "output_refetch_idx")):
+            raise ValueError(
+                "save_by_idx is True, but dataset does not have get_item method or output_refetch_idx attribute to resume samples in buffers based on idx"
+            )
+        self._save_by_idx = value
+        if hasattr(self.dataset, "output_refetch_idx"):
+            self.dataset.output_refetch_idx = value
 
     def __iter__(self):
         """Iterate over the dataset and yield dynamically batched micro batches.
@@ -136,6 +143,15 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 during iteration.
         """
         self._data_iter = iter(self.dataset)
+
+        if not self._just_resumed:
+            # Clear buffer state on new iteration unless we just resumed from a checkpoint,
+            # in which case we want to keep the buffer contents.
+            self._buffer = []
+            self._buffer_of_refetch_idx = []
+            self._buffer_token_count = 0
+        else:
+            self._just_resumed = False
 
         while True:
             try:
@@ -315,6 +331,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
 
         if "dynamic_batch_upstream_dataset_state" in state_dict:
             self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
+
+        self._just_resumed = True
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the upstream dataset.
