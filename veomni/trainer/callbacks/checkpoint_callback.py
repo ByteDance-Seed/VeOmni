@@ -64,6 +64,10 @@ class CheckpointerCallback(Callback):
             "optimizer": self.trainer.optimizer,
             "extra_state": {},
         }
+
+        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
+            self.trainer.checkpointer.save_future.result()
+
         self.trainer.checkpointer.load(args.train.load_checkpoint_path, state)
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]

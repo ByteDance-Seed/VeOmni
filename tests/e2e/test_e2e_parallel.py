@@ -273,5 +273,5 @@ def test_qwen3omni_parallel_align(
         is_moe=is_moe,
         rtol=rtol,
         atol=atol,
-        train_path=dummy_qwen2omni_dataset,
+        train_path=dummy_qwen3omni_dataset,
     )

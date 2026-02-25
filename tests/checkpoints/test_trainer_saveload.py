@@ -126,7 +126,7 @@ class FakeEnvironMeter:
     def state_dict(self):
         return {}
 
-    def load_state_dict(self, **kwargs):
+    def load_state_dict(self, *args, **kwargs):
         pass
 
 
@@ -190,6 +190,16 @@ class CheckCallback(Callback):
                 hf_checkpoint_dir=self.trainer.hf_weights_path,
                 safe_serialization=True,
             ), "HF checkpoint verification failed"
+
+        self.trainer.args.train.load_checkpoint_path = self.trainer.dcp_weights_path
+        self.trainer.callbacks.callbacks[1]._load_checkpoint()
+
+        tied_weights_keys = None
+        if hasattr(self.trainer.model, "_tied_weights_keys"):
+            tied_weights_keys = self.trainer.model._tied_weights_keys
+
+        check_state_dict(self.trainer.golden_model_sd, self.trainer.model.state_dict(), tied_weights_keys)
+        check_state_dict(self.trainer.golden_optim_sd, self.trainer.optimizer.state_dict(), need_flatten=True)
 
 
 def main():
