@@ -23,7 +23,7 @@ class GmmFunction(torch.autograd.Function):
         ctx.group_list = group_list
 
         fwd_output = torch_npu.npu_grouped_matmul(
-            [x], [weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
+            [x], [weight.contiguous()], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
         )[0]
         return fwd_output
 
@@ -34,7 +34,7 @@ class GmmFunction(torch.autograd.Function):
 
         weight = torch.transpose(weight, 1, 2)
         grad_input = torch_npu.npu_grouped_matmul(
-            [grad_output], [weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
+            [grad_output], [weight.contiguous()], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
         )[0]
 
         grad_weight = torch_npu.npu_grouped_matmul(
