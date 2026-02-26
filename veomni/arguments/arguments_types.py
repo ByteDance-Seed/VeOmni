@@ -747,6 +747,14 @@ class TrainingArguments:
                 output_dir=self.output_dir, is_local_rank0=self.local_rank == 0, ckpt_manager=self.ckpt_manager
             )
 
+        if self.load_checkpoint_path:
+            load_path = os.path.abspath(self.load_checkpoint_path)
+            output_dir = os.path.abspath(self.output_dir)
+            assert os.path.commonpath([load_path, output_dir]) == output_dir, (
+                f"load_checkpoint_path must be under output_dir: {self.load_checkpoint_path} "
+                f"not under {self.output_dir}"
+            )
+
         # save paths
         # output_dir/
         # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
