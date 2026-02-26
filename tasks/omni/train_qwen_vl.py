@@ -146,7 +146,7 @@ def main():
             position_id_func=position_id_func,
             **args.data.mm_configs,
         )
-    elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe", "qwen3_next_vl"):
+    elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
         transform = partial(
             process_sample_qwen3_vl,
             processor=processor,

@@ -32,9 +32,9 @@ def _safe_apply_patches():
         logger.info_rank0("❌ veomni_patch is not available")
 
     if is_xpu_models_available():
-        from xpu_models import xpu_veomni_patch
+        from xpu_models import xpu_models_veomni_patch
 
-        xpu_veomni_patch()
+        xpu_models_veomni_patch()
         logger.info_rank0("✅ xpu_models_veomni_patch is available")
     else:
         logger.info_rank0("❌ xpu_models_veomni_patch is not available")
