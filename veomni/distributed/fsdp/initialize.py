@@ -182,7 +182,9 @@ def parallel_init_fsdp_fn(
         global_size[placement.dim] *= ep_size
         global_size = torch.Size(global_size)
         loaded_size = full_data.size()
-        pad_size = tuple((0, module_dim - load_dim) for module_dim, load_dim in zip(global_size, loaded_size))
+        pad_size = tuple(
+            (0, module_dim - load_dim) for module_dim, load_dim in zip(global_size, loaded_size, strict=False)
+        )
         pad_size = tuple(itertools.chain(*(pad_size[::-1])))
         full_data = torch.nn.functional.pad(full_data, pad_size)
         chunk_loaded_data = list(

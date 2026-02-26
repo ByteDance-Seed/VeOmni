@@ -469,7 +469,7 @@ class VisionTransformer(nn.Module):
         if global_pool is not None:
             assert global_pool in ("", "avg", "token", "map")
             if global_pool == "map" and self.attn_pool is None:
-                assert False, "Cannot currently add attention pooling in reset_classifier()."
+                raise AssertionError("Cannot currently add attention pooling in reset_classifier().")
             elif global_pool != "map " and self.attn_pool is not None:
                 self.attn_pool = None  # remove attention pooling
             self.global_pool = global_pool
@@ -554,7 +554,7 @@ class VisionTransformer(nn.Module):
             ]
 
         if return_prefix_tokens:
-            return tuple(zip(outputs, prefix_tokens))
+            return tuple(zip(outputs, prefix_tokens, strict=False))
         return tuple(outputs)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:

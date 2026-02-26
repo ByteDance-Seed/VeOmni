@@ -274,7 +274,7 @@ def test_fetch_videos_multiple_inputs():
     assert len(audios) == 3, f"Expected 3 audios, got {len(audios)}"
 
     # Verify each output
-    for i, (video, audio) in enumerate(zip(videos, audios)):
+    for _i, (video, audio) in enumerate(zip(videos, audios, strict=False)):
         assert_video_output_valid(video, audio, **kwargs)
 
 

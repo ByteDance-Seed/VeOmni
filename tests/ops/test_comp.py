@@ -30,7 +30,7 @@ def fast_pos_embed_interpolate_ref(self, grid_thw):
 
     device = self.pos_embed.weight.device
     dtype = self.pos_embed.weight.dtype
-    for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+    for _t, h, w in zip(grid_ts, grid_hs, grid_ws, strict=False):
         h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, dtype=torch.float64)
         w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, dtype=torch.float64)
 
@@ -69,11 +69,11 @@ def fast_pos_embed_interpolate_ref(self, grid_thw):
     pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
     patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
-    patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+    patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws, strict=False)])
 
     patch_pos_embeds_permute = []
     merge_size = self.spatial_merge_size
-    for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+    for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws, strict=False):
         pos_embed = pos_embed.repeat(t, 1)
         pos_embed = (
             pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)

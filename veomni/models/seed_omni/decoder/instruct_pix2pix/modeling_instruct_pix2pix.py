@@ -148,7 +148,7 @@ class InstructionPix2Pix(PreTrainedModel):
             # textual inversion: process multi-vector tokens if necessary
             prompt_embeds_list = []
             prompts = [prompt, prompt]
-            for prompt, tokenizer, text_encoder in zip(prompts, tokenizers, text_encoders):
+            for prompt, tokenizer, text_encoder in zip(prompts, tokenizers, text_encoders, strict=False):
                 text_inputs = tokenizer(
                     prompt,
                     padding="max_length",
@@ -252,7 +252,7 @@ class InstructionPix2Pix(PreTrainedModel):
         return add_time_ids
 
     def set_trainable_parameters(self, mode=True):
-        for name, param in self.head.named_parameters():
+        for _name, param in self.head.named_parameters():
             param.requires_grad = mode
 
     @torch.no_grad()
@@ -373,7 +373,7 @@ class InstructionPix2Pix(PreTrainedModel):
         add_time_ids = add_time_ids.to(self.device).repeat(batch_size * num_images_per_prompt, 1)
 
         # 8. Denoising loop
-        for i, t in enumerate(timesteps):
+        for _i, t in enumerate(timesteps):
             # Expand the latents if we are doing classifier free guidance.
             # The latents are expanded 3 times because for pix2pix the guidance
             # is applied for both the text and the input image.

@@ -18,7 +18,7 @@ class JanusVQ16DecoderProcessor(BaseDecoderProcessorMixin, JanusImageProcessor):
 
     def __init__(
         self,
-        token_size=[1, 24, 24],
+        token_size=None,
         token_num=576,
         image_size: int = 384,
         min_size: int = 14,
@@ -36,6 +36,8 @@ class JanusVQ16DecoderProcessor(BaseDecoderProcessorMixin, JanusImageProcessor):
         do_normalize: bool = True,
         **kwargs,
     ):
+        if token_size is None:
+            token_size = [1, 24, 24]
         BaseDecoderProcessorMixin.__init__(self, token_num=token_num, token_size=token_size, **kwargs)
         JanusImageProcessor.__init__(
             self,

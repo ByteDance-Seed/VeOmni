@@ -52,8 +52,8 @@ def sync_weight_qwen3moe(config, state_dict_source, veomni_model):
         if i in veomni_model_state_dict.keys():
             try:
                 assert veomni_model_state_dict[i].equal(hf_model_state_dict[i])
-            except AssertionError:
-                raise AssertionError(f"tensor is not the same after init. key={i}")
+            except AssertionError as e:
+                raise AssertionError(f"tensor is not the same after init. key={i}") from e
     return veomni_model
 
 
@@ -92,8 +92,8 @@ def sync_weight_deepseek_v3(config, state_dict_source, veomni_model):
         if i in veomni_model_state_dict.keys():
             try:
                 assert veomni_model_state_dict[i].equal(hf_model_state_dict[i])
-            except AssertionError:
-                raise AssertionError(f"tensor is not the same after init. key={i}")
+            except AssertionError as e:
+                raise AssertionError(f"tensor is not the same after init. key={i}") from e
     return veomni_model
 
 

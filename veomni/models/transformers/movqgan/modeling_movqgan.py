@@ -223,7 +223,7 @@ class MOVQEncoder(nn.Module):
             attn = nn.ModuleList()
             block_in = ch * in_ch_mult[i_level]
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks):
+            for _i_block in range(self.num_res_blocks):
                 block.append(
                     EncoderResnetBlock(
                         in_channels=block_in, out_channels=block_out, temb_channels=self.temb_ch, dropout=dropout
@@ -438,7 +438,7 @@ class MOVQDecoder(nn.Module):
             block = nn.ModuleList()
             attn = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks + 1):
+            for _i_block in range(self.num_res_blocks + 1):
                 block.append(
                     DecoderResnetBlock(
                         in_channels=block_in,

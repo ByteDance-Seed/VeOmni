@@ -41,8 +41,8 @@ if TYPE_CHECKING:
 def build_omni_processor(
     config_path: str,
     tokenizer_path: str,
-    encoders: Dict[str, Dict[str, str]] = {},
-    decoders: Dict[str, Dict[str, str]] = {},
+    encoders: Dict[str, Dict[str, str]] = None,
+    decoders: Dict[str, Dict[str, str]] = None,
     input_encoder: str = "encoder",
     output_encoder: str = "decoder",
     encode_target: bool = False,
@@ -50,6 +50,10 @@ def build_omni_processor(
     """
     Builds omni modality processor using foundation tokenizer, encoders and decoders.
     """
+    if decoders is None:
+        decoders = {}
+    if encoders is None:
+        encoders = {}
     foundation_config = build_config(config_path)
     if isinstance(foundation_config, SeedOmniConfig):
         return build_processor(tokenizer_path)
@@ -79,9 +83,9 @@ def build_omni_processor(
 def build_omni_model(
     config_path: str,
     weights_path: Optional[str] = None,
-    foundation: Dict[str, str] = {},
-    encoders: Dict[str, Dict[str, str]] = {},
-    decoders: Dict[str, Dict[str, str]] = {},
+    foundation: Dict[str, str] = None,
+    encoders: Dict[str, Dict[str, str]] = None,
+    decoders: Dict[str, Dict[str, str]] = None,
     input_encoder: str = "encoder",
     output_encoder: str = "decoder",
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
@@ -92,6 +96,12 @@ def build_omni_model(
     """
     Builds omni modality model using foundation model, encoders, and decoders.
     """
+    if decoders is None:
+        decoders = {}
+    if encoders is None:
+        encoders = {}
+    if foundation is None:
+        foundation = {}
     if config_kwargs is None:
         config_kwargs = {}
 

@@ -229,8 +229,8 @@ def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
                 total_tokens = batch["attention_mask"].sum()
                 if total_tokens > 0:
                     found_last_batch_scenario = True
-            except StopIteration:
-                assert False, "Expected to get a batch from remaining buffer, but got StopIteration"
+            except StopIteration as e:
+                raise AssertionError("Expected to get a batch from remaining buffer, but got StopIteration") from e
         else:
             # Normal batch retrieval
             try:
@@ -323,7 +323,7 @@ def test_save_load_state_dict(save_by_idx):
     assert len(batches_original) == len(batches_resumed), (
         f"Batch count mismatch after resume: original={len(batches_original)}, resumed={len(batches_resumed)}"
     )
-    for i, (orig, resumed) in enumerate(zip(batches_original, batches_resumed)):
+    for i, (orig, resumed) in enumerate(zip(batches_original, batches_resumed, strict=False)):
         for key in orig:
             if torch.is_tensor(orig[key]):
                 assert torch.all(orig[key] == resumed[key]), f"Batch {i} key '{key}' mismatch after resume"
@@ -648,12 +648,12 @@ def _run_distributed_test():
         f"[rank{rank}] Batch count mismatch: {len(batches_after_save_step)} vs {len(batch_after_resume)}"
     )
 
-    for i, (gt_batches, pred_batches) in enumerate(zip(batches_after_save_step, batch_after_resume)):
+    for i, (gt_batches, pred_batches) in enumerate(zip(batches_after_save_step, batch_after_resume, strict=False)):
         assert len(gt_batches) == len(pred_batches), (
             f"[rank{rank}] Micro batch count mismatch at step {i}: {len(gt_batches)} vs {len(pred_batches)}"
         )
 
-        for j, (gt_batch, pred_batch) in enumerate(zip(gt_batches, pred_batches)):
+        for j, (gt_batch, pred_batch) in enumerate(zip(gt_batches, pred_batches, strict=False)):
             for key in gt_batch.keys():
                 if torch.is_tensor(gt_batch[key]):
                     assert torch.all(gt_batch[key] == pred_batch[key]), (

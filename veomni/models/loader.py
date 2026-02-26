@@ -15,7 +15,7 @@
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py
 
-from abc import ABC
+from abc import ABC, abstractmethod
 
 import torch
 from transformers import (
@@ -154,9 +154,11 @@ def get_model_class(model_config: PretrainedConfig):
 
 
 class BaseModelLoader(ABC):
+    @abstractmethod
     def __init__(self):
         pass
 
+    @abstractmethod
     def load_model(self, model_config, **kwargs):
         raise NotImplementedError
 

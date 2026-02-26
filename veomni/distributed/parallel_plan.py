@@ -87,7 +87,7 @@ class ParallelPlan:
             return None
 
         fsdp_no_shard_states_fqn_to_module = {}
-        for fqn, param in model.named_modules():
+        for fqn, _param in model.named_modules():
             for no_shard_pattern in self.fsdp_no_shard_module:
                 if check_fqn_match(no_shard_pattern, fqn):
                     fsdp_no_shard_states_fqn_to_module[fqn] = get_module_from_path(model, fqn)

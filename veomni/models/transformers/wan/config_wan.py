@@ -24,8 +24,8 @@ try:
 
     diffusers_version = diffusers.__version__
 
-except ModuleNotFoundError:
-    raise ImportError("diffusers is not installed")
+except ModuleNotFoundError as e:
+    raise ImportError("diffusers is not installed") from e
 
 
 class WanConfig(PretrainedConfig):
@@ -33,7 +33,7 @@ class WanConfig(PretrainedConfig):
 
     def __init__(
         self,
-        patch_size=[1, 2, 2],
+        patch_size=None,
         dim=5120,
         eps=1e-06,
         ffn_dim=13824,
@@ -46,6 +46,8 @@ class WanConfig(PretrainedConfig):
         text_len=512,
         **kwargs,
     ):
+        if patch_size is None:
+            patch_size = [1, 2, 2]
         self.patch_size = patch_size
         self.dim = dim
         self.eps = eps

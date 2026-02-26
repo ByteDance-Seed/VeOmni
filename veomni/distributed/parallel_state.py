@@ -489,6 +489,7 @@ def init_parallel_state(
         for d, name in zip(
             [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
             ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
+            strict=False,
         ):
             if d > 1 or name in ["dp_shard"]:
                 mesh_shape.append(d)

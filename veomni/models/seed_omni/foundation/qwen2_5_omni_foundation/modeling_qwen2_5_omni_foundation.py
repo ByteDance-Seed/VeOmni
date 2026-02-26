@@ -29,7 +29,9 @@ from ..base import BaseFoundationModelMixin
 from .configuration_qwen2_5_omni_foundation import Qwen25OmniFoundationModelConfig
 
 
-def parse_position_id_kwargs(input_ids: torch.Tensor, attention_mask: torch.Tensor, grid_thw: Dict = {}, **kwargs):
+def parse_position_id_kwargs(input_ids: torch.Tensor, attention_mask: torch.Tensor, grid_thw: Dict = None, **kwargs):
+    if grid_thw is None:
+        grid_thw = {}
     return_dict = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,

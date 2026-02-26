@@ -202,7 +202,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         )
         n_iter = int(cur_token_micro_bsz // n_token_per_iter)
         data = []
-        for i in range(n_iter):
+        for _i in range(n_iter):
             samples = self.buffer.get_samples(n_token_per_iter)
             if self.packer:
                 samples = self.packer(samples)  # maybe packed into one sample, but wrapped in list.
