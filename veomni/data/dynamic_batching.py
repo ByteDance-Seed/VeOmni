@@ -67,7 +67,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         dataset: IterableDataset,
         micro_batch_seq_length: int,
         ready_for_micro_batch_threshold: int,
-        dynamic_batching_collate_fn: Optional[Callable] = DataCollatorWithPositionIDs(),
+        dynamic_batching_collate_fn: Optional[Callable] = None,
         save_by_idx: bool = True,
         get_length_fn: Optional[Callable] = len,
         force_generate_long_sequence: bool = False,
@@ -95,6 +95,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 reconstruct the buffer from indices on resume.
         """
         self.dataset = dataset
+        if dynamic_batching_collate_fn is None:
+            dynamic_batching_collate_fn = DataCollatorWithPositionIDs()
         self.dynamic_batching_collate_fn = dynamic_batching_collate_fn
         self.ready_for_micro_batch_threshold = ready_for_micro_batch_threshold
         self.micro_batch_seq_length = micro_batch_seq_length
