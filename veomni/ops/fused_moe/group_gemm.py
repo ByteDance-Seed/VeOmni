@@ -22,7 +22,7 @@ from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
 from .torch_fused_moe import torch_fused_moe_forward
 
 
-class FusedMoeExpertFunction(torch.autograd.Function):
+class TritonFusedMoeExpertFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -340,7 +340,7 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
             )
         else:
-            final_hidden_states = FusedMoeExpertFunction.apply(
+            final_hidden_states = TritonFusedMoeExpertFunction.apply(
                 num_experts,
                 routing_weights,
                 selected_experts,
