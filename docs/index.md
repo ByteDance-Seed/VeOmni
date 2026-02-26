@@ -29,6 +29,7 @@ usage/basic_modules.md
 usage/data_packing_and_dyn_bsz.md
 usage/support_new_models.md
 usage/checkpoint_conversion.md
+usage/trainer.md
 ```
 
 ```{toctree}

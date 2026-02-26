@@ -17,7 +17,7 @@
         ```
 
 3. **Create Custom Task Directory**  
-    [`train_text.py`](../../tasks/train_text.py) can be used for most of task pre-training and post-training tasks, you can just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_text.py` file from the `tasks` directory and modify it. like [`tasks/train_vlm.py`](../../tasks/train_vlm.py)
+    [`train_text.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_text.py) can be used for most of task pre-training and post-training tasks, you can just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_text.py` file from the `tasks` directory and modify it. like [`tasks/train_vlm.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_vlm.py)
 
 4. **Launch Custom Training**  
     You can overwrite the default arguments in train yaml by passing them to the script.
@@ -33,7 +33,7 @@
 
 ## Arguments
 **Default Parameter Access**:  
-VeOmni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md). A basic argument example is defined in ['arguments_types.py'](../../veomni/arguments/arguments_types.py).
+VeOmni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md). A basic argument example is defined in [`arguments_types.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/arguments/arguments_types.py).
 
 ```python
 from dataclasses import dataclass, field
@@ -106,44 +106,85 @@ tp_mesh = parallel_state.tp_mesh
 ```
 
 ## Dataset
-VeOmni default supports two types of datasets(source code: [veomni/data/dataset.py](../../veomni/data/dataset.py)):
+VeOmni default supports three types of datasets(source code: [veomni/data/dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dataset.py)):
 1. **IterativeDataset** (recommended for large datasets)  
 2. **MappingDataset** (default for small datasets)
+3. **InterleaveDataset** (InterleavedMappingDataset | InterleavedIterableDataset)
 
 ```python
 from veomni.data import build_dataset
 train_dataset = build_dataset(
     dataset_name=args.data.dataset_name,
     transform=transform,
-    dataloader_batch_size=args.train.dataloader_batch_size,
     seed=args.train.seed,
     **asdict(args.data)
 )
 ```
 
-> **Note**:
->
-> args.train.compute_train_steps is used to compute the number of training steps. without this, the train steps will be computed incorrectly.
->
-> If your dataset is iterable, you are recommended to add data.train_size (the token you want to consume) to the config file, the `train_steps` will approximate to `train_size / (global_batch_size * max_seq_len)` (without any warm strategy).
->
-> If your dataset is mapping, you are recommended to pass len(train_dataset) to the `train_steps` to compute the correct train steps.
+### Interleave Dataset
+To use interleave dataset, pass a `dataset.yaml` file path to the `data.train_path` argument. The argument management system will parse the file and build the interleave dataset based on `data.datasets_type`.
 
-### Custom Datasets
-VeOmni is a flexible framework that supports custom datasets. You can implement your own dataset function and use it with VeOmni.
+An example of `dataset.yaml` file: [configs/multimodal/data/tulu_sharegpt4v_llavavideo_voiceassistant.yaml](https://github.com/ByteDance-Seed/VeOmni/blob/main/configs/multimodal/data/tulu_sharegpt4v_llavavideo_voiceassistant.yaml).
+
+Example usage:
+
+1. InterleavedMappingDataset
+```bash
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
+    --data.train_path configs/multimodal/data/tulu_sharegpt4v_llavavideo_voiceassistant.yaml \
+    --data.datasets_type mapping \
+```
+
+2. InterleavedIterableDataset
+```bash
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
+    --data.train_path configs/multimodal/data/tulu_sharegpt4v_llavavideo_voiceassistant.yaml \
+    --data.datasets_type iterable \
+```
+
+### Train Steps Computation
+
+`args.compute_train_steps` is used to compute the number of training steps. without this, the train steps will be computed incorrectly.
+
+If your dataset is iterable, you are recommended to add data.train_size (the token you want to consume) or data.train_sample (the sample you want to consume) to the config file, the `train_steps` will approximate to
+
+1. when dyn_bsz enabled:
+`train_size / (global_batch_size * max_seq_len)` (without any warm strategy).
+
+2. when dyn_bsz disabled:
+`train_sample / dataloader_batch_size` (without any warm strategy).
+
+If your dataset is mapping, you are recommended to pass `len(train_dataset)` to the `train_steps` to compute the correct train steps.
 
 ```python
-def build_custom_dataset(data_path, transform)-> Dataset:
+dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+if args.data.datasets_type == "mapping":
+    dataset_length = dataset_length / args.train.data_parallel_size
+args.compute_train_steps(dataset_length)
+train_steps = args.train_steps
+```
+
+### Custom Datasets
+VeOmni is a flexible framework that supports custom datasets. You can implement your own dataset function and use it with VeOmni by registering it to the dataset registry.
+
+Examples in [veomni/data/dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dataset.py).
+```python
+@DATASET_REGISTRY.register("custom")
+def build_custom_dataset(
+    train_path: str,
+    transform: Optional[Callable] = None,
+    namespace: Literal["train", "test"] = "train",
+    seed: int = 42,
+    source_name: Optional[str] = None,
+    **kwargs,
+)-> Dataset:
     # Implement your custom dataset logic
     pass
-
-elif args.data.datasets_type == "custom":
-    logger.info_rank0("Start building custom dataset")
-    train_dataset = build_custom_dataset(args.data.train_path, transform=transform)
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset)) # compute train steps, remove the len(train_dataset) if your dataset is iterable
 ```
 
 ### Data Transform (Preprocess)
+
+#### Text Transform
 VeOmni default supports two types of transform(source code: [veomni/data/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py)):
 1. **process_pretrain_example** (recommended for pretrain task)
 2. **process_sft_example** (recommended for sft task)
@@ -162,6 +203,7 @@ transform = partial(
     process_pretrain_example,
     tokenizer=tokenizer,
     max_seq_len=args.data.max_seq_len,
+    text_keys=args.data.text_keys,
 )
 ```
 
@@ -174,11 +216,43 @@ transform = partial(
     process_sft_example,
     chat_template=chat_template,
     max_seq_len=args.data.max_seq_len,
+    text_keys=args.data.text_keys,
 )
 ```
 
+#### Multimodal Transform
+VeOmni offers several multimodal transform functions (source code: [veomni/data/multimodal/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/data_transform.py)):
+1. **process_sample_qwen2_5_vl** (process function for Qwen2VL & Qwen2.5VL)
+2. **process_sample_qwen3_vl** (process function for Qwen3VL-MoE & Qwen3VL-dense)
+3. **process_sample_qwen_omni** (process function for Qwen2.5Omni & Qwen3Omni-MoE)
+
+Example usage in `def build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
+```python
+from veomni.models import build_processor
+from veomni.data import build_multimodal_chat_template
+processor = build_processor(args.model.tokenizer_path)
+chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
+position_id_func = model.get_position_id_func()
+transform = partial(
+    process_function,
+    processor=processor,
+    chat_template=chat_template,
+    position_id_func=position_id_func,
+    **args.data.mm_configs,
+)
+```
+
+The position_id_func is used to generate the position ids for the input sequence. For example, `get_rope_index` in qwen-vl series.
+
+Multimodal dataset transform follows the similar pipeline:
+1. conversation preprocess (build the same data structure from different data format) [preprocess.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/preprocess.py)
+2. build conversation with multimodal sequence (pad special tokens manually or using chat_template | processor)
+3. tokenize the input sequence
+4. add position_ids and multimodal mask
+
+
 ### Chat Template
-VeOmni default supports few chat template(source code: [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py)):
+VeOmni default supports several chat template(source code: [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) for text-only model and [veomni/data/multimodal/multimodal_chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/multimodal_chat_template.py) for multimodal model):
 you can add your custom chat template by implementing the `ChatTemplate` class.
 **Custom Template Implementation**:  
 ```python
@@ -196,31 +270,20 @@ class CustomTemplate(ChatTemplate):
 
 ## DataLoader
 VeOmni offered a flexible and powerful dataloader implementation, which supports
-- both padding and remove padding (packing) strategy
+- remove padding (packing) strategy
 - dynamic batching strategy
 
 (source code: [veomni/data/data_loader.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_loader.py)):
 
 ```python
-from veomni.data import build_dataloader, build_mapping_dataset
-
-transform = YOUR_TRANSFORM_FUNCTION
-
-train_dataset = build_mapping_dataset(
-    data_path=args.data.train_path,
-    transform=transform,
-)
-
-args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
-
+from veomni.data import build_dataloader
 train_dataloader = build_dataloader(
+    dataloader_type=args.data.dataloader_type,
     dataset=train_dataset,
     micro_batch_size=args.train.micro_batch_size, # micro batch size
     global_batch_size=args.train.global_batch_size, # global batch size
     dataloader_batch_size=args.train.dataloader_batch_size, # dataloader batch size, how many micro batches to get with next(train_dataloader), automatically calculate
-    seed=args.train.seed, # random seed
     max_seq_len=args.data.max_seq_len, # max sequence length
-    collate_fn=None, # you can pass your custom collate_fn
     train_steps=args.train.train_steps, # train steps, calculate by args.train.compute_train_steps
     dyn_bsz=args.train.dyn_bsz, # enable dynamic batching
     bsz_warmup_ratio=args.train.bsz_warmup_ratio, # bsz warmup ratio
@@ -230,14 +293,33 @@ train_dataloader = build_dataloader(
     drop_last=args.data.drop_last,  # dataloader drop last
     pin_memory=args.data.pin_memory,  # dataloader pin memory
     prefetch_factor=args.data.prefetch_factor, # dataloader prefetch factor
+    seed=args.train.seed, # random seed
+    build_collate_fn=True,
+    collate_fn_kwargs=collate_fn_kwargs, # kwargs for collate_fn
 )
 ```
 
 ### Collate Function
-VeOmni default supports three types of collate function for text task(source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)):
-TODO
+VeOmni default supports a unified collate function for all tasks (text task, multimodal task, omni task, etc.) (source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)). The `MainCollator` handles: packing sequences, precompute position_ids & cu_seqlens & max_seqlens, and sequence parallel slice.
 
-See detail in source code: [veomni/data/multimodal/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/data_collator.py) and how to use it in the [train_omni_model.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_omni_model.py)
+Users can pass `collate_fn_kwargs` to control the behavior of the collate function.
+
+1. DataCollateInfo
+The `DataCollateInfo` is defined as:
+- pack_dim: Dim to pack in batch. Default is 0. If -1, pack in last dim and unsqueeze(0)
+> `input_ids` is -1, and `pixel_values` is 0.
+- sp_slice: Whether to do sp slice when sp_enabled. Default is False.
+> `input_ids` is true, and `image_mask` is false, as we need the full sequence of `image_mask` on each sp rank.
+- sp_pad_value: sp_pad value of a sequence in batch. Not pad if None. Default is None.
+> `labels` is -100, and `image_mask` is 0.
+- sp_pad_scale: sp_pad scale of a sequence in batch. Default is 1.
+> `pixel_values` is merge_size ** 2 for qwen-vl-series.
+2. seq_classification
+If seq_classification is True, the collate function will not shift and mask the labels during packing and sp_slice.
+3. pad_to_length
+If pad_to_length is True, the collate function will pad the desired sequences to the max_seq_len. Default is False. More details in [data_packing_and_dyn_bsz.md](./data_packing_and_dyn_bsz.md).
+
+An example of usage in `def build_data_collate_info` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) for training qwen-omni-models.
 
 
 ## Model and Optimizer
@@ -255,6 +337,10 @@ model = build_foundation_model(
     config_path=args.model.config_path, # model config path, can be None if weights_path is not None
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
     init_device=args.train.init_device, # model init device
+    torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+    attn_implementation=args.model.attn_implementation,
+    moe_implementation=args.model.moe_implementation,
+    config_kwargs=config_kwargs,
 )
 
 # You can replace the following code if you want to use the AutoModelForCausalLM from transformers.
@@ -264,18 +350,18 @@ model = build_foundation_model(
 ### Parallelization your model
 ```python
 from veomni.distributed.torch_parallelize import build_parallelize_model
-
-model = build_foundation_model(...)
-
 model = build_parallelize_model(
     model,
+    init_device=args.train.init_device, # model init device
+    weights_path=args.model.model_path,
     enable_full_shard=args.train.enable_full_shard, # enable full shard, same to Zero3
     enable_reshard_after_forward=args.train.enable_reshard_after_forward, # enable reshard after forward for FSDP2
     enable_mixed_precision=args.train.enable_mixed_precision, # enable mixed precision
     enable_gradient_checkpointing=args.train.enable_gradient_checkpointing, # enable gradient checkpointing
-    init_device=args.train.init_device, # model init device
     enable_fsdp_offload=args.train.enable_fsdp_offload, # enable fsdp offload
     basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
+    enable_reentrant=args.train.enable_reentrant,
+    enable_forward_prefetch=args.train.enable_forward_prefetch,
 )
 ```
 
@@ -329,37 +415,4 @@ def loss_func(logits, labels):
 output = model(**micro_batch)
 logits = output.logits
 loss = loss_func(logits, labels) / len(micro_batches)
-```
-
-
-## Profiler
-VeOmni offers a profiler function for users to trace training, use like that.
-
-```python
-from veomni.utils import helper
-
-# before train loop, create your profiler
-if args.train.global_rank == 0:
-    if args.train.enable_profiling:
-        profiler = helper.create_profiler(
-            start_step=args.train.profile_start_step,
-            end_step=args.train.profile_end_step,
-            trace_dir=args.train.profile_trace_dir,
-            record_shapes=args.train.profile_record_shapes,
-            profile_memory=args.train.profile_profile_memory,
-            with_stack=args.train.profile_with_stack,
-        )
-        profiler.start()
-
-for epoch in range(args.train.num_train_epochs):
-    data_iterator = iter(train_dataloader)
-    for _ in range(args.train.train_steps):
-
-        ## train code
-
-        profiler.step()
-        if global_step == args.train.profile_end_step:
-            profiler.stop()
-            # upload file to merlin
-            helper.upload_trace(args.train.wandb_project, args.train.wandb_name, args.train.profile_trace_dir)
 ```

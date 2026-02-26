@@ -76,7 +76,7 @@ class DataCollateInfo:
     )
     sp_pad_value: int = field(
         default=None,
-        metadata={"help": "sp_pad value of a sequence in batch. concat instead of pad if None. Default is None"},
+        metadata={"help": "sp_pad value of a sequence in batch. Not pad if None. Default is None"},
     )
     sp_pad_scale: int = field(
         default=1,
