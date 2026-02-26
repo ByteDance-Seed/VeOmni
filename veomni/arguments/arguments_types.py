@@ -542,6 +542,10 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Expert parallel size."},
     )
+    embed_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Embed parallel size."},
+    )
     ep_outside: bool = field(
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
@@ -709,6 +713,9 @@ class TrainingArguments:
         # init method check
         assert self.expert_parallel_size == 1 or self.init_device != "cpu", (
             "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
+        )
+        assert self.embed_parallel_size == 1 or self.init_device != "cpu", (
+            "cpu init is not supported when enable emb. Please use `init_device = cuda` or `init_device = meta` instead."
         )
 
         if self.data_parallel_mode == "fsdp2":
