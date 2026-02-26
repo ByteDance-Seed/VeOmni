@@ -85,6 +85,7 @@ def build_native_dataloader(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     seed: int = 0,
+    multiprocessing_context=None,
 ) -> "DistributedDataloader":
     parallel_state = get_parallel_state()
     token_micro_bsz = micro_batch_size * max_seq_len
@@ -169,6 +170,7 @@ def build_native_dataloader(
         pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
+        multiprocessing_context=multiprocessing_context,
     )
     if use_rmpad and dyn_bsz and dyn_bsz_in_dataloader:
         dataloader = DynamicBatchSizeDataLoader(
