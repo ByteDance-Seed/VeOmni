@@ -16,6 +16,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
@@ -529,6 +530,15 @@ class TrainingArguments:
                 is_local_rank0=self.local_rank == 0,
                 ckpt_manager=ckpt.manager,
             )
+
+        if ckpt.load_path:
+            load_path = Path(os.path.normpath(os.path.abspath(ckpt.load_path)))
+            output_dir = Path(os.path.normpath(os.path.abspath(ckpt.output_dir)))
+
+            try:
+                load_path.relative_to(output_dir)
+            except ValueError:
+                logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
         # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
