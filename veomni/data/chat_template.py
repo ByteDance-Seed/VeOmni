@@ -195,7 +195,7 @@ class JanusTemplate(ChatTemplate):
             num_image_tokens = torch.sum(content_ids_tensor == image_token_id).item()
             n_image = num_image_tokens // 576
             if n_image > 0:
-                for j, n_image_tokens in enumerate([num_image_tokens]):
+                for _j, n_image_tokens in enumerate([num_image_tokens]):
                     images_emb_mask.append([True] * n_image_tokens)
 
             if message["loss_mask"] == 1:

@@ -189,8 +189,8 @@ def _dispatch_parameter(
         if orig_tensor.device.type == "cpu":
             raise ValueError("Cannot load dtensor on CPU.")
 
-        device_mesh = getattr(orig_tensor, "device_mesh")
-        placements = getattr(orig_tensor, "placements")
+        device_mesh = orig_tensor.device_mesh
+        placements = orig_tensor.placements
         module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
     else:  # not dtensor
         module._parameters[local_name].data.copy_(tensor)
@@ -212,8 +212,8 @@ def _dispatch_buffer(
         if dtensor_factory is None:
             raise ValueError("dtensor buffer requires a dtensor_factory.")
 
-        device_mesh = getattr(orig_tensor, "device_mesh")
-        placements = getattr(orig_tensor, "placements")
+        device_mesh = orig_tensor.device_mesh
+        placements = orig_tensor.placements
         module._buffers[name] = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
     else:
         module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
@@ -233,7 +233,7 @@ def _init_parameter(
             raise ValueError(f"Cannot find {piece} in {module}.")
 
         if hasattr(module, "_init_weights"):
-            init_func = getattr(module, "_init_weights")
+            init_func = module._init_weights
 
         module = getattr(module, piece)
 
@@ -362,7 +362,7 @@ def rank0_load_and_broadcast_weights(
         shard_iterable = enumerate(range(shard_count))
 
     # iterate safetensor files; each file would have a iterator to read weight keys and tensors
-    for shard_idx, shard_payload in shard_iterable:
+    for _shard_idx, shard_payload in shard_iterable:
         state_dict_iterator = shard_payload if global_rank == 0 else None
         iterator = iter(state_dict_iterator) if global_rank == 0 else None
 

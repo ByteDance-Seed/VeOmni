@@ -16,8 +16,8 @@ ENV_DEFAULTS = {
 def get_env(name: str):
     try:
         default = ENV_DEFAULTS[name]
-    except KeyError:
-        raise KeyError(f"Env var `{name}` not defined in ENV_DEFAULTS")
+    except KeyError as e:
+        raise KeyError(f"Env var `{name}` not defined in ENV_DEFAULTS") from e
 
     return os.environ.get(name, default)
 

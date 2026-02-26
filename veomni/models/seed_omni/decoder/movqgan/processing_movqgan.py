@@ -26,7 +26,9 @@ from ..base import BaseDecoderProcessorMixin
 class MoVQGANDecoderProcessor(BaseDecoderProcessorMixin, MoVQGANProcessor):
     valid_kwargs = BaseDecoderProcessorMixin.valid_kwargs + ["image_size"]
 
-    def __init__(self, token_size=[1, 32, 32], token_num=1024, image_size=256, **kwargs):
+    def __init__(self, token_size=None, token_num=1024, image_size=256, **kwargs):
+        if token_size is None:
+            token_size = [1, 32, 32]
         super().__init__(token_size=token_size, token_num=token_num, image_size=image_size, **kwargs)
 
     def process(

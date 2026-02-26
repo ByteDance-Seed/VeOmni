@@ -312,7 +312,7 @@ class MultiSourceInfoTracker:
         Computes the statistics about the MultiSourceDataset. It should be called at every rank to update dataloader.
         """
         counter = defaultdict(MultiSourceCounterItem)
-        for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens):
+        for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens, strict=False):
             counter[ds_idx].increment(seq_len, 1)
 
         counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(get_parallel_state().dp_size)]
@@ -341,7 +341,7 @@ class MultiSourceInfoTracker:
 
         self.batch_idx += 1
         multisource_info = {}
-        for ds_idx, item in self.accumulate_counter.items():
+        for ds_idx, _item in self.accumulate_counter.items():
             multisource_info.update(
                 {
                     "multi_source/global_consumed_tokens": global_consumed_tokens,
@@ -539,7 +539,7 @@ def unwrap_model(model: "nn.Module") -> "nn.Module":
     Taken from: https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/modeling_utils.py#L4808
     """
     if hasattr(model, "module"):
-        return unwrap_model(getattr(model, "module"))
+        return unwrap_model(model.module)
     else:
         return model
 

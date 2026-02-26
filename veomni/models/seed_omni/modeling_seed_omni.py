@@ -404,7 +404,9 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
             outputs: BaseDecoderOutput = self.image_decoder.lm_head(dummy_hidden_states)
             loss["image_decoder_loss"] = outputs.logits.mean() * 0.0
 
-    def decode(self, hidden_states: torch.Tensor, decoder_inputs: dict = {}, **kwargs):
+    def decode(self, hidden_states: torch.Tensor, decoder_inputs: dict = None, **kwargs):
+        if decoder_inputs is None:
+            decoder_inputs = {}
         loss = {}
         if "image" in self.modality:
             self.image_decode(hidden_states, decoder_inputs, loss, **kwargs)
@@ -522,9 +524,11 @@ class SeedOmniModel(SeedOmniPreTrainedModel, GenerationMixin):
         image_token_num: List = None,
         image_parallel_size: int = 16,
         image_classifier_free_guidance: bool = True,
-        image_generation_config: dict = {},
+        image_generation_config: dict = None,
         **kwargs,
     ):
+        if image_generation_config is None:
+            image_generation_config = {}
         self.image_start_token = image_start_token
         self.image_token_num = image_token_num
         self.image_parallel_size = image_parallel_size

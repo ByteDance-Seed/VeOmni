@@ -508,7 +508,7 @@ def Qwen2_5OmniVisionAttention_forward(
                 is_causal=False,
                 **kwargs,
             )[0]
-            for q, k, v in zip(*splits)
+            for q, k, v in zip(*splits, strict=False)
         ]
         attn_output = torch.cat(attn_outputs, dim=1)
 
@@ -978,10 +978,12 @@ class Qwen2_5OmniForConditionalGeneration(_Qwen2_5OmniForConditionalGeneration):
         talker_top_k: int = 40,
         talker_top_p: float = 0.8,
         talker_temperature: float = 0.9,
-        talker_eos_token_id: list[int] = [8292, 8294],
+        talker_eos_token_id: list[int] = None,
         talker_repetition_penalty: float = 1.05,
         **kwargs,
     ):
+        if talker_eos_token_id is None:
+            talker_eos_token_id = [8292, 8294]
         if speaker not in self.speaker_map:
             raise ValueError(f"{speaker} is not availible, availible speakers: {self.speaker_map.keys()}")
         if return_audio and not self.has_talker:

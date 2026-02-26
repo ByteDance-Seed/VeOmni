@@ -183,7 +183,7 @@ def parse_args(root_class: Type[T]) -> T:
 
         keys = key.split(".")
         current_level = cli_config
-        for i, k in enumerate(keys[:-1]):
+        for _i, k in enumerate(keys[:-1]):
             if k not in current_level:
                 current_level[k] = {}
             current_level = current_level[k]

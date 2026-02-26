@@ -14,7 +14,7 @@
 
 
 import random
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections import defaultdict
 from typing import Dict, List, Literal, Sequence
 
@@ -32,7 +32,7 @@ logger = logging.get_logger(__name__)
 class MultimodalChatTemplate(ChatTemplate):
     @abstractmethod
     def encode_messages(
-        self, messages: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
+        self, messages: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
         """
         Encodes messages to a dictionary of input_ids, attention_mask, labels, and mm with mm_seqlens.
@@ -61,7 +61,7 @@ class MultimodalChatTemplate(ChatTemplate):
         return input_ids
 
 
-class DefaultTag(ABC):
+class DefaultTag:
     def mm_tokenize(
         self,
         mm_type: Literal["image", "video", "audio"],
@@ -70,7 +70,7 @@ class DefaultTag(ABC):
         return [TYPE2INDEX["input"][mm_type]] * token_num
 
 
-class MMTag(ABC):
+class MMTag:
     def mm_tokenize(
         self,
         mm_type: Literal["image", "video", "audio"],
@@ -93,8 +93,10 @@ class PretrainTemplate(MultimodalChatTemplate):
     """
 
     def encode_messages(
-        self, messages: Sequence[Dict[str, str]], num_tokens: Dict = defaultdict(list), **kwargs
+        self, messages: Sequence[Dict[str, str]], num_tokens: Dict = None, **kwargs
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         messages = messages[:2]
         assert messages[0][0] == "user"
         assert messages[1][0] == "assistant"
@@ -160,8 +162,10 @@ class PretrainTemplate(MultimodalChatTemplate):
 
 class SFTTemplate(MultimodalChatTemplate):
     def encode_messages(
-        self, messages: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
+        self, messages: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         input_ids, labels = [], []
         mm_index = dict.fromkeys(num_tokens.keys(), 0)
         for message_list in messages:
@@ -267,8 +271,10 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
 
 class Qwen2VLPretrainTemplate(Qwen2VLTemplate):  # For Omni Only
     def encode_messages(
-        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         messages = []
         data_type = ""
         mm_num_tokens = {key: iter(item) for key, item in num_tokens.items()}
@@ -347,8 +353,10 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
         return system_message
 
     def encode_messages(
-        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         sys_msg = self._get_system_mesage()
         messages = [] if sys_msg is None else [sys_msg]
         data_type = ""
@@ -456,8 +464,10 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
     # ===============================================================================
 
     def encode_messages(
-        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         sys_msg = self._get_system_mesage()
         messages = [] if sys_msg is None else [sys_msg]
         data_type = ""
@@ -482,14 +492,14 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                     # --- [Core Modification: Video Timestamp Processing] ---
                     try:
                         total_video_tokens = next(video_token_num_list)
-                    except StopIteration:
-                        raise ValueError("Video token number is missing for a video input.")
+                    except StopIteration as e:
+                        raise ValueError("Video token number is missing for a video input.") from e
 
                     # Get metadata for the current video
                     try:
                         v_meta = next(video_metadata_list)
-                    except StopIteration:
-                        raise ValueError("Video metadata is missing for a video input.")
+                    except StopIteration as e:
+                        raise ValueError("Video metadata is missing for a video input.") from e
 
                     # 1. Extract FPS (default to 2.0 if missing)
                     fps = v_meta.fps if v_meta.fps is not None else 2.0
@@ -680,8 +690,10 @@ class Qwen25OmniChatTemplate(Qwen2VLChatTemplate):
         return self.audio_bos_token + self.audio_pad * token_num + self.audio_eos_token
 
     def encode_messages(
-        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         sys_msg = self._get_system_mesage()
         messages = [] if sys_msg is None else [sys_msg]
         multimodal_num_tokens = {key: iter(item) for key, item in num_tokens.items()}  # image, video, audio
@@ -785,15 +797,17 @@ class JanusChatTemplate(ChatmlTemplate):
     def encode_messages(
         self,
         conversations: Sequence[Dict[str, str]],
-        num_tokens: Dict[str, List[int]] = defaultdict(list),
+        num_tokens: Dict[str, List[int]] = None,
         max_seq_len: int = 8192,
         **kwargs,
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         image_index = 0
         token_num_list = num_tokens.pop("image", [])
         messages = []
         use_system_prompt = False
-        for i, message in enumerate(conversations):
+        for _i, message in enumerate(conversations):
             role = message[0]
             message = message[1:]
             content = ""
@@ -822,7 +836,7 @@ class JanusChatTemplate(ChatmlTemplate):
             attention_mask = [1] * len(input_ids)
             labels = [IGNORE_INDEX] * len(input_ids)
 
-        for i, message in enumerate(messages):
+        for _i, message in enumerate(messages):
             role: str = message["role"]
             if role == "user":
                 content_str = role.capitalize() + ": " + message["content"] + self.sep1
@@ -970,8 +984,10 @@ class LlamaPretrainTemplate(MultimodalChatTemplate):  # For Omni Only
         return self.cfg_ratio and random.random() < self.cfg_ratio
 
     def encode_messages(
-        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
     ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
         messages = []
         multimodal_num_tokens = {key: iter(item) for key, item in num_tokens.items()}  # image, video, audio
         data_type = ""

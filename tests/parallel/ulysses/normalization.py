@@ -16,7 +16,7 @@ def get_layernorm(hidden_size: torch.Tensor, eps: float = 1e-5, affine: bool = T
             from apex.normalization import FusedLayerNorm
 
             return FusedLayerNorm(hidden_size, elementwise_affine=affine, eps=eps)
-        except ImportError:
-            raise RuntimeError("FusedLayerNorm not available. Please install apex.")
+        except ImportError as e:
+            raise RuntimeError("FusedLayerNorm not available. Please install apex.") from e
     else:
         return nn.LayerNorm(hidden_size, eps, elementwise_affine=affine)

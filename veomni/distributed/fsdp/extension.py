@@ -40,7 +40,7 @@ orig_optim_state_dict = FSDP.optim_state_dict
 orig_optim_state_dict_to_load = FSDP.optim_state_dict_to_load
 
 
-def _shard_tensor(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh, shard: Shard = Shard(0)):
+def _shard_tensor(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh, shard: Shard = None):
     """
     Shard Tensor to DTensor.
 
@@ -51,6 +51,8 @@ def _shard_tensor(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh, shard: Sh
 
     """
     assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
+    if shard is None:
+        shard = Shard(0)
     ep_mesh = device_mesh["ep"]
 
     if orgin_tensor.__class__.__name__ == "DTensor":
@@ -62,7 +64,7 @@ def _shard_tensor(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh, shard: Sh
     return dtensor
 
 
-def _shard_dtensor(orgin_dtensor: DTensor, device_mesh: DeviceMesh, shard: Shard = Shard(0)):
+def _shard_dtensor(orgin_dtensor: DTensor, device_mesh: DeviceMesh, shard: Shard = None):
     """
     Convert DTensor to local Tensor
 
@@ -72,6 +74,9 @@ def _shard_dtensor(orgin_dtensor: DTensor, device_mesh: DeviceMesh, shard: Shard
         shard (Shard): The shard info, default Shard(0).
 
     """
+    if shard is None:
+        shard = Shard(0)
+
     assert isinstance(orgin_dtensor, DTensor), (
         f"Only support DTensor, got {type(orgin_dtensor)}, for torch.Tensor, use _shard_dtensor instead."
     )
@@ -303,6 +308,7 @@ class CheckpointExtensions(FSDPExtensions):
                         for unflat_param_name, unflat_param_state in zip(
                             optim_state_key.unflat_param_names,
                             unflat_state,
+                            strict=False,
                         ):
                             fsdp_osd_state[unflat_param_name] = unflat_param_state
                 elif to_save:

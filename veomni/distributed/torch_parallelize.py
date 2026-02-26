@@ -270,7 +270,7 @@ def parallelize_model_fsdp2(
         )
         ep_fqn2spec_info = parallel_plan.apply(model, parallel_state.ep_fsdp_device_mesh)
         # Attach spec mapping for checkpoint load-time reconstruction
-        setattr(model, "_fqn2spec_info", ep_fqn2spec_info)
+        model._fqn2spec_info = ep_fqn2spec_info
         # ep_mesh does not really exist in EP parameters' device mesh.
         # EP parameters are loaded as local tensors to be later sharded by fully_shard
         ep_mesh = parallel_state.ep_fsdp_device_mesh["ep"]
@@ -396,7 +396,7 @@ def parallelize_model_fsdp2(
     if need_manual_prefetch:
         blocks = [pair[1] for pair in layer_pairs]
         next_blocks = blocks[1:] + [None]
-        for current_block, next_block in zip(blocks, next_blocks):
+        for current_block, next_block in zip(blocks, next_blocks, strict=False):
             if next_block is not None:
                 prefetch_modules = next_block._fsdp_modules
                 # prefetch in order of attn, gate, experts
@@ -405,7 +405,7 @@ def parallelize_model_fsdp2(
         # configure backward prefetch
         rev_blocks = list(reversed(blocks))
         prev_blocks = rev_blocks[1:] + [None]
-        for current_block, prev_block in zip(rev_blocks, prev_blocks):
+        for current_block, prev_block in zip(rev_blocks, prev_blocks, strict=False):
             if prev_block is not None:
                 prefetch_modules = prev_block._fsdp_modules
                 current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))

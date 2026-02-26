@@ -232,22 +232,34 @@ def encode_multimodal_sample(
     if images:
         processor_input.update(
             {
-                "input_images": [img for img, mask in zip(images, multimodal_output_mask["image"]) if not mask],
-                "output_images": [img for img, mask in zip(images, multimodal_output_mask["image"]) if mask],
+                "input_images": [
+                    img for img, mask in zip(images, multimodal_output_mask["image"], strict=False) if not mask
+                ],
+                "output_images": [
+                    img for img, mask in zip(images, multimodal_output_mask["image"], strict=False) if mask
+                ],
             }
         )
     if videos:
         processor_input.update(
             {
-                "input_videos": [vid for vid, mask in zip(videos, multimodal_output_mask["video"]) if not mask],
-                "output_videos": [img for img, mask in zip(videos, multimodal_output_mask["video"]) if mask],
+                "input_videos": [
+                    vid for vid, mask in zip(videos, multimodal_output_mask["video"], strict=False) if not mask
+                ],
+                "output_videos": [
+                    img for img, mask in zip(videos, multimodal_output_mask["video"], strict=False) if mask
+                ],
             }
         )
     if audios and "audio" in modality:
         processor_input.update(
             {
-                "input_audios": [aud for aud, mask in zip(audios, multimodal_output_mask["audio"]) if not mask],
-                "output_audios": [aud for aud, mask in zip(audios, multimodal_output_mask["audio"]) if mask],
+                "input_audios": [
+                    aud for aud, mask in zip(audios, multimodal_output_mask["audio"], strict=False) if not mask
+                ],
+                "output_audios": [
+                    aud for aud, mask in zip(audios, multimodal_output_mask["audio"], strict=False) if mask
+                ],
             }
         )
 

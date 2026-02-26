@@ -440,8 +440,10 @@ def build_energon_dataset(
     """
     try:
         from megatron.energon import WorkerConfig, get_train_dataset
-    except ImportError:
-        raise ImportError("Megatron-Energon is not installed. Please install it with: pip install megatron-energon")
+    except ImportError as e:
+        raise ImportError(
+            "Megatron-Energon is not installed. Please install it with: pip install megatron-energon"
+        ) from e
 
     logger.info_rank0(f"Start building Megatron-Energon native dataset from {train_path}")
     # Get parallel state for distributed training

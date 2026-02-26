@@ -11,9 +11,9 @@ class CosmosConfig(PretrainedConfig):
 
     def __init__(
         self,
-        attn_resolutions=[32],  # The attention resolution for res blocks.
+        attn_resolutions=None,  # The attention resolution for res blocks.
         channels=128,  # The base number of channels.
-        channels_mult=[2, 4, 4],  # The channel multipler for each resolution.
+        channels_mult=None,  # The channel multipler for each resolution.
         dropout=0.0,
         in_channels=3,
         spatial_compression=16,  # The spatial compression ratio.
@@ -26,13 +26,19 @@ class CosmosConfig(PretrainedConfig):
         z_factor=1,  # A factor over the z_channels, to get the total channels the encoder should output. for discrete tokenization, often we directly use the vector, so z_factor=1.
         quantizer="FSQ",  # The quantizer of choice, VQ, LFQ, FSQ, or ResFSQ.
         embedding_dim=6,  # The embedding dimension post-quantization, which is also the input channels of the decoder.Which is also the output
-        levels=[8, 8, 8, 5, 5, 5],  # The number of levels to use for fine-scalar quantization.
+        levels=None,  # The number of levels to use for fine-scalar quantization.
         num_quantizers=4,  # The number of quantizers to use for residual fine-scalar quantization.
         name="DI",
         encoder="Default",  # Specify type of encoder ["Default", "LiteVAE"]
         decoder="Default",  # Specify type of decoder ["Default"]
         **kwargs,
     ):
+        if levels is None:
+            levels = [8, 8, 8, 5, 5, 5]
+        if channels_mult is None:
+            channels_mult = [2, 4, 4]
+        if attn_resolutions is None:
+            attn_resolutions = [32]
         self.attn_resolutions = attn_resolutions
         self.channels = channels
         self.channels_mult = channels_mult

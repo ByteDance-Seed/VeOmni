@@ -259,8 +259,8 @@ def compare_items(item, rank, group_size, group):
 
 
 def compare_global_batch(global_batch_list, global_batch_resume_list):
-    for global_batch, global_batch_resume in zip(global_batch_list, global_batch_resume_list):
-        for micro_batch, micro_batch_resume in zip(global_batch, global_batch_resume):
+    for global_batch, global_batch_resume in zip(global_batch_list, global_batch_resume_list, strict=False):
+        for micro_batch, micro_batch_resume in zip(global_batch, global_batch_resume, strict=False):
             for key in micro_batch.keys():
                 if torch.is_tensor(micro_batch[key]):
                     assert torch.all(micro_batch[key] == micro_batch_resume[key])

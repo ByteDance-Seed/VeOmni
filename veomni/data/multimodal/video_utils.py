@@ -251,7 +251,7 @@ def _download_url_to_bytes(url: str) -> bytes:
         )
         return result.stdout
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to download video from {url}: {e.stderr.decode()}")
+        raise RuntimeError(f"Failed to download video from {url}: {e.stderr.decode()}") from e
 
 
 def _pil_images_to_tensor(images: List["PIL.Image.Image"]) -> torch.Tensor:
@@ -343,9 +343,11 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
                 video_bytes = _download_url_to_bytes(video_input)
                 decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
             except Exception as download_error:
-                raise RuntimeError(f"Failed to decode video from URL {video_input}: {download_error}")
+                raise RuntimeError(
+                    f"Failed to decode video from URL {video_input}: {download_error}"
+                ) from download_error
         else:
-            raise RuntimeError(f"Failed to create VideoDecoder: {e}")
+            raise RuntimeError(f"Failed to create VideoDecoder: {e}") from e
 
     metadata = decoder.metadata
     video_fps = metadata.average_fps
@@ -366,8 +368,8 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
                 frames = decoder.get_frames_at([0]).data
                 sampled_indices = [0]
                 _, pad_count = calculate_frame_indices(total_frames=1, video_fps=video_fps, **kwargs)
-            except Exception:
-                raise RuntimeError(f"Failed to decode even the first frame: {e}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to decode even the first frame: {e}") from e
         else:
             raise e
 
@@ -412,11 +414,11 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
             audio_inputs.append(audio)
             audio_fps_list.append(audio_fps)
         except Exception as e:
-            raise RuntimeError(f"Failed to process video {i}: {e}")
+            raise RuntimeError(f"Failed to process video {i}: {e}") from e
 
     processed_audio_inputs = [
         smart_audio_nframes(audio, audio_fps, **kwargs)[0] if audio is not None and audio_fps is not None else None
-        for audio, audio_fps in zip(audio_inputs, audio_fps_list)
+        for audio, audio_fps in zip(audio_inputs, audio_fps_list, strict=False)
     ]
 
     return video_inputs, processed_audio_inputs
@@ -464,7 +466,7 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
                 audio_metadata_list.append(None)
 
         except Exception as e:
-            raise RuntimeError(f"Failed to process video {i}: {e}")
+            raise RuntimeError(f"Failed to process video {i}: {e}") from e
 
     return video_inputs, video_metadata_list, audio_inputs, audio_metadata_list
 

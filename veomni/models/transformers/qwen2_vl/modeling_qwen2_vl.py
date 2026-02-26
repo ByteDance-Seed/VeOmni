@@ -138,7 +138,7 @@ def VisionAttention_forward(
                 is_causal=False,
                 **kwargs,
             )[0]
-            for q, k, v in zip(*splits)
+            for q, k, v in zip(*splits, strict=False)
         ]
         attn_output = torch.cat(attn_outputs, dim=1)
 
