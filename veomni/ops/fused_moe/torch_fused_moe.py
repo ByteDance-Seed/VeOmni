@@ -8,6 +8,11 @@ from ..group_gemm.torch_moe_utils.utils import indices_padding_wrapper
 
 
 class TorchFusedMoeExpertFunction(torch.autograd.Function):
+    """
+    Fused Moe for non-ep cases that use torch._grouped_mm
+    Reference: veomni/ops/fused_moe/group_gemm.py: TritonFusedMoeExpertFunction
+    """
+
     @staticmethod
     def forward(
         ctx,
@@ -24,10 +29,12 @@ class TorchFusedMoeExpertFunction(torch.autograd.Function):
         hidden_states = hidden_states.bfloat16()
         # Prepare inputs for Grouped GEMM
         # we assume top-k has been performed before this func
+        # Reference:
         # num_tokens_per_expert = torch.histc(selected_experts.view(-1), bins=num_experts, min=0, max=num_experts)
         num_tokens_per_expert = expert_histogram(selected_experts, num_experts)
 
         # Reorder the token indices to match the order of the experts
+        # Reference:
         # token_indices_experts_sorted shape (bs*slen*top_k,)
         # token_indices_experts_sorted = torch.argsort(selected_experts.view(-1), stable=True)
         token_indices_experts_sorted = (
@@ -35,37 +42,38 @@ class TorchFusedMoeExpertFunction(torch.autograd.Function):
         )
 
         # select tokens by scatter_index, and put them together
+        # Reference:
         # token_indices_experts_sorted shape (batch_size * sequence_len * topk, hidden_size)
         # token_indices_experts_sorted = token_indices_experts_sorted.reshape(-1, 1).expand(-1, hidden_states.size(-1))
         # routed_input = torch.gather(hidden_states, dim=0, index=token_indices_experts_sorted)
         routed_input = moe_scatter(hidden_states, token_indices_experts_sorted)
 
-        reshaped_gate_weight = routing_weights.reshape(-1, 1)
-        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
-        scattered_gate_weight[token_indices_experts_sorted.flatten()] = reshaped_gate_weight
-
+        # MOE Step 4: compute linear layer 1-1
         offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
         # TODO: before grouped_mm we need to pad inputs like indices_padding_wrapper
         fc1_1_output = torch._grouped_mm(
             routed_input.bfloat16(), fc1_1_weight.bfloat16().transpose(-2, -1), offs=offsets
         )
+        # MOE Step 6: compute linear layer 1-2
+        # fc1_2_output shape is (batch_size * sequence_len * topk, ffn_dim)
         fc1_2_output = torch._grouped_mm(
             routed_input.bfloat16(), fc1_2_weight.bfloat16().transpose(-2, -1), offs=offsets
         )
-
+        # fc1_1_activation shape is (batch_size * sequence_len * topk, ffn_dim)
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        # MOE Step 7: compute final result of linear layer 1
         fc1_activation = fc1_1_activation * fc1_2_output
-
-        fc1_2_output = fc1_1_output * torch._grouped_mm(
-            routed_input.bfloat16(), fc1_2_weight.bfloat16().transpose(-2, -1), offs=offsets
-        )
+        # MOE Step 8: compute the the weighted linear layer 1 result
+        # MOE Step 8-1: compute scattered_gate_weight, shape is (batch_size * sequence_len * topk)
+        reshaped_gate_weight = routing_weights.reshape(-1, 1)
+        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
+        scattered_gate_weight[token_indices_experts_sorted.flatten()] = reshaped_gate_weight
 
         fc1_weighted_output = fc1_2_output * scattered_gate_weight
-        routed_outputs = torch._grouped_mm(
-            fc1_2_output, fc2_weight.bfloat16().transpose(-2, -1), offs=offsets
-        ).type_as(routed_input)
 
-        output = moe_gather(routed_outputs, token_indices_experts_sorted)
+        fc2_output = torch._grouped_mm(fc1_weighted_output, fc2_weight.bfloat16().transpose(-2, -1), offs=offsets)
+
+        output = moe_gather(fc2_output, token_indices_experts_sorted)
         output = output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
@@ -102,7 +110,9 @@ def torch_fused_moe_forward(
     fc1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
 ):
-    # TODO: support EP
+    """
+    A reference forward pass for torch._grouped_mm based fused moe.
+    """
     routing_weights = routing_weights.bfloat16()
     hidden_states = hidden_states.bfloat16()
     # Prepare inputs for Grouped GEMM
