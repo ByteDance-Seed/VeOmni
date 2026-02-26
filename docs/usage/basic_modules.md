@@ -7,21 +7,22 @@
 2. **Run Example Script**  
    Verify training startup: (need download the dataset first)
 
-   ```bash
-   bash train.sh tasks/train_torch.py configs/pretrain/qwen2_5.yaml
-   ```
+    - Use plain python scripts:
+        ```bash
+        bash train.sh tasks/deprecated_task/train_torch.py configs/text/qwen2_5.yaml
+        ```
+    - Use trainer:
+        ```bash
+        bash train.sh tasks/train_text.py configs/text/qwen2_5.yaml
+        ```
 
 3. **Create Custom Task Directory**  
-    [`train_torch.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, you can just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_qwen2_vl.py)
-    ```bash
-    mkdir tasks/your_task
-    cp tasks/train_torch.py tasks/your_task/train.py
-    ```
+    [`train_text.py`](../../tasks/train_text.py) can be used for most of task pre-training and post-training tasks, you can just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_text.py` file from the `tasks` directory and modify it. like [`tasks/train_vlm.py`](../../tasks/train_vlm.py)
 
 4. **Launch Custom Training**  
     You can overwrite the default arguments in train yaml by passing them to the script.
     ```bash
-    bash train.sh tasks/your_task/train.py \
+    bash train.sh tasks/your_train_script.py \
         $CONFIG.yaml \
         --model.model_path your_path_to_model \
         --data.train_path your_path_to_dataset \
@@ -32,14 +33,14 @@
 
 ## Arguments
 **Default Parameter Access**:  
-veomni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md).
+VeOmni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md). A basic argument example is defined in ['arguments_types.py'](../../veomni/arguments/arguments_types.py).
 
 ```python
 from dataclasses import dataclass, field
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, VeOmniArguments
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
@@ -60,7 +61,7 @@ class CustomTrainingArguments(TrainingArguments):
     )
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "CustomTrainingArguments" = field(default_factory=CustomTrainingArguments)
@@ -86,6 +87,7 @@ init_parallel_state(
     cp_size=args.train.context_parallel_size, # context parallel size, not support now
     ulysses_size=args.train.ulysses_parallel_size, # ulysses parallel size
     dp_mode=args.train.data_parallel_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
+    async_enabled=self.args.train.async_enabled, # async ulysses
 )
 
 parallel_state = get_parallel_state()
@@ -104,7 +106,7 @@ tp_mesh = parallel_state.tp_mesh
 ```
 
 ## Dataset
-VeOmni default supports two types of datasets(source code: [veomni/data/dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dataset.py)):
+VeOmni default supports two types of datasets(source code: [veomni/data/dataset.py](../../veomni/data/dataset.py)):
 1. **IterativeDataset** (recommended for large datasets)  
 2. **MappingDataset** (default for small datasets)
 

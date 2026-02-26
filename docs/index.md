@@ -43,7 +43,9 @@ hardware_support/get_started_npu.md
 :caption: Examples
 
 examples/qwen3.md
+examples/qwen3_moe.md
 examples/qwen3_vl.md
+examples/qwen3_omni_moe.md
 examples/wan2.1.md
 ```
 
@@ -51,9 +53,11 @@ examples/wan2.1.md
 :maxdepth: 1
 :caption: Key Features
 
+key_features/model_loader.md
+key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
 key_features/ulysses.md
-key_features/preprocessor_registry.md
+
 ```
 
 ```{toctree}
