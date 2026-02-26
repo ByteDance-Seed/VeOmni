@@ -16,6 +16,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
@@ -748,12 +749,15 @@ class TrainingArguments:
             )
 
         if self.load_checkpoint_path:
-            load_path = os.path.abspath(self.load_checkpoint_path)
-            output_dir = os.path.abspath(self.output_dir)
-            assert os.path.commonpath([load_path, output_dir]) == output_dir, (
-                f"load_checkpoint_path must be under output_dir: {self.load_checkpoint_path} "
-                f"not under {self.output_dir}"
-            )
+            load_path = Path(self.load_checkpoint_path).resolve()
+            output_dir = Path(self.output_dir).resolve()
+
+            try:
+                load_path.relative_to(output_dir)
+            except ValueError:
+                raise AssertionError(
+                    f"load_checkpoint_path must be under output_dir: {load_path} not under {output_dir}"
+                )
 
         # save paths
         # output_dir/
