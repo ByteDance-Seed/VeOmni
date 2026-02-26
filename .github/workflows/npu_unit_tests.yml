@@ -1,0 +1,113 @@
+# # Tests layout
+
+name: NPU unit tests
+
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - main
+      - v0.*
+    paths:
+      - "**/*.py"
+      - .github/workflows/npu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**/*.py"
+      - .github/workflows/npu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
+
+# Cancel jobs on the same ref if a new one is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Declare permissions just read content.
+permissions:
+  contents: read
+
+jobs:
+  npu_unit_tests:
+    if: github.repository_owner == 'ByteDance-Seed'
+    name: VeOmni Ascend test (self-host)
+    runs-on: [self-hosted, npu-0]
+    timeout-minutes: 60 # Increase this timeout value as needed
+    container:
+      image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
+      volumes:
+        - /usr/local/dcmi:/usr/local/dcmi
+        - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+        - /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/
+        - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
+        - /etc/ascend_install.info:/etc/ascend_install.info
+        - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
+        # - /data00/dataset:/github/home/dataset
+        # - /data00/models:/github/home/models
+        # Use self-host cache speed up pip and model download
+        # - /home/action/actions-runner/_work/cache:/github/home/.cache/
+      options: >-
+        --device /dev/davinci0
+        --device /dev/davinci_manager
+        --device /dev/devmm_svm
+        --device /dev/hisi_hdc
+        --network host
+        --privileged
+        --shm-size 16g
+    env:
+      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
+      HF_ENDPOINT: "https://hf-mirror.com"
+      HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+      CI_SAMPLES_DIR: "/data00/assets/samples"
+
+    steps:
+      - name: Set up proxy
+        run: |
+          CURRENT_PROXY=$(cat /tmp/latest_proxy)
+          echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+          echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+          echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+          echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+      - name: Check npu and CANN info
+        run: |
+          cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
+          npu-smi info
+      - name: Check initial pip list from image
+        run: |
+          pip list
+      - name: Checkout ByteDance-Seed/VeOmni repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+      - name: Sync dependencies
+        run: |
+          uv sync --frozen --extra npu --extra audio --group dev
+      - name: Check final pip list
+        run: |
+          uv pip list
+      - name: Run parallel tests
+        run: |
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
+      - name: Run models tests
+        run: |
+          uv run --frozen pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
+      - name: Run fsdp2/ep+fsdp2 clip grad norm test
+        run: |
+          uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+      - name: Run e2e dcp save and load test
+        run: |
+          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
+      - name: Run data tests
+        run: |
+          uv run --frozen pytest -s -x tests/data

@@ -1,4 +1,4 @@
-Qwen3 MoE training guide
+# Qwen3 MoE training guide
 
 1. Download qwen3 moe model
 
@@ -121,5 +121,5 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
 
 3. Train qwen3 moe model
 ```
-bash train.sh tasks/train_torch.py configs/pretrain/qwen3-moe.yaml
+bash train.sh tasks/train_text.py configs/text/qwen3-moe.yaml
 ```

@@ -3,17 +3,18 @@ import sys
 import torch
 import torch.distributed as c10d
 
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
-if not c10d.is_available() or not c10d.is_nccl_available():
+
+if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
     print("c10d NCCL not available, skipping tests", file=sys.stderr)
     sys.exit(0)
 
+import pytest
 import torch.distributed as dist
-from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
-from veomni.utils.device import get_device_type, get_torch_device
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .utils import (
@@ -41,8 +42,7 @@ class AllToAllCommTest(SequenceParallelTest):
         dim_size_list.append(S - sum(dim_size_list))
         return input_, dim_size_list
 
-    @requires_nccl()
-    @skip_if_lt_x_gpu(4)
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_even_input(self):
         group = self._get_process_group()
         input_ = self._get_even_input_data()
@@ -51,8 +51,7 @@ class AllToAllCommTest(SequenceParallelTest):
 
         torch.allclose(input_, test_input_final)
 
-    @requires_nccl()
-    @skip_if_lt_x_gpu(4)
+    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_uneven_input(self):
         group = self._get_process_group()
         input_, dim_size_list = self._get_uneven_input_data()

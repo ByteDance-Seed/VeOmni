@@ -11,3 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ...loader import MODELING_REGISTRY
+
+
+@MODELING_REGISTRY.register("llama")
+def register_llama_modeling(architecture: str):
+    from transformers import LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
+
+    from .modeling_llama import apply_veomni_llama_patch
+
+    apply_veomni_llama_patch()
+
+    if "ForCausalLM" in architecture:
+        return LlamaForCausalLM
+    elif "ForSequenceClassification" in architecture:
+        return LlamaForSequenceClassification
+    elif "Model" in architecture:
+        return LlamaModel
+    else:
+        return LlamaForCausalLM

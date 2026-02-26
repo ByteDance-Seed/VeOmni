@@ -29,3 +29,6 @@ jobs:
       - name: Run device api usage normativity in VeOmni/veomni
         run: |
           python tests/special_senity/check_device_api_usage.py -d veomni
+      - name: Run device api usage normativity in VeOmni/tests
+        run: |
+          python tests/special_senity/check_device_api_usage.py -d tests

@@ -6,18 +6,18 @@ from dataclasses import dataclass, field
 import pytest
 import torch.distributed as dist
 
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.models import build_foundation_model
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
-from veomni.utils.device import get_device_type, get_nccl_backend, get_torch_device
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
 
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
@@ -27,7 +27,6 @@ class Arguments:
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_helper.py \
     --model.config_path test \
     --data.train_path tests \
-    --train.rmpad True \
     --train.output_dir .tests/cache \
 """
 
@@ -36,7 +35,7 @@ def run_environ_meter(args: Arguments):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_nccl_backend(), world_size=world_size, rank=rank)
+    dist.init_process_group(backend=get_dist_comm_backend(), world_size=world_size, rank=rank)
 
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
@@ -54,7 +53,6 @@ def run_environ_meter(args: Arguments):
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     print(f"Model Class: {type(model)}")
 
@@ -77,6 +75,7 @@ def test_model_loader(model_path):
         f"--model.config_path={model_path}",
         "--data.train_path=tests",
         "--train.output_dir=.tests/cache",
+        f"--train.init_device={get_device_type()}",
     ]
 
     result = subprocess.run(command, check=True)

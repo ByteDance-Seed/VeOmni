@@ -19,13 +19,14 @@ import datetime
 import gc
 import logging as builtin_logging
 import os
+import random
 import subprocess
 import sys
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
 import psutil
@@ -33,23 +34,20 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformers
-from transformers import enable_full_determinism
 from transformers import set_seed as set_seed_func
 
-from veomni.distributed.parallel_state import get_parallel_state
-from veomni.utils import logging
-from veomni.utils.count_flops import VeomniFlopsCounter
-from veomni.utils.device import (
+from ..distributed.parallel_state import get_parallel_state
+from . import logging
+from .count_flops import VeomniFlopsCounter
+from .device import (
     IS_CUDA_AVAILABLE,
     IS_NPU_AVAILABLE,
     get_device_type,
     get_torch_device,
 )
-from veomni.utils.dist_utils import all_reduce
-from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
-
-from .import_utils import is_veomni_patch_available
+from .dist_utils import all_reduce
 from .multisource_utils import parse_multisource_config
+from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
 
 
 try:
@@ -63,36 +61,16 @@ if IS_NPU_AVAILABLE:
     import torch_npu
 
 
-if is_veomni_patch_available():
-    from veomni_patch.utils.helper import (
-        VALID_CONFIG_TYPE,
-        VEOMNI_UPLOAD_CMD,
-        FlopsCounter,
-        convert_hdfs_fuse_path,
-        is_remote_path,
-        load_step2token,
-        save_step2token,
-    )
-else:
+# internal use
+VALID_CONFIG_TYPE = None
+VEOMNI_UPLOAD_CMD = None
+FlopsCounter = None
 
-    def load_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
 
-    def save_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
-
-    def is_remote_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
-
-    def convert_hdfs_fuse_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
-
-    VALID_CONFIG_TYPE = None
-    VEOMNI_UPLOAD_CMD = None
-
-    class FlopsCounter:
-        def __init__(self):
-            raise ImportError("veomni_patch is not available, please install it first")
+def convert_hdfs_fuse_path(*args, **kwargs):
+    if len(args) > 0:
+        return args[0]
+    return kwargs.get("path", None)
 
 
 if TYPE_CHECKING:
@@ -105,33 +83,39 @@ logger = logging.get_logger(__name__)
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "veomni")))
 
 
-def _compute_seqlens(
-    micro_batch: Dict[str, "torch.Tensor"], rmpad: bool, rmpad_with_pos_ids: bool, enable_multisource: bool
-) -> Tuple[List[int], Optional[List[int]]]:
-    """
-    Computes the sequence lengths of the current batch.
-
-    Args:
-        micro_batch (Dict[str, Tensor]): The current batch.
-        rmpad (bool): Whether to remove the padding tokens.
-        rmpad_with_pos_ids (bool): Whether to remove the padding tokens using the position ids.
-        enable_multisource (bool): Whether to enable the multi-source dataloader.
-    """
-    attention_mask = micro_batch["attention_mask"]
-    if rmpad:
-        seqlens = culen2len(micro_batch["cu_seqlens"]).tolist()
-        seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
-    elif rmpad_with_pos_ids:
-        seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-        seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
+def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    if "cu_seq_lens_q" in micro_batch:
+        # packed micro batch
+        seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        return seqlens
     else:
-        seqlens = attention_mask.sum(-1).tolist()
+        # unpacked sample
+        attention_mask = micro_batch["attention_mask"]
+        seqlens = attention_mask.sum().item()
+        return [seqlens]
 
-    ds_idx = None
-    if enable_multisource:
-        ds_idx = micro_batch["ds_idx"].tolist()
 
-    return seqlens, ds_idx
+def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    image_shape_keys = ["image_grid_thw", "video_grid_thw", "audio_grid_thw"]
+    image_seqlens = []
+    for key in image_shape_keys:
+        if key in micro_batch:
+            grid_thw = micro_batch[key]
+            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
+            image_seqlens.extend(seqlens)
+    return image_seqlens
+
+
+def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    ds_idx = micro_batch.pop("ds_idx")
+    micro_batch.pop("source_name", None)
+    micro_batch.pop("cur_token_num", None)
+    if isinstance(ds_idx, torch.Tensor):
+        # packed micro batch
+        return ds_idx.tolist()
+    else:
+        # unpacked sample
+        return [ds_idx]
 
 
 class EnvironMeter:
@@ -141,8 +125,6 @@ class EnvironMeter:
     Args:
         config (PretrainedConfig): The configuration of the model.
         global_batch_size (int): The global batch size.
-        rmpad (bool, optional): Whether to remove the padding tokens. Defaults to False.
-        rmpad_with_pos_ids (bool, optional): Whether to remove the padding tokens using the position ids. Defaults to False.
         enable_multisource (bool, optional): Whether to enable the multi-source dataloader. Defaults to False.
         dataloader (DataLoader, optional): The training dataloader for multi-source dataloader. Defaults to None.
         data_path (str, optional): The data path for multi-source dataloader. Defaults to "".
@@ -153,8 +135,6 @@ class EnvironMeter:
         self,
         config: "PretrainedConfig",
         global_batch_size: int,
-        rmpad: bool = False,
-        rmpad_with_pos_ids: bool = False,
         enable_multisource: bool = False,
         dataloader: Optional["DataLoader"] = None,
         data_path: str = "",
@@ -163,16 +143,15 @@ class EnvironMeter:
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
-        self.rmpad = rmpad
-        self.rmpad_with_pos_ids = rmpad_with_pos_ids
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
         self.world_size = dist.get_world_size()
         self.consume_tokens = 0
+        self.consume_chunks = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
-        self.image_seqlens = []
+        self.images_seqlens = []
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -192,7 +171,7 @@ class EnvironMeter:
             gc.disable()
 
     def state_dict(self) -> Dict[str, Any]:
-        state_dict = {"consume_tokens": self.consume_tokens}
+        state_dict = {"consume_tokens": self.consume_tokens, "consume_chunks": self.consume_chunks}
         if self.enable_multisource:
             state_dict.update({"multisource_tracker": self.multisource_tracker.state_dict()})
 
@@ -200,36 +179,30 @@ class EnvironMeter:
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.consume_tokens = state_dict["consume_tokens"]
+        self.consume_chunks = state_dict["consume_chunks"]
         if self.enable_multisource:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
-    def add(self, micro_batch: Dict[str, "torch.Tensor"]) -> None:
-        seqlens, ds_idx = _compute_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids, self.enable_multisource)
-
-        if "image_grid_thw" in micro_batch:
-            image_grid_thw = micro_batch["image_grid_thw"]
-            image_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
-            self.image_seqlens.extend(image_seqlens.tolist())
-
-        if "video_grid_thw" in micro_batch:
-            video_grid_thw = micro_batch["video_grid_thw"]
-            video_seqlens = torch.repeat_interleave(video_grid_thw[:, 1] * video_grid_thw[:, 2], video_grid_thw[:, 0])
-            self.image_seqlens.extend(video_seqlens.tolist())  # video equals to image
-
-        if self.enable_multisource:
-            self.batch_seqlens.extend(seqlens[: len(ds_idx)])  # rmpad_with_pos_ids has a pad item
-            self.batch_ds_idx.extend(ds_idx)
+    def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
+        if isinstance(micro_batch, List):
+            for sample in micro_batch:
+                self.batch_seqlens.extend(_compute_seqlens(sample))
+                self.images_seqlens.extend(_compute_image_seqlens(sample))
+                if self.enable_multisource:
+                    self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
         else:
-            self.batch_seqlens.extend(seqlens)
+            self.batch_seqlens.extend(_compute_seqlens(micro_batch))
+            self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
+            if self.enable_multisource:
+                self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
-        if len(self.image_seqlens) > 0:
+        if len(self.images_seqlens) > 0:
             flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, image_seqlens=self.image_seqlens
+                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens
             )
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
-
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
@@ -243,6 +216,7 @@ class EnvironMeter:
         avg_sample_seq_len = batch_tokens / real_global_batch_size
         tokens_per_second = batch_tokens / delta_time
         self.consume_tokens += batch_tokens
+        self.consume_chunks += real_global_batch_size
 
         # cuda memory
         allocated_memory = get_torch_device().max_memory_allocated()
@@ -264,6 +238,7 @@ class EnvironMeter:
             "tokens_per_second(M)": tokens_per_second / 1e6,
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
+            "consumed_chunk_num": self.consume_chunks,
             "max_memory_allocated(GB)": allocated_memory / (1024**3),
             "max_memory_reserved(GB)": reserved_memory / (1024**3),
             "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
@@ -283,7 +258,7 @@ class EnvironMeter:
 
         self.batch_seqlens = []
         self.batch_ds_idx = []
-        self.image_seqlens = []
+        self.images_seqlens = []
 
         return metrics
 
@@ -396,12 +371,43 @@ def enable_high_precision_for_bf16():
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
 
+def enable_full_determinism(seed: int):
+    """
+    Helper function for reproducibility in distributed training.
+    See https://pytorch.org/docs/stable/notes/randomness.html for details.
+    """
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ["NCCL_DETERMINISTIC"] = "1"
+    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+    if IS_NPU_AVAILABLE:
+        # The environment variable required to enable deterministic mode on Ascend NPUs.
+        os.environ["NCCL_DETERMINISTIC"] = "true"
+        os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    # Enable CUDNN deterministic mode
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = False
+
+    if IS_NPU_AVAILABLE:
+        torch.npu.manual_seed(seed)
+        torch.npu.manual_seed_all(seed)
+
+
 def set_seed(seed: int, full_determinism: bool = False) -> None:
     """
     Sets a manual seed on all devices.
     """
     if full_determinism:
-        enable_full_determinism(seed, warn_only=True)
+        enable_full_determinism(seed)
     else:
         set_seed_func(seed)
 
@@ -412,7 +418,7 @@ def create_logger(name: Optional[str] = None) -> "logging._Logger":
     """
     logger = builtin_logging.getLogger(name)
     formatter = builtin_logging.Formatter(
-        fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S"
+        fmt="[%(levelname)s|%(pathname)s:%(lineno)s] %(asctime)s >> %(message)s", datefmt="%m/%d/%Y %H:%M:%S"
     )
     handler = builtin_logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
@@ -568,7 +574,6 @@ class ProfilerWithMem:
 
     def __init__(self, inner):
         self._p = inner
-        self.first_step = True  # flagging the first step for record memory history
 
     # delegate ctx-manager behaviour
     def __enter__(self):
@@ -578,7 +583,9 @@ class ProfilerWithMem:
         return self._p.__exit__(*a)
 
     def start(self):
-        return self._p.start()
+        out = self._p.start()
+        get_torch_device().memory._record_memory_history()
+        return out
 
     def stop(self):
         out = self._p.stop()
@@ -586,11 +593,7 @@ class ProfilerWithMem:
         return out
 
     def step(self, *a, **kw):
-        out = self._p.step(*a, **kw)
-        if self.first_step:
-            get_torch_device().memory._record_memory_history()
-            self.first_step = False
-        return out
+        return self._p.step(*a, **kw)
 
 
 def create_profiler(
@@ -620,8 +623,7 @@ def create_profiler(
     def handler_fn(p):
         time = int(datetime.datetime.now().timestamp())
 
-        # torch_npu does not support export gzip trace json directly
-        trace_file_extention = "pt.trace.json" if IS_NPU_AVAILABLE else "pt.trace.json.gz"
+        trace_file_extention = "pt.trace.json.gz"
         gpu_memory_file_extension = "pkl"
 
         if trace_dir.startswith("hdfs://"):
@@ -634,23 +636,16 @@ def create_profiler(
             trace_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
             gpu_memory_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
 
-        p.export_chrome_trace(trace_file)
+        if IS_NPU_AVAILABLE:
+            nonlocal npu_trace_handler
+            npu_trace_handler(p)
+            trace_file = p.prof_if.prof_path
+        elif IS_CUDA_AVAILABLE:
+            p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
-            get_torch_device().memory._dump_snapshot(gpu_memory_file)
-            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
-
-        # In NPU, compress the trace file to .gz format ourselves.
-        if IS_NPU_AVAILABLE:
-            gz_path = trace_file + ".gz"
-            import gzip
-
-            with open(trace_file, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
-                f_out.write(f_in.read())
-            os.remove(trace_file)
-            trace_file = gz_path
-            logger.info(f"Profiling result compressed to {trace_file}.")
+        get_torch_device().memory._dump_snapshot(gpu_memory_file)
+        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)
@@ -667,9 +662,18 @@ def create_profiler(
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
+        npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
+        )
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            data_simplification=False,
+        )
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
+        experimental_config = None
 
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
@@ -690,6 +694,7 @@ def create_profiler(
         profile_memory=profile_memory,
         with_modules=True,
         with_stack=with_stack,
+        experimental_config=experimental_config,
     )
     if IS_CUDA_AVAILABLE and profile_memory:
         return ProfilerWithMem(base_profiler)

@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from veomni.utils.import_utils import is_torch_npu_available
+
 
 """
 This function is adapted from an open-source project, OpenDiT
@@ -8,8 +10,8 @@ For more details, see: https://github.com/NUS-HPC-AI-Lab/OpenDiT/blob/master/ope
 """
 
 
-def get_layernorm(hidden_size: torch.Tensor, eps: float = 1e-5, affine: bool = True, fused: bool = True):
-    if fused:
+def get_layernorm(hidden_size: torch.Tensor, eps: float = 1e-5, affine: bool = True, fused: bool = False):
+    if fused and not is_torch_npu_available():
         try:
             from apex.normalization import FusedLayerNorm
 

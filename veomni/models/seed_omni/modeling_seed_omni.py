@@ -21,10 +21,9 @@ import torch
 import torch.distributed.nn.functional as distF
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoModel, AutoModelForCausalLM, GenerationMixin, PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from ...data.constants import IGNORE_INDEX
 from ...distributed.parallel_plan import ParallelPlan
 from ...distributed.parallel_state import get_parallel_state
 from ...distributed.sequence_parallel import (
@@ -32,6 +31,8 @@ from ...distributed.sequence_parallel import (
     gather_seq_scatter_heads,
 )
 from ...utils import logging
+from ...utils.constants import IGNORE_INDEX
+from ..loader import get_model_class
 from .configuration_seed_omni import SeedOmniConfig, SeedOmniDecoderConfig, SeedOmniEncoderConfig
 from .decoder import BaseDecoderModelMixin, BaseDecoderOutput
 from .encoder import BaseEncoderModelMixin
@@ -111,20 +112,23 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
         )
         self.modality = []
         if config.image_config.model_type:
-            self.image_encoder: BaseEncoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.image_config)
+            self.image_encoder: BaseEncoderModelMixin = model_cls._from_config(
                 config.image_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("image")
             self.modality.append("video")  # image encoder could be used for video embedding
 
         if config.video_config.model_type:
-            self.video_encoder: BaseEncoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.video_config)
+            self.video_encoder: BaseEncoderModelMixin = model_cls._from_config(
                 config.video_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("video") if "video" not in self.modality else None
 
         if config.audio_config.model_type:
-            self.audio_encoder: BaseEncoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.audio_config)
+            self.audio_encoder: BaseEncoderModelMixin = model_cls._from_config(
                 config.audio_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("audio")
@@ -145,7 +149,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                 input_image_features: torch.Tensor = self.image_encoder.lm_encode(**input_image_inputs).to(
                     inputs_embeds
                 )
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_image_features = gather_seq_scatter_heads(
                         input_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -163,7 +167,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                 output_image_features: torch.Tensor = self.image_encoder.lm_encode(**output_image_inputs).to(
                     inputs_embeds
                 )
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     output_image_features = gather_seq_scatter_heads(
                         output_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -189,7 +193,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                     input_video_features: torch.Tensor = self.image_encoder.lm_encode(**input_video_inputs).to(
                         inputs_embeds
                     )
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_video_features = gather_seq_scatter_heads(
                         input_video_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -215,7 +219,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                     inputs_embeds
                 )
                 # TODO: sp_check
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_audio_features = gather_seq_scatter_heads(
                         input_audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -233,7 +237,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
         inputs_embeds: torch.Tensor = self.text_encoder(input_ids)
         decoder_inputs = {}
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_seq_scatter_heads(
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
@@ -247,7 +251,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
         if "audio" in self.modality:
             inputs_embeds = self.audio_forward(inputs_embeds, decoder_inputs, **kwargs)
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(
                 inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
             )
@@ -263,24 +267,23 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         torch_dtype = torch.get_default_dtype()
         self.modality = []
         if config.image_config.model_type:
-            self.image_decoder: BaseDecoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.image_config)
+            self.image_decoder: BaseDecoderModelMixin = model_cls._from_config(
                 config.image_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("image")  # TODO: config keys for sp_slice
         if config.video_config.model_type:
-            self.video_decoder: BaseDecoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.video_config)
+            self.video_decoder: BaseDecoderModelMixin = model_cls._from_config(
                 config.video_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
             self.modality.append("video")
-        if config.video_config.model_type:
-            self.video_decoder: BaseDecoderModelMixin = AutoModel.from_config(
-                config.video_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
-            )
         if config.audio_config.model_type:
-            self.audio_decoder: BaseDecoderModelMixin = AutoModel.from_config(
+            model_cls = get_model_class(config.audio_config)
+            self.audio_decoder: BaseDecoderModelMixin = model_cls._from_config(
                 config.audio_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
             )
-            self.modality.append("video")
+            self.modality.append("audio")
 
         self.encode_input = config.encode_input
         self.encode_output = config.encode_output
@@ -296,7 +299,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
             input_image_mask: torch.Tensor = input_image_inputs.pop("mask", None)
             if input_image_inputs:
                 input_image_features, _ = self.image_decoder.lm_encode(**input_image_inputs)
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     input_image_features = gather_seq_scatter_heads(
                         input_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -313,7 +316,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
             output_image_mask: torch.Tensor = output_image_inputs.pop("mask", None)
             if output_image_inputs:
                 output_image_features, output_image_indices = self.image_decoder.lm_encode(**output_image_inputs)
-                if self.training and get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_enabled:
                     output_image_features = gather_seq_scatter_heads(
                         output_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
                     )
@@ -335,7 +338,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         """
         decoder_inputs = kwargs.pop("decoder_inputs", {})
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_seq_scatter_heads(
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
@@ -343,7 +346,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         if "image" in self.modality:
             inputs_embeds = self.image_encode(inputs_embeds, decoder_inputs, **kwargs)
 
-        if self.training and get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(
                 inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
@@ -356,7 +359,7 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         if target_inputs or image_output_labels is not None:
             output_image_inputs = extract_model_inputs("image_output_", kwargs)
             output_image_mask: torch.Tensor = output_image_inputs.pop("mask", None)
-            if self.training and get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled:
                 bs = output_image_mask.size(0)
                 sp_size = get_parallel_state().sp_size
                 sp_rank = get_parallel_state().sp_rank
@@ -428,7 +431,8 @@ class SeedOmniModel(SeedOmniPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.config = config
         torch_dtype = torch.get_default_dtype()
-        self.foundation: BaseFoundationModelMixin = AutoModelForCausalLM.from_config(
+        model_cls = get_model_class(config.foundation_config)
+        self.foundation: BaseFoundationModelMixin = model_cls._from_config(
             config.foundation_config, attn_implementation=config._attn_implementation, torch_dtype=torch_dtype
         )
         self.encoder = SeedOmniEncoderModel._from_config(

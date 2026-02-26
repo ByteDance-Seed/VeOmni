@@ -1,3 +1,4 @@
+# Copyright 2024-2025 The Black-forest-labs Authors. All rights reserved.
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,12 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from transformers import AutoConfig, AutoModelForCausalLM
-
-from .configuration_qwen2_vl_foundation import Qwen2VLFoundationConfig
-from .modeling_qwen2_vl_foundation import Qwen2VLFoundationModel
+from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
-AutoConfig.register("qwen2_vl_foundation", Qwen2VLFoundationConfig)
-AutoModelForCausalLM.register(Qwen2VLFoundationConfig, Qwen2VLFoundationModel)
+@MODEL_CONFIG_REGISTRY.register("qwen2_vl_foundation")
+def register_qwen2_vl_foundation_config():
+    from .configuration_qwen2_vl_foundation import Qwen2VLFoundationConfig
+
+    return Qwen2VLFoundationConfig
+
+
+@MODELING_REGISTRY.register("qwen2_vl_foundation")
+def register_qwen2_vl_foundation_modeling(architecture: str):
+    from .modeling_qwen2_vl_foundation import Qwen2VLFoundationModel
+
+    return Qwen2VLFoundationModel

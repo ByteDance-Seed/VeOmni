@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List
 
 import torch
 
+from ...utils.constants import TYPE2INDEX
 from ...utils.import_utils import is_video_audio_available
-from ..constants import TYPE2INDEX
 from .image_utils import fetch_images
 from .preprocess import conv_preprocess
 
@@ -204,7 +204,7 @@ def encode_multimodal_sample(
     model_inputs = {}
     source = sample.pop("source_name") if "source_name" in sample else kwargs["source_name"]
     modality = set(modality_info["input"] + modality_info["output"])
-    conversations = sample["text"] if source == "fineweb_100BT" else sample["conversations"]  # text-only data
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     if isinstance(conversations, bytes):
         conversations = json.loads(conversations.decode("utf-8"))
     conversations = conv_preprocess(source, conversations, **kwargs)

@@ -13,33 +13,31 @@
 # limitations under the License.
 
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import Any, Dict, Optional
 
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import get_device_type
-from .batching_strategy import TextBatchingStrategy
+from ..utils.registry import Registry
 from .data_collator import (
-    CollatePipeline,
-    DataCollatorWithPacking,
-    DataCollatorWithPadding,
-    DataCollatorWithPositionIDs,
+    MainCollator,
     MakeMicroBatchCollator,
-    TextSequenceShardCollator,
+    NoopDataCollator,
     UnpackDataCollator,
 )
-from .dynamic_batching import DynamicBatchSizeDataLoader
+from .dynamic_batching import DynamicBatchingSizeDataset, DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
-if TYPE_CHECKING:
-    from torch.utils.data import Dataset
-
-
+DATALOADER_REGISTRY = Registry("dataloader")
 logger = logging.get_logger(__name__)
+
+
+def build_dataloader(dataloader_type: str, **kwargs):
+    return DATALOADER_REGISTRY[dataloader_type](**kwargs)
 
 
 class DistributedDataloader(StatefulDataLoader):
@@ -53,69 +51,84 @@ class DistributedDataloader(StatefulDataLoader):
             self.dataset.set_epoch(epoch)
 
 
-def build_dataloader(
+@DATALOADER_REGISTRY.register("native")
+def build_native_dataloader(
     dataset: "Dataset",
     micro_batch_size: int,
     global_batch_size: int,
     dataloader_batch_size: int,
     max_seq_len: int,
     train_steps: int,
-    rmpad: bool = True,
-    rmpad_with_pos_ids: bool = False,
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
+    dyn_bsz: bool = True,
+    dyn_bsz_in_dataloader: bool = True,  # If True, dynamic batching is handled in the main process via DynamicBatchSizeDataLoader (legacy).
+    # If False, batching is done inside each DataLoader worker via DynamicBatchingSizeDataset, which supports StatefulDataLoader checkpoint/resume.
+    dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_in_dataloader is False.
     dyn_bsz_buffer_size: int = 500,
-    dyn_bsz_margin: int = 0,
-    collate_fn: Optional[Union[Callable, List[Callable]]] = None,
     num_workers: int = 8,
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     shuffle: bool = True,
     seed: int = 0,
+    build_collate_fn: bool = True,
+    collate_fn_kwargs: Optional[Dict[str, Any]] = {},
 ) -> "DistributedDataloader":
     parallel_state = get_parallel_state()
-    token_micro_bsz = micro_batch_size * max_seq_len
+
+    if build_collate_fn:
+        collate_fn = MainCollator(**collate_fn_kwargs)
+    else:
+        collate_fn = NoopDataCollator()
     num_micro_batch = global_batch_size // (
         micro_batch_size * parallel_state.dp_size
     )  # num_micro_batch = num accumulation steps
-    bsz_warmup_steps = int(train_steps * bsz_warmup_ratio)
-    use_rmpad = rmpad or rmpad_with_pos_ids
-    logger.info_rank0(
-        f"train_steps: {train_steps}, max_seq_len: {max_seq_len}, use_rmpad: {use_rmpad}, "
-        f"bsz_warmup_steps: {bsz_warmup_steps}, bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}, "
-        f"token_micro_bsz: {token_micro_bsz}, num_micro_batch: {num_micro_batch}, "
-        f"micro_batch_size: {micro_batch_size}, global_batch_size: {global_batch_size}, "
-        f"dp_size: {parallel_state.dp_size}, sp_size: {parallel_state.sp_size}."
-    )
 
-    if collate_fn is None:
-        collate_fn_list = []
-        if rmpad_with_pos_ids:
-            collate_fn_list.append(DataCollatorWithPositionIDs())
-        elif rmpad:
-            collate_fn_list.append(DataCollatorWithPacking())
-        else:
-            collate_fn_list.append(DataCollatorWithPadding())
+    if dyn_bsz:
+        batching_token_len = micro_batch_size * max_seq_len
+        bsz_warmup_steps = int(train_steps * bsz_warmup_ratio)
 
-        if parallel_state.sp_enabled:
-            collate_fn_list.append(TextSequenceShardCollator(rmpad=rmpad, rmpad_with_pos_ids=rmpad_with_pos_ids))
-
-        collate_fn = CollatePipeline(collate_fn_list)
-
-    if isinstance(collate_fn, list):
-        collate_fn = CollatePipeline(collate_fn)
-
-    if use_rmpad:
-        batching_strategy = TextBatchingStrategy(
-            token_micro_bsz=token_micro_bsz - dyn_bsz_margin * max_seq_len,
-            buffer_size=dyn_bsz_buffer_size,
-            bsz_warmup_steps=bsz_warmup_steps if bsz_warmup_steps else -1,
-            bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
+        logger.info_rank0(
+            f"Use dynamic_batching -->\n"
+            f"micro_batch_size: {micro_batch_size}, max_seq_len: {max_seq_len}, "
+            f"batching_token_len = micro_batch_size * max_seq_len = {batching_token_len}.\n"
+            f"dp_size: {parallel_state.dp_size}, sp_size: {parallel_state.sp_size}, "
+            f"global_batch_size: {global_batch_size}, micro_batch_size: {micro_batch_size}, "
+            f"num_micro_batch: {num_micro_batch}.\n"
+            f"train_steps: {train_steps}, bsz_warmup_steps: {bsz_warmup_steps}, "
+            f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        collate_fn = UnpackDataCollator()
+        if dyn_bsz_in_dataloader:
+            batching_strategy = TextBatchingStrategy(
+                token_micro_bsz=batching_token_len,
+                buffer_size=dyn_bsz_buffer_size,
+                bsz_warmup_steps=bsz_warmup_steps,
+                bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
+            )
+
+            collate_fn = UnpackDataCollator()
+        else:
+            dataloader_batch_size = num_micro_batch
+            dataset = DynamicBatchingSizeDataset(
+                dataset=dataset,
+                micro_batch_seq_length=batching_token_len,
+                ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
+                get_length_fn=lambda x: int(x["attention_mask"].sum()),
+                dynamic_batching_collate_fn=dyn_bsz_collate_fn,
+                save_by_idx=dyn_bsz_dataset_save_by_idx,
+            )
+            collate_fn = NoopDataCollator()
     else:
+        logger.info_rank0(
+            f"Use fixed_sample_batching -->\n"
+            f"fixed_sample_num in one batch = micro_batch_size: {micro_batch_size}.\n"
+            f"dp_size: {parallel_state.dp_size}, sp_size: {parallel_state.sp_size}, "
+            f"global_batch_size: {global_batch_size}, micro_batch_size: {micro_batch_size}, "
+            f"num_micro_batch: {num_micro_batch}.\n"
+            f"train_steps: {train_steps}."
+        )
         collate_fn = MakeMicroBatchCollator(num_micro_batch=num_micro_batch, internal_data_collator=collate_fn)
 
     sampler = None
@@ -139,7 +152,7 @@ def build_dataloader(
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
     )
-    if use_rmpad:
+    if dyn_bsz and dyn_bsz_in_dataloader:
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
             batching_strategy=batching_strategy,

@@ -1,0 +1,73 @@
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-06.html
+from nvcr.io/nvidia/pytorch:25.06-py3
+
+# Define environments
+ENV MAX_JOBS=16
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_ROOT_USER_ACTION=ignore
+
+# Define installation arguments
+ARG APT_SOURCE=https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
+
+# Set apt source
+# ubuntu 24.04
+RUN cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak && \
+    { \
+    echo "Types: deb"; \
+    echo "URIs: ${APT_SOURCE}"; \
+    echo "Suites: noble noble-updates noble-backports noble-security"; \
+    echo "Components: main restricted universe multiverse"; \
+    echo "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"; \
+    } > /etc/apt/sources.list.d/ubuntu.sources
+
+# Set timezone
+RUN echo "Setting timezone to CST (China Standard Time)..." && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    dpkg-reconfigure -f noninteractive tzdata
+
+# Install apt packages.
+RUN apt-get update -y \
+    && apt-get install -y sudo ffmpeg curl wget vim \
+    && apt-get clean
+
+# Add tiger user, remove default user
+RUN userdel -r $(id -un 1000) 2>/dev/null || true && \
+    groupadd --non-unique -g 1000 tiger && \
+    useradd -g 1000 -u 1000 -d /home/tiger -m tiger && \
+    mkdir -p /home/tiger/.service/ && \
+    mkdir -p /home/tiger/.local/share/code-server/User/ && \
+    chown -R tiger:tiger /home/tiger && \
+    mkdir -p /opt/tiger && \
+    chown tiger:tiger /opt/tiger && \
+    mkdir -p /opt/log/tiger && \
+    chown -R tiger:tiger /opt/log && \
+    mkdir -p /var/log/tiger && \
+    chown tiger:tiger /var/log/tiger
+
+# Enable sudo for tiger user
+RUN mkdir -p /etc/sudoers.d && \
+    echo "tiger ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tiger && \
+    chmod 0440 /etc/sudoers.d/tiger
+
+# Add tiger python install permission
+RUN groupadd python-users && \
+    usermod -aG python-users root && \
+    usermod -aG python-users tiger && \
+    chown -R root:python-users /usr/local/lib/python3.12/dist-packages/ && \
+    chmod -R g+w /usr/local/lib/python3.12/dist-packages/ && \
+    chmod g+s /usr/local/lib/python3.12/dist-packages/
+
+USER tiger
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:0.9.8 /uv /uvx /bin/
+ENV PATH="/bin/:$PATH"
+ENV UV_CACHE_DIR=/home/tiger/.cache/uv
+
+# uv sync
+WORKDIR /app
+COPY . ./
+RUN uv sync --locked --all-packages --extra gpu --dev
+
+USER root

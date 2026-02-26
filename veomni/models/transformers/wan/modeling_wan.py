@@ -24,7 +24,6 @@ from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
     gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_world_size,
@@ -32,7 +31,11 @@ from veomni.distributed.sequence_parallel import (
 )
 
 from ....utils import logging
-from ....utils.import_utils import is_liger_kernel_available
+from ....utils.import_utils import (
+    is_liger_kernel_available,
+    is_torch_npu_available,
+    is_transformers_version_greater_or_equal_to,
+)
 from .config_wan import WanConfig
 
 
@@ -326,10 +329,6 @@ class SelfAttention(nn.Module):
             q = self.norm_q(self.q(x))
             k = self.norm_k(self.k(x))
             v = self.v(x)
-
-            if get_parallel_state().ulysses_enabled:
-                q, k, v = gather_seq_scatter_heads_qkv(q, k, v, seq_dim=1, head_dim=2)
-
         else:
             q, k, v = async_ulysses_qkv_projection(
                 hidden_states=x,
@@ -352,9 +351,6 @@ class SelfAttention(nn.Module):
         x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True)
 
         if not self.sp_async:
-            if get_parallel_state().ulysses_enabled:
-                x = gather_heads_scatter_seq(x, seq_dim=1, head_dim=2)
-
             x = self.o(x)
         else:
             x = async_ulysses_output_projection(
@@ -396,7 +392,7 @@ class CrossAttention(nn.Module):
 
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, **kwargs):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
@@ -405,11 +401,11 @@ class CrossAttention(nn.Module):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(ctx))
         v = self.v(ctx)
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, **kwargs)
         if self.has_image_input:
             k_img = self.norm_k_img(self.k_img(img))
             v_img = self.v_img(img)
-            y = self.attn(q, k_img, v_img, head_dim=self.head_dim)
+            y = self.attn(q, k_img, v_img, head_dim=self.head_dim, **kwargs)
             x = x + y
         return self.o(x)
 
@@ -458,7 +454,7 @@ class DiTBlock(nn.Module):
         ).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, cos, sin, last_loss))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = x + self.cross_attn(self.norm3(x), context, skip_ulysses=True)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -618,11 +614,13 @@ class WanModel(PreTrainedModel):
             .reshape(f * h * w, 1, -1)
             .to(x.device)
         )
-        cos = freqs.real.squeeze().contiguous()
-        sin = freqs.imag.squeeze().contiguous()
 
         if get_parallel_state().ulysses_enabled:
             x = slice_input_tensor_scale_grad(x, dim=1)
+            freqs = slice_input_tensor_scale_grad(freqs, dim=0)
+
+        cos = freqs.real.squeeze().contiguous()
+        sin = freqs.imag.squeeze().contiguous()
 
         for block in self.blocks:
             if self.training and self.gradient_checkpointing:
@@ -651,6 +649,11 @@ if is_liger_kernel_available():
     RMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to Wan.")
 
+if is_torch_npu_available() and is_transformers_version_greater_or_equal_to("4.50.4"):
+    from .npu_patch import apply_wan_npu_patch
+
+    apply_wan_npu_patch()
+
 try:
     from veomni.ops.dit.rope_wan.rotary import apply_rotary_emb
 
@@ -658,10 +661,6 @@ try:
     logger.info_rank0("Apply fused interleaved rope to Wan.")
 except ImportError:
     pass
-
-
-ModelClass = WanModel
-
 
 WAN_ATTENTION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {}
 WAN_ATTENTION_FUNCTIONS.update(ALL_ATTENTION_FUNCTIONS)

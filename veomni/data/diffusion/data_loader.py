@@ -13,18 +13,16 @@
 # limitations under the License.
 
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
+from veomni.utils.device import get_device_type
+
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import logging
-from ..data_collator import (
-    CollatePipeline,
-    DataCollatorWithPadding,
-    MakeMicroBatchCollator,
-)
+from ..data_collator import MainCollator, MakeMicroBatchCollator, NoopDataCollator
 from ..data_loader import DistributedDataloader
 
 
@@ -41,13 +39,15 @@ def build_dit_dataloader(
     global_batch_size: int,
     dataloader_batch_size: int,
     train_steps: int,
-    collate_fn: Optional[Union[Callable, List[Callable]]] = None,
     num_workers: int = 8,
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     seed: int = 0,
+    build_collate_fn: bool = True,
+    collate_fn_kwargs: Optional[Dict[str, Any]] = {},
 ) -> "DistributedDataloader":
+    # TODO: also need dyn_bsz here?
     parallel_state = get_parallel_state()
     num_micro_batch = global_batch_size // (
         micro_batch_size * parallel_state.dp_size
@@ -60,14 +60,10 @@ def build_dit_dataloader(
         f"dp_size: {parallel_state.dp_size}, sp_size: {parallel_state.sp_size}."
     )
 
-    if collate_fn is None:
-        collate_fn_list = []
-        collate_fn_list.append(DataCollatorWithPadding())
-
-        collate_fn = CollatePipeline(collate_fn_list)
-
-    if isinstance(collate_fn, list):
-        collate_fn = CollatePipeline(collate_fn)
+    if build_collate_fn:
+        collate_fn = MainCollator(**collate_fn_kwargs)
+    else:
+        collate_fn = NoopDataCollator()
 
     collate_fn = MakeMicroBatchCollator(num_micro_batch=num_micro_batch, internal_data_collator=collate_fn)
 
@@ -88,6 +84,7 @@ def build_dit_dataloader(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
+        pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
     )

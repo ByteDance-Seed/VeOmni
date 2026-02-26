@@ -25,6 +25,8 @@ from datasets.distributed import split_dataset_by_node
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset, IterableDataset
 
+from ..utils.registry import Registry
+
 
 try:
     from hdfs_io import isdir, listdir
@@ -38,6 +40,12 @@ from ..utils.multisource_utils import parse_multisource_config
 
 
 logger = logging.get_logger(__name__)
+
+DATASET_REGISTRY = Registry("Dataset")
+
+
+def build_dataset(dataset_name: str, **kwargs) -> "Dataset":
+    return DATASET_REGISTRY[dataset_name](**kwargs)
 
 
 class MappingDataset(Dataset):
@@ -236,23 +244,9 @@ class EnergonDataset(IterativeDataset):
             logger.debug(f"Dataset {type(self._data).__name__} does not support set_epoch or state reset")
 
 
-def build_mapping_dataset(
-    data_path: str,
-    transform: Optional[Callable] = None,
-    namespace: Literal["train", "test"] = "train",
-    source_name: Optional[str] = None,
-) -> "Dataset":
-    """
-    Build mapping dataset.
-    Args:
-        data_path (str): data path
-        transform (Optional[Callable]): transform function
-        namespace (Literal["train", "test"]): dataset namespace
-    Returns:
-        Dataset: mapping dataset
-    """
+def get_data_files(train_path):
     data_files = []
-    data_paths = data_path.split(",")
+    data_paths = train_path.split(",")
     for data_path in data_paths:
         if data_path.startswith("hdfs://"):
             if not isdir(data_path):
@@ -264,7 +258,7 @@ def build_mapping_dataset(
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
 
         elif os.path.isdir(data_path):
-            data_files.extend([os.path.join(data_path, fn) for fn in os.listdir(data_path)])
+            data_files.extend([os.path.join(data_path, fn) for fn in sorted(os.listdir(data_path))])
         elif os.path.isfile(data_path):
             data_files.append(data_path)
         else:
@@ -274,6 +268,29 @@ def build_mapping_dataset(
         raise ValueError(f"{file_extenstion} files are not supported.")
 
     file_extenstion = "json" if file_extenstion == "jsonl" else file_extenstion
+    return data_files, file_extenstion
+
+
+@DATASET_REGISTRY.register("mapping")
+def build_mapping_dataset(
+    train_path: str,
+    transform: Optional[Callable] = None,
+    namespace: Literal["train", "test"] = "train",
+    source_name: Optional[str] = None,
+    **kwargs,
+) -> "Dataset":
+    """
+    Build mapping dataset.
+    Args:
+        train_path (str): data path
+        transform (Optional[Callable]): transform function
+        namespace (Literal["train", "test"]): dataset namespace
+        source_name (Optional[str]): source name
+    Returns:
+        Dataset: mapping dataset
+    """
+    logger.info_rank0("Start building mapping dataset")
+    data_files, file_extenstion = get_data_files(train_path)
     with main_process_first():
         dataset = load_dataset(file_extenstion, data_files=data_files, split=namespace)
 
@@ -282,66 +299,65 @@ def build_mapping_dataset(
     return MappingDataset(data=dataset, transform=transform)
 
 
-def build_iterative_dataset(
-    data_path: str,
+@DATASET_REGISTRY.register("iterable")
+def build_iterable_dataset(
+    train_path: str,
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
     seed: int = 42,
     source_name: Optional[str] = None,
+    split_by_node: bool = True,
+    **kwargs,
 ) -> "IterableDataset":
     """
     Build iterative dataset.
     Args:
-        data_path (str): data path
+        train_path (str): data path
         transform (Optional[Callable]): transform function
         namespace (Literal["train", "test"]): dataset namespace
         seed (int): random seed
+        source_name (Optional[str]): source name
     Returns:
         IterableDataset: iterative dataset
     """
-
-    data_files = []
-    data_paths = data_path.split(",")
-    for data_path in data_paths:
-        if data_path.startswith("hdfs://"):
-            if not isdir(data_path):
-                raise FileNotFoundError(f"Dataset {data_path} not exists.")
-
-            for filename in listdir(data_path):
-                from ..utils.helper import get_cache_dir
-
-                data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
-
-        elif os.path.isdir(data_path):
-            data_files.extend([os.path.join(data_path, fn) for fn in os.listdir(data_path)])
-        elif os.path.isfile(data_path):
-            data_files.append(data_path)
-        else:
-            raise FileNotFoundError(f"Dataset {data_path} not exists.")
-
-    parallel_state = get_parallel_state()
-    file_extenstion = os.path.splitext(data_files[0])[-1][1:]
-    if file_extenstion not in ["parquet", "jsonl", "json", "csv", "arrow"]:
-        raise ValueError(f"{file_extenstion} files are not supported.")
-
-    file_extenstion = "json" if file_extenstion == "jsonl" else file_extenstion
+    logger.info_rank0("Start building iterative dataset")
+    data_files, file_extenstion = get_data_files(train_path)
     dataset = load_dataset(file_extenstion, data_files=data_files, split=namespace, streaming=True)
     dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
-    dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
+
+    if split_by_node:
+        parallel_state = get_parallel_state()
+        dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
 
     if transform:
         transform = partial(transform, source_name=source_name)
     return IterativeDataset(dataset, transform=transform)
 
 
+@DATASET_REGISTRY.register("interleave")
 def build_interleave_dataset(
-    data_path: str,
+    train_path: str,
     datasets_type: str = "mapping",
     namespace: Literal["train", "test"] = "train",
     transform: Optional[Callable] = None,
     seed: int = 42,
+    **kwargs,
 ):
-    multisource_config = parse_multisource_config(data_path)
+    """
+    Build interleave dataset.
+    Args:
+        train_path (str): data path
+        datasets_type (str): datasets type
+        namespace (Literal["train", "test"]): dataset namespace
+        transform (Optional[Callable]): transform function
+        seed (int): random seed
+    Returns:
+        InterleavedIterableDataset: interleaved iterable dataset
+        or
+        InterleavedMappingDataset: interleaved mapping dataset
+    """
+    logger.info_rank0("Start building interleave dataset")
+    multisource_config = parse_multisource_config(train_path)
     logger.info_rank0(f"multisource_config: {multisource_config}")
     sources = multisource_config["sources"]
     schedule = multisource_config["schedule"]
@@ -357,23 +373,26 @@ def build_interleave_dataset(
         logger.info_rank0("Start building iterable multisource dataset")
 
         def add_ds_idx_to_iterable(dataset, ds_idx, source_name):
-            def gen():
-                for x in dataset:
-                    yield {**x, "ds_idx": ds_idx, "source_name": source_name}
+            def trans_example(example):
+                return {**example, "ds_idx": ds_idx, "source_name": source_name}
 
-            return HFIterableDataset.from_generator(gen)
+            return dataset.map(trans_example)
 
         for idx, source in enumerate(sources):
-            dataset = build_iterative_dataset(source, namespace=namespace, seed=seed)
+            dataset = build_iterable_dataset(source, namespace=namespace, seed=seed, split_by_node=False)
             ds = dataset._data
             ds = add_ds_idx_to_iterable(ds, idx, source_names[idx])
             datasets.append(ds)
 
-        return InterleavedIterableDataset(
-            interleave_datasets(datasets=datasets, probabilities=weights, seed=seed + get_parallel_state().dp_rank),
+        interleave_dataset = interleave_datasets(datasets=datasets, probabilities=weights, seed=seed)
+        # split dataset by node
+        parallel_state = get_parallel_state()
+        interleave_dataset = split_dataset_by_node(interleave_dataset, parallel_state.dp_rank, parallel_state.dp_size)
+
+        interleave_dataset = InterleavedIterableDataset(
+            interleave_dataset,
             transform=transform,
         )
-
     elif datasets_type == "mapping":
         logger.info_rank0("Start building mapping multisource dataset")
 
@@ -383,21 +402,26 @@ def build_interleave_dataset(
             ds = ds.add_column("ds_idx", [idx] * len(ds))
             ds = ds.add_column("source_name", [source_names[idx]] * len(ds))
             datasets.append(ds)
-        return InterleavedMappingDataset(
+        interleave_dataset = InterleavedMappingDataset(
             interleave_datasets(datasets=datasets, probabilities=weights, seed=seed),
             transform=transform,
         )
-    return IterativeDataset(dataset, transform)
+    else:
+        raise ValueError(f"Unsupported datasets_type: {datasets_type}")
+
+    return interleave_dataset
 
 
+@DATASET_REGISTRY.register("energon")
 def build_energon_dataset(
-    data_path: str,
+    train_path: str,
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
     max_samples_per_sequence: Optional[int] = None,
     virtual_epoch_length: Optional[int] = 0,
     shuffle_buffer_size: Optional[int] = None,
     num_workers: Optional[int] = None,
+    **kwargs,
 ) -> "Dataset":
     """
     Build Megatron-Energon native dataset using the official get_train_dataset function.
@@ -409,7 +433,7 @@ def build_energon_dataset(
     - Built-in error handling and performance optimizations
 
     Args:
-        data_path (str): Path to the energon dataset directory
+        train_path (str): Path to the energon dataset directory
         transform (Optional[Callable]): Transform function to apply to samples
         namespace (Literal["train", "test"]): Dataset namespace (not used for energon)
         max_samples_per_sequence (Optional[int]): Maximum samples per sequence
@@ -425,6 +449,7 @@ def build_energon_dataset(
     except ImportError:
         raise ImportError("Megatron-Energon is not installed. Please install it with: pip install megatron-energon")
 
+    logger.info_rank0(f"Start building Megatron-Energon native dataset from {train_path}")
     # Get parallel state for distributed training
     parallel_state = get_parallel_state()
 
@@ -446,7 +471,7 @@ def build_energon_dataset(
     if virtual_epoch_length is None:
         # Estimate based on data path - look for .nv-meta/info.json
         try:
-            meta_path = os.path.join(data_path, ".nv-meta", "info.json")
+            meta_path = os.path.join(train_path, ".nv-meta", "info.json")
             if os.path.exists(meta_path):
                 import json
 
@@ -460,15 +485,13 @@ def build_energon_dataset(
             logger.warning(f"Could not determine virtual_epoch_length from metadata: {e}")
         if virtual_epoch_length is None:
             virtual_epoch_length = 0  # Fallback
-
-    logger.info(f"Building Megatron-Energon native dataset from {data_path}")
     logger.info(f"  - max_samples_per_sequence: {max_samples_per_sequence}")
     logger.info(f"  - virtual_epoch_length: {virtual_epoch_length}")
     logger.info(f"  - shuffle_buffer_size: {shuffle_buffer_size}")
 
     # Get the dataset using Megatron-Energon's official function
     dataset = get_train_dataset(
-        path=data_path,
+        path=train_path,
         split_part=namespace,
         worker_config=worker_config,
         batch_size=None,  # No batching at dataset level

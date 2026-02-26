@@ -11,20 +11,15 @@ import wandb
 from torch import distributed as dist
 from tqdm import trange
 
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
-    OmniDataCollatorWithPacking,
-    OmniDataCollatorWithPadding,
-    OmniSequenceShardCollator,
     build_dataloader,
-    build_energon_dataset,
-    build_interleave_dataset,
-    build_iterative_dataset,
-    build_mapping_dataset,
+    build_dataset,
     build_multimodal_chat_template,
 )
-from veomni.data.constants import IGNORE_INDEX
 from veomni.data.multimodal.multimodal_transform import encode_multimodal_sample
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -32,10 +27,10 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 logger = helper.create_logger(__name__)
@@ -92,7 +87,7 @@ class MyTrainingArguments(TrainingArguments):
 
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
@@ -105,8 +100,12 @@ def main():
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group()
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
+
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -159,135 +158,60 @@ def main():
         scale_factor=args.data.scale_factor,
     )
 
-    if args.train.rmpad:
-        raise ValueError("Qwen2-VL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
+    train_dataset = build_dataset(
+        dataset_name=args.data.dataset_name,
+        transform=transform,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        seed=args.train.seed,
+        **asdict(args.data),
+    )
+    dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+    if args.data.datasets_type == "mapping":
+        dataset_length = dataset_length / args.train.data_parallel_size
+    args.compute_train_steps(dataset_length)
 
-    data_collate_fn = []
+    data_collate_info = {
+        # image
+        "image_input_features": (0, True, 0, 4),  # 4 = merge_size ** 2
+        "image_output_features": (0, True, 0, 1),
+        "image_input_mask": (-1, False, 0, 1),
+        "image_output_mask": (-1, False, 0, 1),
+        # video
+        "video_input_features": (0, True, 0, 4),  # 4 = merge_size ** 2
+        "video_output_features": (0, True, 0, 1),
+        "video_input_mask": (-1, False, 0, 1),
+        "video_output_mask": (-1, False, 0, 1),
+        # audio
+        "audio_input_features": (0, True, 0, 1),  # 4 = merge_size ** 2
+        "audio_output_features": (0, True, 0, 1),
+        "audio_input_mask": (-1, False, 0, 1),
+        "audio_output_mask": (-1, False, 0, 1),
+    }
 
-    # TODO: config by model
-    if args.train.rmpad_with_pos_ids:
-        data_collate_fn.append(
-            OmniDataCollatorWithPacking(
-                packing_features=[
-                    "input_ids",
-                    "attention_mask",
-                    "labels",
-                    "position_ids",
-                    "image_input_mask",
-                    "image_output_mask",
-                ],
-                concat_features=[
-                    "image_input_features",
-                    "image_input_grid_thw",
-                    "image_output_features",
-                    "image_output_grid_thw",
-                ],
-            )
-        )
-    else:
-        data_collate_fn.append(
-            OmniDataCollatorWithPadding(
-                concat_features={
-                    "image_input_features": 0,
-                    "image_input_grid_thw": 0,
-                    "image_output_features": 0,
-                    "image_output_grid_thw": 0,
-                },
-                padding_features={
-                    "input_ids": 0,
-                    "attention_mask": 0,
-                    "labels": IGNORE_INDEX,
-                    "position_ids": 0,
-                    "image_input_mask": False,
-                    "image_output_mask": False,
-                },
-            )
-        )
-    if get_parallel_state().sp_enabled:
-        data_collate_fn.append(
-            OmniSequenceShardCollator(
-                sp_slice_features={
-                    "input_ids": -1,
-                    "labels": -1,
-                    "image_input_features": 0,
-                    "image_output_features": 0,
-                },
-                padding_features={
-                    "input_ids": 0,
-                    "attention_mask": 0,
-                    "labels": IGNORE_INDEX,
-                    "position_ids": 0,
-                    "image_input_features": 0,
-                    "image_output_features": 0,
-                    "image_input_mask": False,
-                    "image_output_mask": False,
-                },
-                padding_scale={
-                    "image_input_features": 4,
-                    "image_output_features": 1,
-                },
-                rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            )
-        )
+    collate_fn_kwargs = {
+        "pad_to_length": args.train.pad_to_length,
+        "data_collate_info": data_collate_info,
+    }
 
-    if args.data.dataloader_type == "native":
-        if args.data.enable_multisource:
-            logger.info_rank0("Start building interleave dataset")
-            train_dataset = build_interleave_dataset(
-                args.data.train_path, args.data.datasets_type, transform=transform, seed=args.train.seed
-            )
-        elif args.data.datasets_type == "iterable":
-            logger.info_rank0("Start building iterative dataset")
-            train_dataset = build_iterative_dataset(
-                args.data.train_path, transform=transform, seed=args.train.seed, source_name=args.data.source_name
-            )
-        elif args.data.datasets_type == "mapping":
-            logger.info_rank0("Start building mapping dataset")
-            train_dataset = build_mapping_dataset(
-                args.data.train_path, transform=transform, source_name=args.data.source_name
-            )
-        elif args.data.datasets_type == "energon":
-            logger.info_rank0("Start building Megatron-Energon native dataset")
-            train_dataset = build_energon_dataset(
-                args.data.train_path,
-                transform=transform,
-                max_samples_per_sequence=args.data.max_samples_per_sequence
-                if hasattr(args.data, "max_samples_per_sequence")
-                else None,
-                virtual_epoch_length=args.data.virtual_epoch_length
-                if hasattr(args.data, "virtual_epoch_length")
-                else None,
-                shuffle_buffer_size=args.data.shuffle_buffer_size
-                if hasattr(args.data, "shuffle_buffer_size")
-                else None,
-                num_workers=args.data.num_workers,
-            )
-        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
-        if args.data.datasets_type == "mapping":
-            dataset_length = dataset_length / args.train.data_parallel_size
-        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
-
-        train_dataloader = build_dataloader(
-            dataset=train_dataset,
-            micro_batch_size=args.train.micro_batch_size,
-            global_batch_size=args.train.global_batch_size,
-            dataloader_batch_size=args.train.dataloader_batch_size,
-            seed=args.train.seed,
-            collate_fn=data_collate_fn,
-            max_seq_len=args.data.max_seq_len,
-            train_steps=args.train.train_steps,
-            rmpad=args.train.rmpad,
-            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-            dyn_bsz_margin=args.train.dyn_bsz_margin,
-            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
-            num_workers=args.data.num_workers,
-            drop_last=args.data.drop_last,
-            pin_memory=args.data.pin_memory,
-            prefetch_factor=args.data.prefetch_factor,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported dataloader type: {args.data.dataloader_type}.")
+    train_dataloader = build_dataloader(
+        dataloader_type=args.data.dataloader_type,
+        dataset=train_dataset,
+        micro_batch_size=args.train.micro_batch_size,
+        global_batch_size=args.train.global_batch_size,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        max_seq_len=args.data.max_seq_len,
+        train_steps=args.train_steps,
+        dyn_bsz=args.train.dyn_bsz,
+        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+        num_workers=args.data.num_workers,
+        drop_last=args.data.drop_last,
+        pin_memory=args.data.pin_memory,
+        prefetch_factor=args.data.prefetch_factor,
+        seed=args.train.seed,
+        collate_fn_kwargs=collate_fn_kwargs,
+    )
 
     freeze_any = False
     if args.train.freeze_encoder:
@@ -321,7 +245,9 @@ def main():
 
     model = build_parallelize_model(
         model,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
+        enable_reshard_after_forward=args.train.enable_reshard_after_forward,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         init_device=args.train.init_device,
@@ -349,11 +275,13 @@ def main():
         lr_start=args.train.lr_start,
     )
 
+    model_assets = None
     if args.train.global_rank == 0:
         if args.train.use_wandb:
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
@@ -377,8 +305,6 @@ def main():
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
         enable_multisource=args.data.enable_multisource,
         dataloader=train_dataloader,
@@ -439,10 +365,22 @@ def main():
             total_losses = defaultdict(int)
             synchronize()
             start_time = time.time()
-            for micro_batch in micro_batches:
+            num_micro_steps = len(micro_batches)
+
+            for micro_step, micro_batch in enumerate(micro_batches):
+                if (
+                    args.train.data_parallel_mode == "fsdp2"
+                    and not args.train.enable_reshard_after_backward
+                    and num_micro_steps > 1
+                ):
+                    if micro_step == 0:
+                        model.set_reshard_after_backward(False)
+                    elif micro_step == num_micro_steps - 1:
+                        model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
+                    micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
                 micro_batch = {
@@ -464,10 +402,7 @@ def main():
 
                 del micro_batch
 
-            if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
@@ -492,7 +427,7 @@ def main():
                     "lr": lr,
                 }
             )
-            data_loader_tqdm.set_postfix_str({k: f"{v:.2f}" for k, v in step_info.items() if k != "lr"})
+            data_loader_tqdm.set_postfix_str({k: f"{v:.2f}" for k, v in step_info.items() if k != "lr"}, refresh=False)
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
@@ -550,15 +485,19 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
+            ckpt_manager=args.train.ckpt_manager,
+            model_assets=model_assets,
+            train_architecture=args.train.train_architecture,
             save_checkpoint_path=save_checkpoint_path,
             output_dir=args.train.output_dir,
-            ckpt_manager=args.train.ckpt_manager,
+            is_rank_0=args.train.global_rank == 0,
+            model=model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {args.train.output_dir} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

@@ -1,0 +1,85 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Union
+
+import torch
+
+from ..distributed.parallel_state import get_parallel_state
+from .constants import IGNORE_INDEX
+from .dist_utils import all_reduce
+
+
+def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]):
+    """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
+    if isinstance(batches, dict):
+        batches = [batches]
+    token_len = {
+        "foundation_tokens": torch.tensor(0),
+        "image_decoder_tokens": torch.tensor(0),
+    }
+
+    def _count(obj):
+        if isinstance(obj, dict) and not obj.get("padding_flag", False):
+            token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
+
+            if "image_output_mask" in obj:
+                token_len["image_decoder_tokens"] += torch.sum(obj["image_output_mask"])  # image generation tokens
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                _count(item)
+        else:
+            raise TypeError(f"Unsupported batch type: {type(obj)}")
+
+    _count(batches)
+    return token_len
+
+
+def mean_global_loss(
+    losses: Union[dict[str, torch.Tensor], torch.Tensor],
+    micro_batch_token_len: dict[str, torch.Tensor],
+    micro_batches_token_len: dict[str, torch.Tensor],
+):
+    """Calcuate the global mean loss. Avg on all_reduced_token_num instead of on dp_size.
+    - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().fsdp_size
+    # fsdp by default divides gradients by its size, so we need to multiply by fsdp_size
+    """
+    loss_dict = {}
+
+    if isinstance(losses, torch.Tensor):  # text loss only
+        losses = {"foundation_loss": losses}
+
+    for key, cur_loss in losses.items():
+        loss_name = key.split("_loss")[0]  # foundation/image_decoder/**
+
+        cur_token_len = micro_batch_token_len[f"{loss_name}_tokens"]
+        if get_parallel_state().sp_enabled:
+            cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=get_parallel_state().sp_group)
+
+        all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
+
+        if all_reduced_len != 0:
+            cur_loss = cur_loss * cur_token_len / all_reduced_len * get_parallel_state().fsdp_size
+        else:
+            if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
+                raise ValueError(
+                    f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}"
+                )
+
+        if get_parallel_state().sp_enabled:
+            cur_loss = cur_loss / get_parallel_state().sp_size
+
+        loss_dict[key] = cur_loss
+
+    return loss_dict
