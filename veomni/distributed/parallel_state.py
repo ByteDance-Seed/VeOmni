@@ -328,9 +328,11 @@ class ParallelState:
         return self.ep_fsdp_device_mesh["ep", "ep_fsdp"]
 
     @cached_property
-    @requires_mesh
     def ep_group(self) -> "ProcessGroup":
-        return self.ep_mesh.get_group()
+        if self.ep_enabled:
+            return self.ep_mesh.get_group()
+        else:
+            return None
 
     @property
     def ep_enabled(self) -> bool:
