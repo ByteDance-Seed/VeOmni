@@ -748,16 +748,13 @@ class TrainingArguments:
                 output_dir=self.output_dir, is_local_rank0=self.local_rank == 0, ckpt_manager=self.ckpt_manager
             )
 
-        if self.load_checkpoint_path:
-            load_path = Path(self.load_checkpoint_path).resolve()
-            output_dir = Path(self.output_dir).resolve()
+        load_path = Path(os.path.normpath(os.path.abspath(self.load_checkpoint_path)))
+        output_dir = Path(os.path.normpath(os.path.abspath(self.output_dir)))
 
-            try:
-                load_path.relative_to(output_dir)
-            except ValueError:
-                raise AssertionError(
-                    f"load_checkpoint_path must be under output_dir: {load_path} not under {output_dir}"
-                )
+        try:
+            load_path.relative_to(output_dir)
+        except ValueError:
+            logger.warning("load_checkpoint_path should be under output_dir.")
 
         # save paths
         # output_dir/
