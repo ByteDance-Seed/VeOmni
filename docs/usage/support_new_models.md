@@ -314,29 +314,9 @@ train:
 
 ---
 
-### Step 10: Verify
+### Step 10: Test Your Integration
 
-```bash
-source .venv/bin/activate
-
-# 1. Import check
-python -c "from veomni.models.transformers.your_model_name import *; print('OK')"
-
-# 2. Build model on CPU (empty weights)
-python -c "
-from veomni.models import build_foundation_model
-m = build_foundation_model(config_path='path/to/config', weights_path=None,
-                            torch_dtype='bfloat16', init_device='cpu')
-print(type(m))
-"
-
-# 3. Data transform check
-python -c "
-from veomni.data.multimodal.data_transform import process_sample_your_model
-result = process_sample_your_model(sample, processor, chat_template, position_id_func)
-print({k: v.shape for k, v in result[0].items() if hasattr(v, 'shape')})
-"
-```
+Testing for a new model integration happens at three levels, each catching a different class of bugs. See **Part 4: Testing** for detailed guidance on each level and what to add for your model.
 
 ---
 
@@ -711,9 +691,236 @@ class YourModel(hf_your_model.YourModel):
 - [ ] `audio_mask` in data transform; `audio_feature_lengths` in `build_data_collate_info`
 - [ ] Processor patched: `if audios:` truthy check
 
+### Testing (all models — see Part 4 for details)
+
+- [ ] Toy config added to `tests/toy_config/your_model_toy/`
+- [ ] `DummyYourModelDataset` added to `veomni/data/dummy_dataset.py` (multimodal)
+- [ ] Entry added to `test_cases` in `tests/models/test_models_patch.py` (Level 1)
+- [ ] Test case + fixture + test function added to `tests/e2e/test_e2e_parallel.py` (Level 2)
+
 ---
 
-## Part 4: Reference
+## Part 4: Testing
+
+VeOmni has a structured test suite under `tests/`. For a new model integration, testing spans three levels:
+
+```
+Level 1 — Unit (single GPU, no real weights)   → tests/models/
+Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel.py
+Level 3 — End-to-end training (real data/ckpt)  → tests/e2e/test_e2e_training.py
+```
+
+Each level is additive: pass Level 1 before running Level 2, and Level 2 before Level 3.
+
+---
+
+### Level 1 — Unit Tests (`tests/models/`)
+
+**What it tests:** model registration, forward/backward pass correctness, and HF↔VeOmni patch alignment — all on a single GPU using tiny random weights.
+
+#### 1a. Toy Config
+
+Every model under test needs a toy `config.json` (and `preprocessor_config.json` for multimodal models) in `tests/toy_config/your_model_toy/`. The toy config should be structurally identical to the real config but with drastically reduced sizes:
+
+| Field | Real Qwen3-Omni-MoE | Toy version |
+|---|---|---|
+| `num_hidden_layers` | 28 | 2 |
+| `hidden_size` | 2048 | 2048 (keep; shapes matter) |
+| `num_experts` | 128 | 128 (keep for routing logic) |
+| `encoder_layers` | 32 | 2 |
+
+For omni-modal models the toy config also needs `preprocessor_config.json` — copy from the real model and keep as-is, since the feature extractor parameters (mel bins, sample rate, patch size) are not reducible without changing the data pipeline.
+
+Reference: [tests/toy_config/qwen3omni_toy/config.json](../../tests/toy_config/qwen3omni_toy/config.json), [tests/toy_config/qwen3omni_toy/preprocessor_config.json](../../tests/toy_config/qwen3omni_toy/preprocessor_config.json)
+
+#### 1b. Dummy Dataset
+
+For multimodal models, add a `DummyXxxDataset` class to [veomni/data/dummy_dataset.py](../../veomni/data/dummy_dataset.py) and register it in `build_dummy_dataset()`. The class must produce the exact tensor keys and shapes your model's collator expects.
+
+Key design notes:
+- Compute `image_seqlen`, `audio_seq_length`, `video_seqlen` from the same formulas used in the real data pipeline (patch size, merge size, audio feature extractor downsampling) so the dummy shapes are realistic.
+- Provide `image_mask`, `audio_mask`, `video_mask` as boolean tensors over the full sequence.
+- For Qwen3-Omni-MoE the audio output length formula matches the convolutional downsampler:
+
+```python
+# DummyQwen3OmniMoeDataset._get_feat_extract_output_lengths
+input_lengths_leave = input_lengths % 100
+feat_lengths = (input_lengths_leave - 1) // 2 + 1
+output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+```
+
+Then register the new dataset type in `build_dummy_dataset()`:
+
+```python
+elif task_type == "your_model":
+    return DummyYourModelDataset(size=size, seq_length=max_seq_len, patch_size=16)
+```
+
+Reference: [veomni/data/dummy_dataset.py](../../veomni/data/dummy_dataset.py)
+
+#### 1c. Forward/Backward Patch Test
+
+Add a `pytest.param` entry to the `test_cases` list in [tests/models/test_models_patch.py](../../tests/models/test_models_patch.py):
+
+```python
+pytest.param(
+    "./tests/toy_config/your_model_toy",
+    is_moe,          # True if model has expert parallelism
+    _DEFAULT_RTOL,
+    _DEFAULT_ATOL,
+    id="your_model_type",   # must match model_type in config.json
+),
+```
+
+This single entry exercises:
+- Model loading via registry (`MODELING_REGISTRY`, `MODEL_CONFIG_REGISTRY`)
+- Forward pass under all attention implementations (`eager`, `flash_attention_2`, `flash_attention_3`)
+- Forward pass under all MoE implementations (`eager`, `fused`) if `is_moe=True`
+- Numerical alignment between HF baseline and VeOmni-patched forward
+- Backward pass (gradient flow through all patched components)
+
+If the HF and VeOmni models have different state-dict layouts (e.g. stacked expert weights vs `nn.ModuleList`), add a weight sync function to [tests/models/weight_sync_adapters.py](../../tests/models/weight_sync_adapters.py) and register it under your model's `id`.
+
+Run:
+```bash
+source .venv/bin/activate
+pytest -s tests/models/test_models_patch.py -k your_model_type
+```
+
+Also add a token-ID mapping entry to [tests/models/utils.py](../../tests/models/utils.py) — `MODEL_TO_DATASET` maps `model_type` → dummy dataset key, and omni-modal models need special handling in `parse_token_id_from_config()` to read token IDs from the nested `thinker_config`:
+
+```python
+# MODEL_TO_DATASET mapping
+"your_model_type": "your_dataset_key",
+
+# parse_token_id_from_config — for omni models with nested thinker_config
+if model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe", "your_omni_model"]:
+    token_ids_dict = {
+        "image_token_id": model_config.thinker_config.image_token_id,
+        "video_token_id": model_config.thinker_config.video_token_id,
+        "audio_token_id": model_config.thinker_config.audio_token_id,
+    }
+```
+
+---
+
+### Level 2 — Parallel Alignment Test (`tests/e2e/test_e2e_parallel.py`)
+
+**What it tests:** that training loss and gradient norms stay numerically aligned across different parallelism configurations — specifically SP×1 vs SP×2, and EP×1 vs EP×2 for MoE models. This catches bugs in SP gather/scatter, FSDP dummy forwards, and EP sharding that only surface under distributed execution.
+
+**How it works:**
+1. Builds a random-weight model from the toy config via `build_foundation_model()`.
+2. Runs `torchrun` with 8 GPUs in each parallel mode (SP=1, SP=2; EP=1, EP=2 if MoE).
+3. Each run writes metrics to `log_dict.json`.
+4. Compares all runs with `compare_multi_items(rtol, atol)`.
+
+Add a test case list and test function:
+
+```python
+# In test_e2e_parallel.py
+
+your_model_test_cases = [
+    pytest.param(
+        "your_model_type",
+        "./tests/toy_config/your_model_toy",
+        is_moe,          # True enables EP=2 variant
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
+]
+
+@pytest.fixture(scope="session")
+def dummy_your_model_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="your_dataset_key")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", your_model_test_cases)
+def test_your_model_parallel_align(
+    model_name, config_path, is_moe, rtol, atol, dummy_your_model_dataset
+):
+    main(
+        task_name="train_vlm_test",   # or "train_text_test" for text-only
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_your_model_dataset,
+    )
+```
+
+For Qwen3-Omni-MoE the task is `"train_vlm_test"` (uses `TestVLMTrainer` which extends `VLMTrainer`). Text-only models use `"train_text_test"`.
+
+Run:
+```bash
+source .venv/bin/activate
+pytest -s tests/e2e/test_e2e_parallel.py -k your_model_type
+```
+
+Reference implementation: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel.py](../../tests/e2e/test_e2e_parallel.py).
+
+---
+
+### Level 3 — End-to-End Training Test (`tests/e2e/test_e2e_training.py`)
+
+**What it tests:** a full training run with real model weights, real data, checkpointing, and resumption. This is the final gate before declaring a model production-ready.
+
+This level currently covers text-only models (Qwen3 0.6B with Tulu SFT data). Extending it to a new multimodal model requires:
+1. A real model checkpoint accessible at `CI_MODEL_DIR`.
+2. A real dataset accessible at `CI_DATASET_DIR`.
+3. An entry in the `E2E_TEST_SCRIPT` dictionary in [tests/e2e/exec_scripts.py](../../tests/e2e/exec_scripts.py) with the full `torchrun` command.
+4. A new `pytest.param` in `test_e2e_training.py` pointing to it.
+
+Run:
+```bash
+source .venv/bin/activate
+CI_MODEL_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
+pytest -s tests/e2e/test_e2e_training.py -k your_model
+```
+
+---
+
+### Quick Reference: What to Add Per Test Level
+
+| What to add | Location | Required for |
+|---|---|---|
+| Toy `config.json` | `tests/toy_config/your_model_toy/` | All levels |
+| `preprocessor_config.json` | `tests/toy_config/your_model_toy/` | Multimodal |
+| `DummyYourModelDataset` | `veomni/data/dummy_dataset.py` | Multimodal |
+| `build_dummy_dataset` entry | `veomni/data/dummy_dataset.py` | Multimodal |
+| `MODEL_TO_DATASET` entry | `tests/models/utils.py` | Level 1 |
+| `parse_token_id_from_config` branch | `tests/models/utils.py` | Omni-modal |
+| `pytest.param` in `test_cases` | `tests/models/test_models_patch.py` | Level 1 |
+| Weight sync adapter | `tests/models/weight_sync_adapters.py` | Level 1 (MoE only) |
+| `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
+| Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
+| Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |
+| Entry in `E2E_TEST_SCRIPT` | `tests/e2e/exec_scripts.py` | Level 3 |
+| `pytest.param` in training test | `tests/e2e/test_e2e_training.py` | Level 3 |
+
+---
+
+### Future Work
+
+The following testing gaps exist and are candidates for future improvement:
+
+- **Checkpoint round-trip for multimodal/omni models.** `tests/checkpoints/test_trainer_saveload.py` currently only covers text MoE models (`qwen3_moe`, `deepseek_v3`). VLM and omni-modal models with heterogeneous sub-components (ViT, audio encoder, talker, code2wav) need dedicated save/load/conversion tests to catch dtype and layout bugs in their individual sub-module checkpoints.
+
+- **Data collator tests for omni-modal keys.** `tests/data/test_collators.py` tests the base collator with sequence parallelism but does not cover the extra collation fields for omni-modal models (`input_features`, `audio_feature_lengths`, `audio_mask`). These fields have non-trivial padding and SP-slicing behavior that warrants explicit coverage.
+
+- **Processor patch tests.** There are no unit tests specifically for the patched processors (e.g. truthy `if audios:` vs `if audio is not None:` behavior). A lightweight test that calls the patched processor with empty lists vs `None` vs populated inputs would catch regressions early.
+
+- **`get_position_id_func` pickling test.** The position ID function must be picklable for multiprocessing data loaders. A test that pickles and unpickles the function with `pickle.dumps` / `pickle.loads` would guard against accidental closure captures.
+
+- **Expert Parallel checkpoint for omni models.** MoE checkpoint tests only test EP=[1,4,8] for text MoE; omni-modal MoE models (which have MoE in the thinker LLM and the talker) are not yet covered.
+
+- **NPU coverage for multimodal models.** The NPU CI workflow mirrors the GPU unit test structure but multimodal and omni-modal models are not yet included. Some ops (e.g. `torch.kaiser_window` in BigVGAN) are known to be unsupported on NPU — these should be explicitly skipped and documented.
+
+---
+
+## Part 5: Reference
 
 ### Key Imports
 
