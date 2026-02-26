@@ -83,12 +83,16 @@ class SeedOmniConfig(PretrainedConfig):
 
     def __init__(
         self,
-        encoder_config: Dict[Literal["image_config"], Dict[str, Any]] = {},
+        encoder_config: Dict[Literal["image_config"], Dict[str, Any]] = None,
         foundation_config: Optional[Dict[str, Any]] = None,
-        decoder_config: Dict[Literal["image_config"], Dict[str, Any]] = {},
+        decoder_config: Dict[Literal["image_config"], Dict[str, Any]] = None,
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        if decoder_config is None:
+            decoder_config = {}
+        if encoder_config is None:
+            encoder_config = {}
         self.encoder_config = SeedOmniEncoderConfig(**encoder_config)
         self.decoder_config = SeedOmniDecoderConfig(**decoder_config)
         self.foundation_config = _init_config(foundation_config)

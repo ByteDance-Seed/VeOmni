@@ -104,7 +104,7 @@ class DummyDataset:
         print(f"Total length: {self.num_samples}, batch length: {batch_len}")
 
         index = 0
-        for i in range(0, self.num_samples, batch_len):
+        for _i in range(0, self.num_samples, batch_len):
             print(f"Generating {index}th parquet file")
             ds = Dataset.from_generator(
                 self.generate_data,
@@ -255,6 +255,6 @@ def compare_multi_items(model_name: str, outputs_dict: Dict, rtol=0.01, atol=0.0
                     rtol=rtol,
                     atol=atol,
                 )
-            except AssertionError:
+            except AssertionError as e:
                 print_all_values(outputs_dict, key, model_name)
-                raise AssertionError(f"{key} not match")
+                raise AssertionError(f"{key} not match") from e

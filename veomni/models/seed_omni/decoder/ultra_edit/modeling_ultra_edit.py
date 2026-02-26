@@ -255,7 +255,7 @@ class UltraEdit(PreTrainedModel):
     def encode_prompt(
         self,
         prompt: Union[str, List[str]] = None,
-        input_ids: Optional[List[torch.Tensor]] = [None, None, None],
+        input_ids: Optional[List[torch.Tensor]] = None,
         device: Optional[torch.device] = None,
         num_images_per_prompt: int = 1,
         do_classifier_free_guidance: bool = True,
@@ -264,9 +264,15 @@ class UltraEdit(PreTrainedModel):
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         clip_skip: Optional[int] = None,
-        text_encoders=[None, None, None],
-        tokenizers=[None, None, None],
+        text_encoders=None,
+        tokenizers=None,
     ):
+        if tokenizers is None:
+            tokenizers = [None, None, None]
+        if text_encoders is None:
+            text_encoders = [None, None, None]
+        if input_ids is None:
+            input_ids = [None, None, None]
         prompt = [prompt] if isinstance(prompt, str) else prompt
         if prompt_embeds is None:
             prompt_embed, pooled_prompt_embed = self._get_clip_prompt_embeds(
@@ -620,7 +626,7 @@ class UltraEdit(PreTrainedModel):
             )
 
         # 5. Denoising loop
-        for i, t in enumerate(timesteps):
+        for _i, t in enumerate(timesteps):
             # Expand the latents if we are doing classifier free guidance.
             # The latents are expanded 3 times because for pix2pix the guidance
             # is applied for both the text and the input image.

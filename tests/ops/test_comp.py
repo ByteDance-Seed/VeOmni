@@ -30,7 +30,7 @@ def fast_pos_embed_interpolate_ref(self, grid_thw):
 
     device = self.pos_embed.weight.device
     dtype = self.pos_embed.weight.dtype
-    for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+    for _t, h, w in zip(grid_ts, grid_hs, grid_ws, strict=True):
         h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, dtype=torch.float64)
         w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, dtype=torch.float64)
 

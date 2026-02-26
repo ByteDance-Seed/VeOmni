@@ -343,8 +343,7 @@ def parallelize_model_fsdp2(
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
 
         # Attach spec mapping for checkpoint load-time reconstruction
-        setattr(model, "_fqn2spec_info", fqn2spec_info)
-
+        model._fqn2spec_info = fqn2spec_info
         # ExtraParallel mesh does not really exist in ExtraParallel parameters' device mesh.
         # ExtraParallel parameters are loaded as local tensors to be later sharded by fully_shard.
         # We store each extra_parallel's fqn to module mapping in _extra_parallel_map.

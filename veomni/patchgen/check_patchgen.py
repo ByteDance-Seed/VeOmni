@@ -47,14 +47,16 @@ from .run_codegen import (
 def _ruff_fix_and_format(path: Path) -> None:
     """Run ``ruff check --fix`` and ``ruff format`` on *path*.
 
-    We pass ``--ignore E402`` because generated files may have imports
+    We pass ``--ignore E402,B007`` because generated files may have imports
     after non-import code (e.g. ``create_patch_from_external`` inline
-    import aliases) which is unavoidable.  In the real repo this is
-    handled by per-file-ignores in pyproject.toml, but temp files live
-    outside the project tree so the config does not apply.
+    import aliases) which is unavoidable, and upstream Transformers
+    sources may contain unused loop variables that trigger ``B007``.
+    In the real repo this is handled by per-file-ignores in
+    pyproject.toml, but temp files live outside the project tree so the
+    config does not apply.
     """
     subprocess.run(
-        ["ruff", "check", "--fix", "--quiet", "--ignore", "E402", str(path)],
+        ["ruff", "check", "--fix", "--quiet", "--ignore", "E402,B007", str(path)],
         check=True,
         capture_output=True,
     )

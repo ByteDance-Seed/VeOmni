@@ -281,12 +281,12 @@ line-length = 119
 indent-width = 4
 
 [tool.ruff.lint]
-ignore = ["C901", "E501", "E741", "W605", "C408"]
-select = ["C", "E", "F", "I", "W"]
+ignore = ["B905", "C901", "E501", "E741", "W605", "C408"]
+select = ["B", "C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
-"veomni/models/transformers/**/generated/*.py" = ["E402"]
+"veomni/models/transformers/**/generated/*.py" = ["E402", "B007"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
