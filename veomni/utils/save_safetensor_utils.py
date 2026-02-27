@@ -80,6 +80,31 @@ def get_model_save_state(
     return save_state
 
 
+class _TimedHuggingFaceStorageWriter:
+    """Mixin that adds per-rank timing logs to HuggingFaceStorageWriter.
+
+    Logs wall-clock time for:
+    - write_data: each rank writing its local shard files
+    - finish: rank-0 consolidation (only executes on coordinator)
+    """
+
+    def write_data(self, plan, planner):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        start = time.time()
+        result = super().write_data(plan, planner)
+        elapsed = time.time() - start
+        logger.info(f"[Rank {rank}] Shard write took {elapsed:.2f}s")
+        return result
+
+    def finish(self, metadata, results):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        start = time.time()
+        result = super().finish(metadata=metadata, results=results)
+        elapsed = time.time() - start
+        logger.info(f"[Rank {rank}] finish (consolidation) took {elapsed:.2f}s")
+        return result
+
+
 def _save_hf_safetensor_distributed(
     model: torch.nn.Module,
     save_path: str,
@@ -98,7 +123,10 @@ def _save_hf_safetensor_distributed(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    storage_writer = HuggingFaceStorageWriter(
+    class TimedHuggingFaceStorageWriter(_TimedHuggingFaceStorageWriter, HuggingFaceStorageWriter):
+        pass
+
+    storage_writer = TimedHuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
         fqn_to_index_mapping=fqn_to_index_mapping,
@@ -137,6 +165,7 @@ def _save_hf_safetensor_distributed(
 
     # Rank 0: copy consolidated files from local temp to mount path, then clean up
     if is_rank_0:
+        logger.info_rank0(f"Start copying from {local_tmp_dir} to {save_path} at rank 0")
         os.makedirs(save_path, exist_ok=True)
         copy_start = time.time()
         for filename in os.listdir(local_tmp_dir):
