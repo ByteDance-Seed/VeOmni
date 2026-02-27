@@ -72,6 +72,26 @@ def _unpermute(out, input_shape, permuted_indices):
     return out
 
 
+def permute_for_grouped_mm(
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
+):
+    ep_degree = num_tokens_per_expert.shape[0] // num_local_experts
+    return _permute(x, num_tokens_per_expert, ep_degree, num_local_experts)
+
+
+def unpermute_for_grouped_mm(
+    out: torch.Tensor,
+    input_shape: tuple[int, int] | torch.Size | torch.Tensor,
+    permuted_indices: torch.Tensor,
+) -> torch.Tensor:
+    if isinstance(input_shape, torch.Tensor):
+        # For tensor input_shape, out already has the padded shape we need.
+        input_shape = out.shape
+    return _unpermute(out, input_shape, permuted_indices)
+
+
 def indices_padding_wrapper(func: Callable) -> Callable:
     """
     In order to use torch._grouped_mm, we need to make sure the number of
@@ -89,10 +109,8 @@ def indices_padding_wrapper(func: Callable) -> Callable:
         gate_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_local_experts = w1.shape[0]
-        ep_degree = num_tokens_per_expert.shape[0] // num_local_experts
-
-        input_shape, x, permuted_indices, num_tokens_per_expert = _permute(
-            x, num_tokens_per_expert, ep_degree, num_local_experts
+        input_shape, x, permuted_indices, num_tokens_per_expert = permute_for_grouped_mm(
+            x, num_tokens_per_expert, num_local_experts
         )
 
         if gate_weights is not None:
@@ -100,7 +118,7 @@ def indices_padding_wrapper(func: Callable) -> Callable:
 
         out = func(w1, w2, w3, x, num_tokens_per_expert, gate_weights=gate_weights)
 
-        out = _unpermute(out, input_shape, permuted_indices)
+        out = unpermute_for_grouped_mm(out, input_shape, permuted_indices)
 
         return out
 
