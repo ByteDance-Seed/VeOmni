@@ -199,7 +199,10 @@ def _save_hf_safetensor_distributed(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    storage_writer = HuggingFaceStorageWriter(
+    class TimedHuggingFaceStorageWriter(_TimedHuggingFaceStorageWriter, HuggingFaceStorageWriter):
+        pass
+
+    storage_writer = TimedHuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
         fqn_to_index_mapping=fqn_to_index_mapping,
