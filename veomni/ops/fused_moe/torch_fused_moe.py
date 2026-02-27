@@ -1,158 +1,55 @@
-from typing import Any
-
 import torch
 import torch.nn.functional as F
 
-from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from ..group_gemm.kernel.moe import expert_histogram
 from ..group_gemm.torch_moe_utils.utils import indices_padding_wrapper
 
 
-class TorchFusedMoeExpertFunction(torch.autograd.Function):
-    """
-    Fused Moe for non-ep cases that use torch._grouped_mm
-    Reference: veomni/ops/fused_moe/group_gemm.py: TritonFusedMoeExpertFunction
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        num_experts: int,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,  # expert_index for each token
-        hidden_states: torch.Tensor,
-        fc1_1_weight: torch.Tensor,
-        fc1_2_weight: torch.Tensor,
-        fc2_weight: torch.Tensor,
-    ):
-        # TODO: implement backward since expert_histogram / moe_scatter / moe_gather are plain triton kernels that do not autograd
-        routing_weights = routing_weights.bfloat16()
-        hidden_states = hidden_states.bfloat16()
-        # Prepare inputs for Grouped GEMM
-        # we assume top-k has been performed before this func
-        # Reference:
-        # num_tokens_per_expert = torch.histc(selected_experts.view(-1), bins=num_experts, min=0, max=num_experts)
-        num_tokens_per_expert = expert_histogram(selected_experts, num_experts)
-
-        # Reorder the token indices to match the order of the experts
-        # Reference:
-        # token_indices_experts_sorted shape (bs*slen*top_k,)
-        # token_indices_experts_sorted = torch.argsort(selected_experts.view(-1), stable=True)
-        token_indices_experts_sorted = (
-            selected_experts.flatten().argsort(stable=True).argsort().int().view(selected_experts.shape)
-        )
-
-        # select tokens by scatter_index, and put them together
-        # Reference:
-        # token_indices_experts_sorted shape (batch_size * sequence_len * topk, hidden_size)
-        # token_indices_experts_sorted = token_indices_experts_sorted.reshape(-1, 1).expand(-1, hidden_states.size(-1))
-        # routed_input = torch.gather(hidden_states, dim=0, index=token_indices_experts_sorted)
-        routed_input = moe_scatter(hidden_states, token_indices_experts_sorted)
-
-        # MOE Step 4: compute linear layer 1-1
-        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-        # TODO: before grouped_mm we need to pad inputs like indices_padding_wrapper
-        fc1_1_output = torch._grouped_mm(
-            routed_input.bfloat16(), fc1_1_weight.bfloat16().transpose(-2, -1), offs=offsets
-        )
-        # MOE Step 6: compute linear layer 1-2
-        # fc1_2_output shape is (batch_size * sequence_len * topk, ffn_dim)
-        fc1_2_output = torch._grouped_mm(
-            routed_input.bfloat16(), fc1_2_weight.bfloat16().transpose(-2, -1), offs=offsets
-        )
-        # fc1_1_activation shape is (batch_size * sequence_len * topk, ffn_dim)
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        # MOE Step 7: compute final result of linear layer 1
-        fc1_activation = fc1_1_activation * fc1_2_output
-        # MOE Step 8: compute the the weighted linear layer 1 result
-        # MOE Step 8-1: compute scattered_gate_weight, shape is (batch_size * sequence_len * topk)
-        reshaped_gate_weight = routing_weights.reshape(-1, 1)
-        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
-        scattered_gate_weight[token_indices_experts_sorted.flatten()] = reshaped_gate_weight
-
-        fc1_weighted_output = fc1_2_output * scattered_gate_weight
-
-        fc2_output = torch._grouped_mm(fc1_weighted_output, fc2_weight.bfloat16().transpose(-2, -1), offs=offsets)
-
-        output = moe_gather(fc2_output, token_indices_experts_sorted)
-        output = output.reshape(hidden_states.shape)
-
-        ctx.num_experts = num_experts
-        ctx.save_for_backward(
-            routing_weights,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-            hidden_states,
-            token_indices_experts_sorted,
-            routed_input,
-            offsets,  # not used in torch grouped gemm
-            fc1_1_output,
-            fc1_2_output,
-            fc1_activation,
-            scattered_gate_weight,
-            fc1_weighted_output,
-        )
-
-        return output
-
-    @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> Any:
-        raise NotImplementedError
-
-
-# A forward only reference
 def torch_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
-    selected_experts: torch.Tensor,  # expert_index for each token
+    selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
     fc1_1_weight: torch.Tensor,
     fc1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
 ):
     """
-    A reference forward pass for torch._grouped_mm based fused moe.
+    torch._grouped_mm based fused moe forward using pure torch token reorder/combine.
+    This path relies on native autograd end-to-end (no custom autograd.Function needed).
     """
     routing_weights = routing_weights.bfloat16()
     hidden_states = hidden_states.bfloat16()
-    # Prepare inputs for Grouped GEMM
-    # we assume top-k has been performed before this func
-    # num_tokens_per_expert = torch.histc(selected_experts.view(-1), bins=num_experts, min=0, max=num_experts)
+
     num_tokens_per_expert = expert_histogram(selected_experts, num_experts)
 
-    # Reorder the token indices to match the order of the experts
-    # token_indices_experts_sorted shape (bs*slen*top_k,)
-    # token_indices_experts_sorted = torch.argsort(selected_experts.view(-1), stable=True)
-    token_indices_experts_sorted = (
-        selected_experts.flatten().argsort(stable=True).argsort().int().view(selected_experts.shape)
-    )
+    # Sort flattened (token, topk slot) entries by expert id.
+    token_indices_experts_sorted = torch.argsort(selected_experts.view(-1), stable=True)
 
-    # select tokens by scatter_index, and put them together
-    # token_indices_experts_sorted shape (batch_size * sequence_len * topk, hidden_size)
-    # token_indices_experts_sorted = token_indices_experts_sorted.reshape(-1, 1).expand(-1, hidden_states.size(-1))
-    # routed_input = torch.gather(hidden_states, dim=0, index=token_indices_experts_sorted)
-    routed_input = moe_scatter(hidden_states, token_indices_experts_sorted)
+    topk = selected_experts.shape[1]
 
-    reshaped_gate_weight = routing_weights.reshape(-1, 1)
-    scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
-    scattered_gate_weight[token_indices_experts_sorted.flatten()] = reshaped_gate_weight
+    # Route tokens to grouped expert input order.
+    routed_input = hidden_states[token_indices_experts_sorted // topk]
+    top_scores_experts_sorted = routing_weights.view(-1)[token_indices_experts_sorted].reshape(-1, 1)
 
-    # padd inputs for alignment
     run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm)
-
-    # _run_experts_grouped_mm expects (w1, w2, w3) where w2 is the output proj.
     routed_outputs = run_experts_fn(
         fc1_1_weight,
         fc2_weight,
         fc1_2_weight,
         routed_input,
         num_tokens_per_expert=num_tokens_per_expert,
-        gate_weights=scattered_gate_weight,
+        gate_weights=top_scores_experts_sorted,
     )
 
-    output = moe_gather(routed_outputs, token_indices_experts_sorted)
-    output = output.reshape(hidden_states.shape)
-
+    # Unsort and reduce top-k expert outputs back to token order.
+    routed_output_unsorted = torch.zeros(
+        (hidden_states.shape[0] * topk, hidden_states.shape[1]),
+        dtype=routed_outputs.dtype,
+        device=routed_outputs.device,
+    )
+    routed_output_unsorted[token_indices_experts_sorted] = routed_outputs
+    output = routed_output_unsorted.view(hidden_states.shape[0], topk, hidden_states.shape[1]).sum(dim=1)
     return output
 
 
@@ -171,5 +68,4 @@ def _run_experts_grouped_mm(
     if gate_weights is not None:
         h = h * gate_weights
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
-
     return out
