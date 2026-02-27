@@ -7,8 +7,6 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from ..utils.multisource_utils import parse_multisource_config
-from .dataset import DATASET_REGISTRY, build_iterable_dataset
 
 
 logger = logging.get_logger(__name__)
@@ -457,69 +455,3 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         # This is important when sources are added/removed during checkpoint resume
         self._exhausted = [False for _ in range(self._ds_num)]
         self._just_resumed = True
-
-
-@DATASET_REGISTRY.register("simple_multisource")
-def build_simple_multisource_dataset(
-    train_path: str,
-    datasets_type: str = "iterable",
-    namespace: Literal["train", "test"] = "train",
-    transform: Optional[Callable] = None,
-    seed: int = 42,
-    level: str = "sample",
-    sample_token_len_fn: Optional[Callable[[Any], float]] = None,
-    split_by_node: bool = True,
-    stopping_strategy: Literal["first_exhausted", "all_exhausted", "never_exhausted"] = "first_exhausted",
-    **kwargs: Any,
-) -> IterableDataset:
-    """Build a simple multi-source iterable dataset from a multisource config file.
-
-    Args:
-        train_path: Path to a multisource YAML/JSON config understood by ``parse_multisource_config``.
-        datasets_type: Dataset type; only ``iterable`` is supported here.
-        namespace: Dataset namespace passed to sub-dataset builders.
-        transform: Optional transform applied within each sub-dataset.
-        seed: Random seed.
-        level: Sampling level. ``sample`` uses weights directly; ``token`` uses token-adjusted weights.
-        sample_token_len_fn: Optional function to compute token length for ``level='token'``.
-        split_by_node: Whether sub-datasets are split/sharded by node.
-        stopping_strategy: See ``SimpleMultiSourceIterableDataset`` for semantics.
-        **kwargs: Reserved for compatibility.
-
-    Returns:
-        A ``SimpleMultiSourceIterableDataset`` instance.
-    """
-    multisource_config = parse_multisource_config(train_path)
-    schedule = multisource_config["schedule"]
-    if len(schedule) != 1 or schedule[0].get("schedule_type") != "const":
-        raise ValueError("simple_multisource only supports a single const schedule")
-    if datasets_type != "iterable":
-        raise ValueError("simple_multisource only supports iterable datasets")
-    sources = multisource_config["sources"]
-    source_names = multisource_config.get("names")
-    weights = schedule[0]["weights"]
-    source_names_for_id: List[Optional[str]] = (
-        list(source_names) if source_names is not None else [None for _ in sources]
-    )
-    source_ids = [_build_source_id(source, source_name) for source, source_name in zip(sources, source_names_for_id)]
-    datasets = [
-        build_iterable_dataset(
-            train_path=source,
-            namespace=namespace,
-            seed=seed,
-            transform=transform,
-            split_by_node=split_by_node,
-        )
-        for source in sources
-    ]
-    return SimpleMultiSourceIterableDataset(
-        datasets=datasets,
-        weights=weights,
-        seed=seed,
-        level=level,
-        sample_token_len_fn=sample_token_len_fn,
-        source_names=source_names,
-        source_ids=source_ids,
-        sharded=split_by_node,
-        stopping_strategy=stopping_strategy,
-    )

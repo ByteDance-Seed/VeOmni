@@ -393,7 +393,7 @@ def build_command(shuffle=True, save_by_idx=True):
         "--train.rmpad=false",
         "--train.rmpad_with_pos_ids=true",
         "--train.dyn_bsz=true",
-        "--dyn_bsz_in_dataloader=false",
+        "--train.dyn_bsz_runtime=worker",
         f"--save_by_idx={str(save_by_idx).lower()}",
         "--train.seed=42",
     ]
@@ -453,7 +453,6 @@ def _run_distributed_test():
     _parser = argparse.ArgumentParser()
     _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
     _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
-    _parser.add_argument("--dyn_bsz_in_dataloader", type=lambda x: x.lower() == "true", default=True)
     test_args, remaining_argv = _parser.parse_known_args()
     sys.argv = [sys.argv[0]] + remaining_argv
 
@@ -505,7 +504,7 @@ def _run_distributed_test():
         train_steps=train_steps,
         rmpad=args.train.rmpad,
         dyn_bsz=args.train.dyn_bsz,
-        dyn_bsz_in_dataloader=test_args.dyn_bsz_in_dataloader,
+        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         dyn_bsz_buffer_size=READY_FOR_MICRO_BATCH_THRESHOLD,

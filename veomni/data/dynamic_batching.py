@@ -30,6 +30,10 @@ from ..utils import logging
 logger = logging.get_logger(__name__)
 
 
+def get_length_by_attention_mask_fn(sample):
+    return int(sample["attention_mask"].sum())
+
+
 class DynamicBatchingSizeDataset(IterableDataset):
     """Dynamic batching dataset that yields micro batches based on token count.
 
@@ -69,7 +73,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         ready_for_micro_batch_threshold: int,
         dynamic_batching_collate_fn: Optional[Callable] = None,
         save_by_idx: bool = True,
-        get_length_fn: Optional[Callable] = len,
+        get_length_fn: Optional[Callable] = get_length_by_attention_mask_fn,
         force_generate_long_sequence: bool = False,
     ) -> None:
         """Initialize the DynamicBatchingSizeDataset.
@@ -170,19 +174,25 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 if self.save_by_idx:
                     item, refetch_idx = item[0], item[1]
 
-                length = self.get_length_fn(item)
-                if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
-                    # TODO: record the count of discarded long examples for monitoring
-                    logger.warning(
-                        f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
-                    )
-                    continue
+                samples_to_add = []
+                if type(item) is list:
+                    samples_to_add = item
+                else:
+                    samples_to_add = [item]
+                for item in samples_to_add:
+                    length = self.get_length_fn(item)
+                    if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
+                        # TODO: record the count of discarded long examples for monitoring
+                        logger.warning(
+                            f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
+                        )
+                        continue
 
-                self._buffer.append((item, length))
-                if self.save_by_idx:
-                    self._buffer_of_refetch_idx.append(refetch_idx)
+                    self._buffer.append((item, length))
+                    if self.save_by_idx:
+                        self._buffer_of_refetch_idx.append(refetch_idx)
 
-                self._buffer_token_count += self._buffer[-1][1]
+                    self._buffer_token_count += self._buffer[-1][1]
 
             except Exception as e:
                 if isinstance(e, StopIteration):
