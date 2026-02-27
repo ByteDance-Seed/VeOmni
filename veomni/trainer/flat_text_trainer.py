@@ -36,19 +36,19 @@ from ..arguments import VeOmniArguments
 from ..data import build_chat_template, build_dataloader, build_dataset
 from ..data.data_transform import process_pretrain_example, process_sft_example
 from ..models import build_tokenizer
-from ..trainer.callbacks.base import TrainerState
-from ..trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
-from ..trainer.callbacks.evaluate_callback import EvaluateCallback
-from ..trainer.callbacks.trace_callback import (
+from ..utils import helper
+from ..utils.device import synchronize
+from ..utils.loss_utils import count_loss_token
+from .base import BaseTrainer
+from .callbacks.base import TrainerState
+from .callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
+from .callbacks.evaluate_callback import EvaluateCallback
+from .callbacks.trace_callback import (
     EnvironMeterCallback,
     ProfileTraceCallback,
     TqdmCallback,
     WandbTraceCallback,
 )
-from ..utils import helper
-from ..utils.device import synchronize
-from ..utils.loss_utils import count_loss_token
-from .base import BaseTrainer
 
 
 logger = helper.create_logger(__name__)
