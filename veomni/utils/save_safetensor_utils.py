@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import gc
 import os
 import shutil
@@ -130,9 +131,9 @@ def _save_hf_safetensor_distributed(
     output_to_mount_path = save_path.startswith("/mnt/hdfs")
 
     # Use a dedicated Gloo process group for DCP save coordination and barriers.
-    # Checkpoint I/O can take longer than the default NCCL timeout (10 min) for large
-    # models, and Gloo has no such timeout constraint.
-    gloo_group = dist.new_group(backend="gloo") if dist.is_initialized() else None
+    # Each rank writes its own safetensor shards, and rank 0 performs consolidation,
+    # We set a large timeout to accommodate I/O time.
+    gloo_group = dist.new_group(backend="gloo", timeout=datetime.timedelta(hours=2)) if dist.is_initialized() else None
 
     storage_writer = TimedHuggingFaceStorageWriter(
         path=save_path,
