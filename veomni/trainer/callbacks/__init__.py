@@ -18,7 +18,7 @@ Trainer Callbacks module.
 Provides callback system for customizing trainer behavior at various stages of training.
 """
 
-from .base import Callback, CallbackHandler, TrainerState
+from .base import Callback, TrainerState
 from .checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
 from .evaluate_callback import EvaluateCallback
 from .trace_callback import EnvironMeterCallback, ProfileTraceCallback, TqdmCallback, WandbTraceCallback
@@ -26,7 +26,6 @@ from .trace_callback import EnvironMeterCallback, ProfileTraceCallback, TqdmCall
 
 __all__ = [
     "Callback",
-    "CallbackHandler",
     "TrainerState",
     "CheckpointerCallback",
     "HuggingfaceCkptCallback",

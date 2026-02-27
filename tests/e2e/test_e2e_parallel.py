@@ -155,7 +155,7 @@ qwen3omni_test_cases = [
     pytest.param(
         "qwen3_omni_moe",
         "./tests/toy_config/qwen3omni_toy",
-        False,
+        True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
     ),

@@ -222,9 +222,9 @@ class DynamicBatchingSizeDataset(IterableDataset):
         dataset: IterableDataset,
         micro_batch_seq_length: int,
         ready_for_micro_batch_threshold: int,
+        dynamic_batching_collate_fn: Callable,
         save_by_idx: bool = True,
         get_length_fn: Optional[Callable] = len,
-        dynamic_batching_collate_fn: Optional[Callable] = None,
         force_generate_long_sequence: bool = False,
     ) -> None:
         """Initialize the DynamicBatchingSizeDataset.

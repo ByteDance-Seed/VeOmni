@@ -7,7 +7,7 @@ import torch
 
 from veomni.arguments import parse_args
 from veomni.trainer.callbacks import Callback, TrainerState
-from veomni.trainer.vlm_trainer import Arguments, VLMTrainer
+from veomni.trainer.vlm_trainer import VeOmniVLMArguments, VLMTrainer
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -24,15 +24,23 @@ def process_dummy_example(
 
 
 class TestVLMTrainer(VLMTrainer):
-    def _init_callbacks(self):
-        super()._init_callbacks()
-        self.callbacks.add(LogDictSaveCallback(self))
+    def __init__(self, args: VeOmniVLMArguments):
+        super().__init__(args)
+        self.base.logdictsave_callback = LogDictSaveCallback(self.base)
 
-    def build_model_assets(self):
-        return []
+    def _build_model_assets(self):
+        self.base.model_assets = []
 
-    def build_data_transform(self):
-        return process_dummy_example
+    def _build_data_transform(self):
+        self.base.data_transform = process_dummy_example
+
+    def on_train_end(self):
+        super().on_train_end()
+        self.base.logdictsave_callback.on_train_end(self.base.state)
+
+    def on_step_end(self, **kwargs):
+        super().on_step_end(**kwargs)
+        self.base.logdictsave_callback.on_step_end(self.base.state, **kwargs)
 
 
 class LogDictSaveCallback(Callback):
@@ -57,6 +65,6 @@ class LogDictSaveCallback(Callback):
 
 
 if __name__ == "__main__":
-    args = parse_args(Arguments)
+    args = parse_args(VeOmniVLMArguments)
     trainer = TestVLMTrainer(args)
     trainer.fit()
