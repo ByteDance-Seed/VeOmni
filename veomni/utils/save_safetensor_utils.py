@@ -298,6 +298,8 @@ def save_hf_safetensor(
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
+    overall_start = time.time()
+
     use_distributed = is_torch_version_greater_than("2.9") and train_architecture != "lora" and ckpt_manager == "dcp"
 
     # Ensure all GPU operations are complete before reading tensor data for saving
@@ -333,3 +335,6 @@ def save_hf_safetensor(
     # Ensure all ranks finish saving before anyone proceeds
     if dist.is_initialized():
         dist.barrier()
+
+    overall_elapsed = time.time() - overall_start
+    logger.info_rank0(f"save_hf_safetensor total time: {overall_elapsed:.2f}s")
