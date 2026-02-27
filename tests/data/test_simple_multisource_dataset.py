@@ -18,7 +18,7 @@ from utils import DummyIterableDataset, DummyMappingDataset, FakeModel, compare_
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader
-from veomni.data.simple_multisource_dataset import SimpleMultiSourceIterableDataset, _build_source_id
+from veomni.data.simple_multisource_dataset import SimpleMultiSourceIterableDataset
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -308,16 +308,6 @@ def _make_simple_dataset(
         sharded=False,
         stopping_strategy=stopping_strategy,
     )
-
-
-def test_source_id_stability():
-    a1 = _build_source_id("path/a", "name")
-    a2 = _build_source_id("path/a", "name")
-    b1 = _build_source_id("path/a", "name2")
-    b2 = _build_source_id("path/b", "name")
-    assert a1 == a2
-    assert a1 != b1
-    assert a1 != b2
 
 
 def test_state_dict_structure():

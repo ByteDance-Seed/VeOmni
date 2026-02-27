@@ -1,4 +1,4 @@
-import hashlib
+import copy
 from typing import Any, Callable, List, Literal, Optional, Sequence
 
 import numpy as np
@@ -10,20 +10,6 @@ from ..utils import logging
 
 
 logger = logging.get_logger(__name__)
-
-
-def _build_source_id(source: Any, source_name: Optional[str]) -> str:
-    """Build a stable source identifier from the raw source and its display name.
-
-    Args:
-        source: The raw source spec (e.g., a dataset path).
-        source_name: Optional human-readable source name.
-
-    Returns:
-        A SHA1 hex digest that is stable across runs for the same inputs.
-    """
-    raw = f"{source_name or ''}|{source}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 class SimpleMultiSourceIterableDataset(IterableDataset):
@@ -87,16 +73,21 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         self._sharded = sharded
         self._stopping_strategy = stopping_strategy
         self._ds_num = len(self._datasets)
+
+        if not self._source_names:
+            self._source_names = []
+            for i, dataset in enumerate(self._datasets):
+                if callable(getattr(dataset, "get_name", None)):
+                    self._source_names.append(dataset.get_name())
+                else:
+                    self._source_names.append(f"source_{i}")
+
         if not self._source_ids:
-            if self._source_names is not None:
-                self._source_ids = [str(name) for name in self._source_names]
-            else:
-                self._source_ids = [
-                    getattr(self._datasets[idx], "get_name")()
-                    if callable(getattr(self._datasets[idx], "get_name", None))
-                    else f"source_{idx}"
-                    for idx in range(self._ds_num)
-                ]
+            self._source_ids = copy.deepcopy(self._source_names)
+
+        # assert all ids are different
+        assert len(set(self._source_ids)) == len(self._source_ids), "source_ids must be unique"
+
         self._id2dataset = dict(zip(self._source_ids, self._datasets))
         self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
         self._avg_len_count = [0 for _ in range(self._ds_num)]
