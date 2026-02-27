@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -71,15 +71,18 @@ def build_native_dataloader(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     seed: int = 0,
+    collate_fn: Optional[Callable] = None,
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = {},
 ) -> "DistributedDataloader":
     parallel_state = get_parallel_state()
 
-    if build_collate_fn:
-        collate_fn = MainCollator(**collate_fn_kwargs)
-    else:
-        collate_fn = NoopDataCollator()
+    if collate_fn is None:
+        if build_collate_fn:
+            collate_fn = MainCollator(**collate_fn_kwargs)
+        else:
+            collate_fn = NoopDataCollator()
+
     num_micro_batch = global_batch_size // (
         micro_batch_size * parallel_state.dp_size
     )  # num_micro_batch = num accumulation steps

@@ -2,7 +2,7 @@ import copy
 import os
 import shutil
 import subprocess
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
@@ -23,7 +23,7 @@ except Exception as _:
 from veomni.arguments import parse_args
 from veomni.data import build_dummy_dataset
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
-from veomni.trainer.callbacks.base import Callback, CallbackHandler, TrainerState
+from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
 from veomni.utils import helper
 
@@ -102,24 +102,60 @@ class TrainerTest(BaseTrainer):
     dcp_weights_path: str
     hf_weights_path: str
 
-    def build_model_assets(self):
-        return []
+    def _build_model_assets(self):
+        self.model_assets = [self.model_config]
 
-    def build_training_dataset(self):
+    def _build_data_transform(self):
+        pass
+
+    def _build_dataset(self):
         args: VeOmniArguments = self.args
         self.train_dataset = build_dummy_dataset(task_type="text", size=8192, max_seq_len=args.data.max_seq_len)
         args.compute_train_steps()
+        self.train_steps = args.train_steps
 
     def _init_callbacks(self):
-        self.callbacks = CallbackHandler(
-            [
-                EnvironMeterCallbackTest(self),
-                CheckpointerCallbackTest(self),
-                HuggingfaceCkptCallbackTest(self),
-                CheckCallback(self),
-            ]
-        )
+        self.environ_meter_callback = EnvironMeterCallbackTest(self)
+        self.checkpointer_callback = CheckpointerCallbackTest(self)
+        self.hf_ckpt_callback = HuggingfaceCkptCallbackTest(self)
+        self.check_callback = CheckCallback(self)
         self.state = TrainerState()
+
+    def on_train_begin(self):
+        self.environ_meter_callback.on_train_begin(self.state)
+        self.checkpointer_callback.on_train_begin(self.state)
+        self.hf_ckpt_callback.on_train_begin(self.state)
+        self.check_callback.on_train_begin(self.state)
+
+    def on_train_end(self):
+        self.environ_meter_callback.on_train_end(self.state)
+        self.checkpointer_callback.on_train_end(self.state)
+        self.hf_ckpt_callback.on_train_end(self.state)
+        self.check_callback.on_train_end(self.state)
+
+    def on_epoch_begin(self):
+        self.environ_meter_callback.on_epoch_begin(self.state)
+        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.hf_ckpt_callback.on_epoch_begin(self.state)
+        self.check_callback.on_epoch_begin(self.state)
+
+    def on_epoch_end(self):
+        self.environ_meter_callback.on_epoch_end(self.state)
+        self.checkpointer_callback.on_epoch_end(self.state)
+        self.hf_ckpt_callback.on_epoch_end(self.state)
+        self.check_callback.on_epoch_end(self.state)
+
+    def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
+
+    def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
+        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
 
 class FakeEnvironMeter:
@@ -192,7 +228,7 @@ class CheckCallback(Callback):
             ), "HF checkpoint verification failed"
 
         self.trainer.args.train.load_checkpoint_path = self.trainer.dcp_weights_path
-        self.trainer.callbacks.callbacks[1]._load_checkpoint()
+        self.trainer.checkpointer_callback._load_checkpoint()
 
         tied_weights_keys = None
         if hasattr(self.trainer.model, "_tied_weights_keys"):
