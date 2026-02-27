@@ -105,7 +105,7 @@ class _TimedHuggingFaceStorageWriter:
         return result
 
 
-def _save_hf_safetensor_distributed(
+def _save_hf_safetensor_distributed_for_mount_output_path(
     model: torch.nn.Module,
     save_path: str,
     fqn_to_index_mapping: Optional[Dict[str, int]],
@@ -182,6 +182,51 @@ def _save_hf_safetensor_distributed(
 
     # Save model assets (config, tokenizer, etc.) on rank 0
     if model_assets and is_rank_0:
+        save_model_assets(save_path, model_assets)
+
+    logger.info_rank0(f"HuggingFace checkpoint saved at {save_path} successfully!")
+
+
+def _save_hf_safetensor_distributed(
+    model: torch.nn.Module,
+    save_path: str,
+    fqn_to_index_mapping: Optional[Dict[str, int]],
+    model_assets: Optional[Sequence],
+):
+    """Distributed HuggingFace safetensors save using HuggingFaceStorageWriter (PyTorch >= 2.9).
+
+    All ranks must call this function.
+    """
+    from torch.distributed.checkpoint import HuggingFaceStorageWriter
+
+    storage_writer = HuggingFaceStorageWriter(
+        path=save_path,
+        save_distributed=True,
+        fqn_to_index_mapping=fqn_to_index_mapping,
+        enable_consolidation=True,
+        thread_count_consolidation=5,
+    )
+
+    save_state = get_model_save_state(model, fqn_to_index_mapping)
+
+    logger.info_rank0("Starting distributed HuggingFace safetensors save...")
+    if dist.is_initialized():
+        dist.barrier()
+    start_time = time.time()
+    dcp.save(
+        state_dict=save_state,
+        storage_writer=storage_writer,
+    )
+    del save_state  # Free copied tensors (e.g. fp32->bf16) to reduce peak memory
+    if dist.is_initialized():
+        dist.barrier()
+    gc.collect()
+    helper.empty_cache()
+    elapsed_time = time.time() - start_time
+    logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
+
+    # Save model assets (config, tokenizer, etc.) on rank 0
+    if model_assets and (not dist.is_initialized() or dist.get_rank() == 0):
         save_model_assets(save_path, model_assets)
 
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_path} successfully!")
@@ -264,7 +309,12 @@ def save_hf_safetensor(
             dist.barrier()
 
     if use_distributed:
-        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, is_rank_0)
+        if save_hf_safetensor_path.startswith("/mnt/hdfs"):
+            _save_hf_safetensor_distributed_for_mount_output_path(
+                model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, is_rank_0
+            )
+        else:
+            _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
     else:
         # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
