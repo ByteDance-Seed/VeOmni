@@ -243,6 +243,6 @@ def set_environ_param(model_mode: ModelMode):
         os.environ["MODELING_BACKEND"] = "hf"
 
     if model_mode.use_liger_kernel:
-        os.environ["USE_LIGER_KERNEL"] = "1"
+        os.environ["VEOMNI_USE_LIGER_KERNEL"] = "1"
     else:
-        os.environ["USE_LIGER_KERNEL"] = "0"
+        os.environ["VEOMNI_USE_LIGER_KERNEL"] = "0"

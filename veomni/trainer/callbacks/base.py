@@ -50,17 +50,3 @@ class Callback(ABC):
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         pass
-
-
-class CallbackHandler:
-    def __init__(self, callbacks: list[Callback]):
-        self.callbacks = callbacks
-
-    def call(self, event: str, state: TrainerState, **kwargs):
-        for cb in self.callbacks:
-            fn = getattr(cb, event, None)
-            if fn is not None:
-                fn(state, **kwargs)
-
-    def add(self, callback: Callback):
-        self.callbacks.append(callback)

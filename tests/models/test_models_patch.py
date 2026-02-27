@@ -51,16 +51,25 @@ class TrainerTest(BaseTrainer):
     def _init_callbacks(self):
         pass
 
-    def build_model_assets(self):
-        return []
+    def _build_model_assets(self):
+        self.model_assets = []
 
-    def _build_data(self):
+    def _build_data_transform(self):
+        pass
+
+    def _build_dataset(self):
         # use dummy micro_batch in this ci
         self.args.compute_train_steps(100)
         self.train_steps = self.args.train_steps
         pass
 
-    def build_parallelize_model(self):
+    def _build_collate_fn(self):
+        pass
+
+    def _build_dataloader(self):
+        pass
+
+    def _build_parallelize_model(self):
         # no parallel in this ci
         pass
 
@@ -73,7 +82,8 @@ class TrainerTest(BaseTrainer):
         self.args.model.moe_implementation = model_mode.moe_implementation
 
         self._build_model()
-        self._build_optimizer_and_scheduler()
+        self._build_optimizer()
+        self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
         # Sync weights

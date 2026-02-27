@@ -30,7 +30,8 @@ import json
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict
-from typing import Any, Dict, List
+from functools import partial
+from typing import Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -49,6 +50,9 @@ from ..data import (
     build_dataloader,
     build_dataset,
 )
+from ..data.chat_template import ChatTemplate
+from ..data.data_collator import DataCollator, MainCollator
+from ..data.data_transform import process_pretrain_example
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import init_parallel_state
@@ -66,8 +70,6 @@ from ..utils.device import (
 from ..utils.loss_utils import count_loss_token, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
-    Callback,
-    CallbackHandler,
     CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
@@ -111,16 +113,17 @@ class BaseTrainer(Stateful, ABC):
     device: torch.device
 
     # Data
+    data_transform: Callable
     train_dataset: Dataset
-    val_dataset: Dataset
+    collate_fn: DataCollator
     train_dataloader: DistributedDataloader
-    val_dataloader: DistributedDataloader
 
     # Model
     model: PreTrainedModel
     model_config: PretrainedConfig
     tokenizer: PreTrainedTokenizerBase
     processor: ProcessorMixin
+    chat_template: ChatTemplate
     model_assets: List[Any]
 
     # Training components
@@ -140,7 +143,6 @@ class BaseTrainer(Stateful, ABC):
     checkpointer: CheckpointerBase  # see in checkpoint_callback.CheckpointerCallback
 
     # Callback system
-    callbacks: CallbackHandler
     state: TrainerState
 
     # Training states
@@ -161,87 +163,34 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
-        logger.info_rank0(json.dumps(asdict(self.args), indent=2))
-
         self._setup()
-        # build model and model assets (config, tokenizer, processor, chat_template)
+        # build model
         self._build_model()
+        # freeze module and print trainable parameters
+        self._freeze_model_module()
+        # build model assets (config, tokenizer, processor, chat_template)
+        self._build_model_assets()
         # build dataset and dataloader
-        self._build_data()
+        self._build_data_transform()
+        self._build_dataset()
+        self._build_collate_fn()
+        self._build_dataloader()
+
         # Parallelize model
         self._build_parallelized_model()
         # Build optimizer and lr scheduler
-        self._build_optimizer_and_scheduler()
+        self._build_optimizer()
+        self._build_lr_scheduler()
         # Build training context
         self._build_training_context()
         # Initialize callbacks
         self._init_callbacks()
 
-        # Call post-initialization hook for subclasses
-        self.post_init()
-
-    def post_init(self) -> None:
-        pass
-
-    def freeze_module(self):
-        pass
-
-    def build_param_groups(self):
-        return None
-
-    def build_data_transform(self):
-        raise NotImplementedError("build_data_transform must be implemented in subclasses")
-
-    def build_model_assets(self):
-        self.tokenizer = build_tokenizer(self.args.model.tokenizer_path)
-        return [self.tokenizer]
-
-    def build_data_collate_info(self):
-        return {}
-
-    def build_collaten_fn_kwargs(self):
-        if self.args.data.data_type == "classification":
-            seq_classification = True
-        else:
-            seq_classification = False
-        return {
-            "data_collate_info": self.build_data_collate_info(),
-            "pad_to_length": self.args.train.pad_to_length,
-            "seq_classification": seq_classification,
-        }
-
-    def build_model_config_kwargs(self):
-        return {}
-
     def _setup(self):
-        self._init_distributed()
+        # log args
+        logger.info_rank0(json.dumps(asdict(self.args), indent=2))
 
-        # Set random seed
-        helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
-
-        # Enable high precision for bf16
-        helper.enable_high_precision_for_bf16()
-
-        # Enable third party logging
-        if self.args.train.local_rank == 0:
-            helper.enable_third_party_logging()
-
-        # Save arguments
-        if self.args.train.global_rank == 0:
-            save_args(self.args, self.args.train.output_dir)
-
-        # Gradient checkpointing debug
-        set_checkpoint_debug_enabled(self.args.train.debug_gradient_checkpointing)
-
-    def _destroy_distributed(self):
-        # Clean up optimizer and lr scheduler
-        del self.optimizer, self.lr_scheduler
-        helper.empty_cache()
-
-        dist.barrier()
-        dist.destroy_process_group()
-
-    def _init_distributed(self):
+        # init distributed environment
         device_str = f"{get_device_type()}:{self.args.train.local_rank}"
         get_torch_device().set_device(device_str)
         self.device = torch.device(device_str)
@@ -266,6 +215,23 @@ class BaseTrainer(Stateful, ABC):
             async_enabled=self.args.train.async_enabled,
         )
 
+        # Set random seed
+        helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
+
+        # Enable high precision for bf16
+        helper.enable_high_precision_for_bf16()
+
+        # Enable third party logging
+        if self.args.train.local_rank == 0:
+            helper.enable_third_party_logging()
+
+        # Save arguments
+        if self.args.train.global_rank == 0:
+            save_args(self.args, self.args.train.output_dir)
+
+        # Gradient checkpointing debug
+        set_checkpoint_debug_enabled(self.args.train.debug_gradient_checkpointing)
+
     def _build_model(self):
         logger.info_rank0("Build model")
         self.model = build_foundation_model(
@@ -275,26 +241,33 @@ class BaseTrainer(Stateful, ABC):
             attn_implementation=self.args.model.attn_implementation,
             moe_implementation=self.args.model.moe_implementation,
             init_device=self.args.train.init_device,
-            config_kwargs=self.build_model_config_kwargs(),
         )
         self.model_config = self.model.config
 
-        # model assets
-        self.model_assets = [self.model_config]
-        self.model_assets.extend(self.build_model_assets())
-
-        # freeze module
-        self.freeze_module()
+    def _freeze_model_module(self):
+        # basically fully sft
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
-    def build_training_dataset(self):
+    def _build_model_assets(self):
+        # model assets
+        self.tokenizer = build_tokenizer(self.args.model.tokenizer_path)
+        self.model_assets = [self.model_config, self.tokenizer]
+
+    def _build_data_transform(self):
+        self.data_transform = partial(
+            process_pretrain_example,
+            tokenizer=self.tokenizer,
+            max_seq_len=self.args.data.max_seq_len,
+            text_keys=self.args.data.text_keys,
+        )
+
+    def _build_dataset(self):
         args: VeOmniArguments = self.args
-        data_transform = self.build_data_transform()
         # Build dataset
         self.train_dataset = build_dataset(
             dataset_name=args.data.dataset_name,
-            transform=data_transform,
+            transform=self.data_transform,
             seed=args.train.seed,
             **asdict(args.data),
         )
@@ -304,9 +277,16 @@ class BaseTrainer(Stateful, ABC):
         args.compute_train_steps(dataset_length)
         self.train_steps = args.train_steps
 
-    def build_training_dataloader(self):
+    def _build_collate_fn(self):
+        seq_classification = self.args.data.data_type == "classification"
+        pad_to_length = self.args.train.pad_to_length
+        self.collate_fn = MainCollator(
+            pad_to_length=pad_to_length,
+            seq_classification=seq_classification,
+        )
+
+    def _build_dataloader(self):
         args: VeOmniArguments = self.args
-        collate_fn_kwargs = self.build_collaten_fn_kwargs()
         self.train_dataloader = build_dataloader(
             dataloader_type=args.data.dataloader_type,
             dataset=self.train_dataset,
@@ -324,15 +304,8 @@ class BaseTrainer(Stateful, ABC):
             pin_memory=args.data.pin_memory,
             prefetch_factor=args.data.prefetch_factor,
             seed=args.train.seed,
-            build_collate_fn=True,
-            collate_fn_kwargs=collate_fn_kwargs,
+            collate_fn=self.collate_fn,
         )
-
-    def _build_data(self):
-        logger.info_rank0("Build data")
-        self.build_training_dataset()
-        self.build_training_dataloader()
-        # TODO: val dataset & dataloader
 
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
@@ -355,12 +328,8 @@ class BaseTrainer(Stateful, ABC):
         )
         self.model.train()
 
-    def _build_optimizer_and_scheduler(self):
-        """Build optimizer and learning rate scheduler."""
+    def _build_optimizer(self):
         args: VeOmniArguments = self.args
-
-        param_groups = self.build_param_groups()
-
         # Build optimizer
         self.optimizer = build_optimizer(
             self.model,
@@ -368,9 +337,10 @@ class BaseTrainer(Stateful, ABC):
             weight_decay=args.train.weight_decay,
             fused=True,
             optimizer_type=args.train.optimizer,
-            param_groups=param_groups,
         )
 
+    def _build_lr_scheduler(self):
+        args: VeOmniArguments = self.args
         # Build lr scheduler
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
@@ -391,74 +361,70 @@ class BaseTrainer(Stateful, ABC):
             self.args.train.activation_gpu_limit,
         )
 
-    def _model_reshard(self, micro_step: int, num_micro_steps: int):
-        """Reshard model after backward pass."""
-        args: VeOmniArguments = self.args
-        if (
-            args.train.data_parallel_mode == "fsdp2"
-            and not args.train.enable_reshard_after_backward
-            and num_micro_steps > 1
-        ):
-            if micro_step == 0:
-                self.model.set_reshard_after_backward(False)
-            elif micro_step == num_micro_steps - 1:
-                self.model.set_reshard_after_backward(True)
-
     def _init_callbacks(self):
         """Initialize callbacks."""
-        callbacks = [
-            EnvironMeterCallback(self),  # First in trace
-            TqdmCallback(self),
-            WandbTraceCallback(self),
-            ProfileTraceCallback(self),
-            CheckpointerCallback(self),
-            HuggingfaceCkptCallback(self),
-            EvaluateCallback(self),
-        ]
-        self.callbacks = CallbackHandler(callbacks)
+        self.environ_meter_callback = EnvironMeterCallback(self)
+        self.tqdm_callback = TqdmCallback(self)
+        self.wandb_callback = WandbTraceCallback(self)
+        self.profile_callback = ProfileTraceCallback(self)
+        self.checkpointer_callback = CheckpointerCallback(self)
+        self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
+        self.evaluate_callback = EvaluateCallback(self)
         self.state = TrainerState()
 
-    def add_callback(self, callback: Callback):
-        self.callbacks.add(callback)
+    def on_train_begin(self):
+        self.environ_meter_callback.on_train_begin(self.state)
+        self.tqdm_callback.on_train_begin(self.state)
+        self.wandb_callback.on_train_begin(self.state)
+        self.profile_callback.on_train_begin(self.state)
+        self.checkpointer_callback.on_train_begin(self.state)
+        self.hf_ckpt_callback.on_train_begin(self.state)
+        self.evaluate_callback.on_train_begin(self.state)
 
-    def fit(self):
-        args: VeOmniArguments = self.args
-        self.callbacks.call("on_train_begin", self.state)
-        logger.info(
-            f"Rank{args.train.local_rank} Start training. "
-            f"Start step: {self.start_step}. "
-            f"Train steps: {args.train_steps}. "
-            f"Start epoch: {self.start_epoch}. "
-            f"Train epochs: {args.train.num_train_epochs}."
-        )
+    def on_train_end(self):
+        self.environ_meter_callback.on_train_end(self.state)
+        self.tqdm_callback.on_train_end(self.state)
+        self.wandb_callback.on_train_end(self.state)
+        self.profile_callback.on_train_end(self.state)
+        self.checkpointer_callback.on_train_end(self.state)
+        self.hf_ckpt_callback.on_train_end(self.state)
+        self.evaluate_callback.on_train_end(self.state)
 
-        for epoch in range(self.start_epoch, args.train.num_train_epochs):
-            if hasattr(self.train_dataloader, "set_epoch"):
-                self.train_dataloader.set_epoch(epoch)
-            self.state.epoch = epoch
+    def on_epoch_begin(self):
+        self.environ_meter_callback.on_epoch_begin(self.state)
+        self.tqdm_callback.on_epoch_begin(self.state)
+        self.wandb_callback.on_epoch_begin(self.state)
+        self.profile_callback.on_epoch_begin(self.state)
+        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.hf_ckpt_callback.on_epoch_begin(self.state)
+        self.evaluate_callback.on_epoch_begin(self.state)
 
-            self.callbacks.call("on_epoch_begin", self.state)
+    def on_epoch_end(self):
+        self.environ_meter_callback.on_epoch_end(self.state)
+        self.tqdm_callback.on_epoch_end(self.state)
+        self.wandb_callback.on_epoch_end(self.state)
+        self.profile_callback.on_epoch_end(self.state)
+        self.checkpointer_callback.on_epoch_end(self.state)
+        self.hf_ckpt_callback.on_epoch_end(self.state)
+        self.evaluate_callback.on_epoch_end(self.state)
 
-            # Create a batch generator
-            data_iterator = iter(self.train_dataloader)
+    def on_step_begin(self, micro_batches=None):
+        self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.tqdm_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.wandb_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.profile_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.evaluate_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
-            for _ in range(self.start_step, args.train_steps):
-                try:
-                    self.train_step(data_iterator)
-                except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
-                    break
-
-            self.callbacks.call("on_epoch_end", self.state)
-
-            self.start_step = 0
-            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-
-        self.callbacks.call("on_train_end", self.state)
-
-        synchronize()
-
-        self._destroy_distributed()
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.profile_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
@@ -500,6 +466,19 @@ class BaseTrainer(Stateful, ABC):
         del micro_batch
         return loss, loss_dict
 
+    def model_reshard(self, micro_step: int, num_micro_steps: int):
+        """Reshard model after backward pass."""
+        args: VeOmniArguments = self.args
+        if (
+            args.train.data_parallel_mode == "fsdp2"
+            and not args.train.enable_reshard_after_backward
+            and num_micro_steps > 1
+        ):
+            if micro_step == 0:
+                self.model.set_reshard_after_backward(False)
+            elif micro_step == num_micro_steps - 1:
+                self.model.set_reshard_after_backward(True)
+
     def train_step(
         self,
         data_iterator: Any,
@@ -509,7 +488,7 @@ class BaseTrainer(Stateful, ABC):
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        self.callbacks.call("on_step_begin", self.state, micro_batches=micro_batches)
+        self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
         synchronize()
@@ -522,7 +501,7 @@ class BaseTrainer(Stateful, ABC):
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
-            self._model_reshard(micro_step, num_micro_steps)
+            self.model_reshard(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
@@ -541,4 +520,51 @@ class BaseTrainer(Stateful, ABC):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
 
-        self.callbacks.call("on_step_end", self.state, loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+
+    def destroy_distributed(self):
+        # Clean up optimizer and lr scheduler
+        del self.optimizer, self.lr_scheduler
+        helper.empty_cache()
+
+        dist.barrier()
+        dist.destroy_process_group()
+
+    def fit(self):
+        args: VeOmniArguments = self.args
+        self.on_train_begin()
+        logger.info(
+            f"Rank{args.train.local_rank} Start training. "
+            f"Start step: {self.start_step}. "
+            f"Train steps: {args.train_steps}. "
+            f"Start epoch: {self.start_epoch}. "
+            f"Train epochs: {args.train.num_train_epochs}."
+        )
+
+        for epoch in range(self.start_epoch, args.train.num_train_epochs):
+            if hasattr(self.train_dataloader, "set_epoch"):
+                self.train_dataloader.set_epoch(epoch)
+            self.state.epoch = epoch
+
+            self.on_epoch_begin()
+
+            # Create a batch generator
+            data_iterator = iter(self.train_dataloader)
+
+            for _ in range(self.start_step, args.train_steps):
+                try:
+                    self.train_step(data_iterator)
+                except StopIteration:
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                    break
+
+            self.on_epoch_end()
+
+            self.start_step = 0
+            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+        self.on_train_end()
+
+        synchronize()
+
+        self.destroy_distributed()

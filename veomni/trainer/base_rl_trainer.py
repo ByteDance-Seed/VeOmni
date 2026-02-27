@@ -36,10 +36,18 @@ from .base import BaseTrainer, VeOmniArguments, build_dataloader
 
 
 class BaseRLTrainer(BaseTrainer):
-    def post_init(self):
-        self.build_preforward_postforward()
+    def __init__(self, args: VeOmniArguments):
+        super().__init__(args)
+        self._build_preforward_postforward()
 
-    def build_training_dataloader(self):
+    # post init preforward and postforward hooks
+    def _build_preforward_postforward(self):
+        """Build preforward and postforward hooks."""
+        self.pre_forward = Preforward()
+        self.post_forward = Postforward()
+
+    # rewrite: do not build collate_fn in dataloader, as we pack and sp slice data in training loop in preforward
+    def _build_dataloader(self):
         """Do not build collate_fn for RL trainer."""
         args: VeOmniArguments = self.args
         self.train_dataloader = build_dataloader(
@@ -61,12 +69,6 @@ class BaseRLTrainer(BaseTrainer):
             seed=args.train.seed,
             build_collate_fn=False,
         )
-
-    def build_preforward_postforward(self):
-        """Build preforward and postforward hooks."""
-        preforward_kwargs = self.build_collaten_fn_kwargs()
-        self.pre_forward = Preforward(**preforward_kwargs)
-        self.post_forward = Postforward()
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         micro_batch = self.pre_forward(micro_batch)

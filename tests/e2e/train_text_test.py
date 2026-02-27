@@ -24,15 +24,23 @@ def process_dummy_example(
 
 
 class TestTextTrainer(TextTrainer):
-    def _init_callbacks(self):
-        super()._init_callbacks()
-        self.callbacks.add(LogDictSaveCallback(self))
+    def __init__(self, args: VeOmniArguments):
+        super().__init__(args)
+        self.base.logdictsave_callback = LogDictSaveCallback(self.base)
 
-    def build_model_assets(self):
-        return []
+    def _build_model_assets(self):
+        self.base.model_assets = []
 
-    def build_data_transform(self):
-        return process_dummy_example
+    def _build_data_transform(self):
+        self.base.data_transform = process_dummy_example
+
+    def on_train_end(self):
+        super().on_train_end()
+        self.base.logdictsave_callback.on_train_end(self.base.state)
+
+    def on_step_end(self, **kwargs):
+        super().on_step_end(**kwargs)
+        self.base.logdictsave_callback.on_step_end(self.base.state, **kwargs)
 
 
 class LogDictSaveCallback(Callback):
