@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import gc
 import os
 import shutil
@@ -155,7 +156,7 @@ def _save_hf_safetensor_distributed_for_mount_output_path(
     )
     del save_state  # Free copied tensors (e.g. fp32->bf16) to reduce peak memory
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(timeout=datetime.timedelta(minutes=120))
     gc.collect()
     helper.empty_cache()
     elapsed_time = time.time() - start_time
@@ -354,9 +355,11 @@ def save_hf_safetensor(
                 output_dir,
             )
 
-    # Ensure all ranks finish saving before anyone proceeds
+    # Ensure all ranks finish saving before anyone proceeds.
+    # Use a long timeout because rank 0 may spend a long time processing and copying consolidated
+    # files to a mounted filesystem (e.g., HDFS FUSE), exceeding the default NCCL timeout.
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(timeout=datetime.timedelta(minutes=120))
 
     overall_elapsed = time.time() - overall_start
     logger.info_rank0(f"save_hf_safetensor total time: {overall_elapsed:.2f}s")
