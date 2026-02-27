@@ -116,38 +116,36 @@ def _save_hf_safetensor_distributed_for_mount_output_path(
 
     All ranks must call this function.
 
-    save_path can be a local path or a mount path. HuggingFaceStorageWriter first writes
-    each rank's shard to save_path, then rank 0 consolidates all shards and writes the
-    output to a local temp directory (to avoid EOPNOTSUPP on mounted filesystems), and
-    finally copies the consolidated files back to save_path.
+    save_path can be a local path or a mount path. Each rank writes its own shard via
+    dcp.save(), then rank 0
+    consolidates all shards to a local temp directory (to avoid EOPNOTSUPP on mounted
+    filesystems), and finally copies the consolidated files back to save_path.
+
+    Consolidation is performed outside the dcp.save() pipeline to avoid NCCL timeout.
+    When enable_consolidation=True inside dcp.save(), consolidation runs in the finish()
+    callback on rank 0 only, while other ranks wait at a broadcast collective. For large
+    models, rank 0's consolidation can exceed the NCCL timeout (600s), causing all other
+    ranks to crash.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+        consolidate_safetensors_files,
+    )
 
     class TimedHuggingFaceStorageWriter(_TimedHuggingFaceStorageWriter, HuggingFaceStorageWriter):
         pass
 
+    # Disable enable_consolidation to prevent NCCL timeout (see docstring).
     storage_writer = TimedHuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
         fqn_to_index_mapping=fqn_to_index_mapping,
-        enable_consolidation=True,
-        thread_count_consolidation=5,
+        enable_consolidation=False,
     )
-
-    # Redirect consolidation output to a local temp dir instead of the mount path to avoid
-    # memoryview write issues (EOPNOTSUPP) on mounted filesystems.
-    # - Consolidated output goes to local temp dir (rank 0 only, via finish())
-    # Note: Only rank 0 executes storage_writer.finish()
-    # so consolidated_output_path is only used on rank 0
-    local_tmp_dir = None
-    if is_rank_0:
-        local_tmp_dir = tempfile.mkdtemp(prefix="veomni_hf_save_")
-        storage_writer.consolidated_output_path = local_tmp_dir
-        logger.info(f"Redirected consolidated_output_path to rank 0 local temp dir: {local_tmp_dir}")
 
     save_state = get_model_save_state(model, fqn_to_index_mapping)
 
-    logger.info_rank0("Starting distributed HuggingFace safetensors save...")
+    logger.info_rank0("Starting distributed HuggingFace safetensors save (shards only, no consolidation)...")
     if dist.is_initialized():
         dist.barrier()
     start_time = time.time()
@@ -161,11 +159,29 @@ def _save_hf_safetensor_distributed_for_mount_output_path(
     gc.collect()
     helper.empty_cache()
     elapsed_time = time.time() - start_time
-    logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
+    logger.info_rank0(
+        f"Distributed HuggingFace safetensors all ranks finished writing shards, took {elapsed_time:.2f}s"
+    )
 
-    # Rank 0: copy consolidated files from local temp to mount path, then clean up
+    # Rank 0: consolidate shards to a local temp dir, then copy to mount path.
+    # Consolidation is done outside dcp.save() so there is no NCCL collective to timeout.
+    # Other ranks simply wait at the final barrier in save_hf_safetensor().
     if is_rank_0:
-        logger.info_rank0(f"Start copying from {local_tmp_dir} to {save_path} at rank 0")
+        local_tmp_dir = tempfile.mkdtemp(prefix="veomni_hf_save_")
+        logger.info(f"Starting consolidation from {save_path} to local temp dir: {local_tmp_dir}")
+
+        consolidation_start = time.time()
+        consolidate_safetensors_files(
+            input_dir=save_path,
+            output_dir=local_tmp_dir,
+            fqn_to_index_mapping=fqn_to_index_mapping if fqn_to_index_mapping is not None else {},
+            num_threads=5,
+        )
+        consolidation_elapsed = time.time() - consolidation_start
+        logger.info(f"Consolidation took {consolidation_elapsed:.2f}s")
+
+        # Copy consolidated files to mount path
+        logger.info(f"Start copying from {local_tmp_dir} to {save_path}")
         os.makedirs(save_path, exist_ok=True)
         copy_start = time.time()
         for filename in os.listdir(local_tmp_dir):
@@ -174,11 +190,17 @@ def _save_hf_safetensor_distributed_for_mount_output_path(
             if os.path.isfile(src_file):
                 shutil.copy2(src_file, dst_file)
         copy_elapsed = time.time() - copy_start
-        logger.info_rank0(
-            f"Copied consolidated safetensors from {local_tmp_dir} to {save_path} in {copy_elapsed:.2f}s"
-        )
-        # Clean up local temp dir
+        logger.info(f"Copied consolidated safetensors from {local_tmp_dir} to {save_path} in {copy_elapsed:.2f}s")
+
+        # Clean up local temp dir and per-rank shard files
         shutil.rmtree(local_tmp_dir, ignore_errors=True)
+        import glob as glob_module
+
+        shard_files = glob_module.glob(os.path.join(save_path, "shard-*.safetensors"))
+        for shard_file in shard_files:
+            os.remove(shard_file)
+        if shard_files:
+            logger.info(f"Cleaned up {len(shard_files)} shard files from {save_path}")
 
     # Save model assets (config, tokenizer, etc.) on rank 0
     if model_assets and is_rank_0:
