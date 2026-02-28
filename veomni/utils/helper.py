@@ -26,7 +26,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
 import psutil
@@ -36,19 +36,18 @@ import torch.nn as nn
 import transformers
 from transformers import set_seed as set_seed_func
 
-from veomni.distributed.parallel_state import get_parallel_state
-from veomni.utils import logging
-from veomni.utils.count_flops import VeomniFlopsCounter
-from veomni.utils.device import (
+from ..distributed.parallel_state import get_parallel_state
+from . import logging
+from .count_flops import VeomniFlopsCounter
+from .device import (
     IS_CUDA_AVAILABLE,
     IS_NPU_AVAILABLE,
     get_device_type,
     get_torch_device,
 )
-from veomni.utils.dist_utils import all_reduce
-from veomni.utils.seqlen_pos_transform_utils import culen2len, pos2culen
-
+from .dist_utils import all_reduce
 from .multisource_utils import parse_multisource_config
+from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
 
 
 try:
@@ -84,34 +83,39 @@ logger = logging.get_logger(__name__)
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "veomni")))
 
 
-def _compute_seqlens(
-    micro_batch: Dict[str, "torch.Tensor"], rmpad: bool, rmpad_with_pos_ids: bool, enable_multisource: bool
-) -> Tuple[List[int], Optional[List[int]]]:
-    """
-    Computes the sequence lengths of the current batch.
-
-    Args:
-        micro_batch (Dict[str, Tensor]): The current batch.
-        rmpad (bool): Whether to remove the padding tokens.
-        rmpad_with_pos_ids (bool): Whether to remove the padding tokens using the position ids.
-        enable_multisource (bool): Whether to enable the multi-source dataloader.
-    """
-    attention_mask = micro_batch["attention_mask"]
-    if rmpad:
-        seqlens = culen2len(micro_batch["cu_seqlens"]).tolist()
-        seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
-    elif rmpad_with_pos_ids:
-        seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-        # seqlen is the last dim of position_ids: 3, 1, seqlen for qwenvl; 1, seqlen for llm
-        seqlens = seqlens[:-1] if (micro_batch["position_ids"][..., -seqlens[-1] :] == 0).all().item() else seqlens
+def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    if "cu_seq_lens_q" in micro_batch:
+        # packed micro batch
+        seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        return seqlens
     else:
-        seqlens = attention_mask.sum(-1).tolist()
+        # unpacked sample
+        attention_mask = micro_batch["attention_mask"]
+        seqlens = attention_mask.sum().item()
+        return [seqlens]
 
-    ds_idx = None
-    if enable_multisource:
-        ds_idx = micro_batch["ds_idx"].tolist()
 
-    return seqlens, ds_idx
+def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    image_shape_keys = ["image_grid_thw", "video_grid_thw", "audio_grid_thw"]
+    image_seqlens = []
+    for key in image_shape_keys:
+        if key in micro_batch:
+            grid_thw = micro_batch[key]
+            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
+            image_seqlens.extend(seqlens)
+    return image_seqlens
+
+
+def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    ds_idx = micro_batch.pop("ds_idx")
+    micro_batch.pop("source_name", None)
+    micro_batch.pop("cur_token_num", None)
+    if isinstance(ds_idx, torch.Tensor):
+        # packed micro batch
+        return ds_idx.tolist()
+    else:
+        # unpacked sample
+        return [ds_idx]
 
 
 class EnvironMeter:
@@ -121,8 +125,6 @@ class EnvironMeter:
     Args:
         config (PretrainedConfig): The configuration of the model.
         global_batch_size (int): The global batch size.
-        rmpad (bool, optional): Whether to remove the padding tokens. Defaults to False.
-        rmpad_with_pos_ids (bool, optional): Whether to remove the padding tokens using the position ids. Defaults to False.
         enable_multisource (bool, optional): Whether to enable the multi-source dataloader. Defaults to False.
         dataloader (DataLoader, optional): The training dataloader for multi-source dataloader. Defaults to None.
         data_path (str, optional): The data path for multi-source dataloader. Defaults to "".
@@ -133,8 +135,6 @@ class EnvironMeter:
         self,
         config: "PretrainedConfig",
         global_batch_size: int,
-        rmpad: bool = False,
-        rmpad_with_pos_ids: bool = False,
         enable_multisource: bool = False,
         dataloader: Optional["DataLoader"] = None,
         data_path: str = "",
@@ -143,13 +143,12 @@ class EnvironMeter:
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
-        self.rmpad = rmpad
-        self.rmpad_with_pos_ids = rmpad_with_pos_ids
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
         self.world_size = dist.get_world_size()
         self.consume_tokens = 0
+        self.consume_chunks = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
@@ -172,7 +171,7 @@ class EnvironMeter:
             gc.disable()
 
     def state_dict(self) -> Dict[str, Any]:
-        state_dict = {"consume_tokens": self.consume_tokens}
+        state_dict = {"consume_tokens": self.consume_tokens, "consume_chunks": self.consume_chunks}
         if self.enable_multisource:
             state_dict.update({"multisource_tracker": self.multisource_tracker.state_dict()})
 
@@ -180,32 +179,22 @@ class EnvironMeter:
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.consume_tokens = state_dict["consume_tokens"]
+        self.consume_chunks = state_dict["consume_chunks"]
         if self.enable_multisource:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
-    def add(self, micro_batch: Dict[str, "torch.Tensor"]) -> None:
-        seqlens, ds_idx = _compute_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids, self.enable_multisource)
-
-        if "image_grid_thw" in micro_batch:
-            image_grid_thw = micro_batch["image_grid_thw"]
-            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
-            self.images_seqlens.extend(images_seqlens.tolist())
-
-        if "image_grid_hw" in micro_batch:
-            image_grid_hw = micro_batch["image_grid_hw"]
-            images_seqlens = torch.repeat_interleave(image_grid_hw[:, 1], image_grid_hw[:, 0])
-            self.images_seqlens.extend(images_seqlens.tolist())
-
-        if "video_grid_thw" in micro_batch:
-            video_grid_thw = micro_batch["video_grid_thw"]
-            video_seqlens = torch.repeat_interleave(video_grid_thw[:, 1] * video_grid_thw[:, 2], video_grid_thw[:, 0])
-            self.images_seqlens.extend(video_seqlens.tolist())  # video equals to image
-
-        if self.enable_multisource:
-            self.batch_seqlens.extend(seqlens[: len(ds_idx)])  # rmpad_with_pos_ids has a pad item
-            self.batch_ds_idx.extend(ds_idx)
+    def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
+        if isinstance(micro_batch, List):
+            for sample in micro_batch:
+                self.batch_seqlens.extend(_compute_seqlens(sample))
+                self.images_seqlens.extend(_compute_image_seqlens(sample))
+                if self.enable_multisource:
+                    self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
         else:
-            self.batch_seqlens.extend(seqlens)
+            self.batch_seqlens.extend(_compute_seqlens(micro_batch))
+            self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
+            if self.enable_multisource:
+                self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0:
@@ -214,7 +203,6 @@ class EnvironMeter:
             )
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
-
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
@@ -228,6 +216,7 @@ class EnvironMeter:
         avg_sample_seq_len = batch_tokens / real_global_batch_size
         tokens_per_second = batch_tokens / delta_time
         self.consume_tokens += batch_tokens
+        self.consume_chunks += real_global_batch_size
 
         # cuda memory
         allocated_memory = get_torch_device().max_memory_allocated()
@@ -249,6 +238,7 @@ class EnvironMeter:
             "tokens_per_second(M)": tokens_per_second / 1e6,
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
+            "consumed_chunk_num": self.consume_chunks,
             "max_memory_allocated(GB)": allocated_memory / (1024**3),
             "max_memory_reserved(GB)": reserved_memory / (1024**3),
             "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),

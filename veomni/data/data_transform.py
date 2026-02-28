@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
-from veomni.data.constants import IGNORE_INDEX
+from veomni.utils.constants import IGNORE_INDEX
 
 
 if TYPE_CHECKING:

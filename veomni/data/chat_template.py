@@ -20,8 +20,8 @@ import torch
 
 from veomni.utils import logging
 
+from ..utils.constants import IGNORE_INDEX
 from ..utils.registry import Registry
-from .constants import IGNORE_INDEX
 
 
 if TYPE_CHECKING:

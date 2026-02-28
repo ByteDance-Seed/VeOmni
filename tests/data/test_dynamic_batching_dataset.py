@@ -46,10 +46,10 @@ from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
 from utils import DummyIterableDataset, DummyMappingDataset, FakeModel
 
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader
-from veomni.data.data_collator import DataCollatorWithPositionIDs
+from veomni.data.data_collator import MainCollator
 from veomni.data.dynamic_batching import DynamicBatchingSizeDataset
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
@@ -89,7 +89,7 @@ def setup_dynamic_batching_dataset():
         dataset=iterable_dataset,
         micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
         ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dynamic_batching_collate_fn=DataCollatorWithPositionIDs(),
+        dynamic_batching_collate_fn=MainCollator(),
         get_length_fn=get_length_fn,
     )
 
@@ -124,7 +124,7 @@ def test_dynamic_batching_basic(shuffle, seed):
     iterable_ds = DummyIterableDataset(mapping_ds, shuffle=shuffle, seed=seed)
 
     # Create data collator
-    collator = DataCollatorWithPositionIDs()
+    collator = MainCollator()
 
     # Create dynamic batching dataset
     dynamic_ds = DynamicBatchingSizeDataset(
@@ -264,7 +264,7 @@ def test_dynamic_batching_without_get_item():
             dataset=iterable_dataset,
             micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
             ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-            dynamic_batching_collate_fn=DataCollatorWithPositionIDs(),
+            dynamic_batching_collate_fn=MainCollator(),
             get_length_fn=get_length_fn,
             save_by_idx=True,
         )
@@ -288,7 +288,7 @@ def test_save_load_state_dict(save_by_idx):
         dataset=iterable_ds,
         micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
         ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dynamic_batching_collate_fn=DataCollatorWithPositionIDs(),
+        dynamic_batching_collate_fn=MainCollator(),
         get_length_fn=get_length_fn,
         save_by_idx=save_by_idx,
     )
@@ -312,7 +312,7 @@ def test_save_load_state_dict(save_by_idx):
         dataset=iterable_ds2,
         micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
         ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dynamic_batching_collate_fn=DataCollatorWithPositionIDs(),
+        dynamic_batching_collate_fn=MainCollator(),
         get_length_fn=get_length_fn,
         save_by_idx=save_by_idx,
     )
@@ -390,8 +390,6 @@ def build_command(shuffle=True, save_by_idx=True):
         "--train.data_parallel_mode=ddp",
         "--train.ckpt_manager=dcp",
         "--train.output_dir=.tests/cache",
-        "--train.rmpad=false",
-        "--train.rmpad_with_pos_ids=true",
         "--train.dyn_bsz=true",
         "--dyn_bsz_in_dataloader=false",
         f"--save_by_idx={str(save_by_idx).lower()}",
@@ -401,7 +399,7 @@ def build_command(shuffle=True, save_by_idx=True):
 
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     """
     Container for training arguments.
 
@@ -491,10 +489,9 @@ def _run_distributed_test():
 
     # Compute train_steps based on dataset size
     dataset_length = len(mapping_dataset)
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
-    train_steps = args.train.train_steps
+    args.compute_train_steps(dataset_length)
+    train_steps = args.train_steps
 
-    # Build dataloader using build_dataloader(disabling rmpad and dyn_bsz to avoid using DynamicBatchSizeDataLoader)
     dataloader = build_dataloader(
         dataloader_type="native",
         dataset=iterable_dataset,
@@ -503,11 +500,9 @@ def _run_distributed_test():
         dataloader_batch_size=args.train.dataloader_batch_size,
         max_seq_len=args.data.max_seq_len,
         train_steps=train_steps,
-        rmpad=args.train.rmpad,
         dyn_bsz=args.train.dyn_bsz,
         dyn_bsz_in_dataloader=test_args.dyn_bsz_in_dataloader,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         dyn_bsz_buffer_size=READY_FOR_MICRO_BATCH_THRESHOLD,
         dyn_bsz_dataset_save_by_idx=test_args.save_by_idx,
         num_workers=2,
@@ -520,8 +515,6 @@ def _run_distributed_test():
     environ_meter = helper.EnvironMeter(
         config=config,
         global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
     )
 

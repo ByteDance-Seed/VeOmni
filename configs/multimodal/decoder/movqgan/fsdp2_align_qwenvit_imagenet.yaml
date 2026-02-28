@@ -14,7 +14,6 @@ data:
 train:
   output_dir: movqgan_align_qwenvit_imagenet
   data_parallel_mode: fsdp2
-  rmpad: false
   lr: 1.0e-4
   lr_decay_style: constant
   num_train_epochs: 40

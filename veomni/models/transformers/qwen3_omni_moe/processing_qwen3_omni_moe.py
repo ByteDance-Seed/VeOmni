@@ -16,6 +16,9 @@
 Processor class for Qwen3OmniMoe.
 """
 
+import re
+
+import numpy as np
 import transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe as hf_qwen3_omni_moe
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
@@ -32,8 +35,7 @@ from transformers.video_utils import make_batched_videos
 # Patch: Qwen3OmniMoeProcessor
 # 1. Use truthy check `if audio:` instead of `if audio is not None:`
 #    to properly handle empty lists from VeOmni data format
-# 2. Accept `audios` (qwen2_5_omni style) and `input_audios` (VeOmni data pipeline)
-#    as aliases for `audio`, must be popped before `_merge_kwargs` to avoid unknown kwarg warning
+# 2. Accept veomni multimodal data format: `audios``
 # ================================================================
 class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
     def __call__(
@@ -41,16 +43,13 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
         text=None,
         images=None,
         videos=None,
-        audio=None,
+        # --- Patch.2 ---
+        audios=None,
+        # --- Patch.2 ---
         **kwargs,
     ) -> BatchFeature:
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
-
-        # Accept `audios` and `input_audios` as aliases for `audio`.
-        # Must be popped before `_merge_kwargs` to avoid unknown kwarg warning.
-        if audio is None:
-            audio = kwargs.pop("audios", None) or kwargs.pop("input_audios", None)
 
         output_kwargs = self._merge_kwargs(
             Qwen3OmniMoeProcessorKwargs,
@@ -60,13 +59,20 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
 
         seconds_per_chunk = output_kwargs["videos_kwargs"].pop("seconds_per_chunk")
         position_id_per_seconds = output_kwargs["videos_kwargs"].pop("position_id_per_seconds")
-        use_audio_in_video = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
         fps = output_kwargs["videos_kwargs"].get("fps", 1.0)
 
+        # --- Patch.2 ---
+        _ = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
+        # --- Patch.2 ---
+
         # Modification: use truthy check instead of `is not None`
-        if audio:
-            output_kwargs["audio_kwargs"]["padding"] = True
-            audio_inputs = self.feature_extractor(audio, **output_kwargs["audio_kwargs"])
+        if audios:
+            # --- Patch.2 ---
+            output_kwargs["audio_kwargs"]["padding"] = "max_length"
+            audios = [audio if audio is not None else np.zeros((0,)) for audio in audios]
+            # --- Patch.2 ---
+
+            audio_inputs = self.feature_extractor(audios, **output_kwargs["audio_kwargs"])
             audio_inputs["feature_attention_mask"] = audio_inputs.pop("attention_mask")
             audio_inputs["input_features"] = audio_inputs.pop("input_features")
             audio_lengths = iter(_get_feat_extract_output_lengths(audio_inputs["feature_attention_mask"].sum(-1)))
@@ -106,7 +112,6 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
             image_grid_thw,
             video_grid_thw,
             video_second_per_grid=video_second_per_grid,
-            use_audio_in_video=use_audio_in_video,
             position_id_per_seconds=position_id_per_seconds,
             seconds_per_chunk=seconds_per_chunk,
         )
@@ -117,6 +122,93 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
             data={**texts_inputs, **images_inputs, **videos_inputs, **audio_inputs},
             tensor_type=kwargs.get("return_tensors"),
         )
+
+    def replace_multimodal_special_tokens(
+        self,
+        text,
+        audio_lengths,
+        image_grid_thw,
+        video_grid_thw,
+        video_second_per_grid,
+        # --- Patch.2 ---
+        # use_audio_in_video,
+        # --- Patch.2 ---
+        position_id_per_seconds,
+        seconds_per_chunk,
+    ):
+        # Extend mm token length
+        merge_length_image = self.image_processor.merge_size**2
+        merge_length_video = self.video_processor.merge_size**2
+
+        processed_text = []
+        for sample in text:
+            positions = []
+            special_tokens = [re.escape(tok) for tok in [self.audio_token, self.image_token, self.video_token]]
+            pattern = "|".join(special_tokens)
+            positions = sorted([(match.start(), match.group()) for match in re.finditer(pattern, sample)])
+            positions.sort(key=lambda x: x[0])
+
+            for _, special_token in positions:
+                if special_token == self.audio_token:
+                    sample = sample.replace(self.audio_token, "<|audio_placeholder|>" * next(audio_lengths), 1)
+                elif special_token == self.image_token:
+                    image_seq_length = next(image_grid_thw).prod() // merge_length_image
+                    sample = sample.replace(self.image_token, "<|image_placeholder|>" * image_seq_length, 1)
+                elif special_token == self.video_token:
+                    # --- Patch.2 ---
+                    audio_length = next(audio_lengths)
+                    use_audio_in_video = audio_length != 0
+                    # --- Patch.2 ---
+
+                    if not use_audio_in_video:
+                        video_seq_length = next(video_grid_thw).prod() // merge_length_video
+                        sample = sample.replace(self.video_token, "<|video_placeholder|>" * video_seq_length, 1)
+                    else:
+                        # --- Patch.2 ---
+                        audio_token_indices = np.arange(audio_length)
+                        # --- Patch.2 ---
+                        curr_video_grid_thw = next(video_grid_thw)
+                        height = curr_video_grid_thw[1] // self.video_processor.merge_size
+                        width = curr_video_grid_thw[2] // self.video_processor.merge_size
+                        video_token_indices = np.arange(curr_video_grid_thw[0]).reshape(-1, 1, 1)
+                        video_token_indices = np.broadcast_to(
+                            video_token_indices, (video_token_indices.shape[0], height, width)
+                        ).reshape(-1)
+                        video_token_indices = (
+                            video_token_indices * next(video_second_per_grid) * position_id_per_seconds
+                        )
+
+                        video_data_index, audio_data_index = 0, 0
+                        placeholder_string = self.vision_bos_token + self.audio_bos_token
+                        while video_data_index < len(video_token_indices) and audio_data_index < len(
+                            audio_token_indices
+                        ):
+                            if video_token_indices[video_data_index] <= audio_token_indices[audio_data_index]:
+                                placeholder_string += "<|video_placeholder|>"
+                                video_data_index += 1
+                            else:
+                                placeholder_string += "<|audio_placeholder|>"
+                                audio_data_index += 1
+                        if video_data_index < len(video_token_indices):
+                            placeholder_string += "<|video_placeholder|>" * (
+                                len(video_token_indices) - video_data_index
+                            )
+                        if audio_data_index < len(audio_token_indices):
+                            placeholder_string += "<|audio_placeholder|>" * (
+                                len(audio_token_indices) - audio_data_index
+                            )
+                        placeholder_string += self.audio_eos_token + self.vision_eos_token
+                        sample = sample.replace(
+                            self.vision_bos_token + self.video_token + self.vision_eos_token,
+                            placeholder_string,
+                            1,
+                        )
+
+            sample = sample.replace("<|audio_placeholder|>", self.audio_token)
+            sample = sample.replace("<|image_placeholder|>", self.image_token)
+            sample = sample.replace("<|video_placeholder|>", self.video_token)
+            processed_text.append(sample)
+        return processed_text
 
 
 def apply_veomni_qwen3_omni_moe_patch():
