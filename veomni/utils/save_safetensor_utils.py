@@ -99,6 +99,7 @@ class _TimedHuggingFaceStorageWriter:
 
     def finish(self, metadata, results):
         rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.info(f"[Rank {rank}] Start consolidation")
         start = time.time()
         result = super().finish(metadata=metadata, results=results)
         elapsed = time.time() - start
@@ -187,12 +188,12 @@ def _save_hf_safetensor_distributed(
     if model_assets and is_rank_0:
         save_model_assets(save_path, model_assets)
 
-    logger.info_rank0(f"HuggingFace checkpoint saved at {save_path} successfully!")
-
     # Ensure all ranks wait for rank 0 to finish before proceeding.
     if gloo_group is not None:
         dist.barrier(group=gloo_group)
         dist.destroy_process_group(gloo_group)
+
+    logger.info_rank0(f"HuggingFace checkpoint saved at {save_path} successfully!")
 
 
 def _save_hf_safetensor_legacy(
