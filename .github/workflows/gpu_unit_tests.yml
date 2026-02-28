@@ -95,6 +95,14 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
+      - name: Sync dependencies [transformers-v5]
+        run: |
+          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
+      - name: Run models tests [transformers-v5]
+        run: |
+          uv run  --frozen pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -s -x tests/models/test_models_patch.py
+      # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:
     runs-on: ubuntu-latest
