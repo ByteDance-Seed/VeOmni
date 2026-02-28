@@ -39,7 +39,7 @@ Testing in 8x80GB GPUs.
 # Note: max_seq_len is set to 128 to avoid OOM with 8x80GB GPUs since the only currently available
 # Qwen3.5 model size is 27B.
 # We recommend that you use more GPUs to train Qwen3.5 27B so that you can get a proper seq len.
-bash train.sh tasks/train_torch.py configs/sft/qwen3_5_sft.yaml \
+bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-27B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --data.max_seq_len 128 \
