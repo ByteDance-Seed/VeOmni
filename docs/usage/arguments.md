@@ -1,4 +1,3 @@
-(arguments-api-reference)=
 # Arguments API Reference
 
 ## Model configuration arguments
@@ -9,9 +8,11 @@
 | model.tokenizer_path | str | Path to the tokenizer | model.model_path |
 | model.encoders | dict | Configuration file for multi-modal encoders | {} |
 | model.decoders | dict | Configuration file for multi-modal decoders | {} |
-| model.input_encoder | str: {"encoder", "decoder"} | Use the encoder of the encoder or decoder to encode the input image | encoder |
-| model.output_encoder | str: {"encoder", "decoder"} | Use the encoder of the encoder or decoder to encode the output image | decoder |
-| model.encode_target | bool | Used to encode the training data for the diffusion model | False |
+| model.input_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the input image | encoder |
+| model.output_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the output image | decoder |
+| model.encode_target | bool | Whether to encode the training data for the diffusion model | False |
+| model.encoder_data_balance | bool | Whether to balance encoder data (currently supported only for the Qwen3-VL MoE model) | False |
+| model.encoder_data_balance_sorting_algo | str | The sorting algorithm of encoder data balance | post_mbs_balancing_greedy_without_pad |
 
 ## Data configuration arguments
 
@@ -19,8 +20,8 @@
 | --- | --- | --- | --- |
 | data.train_path | str | Path of training dataset | Required |
 | data.train_size | int | Total number of tokens in the training set | 10,000,000 |
-| data.data_type | str: {"plaintext", "conversation"} | Dataset type.  | conversation |
-| data.dataloader_type | str: {"native"} | Use the pytorch dataloader or  | native |
+| data.data_type | str: {"plaintext", "conversation", "classification"} | Dataset type.  | conversation |
+| data.dataloader_type | str: {"native"} | Type of the dataloader | native |
 | data.datasets_type | str: {"mapping", "iterable"} | Dataset type. `IterativeDataset` or `MappingDataset`, or your custom datsets | mapping |
 | data.text_keys | str: {"content_split", "messages"} | The key corresponding to the text samples in the data dictionary. Generally, it is "content_split" for pretraining and "messages" for SFT. | content_split |
 | data.image_keys | str | The key corresponding to the image samples in the data dictionary. Generally, it is "images". | images |
@@ -74,6 +75,7 @@
 | train.use_wandb | bool | Whether to enable byted wandb experiment logging.                                                                                                                              | False |
 | train.wandb_project | str | Name of the wandb experiment project.                                                                                                                                          | VeOmni |
 | train.wandb_name | str | Name of the wandb experiment.                                                                                                                                                  | None |
+| train.wandb_id | str | Wandb run ID for resuming a previous run. When specified, training logs will continue in the existing wandb run.                                                              | None |
 | train.enable_profiling | bool | Whether to use torch profiling.                                                                                                                                                | False |
 | train.profile_start_step | int | Starting step of profiling.                                                                                                                                                    | 1 |
 | train.profile_end_step | int | Ending step of profiling.                                                                                                                                                      | 2 |

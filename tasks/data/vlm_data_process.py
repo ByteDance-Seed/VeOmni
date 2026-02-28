@@ -5,71 +5,28 @@ This module provides process_sample functions for different VLM variants,
 extracted from training scripts for better extensibility and reusability.
 
 Functions:
-    prepare_fa_kwargs_from_position_ids: Prepare flash attention kwargs for varlen attention
     process_sample_qwen2_5_vl: Process samples for Qwen2.5-VL models
     process_sample_qwen3_vl: Process samples for Qwen3-VL models
+    get_omni_token_ids: Resolve image/video/audio pad token IDs from processor vocab
+    process_sample_qwen_omni: Process samples for Qwen2.5-Omni and Qwen3-Omni-MoE models
 """
 
-import time
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
+import numpy as np
 import torch
 
-from veomni.data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.data.multimodal import conv_preprocess
+from veomni.data.multimodal.audio_utils import fetch_audios
 from veomni.data.multimodal.image_utils import fetch_images
-from veomni.data.multimodal.video_utils import fetch_videos
+from veomni.data.multimodal.video_utils import fetch_videos, fetch_videos_metadata
 
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
     from veomni.data.chat_template import ChatTemplate
-
-
-def prepare_fa_kwargs_from_position_ids(position_ids: torch.Tensor):
-    """
-    Prepare-compute flash attention kwargs from position_ids for varlen flash attention.
-
-    Qwen2.5-VL and Qwen3-VL note:
-    - The model uses 3-D position ids (temporal, height, width) for vision tokens.
-    Here we rely ONLY on the temporal channel semantics: within a single sequence,
-    temporal ids are nondecreasing; when a new sequence begins, the temporal id
-    resets and strictly drops (e.g., ... 100, 100, 101 | 0, 0, 0, 50, 50, ...).
-    - Vision frames at the start of a sequence often share the same temporal id (many
-    leading 0s). We DO NOT detect starts by "id == 0". Instead, we detect starts by
-    a strict drop between adjacent tokens: pos[i] > pos[i+1] ⇒ i+1 is a new seq head.
-    This works even if a sequence begins with many zeros.
-    - Assumption: Each concatenated sequence has at least two items (text/image/video),
-    so that a reset (drop) or a proper length can be inferred.
-    """
-    # Flatten to 1-D over the token dimension; the upstream caller must ensure that
-    # this tensor corresponds to the temporal ids (or an equivalent 1-D monotone id).
-    position_ids = position_ids.flatten()
-
-    # Find boundaries where the temporal id strictly drops. Each drop marks the start
-    # index of a NEW sequence within the concatenated batch stream.
-    # Example: [0,0,0,50,50,100,100, 0,0,50] → drop at the transition 100→0
-    seq_starts = torch.where(position_ids[:-1] > position_ids[1:])[0] + 1
-
-    # Build cu_seq_lens (cumulative sequence lengths): always start at 0 and end at N.
-    # We insert all detected start indices in order. This matches FlashAttention's varlen format.
-    cu_seq_lens = torch.cat(
-        (
-            torch.tensor([0], device=position_ids.device, dtype=torch.int32),
-            seq_starts.to(torch.int32),
-            torch.tensor([position_ids.size(0)], device=position_ids.device, dtype=torch.int32),
-        )
-    )
-
-    max_length = cu_seq_lens.diff().max().item()  # use cu_seq_lens to infer max_length, convert to int
-
-    return {
-        "cu_seq_lens_q": cu_seq_lens,
-        "cu_seq_lens_k": cu_seq_lens,
-        "max_length_q": max_length,
-        "max_length_k": max_length,
-    }
 
 
 def process_sample_qwen2_5_vl(
@@ -82,35 +39,34 @@ def process_sample_qwen2_5_vl(
     """
     Processes multimodal example with qwen2_5_vl's pre-processor.
     """
-    record_process_time = kwargs.get("record_process_time", False)
-    if record_process_time:
-        start_time = time.time()
 
     source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
+        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
-    if "images" in sample:
+    if "images" in sample and sample["images"]:
         images = fetch_images(sample["images"], **kwargs)
         image_inputs = processor.image_processor(images=images, return_tensors="pt")
         image_grid_thw = image_inputs["image_grid_thw"]
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
-    if "videos" in sample:
+    if "videos" in sample and sample["videos"]:
         videos, _ = fetch_videos(sample["videos"], **kwargs)
-        video_inputs = processor.image_processor(images=None, videos=videos, return_tensors="pt")
+        video_inputs = processor.video_processor(videos=videos, return_tensors="pt")
         video_grid_thw = video_inputs["video_grid_thw"]
-        merge_length = processor.image_processor.merge_size**2
+        merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["video"] = video_token_num
 
     tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
-    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+    tokenized_example = {
+        k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
+    }
     input_ids = tokenized_example["input_ids"]
 
     tokenized_example["position_ids"] = position_id_func(
@@ -128,10 +84,6 @@ def process_sample_qwen2_5_vl(
     tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
-
-    if record_process_time:
-        process_time = time.time() - start_time
-        tokenized_example["process_sample_time_sec"] = process_time
 
     return [tokenized_example]
 
@@ -144,46 +96,63 @@ def process_sample_qwen3_vl(
     **kwargs,
 ):
     """
-    Processes multimodal example with qwen3_vl's pre-processor.
+    Processes a multimodal example using the Qwen3-VL pre-processor.
     """
-    record_process_time = kwargs.get("record_process_time", False)
-    if record_process_time:
-        start_time = time.time()
 
     source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source"]
-    )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
+        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+    )  # 'source_name' is used if using a multisource dataset
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
-    if "images" in sample:
+
+    tokenized_example = {}
+    if "images" in sample and sample["images"]:
         images = fetch_images(sample["images"], **kwargs)
         image_inputs = processor.image_processor(images=images, return_tensors="pt")
         image_grid_thw = image_inputs["image_grid_thw"]
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
-    if "videos" in sample:
-        videos, _ = fetch_videos(sample["videos"], **kwargs)
-        video_inputs = processor.video_processor(images=None, videos=videos, return_tensors="pt")
+        tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
+    if "videos" in sample and sample["videos"]:
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        # Process videos without resizing or sampling frames initially
+        video_inputs = processor.video_processor(
+            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
+        )
         video_grid_thw = video_inputs["video_grid_thw"]
         merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["video"] = video_token_num
 
-    tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
-    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
-    input_ids = tokenized_example["input_ids"]
+        # Extract metadata for use in the chat template
+        video_metadata = video_inputs.pop("video_metadata")
 
+        # Uses Qwen3-VL chat template encoding with video metadata
+        tokenized_example = chat_template.encode_messages(
+            conversations, token_num_inputs, video_metadata=video_metadata
+        )
+
+    if not tokenized_example:
+        tokenized_example = chat_template.encode_messages(conversations)
+
+    # Ensure all values are tensors
+    tokenized_example = {
+        k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
+    }
+
+    # Generate 3D position IDs and squeeze for the collator
+    input_ids = tokenized_example["input_ids"]
     tokenized_example["position_ids"] = position_id_func(
         input_ids=input_ids.unsqueeze(0),
         image_grid_thw=image_grid_thw,
         video_grid_thw=video_grid_thw,
         attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
-    )["position_ids"]  # (dim, 1, seq_length)
-    # Squeezed to (dim, seq_len) for later collator processing
+    )["position_ids"]  # Returns (dim, 1, seq_length)
+
     tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
 
     tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
@@ -193,8 +162,202 @@ def process_sample_qwen3_vl(
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
 
-    if record_process_time:
-        process_time = time.time() - start_time
-        tokenized_example["process_sample_time_sec"] = process_time
-
     return [tokenized_example]
+
+
+QWEN_OMNI_SYSTEM_MESSAGE = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating text and speech."
+)
+
+
+def get_omni_token_ids(processor: "ProcessorMixin") -> tuple[int, int, int]:
+    """
+    Resolve (image_token_id, video_token_id, audio_token_id) by reading from the processor's
+    tokenizer vocab. Supports both Qwen2.5-Omni and Qwen3-Omni-MoE:
+      Qwen2.5-Omni:   image=151655 (<|IMAGE|>),     video=151656 (<|VIDEO|>),     audio=151646 (<|AUDIO|>)
+      Qwen3-Omni-MoE: image=151655 (<|image_pad|>), video=151656 (<|video_pad|>), audio=151675 (<|audio_pad|>)
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    vocab = tokenizer.get_vocab()
+    # Qwen2.5-Omni uses <|IMAGE|>/<|VIDEO|>/<|AUDIO|>; https://huggingface.co/Qwen/Qwen2.5-Omni-7B/blob/main/tokenizer_config.json
+    # Qwen3-Omni uses <|image_pad|>/<|video_pad|>/<|audio_pad|>; https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
+    image_token_id = vocab.get("<|image_pad|>", vocab.get("<|IMAGE|>"))
+    video_token_id = vocab.get("<|video_pad|>", vocab.get("<|VIDEO|>"))
+    audio_token_id = vocab.get("<|audio_pad|>", vocab.get("<|AUDIO|>"))
+    if image_token_id is None:
+        raise ValueError("Cannot find image token (<|image_pad|> or <|IMAGE|>) in tokenizer vocab.")
+    if video_token_id is None:
+        raise ValueError("Cannot find video token (<|video_pad|> or <|VIDEO|>) in tokenizer vocab.")
+    if audio_token_id is None:
+        raise ValueError("Cannot find audio token (<|audio_pad|> or <|AUDIO|>) in tokenizer vocab.")
+    return image_token_id, video_token_id, audio_token_id
+
+
+def _process_sample_omni(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    position_id_func: "Callable",
+    image_token_id: int,
+    video_token_id: int,
+    audio_token_id: int,
+    **kwargs,
+) -> list[Dict[str, Any]]:
+    """
+    Shared implementation for Omni model sample processing (Qwen2.5-Omni and Qwen3-Omni-MoE).
+    Token IDs for image/video/audio placeholders are passed explicitly to support
+    different tokenizer vocabs across model versions.
+    """
+    source = (
+        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+    )  # source_name if use multisource_dataset
+    conversations = (
+        sample["conversations"] if ("conversations" in sample and len(sample["conversations"]) > 0) else sample
+    )
+    conversations = conv_preprocess(source, conversations, **kwargs)
+    input_conversations = [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": QWEN_OMNI_SYSTEM_MESSAGE,
+                },
+            ],
+        },
+    ]
+    for conversation in conversations:
+        contents = []
+        for message in conversation[1:]:
+            contents.append({"type": message[0], message[0]: message[1]})
+        tmp_conv = {
+            "role": conversation[0],
+            "content": contents,
+        }
+        input_conversations.append(tmp_conv)
+    text = processor.apply_chat_template(input_conversations, tokenize=False)
+
+    images = sample.get("images", [])
+    if images:
+        images = fetch_images(images, **kwargs)
+    else:
+        images = []
+
+    videos = sample.get("videos", [])
+    if videos:
+        videos, video_audios = fetch_videos(videos, **kwargs)
+    else:
+        videos, video_audios = [], []
+
+    audios = sample.get("audios", [])
+    if audios:
+        audio_audios = fetch_audios(audios, **kwargs)
+    else:
+        audio_audios = []
+
+    # Whisper STFT requires input length > n_fft/2 (pad=200, so need len > 200).
+    # Use n_fft=400 as the minimum safe length; pad short/empty audio with silence.
+    _WHISPER_MIN_AUDIO_LEN = 400
+
+    def _ensure_min_audio_len(audio):
+        if audio is None:
+            return np.zeros(_WHISPER_MIN_AUDIO_LEN, dtype=np.float32)
+        if len(audio) < _WHISPER_MIN_AUDIO_LEN:
+            pad_len = _WHISPER_MIN_AUDIO_LEN - len(audio)
+            audio = np.concatenate([audio, np.zeros(pad_len, dtype=audio.dtype)])
+        return audio
+
+    video_audios_iter = iter(video_audios)
+    audio_audios_iter = iter(audio_audios)
+    audios = []
+    for item in input_conversations:
+        for content in item["content"]:
+            if content["type"] == "video":
+                audios.append(_ensure_min_audio_len(next(video_audios_iter)))
+            elif content["type"] == "audio":
+                audios.append(_ensure_min_audio_len(next(audio_audios_iter)))
+
+    model_inputs = processor(
+        text=text,
+        audios=audios,
+        images=images,
+        videos=videos,
+        return_tensors="pt",
+        padding=True,
+    )
+    model_inputs = model_inputs.data  # batch_feature to dict
+    # process audio inputs:
+    input_features = model_inputs.pop("input_features", None)
+    feature_attention_mask = model_inputs.pop("feature_attention_mask", None)
+    if feature_attention_mask is not None:
+        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+        valid_mask = audio_feature_lengths != 0  # filter videos without audios
+        input_features = input_features[valid_mask].permute(0, 2, 1)[
+            feature_attention_mask[valid_mask].bool()
+        ]  # l, dim
+
+        model_inputs["input_features"] = input_features
+        model_inputs["audio_feature_lengths"] = audio_feature_lengths
+    else:
+        audio_feature_lengths = None  # no video & no audio
+
+    input_ids = model_inputs["input_ids"].squeeze(0)
+    image_mask = input_ids == image_token_id
+    video_mask = input_ids == video_token_id
+    audio_mask = input_ids == audio_token_id
+    input_ids[image_mask] = IMAGE_INPUT_INDEX
+    input_ids[video_mask] = VIDEO_INPUT_INDEX
+    input_ids[audio_mask] = AUDIO_INPUT_INDEX
+
+    model_inputs["position_ids"] = position_id_func(
+        input_ids=input_ids.unsqueeze(0),
+        image_grid_thw=model_inputs.get("image_grid_thw", None),
+        video_grid_thw=model_inputs.get("video_grid_thw", None),
+        attention_mask=model_inputs["attention_mask"],
+        audio_seqlens=audio_feature_lengths,
+        second_per_grids=model_inputs.pop("video_second_per_grid", None),
+    )["position_ids"]  # (dim, l)
+
+    model_inputs["position_ids"] = model_inputs["position_ids"].clone()
+    model_inputs["image_mask"] = image_mask
+    model_inputs["video_mask"] = video_mask
+    model_inputs["audio_mask"] = audio_mask
+    input_ids[image_mask | video_mask | audio_mask] = 0
+    model_inputs["input_ids"] = input_ids
+    model_inputs["attention_mask"] = model_inputs["attention_mask"].squeeze(0)
+
+    labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
+    tokenizer = getattr(processor, "tokenizer", processor)
+    vocab = tokenizer.get_vocab()
+    user_token_id = vocab.get("user")
+    assistant_token_id = vocab.get("assistant")
+    if user_token_id is None or assistant_token_id is None:
+        raise ValueError("Cannot find user/assistant tokens in tokenizer vocab.")
+    user_start_index = torch.where(input_ids == user_token_id)[0].tolist()
+    assistant_start_index = torch.where(input_ids == assistant_token_id)[0].tolist()
+    user_start_index.append(len(input_ids) + 1)
+    user_i = 0
+    for assis_i in assistant_start_index:
+        while user_start_index[user_i] < assis_i:
+            user_i += 1
+        labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
+    model_inputs["labels"] = labels
+    return [model_inputs]
+
+
+def process_sample_qwen_omni(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    position_id_func: "Callable",
+    **kwargs,
+):
+    """
+    Processes multimodal example for Qwen-Omni family models (Qwen2.5-Omni and Qwen3-Omni-MoE).
+    Token IDs are resolved dynamically from the processor vocab to support both variants:
+      Qwen2.5-Omni:   image=151655 (<|IMAGE|>),     video=151656 (<|VIDEO|>),     audio=151646 (<|AUDIO|>)
+      Qwen3-Omni-MoE: image=151655 (<|image_pad|>), video=151656 (<|video_pad|>), audio=151675 (<|audio_pad|>)
+    """
+    image_token_id, video_token_id, audio_token_id = get_omni_token_ids(processor)
+    return _process_sample_omni(
+        sample, processor, position_id_func, image_token_id, video_token_id, audio_token_id, **kwargs
+    )

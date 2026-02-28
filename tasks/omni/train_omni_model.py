@@ -11,7 +11,8 @@ import wandb
 from torch import distributed as dist
 from tqdm import trange
 
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     OmniDataCollatorWithPacking,
     OmniDataCollatorWithPadding,
@@ -30,10 +31,10 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 logger = helper.create_logger(__name__)
@@ -103,8 +104,12 @@ def main():
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group()
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
+
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -252,6 +257,8 @@ def main():
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        dyn_bsz=args.train.dyn_bsz,
+        pad_packed_to_length=args.train.pad_packed_to_length,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
@@ -295,6 +302,7 @@ def main():
         model,
         weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
+        enable_reshard_after_forward=args.train.enable_reshard_after_forward,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         init_device=args.train.init_device,
@@ -322,6 +330,7 @@ def main():
         lr_start=args.train.lr_start,
     )
 
+    model_assets = None
     if args.train.global_rank == 0:
         if args.train.use_wandb:
             wandb.init(
@@ -413,7 +422,18 @@ def main():
             total_losses = defaultdict(int)
             synchronize()
             start_time = time.time()
-            for micro_batch in micro_batches:
+            num_micro_steps = len(micro_batches)
+
+            for micro_step, micro_batch in enumerate(micro_batches):
+                if (
+                    args.train.data_parallel_mode == "fsdp2"
+                    and not args.train.enable_reshard_after_backward
+                    and num_micro_steps > 1
+                ):
+                    if micro_step == 0:
+                        model.set_reshard_after_backward(False)
+                    elif micro_step == num_micro_steps - 1:
+                        model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch)
                 if args.data.enable_multisource:
                     micro_batch.pop("ds_idx", None)
@@ -522,15 +542,19 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
+            ckpt_manager=args.train.ckpt_manager,
+            model_assets=model_assets,
+            train_architecture=args.train.train_architecture,
             save_checkpoint_path=save_checkpoint_path,
             output_dir=args.train.output_dir,
-            ckpt_manager=args.train.ckpt_manager,
+            is_rank_0=args.train.global_rank == 0,
+            model=model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {args.train.output_dir} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

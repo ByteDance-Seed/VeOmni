@@ -16,7 +16,9 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen3_vl")
 def register_qwen3_vl_modeling(architecture: str):
-    from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLModel
+    from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLModel, apply_veomni_qwen3vl_patch
+
+    apply_veomni_qwen3vl_patch()
 
     if "ForConditionalGeneration" in architecture:
         return Qwen3VLForConditionalGeneration

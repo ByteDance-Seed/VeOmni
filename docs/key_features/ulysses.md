@@ -45,20 +45,12 @@ Sequence Parallel (SP) serves as a prevalent strategy to handle long sequences t
 
 Suppose we have P GPUs and a sequence whose shape is [S, H], where N denotes the sequence length and d represents the hidden size (head num \* head dim). Each GPU initially holds the sequence's [S/P, H] partition. After performing an all_to_all communication, each GPU will get a head-splitting sequence whose shape is [S, H/P]. An illustration figure when P = 4 is as follows:
 
-```{image} ../assets/all_2_all.jpg
-:alt: all_to_all communication
-:width: 75%
-:align: center
-```
+![all_to_all communication](../assets/all_2_all.jpg)
 
 ### DeepSpeed-Ulysses
 We use the all_to_all based sequence parallelism which is proposed by DeepSpeed, named DeepSpeed-Ulysses.
 
-```{image} ../assets/ulysses.png
-:alt: DeepSpeed-Ulysses
-:width: 75%
-:align: center
-```
+![DeepSpeed-Ulysses](../assets/ulysses.png)
 
 (Image source: [DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models](https://arxiv.org/abs/2309.14509))
 
@@ -142,7 +134,7 @@ from veomni.distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
 )
 # Step1: Create a sequence parallel group
-# VeOmni will construct a sequence parllel group based on the parallel size
+# VeOmni will construct a sequence parallel group based on the parallel size
 
 # Step2: Shard input sequences
 # Suppose we get an input x of shape [batch_size, seq_len, dim]
@@ -162,3 +154,124 @@ loss = loss_fct(logits, labels)
 loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
 return loss
 ```
+
+## ⚡ Async Ulysses CP
+
+We also support **Async Ulysses** which further improves performance by overlapping communication and computation, reducing communication latency and improving hardware utilization.
+
+### Asynchronous Ulysses
+
+![async_ulysses](../assets/async_ulysses.jpg)
+
+VeOmni extends the original Ulysses implementation with asynchronous communication capabilities, further improving performance by overlapping communication and computation.
+
+#### Performance Benefits
+
+By overlapping communication and computation, Async Ulysses:
+- Reduces idle time during communication operations
+- Lowers end-to-end training time
+- Maintains nearly the same memory efficiency as original Ulysses
+
+#### Enabling Async Ulysses
+
+To enable Async Ulysses, simply set the `async_enabled` parameter to `True`:
+
+Notice: Async Ulysses works when `ulysses_parallel_size > 1`.
+
+```shell
+bash train.sh tasks/multimodal/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+    --train.ulysses_parallel_size 4 \
+    --train.async_enabled true
+```
+
+
+### API
+
+1. async_ulysses_qkv_projection
+
+An asynchronous method to perform QKV projection and all-to-all communication, overlapping computation and communication.
+
+```Python
+def async_ulysses_qkv_projection(
+    hidden_states: torch.Tensor,
+    seq_dimension: int,
+    head_dimension: int,
+    q_weight: torch.Tensor,
+    q_bias: Optional[torch.Tensor],
+    k_weight: torch.Tensor,
+    k_bias: Optional[torch.Tensor],
+    v_weight: torch.Tensor,
+    v_bias: Optional[torch.Tensor],
+    norm_type: Optional[str] = None,
+    norm_q_weight: Optional[torch.Tensor] = None,
+    norm_q_bias: Optional[torch.Tensor] = None,
+    norm_k_weight: Optional[torch.Tensor] = None,
+    norm_k_bias: Optional[torch.Tensor] = None,
+    normalized_shape: Optional[Union[int, torch.Size]] = None,
+    eps: float = 1e-5,
+    unpadded_dim_size: int = 0,
+    head_dim: int = 0,
+    group: Optional[ProcessGroup] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+```
+
+Args:
+- hidden_states: Input hidden states
+- seq_dimension: Sequence dimension
+- head_dimension: Head dimension
+- q_weight: Query projection weight
+- q_bias: Query projection bias
+- k_weight: Key projection weight
+- k_bias: Key projection bias
+- v_weight: Value projection weight
+- v_bias: Value projection bias
+- norm_type: Normalization type ("rmsnorm" or "layernorm")
+- norm_q_weight: Query normalization weight
+- norm_q_bias: Query normalization bias
+- norm_k_weight: Key normalization weight
+- norm_k_bias: Key normalization bias
+- normalized_shape: Normalization shape
+- eps: Normalization epsilon
+- unpadded_dim_size: Unpadded dimension size
+- head_dim: Head dimension size
+- group: Process group (optional)
+
+2. async_ulysses_output_projection
+
+An asynchronous method to perform output projection and all-to-all communication.
+
+```Python
+def async_ulysses_output_projection(
+    hidden_states: torch.Tensor,
+    seq_dimension: int,
+    head_dimension: int,
+    proj_weight: torch.Tensor,
+    proj_bias: Optional[torch.Tensor],
+    unpadded_dim_size: int = 0,
+    group: Optional[ProcessGroup] = None,
+) -> torch.Tensor
+```
+
+Args:
+- hidden_states: Input hidden states
+- seq_dimension: Sequence dimension
+- head_dimension: Head dimension
+- proj_weight: Projection weight
+- proj_bias: Projection bias
+- unpadded_dim_size: Unpadded dimension size
+- group: Process group (optional)
+
+
+### Enabling Async Ulysses
+
+To enable Async Ulysses for an existing model, you need to:
+
+1. Check if Async Ulysses is supported for your model (currently supported for Qwen3VL Dense)
+2. Set `async_enabled=True` in your training configuration
+3. Ensure you're using Flash Attention 2.0 and Ulysses Context Parallelism is **enabled**
+4. Verify that your hardware supports asynchronous operations
+
+Async Ulysses is currently available for the following models:
+- Qwen3VL Dense
+
+Support for more models will be added in future releases.

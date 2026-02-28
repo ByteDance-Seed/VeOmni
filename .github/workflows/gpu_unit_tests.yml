@@ -1,4 +1,3 @@
-
 # # Tests layout
 
 name: GPU unit tests
@@ -13,12 +12,16 @@ on:
     paths:
       - "**/*.py"
       - .github/workflows/gpu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
   pull_request:
     branches:
       - main
     paths:
       - "**/*.py"
       - .github/workflows/gpu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
@@ -30,7 +33,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_8"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
   DYNAMIC_RUNNER_ENDPOINT: "https://sd4hav466omp034ocfn0g.apigateway-cn-beijing.volceapi.com/veomni/runner"
   NCCL_DEBUG: "WARN"
 
@@ -53,22 +56,29 @@ jobs:
   gpu_unit_tests:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: setup
-    runs-on: [ "${{ needs.setup.outputs.runner-label || 'L20x8' }}" ]
+    runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
     timeout-minutes: 60 # Increase this timeout value as needed
     env:
       HF_HUB_ENABLE_HF_TRANSFER: 1
       NCCL_DEBUG: "WARN"
+      CI_SAMPLES_DIR: "/root/models/samples"
+
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-            fetch-depth: 0
+          fetch-depth: 0
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra gpu --group dev
+          uv sync --frozen --extra gpu --extra audio --group dev
       - name: Run parallel tests
+        # TODO: run all tests under tests/parallel/ulysses after we verify
+        #       tests/parallel/ulysses/test_ulysses_async.py still works
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
@@ -82,15 +92,13 @@ jobs:
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data
-
+      - name: Run ops tests
+        run: |
+          uv run --frozen pytest -s -x tests/ops
 
   cleanup:
     runs-on: ubuntu-latest
-    needs:
-      [
-        setup,
-        gpu_unit_tests,
-      ]
+    needs: [setup, gpu_unit_tests]
     if: always()
     steps:
       - id: destroy-runner

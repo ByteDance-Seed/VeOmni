@@ -9,7 +9,14 @@ import torch.nn.functional as F
 import wandb
 from tqdm import trange
 
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.arguments import (
+    DataArguments,
+    ModelArguments,
+    TrainingArguments,
+    parse_args,
+    save_args,
+)
+from veomni.checkpoint import build_checkpointer
 from veomni.data.diffusion.data_loader import build_dit_dataloader
 from veomni.data.diffusion.dataset import build_tensor_dataset
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
@@ -23,13 +30,6 @@ from veomni.models import (
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.schedulers.flow_match import FlowMatchScheduler
 from veomni.utils import helper
-from veomni.utils.arguments import (
-    DataArguments,
-    ModelArguments,
-    TrainingArguments,
-    parse_args,
-    save_args,
-)
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -40,6 +40,7 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.utils.dit_utils import EnvironMeter, save_model_weights
 from veomni.utils.lora_utils import add_lora_to_model, freeze_parameters
 from veomni.utils.recompute_utils import convert_ops_to_objects
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 logger = helper.create_logger(__name__)
@@ -92,8 +93,12 @@ def main():
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
+
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     Checkpointer = build_checkpointer(
         dist_backend=args.train.data_parallel_mode,
@@ -189,6 +194,7 @@ def main():
         model,
         weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
+        enable_reshard_after_forward=args.train.enable_reshard_after_forward,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         init_device=args.train.init_device,
@@ -318,7 +324,18 @@ def main():
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
 
-            for micro_batch in micro_batches:
+            num_micro_steps = len(micro_batches)
+
+            for micro_step, micro_batch in enumerate(micro_batches):
+                if (
+                    args.train.data_parallel_mode == "fsdp2"
+                    and not args.train.enable_reshard_after_backward
+                    and num_micro_steps > 1
+                ):
+                    if micro_step == 0:
+                        model.set_reshard_after_backward(False)
+                    elif micro_step == num_micro_steps - 1:
+                        model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch, model_type="wan")
                 latents = micro_batch["latents"].to(model.device)
                 prompt_emb = micro_batch["prompt_emb"]
@@ -417,8 +434,18 @@ def main():
                     },
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-                if args.train.global_rank == 0:
-                    save_hf_weights(args, save_checkpoint_path, model_assets)
+                hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+                save_hf_safetensor(
+                    save_hf_safetensor_path=hf_weights_path,
+                    ckpt_manager=args.train.ckpt_manager,
+                    model_assets=model_assets,
+                    train_architecture=args.train.train_architecture,
+                    save_checkpoint_path=save_checkpoint_path,
+                    output_dir=args.train.output_dir,
+                    is_rank_0=args.train.global_rank == 0,
+                    model=model,
+                    fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                )
 
         data_loader_tqdm.close()
         epoch_time = time.time() - epoch_start_time
@@ -446,8 +473,18 @@ def main():
                 },
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-            if args.train.global_rank == 0:
-                save_hf_weights(args, save_checkpoint_path, model_assets)
+            hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+            save_hf_safetensor(
+                save_hf_safetensor_path=hf_weights_path,
+                ckpt_manager=args.train.ckpt_manager,
+                model_assets=model_assets,
+                train_architecture=args.train.train_architecture,
+                save_checkpoint_path=save_checkpoint_path,
+                output_dir=args.train.output_dir,
+                is_rank_0=args.train.global_rank == 0,
+                model=model,
+                fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+            )
 
     synchronize()
     # release memory
@@ -456,23 +493,6 @@ def main():
 
     dist.barrier()
     dist.destroy_process_group()
-
-
-def save_hf_weights(args, save_checkpoint_path, model_assets):
-    hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-    model_state_dict = ckpt_to_state_dict(
-        save_checkpoint_path=save_checkpoint_path,
-        output_dir=args.train.output_dir,
-        ckpt_manager=args.train.ckpt_manager,
-    )
-    if args.train.train_architecture == "lora":
-        model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
-    save_model_weights(
-        hf_weights_path,
-        model_state_dict,
-        model_assets=model_assets,
-    )
-    logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
 
 if __name__ == "__main__":

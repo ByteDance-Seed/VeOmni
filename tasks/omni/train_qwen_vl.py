@@ -11,11 +11,11 @@ import wandb
 from tqdm import trange
 
 from tasks.data.vlm_data_process import (
-    prepare_fa_kwargs_from_position_ids,
     process_sample_qwen2_5_vl,
     process_sample_qwen3_vl,
 )
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     OmniDataCollatorWithPacking,
     OmniDataCollatorWithPadding,
@@ -28,10 +28,9 @@ from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model, build_processor, save_model_assets, save_model_weights
+from veomni.models import build_foundation_model, build_processor, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -40,18 +39,14 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 
 if TYPE_CHECKING:
     pass
 
 logger = helper.create_logger(__name__)
-
-MAX_PIXELS = 768 * 28 * 28
-ROLE_MAPPING = {
-    "human": "user",
-    "gpt": "assistant",
-}
 
 
 def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
@@ -100,11 +95,15 @@ def main():
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
+
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -128,17 +127,18 @@ def main():
         init_device=args.train.init_device,
         moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
+        encoder_data_balance=args.model.encoder_data_balance,
+        encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
     logger.info_rank0("Prepare data")
     processor = build_processor(args.model.tokenizer_path)
-    processor.image_processor.max_pixels = MAX_PIXELS
     position_id_func = model.get_position_id_func()
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
-    if model_config.model_type == "qwen2_5_vl":
+    if model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
         transform = partial(
             process_sample_qwen2_5_vl,
             processor=processor,
@@ -187,7 +187,6 @@ def main():
         seed=args.train.seed,
         **asdict(args.data),
     )
-
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
@@ -205,6 +204,8 @@ def main():
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        dyn_bsz=args.train.dyn_bsz,
+        pad_packed_to_length=args.train.pad_packed_to_length,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
@@ -224,6 +225,7 @@ def main():
         model,
         weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
+        enable_reshard_after_forward=args.train.enable_reshard_after_forward,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         init_device=args.train.init_device,
@@ -252,6 +254,7 @@ def main():
         lr_start=args.train.lr_start,
     )
 
+    model_assets = None
     if args.train.global_rank == 0:
         if args.train.use_wandb:
             wandb.init(
@@ -337,8 +340,18 @@ def main():
             synchronize()
             start_time = time.time()
             micro_batches_token_len = count_loss_token(micro_batches)
+            num_micro_steps = len(micro_batches)
 
-            for micro_batch in micro_batches:
+            for micro_step, micro_batch in enumerate(micro_batches):
+                if (
+                    args.train.data_parallel_mode == "fsdp2"
+                    and not args.train.enable_reshard_after_backward
+                    and num_micro_steps > 1
+                ):
+                    if micro_step == 0:
+                        model.set_reshard_after_backward(False)
+                    elif micro_step == num_micro_steps - 1:
+                        model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch)
                 micro_batch_token_len = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
@@ -346,20 +359,16 @@ def main():
                     micro_batch.pop("cur_token_num", None)
                     micro_batch.pop("source_name", None)
 
-                # For QwenVL: get_position_id -> (dim, 1, seq_len), then squeezed to (dim, seq_len)
-                # data collator adds batch dim -> (1, dim, seq_len) for unified SP slicing
-                # transpose back to (dim, 1, seq_len) for QwenVL compatibility
-                if micro_batch["position_ids"].shape[1] == 3:
-                    micro_batch["position_ids"] = micro_batch["position_ids"].transpose(0, 1).contiguous()
-
                 # Prepare flash attention kwargs from position_ids for both Qwen2.5-VL and Qwen3-VL
-                fa_kwargs = prepare_fa_kwargs_from_position_ids(micro_batch["position_ids"][0])
+                (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                    micro_batch["position_ids"][:, 0, :]
+                )
                 micro_batch.update(
                     dict(
-                        cu_seq_lens_q=fa_kwargs["cu_seq_lens_q"],
-                        cu_seq_lens_k=fa_kwargs["cu_seq_lens_k"],
-                        max_length_q=fa_kwargs["max_length_q"],
-                        max_length_k=fa_kwargs["max_length_k"],
+                        cu_seq_lens_q=cu_seq_lens_q,
+                        cu_seq_lens_k=cu_seq_lens_k,
+                        max_length_q=max_length_q,
+                        max_length_k=max_length_k,
                     )
                 )
 
@@ -451,16 +460,19 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0:
-        if args.train.save_hf_weights and save_checkpoint_path is not None:
-            hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-            model_state_dict = ckpt_to_state_dict(
-                save_checkpoint_path=save_checkpoint_path,
-                output_dir=args.train.output_dir,
-                ckpt_manager=args.train.ckpt_manager,
-            )
-            save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-            logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
+            ckpt_manager=args.train.ckpt_manager,
+            model_assets=model_assets,
+            train_architecture=args.train.train_architecture,
+            save_checkpoint_path=save_checkpoint_path,
+            output_dir=args.train.output_dir,
+            is_rank_0=args.train.global_rank == 0,
+            model=model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+        )
 
     dist.barrier()
     dist.destroy_process_group()

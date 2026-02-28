@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from datetime import timedelta
 from functools import partial
 from typing import Any, Dict, List
@@ -11,7 +11,9 @@ import torch.distributed as dist
 import wandb
 from tqdm import trange
 
-from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+# from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from veomni.arguments import VeOmniArguments, parse_args, save_args
+from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_chat_template,
     build_dataloader,
@@ -22,10 +24,9 @@ from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
+from veomni.models import build_foundation_model, build_tokenizer, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -35,16 +36,17 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 logger = helper.create_logger(__name__)
 
 
-@dataclass
-class Arguments:
-    model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
+# @dataclass
+# class Arguments:
+#     model: "ModelArguments" = field(default_factory=ModelArguments)
+#     data: "DataArguments" = field(default_factory=DataArguments)
+#     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
 def main():
@@ -55,17 +57,22 @@ def main():
     logger.info(f"Process_group timeout: {nccl_timeout}")
     dist.init_process_group(backend=get_dist_comm_backend(), timeout=pg_nccl_timeout)
 
-    args = parse_args(Arguments)
+    args = parse_args(VeOmniArguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
 
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
+
+    # Model checkpointer
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
     init_parallel_state(
@@ -123,8 +130,10 @@ def main():
         train_steps=args.train.train_steps,
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        dyn_bsz=args.train.dyn_bsz,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+        pad_packed_to_length=args.train.pad_packed_to_length,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
@@ -151,10 +160,11 @@ def main():
         init_device=args.train.init_device,
         weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
+        enable_reshard_after_forward=args.train.enable_reshard_after_forward,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         enable_fsdp_offload=args.train.enable_fsdp_offload,
-        basic_modules=model._no_split_modules + args.model.basic_modules,
+        basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)),
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
@@ -181,11 +191,14 @@ def main():
         lr_start=args.train.lr_start,
     )
 
+    model_assets = None
     if args.train.global_rank == 0:
         if args.train.use_wandb:
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                id=args.train.wandb_id,
+                resume="allow" if args.train.wandb_id else None,
                 settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
@@ -272,8 +285,18 @@ def main():
             start_time = time.time()
 
             micro_batches_token_num = count_loss_token(micro_batches)
+            num_micro_steps = len(micro_batches)
 
-            for micro_batch in micro_batches:
+            for micro_step, micro_batch in enumerate(micro_batches):
+                if (
+                    args.train.data_parallel_mode == "fsdp2"
+                    and not args.train.enable_reshard_after_backward
+                    and num_micro_steps > 1
+                ):
+                    if micro_step == 0:
+                        model.set_reshard_after_backward(False)
+                    elif micro_step == num_micro_steps - 1:
+                        model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch)
                 micro_batch_token_num = count_loss_token(micro_batch)
                 if args.data.enable_multisource:
@@ -373,14 +396,18 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
             ckpt_manager=args.train.ckpt_manager,
+            model_assets=model_assets,
+            train_architecture=args.train.train_architecture,
+            save_checkpoint_path=save_checkpoint_path,
+            is_rank_0=args.train.global_rank == 0,
+            model=model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

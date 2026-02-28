@@ -12,12 +12,16 @@ on:
     paths:
       - "**/*.py"
       - .github/workflows/npu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
   pull_request:
     branches:
       - main
     paths:
       - "**/*.py"
       - .github/workflows/npu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
@@ -59,12 +63,12 @@ jobs:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
+      CI_SAMPLES_DIR: "/data00/assets/samples"
 
     steps:
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
-          echo "Current proxy: $CURRENT_PROXY"
           echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
           echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
           echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
@@ -83,7 +87,7 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra npu --group dev
+          uv sync --frozen --extra npu --extra audio --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -91,6 +95,8 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py

@@ -24,7 +24,12 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   "diffusers>=0.30.0,<=0.31.0",
-  "transformers==4.57.3",
+  # Comment out transformers version for pip user compatibility (not to accidentally install v5 which is still WIP
+  # and experimental)
+  # For uv user: The actual version is controlled by the "transformers-stable" default
+  # dependency-group (==4.57.3) or by the "transformers5-exp" optional extra (==5.2.0).
+  # For pip user: please install 4.57.3 manually via pip install transformers==4.57.3.
+  # "transformers==4.57.3",
   "psutil",
   "timm",
   "wandb",
@@ -40,6 +45,14 @@ dev = [
   "expecttest>=0.3.0,<0.4"
 ]
 audio = [
+  "torchcodec",
+  "av>=14.3.0,<15.0",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14"
+]
+# Alias for audio extra - includes both video and audio processing dependencies
+video = [
+  "torchcodec",
   "av>=14.3.0,<15.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
@@ -54,7 +67,8 @@ npu_aarch64 = [
   "torchvision==0.22.1",
   "torchaudio==2.7.1",
   "decorator>=5.2.1",
-  "scipy>=1.16.2"
+  "scipy>=1.16.2",
+  "torchcodec>=0.4.0,<0.6.0"
 ]
 npu = [
   "torch==2.7.1+cpu",
@@ -62,24 +76,41 @@ npu = [
   "torchvision==0.22.1+cpu",
   "torchaudio==2.7.1+cpu",
   "decorator>=5.2.1",
-  "scipy>=1.16.2"
+  "scipy>=1.16.2",
+  "torchcodec>=0.4.0,<0.6.0"
 ]
 gpu = [
-  "torch==2.8.0+cu128",
-  "torchvision==0.23.0+cu128",
-  "torchaudio==2.8.0+cu128",
+  "torch==2.9.1+cu129",
+  "torchvision==0.24.1+cu129",
+  "torchaudio==2.9.1+cu129",
   "nvidia-cusparselt-cu12",
   "nvidia-nccl-cu12",
   "liger-kernel",
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
+  "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
+  "cuda-python==12.9.1",
+  "torch-c-dlpack-ext"
 ]
 megatron = [
   "megatron-energon>=7.2.1"
 ]
 trl = [
   "trl<=0.9.6"
+]
+
+fa4 = [
+  "flash-attn-cute",
+  "nvidia-cutlass-dsl>=4.4.0"
+]
+
+# Experimental dep to install transformers 5.x.
+# Note that transformers 5.x support is experimental and WIP.
+# See https://github.com/ByteDance-Seed/VeOmni/issues/468 for the progress.
+# Usage: `uv sync --no-group transformers-stable --extra transformers5-exp --extra <other extra>`.
+transformers5-exp = [
+  "transformers==5.2.0"
 ]
 
 [dependency-groups]
@@ -95,8 +126,23 @@ lint = [
   "ruff",
 ]
 test = [
+  "rich",
   "pytest",
   "expecttest",
+]
+# Pin the default transformers version via a dependency group.
+# This is a default group (see default-groups below), so `uv sync` will
+# always install transformers==4.57.3 unless the user opts out with
+# `--no-group transformers-stable` (and opts in to `--extra transformers5-exp`).
+#
+# Why a dependency group instead of override-dependencies?
+# uv's override-dependencies replaces ALL occurrences of a package name globally.
+# When using `extra` markers in overrides (e.g. `extra != 'transformers5-exp'`),
+# uv converts them to impossible markers like `python_version < '0'`, which
+# silently removes transformers from the dependency tree entirely.
+# See: https://github.com/astral-sh/uv/issues/11153
+transformers-stable = [
+  "transformers==4.57.3"
 ]
 
 [tool.uv]
@@ -112,24 +158,42 @@ no-build-isolation-package = [
     "flash-attn-3",
 ]
 
+# The "transformers-stable" dependency group is synced by default, ensuring
+# that `uv sync` (with no extra flags) installs transformers==4.57.3.
+# To use transformers 5, run:
+#   uv sync --no-group transformers-stable --extra transformers5-exp
+default-groups = ["transformers-stable"]
+
 override-dependencies = [
     # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
     # PyPI without using the cu128 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
-    "torch==2.8.0+cu128; (extra == 'gpu')",
-    "torchaudio==2.8.0+cu128; (extra == 'gpu')",
-    "torchvision==0.23.0+cu128; (extra == 'gpu')",
+    "torch==2.9.1+cu129; (extra == 'gpu')",
+    "torchaudio==2.9.1+cu129; (extra == 'gpu')",
+    "torchvision==0.24.1+cu129; (extra == 'gpu')",
+    "torchcodec==0.8.1; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
     "torchvision==0.22.1; (extra == 'npu_aarch64')",
+    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu_aarch64')",
     # Adding explicit override for NPU backends - x86 variant (default npu)
     "torch==2.7.1+cpu; (extra == 'npu')",
     "torchaudio==2.7.1+cpu; (extra == 'npu')",
     "torchvision==0.22.1+cpu; (extra == 'npu')",
-    # Fixate to a specific transformers version since upgrading transformers is a large task.
-    "transformers==4.57.3",
+    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
+
+    # NOTE: The transformers overrides that were previously here have been removed.
+    # They used `extra != 'transformers5-exp'` markers which uv converts to
+    # `python_version < '0'` (always false), silently removing transformers
+    # from the dependency tree. The version pinning is now handled by the
+    # "transformers-stable" default dependency group + conflicts declaration.
+
+    # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
+    # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
+    # TODO: remove this override after we upgrade to torch 2.10.
+    "nvidia-cudnn-cu12==9.15.1.9",
 ]
 
 conflicts = [
@@ -137,6 +201,18 @@ conflicts = [
     { extra = "gpu" },
     { extra = "npu" },
     { extra = "npu_aarch64" },
+  ],
+  # transformers version conflicts: the "transformers-stable" dependency group
+  # pins to 4.x while the "transformers5-exp" extra pins to 5.x.
+  # Declaring them as conflicting allows uv to resolve both forks independently.
+  [
+    { group = "transformers-stable" },
+    { extra = "transformers5-exp" },
+  ],
+  # FA4 only works for transformers v5
+  [
+    { group = "transformers-stable" },
+    { extra = "fa4" },
   ],
 ]
 
@@ -152,13 +228,26 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-# Download flash-attn wheel directly to avoid build issues.
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' or extra == 'sglang'" }
-flash-attn-3 = { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2025.09.28/flash_attn_3-3.0.0b1%2B20250928.cu128torch280cxx11abitrue.5059fd-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"}
+# Download fa2 and fa3 wheels directly to avoid build issues.
+flash-attn = [
+  # torch 2.9+cu129
+  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.9+.
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"},
+]
+flash-attn-3 = [
+  # torch 2.9+cu129
+  { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
+]
+# FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
+# Pinned to 02/20/2026 latest main commit.
+flash-attn-cute = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "6079a9bf4cfd7af8e7586afea6c49a97ebddf46e" }
+
+# Download av wheel directly to avoid FFmpeg build dependency issues in CI.
+av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video'" }
 
 [[tool.uv.index]]
 name = "pytorch"
@@ -189,6 +278,8 @@ exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts"]
 target-version = "py311"
 line-length = 119
 indent-width = 4
+extend-exclude = ["veomni/models/transformers/**/generated/*.py"]
+force-exclude = true
 
 [tool.ruff.lint]
 ignore = ["C901", "E501", "E741", "W605", "C408"]
@@ -207,3 +298,9 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
+exclude = ["veomni/models/transformers/**/generated/*.py"]
+
+[tool.pytest.ini_options]
+markers = [
+    "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
+]

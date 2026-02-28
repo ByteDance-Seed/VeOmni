@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
+from ..models.module_utils import _convert_weight_key as convert_weight_key
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
@@ -76,11 +77,17 @@ def verbose_fsdp_grouping(model, prefix="", depth=0):
             verbose_fsdp_grouping(child, prefix=f"{prefix}{name}.", depth=depth)
 
 
+def _convert_state_dict_keys(state_dict, model):
+    return {convert_weight_key(key, model): value for key, value in state_dict.items()}
+
+
 def parallelize_model_fsdp1(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     enable_full_shard: bool = True,
+    enable_shard_grad_op: bool = False,
     enable_mixed_precision: bool = True,
+    use_orig_params: bool = True,
     basic_modules: Optional[List[str]] = None,
     fsdp_no_shard_states=None,
     fsdp_no_shard_states_fqn=None,
@@ -91,6 +98,9 @@ def parallelize_model_fsdp1(
     """
     Applies EP (when enabled) + FSDP1 parallel strategy to the model.
     """
+    assert not (enable_full_shard and enable_shard_grad_op), (
+        "You must explicitly specify enable_full_shard as False if enable_shard_grad_op is set to True"
+    )
     parallel_state = get_parallel_state()
 
     if parallel_state.ep_enabled:
@@ -110,16 +120,15 @@ def parallelize_model_fsdp1(
 
     # set fsdp/hsdp sharding strategy
     if parallel_state.fsdp_mesh.ndim > 1 and parallel_state.fsdp_mesh.size() > 1:
-        strategy = ShardingStrategy.HYBRID_SHARD
+        strategy = ShardingStrategy.HYBRID_SHARD if enable_full_shard else ShardingStrategy._HYBRID_SHARD_ZERO2
     else:
-        strategy = ShardingStrategy.FULL_SHARD
-
+        strategy = ShardingStrategy.FULL_SHARD if enable_full_shard else ShardingStrategy.SHARD_GRAD_OP
     fsdp_kwargs = {
         "auto_wrap_policy": wrap_policy,
         "ignored_states": fsdp_no_shard_states,
         "device_id": get_device_id(),
-        "sharding_strategy": strategy if enable_full_shard else ShardingStrategy.NO_SHARD,
-        "use_orig_params": True,
+        "sharding_strategy": strategy if enable_full_shard or enable_shard_grad_op else ShardingStrategy.NO_SHARD,
+        "use_orig_params": use_orig_params,
     }
 
     fsdp_kwargs["device_mesh"] = parallel_state.fsdp_mesh
@@ -151,7 +160,7 @@ def parallelize_model_fsdp1(
         shard_states = kwargs.get("shard_states", {})
         if not shard_states and weights_path:
             shard_states = parallel_load_safetensors(weights_path)
-
+        shard_states = _convert_state_dict_keys(shard_states, model)
         fsdp_kwargs["param_init_fn"] = parallel_init_fsdp_fn(
             model,
             shard_states.copy(),
@@ -228,6 +237,7 @@ def parallelize_model_fsdp1(
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
+    enable_reshard_after_forward: bool = True,
     enable_mixed_precision: bool = True,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
@@ -244,7 +254,8 @@ def parallelize_model_fsdp2(
     parallel_state = get_parallel_state()
 
     # Step 0: Get target classes to shard later
-    target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
+    model_no_split_modules = getattr(model, "_no_split_modules", None) or []
+    target_classes = set(model_no_split_modules) | set(basic_modules or [])
     # Make a list of tuples that contains layer's name and module
     decoder_blocks: List[Tuple[str, nn.Module]] = [
         (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
@@ -292,7 +303,7 @@ def parallelize_model_fsdp2(
     logger.info_rank0(f"layer pairs: {layer_pairs}")
 
     # Step 2: Update fsdp2 kwargs
-    fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh}
+    fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
     # mp_policy kwargs
     if enable_mixed_precision:
         mp_policy = MixedPrecisionPolicy(
@@ -430,6 +441,9 @@ def build_parallelize_model(
     weights_path: Optional[str] = None,
     sharding_plan: Optional[Dict[str, Any]] = None,
     enable_full_shard: bool = True,
+    enable_shard_grad_op: bool = False,
+    use_orig_params: bool = True,
+    enable_reshard_after_forward: bool = True,
     enable_mixed_precision: bool = True,
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
@@ -477,6 +491,7 @@ def build_parallelize_model(
                 model=model,
                 weights_path=weights_path,
                 enable_full_shard=enable_full_shard,
+                enable_reshard_after_forward=enable_reshard_after_forward,
                 enable_mixed_precision=enable_mixed_precision,
                 basic_modules=basic_modules,
                 **kwargs,
@@ -486,6 +501,8 @@ def build_parallelize_model(
                 model=model,
                 weights_path=weights_path,
                 enable_full_shard=enable_full_shard,
+                enable_shard_grad_op=enable_shard_grad_op,
+                use_orig_params=use_orig_params,
                 enable_mixed_precision=enable_mixed_precision,
                 basic_modules=basic_modules,
                 fsdp_no_shard_states=fsdp_no_shard_states,

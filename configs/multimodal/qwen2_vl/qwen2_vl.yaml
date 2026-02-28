@@ -2,17 +2,20 @@ model:
   model_path: Qwen/Qwen2-VL-7B-Instruct
 
 data:
-  dataloader_type: native
-  datasets_type: iterable
-  train_path: sharegpt4v_pretrain
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
   chat_template: qwen2vl
   max_seq_len: 2048
   train_size: 80000000
-  source_name: sharegpt4v_pretrain
+  mm_configs:
+    image_max_pixels: 602112 # 28 * 28 * 768
+    video_max_pixels: 602112 # 28 * 28 * 768
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
 
 train:
   output_dir: qwen2vl_sft
-  data_parallel_mode: fsdp1
+  data_parallel_mode: fsdp2
   wandb_project: qwen2vl
   wandb_name: qwen2vl
   rmpad: false
@@ -20,9 +23,9 @@ train:
   ulysses_parallel_size: 1
   freeze_vit: false
   lr: 1.0e-5
+  init_device: meta
   lr_decay_style: cosine
-  num_train_epochs: 3
+  num_train_epochs: 2
   micro_batch_size: 1
   global_batch_size: 32
   max_steps: 2000
-  ckpt_manager: dcp

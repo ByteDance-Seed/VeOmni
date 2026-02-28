@@ -1,5 +1,3 @@
-(installation-install_ascend)=
-
 # Installation with Ascend NPU
 
 ## Required Environment
@@ -28,6 +26,24 @@ cd VeOmni
 uv sync --locked  --extra npu
 source .venv/bin/activate
 ```
+
+You can use `--extra` to install other optional dependencies. Refer to [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml) for more details.
+
+```bash
+# eg. install with video/audio processing dependencies (torchcodec, PyAV, librosa, soundfile)
+# Note: `video` and `audio` extras are equivalent - both include video and audio processing
+uv sync --locked  --extra npu --extra video
+# or equivalently:
+uv sync --locked  --extra npu --extra audio
+```
+
+> **Note**: For video/audio processing with the `video` or `audio` extra, you also need to install ffmpeg separately:
+> ```bash
+> # Ubuntu/Debian/openEuler
+> sudo apt-get install ffmpeg
+> # or
+> sudo yum install ffmpeg
+> ```
 
 **Pip**
 

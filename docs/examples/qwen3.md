@@ -1,9 +1,17 @@
-(examples-qwen3)=
-
 # Qwen3 training guide
 
 ## Download dataset
 Download the [tulu-3-sft-mixture](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) dataset.
+
+```python
+import pyarrow.parquet as pq
+input_path = "tulu-3-sft-mixture/data/train-00000-of-00006.parquet"
+output_path = "tulu-first2000.parquet"
+# Read parquet file and extract the first 2000 rows
+table = pq.read_table(input_path)
+table_first_2000 = table.slice(0, 2000)
+pq.write_table(table_first_2000, output_path)
+```
 
 ## Download Qwen3 model
 
@@ -35,10 +43,9 @@ python3 scripts/moe_ckpt_merge/moe_merge.py --raw_hf_path Qwen3-30B-A3B-Instruct
 ```shell
 bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml \
     --model.model_path ./Qwen3-8B \
-    --data.train_path ./tulu-3-sft-mixture/data \
+    --data.train_path ./tulu-first2000.parquet \
     --train.data_parallel_mode fsdp2 \
-    --train.init_device meta \
-    --train.use_wandb false
+    --train.init_device meta
 ```
 
 ### Qwen3-30B
@@ -47,9 +54,8 @@ bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml \
 bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml \
     --model.model_path ./Qwen3-30B-A3B-Instruct-2507-merge \
     --model.moe_implementation fused \
-    --data.train_path ./tulu-3-sft-mixture/data \
+    --data.train_path ./tulu-first2000.parquet \
     --train.data_parallel_mode fsdp2 \
     --train.init_device meta \
-    --train.global_batch_size 16 \
-    --train.use_wandb false
+    --train.global_batch_size 16
 ```

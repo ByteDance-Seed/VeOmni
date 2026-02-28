@@ -4,12 +4,20 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+
+try:
+    from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
+    from .utils import get_checkpoint_dir, get_checkpoint_test_command, get_hf_output_dir, get_merge_dcp_to_hf_command
+except ImportError:
+    # from utils import get_checkpoint_test_command, get_merge_dcp_to_hf_command, get_checkpoint_dir, get_hf_output_dir
+    from checkpoint_verification_utils import verify_dcp_to_hf_conversion
+
+import pytest
 import torch
 import torch.distributed as dist
-import yaml
-from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from tqdm import trange
 
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader, build_dummy_dataset
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -18,9 +26,9 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
+from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
 
 """
@@ -90,11 +98,20 @@ def check_state_dict(lhs_dict, rhs_dict, need_flatten=False, tied_weight_key: Op
         torch.testing.assert_close(rhs_val, lhs_val)
 
 
-def read_output_dir_from_yaml(yaml_path: str) -> str:
-    """Read output_dir from yaml config file."""
-    with open(yaml_path) as f:
-        config = yaml.safe_load(f)
-    return config.get("train", {}).get("output_dir", None)
+def capture_param_dtypes(model):
+    """Capture a snapshot of {param_name: dtype} for the model."""
+    return {name: param.data.dtype for name, param in model.named_parameters()}
+
+
+def assert_param_dtypes_unchanged(model, original_dtypes):
+    """Assert that model parameter dtypes have not been mutated."""
+    for name, param in model.named_parameters():
+        current_dtype = param.data.dtype
+        expected_dtype = original_dtypes[name]
+        assert current_dtype == expected_dtype, (
+            f"Parameter '{name}' dtype was mutated: expected {expected_dtype}, got {current_dtype}. "
+            f"This indicates an in-place dtype conversion side effect during save."
+        )
 
 
 @dataclass
@@ -187,7 +204,7 @@ def main():
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         enable_fsdp_offload=args.train.enable_fsdp_offload,
-        basic_modules=model._no_split_modules + args.model.basic_modules,
+        basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)),
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
@@ -320,6 +337,37 @@ def main():
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
+    # After training on all epochs, save model in huggingface's format and verify against DCP checkpoint
+    if Checkpointer.dcp_save_future is not None:
+        Checkpointer.dcp_save_future.result()
+    if args.train.save_hf_weights and save_checkpoint_path is not None:
+        # Capture param dtypes before HF save to detect in-place mutation
+        dtypes_before_hf_save = capture_param_dtypes(model)
+
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
+            ckpt_manager=args.train.ckpt_manager,
+            model_assets=[model_config],
+            train_architecture=args.train.train_architecture,
+            save_checkpoint_path=save_checkpoint_path,
+            is_rank_0=args.train.global_rank == 0,
+            model=model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+        )
+
+        # Assert model parameter dtypes were not mutated by the save operation
+        assert_param_dtypes_unchanged(model, dtypes_before_hf_save)
+        logger.info_rank0("HuggingFaceStorageWriter dtype preservation check PASSED!")
+
+        if args.train.global_rank == 0:
+            assert verify_dcp_to_hf_conversion(
+                dcp_checkpoint_dir=save_checkpoint_path,
+                hf_checkpoint_dir=hf_weights_path,
+                safe_serialization=True,
+            ), "HF safetensors verification failed: saved weights don't match DCP checkpoint"
+    dist.barrier()
+
     # resume states from checkpoints and compare them with the ones before saving
     state = {"model": model, "optimizer": optimizer, "extra_state": {}}
     subdirs = [d for d in os.listdir(save_checkpoint_path) if d.startswith("global_step_")]
@@ -355,155 +403,43 @@ def main():
     dist.destroy_process_group()
 
 
-def test_trainer_saveload_ep8():
-    yaml_config_path = "tests/checkpoints/ep8.yaml"
-    ep8_command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/checkpoints/test_trainer_saveload.py",
-        yaml_config_path,
-    ]
-    ep8_result = subprocess.run(ep8_command, check=True)
-    assert ep8_result.returncode == 0
-
-    # Run merge_dcp_to_hf script after training completes
-    output_dir = read_output_dir_from_yaml(yaml_config_path)
-    assert output_dir is not None, f"output_dir not found in {yaml_config_path}"
-    checkpoint_dir = os.path.join(output_dir, "checkpoints", "global_step_5")
-    hf_output_dir = os.path.join(output_dir, "hf_ckpt")
-
-    merge_command = [
-        "python",
-        "scripts/merge_dcp_to_hf.py",
-        "--load-dir",
-        checkpoint_dir,
-        "--save-dir",
-        hf_output_dir,
-        "--model-assets-dir",
-        os.path.join(output_dir, "model_assets"),
-    ]
-
-    logger.info(f"Running merge_dcp_to_hf script: {' '.join(merge_command)}")
-    merge_result = subprocess.run(merge_command, check=True, capture_output=True, text=True)
-    assert merge_result.returncode == 0
-
-    # Verify the output exists
-    assert os.path.exists(hf_output_dir), f"HF checkpoint directory not found: {hf_output_dir}"
-    files = os.listdir(hf_output_dir)
-    logger.info(f"HF checkpoint files: {files}")
-    assert len(files) > 0, "No files generated in HF checkpoint directory"
-    assert "config.json" in files, "config.json not found in HF checkpoint directory"
-
-    # Verify HF checkpoint by comparing with DCP checkpoint
-    logger.info("Verifying HF checkpoint conversion...")
-    assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=checkpoint_dir,
-        hf_checkpoint_dir=hf_output_dir,
-        safe_serialization=True,
-    ), "HF checkpoint verification failed"
-
-
-def test_trainer_saveload_ep4():
-    yaml_config_path = "tests/checkpoints/ep4.yaml"
-    ep4_command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/checkpoints/test_trainer_saveload.py",
-        yaml_config_path,
-    ]
-    ep4_result = subprocess.run(ep4_command, check=True)
-    assert ep4_result.returncode == 0
-
-    # Run merge_dcp_to_hf script after training completes
-    output_dir = read_output_dir_from_yaml(yaml_config_path)
-    assert output_dir is not None, f"output_dir not found in {yaml_config_path}"
-    checkpoint_dir = os.path.join(output_dir, "checkpoints", "global_step_5")
-    hf_output_dir = os.path.join(output_dir, "hf_ckpt")
-
-    merge_command = [
-        "python",
-        "scripts/merge_dcp_to_hf.py",
-        "--load-dir",
-        checkpoint_dir,
-        "--save-dir",
-        hf_output_dir,
-        "--model-assets-dir",
-        os.path.join(output_dir, "model_assets"),
-    ]
-
-    logger.info(f"Running merge_dcp_to_hf script: {' '.join(merge_command)}")
-    merge_result = subprocess.run(merge_command, check=True, capture_output=True, text=True)
-    assert merge_result.returncode == 0
-
-    # Verify the output exists
-    assert os.path.exists(hf_output_dir), f"HF checkpoint directory not found: {hf_output_dir}"
-    files = os.listdir(hf_output_dir)
-    logger.info(f"HF checkpoint files: {files}")
-    assert len(files) > 0, "No files generated in HF checkpoint directory"
-    assert "config.json" in files, "config.json not found in HF checkpoint directory"
-
-    # Verify HF checkpoint by comparing with DCP checkpoint
-    logger.info("Verifying HF checkpoint conversion...")
-    assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=checkpoint_dir,
-        hf_checkpoint_dir=hf_output_dir,
-        safe_serialization=True,
-    ), "HF checkpoint verification failed"
-
-
-def test_trainer_saveload_no_ep():
-    yaml_config_path = "tests/checkpoints/no_ep.yaml"
-    no_ep_command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/checkpoints/test_trainer_saveload.py",
-        yaml_config_path,
-    ]
-    no_ep_result = subprocess.run(no_ep_command, check=True)
-    assert no_ep_result.returncode == 0
-
-    # Run merge_dcp_to_hf script after training completes
-    output_dir = read_output_dir_from_yaml(yaml_config_path)
-    assert output_dir is not None, f"output_dir not found in {yaml_config_path}"
-    checkpoint_dir = os.path.join(output_dir, "checkpoints", "global_step_5")
-    hf_output_dir = os.path.join(output_dir, "hf_ckpt")
-
-    merge_command = [
-        "python",
-        "scripts/merge_dcp_to_hf.py",
-        "--load-dir",
-        checkpoint_dir,
-        "--save-dir",
-        hf_output_dir,
-        "--model-assets-dir",
-        os.path.join(output_dir, "model_assets"),
-    ]
-
-    logger.info(f"Running merge_dcp_to_hf script: {' '.join(merge_command)}")
-    merge_result = subprocess.run(merge_command, check=True, capture_output=True, text=True)
-    assert merge_result.returncode == 0
-
-    # Verify the output exists
-    assert os.path.exists(hf_output_dir), f"HF checkpoint directory not found: {hf_output_dir}"
-    files = os.listdir(hf_output_dir)
-    logger.info(f"HF checkpoint files: {files}")
-    assert len(files) > 0, "No files generated in HF checkpoint directory"
-    assert "config.json" in files, "config.json not found in HF checkpoint directory"
-
-    # Verify HF checkpoint by comparing with DCP checkpoint
-    logger.info("Verifying HF checkpoint conversion...")
-    assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=checkpoint_dir,
-        hf_checkpoint_dir=hf_output_dir,
-        safe_serialization=True,
-    ), "HF checkpoint verification failed"
-
-
 if __name__ == "__main__":
     main()
+
+
+def _run_trainer_saveload_and_verify(model_name: str, ep_size: int):
+    exec_command = get_checkpoint_test_command(model_name, ep_size)
+    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size)
+
+    exec_result = subprocess.run(exec_command, shell=True, check=True)
+    assert exec_result.returncode == 0
+
+    merge_result = subprocess.run(merge_command, shell=True, check=True)
+    assert merge_result.returncode == 0
+
+    assert verify_dcp_to_hf_conversion(
+        dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size),
+        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size),
+        safe_serialization=True,
+    ), f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}`"
+
+
+def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
+    exec_command = get_checkpoint_test_command(model_name, ep_size, save_hf_weights=True)
+    exec_result = subprocess.run(exec_command, shell=True, check=True)
+    assert exec_result.returncode == 0
+
+
+TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
+TEST_EP_SIZES = [1, 4, 8]
+
+
+@pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
+def test_trainer_saveload(model_name: str, ep_size: int):
+    _run_trainer_saveload_and_verify(model_name, ep_size)
+
+
+@pytest.mark.parametrize("ep_size", TEST_EP_SIZES)
+def test_trainer_save_hf_safetensor(ep_size: int):
+    # only test save hf safetensor on qwen3_moe to save resources
+    _run_trainer_save_hf_safetensor("qwen3_moe", ep_size)

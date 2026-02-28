@@ -83,7 +83,7 @@ def slice_input_tensor(
         x = pad_tensor(x, dim, padding_size, padding_value)
     slc = [slice(None)] * len(x.shape)
     slc[dim] = slice(unit * sp_rank, unit * (sp_rank + 1))
-    return x[slc].contiguous()
+    return x[tuple(slc)].contiguous()
 
 
 def slice_input_tensor_scale_grad(

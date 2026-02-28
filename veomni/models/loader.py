@@ -23,17 +23,32 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
-    AutoModelForVision2Seq,
+    AutoModelForSequenceClassification,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedModel,
 )
-from transformers.modeling_utils import no_init_weights
+
+
+# transformers v5 deleted the AutoModelForVision2Seq class, so we use AutoModelForImageTextToText as a fallback
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = AutoModelForImageTextToText
 
 from ..utils import logging
 from ..utils.env import get_env
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from ..utils.registry import Registry
 from .module_utils import init_empty_weights, load_model_weights
+
+
+# `no_init_weights` was moved to `transformers.initialization` in:
+# https://github.com/huggingface/transformers/pull/42957
+if is_transformers_version_greater_or_equal_to("5.0.0"):
+    from transformers.initialization import no_init_weights
+else:
+    from transformers.modeling_utils import no_init_weights
 
 
 MODELING_REGISTRY = Registry("Modeling")
@@ -114,6 +129,9 @@ def get_model_class(model_config: PretrainedConfig):
 
     arch_name = get_model_arch_from_config(model_config)
     model_type = model_config.model_type
+    modeling_backend = get_env("MODELING_BACKEND")
+    if not modeling_backend == "hf":
+        return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
         load_class = AutoModelForImageTextToText
     elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
@@ -124,12 +142,15 @@ def get_model_class(model_config: PretrainedConfig):
         and type(model_config) in AutoModelForCausalLM._model_mapping.keys()
     ):
         load_class = AutoModelForCausalLM
+    elif (
+        arch_name is not None
+        and "ForSequenceClassification" in arch_name
+        and type(model_config) in AutoModelForSequenceClassification._model_mapping.keys()
+    ):
+        load_class = AutoModelForSequenceClassification
     else:
         load_class = AutoModel
-    modeling_backend = get_env("MODELING_BACKEND")
-    if modeling_backend == "hf":
-        return load_class
-    return MODELING_REGISTRY[model_type](arch_name)
+    return load_class
 
 
 class BaseModelLoader(ABC):

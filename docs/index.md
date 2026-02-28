@@ -42,6 +42,7 @@ hardware_support/get_started_npu.md
 
 examples/qwen3.md
 examples/qwen3_vl.md
+examples/wan2.1.md
 ```
 
 ```{toctree}
@@ -51,6 +52,13 @@ examples/qwen3_vl.md
 key_features/ep_fsdp2.md
 key_features/ulysses.md
 key_features/preprocessor_registry.md
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Transformers v5 Updates
+
+transformers_v5/index.md
 ```
 
 ---

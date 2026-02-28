@@ -2,7 +2,7 @@
 
 ## Usage
 1. **Install VeOmni**  
-    Please refer to [Install](install-guide) for detailed instructions.
+    Please refer to [Install](../get_started/installation/install.md) for detailed instructions.
 
 2. **Run Example Script**  
    Verify training startup: (need download the dataset first)
@@ -12,14 +12,14 @@
    ```
 
 3. **Create Custom Task Directory**  
-    [`train_torch.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, youcan just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_qwen2_vl.py)
+    [`train_torch.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_torch.py) can be used for most of task pre-training and post-training tasks, you can just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_torch.py` file from the `tasks` directory and modify it. like [`tasks/omni/train_qwen2_vl.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/omni/train_qwen2_vl.py)
     ```bash
     mkdir tasks/your_task
     cp tasks/train_torch.py tasks/your_task/train.py
     ```
 
 4. **Launch Custom Training**  
-    you  can overwrite the default arguments in train yaml by passing them to the script.
+    You can overwrite the default arguments in train yaml by passing them to the script.
     ```bash
     bash train.sh tasks/your_task/train.py \
         $CONFIG.yaml \
@@ -32,11 +32,11 @@
 
 ## Arguments
 **Default Parameter Access**:  
-veomni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments-api-reference).
+veomni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md).
 
 ```python
 from dataclasses import dataclass, field
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 
 @dataclass
 class Arguments:
@@ -123,9 +123,9 @@ train_dataset = build_dataset(
 >
 > args.train.compute_train_steps is used to compute the number of training steps. without this, the train steps will be computed incorrectly.
 >
-> if you dataset is iterable, you are recommended to add data.train_size(the token you want to comsume) to the config file, the `train_steps` will approximate to `train_size / (global_batch_size * max_seq_len)`(without any warm strategy).
+> If your dataset is iterable, you are recommended to add data.train_size (the token you want to consume) to the config file, the `train_steps` will approximate to `train_size / (global_batch_size * max_seq_len)` (without any warm strategy).
 >
-> if you dataset is mapping, you are recommended to add pass the len(train_dataset) to the `train_steps` to compute the correct train steps.
+> If your dataset is mapping, you are recommended to pass len(train_dataset) to the `train_steps` to compute the correct train steps.
 
 ### Custom Datasets
 VeOmni is a flexible framework that supports custom datasets. You can implement your own dataset function and use it with VeOmni.
@@ -138,7 +138,7 @@ def build_custom_dataset(data_path, transform)-> Dataset:
 elif args.data.datasets_type == "custom":
     logger.info_rank0("Start building custom dataset")
     train_dataset = build_custom_dataset(args.data.train_path, transform=transform)
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset)) # compute train steps, remove the len(train_dataset) if you dataset is iterable
+    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset)) # compute train steps, remove the len(train_dataset) if your dataset is iterable
 ```
 
 ### Data Transform (Preprocess)
@@ -194,9 +194,9 @@ class CustomTemplate(ChatTemplate):
 
 ## DataLoader
 VeOmni offered a flexible and powerful dataloader implementation, which supports
-- both padding and remove padding(packing) strategy
+- both padding and remove padding (packing) strategy
 - dynamic batching strategy
--
+
 (source code: [veomni/data/data_loader.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_loader.py)):
 
 ```python
@@ -222,6 +222,7 @@ train_dataloader = build_dataloader(
     train_steps=args.train.train_steps, # train steps, calculate by args.train.compute_train_steps
     rmpad=args.train.rmpad, # remove padding
     rmpad_with_pos_ids=args.train.rmpad_with_pos_ids, # remove padding with position ids
+    dyn_bsz=args.train.dyn_bsz, # enable dynamic batching
     bsz_warmup_ratio=args.train.bsz_warmup_ratio, # bsz warmup ratio
     bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken, # bsz warmup init micro batch token
     dyn_bsz_margin=args.train.dyn_bsz_margin, # dynamic batching margin
@@ -276,11 +277,12 @@ model = build_foundation_model(...)
 model = build_parallelize_model(
     model,
     enable_full_shard=args.train.enable_full_shard, # enable full shard, same to Zero3
+    enable_reshard_after_forward=args.train.enable_reshard_after_forward, # enable reshard after forward for FSDP2
     enable_mixed_precision=args.train.enable_mixed_precision, # enable mixed precision
     enable_gradient_checkpointing=args.train.enable_gradient_checkpointing, # enable gradient checkpointing
     init_device=args.train.init_device, # model init device
     enable_fsdp_offload=args.train.enable_fsdp_offload, # enable fsdp offload
-    basic_modules=model._no_split_modules + args.model.basic_modules, # FSDP basic modules
+    basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
 )
 ```
 

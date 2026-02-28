@@ -124,6 +124,10 @@ Thanks to the following projects for their excellent work:
 - [torchtitan](https://github.com/pytorch/torchtitan/)
 - [torchtune](https://github.com/pytorch/torchtune)
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=ByteDance-Seed/VeOmni&type=date&legend=top-left)](https://www.star-history.com/#ByteDance-Seed/VeOmni&type=date&legend=top-left)
+
 
 ## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
 

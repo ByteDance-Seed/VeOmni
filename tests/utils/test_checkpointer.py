@@ -8,13 +8,13 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.checkpoint import build_checkpointer
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_tokenizer
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
-from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.import_utils import is_torch_npu_available
 
@@ -83,7 +83,7 @@ def run_checkpointer_test():
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
         init_device=args.train.init_device,
         enable_fsdp_offload=args.train.enable_fsdp_offload,
-        basic_modules=model._no_split_modules + args.model.basic_modules,
+        basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)),
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )

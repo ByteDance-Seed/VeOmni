@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
+from veomni.data.constants import IGNORE_INDEX
+
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
@@ -91,3 +93,94 @@ def process_sft_example(
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
+
+
+def process_classification_example(
+    example: dict[str, Any],
+    tokenizer: "PreTrainedTokenizer",
+    max_seq_len: int,
+    text_keys: Union[str, list[str]] = "text",
+    label_key: str = "label",
+) -> list[dict[str, "torch.Tensor"]]:
+    """
+    Convert a single raw example into one classification training sample.
+
+    Args:
+        example:
+            A single record from the dataset. Expected format (minimal):
+                {
+                    "<text_key>":  str,   # e.g. news article / sentence
+                    "<label_key>": int,   # e.g. 0..(num_labels-1)
+                    ...                   # other fields are ignored
+                }
+            By default:
+                text_key  = "text"
+                label_key = "label"
+
+        tokenizer:
+            A HuggingFace tokenizer used to tokenize the input text.
+
+        max_seq_len:
+            Maximum sequence length (in tokens). Text longer than this
+            will be truncated to the first `max_seq_len` tokens.
+
+        text_key:
+            Key in `example` that contains the raw input text.
+
+        label_key:
+            Key in `example` that contains the class id. The value should be int-like.
+
+    Returns:
+        A list with exactly one sample dict:
+            {
+                "input_ids":      LongTensor[L],
+                "attention_mask": LongTensor[L],
+                "labels":         LongTensor[L],
+                "position_ids":   LongTensor[L]
+            }
+    """
+    # 1) text
+    if isinstance(text_keys, str):
+        text = example[text_keys]
+    elif isinstance(text_keys, list):
+        for key in text_keys:
+            if key in example:
+                text = example[key]
+                break
+        else:
+            raise ValueError(f"None of the keys {text_keys} are found in the example.")
+    else:
+        raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
+
+    # 2) label
+    if label_key not in example:
+        raise ValueError(f"Missing label key '{label_key}' in example.")
+    try:
+        label_val = int(example[label_key])
+    except Exception as e:
+        raise ValueError(f"Label '{example[label_key]}' is not an int-like value.") from e
+
+    # 3) tokenize
+    tokens: list[int] = tokenizer.encode(text, add_special_tokens=True)
+
+    # 4) build samples
+    examples: list[dict[str, torch.Tensor]] = []
+
+    def build_sample(seq: list[int]) -> dict[str, "torch.Tensor"]:
+        L = len(seq)
+        token_labels = torch.full((L,), IGNORE_INDEX, dtype=torch.long)
+        token_labels[L - 1] = label_val
+
+        sample: dict[str, torch.Tensor] = {
+            "input_ids": torch.tensor(seq, dtype=torch.long),
+            "attention_mask": torch.ones(len(seq), dtype=torch.long),
+            "labels": token_labels,
+        }
+        sample["position_ids"] = torch.arange(len(seq), dtype=torch.long)
+        return sample
+
+    if len(tokens) > max_seq_len:
+        tokens = tokens[:max_seq_len]
+
+    examples.append(build_sample(tokens))
+    return examples

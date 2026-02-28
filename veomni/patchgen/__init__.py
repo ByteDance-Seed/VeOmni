@@ -1,0 +1,1 @@
+"""VeOmni patch generation utilities."""
