@@ -7,6 +7,7 @@ from transformers import AutoConfig
 
 from veomni import _safe_apply_patches
 from veomni.utils.device import empty_cache, synchronize
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from ..tools.common_utils import print_device_mem_info
 from .utils import (
@@ -32,7 +33,7 @@ def _release_device_memory():
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
-test_cases = [
+_TEST_CASES_TRANSFORMERS_V4 = [
     pytest.param(
         "./tests/toy_config/llama31_toy/config.json",
         False,
@@ -76,6 +77,23 @@ test_cases = [
         id="deepseek_v3",
     ),
 ]
+
+_TEST_CASES_TRANSFORMERS_V5 = [
+    pytest.param(
+        "./tests/toy_config/qwen3_5_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_5",
+    ),
+]
+
+if is_transformers_version_greater_or_equal_to("5.0.0"):
+    test_cases = _TEST_CASES_TRANSFORMERS_V5
+    print("[test_models_patch] Using transformers v5 test cases.")
+else:
+    test_cases = _TEST_CASES_TRANSFORMERS_V4
+    print("[test_models_patch] Using transformers v4 test cases.")
 
 
 @pytest.mark.parametrize("config_path, is_moe, rtol, atol", test_cases)
@@ -145,6 +163,13 @@ def test_models_patch_fwd_bwd(
     # TODO: transformers v5 fixed this, remove this after veomni support transformers v5.
     if case_id == "deepseek_v3":
         hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
+
+    # Qwen3.5 compatibility:
+    # - HF backend doesn't support the test's position_ids test cases.
+    # - VeOmni backend doesn't support the padded_bsh cases as we only support packed sequence case.
+    if case_id == "qwen3_5":
+        hf_model_modes = [mode for mode in hf_model_modes if mode.attn_case != "position_ids"]
+        veomni_model_modes = [mode for mode in veomni_model_modes if mode.attn_case != "padded_bsh"]
 
     # Train HF backend models
     for idx, mode in enumerate(hf_model_modes):

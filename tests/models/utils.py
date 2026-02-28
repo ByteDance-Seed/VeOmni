@@ -175,10 +175,22 @@ def prepare_data(bsz, max_seq_len, seq_lens):
                 position_ids_list.append(position_ids)
             position_ids = torch.cat(position_ids_list).unsqueeze(0)
             input_ids = torch.cat([input_ids[i, :l] for i, l in enumerate(seq_lens)]).unsqueeze(0)
+            cu_seqlens = F.pad(seq_lens, pad=(1, 0)).cumsum_(-1).int()
+            max_seqlen = seq_lens.max().item()
 
             return {
                 "input_ids": input_ids,
                 "position_ids": position_ids,
+                # NOTE: position_ids mode (args.rmpad_with_pos_ids=True)
+                # requires cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k as input to avoid
+                # recomputing them in the forward pass (which causes device-to-host sync that kills performance).
+                # For models with linear attention like Qwen3.5, we also assert the presence of
+                # cu_seq_lens_q to make sure the linear attention layer ops like casual_conv1d can properly handle
+                # the sequence packing case.
+                "cu_seq_lens_q": cu_seqlens,
+                "cu_seq_lens_k": cu_seqlens,
+                "max_length_q": max_seqlen,
+                "max_length_k": max_seqlen,
                 "labels": input_ids.clone(),
             }
 
@@ -209,7 +221,8 @@ def prepare_data(bsz, max_seq_len, seq_lens):
 
 def train_one_step(model, optimizer, inputs):
     for k, v in inputs.items():
-        inputs[k] = v.to(get_device_type())
+        if isinstance(v, torch.Tensor):
+            inputs[k] = v.to(get_device_type())
 
     optimizer.zero_grad()
     loss = model(**inputs, use_cache=False).loss.mean()
