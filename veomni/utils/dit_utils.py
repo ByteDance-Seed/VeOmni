@@ -43,16 +43,12 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-def _compute_wan_seqlens(
-    micro_batch: Dict[str, "torch.Tensor"], rmpad: bool, rmpad_with_pos_ids: bool
-) -> Tuple[List[int], Optional[List[int]]]:
+def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> Tuple[List[int], Optional[List[int]]]:
     """
     Computes the sequence lengths of the current batch.
 
     Args:
         micro_batch (Dict[str, Tensor]): The current batch.
-        rmpad (bool): Whether to remove the padding tokens.
-        rmpad_with_pos_ids (bool): Whether to remove the padding tokens using the position ids.
     """
     latent_shape = micro_batch["latents"].shape
     if len(latent_shape) == 5:
@@ -101,7 +97,7 @@ class EnvironMeter(OriginalEnvironMeter):
 
     def add(self, micro_batch: Dict[str, "torch.Tensor"], model_type: Optional[str] = None) -> None:
         if model_type == "wan":
-            seqlens = _compute_wan_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids)
+            seqlens = _compute_wan_seqlens(micro_batch)
         elif model_type == "flux":
             seqlens = _compute_flux_seqlens(micro_batch)
         else:

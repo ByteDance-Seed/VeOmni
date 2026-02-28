@@ -18,7 +18,6 @@ data:
 train:
   output_dir: omni_sft
   data_parallel_mode: fsdp1
-  rmpad: false
   lr: 1.0e-5
   lr_decay_style: cosine
   num_train_epochs: 3

@@ -54,7 +54,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLModel as _Qwen2VLModel
 from transformers.processing_utils import Unpack
 
-from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -63,6 +62,7 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_CUDA_AVAILABLE
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -383,11 +383,6 @@ class Qwen2VLModel(_Qwen2VLModel):
             if position_ids.shape[1] == 3:  # bs, 3, l
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, 3, l -> 3, bs, l
         # --- Patch.3 ---
-
-        # --- Patch.1 ---
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-        # --- Patch.1 ---
 
         outputs = self.language_model(
             input_ids=None,

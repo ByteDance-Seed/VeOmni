@@ -22,8 +22,6 @@ train:
   use_wandb: false
   wandb_project: qwen25_vl
   wandb_name: qwen25_vl
-  rmpad: false
-  rmpad_with_pos_ids: true
   ulysses_parallel_size: 1
   freeze_vit: false
   lr: 1.0e-5

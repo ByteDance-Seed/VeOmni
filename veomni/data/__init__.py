@@ -14,23 +14,13 @@
 
 from .chat_template import build_chat_template
 from .data_collator import (
-    CollatePipeline,
-    DataCollatorWithPacking,
-    DataCollatorWithPadding,
-    DataCollatorWithPositionIDs,
-    DataCollatorWithPositionIDsAndPadding,
+    MainCollator,
     MakeMicroBatchCollator,
-    TextSequenceShardCollator,
     UnpackDataCollator,
 )
-from .data_loader import build_dataloader
+from .data_loader import DistributedDataloader, build_dataloader
 from .dataset import build_dataset
 from .dummy_dataset import build_dummy_dataset
-from .multimodal.data_collator import (
-    OmniDataCollatorWithPacking,
-    OmniDataCollatorWithPadding,
-    OmniSequenceShardCollator,
-)
 from .multimodal.multimodal_chat_template import build_multimodal_chat_template
 
 
@@ -39,16 +29,9 @@ __all__ = [
     "build_dataloader",
     "build_dummy_dataset",
     "build_multimodal_chat_template",
-    "CollatePipeline",
-    "DataCollatorWithPacking",
-    "DataCollatorWithPadding",
-    "DataCollatorWithPositionIDs",
-    "DataCollatorWithPositionIDsAndPadding",
+    "MainCollator",
     "MakeMicroBatchCollator",
-    "TextSequenceShardCollator",
     "UnpackDataCollator",
-    "OmniDataCollatorWithPacking",
-    "OmniDataCollatorWithPadding",
-    "OmniSequenceShardCollator",
     "build_dataset",
+    "DistributedDataloader",
 ]
