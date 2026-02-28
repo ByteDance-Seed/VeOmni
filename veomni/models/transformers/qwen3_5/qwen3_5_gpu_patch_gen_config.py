@@ -24,14 +24,18 @@ Language-model focused patches from qwen3_next example:
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
+    Qwen3_5Config,
     Qwen3_5DynamicCache,
     Qwen3_5ModelOutputWithPast,
+    Qwen3_5RMSNormGated,
     apply_mask_to_padding_states,
     torch_chunk_gated_delta_rule,
 )
@@ -41,6 +45,7 @@ from transformers.utils import TransformersKwargs, logging
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import slice_position_embedding
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.device import get_device_id
 
 
 logger = logging.get_logger(__name__)
@@ -54,6 +59,7 @@ config = PatchConfig(
 
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.distributed.sequence_parallel", names=["slice_position_embedding"])
+config.add_import("veomni.utils.device", names=["get_device_id"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -81,6 +87,91 @@ config.add_post_import_block(
         )
     """
 )
+
+
+# Dummy definitions for names that exist in the generated file's scope but not here.
+# The patchgen only extracts the function body; these are resolved at codegen time.
+FusedRMSNormGated = None
+Qwen3_5GatedDeltaNet = None
+causal_conv1d_fn = None
+causal_conv1d_update = None
+torch_causal_conv1d_update = None
+chunk_gated_delta_rule = None
+torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
+fused_recurrent_gated_delta_rule = None
+torch_recurrent_gated_delta_rule = None
+is_fast_path_available = None
+
+
+@config.override_method(
+    "Qwen3_5GatedDeltaNet.__init__",
+    description="Use device-agnostic get_device_id() for FusedRMSNormGated init",
+)
+def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.num_v_heads = config.linear_num_value_heads
+    self.num_k_heads = config.linear_num_key_heads
+    self.head_k_dim = config.linear_key_head_dim
+    self.head_v_dim = config.linear_value_head_dim
+    self.key_dim = self.head_k_dim * self.num_k_heads
+    self.value_dim = self.head_v_dim * self.num_v_heads
+
+    self.conv_kernel_size = config.linear_conv_kernel_dim
+    self.layer_idx = layer_idx
+    self.activation = config.hidden_act
+    self.act = ACT2FN[config.hidden_act]
+    self.layer_norm_epsilon = config.rms_norm_eps
+
+    # QKV
+    self.conv_dim = self.key_dim * 2 + self.value_dim
+    self.conv1d = nn.Conv1d(
+        in_channels=self.conv_dim,
+        out_channels=self.conv_dim,
+        bias=False,
+        kernel_size=self.conv_kernel_size,
+        groups=self.conv_dim,
+        padding=self.conv_kernel_size - 1,
+    )
+
+    # time step projection (discretization)
+    # instantiate once and copy inv_dt in init_weights of PretrainedModel
+    self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+
+    A = torch.empty(self.num_v_heads).uniform_(0, 16)
+    self.A_log = nn.Parameter(torch.log(A))
+
+    self.norm = (
+        Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+        if FusedRMSNormGated is None
+        else FusedRMSNormGated(
+            self.head_v_dim,
+            eps=self.layer_norm_epsilon,
+            activation=self.activation,
+            # Modification: use device-agnostic get_device_id() instead of hardcoded device
+            device=get_device_id(),
+            dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
+        )
+    )
+
+    self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    self.causal_conv1d_fn = causal_conv1d_fn
+    self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
+    self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+    self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
+
+    if not is_fast_path_available:
+        logger.warning_once(
+            "The fast path is not available because one of the required library is not installed. Falling back to "
+            "torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and"
+            " https://github.com/Dao-AILab/causal-conv1d"
+        )
+
+    self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+    self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+    self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+    self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
 
 @config.override_method(
