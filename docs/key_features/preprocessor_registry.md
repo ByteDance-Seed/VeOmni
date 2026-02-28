@@ -2,17 +2,17 @@
 
 ## Overview
 
-The Custom Preprocessor Registry provides a simple and extensible system for registering data source-specific preprocessor functions in VeOmni. All preprocessors (built-in and custom) are registered using the `@register_preprocessor` decorator and automatically available throughout the framework.
+The Custom Preprocessor Registry provides a simple and extensible system for registering data source-specific preprocessor functions in VeOmni. All preprocessors (built-in and custom) are registered using the `@PREPROCESSOR_REGISTRY` decorator and automatically available throughout the framework.
 
 **Terminology Clarification:**
-- **Dataset**: Classes that handle data loading (e.g., `MultiSourceDataset`, `MappingDataset`, `IterableDataset`)
+- **Dataset**: Classes that handle data loading (e.g., `MappingDataset`, `IterableDataset`)
 - **Preprocessor**: Functions that convert raw data samples from a specific source into model-ready format
 
 This registry manages preprocessor functions, not dataset classes.
 
 ## Features
 
-- **Decorator-based API**: Simple `@register_preprocessor` decorator for registration
+- **Decorator-based API**: Simple `@PREPROCESSOR_REGISTRY` decorator for registration
 - **Auto-registration**: Preprocessors are automatically registered when the module is imported
 - **Multiple Names**: Register the same preprocessor under multiple data source names
 - **Clear Terminology**: Distinguishes between dataset classes (data loading) and preprocessor functions (format conversion)
@@ -353,18 +353,18 @@ For a complete working example of how preprocessors integrate into the training 
 **1. Training Entry Point**: [train.sh](../../train.sh)
    - Launches distributed training with torchrun
 
-**2. Training Script**: [tasks/omni/train_qwen2_vl.py](../../tasks/omni/train_qwen2_vl.py)
-   - **Line 27**: Imports `conv_preprocess` from the preprocessor registry
-   - **Lines 60-103**: Defines `process_sample()` function that:
-     - Calls `conv_preprocess()` at line 72 to apply the registered preprocessor
+**2. Training Script**: [tasks/train_vlm.py](../../tasks/train_vlm.py)
+   - [data/multimodal/data_transform.py](../../veomni/data/multimodal/data_transform.py) Imports `conv_preprocess` from the preprocessor registry
+   - Each transform function defines `process_sample()` function that:
+     - Calls `conv_preprocess()` at to apply the registered preprocessor
      - Handles image processing and tokenization
      - Returns the processed example ready for training
 
 **3. Configuration**: [configs/multimodal/qwen2_vl/qwen2_vl.yaml](../../configs/multimodal/qwen2_vl/qwen2_vl.yaml)
-   - **Line 11**: Specifies `source_name: sharegpt4v_pretrain` which matches the preprocessor name
+   - [configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml](../../configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml): Specifies `source_name: sharegpt4v_sft` which matches the preprocessor name
 
 **4. Preprocessor Definition**: [veomni/data/multimodal/preprocess.py](../../veomni/data/multimodal/preprocess.py)
-   - **Lines 41-61**: Defines `sharegpt4v_pretrain_preprocess()` decorated with `@register_preprocessor("sharegpt4v_pretrain")`
+   - Defines `sharegpt4v_sft_preprocess()` decorated with `@register_preprocessor("sharegpt4v_captioner_sft")`
    - This preprocessor converts ShareGPT4V data format into VeOmni's standardized conversation format
 
 **5. Registry System**: [veomni/utils/registry.py](../../veomni/utils/registry.py)

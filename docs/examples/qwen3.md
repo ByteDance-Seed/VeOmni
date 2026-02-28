@@ -41,7 +41,7 @@ python3 scripts/moe_ckpt_merge/moe_merge.py --raw_hf_path Qwen3-30B-A3B-Instruct
 ### Qwen3-8B
 
 ```shell
-bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml \
+bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
     --model.model_path ./Qwen3-8B \
     --data.train_path ./tulu-first2000.parquet \
     --train.data_parallel_mode fsdp2 \
@@ -51,7 +51,7 @@ bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml \
 ### Qwen3-30B
 
 ```shell
-bash train.sh tasks/train_torch.py configs/sft/qwen3_sft.yaml \
+bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
     --model.model_path ./Qwen3-30B-A3B-Instruct-2507-merge \
     --model.moe_implementation fused \
     --data.train_path ./tulu-first2000.parquet \

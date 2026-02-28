@@ -1,0 +1,30 @@
+model:
+  model_path: /PATH/TO/SEED-OSS
+
+data:
+  train_path: fineweb_100BT
+  train_size: 1000000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 4096
+  text_keys: text
+  drop_last: true
+
+train:
+  output_dir: seed_oss
+  data_parallel_mode: fsdp1
+  enable_full_shard: true
+  init_device: cpu
+  global_batch_size: 512
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  lr: 3.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  ckpt_manager: dcp
+  wandb_project: seed_oss
+  wandb_name: seed_oss_sft

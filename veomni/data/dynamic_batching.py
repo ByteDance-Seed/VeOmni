@@ -21,13 +21,170 @@ from typing import Any, Callable, Dict, Generator, Iterator, Optional
 
 from torch.utils.data import IterableDataset
 
-from veomni.data.batching_strategy import BaseBatchingStrategy
-from veomni.data.data_collator import DataCollatorWithPositionIDs
-
 from ..utils import logging
 
 
 logger = logging.get_logger(__name__)
+
+
+# TODO: add state dict for buffer to resume training.
+class DynBszBuffer:
+    """
+    A buffer to store samples for dynamic batch size.
+    """
+
+    def __init__(self):
+        self._buffer = []
+        self._buffer_sample_lens = []
+        self.del_idxs = []
+        self.cur_idx = 0
+        self.all_token_cnt = 0
+
+    def append(self, item: Dict[str, Any]):
+        """
+        Append a sample to the buffer.
+        Args:
+            item: a sample to append to the buffer.
+                The sample should be a dict with the following keys:
+                    - input_ids: torch.Tensor of shape (seq_len, )
+                    - attention_mask: torch.Tensor of shape (seq_len, )
+        """
+        self._buffer.append(item)
+        self._buffer_sample_lens.append(item["attention_mask"].sum())
+        self.all_token_cnt += self._buffer_sample_lens[-1]
+
+    def get_samples(self, n_token_per_iter: int, force: bool = True):
+        """
+        get samples from the buffer.
+        Args:
+            n_token_per_iter: the number of tokens to get.
+            force: if True, the first sample will be returned even if it is not full.
+        Returns:
+            samples: a list of samples.
+        """
+        cum_seq_len = 0
+        samples = []
+        while self.cur_idx < len(self._buffer) and cum_seq_len < n_token_per_iter:
+            seq_len = self._buffer_sample_lens[self.cur_idx]
+            if self.cur_idx not in self.del_idxs and (
+                (force is True and cum_seq_len == 0) or (seq_len <= n_token_per_iter - cum_seq_len)
+            ):
+                cum_seq_len += seq_len
+                samples.append(self._buffer[self.cur_idx])
+                self.del_idxs.append(self.cur_idx)
+            self.cur_idx += 1
+        assert len(samples) > 0
+        return samples
+
+    def __len__(self):
+        return len(self._buffer)
+
+    def flush(self):
+        """ "
+        Flush the buffer.
+        """
+        self.cur_idx = 0
+        self.all_token_cnt -= sum([self._buffer_sample_lens[idx] for idx in self.del_idxs])
+        buffer_len = len(self._buffer)
+        self._buffer = [self._buffer[idx] for idx in range(buffer_len) if idx not in self.del_idxs]
+        self._buffer_sample_lens = [
+            self._buffer_sample_lens[idx] for idx in range(buffer_len) if idx not in self.del_idxs
+        ]
+        self.del_idxs = []
+
+    def merge(self, buffer_to_merge: "DynBszBuffer"):
+        """ "
+        Merge the buffer with another buffer.
+        Args:
+            buffer_to_merge: the buffer to merge.
+        """
+        self.flush()
+        buffer_to_merge.flush()
+        for item in buffer_to_merge._buffer:
+            self.append(item)
+
+
+class BaseBatchingStrategy:
+    """
+    Base class for batching strategy.
+    """
+
+    def is_ready_for_micro_batch(self) -> bool:
+        raise NotImplementedError("should implement `is_ready_for_micro_batch`")
+
+    def put_item(self, item: Dict[str, Any]):
+        raise NotImplementedError("should implement `put_item`")
+
+    def get_micro_batch(self, step: int) -> Any:
+        raise NotImplementedError("should implement `get_micro_batch` ")
+
+    def empty(self) -> bool:
+        raise NotImplementedError("should implement `empty`")
+
+
+class TextBatchingStrategy(BaseBatchingStrategy):
+    """ "
+    Batching strategy for text data.
+    Args:
+        token_micro_bsz: the number of tokens to get for each request.
+        bsz_warmup_steps: the number of steps to warm up the batch size.
+        bsz_warmup_init_mbtoken: the initial number of tokens to get for each request.
+        buffer_size: the size of the buffer.
+    """
+
+    def __init__(
+        self,
+        token_micro_bsz,
+        buffer_size: int = 500,
+        bsz_warmup_steps: int = 0,
+        bsz_warmup_init_mbtoken: int = 200,
+    ) -> None:
+        super().__init__()
+        self._step = 0
+        self.token_micro_bsz = token_micro_bsz
+        self.bsz_warmup_steps = bsz_warmup_steps
+        self.bsz_warmup_init_mbtoken = bsz_warmup_init_mbtoken
+        if bsz_warmup_steps > 0:
+            assert self.bsz_warmup_init_mbtoken > 0
+
+        self.buffer_size = buffer_size  # minimum samples in buffer
+        self.buffer = DynBszBuffer()
+
+    def is_ready_for_micro_batch(self) -> bool:
+        return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
+
+    def put_item(self, item: Dict[str, Any]):
+        if len(item["input_ids"]) == 1:
+            print("WARNING: EMPTY STRING.")
+            return
+        self.buffer.append(item)
+
+    def get_cur_token_micro_bsz(self):
+        warmup = self.bsz_warmup_steps > 0 and self._step <= self.bsz_warmup_steps
+        if warmup:
+            return (
+                self.token_micro_bsz - self.bsz_warmup_init_mbtoken
+            ) * self._step // self.bsz_warmup_steps + self.bsz_warmup_init_mbtoken
+        else:
+            return self.token_micro_bsz
+
+    def get_micro_batch(self, step) -> Any:
+        """
+        Get a micro batch from the buffer according to the current step.
+        Args:
+            step: the current step.
+        Returns:
+            data: a list of samples.
+        """
+
+        self._step = step
+        cur_token_micro_bsz = self.get_cur_token_micro_bsz()
+        samples = self.buffer.get_samples(cur_token_micro_bsz)
+        self.buffer.flush()  # remove the selected samples.
+        return samples
+
+    def empty(self) -> bool:
+        return len(self.buffer) == 0
 
 
 class DynamicBatchingSizeDataset(IterableDataset):
@@ -47,8 +204,6 @@ class DynamicBatchingSizeDataset(IterableDataset):
 
     Attributes:
         dataset: The upstream iterable dataset to read samples from.
-        dynamic_batching_collate_fn: Callable that collates a list of samples into a
-            single micro batch.
         ready_for_micro_batch_threshold: Minimum number of samples that must be in the
             buffer before a microbatch can be formed.
         micro_batch_seq_length: Target total token count per micro batch (soft upper
@@ -67,7 +222,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         dataset: IterableDataset,
         micro_batch_seq_length: int,
         ready_for_micro_batch_threshold: int,
-        dynamic_batching_collate_fn: Optional[Callable] = DataCollatorWithPositionIDs(),
+        dynamic_batching_collate_fn: Callable,
         save_by_idx: bool = True,
         get_length_fn: Optional[Callable] = len,
         force_generate_long_sequence: bool = False,
@@ -79,8 +234,6 @@ class DynamicBatchingSizeDataset(IterableDataset):
             micro_batch_seq_length: Target total token count per micro batch.
             ready_for_micro_batch_threshold: Minimum number of samples required in
                 buffer before attempting to create a batch.
-            dynamic_batching_collate_fn: Callable to collate samples into a batch.
-                Defaults to DataCollatorWithPositionIDs().
             save_by_idx: If True, saves sample indices for checkpoint resumption.
                 Requires dataset to have get_item method and output_refetch_idx attribute.
             get_length_fn: Function to compute the length (token count) of a sample.

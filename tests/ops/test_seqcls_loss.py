@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import veomni.ops.fused_cross_entropy as m
-from veomni.data.constants import IGNORE_INDEX
+from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_torch_device
 
 

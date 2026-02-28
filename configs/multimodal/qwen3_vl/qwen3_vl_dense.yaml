@@ -22,8 +22,6 @@ train:
   use_wandb: false
   wandb_project: qwen3_vl_dense
   wandb_name: qwen3_vl_dense
-  rmpad: false
-  rmpad_with_pos_ids: true
   ulysses_parallel_size: 1
   freeze_vit: false
   lr: 1.0e-5

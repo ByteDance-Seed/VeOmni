@@ -18,8 +18,6 @@ train:
   data_parallel_mode: fsdp2
   wandb_project: qwen2vl
   wandb_name: qwen2vl
-  rmpad: false
-  rmpad_with_pos_ids: true
   ulysses_parallel_size: 1
   freeze_vit: false
   lr: 1.0e-5

@@ -16,6 +16,7 @@
 from .checkpointer import (
     CHECKPOINT_TO_STATE_DICT_REGISTRY,
     CHECKPOINTER_REGISTRY,
+    CheckpointerBase,
     build_checkpointer,
     ckpt_to_state_dict,
 )
@@ -26,4 +27,5 @@ __all__ = [
     "build_checkpointer",
     "CHECKPOINTER_REGISTRY",
     "CHECKPOINT_TO_STATE_DICT_REGISTRY",
+    "CheckpointerBase",
 ]

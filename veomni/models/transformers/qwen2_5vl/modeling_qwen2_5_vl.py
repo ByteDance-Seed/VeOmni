@@ -47,7 +47,6 @@ from transformers.utils import (
     is_torchdynamo_compiling,
 )
 
-from ....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -57,6 +56,7 @@ from ....distributed.sequence_parallel import (
     unpad_tensor,
 )
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -509,11 +509,6 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
             if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, dim, l -> dim, bs, l
             # --- Patch.5 ---
-
-        # --- Patch.3 ---
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-        # --- Patch.3 ---
 
         # --- Patch.6 ---
         kwargs.update(flash_attn_kwargs)

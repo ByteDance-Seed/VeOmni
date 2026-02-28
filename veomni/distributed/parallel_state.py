@@ -328,9 +328,11 @@ class ParallelState:
         return self.ep_fsdp_device_mesh["ep", "ep_fsdp"]
 
     @cached_property
-    @requires_mesh
     def ep_group(self) -> "ProcessGroup":
-        return self.ep_mesh.get_group()
+        if self.ep_enabled:
+            return self.ep_mesh.get_group()
+        else:
+            return None
 
     @property
     def ep_enabled(self) -> bool:
@@ -477,7 +479,7 @@ def init_parallel_state(
         dp_shard_size = dp_size
 
     logger.info_rank0(
-        f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, ep_size {ep_size}, cp_size {cp_size}, ulysses_size {ulysses_size}"
+        f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size}, tp_size {tp_size}, pp_size {pp_size}, ep_size {ep_size}, cp_size {cp_size}, ulysses_size {ulysses_size}"
     )
 
     device_mesh, ep_fsdp_device_mesh = None, None
