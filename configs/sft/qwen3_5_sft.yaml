@@ -12,7 +12,7 @@ data:
 
 train:
   output_dir: Qwen3.5-32B-sft-tulu
-  data_parallel_mode: fsdp1
+  data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
   global_batch_size: 8
   micro_batch_size: 1

@@ -44,7 +44,7 @@ bash train.sh tasks/train_torch.py configs/sft/qwen3_5_sft.yaml \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --data.max_seq_len 128 \
     --train.data_parallel_mode fsdp2 \
-    --train.init_device meta
-    --train.max_step 20
+    --train.init_device meta \
+    --train.max_steps 20 \
     --train.output_dir /mnt/local/localcache00
 ```
