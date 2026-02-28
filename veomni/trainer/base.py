@@ -337,6 +337,8 @@ class BaseTrainer(Stateful, ABC):
             weight_decay=args.train.weight_decay,
             fused=True,
             optimizer_type=args.train.optimizer,
+            no_decay_modules=args.train.no_decay_modules,
+            no_decay_params=args.train.no_decay_params,
         )
 
     def _build_lr_scheduler(self):

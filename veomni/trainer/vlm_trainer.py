@@ -230,6 +230,8 @@ class VLMTrainer:
             fused=True,
             optimizer_type=args.train.optimizer,
             param_groups=param_groups,
+            no_decay_modules=args.train.no_decay_modules,
+            no_decay_params=args.train.no_decay_params,
         )
 
     def on_train_begin(self):
