@@ -1,5 +1,5 @@
 model:
-  model_path: Qwen3.5-32B
+  model_path: Qwen3.5-27B
   attn_implementation: flash_attention_2
 
 data:
@@ -11,7 +11,7 @@ data:
   text_keys: messages
 
 train:
-  output_dir: Qwen3.5-32B-sft-tulu
+  output_dir: Qwen3.5-27B-sft-tulu
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
   global_batch_size: 8
@@ -40,4 +40,4 @@ train:
   save_epochs: 1
   save_hf_weights: false
   wandb_project: VeOmni
-  wandb_name: Qwen3.5-32B-sft-tulu
+  wandb_name: Qwen3.5-27B-sft-tulu
