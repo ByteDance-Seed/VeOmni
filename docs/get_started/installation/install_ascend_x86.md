@@ -51,7 +51,13 @@ uv sync --locked  --extra npu --extra audio
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-pip3 install -e .[npu]
+# Option 1: Stable version (transformers < 5.0)
+pip install -e .[npu,transformers-stable]
+
+# Option 2: Experimental version for new models (transformers ≥ 5.0)
+# Note: This uses the transformers5-exp extra which includes transformers 5.0+ support
+# as specified in pyproject.toml (experimental and under development)
+# pip install -e .[npu,transformers5-exp]
 ```
 
 ## Ascend relevant Environment variables
