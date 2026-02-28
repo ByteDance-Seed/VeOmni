@@ -708,10 +708,8 @@ class TrainingArguments:
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
-        # ├── model_assets/
-        # └── step2token.json
+        # └── model_assets/
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
-        self.step2token_path = os.path.join(self.output_dir, "step2token.json")
         self.model_assets_dir = os.path.join(self.output_dir, "model_assets")
 
         # determine whether to profile this rank
