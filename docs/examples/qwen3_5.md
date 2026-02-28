@@ -28,16 +28,23 @@ pq.write_table(table_first_2000, output_path)
 
 ```shell
 python3 scripts/download_hf_model.py \
-    --repo_id Qwen/Qwen3.5-32B \
-    --local_dir .
+    --repo_id Qwen/Qwen3.5-27B \
+    --local_dir ${HOME}/Qwen3.5-27B
 ```
 
 ## Start training on GPU
 
+Testing in 8x80GB GPUs.
 ```shell
+# Note: max_seq_len is set to 128 to avoid OOM with 8x80GB GPUs since the only currently available
+# Qwen3.5 model size is 27B.
+# We recommend that you use more GPUs to train Qwen3.5 27B so that you can get a proper seq len.
 bash train.sh tasks/train_torch.py configs/sft/qwen3_5_sft.yaml \
-    --model.model_path ./Qwen3.5-32B \
-    --data.train_path ./tulu-first2000.parquet \
+    --model.model_path ${HOME}/Qwen3.5-27B \
+    --data.train_path ${HOME}/tulu-first2000.parquet \
+    --data.max_seq_len 128 \
     --train.data_parallel_mode fsdp2 \
     --train.init_device meta
+    --train.max_step 20
+    --train.output_dir /mnt/local/localcache00
 ```
