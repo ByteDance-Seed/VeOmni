@@ -437,11 +437,8 @@ class MultiSourceDataset(IterableDataset):
             if ds_state is None:
                 continue
             load_state_fn = getattr(dataset, "load_state_dict", None)
-            setstate_fn = getattr(dataset, "__setstate__", None)
             if callable(load_state_fn):
                 load_state_fn(ds_state)
-            elif callable(setstate_fn):
-                setstate_fn(ds_state)
 
         # Ensure _exhausted is re-initialized for the current source count
         # This is important when sources are added/removed during checkpoint resume

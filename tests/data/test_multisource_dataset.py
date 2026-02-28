@@ -58,7 +58,7 @@ class MockIterableDataset(IterableDataset):
         self._state = dict(state)
 
 
-def run_data_test():
+def run_multisource_dataset_test():
     args = parse_args(VeOmniArguments)
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
@@ -213,7 +213,7 @@ def run_data_test():
 
             delta_time = time.time() - start_time
             try:
-                metrics = environ_meter.step(delta_time, global_step=global_step)
+                metrics_resume = environ_meter.step(delta_time, global_step=global_step)
             except AttributeError as e:
                 # Skip metrics on CPU
                 logger.warning(f"[rank{rank}] Skipping metrics: {e}")
@@ -557,7 +557,8 @@ def test_level_token_weighting():
     dataset._avg_len_sum = [4.0, 1.0]
     dataset._avg_len_count = [1, 1]
     weights = dataset._runtime_weights()
-    assert weights[1] > weights[0]
+    assert weights[0] == 0.2
+    assert weights[1] == 0.8
 
 
 @pytest.mark.parametrize(
@@ -754,4 +755,4 @@ def test_multisource_dataset_chain():
 
 if __name__ == "__main__":
     with patch("veomni.utils.device.empty_cache", _mock_empty_cache):
-        run_data_test()
+        run_multisource_dataset_test()
