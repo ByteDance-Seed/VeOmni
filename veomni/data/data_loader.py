@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Union
 
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -35,7 +35,7 @@ from .data_collator import (
     TextSequenceShardCollator,
     UnpackDataCollator,
 )
-from .dynamic_batching import DynamicBatchingSizeDataset, DynamicBatchSizeDataLoader
+from .dynamic_batching import DynamicBatchingSizeDataset, DynamicBatchSizeDataLoader, get_length_by_attention_mask_fn
 
 
 if TYPE_CHECKING:
@@ -73,18 +73,18 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
-    dyn_bsz_in_dataloader: bool = True,  # If True, dynamic batching is handled in the main process via DynamicBatchSizeDataLoader (legacy).
-    # If False, batching is done inside each DataLoader worker via DynamicBatchingSizeDataset, which supports StatefulDataLoader checkpoint/resume.
+    dyn_bsz_runtime: Literal["main", "worker"] = "main",
     pad_packed_to_length: Optional[int] = None,
     dyn_bsz_buffer_size: int = 500,
     dyn_bsz_margin: int = 0,
-    dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_in_dataloader is False.
+    dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_runtime is "worker".
     collate_fn: Optional[Union[Callable, List[Callable]]] = None,
     num_workers: int = 8,
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     seed: int = 0,
+    multiprocessing_context=None,
 ) -> "DistributedDataloader":
     parallel_state = get_parallel_state()
     token_micro_bsz = micro_batch_size * max_seq_len
@@ -127,7 +127,7 @@ def build_native_dataloader(
 
     if use_rmpad and dyn_bsz:
         dyn_bsz_collate_fn = collate_fn
-        if dyn_bsz_in_dataloader:
+        if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=token_micro_bsz - dyn_bsz_margin * max_seq_len,
                 buffer_size=dyn_bsz_buffer_size,
@@ -141,7 +141,7 @@ def build_native_dataloader(
                 dataset=dataset,
                 micro_batch_seq_length=token_micro_bsz,
                 ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
-                get_length_fn=lambda x: int(x["attention_mask"].sum()),
+                get_length_fn=get_length_by_attention_mask_fn,
                 dynamic_batching_collate_fn=dyn_bsz_collate_fn,
                 save_by_idx=dyn_bsz_dataset_save_by_idx,
             )
@@ -169,8 +169,9 @@ def build_native_dataloader(
         pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
+        multiprocessing_context=multiprocessing_context,
     )
-    if use_rmpad and dyn_bsz and dyn_bsz_in_dataloader:
+    if use_rmpad and dyn_bsz and dyn_bsz_runtime == "main":
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
             batching_strategy=batching_strategy,

@@ -256,7 +256,7 @@ def build_command(dataset_type, dataloader_type):
         "--nnodes=1",
         "--nproc_per_node=8",
         f"--master_port={port}",
-        "tests/data/test_multisource_datasets.py",
+        "tests/data/test_interleave_datasets.py",
         "--data.enable_multisource=True",
         "--model.config_path=test",
         "--data.train_path=None",
@@ -276,7 +276,7 @@ def build_command(dataset_type, dataloader_type):
     return command
 
 
-def test_multisource_data_rmpad_with_pos_ids():
+def test_interleave_rmpad_with_pos_ids():
     command = build_command(dataset_type="mapping", dataloader_type="rmpad_with_pos_ids")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
@@ -286,7 +286,7 @@ def test_multisource_data_rmpad_with_pos_ids():
     assert result.returncode == 0
 
 
-def test_multisource_data_padding():
+def test_interleave_padding():
     command = build_command(dataset_type="mapping", dataloader_type="padding")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
