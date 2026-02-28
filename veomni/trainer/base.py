@@ -99,7 +99,7 @@ class BaseTrainer(Stateful, ABC):
     - `post_init()`: Add custom initialization after setup
     - `forward_backward_step()`: Customize forward/backward logic
     - `train_step()`: Customize training step execution
-    - `fit()`: Train the model
+    - `train()`: Train the model
 
     Callback Hooks:
         The trainer calls callback methods at various stages:
@@ -530,7 +530,7 @@ class BaseTrainer(Stateful, ABC):
         dist.barrier()
         dist.destroy_process_group()
 
-    def fit(self):
+    def train(self):
         args: VeOmniArguments = self.args
         self.on_train_begin()
         logger.info(

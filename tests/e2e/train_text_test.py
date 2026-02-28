@@ -67,4 +67,4 @@ class LogDictSaveCallback(Callback):
 if __name__ == "__main__":
     args = parse_args(VeOmniArguments)
     trainer = TestTextTrainer(args)
-    trainer.fit()
+    trainer.train()

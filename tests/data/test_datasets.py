@@ -97,10 +97,10 @@ class TrainerTest(BaseTrainer):
         self.on_step_begin(micro_batches=micro_batches)
         self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
 
-    def resume_fit(self):
+    def resume_train(self):
         self.is_resume = True
         self.start_save_data = True
-        super().fit()
+        super().train()
 
     def destroy_distributed(self):
         if self.is_resume:  # do not destroy distributed when gt train
@@ -198,8 +198,8 @@ class CheckCallback(Callback):
 def main():
     args: VeOmniArguments = parse_args(VeOmniArguments)
     trainer = TrainerTest(args)
-    trainer.fit()
-    trainer.resume_fit()
+    trainer.train()
+    trainer.resume_train()
 
 
 if __name__ == "__main__":

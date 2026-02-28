@@ -33,11 +33,11 @@ class TextRLTrainer(TextTrainer):
 
         self.base._build_preforward_postforward()
 
-    def fit(self):
-        super().fit()
+    def train(self):
+        super().train()
 
 
 if __name__ == "__main__":
     args = parse_args(VeOmniArguments)
     trainer = TextRLTrainer(args)
-    trainer.fit()
+    trainer.train()

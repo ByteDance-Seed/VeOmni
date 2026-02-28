@@ -241,7 +241,7 @@ class CheckCallback(Callback):
 def main():
     args: VeOmniArguments = parse_args(VeOmniArguments)
     trainer = TrainerTest(args)
-    trainer.fit()
+    trainer.train()
 
 
 if __name__ == "__main__":

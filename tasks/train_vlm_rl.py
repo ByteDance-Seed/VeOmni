@@ -43,11 +43,11 @@ class VLMRLTrainer(VLMTrainer):
 
         self.base._build_preforward_postforward()
 
-    def fit(self):
-        self.base.fit()
+    def train(self):
+        self.base.train()
 
 
 if __name__ == "__main__":
     args = parse_args(VeOmniVLMArguments)
     trainer = VLMRLTrainer(args)
-    trainer.fit()
+    trainer.train()
