@@ -1,4 +1,4 @@
-# Installation with Ascend NPU
+# Installation with Ascend NPU (ARM)
 
 ## Required Environment
 
