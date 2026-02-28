@@ -18,7 +18,7 @@ from utils import DummyIterableDataset, DummyMappingDataset, FakeModel, compare_
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader
-from veomni.data.simple_multisource_dataset import SimpleMultiSourceIterableDataset
+from veomni.data.multisource_dataset import MultiSourceDataset
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -92,7 +92,7 @@ def run_data_test():
     ]
 
     args.data.enable_multisource = True
-    train_dataset = SimpleMultiSourceIterableDataset(
+    train_dataset = MultiSourceDataset(
         datasets=iterable_datasets,
         weights=multisource_weights,
         seed=args.train.seed,
@@ -114,7 +114,7 @@ def run_data_test():
             yaml.safe_dump(multisource_config, f)
     dist.barrier()
 
-    state = cast(SimpleMultiSourceIterableDataset, train_dataset).state_dict()
+    state = cast(MultiSourceDataset, train_dataset).state_dict()
     assert state["version"] == 0
     assert state["topology"]["stopping_strategy"] == "all_exhausted"
     assert state["topology"]["level"] == "token"
@@ -297,7 +297,7 @@ def _make_simple_dataset(
     source_names=None,
     source_ids=None,
 ):
-    return SimpleMultiSourceIterableDataset(
+    return MultiSourceDataset(
         datasets=datasets,
         weights=weights,
         seed=123,
@@ -327,6 +327,85 @@ def test_state_dict_structure():
     assert sorted(state["runtime"]["avg_len_sum"].keys()) == ["id_a", "id_b"]
     assert sorted(state["runtime"]["avg_len_count"].keys()) == ["id_a", "id_b"]
     assert sorted(state["runtime"]["dataset_states"].keys()) == ["id_a", "id_b"]
+    assert sorted(state["runtime"]["exhausted"].keys()) == ["id_a", "id_b"]
+
+
+def test_exhausted_state_save_restore_and_elastic():
+    """Test exhausted state save/restore with elastic source add/remove scenarios."""
+    # Scenario 1: Basic save and restore
+    ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
+    ds2 = MockIterableDataset([{"input_ids": [2]}, {"input_ids": [3]}], name="b")
+    dataset = _make_simple_dataset(
+        datasets=[ds1, ds2],
+        weights=[0.5, 0.5],
+        stopping_strategy="all_exhausted",
+        source_ids=["id_a", "id_b"],
+    )
+    dataset._exhausted = [True, False]
+    state = dataset.state_dict()
+    assert state["runtime"]["exhausted"] == {"id_a": True, "id_b": False}
+
+    # Restore to same structure
+    ds1_new = MockIterableDataset([{"input_ids": [1]}], name="a")
+    ds2_new = MockIterableDataset([{"input_ids": [2]}, {"input_ids": [3]}], name="b")
+    dataset_new = _make_simple_dataset(
+        datasets=[ds1_new, ds2_new],
+        weights=[0.5, 0.5],
+        stopping_strategy="all_exhausted",
+        source_ids=["id_a", "id_b"],
+    )
+    dataset_new.load_state_dict(state)
+    assert dataset_new._exhausted == [True, False]
+
+    # Scenario 2: Add a new source - new source should default to False
+    ds1_new2 = MockIterableDataset([{"input_ids": [1]}], name="a")
+    ds2_new2 = MockIterableDataset([{"input_ids": [2]}, {"input_ids": [3]}], name="b")
+    ds3_new = MockIterableDataset([{"input_ids": [4]}], name="c")
+    dataset_with_new = _make_simple_dataset(
+        datasets=[ds1_new2, ds2_new2, ds3_new],
+        weights=[0.3, 0.3, 0.4],
+        stopping_strategy="all_exhausted",
+        source_ids=["id_a", "id_b", "id_c"],
+    )
+    dataset_with_new.load_state_dict(state, reconcile_policy="allow_add")
+    assert dataset_with_new._exhausted == [True, False, False]
+
+    # Scenario 3: Remove a source - only remaining sources' states preserved
+    ds1_new3 = MockIterableDataset([{"input_ids": [1]}], name="a")
+    dataset_removed = _make_simple_dataset(
+        datasets=[ds1_new3],
+        weights=[1.0],
+        stopping_strategy="all_exhausted",
+        source_ids=["id_a"],
+    )
+    dataset_removed.load_state_dict(state, reconcile_policy="allow_add_remove")
+    assert dataset_removed._exhausted == [True]
+
+
+def test_exhausted_state_backward_compatible():
+    """Test that loading old checkpoint without exhausted field defaults to all False."""
+    ds1 = MockIterableDataset([{"input_ids": [1]}], name="a")
+    ds2 = MockIterableDataset([{"input_ids": [2]}], name="b")
+    dataset = _make_simple_dataset(
+        datasets=[ds1, ds2],
+        weights=[0.5, 0.5],
+        stopping_strategy="all_exhausted",
+        source_ids=["id_a", "id_b"],
+    )
+
+    # Simulate old checkpoint without exhausted field
+    old_state = {
+        "topology": {"source_ids": ["id_a", "id_b"]},
+        "runtime": {
+            "random_state": np.random.RandomState(42).get_state(),
+            "avg_len_sum": {"id_a": 1.0, "id_b": 2.0},
+            "avg_len_count": {"id_a": 1, "id_b": 2},
+            "dataset_states": {"id_a": {"consumed": 1}, "id_b": {"consumed": 2}},
+        },
+    }
+
+    dataset.load_state_dict(old_state)
+    assert dataset._exhausted == [False, False]
 
 
 def test_elastic_load_add_source():
@@ -531,7 +610,7 @@ def test_level_token_weighting():
 )
 def test_init_validation(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        SimpleMultiSourceIterableDataset(**kwargs, seed=42)
+        MultiSourceDataset(**kwargs, seed=42)
 
 
 @pytest.mark.parametrize(
@@ -644,7 +723,7 @@ def build_command():
         "--nnodes=1",
         "--nproc_per_node=2",
         f"--master_port={port}",
-        "tests/data/test_simple_multisource_dataset.py",
+        "tests/data/test_multisource_dataset.py",
         "--data.enable_multisource=True",
         "--model.config_path=test",
         "--data.train_path=None",
@@ -658,14 +737,14 @@ def build_command():
         "--train.ulysses_parallel_size=1",
         "--train.bsz_warmup_ratio=0",
         "--train.output_dir=.tests/cache",
-        "--train.rmpad=False",
-        "--train.dyn_bsz=False",
+        "--train.rmpad=True",
+        "--train.dyn_bsz=True",
         "--train.max_steps=6",
     ]
     return command
 
 
-def test_simple_multisource_dataset_chain():
+def test_multisource_dataset_chain():
     if sys.platform == "darwin":
         pytest.skip(f"torch_shm_manager not supported on macOS: executable={_torch_shm_manager_executable()}")
     command = build_command()

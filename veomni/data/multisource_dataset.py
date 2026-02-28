@@ -12,8 +12,8 @@ from ..utils import logging
 logger = logging.get_logger(__name__)
 
 
-class SimpleMultiSourceIterableDataset(IterableDataset):
-    """Multi-source iterable dataset with weighted sampling.
+class MultiSourceDataset(IterableDataset):
+    """Multi-source dataset with weighted sampling.
 
     This dataset samples from multiple upstream iterable datasets according to a
     (possibly token-adjusted) weight distribution.
@@ -38,7 +38,7 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         stopping_strategy: Literal["first_exhausted", "all_exhausted", "never_exhausted"] = "first_exhausted",
         output_refetch_idx: bool = False,
     ) -> None:
-        """Initialize a SimpleMultiSourceIterableDataset.
+        """Initialize a MultiSourceDataset.
 
         Args:
             datasets: Upstream iterable datasets (one per source).
@@ -85,9 +85,6 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         if not self._source_ids:
             self._source_ids = copy.deepcopy(self._source_names)
 
-        # assert all ids are different
-        assert len(set(self._source_ids)) == len(self._source_ids), "source_ids must be unique"
-
         self._id2dataset = dict(zip(self._source_ids, self._datasets))
         self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
         self._avg_len_count = [0 for _ in range(self._ds_num)]
@@ -95,6 +92,7 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
         self._random_state = np.random.RandomState(seed=self._seed)
         self._iters: List[Any] = []
         self._epoch = 0
+        self._exhausted = [False for _ in range(self._ds_num)]
         if self._weights.shape[0] != self._ds_num:
             raise ValueError("weights length must match datasets length")
         if self._source_names is not None and len(self._source_names) != self._ds_num:
@@ -355,6 +353,8 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
             dataset_states_by_id[source_id] = ds_state
         avg_len_sum_by_id = {source_id: self._avg_len_sum[idx] for idx, source_id in enumerate(self._source_ids)}
         avg_len_count_by_id = {source_id: self._avg_len_count[idx] for idx, source_id in enumerate(self._source_ids)}
+        # save _exhausted state
+        exhausted_by_id = {source_id: self._exhausted[idx] for idx, source_id in enumerate(self._source_ids)}
         return {
             "version": 0,
             "topology": {
@@ -369,6 +369,7 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
                 "random_state": self._random_state.get_state(),
                 "avg_len_sum": avg_len_sum_by_id,
                 "avg_len_count": avg_len_count_by_id,
+                "exhausted": exhausted_by_id,
                 "global_sample_idx": self._global_sample_idx,
                 "dataset_states": dataset_states_by_id,
             },
@@ -444,5 +445,10 @@ class SimpleMultiSourceIterableDataset(IterableDataset):
 
         # Ensure _exhausted is re-initialized for the current source count
         # This is important when sources are added/removed during checkpoint resume
-        self._exhausted = [False for _ in range(self._ds_num)]
+        if "exhausted" in runtime and isinstance(runtime["exhausted"], dict):
+            exhausted_dict = runtime["exhausted"]
+            self._exhausted = [bool(exhausted_dict.get(source_id, False)) for source_id in self._source_ids]
+        else:
+            self._exhausted = [False for _ in range(self._ds_num)]
+
         self._just_resumed = True
