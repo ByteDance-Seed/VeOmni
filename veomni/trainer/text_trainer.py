@@ -152,7 +152,7 @@ class TextTrainer:
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
-    def fit(self):
+    def train(self):
         args: VeOmniArguments = self.base.args
         self.on_train_begin()
         logger.info(
