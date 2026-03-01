@@ -272,8 +272,11 @@ def test_models_patch_fwd_bwd(
     # - HF backend doesn't support the test's position_ids test cases.
     # - VeOmni backend doesn't support the padded_bsh cases as we only support packed sequence case.
     if case_id == "qwen3_5":
-        hf_model_modes = [mode for mode in hf_model_modes if mode.attn_case != "position_ids"]
-        veomni_model_modes = [mode for mode in veomni_model_modes if mode.attn_case != "padded_bsh"]
+        #    hf_model_modes = [mode for mode in hf_model_modes if mode.attn_case != "position_ids"]
+        hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
+        veomni_model_modes = [
+            mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
+        ]
 
     model_config = ModelArguments(config_path=config_path)
     data_config = DataArguments(train_path="")
