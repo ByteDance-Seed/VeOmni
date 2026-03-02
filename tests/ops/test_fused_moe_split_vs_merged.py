@@ -5,11 +5,12 @@ import torch.nn.functional as F
 from veomni.ops import fused_moe
 from veomni.ops.fused_moe import fused_moe_forward
 from veomni.ops.fused_moe.torch_fused_moe import torch_fused_moe_forward
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_fused_moe_available
 
 
 def _skip_if_unsupported(moe_kernel: str):
-    if not torch.cuda.is_available():
+    if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA is required for fused MoE split/merged parity test.")
     if moe_kernel == "triton" and not is_fused_moe_available():
         pytest.skip("Triton fused MoE is not available in this environment.")
@@ -65,7 +66,7 @@ def test_fused_moe_split_and_merged_match_eager(
     _skip_if_unsupported(moe_kernel)
 
     torch.manual_seed(seed)
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.bfloat16
 
     hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
