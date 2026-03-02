@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import gc
+import os
+import shutil
+import tempfile
 import time
 from typing import Dict, Optional, Sequence
 
@@ -77,47 +81,117 @@ def get_model_save_state(
     return save_state
 
 
+class _TimedHuggingFaceStorageWriter:
+    """Mixin that adds per-rank timing logs to HuggingFaceStorageWriter.
+
+    Logs wall-clock time for:
+    - write_data: each rank writing its local shard files
+    - finish: rank-0 consolidation (only executes on coordinator)
+    """
+
+    def write_data(self, plan, planner):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        start = time.time()
+        result = super().write_data(plan, planner)
+        elapsed = time.time() - start
+        logger.info(f"[Rank {rank}] Shard write took {elapsed:.2f}s")
+        return result
+
+    def finish(self, metadata, results):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.info(f"[Rank {rank}] Start consolidation")
+        start = time.time()
+        result = super().finish(metadata=metadata, results=results)
+        elapsed = time.time() - start
+        logger.info(f"[Rank {rank}] finish (consolidation) took {elapsed:.2f}s")
+        return result
+
+
 def _save_hf_safetensor_distributed(
     model: torch.nn.Module,
     save_path: str,
     fqn_to_index_mapping: Optional[Dict[str, int]],
     model_assets: Optional[Sequence],
+    is_rank_0: bool,
 ):
     """Distributed HuggingFace safetensors save using HuggingFaceStorageWriter (PyTorch >= 2.9).
 
     All ranks must call this function.
+
+    Uses a dedicated Gloo process group for DCP save coordination
+
+    For mounted filesystems (e.g., HDFS FUSE), consolidation output is
+    redirected to a local temp directory to avoid EOPNOTSUPP errors, then
+    copied back to save_path.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    storage_writer = HuggingFaceStorageWriter(
+    class TimedHuggingFaceStorageWriter(_TimedHuggingFaceStorageWriter, HuggingFaceStorageWriter):
+        pass
+
+    output_to_mount_path = save_path.startswith("/mnt/hdfs")
+
+    # Use a dedicated Gloo process group for DCP save coordination and barriers.
+    # Each rank writes its own safetensor shards, and rank 0 performs consolidation,
+    # We set a large timeout to accommodate I/O time.
+    gloo_group = dist.new_group(backend="gloo", timeout=datetime.timedelta(hours=2)) if dist.is_initialized() else None
+
+    storage_writer = TimedHuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
         fqn_to_index_mapping=fqn_to_index_mapping,
         enable_consolidation=True,
-        thread_count_consolidation=5,
     )
+
+    # For mounted filesystems, redirect consolidation output to a local temp dir
+    # to avoid EOPNOTSUPP errors on HDFS FUSE.
+    local_tmp_dir = None
+    if output_to_mount_path:
+        local_tmp_dir = tempfile.mkdtemp(prefix="veomni_hf_save_")
+        storage_writer.consolidated_output_path = local_tmp_dir
+        logger.info_rank0(f"Mount path detected, consolidation output redirected to local temp dir: {local_tmp_dir}")
 
     save_state = get_model_save_state(model, fqn_to_index_mapping)
 
-    logger.info_rank0("Starting distributed HuggingFace safetensors save...")
-    if dist.is_initialized():
-        dist.barrier()
+    logger.info_rank0("Starting dcp.save()...")
+    if gloo_group is not None:
+        dist.barrier(group=gloo_group)
     start_time = time.time()
     dcp.save(
         state_dict=save_state,
         storage_writer=storage_writer,
+        process_group=gloo_group,
     )
     del save_state  # Free copied tensors (e.g. fp32->bf16) to reduce peak memory
-    if dist.is_initialized():
-        dist.barrier()
+    if gloo_group is not None:
+        dist.barrier(group=gloo_group)
     gc.collect()
     helper.empty_cache()
     elapsed_time = time.time() - start_time
-    logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
+    logger.info_rank0(f"dcp.save() save took {elapsed_time:.2f}s")
+
+    # For mount paths, rank 0 copies consolidated files from local temp dir back to save_path.
+    if is_rank_0 and output_to_mount_path:
+        logger.info(f"Copying consolidated safetensors from {local_tmp_dir} to {save_path}")
+        os.makedirs(save_path, exist_ok=True)
+        copy_start = time.time()
+        for filename in os.listdir(local_tmp_dir):
+            src_file = os.path.join(local_tmp_dir, filename)
+            dst_file = os.path.join(save_path, filename)
+            if os.path.isfile(src_file):
+                shutil.copy2(src_file, dst_file)
+        copy_elapsed = time.time() - copy_start
+        logger.info(f"Copied consolidated safetensors to {save_path} in {copy_elapsed:.2f}s")
+        shutil.rmtree(local_tmp_dir, ignore_errors=True)
 
     # Save model assets (config, tokenizer, etc.) on rank 0
-    if model_assets and (not dist.is_initialized() or dist.get_rank() == 0):
+    if model_assets and is_rank_0:
         save_model_assets(save_path, model_assets)
+
+    # Ensure all ranks wait for rank 0 to finish before proceeding.
+    if gloo_group is not None:
+        dist.barrier(group=gloo_group)
+        dist.destroy_process_group(gloo_group)
 
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_path} successfully!")
 
@@ -176,14 +250,16 @@ def save_hf_safetensor(
             and to filter LoRA weights in legacy mode.
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
-        is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
-            Required by non-dcp checkpoint managers (e.g., omnistore).
+        is_rank_0: Whether the current process is global rank 0.
+            Used by both legacy (rank-0 only save) and distributed (rank-0
+            consolidation and asset saving) paths.
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    overall_start = time.time()
 
     use_distributed = is_torch_version_greater_than("2.9") and train_architecture != "lora" and ckpt_manager == "dcp"
 
@@ -199,7 +275,7 @@ def save_hf_safetensor(
             dist.barrier()
 
     if use_distributed:
-        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
+        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, is_rank_0)
     else:
         # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
@@ -212,6 +288,9 @@ def save_hf_safetensor(
                 output_dir,
             )
 
-    # Ensure all ranks finish saving before anyone proceeds
+    # Ensure all ranks finish saving before anyone proceeds.
     if dist.is_initialized():
         dist.barrier()
+
+    overall_elapsed = time.time() - overall_start
+    logger.info_rank0(f"save_hf_safetensor total time: {overall_elapsed:.2f}s")
