@@ -51,11 +51,14 @@ def process_sample_qwen2_5_vl(
     """
     Processes multimodal example with qwen2_5_vl's pre-processor.
     """
-
     source = (
         kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # source_name if use multisource_dataset
-    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
+
+    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
+        conversations = sample["conversations"]
+    else:
+        conversations = sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
@@ -69,7 +72,7 @@ def process_sample_qwen2_5_vl(
         token_num_inputs["image"] = image_token_num
     if "videos" in sample and sample["videos"]:
         videos, _ = fetch_videos(sample["videos"], **kwargs)
-        video_inputs = processor.video_processor(images=None, videos=videos, return_tensors="pt")
+        video_inputs = processor.video_processor(videos=videos, return_tensors="pt")
         video_grid_thw = video_inputs["video_grid_thw"]
         merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
@@ -114,7 +117,12 @@ def process_sample_qwen3_vl(
     source = (
         kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     )  # 'source_name' is used if using a multisource dataset
-    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
+
+    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
+        conversations = sample["conversations"]
+    else:
+        conversations = sample
+    
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
