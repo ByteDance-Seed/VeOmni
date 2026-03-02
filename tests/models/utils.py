@@ -160,6 +160,20 @@ def prepare_data(model_name: str, max_seq_len: int, model_config):
             if example["position_ids"].dim() == 3:
                 example["position_ids"] = example["position_ids"].transpose(0, 1).contiguous()
 
+            # NOTE: position_ids mode (args.rmpad_with_pos_ids=True)
+            # requires cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k as input to avoid
+            # recomputing them in the forward pass (which causes device-to-host sync that kills performance).
+            # For models with linear attention like Qwen3.5, we also assert the presence of
+            # cu_seq_lens_q to make sure the linear attention layer ops like causal_conv1d can properly handle
+            # the sequence packing case.
+            if "position_ids" in example:
+                seq_len = example["position_ids"].shape[-1]
+                cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+                example["cu_seq_lens_q"] = cu_seqlens
+                example["cu_seq_lens_k"] = cu_seqlens
+                example["max_length_q"] = seq_len
+                example["max_length_k"] = seq_len
+
             return example
 
         def __iter__(self):

@@ -25,7 +25,6 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
-    AutoModelForVision2Seq,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedModel,
