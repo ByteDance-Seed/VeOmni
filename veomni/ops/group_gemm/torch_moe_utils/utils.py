@@ -114,6 +114,10 @@ def indices_padding_wrapper(func: Callable) -> Callable:
         )
 
         if gate_weights is not None:
+            # Zero-pad gate_weights (like _permute does for x) so that -1
+            # indices in permuted_indices map to zero instead of the last
+            # real gate weight.
+            gate_weights = torch.vstack((gate_weights, gate_weights.new_zeros(gate_weights.shape[-1])))
             gate_weights = gate_weights[permuted_indices, :]
 
         out = func(w1, w2, w3, x, num_tokens_per_expert, gate_weights=gate_weights)

@@ -204,4 +204,13 @@ def generate_permute_indices(
             max_len,
         )
 
+    # Extend the last expert's padded count so that sum(m_sizes) == max_len.
+    # Unfilled slots in permuted_indices (beyond the original sum(m_sizes))
+    # are -1, which _permute maps to the zero-padding row.  By including
+    # them in the last expert's group, torch._grouped_mm processes every row
+    # and its output/backward contain no uninitialized values.
+    remaining = max_len - m_offsets[-1]
+    m_sizes[-1] += remaining
+    m_offsets[-1] = max_len
+
     return permuted_indices, m_sizes, m_offsets.to(torch.int32)
