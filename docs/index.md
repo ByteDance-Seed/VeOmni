@@ -16,7 +16,8 @@ VeOmni is a versatile framework for both single- and multi-modal pre-training an
 :caption: Get Started
 
 get_started/installation/install.md
-get_started/installation/install_ascend.md
+get_started/installation/install_ascend_x86.md
+get_started/installation/install_ascend_arm.md
 ```
 
 ```{toctree}
