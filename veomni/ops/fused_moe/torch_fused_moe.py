@@ -10,28 +10,19 @@ def torch_fused_moe_forward(
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor | None,
-    fc1_2_weight: torch.Tensor | None,
+    fc1_1_weight: torch.Tensor,
+    fc1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
-    fc1_1_2_weight: torch.Tensor | None = None,
 ):
     """
     torch._grouped_mm based fused moe forward using pure torch token reorder/combine.
     This path relies on native autograd end-to-end (no custom autograd.Function needed).
+
+    fc1_1_weight / fc1_2_weight must already be resolved (split) before calling this
+    function; merged-weight resolution is handled by the caller (group_gemm_fused_moe_forward).
     """
     routing_weights = routing_weights.bfloat16()
     hidden_states = hidden_states.bfloat16()
-
-    use_merged_fc1 = fc1_1_2_weight is not None
-    if use_merged_fc1:
-        if fc1_1_weight is not None or fc1_2_weight is not None:
-            raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
-        intermediate_dim = fc1_1_2_weight.shape[1] // 2
-        fc1_1_weight = fc1_1_2_weight[:, :intermediate_dim, :].contiguous()
-        fc1_2_weight = fc1_1_2_weight[:, intermediate_dim:, :].contiguous()
-    else:
-        if fc1_1_weight is None or fc1_2_weight is None:
-            raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
 
     num_tokens_per_expert = expert_histogram(selected_experts, num_experts)
 
