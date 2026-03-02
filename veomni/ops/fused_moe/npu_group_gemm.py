@@ -213,6 +213,7 @@ def npu_fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    moe_kernel_backend: str = "npu",
 ):
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(

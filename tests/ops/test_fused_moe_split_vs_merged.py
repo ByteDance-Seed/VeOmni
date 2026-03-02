@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from veomni.ops import fused_moe
 from veomni.ops.fused_moe import fused_moe_forward
-from veomni.ops.fused_moe.torch_fused_moe import torch_fused_moe_forward
+from veomni.ops.fused_moe.group_gemm import group_gemm_fused_moe_forward
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_fused_moe_available
 
@@ -79,16 +79,8 @@ def test_fused_moe_split_and_merged_match_eager(
     fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
     fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
 
-    if moe_kernel == "triton":
-        from veomni.ops.fused_moe import group_gemm as group_gemm_module
-
-        # Force fused_moe_forward -> group_gemm backend and force Triton branch first.
-        monkeypatch.setattr(fused_moe, "_fused_moe_forward", group_gemm_module.group_gemm_fused_moe_forward)
-        monkeypatch.setattr(group_gemm_module, "get_device_capability", lambda: (0, 0))
-    elif moe_kernel == "torch":
-        monkeypatch.setattr(fused_moe, "_fused_moe_forward", torch_fused_moe_forward)
-    else:
-        raise ValueError(f"Unsupported moe_kernel: {moe_kernel}")
+    # Use group_gemm backend directly with moe_kernel_backend to select triton/torch path.
+    monkeypatch.setattr(fused_moe, "_fused_moe_forward", group_gemm_fused_moe_forward)
 
     out_split = fused_moe_forward(
         num_experts=num_experts,
@@ -98,6 +90,7 @@ def test_fused_moe_split_and_merged_match_eager(
         fc1_1_weight=fc1_1_weight,
         fc1_2_weight=fc1_2_weight,
         fc2_weight=fc2_weight,
+        moe_kernel_backend=moe_kernel,
     )
     out_merged = fused_moe_forward(
         num_experts=num_experts,
@@ -108,6 +101,7 @@ def test_fused_moe_split_and_merged_match_eager(
         fc1_2_weight=None,
         fc2_weight=fc2_weight,
         fc1_1_2_weight=fc1_1_2_weight,
+        moe_kernel_backend=moe_kernel,
     )
     out_eager = _eager_moe_forward(
         num_experts=num_experts,
@@ -119,5 +113,5 @@ def test_fused_moe_split_and_merged_match_eager(
         fc2_weight=fc2_weight,
     )
 
-    torch.testing.assert_close(out_split, out_merged, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(out_split, out_eager, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out_split, out_merged, rtol=0, atol=0)
+    torch.testing.assert_close(out_split, out_eager, rtol=1e-3, atol=1e-3)

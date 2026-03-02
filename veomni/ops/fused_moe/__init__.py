@@ -38,6 +38,7 @@ def fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    moe_kernel_backend: str = "triton",
 ):
     if _fused_moe_forward is None:
         raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
@@ -58,6 +59,7 @@ def fused_moe_forward(
         fc1_2_weight,
         fc2_weight,
         fc1_1_2_weight,
+        moe_kernel_backend,
     )
 
 

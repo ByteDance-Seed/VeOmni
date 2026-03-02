@@ -16,7 +16,6 @@ import torch
 
 from ...distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
 from ...distributed.parallel_state import get_parallel_state
-from ...utils.device import get_device_capability
 from ..group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
 from .torch_fused_moe import torch_fused_moe_forward
@@ -297,6 +296,7 @@ def group_gemm_fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    moe_kernel_backend: str = "triton",
 ):
     if get_parallel_state().ep_enabled:
         fc1_1_weight, fc1_2_weight = _resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
@@ -350,8 +350,7 @@ def group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
     else:
-        if get_device_capability()[0] >= 8:
-            # enable torch cutlass grouped mm for compute capability for Hopper and later generations
+        if moe_kernel_backend == "torch":
             final_hidden_states = torch_fused_moe_forward(
                 num_experts,
                 routing_weights,
@@ -362,7 +361,7 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
                 fc1_1_2_weight,
             )
-        else:
+        elif moe_kernel_backend == "triton":
             fc1_1_weight, fc1_2_weight = _resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
             final_hidden_states = TritonFusedMoeExpertFunction.apply(
                 num_experts,
@@ -373,4 +372,6 @@ def group_gemm_fused_moe_forward(
                 fc1_2_weight,
                 fc2_weight,
             )
+        else:
+            raise ValueError(f"Unsupported moe_kernel_backend: {moe_kernel_backend}. Choose 'triton' or 'torch'.")
     return final_hidden_states
