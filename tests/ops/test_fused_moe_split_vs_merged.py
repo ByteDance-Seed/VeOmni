@@ -5,12 +5,15 @@ import torch.nn.functional as F
 from veomni.ops import fused_moe
 from veomni.ops.fused_moe import fused_moe_forward
 from veomni.ops.fused_moe.torch_fused_moe import torch_fused_moe_forward
+from veomni.utils.import_utils import is_fused_moe_available
 
 
-def _skip_if_unsupported():
+def _skip_if_unsupported(moe_kernel: str):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for fused MoE split/merged parity test.")
-    if not hasattr(torch, "_grouped_mm"):
+    if moe_kernel == "triton" and not is_fused_moe_available():
+        pytest.skip("Triton fused MoE is not available in this environment.")
+    if moe_kernel == "torch" and not hasattr(torch, "_grouped_mm"):
         pytest.skip("torch._grouped_mm is not available in this torch build.")
 
 
@@ -41,13 +44,16 @@ def _eager_moe_forward(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
+    "moe_kernel,num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
     [
-        (61, 8, 128, 256, 2, 0),
-        (96, 16, 128, 384, 2, 1),
+        ("triton", 61, 8, 128, 256, 2, 0),
+        ("triton", 96, 16, 128, 384, 2, 1),
+        ("torch", 61, 8, 128, 256, 2, 0),
+        ("torch", 96, 16, 128, 384, 2, 1),
     ],
 )
 def test_fused_moe_split_and_merged_match_eager(
+    moe_kernel: str,
     num_tokens: int,
     num_experts: int,
     hidden_dim: int,
@@ -56,21 +62,32 @@ def test_fused_moe_split_and_merged_match_eager(
     seed: int,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    _skip_if_unsupported()
+    _skip_if_unsupported(moe_kernel)
 
     torch.manual_seed(seed)
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    hidden_states = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
-    routing_weights = torch.randn(num_tokens, topk, device=device, dtype=dtype)
-    selected_experts = torch.randint(0, num_experts, (num_tokens, topk), device=device, dtype=torch.int64)
-    fc1_1_weight = torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
-    fc1_2_weight = torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    # Match real router behavior: top-k experts from a softmax distribution.
+    router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
+    routing_weights = routing_weights.to(dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
     fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
-    fc2_weight = torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
 
-    monkeypatch.setattr(fused_moe, "_fused_moe_forward", torch_fused_moe_forward)
+    if moe_kernel == "triton":
+        from veomni.ops.fused_moe import group_gemm as group_gemm_module
+
+        # Force fused_moe_forward -> group_gemm backend and force Triton branch first.
+        monkeypatch.setattr(fused_moe, "_fused_moe_forward", group_gemm_module.group_gemm_fused_moe_forward)
+        monkeypatch.setattr(group_gemm_module, "get_device_capability", lambda: (0, 0))
+    elif moe_kernel == "torch":
+        monkeypatch.setattr(fused_moe, "_fused_moe_forward", torch_fused_moe_forward)
+    else:
+        raise ValueError(f"Unsupported moe_kernel: {moe_kernel}")
 
     out_split = fused_moe_forward(
         num_experts=num_experts,

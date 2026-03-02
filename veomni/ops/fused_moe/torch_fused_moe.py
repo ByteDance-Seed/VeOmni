@@ -26,6 +26,9 @@ def torch_fused_moe_forward(
     if use_merged_fc1:
         if fc1_1_weight is not None or fc1_2_weight is not None:
             raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
+        intermediate_dim = fc1_1_2_weight.shape[1] // 2
+        fc1_1_weight = fc1_1_2_weight[:, :intermediate_dim, :].contiguous()
+        fc1_2_weight = fc1_1_2_weight[:, intermediate_dim:, :].contiguous()
     else:
         if fc1_1_weight is None or fc1_2_weight is None:
             raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
@@ -41,25 +44,15 @@ def torch_fused_moe_forward(
     routed_input = hidden_states[token_indices_experts_sorted // topk]
     top_scores_experts_sorted = routing_weights.view(-1)[token_indices_experts_sorted].reshape(-1, 1)
 
-    if use_merged_fc1:
-        run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm_merged_fc1)
-        routed_outputs = run_experts_fn(
-            fc1_1_2_weight,
-            fc2_weight,
-            routed_input,
-            num_tokens_per_expert=num_tokens_per_expert,
-            gate_weights=top_scores_experts_sorted,
-        )
-    else:
-        run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm)
-        routed_outputs = run_experts_fn(
-            fc1_1_weight,
-            fc2_weight,
-            fc1_2_weight,
-            routed_input,
-            num_tokens_per_expert=num_tokens_per_expert,
-            gate_weights=top_scores_experts_sorted,
-        )
+    run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm)
+    routed_outputs = run_experts_fn(
+        fc1_1_weight,
+        fc2_weight,
+        fc1_2_weight,
+        routed_input,
+        num_tokens_per_expert=num_tokens_per_expert,
+        gate_weights=top_scores_experts_sorted,
+    )
 
     # Unsort and reduce top-k expert outputs back to token order.
     routed_output_unsorted = torch.zeros(
@@ -84,24 +77,6 @@ def _run_experts_grouped_mm(
 
     h = F.silu(torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets))
     h = h * torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
-    if gate_weights is not None:
-        h = h * gate_weights
-    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
-    return out
-
-
-def _run_experts_grouped_mm_merged_fc1(
-    w1_2: torch.Tensor,
-    w2: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor | None,
-    gate_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-
-    h12 = torch._grouped_mm(x.bfloat16(), w1_2.bfloat16().transpose(-2, -1), offs=offsets)
-    intermediate_dim = h12.shape[-1] // 2
-    h = F.silu(h12[..., :intermediate_dim]) * h12[..., intermediate_dim:]
     if gate_weights is not None:
         h = h * gate_weights
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
