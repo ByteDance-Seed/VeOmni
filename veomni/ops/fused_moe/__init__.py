@@ -27,6 +27,7 @@ from ...utils.import_utils import (
 logger = logging.get_logger(__name__)
 
 _fused_moe_forward = None
+_moe_kernel_backend = "triton"
 
 
 def fused_moe_forward(
@@ -38,8 +39,9 @@ def fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
-    moe_kernel_backend: str = "triton",
+    moe_kernel_backend: str | None = None,
 ):
+    moe_kernel_backend = moe_kernel_backend or _moe_kernel_backend
     if _fused_moe_forward is None:
         raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
 
