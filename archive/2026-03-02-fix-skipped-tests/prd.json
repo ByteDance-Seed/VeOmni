@@ -1,0 +1,106 @@
+{
+  "project": "VeOmni",
+  "branchName": "ralph/fix-skipped-tests",
+  "description": "Fix all previously-skipped LIBERO tests now that av, huggingface_hub, and youmu Rust extension are available, and add synthetic dataset fixtures for CI",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add synthetic LIBERO dataset fixture in conftest",
+      "description": "As a developer, I want a shared pytest fixture that generates a minimal synthetic LIBERO dataset in a temp directory so integration tests can run without the real /mnt/local/localcache00/ mount.",
+      "acceptanceCriteria": [
+        "Create tests/data/conftest.py with a session-scoped fixture 'synthetic_libero_dir' that creates a temp directory with episode-per-file layout",
+        "Fixture creates data/chunk-000/ with 3 small episode parquet files (episode_000000.parquet through episode_000002.parquet)",
+        "Fixture creates meta/episodes.jsonl with matching metadata (episode_index, tasks, length)",
+        "Parquet files use correct schema: state (fixed_size_list<float>[8]), actions (fixed_size_list<float>[7]), image (struct<bytes: binary, path: string>)",
+        "Each episode parquet has 5-10 rows with deterministic data (seeded random)",
+        "Parquet files are readable by both PyArrow and the youmu Rust ParquetReaderCachePy",
+        "Typecheck passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Use plain/non-dict-encoded columns to avoid Rust reader panics. Use pyarrow.FixedSizeListArray.from_arrays and pyarrow.StructArray.from_arrays for schema construction."
+    },
+    {
+      "id": "US-002",
+      "title": "Run and fix raw parquet parity tests",
+      "description": "As a developer, I want the 7 TestRawParquetParity tests in test_youmu_lerobot_parity.py to pass so I can confirm libero and libero_64KB are byte-identical at the parquet level.",
+      "acceptanceCriteria": [
+        "All 7 raw parquet tests pass: test_same_number_of_files, test_same_row_counts, test_state_data_identical, test_actions_data_identical, test_image_bytes_identical, test_metadata_episode_count_matches, test_metadata_episode_lengths_match",
+        "If any test fails, diagnose whether it's a data issue or test logic issue and fix accordingly",
+        "All existing unit tests in the same file still pass",
+        "Typecheck passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "These tests use PyArrow directly (no youmu/lerobot dependency). They only need the two data directories to exist. Skip conditions should now evaluate to not-skipped."
+    },
+    {
+      "id": "US-003",
+      "title": "Run and fix backend parity tests (youmu vs LeRobot)",
+      "description": "As a developer, I want the 5 TestBackendParity tests in test_youmu_lerobot_parity.py to pass so I can verify youmu and LeRobot produce identical outputs for the same LIBERO dataset.",
+      "acceptanceCriteria": [
+        "test_dataset_lengths_match passes — both backends produce same total anchor frames",
+        "test_state_parity passes — observation.state tensors are byte-identical for boundary + random indices",
+        "test_action_parity passes — action tensors are exactly equal (torch.equal)",
+        "test_image_parity passes — observation.images.image tensors are pixel-perfect identical",
+        "test_episode_index_parity passes — episode_index scalar values match",
+        "If any test fails, root-cause and fix the underlying code (youmu dataset, lerobot adapter, or test itself)",
+        "All existing unit tests still pass",
+        "Typecheck passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Requires both data dirs and both backends (youmu Rust + lerobot+av). Test creates a temporary v3.0-compatible directory to bridge v2.0 dataset format with lerobot 0.4.4. Key mappings: youmu observation.state→lerobot state, youmu action→lerobot actions, youmu observation.images.image→lerobot image. Youmu action timestamps start at t+1 (next frame), not t+0."
+    },
+    {
+      "id": "US-004",
+      "title": "Run and fix LiberoYoumuDataset integration tests and add synthetic variants",
+      "description": "As a developer, I want the 6 TestGetItemRealDataset tests in test_libero_dataset_episode_per_file.py to pass with real data, and also add synthetic-data variants using the fixture from US-001.",
+      "acceptanceCriteria": [
+        "test_dataset_length passes — dataset has >0 anchor frames",
+        "test_getitem_returns_standard_keys passes — output dict has observation.state, action, observation.images.image, episode_index, frame_index",
+        "test_getitem_state_shape passes — shape is (1, 8) for obs_len=1",
+        "test_getitem_action_shape passes — shape is (4, 7) for pred_len=4",
+        "test_getitem_image_shape passes — 4D uint8 tensor with 3 channels",
+        "test_getitem_finite_values passes — no NaN/inf in state or action",
+        "Add a TestGetItemSyntheticDataset class using the synthetic_libero_dir fixture that runs equivalent checks",
+        "All existing unit tests (TestLoadChunkEpisodePerFile, TestSchemaColumnDetection) still pass",
+        "Typecheck passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Synthetic tests may have different expected shapes if the fixture uses different state/action dimensions — use the same dims (8 for state, 7 for actions) in the fixture."
+    },
+    {
+      "id": "US-005",
+      "title": "Run and fix real-data task description tests and add synthetic variants",
+      "description": "As a developer, I want the 2 TestRealData tests in test_libero_task_descriptions.py to pass with real data, and also add synthetic-data variants using the fixture from US-001.",
+      "acceptanceCriteria": [
+        "test_load_from_real_jsonl passes — loads real episodes.jsonl, all keys are non-negative ints, all values are non-empty strings",
+        "test_all_episodes_have_descriptions passes — every JSONL line maps to a dict entry",
+        "Add a TestSyntheticData class using the synthetic_libero_dir fixture that runs equivalent checks on synthetic episodes.jsonl",
+        "All existing unit tests (12 tests) still pass",
+        "Typecheck passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Uses importlib + sys.modules mock-patching to bypass heavy veomni import chain. Synthetic tests should use same pattern."
+    },
+    {
+      "id": "US-006",
+      "title": "Full LIBERO test suite green run",
+      "description": "As a developer, I want to run the full LIBERO-related test suite and confirm everything passes end-to-end with zero skips.",
+      "acceptanceCriteria": [
+        "pytest tests/data/test_youmu_lerobot_parity.py -v — all 12 tests pass (0 skipped)",
+        "pytest tests/data/test_libero_dataset_episode_per_file.py -v — all tests pass including new synthetic tests (0 skipped)",
+        "pytest tests/data/test_libero_task_descriptions.py -v — all tests pass including new synthetic tests (0 skipped)",
+        "pytest tests/data/test_libero_metadata_jsonl.py -v — all 8 tests pass",
+        "No warnings about missing imports for av, huggingface_hub, lerobot, or youmu",
+        "Typecheck passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "This is a validation-only story. No code changes expected — just run all tests and confirm green. If anything fails, go back and fix in the relevant story."
+    }
+  ]
+}

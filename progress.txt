@@ -1,106 +1,43 @@
 ## Codebase Patterns
-- youmu Rust extension cannot be built in this environment (missing arrow-rs submodule). Use mock patching for tests that need pure-Python youmu utils.
+- youmu Rust extension is available (ParquetReaderCachePy imports successfully).
 - youmu submodule commits must happen inside `submodules/youmu/` first, then `git add submodules/youmu` in parent repo.
-- LIBERO 64KB dataset at `/mnt/local/localcache00/libero_64KB/` uses episode-per-file layout: `data/chunk-NNN/episode_NNNNNN.parquet` with flat column names (`state`, `actions`, `image`).
-- Episode metadata is at `meta/episodes.jsonl` (JSONL format), NOT `meta/episodes/chunk-000/file-000.parquet`.
-- Column names in actual dataset: `state` (not `observation.state`), `actions` (not `action`), `image` (not `observation.images.image`).
-- LiberoYoumuDataset defaults now match actual LIBERO schema: `state_column='state'`, `action_column='actions'`, `image_column='image'`.
-- For episode-per-file layout, `_load_chunk` filters JSONL metadata by parsing episode indices from filenames in each chunk directory.
-- `load_libero_task_descriptions` auto-detects format by file extension: `.jsonl` → JSONL loader, otherwise → parquet loader.
-- Training script metadata resolution order: `meta/episodes.jsonl` → `meta/episodes/episodes.parquet` → `meta/episodes/chunk-000/file-000.parquet`.
-- Both `/mnt/local/localcache00/libero` and `libero_64KB` have identical data; 64KB is a page-size re-encoding only.
-- `huggingface_hub` and `av` are not in this venv; lerobot import requires manual workarounds or `uv sync --extra robotics` (blocked by youmu Rust build).
+- LIBERO 64KB dataset at `/mnt/local/localcache00/libero_64KB/` was re-encoded with `use_dictionary=False` — Rust reader works directly, no PyArrow fallback needed.
+- Episode metadata is at `meta/episodes.jsonl` (JSONL format).
+- Column names in actual dataset: `state`, `actions`, `image` (flat names, not dotted).
+- LiberoYoumuDataset defaults: `state_column='state'`, `action_column='actions'`, `image_column='image'`.
+- Synthetic parquet files: use `write_page_index=True`, `use_dictionary=False`, Pillow-generated PNGs.
+- Root FS is 97% full — set `HF_DATASETS_CACHE=/mnt/local/localcache00/hf_datasets_cache` for lerobot tests.
+- Training requires `NPROC_PER_NODE>=2` for FSDP2 and `VEOMNI_USE_LIGER_KERNEL=0` to avoid Triton bf16 errors.
+- No pyright/mypy installed; use `python -m py_compile` for basic compile checks.
+- ruff-format pre-commit hook reformats files automatically; re-stage after first commit attempt fails due to formatting.
 
 ---
 
 ## 2026-03-02 - US-001
-- What was implemented:
-  - Added `load_episode_metadata_jsonl()` function to `submodules/youmu/python/youmu/libero_utils.py`
-  - Updated `load_episode_metadata()` to auto-detect format: tries parquet first, falls back to JSONL
-  - Extracted original parquet logic into `_load_episode_metadata_parquet()`
-  - For episode-per-file layout, file_index = episode_index, frame offsets computed cumulatively
-- Files changed:
-  - `submodules/youmu/python/youmu/libero_utils.py` (added ~110 lines)
-  - `tests/data/test_libero_metadata_jsonl.py` (new, 8 tests)
+- Removed PyArrow fallback from LiberoYoumuDataset, enforcing Rust-only backend
+- Removed: `_HAS_RUST` flag, `_use_rust` instance variable, `_pf_cache` dict, `_get_pf()` method, all PyArrow read branches
+- Removed: `column_name` parameter from `_read_list_column_range()`, `_state_column`/`_action_column`/`_image_column` instance variables
+- Added: fail-fast RuntimeError in constructor smoke test with helpful error message
+- Simplified `__getstate__`/`__setstate__` to only handle Rust cache
+- Updated all docstrings to reflect Rust-only operation
+- Files changed: `submodules/youmu/python/youmu/libero_dataset.py`
 - **Learnings for future iterations:**
-  - The youmu __init__.py imports from `.youmu` (Rust extension), so tests need mock patching via `sys.modules`
-  - Use `importlib.util.spec_from_file_location` to load individual Python modules from the submodule without triggering the Rust import
-  - JSONL format: `{"episode_index": N, "tasks": ["..."], "length": L}` per line
+  - `state_column`, `action_column`, `image_column` constructor params are still needed for `_find_physical_column_index` — only the private `_state_column`/`_action_column`/`_image_column` copies were redundant
+  - prd.json and progress.txt lived on the previous branch (`ralph/fix-skipped-tests`) and needed to be brought to the new branch
+  - The submodule commit workflow: commit inside submodule dir first, then `git add submodules/youmu` in parent
 ---
 
 ## 2026-03-02 - US-002
-- What was implemented:
-  - Updated `_load_chunk` in `libero_dataset.py` to auto-detect episode-per-file layout (`episode_XXXXXX.parquet`)
-  - For episode-per-file: parses episode indices from filenames, filters JSONL metadata to chunk-specific episodes, maps each episode directly to its file with row_offset=0
-  - Changed constructor defaults: `state_column='state'`, `action_column='actions'`, `image_column='image'`
-  - Output dict keys remain unchanged: `observation.state`, `action`, `observation.images.image`
-- Files changed:
-  - `submodules/youmu/python/youmu/libero_dataset.py` (~56 lines added, 13 removed)
-  - `tests/data/test_libero_dataset_episode_per_file.py` (new, 8 unit tests + 6 integration tests)
+- Verified all existing LIBERO tests pass with Rust-only LiberoYoumuDataset (0 skipped)
+- test_libero_dataset_episode_per_file.py: 20/20 passed
+- test_youmu_lerobot_parity.py: 12/12 passed (with HF_DATASETS_CACHE override)
+- test_libero_task_descriptions.py: 15/15 passed
+- test_libero_metadata_jsonl.py: 8/8 passed
+- No test files needed modification — all tests already work with Rust-only backend
+- py_compile passes on all test files and libero_dataset.py
+- Files changed: prd.json (mark US-002 passes), progress.txt
 - **Learnings for future iterations:**
-  - JSONL metadata returns ALL episodes across all chunks; for episode-per-file, filter by parsing episode indices from filenames in each chunk directory
-  - `_find_physical_column_index` works correctly with flat LIBERO column names (state, actions, image) — no changes needed
-  - The `image` column in LIBERO is `struct<bytes: binary, path: string>` — same structure as LeRobot, just different column name
-  - Synthetic test parquet files can be created with PyArrow `FixedSizeListArray.from_arrays` and `StructArray.from_arrays`
----
-
-## 2026-03-02 - US-003
-- What was implemented:
-  - Updated `load_libero_task_descriptions` in `veomni/data/multimodal/data_transform.py` to auto-detect parquet vs JSONL by file extension
-  - Extracted parquet logic into `_load_libero_task_descriptions_parquet()`
-  - Added `_load_libero_task_descriptions_jsonl()` for JSONL format with fallback to "perform the task" for missing/empty tasks
-  - Updated training script `tasks/omni/train_qwen_vl_libero.py` to add `meta/episodes.jsonl` as the first metadata candidate
-- Files changed:
-  - `veomni/data/multimodal/data_transform.py` (~50 lines added)
-  - `tasks/omni/train_qwen_vl_libero.py` (metadata resolution logic updated)
-  - `tests/data/test_libero_task_descriptions.py` (new, 12 tests including integration tests on real data)
-- **Learnings for future iterations:**
-  - Importing `veomni.data.multimodal.data_transform` triggers the full veomni import chain (torch, transformers, huggingface_hub). Use `importlib.util.spec_from_file_location` with mocked dependencies for tests.
-  - The training script import `from tasks.data.vlm_data_process import ...` does not correspond to an actual file — this will be an issue when running the training script (US-005 concern).
-  - ruff-format pre-commit hook reformats files automatically; always re-stage after first commit attempt fails due to formatting.
----
-
-## 2026-03-02 - US-004
-- What was implemented:
-  - Created `tests/data/test_youmu_lerobot_parity.py` with two test classes:
-    - `TestBackendParity` (5 tests): loads datasets via `build_libero_dataset` with both youmu and lerobot backends, compares observation.state, action, images, and episode_index for boundary + random indices. Skips gracefully if either backend is unavailable.
-    - `TestRawParquetParity` (7 tests): uses PyArrow directly to verify data identity between `/mnt/local/localcache00/libero` and `libero_64KB` — file counts, row counts, state values, actions values, image bytes, metadata episode counts and lengths.
-  - All 7 raw parquet tests pass; 5 backend tests skip (youmu Rust extension and lerobot/av not available in this environment)
-- Files changed:
-  - `tests/data/test_youmu_lerobot_parity.py` (new, 12 tests total)
-- **Learnings for future iterations:**
-  - `huggingface_hub` is not installed in this venv (only available via `extra == 'robotics'`) and `uv pip install` silently "audits" without installing when the lockfile doesn't include it. Manual wheel extraction to site-packages works as a workaround.
-  - lerobot requires `av` (PyAV C extension) which is also not installed. Neither backend (youmu Rust, lerobot+av) is available, so parity tests must skip gracefully.
-  - Both `/mnt/local/localcache00/libero` and `libero_64KB` have identical schemas and data content; the 64KB version is a page-size re-encoding only.
----
-
-## 2026-03-02 - US-005
-- What was implemented:
-  - Fixed import path in training script: `from tasks.data.vlm_data_process` → `from veomni.data.multimodal.data_transform`
-  - Updated YAML config: `libero_data_dir` to `/mnt/local/localcache00/libero_64KB`, added `train_path: unused`, `dyn_bsz: false`
-  - Fixed data_collator.py imports: `IGNORE_INDEX` from `...utils.constants`, `pos2culen` from `...utils.seqlen_pos_transform_utils`
-  - Made heavy imports (audio/video) lazy in data_transform.py to avoid missing module errors
-  - Added PyArrow fallback in libero_dataset.py for Rust reader panics on dict-encoded columns
-  - Made Arguments inherit from VeOmniArguments; added rmpad/rmpad_with_pos_ids/pad_packed_to_length/dyn_bsz_margin to MyTrainingArguments
-  - Replaced build_foundation_model with direct Qwen3VLForConditionalGenerationAction instantiation + apply_veomni_qwen3vl_patch()
-  - Replaced compute_train_steps with inline math
-  - Fixed collate_fn: pass single LiberoActionPackingCollator() not a list
-  - Fixed model forward: extend image_mask/video_mask when state token is appended (off-by-one)
-  - Added @dataclass decorator to Qwen3VLActionOutput (was missing, caused __init__ error)
-  - Added `from dataclasses import dataclass` import to modeling_qwen3_vl.py
-- Files changed:
-  - `configs/multimodal/qwen3_vl/qwen3_vl_libero.yaml`
-  - `tasks/omni/train_qwen_vl_libero.py`
-  - `veomni/data/multimodal/data_collator.py`
-  - `veomni/data/multimodal/data_transform.py`
-  - `veomni/models/transformers/qwen3_vl/modeling_qwen3_vl.py`
-  - `submodules/youmu/python/youmu/libero_dataset.py`
-- Training results: Step 1 loss=4.0726 (finite), Step 2 loss=2.3834 (finite)
-- **Learnings for future iterations:**
-  - `build_foundation_model` calls `apply_veomni_qwen3vl_patch()` via the registry; bypassing it requires calling the patch manually
-  - The action model appends a state token to inputs_embeds, so image_mask/video_mask must also be extended by 1 False
-  - `Qwen3VLActionOutput` (and any ModelOutput subclass adding fields) needs @dataclass decorator
-  - VEOMNI_USE_LIGER_KERNEL=0 needed to avoid Triton bf16 compilation errors
-  - FSDP2 requires NPROC_PER_NODE>=2; single GPU gets fsdp_size=1 which skips parallelization
-  - `dyn_bsz: false` needed when using LiberoActionPackingCollator (dynamic batching calls collate_fn differently)
+  - The synthetic fixtures in conftest.py write plain-encoded parquet (use_dictionary=False), so they work with Rust-only out of the box
+  - Real data at libero_64KB was already re-encoded without dictionary encoding in a prior step
+  - No PyArrow fallback paths were exercised by any test — confirms the fallback code was dead weight
 ---

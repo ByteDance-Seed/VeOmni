@@ -55,6 +55,7 @@ def convert_single_file(
         dst_path,
         schema=table.schema,
         compression="snappy",
+        use_dictionary=False,  # youmu is not compatiable with dictionary encoding
         data_page_size=page_size,
         write_page_index=True,
         # Keep data_page_version='2.0' for better page index support

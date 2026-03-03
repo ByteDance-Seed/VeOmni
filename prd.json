@@ -1,88 +1,60 @@
 {
   "project": "VeOmni",
-  "branchName": "ralph/youmu-libero-e2e",
-  "description": "Adapt LiberoYoumuDataset for actual LIBERO dataset format (episode-per-file, JSONL metadata, flat column names), verify exact parity with LeRobot, and run e2e training",
+  "branchName": "ralph/enforce-rust-backend",
+  "description": "Remove PyArrow fallback from LiberoYoumuDataset, enforce Rust-only backend with fail-fast behavior, and verify e2e training works",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Adapt metadata loading for JSONL format",
-      "description": "As a developer, I need load_episode_metadata to load episode metadata from meta/episodes.jsonl (JSONL format) since the actual LIBERO dataset does not have meta/episodes/chunk-000/file-000.parquet. The function should auto-detect which format is present.",
+      "title": "Remove PyArrow fallback from LiberoYoumuDataset",
+      "description": "As a developer, I want LiberoYoumuDataset to use only the Rust backend so the code is simpler and encoding issues are caught immediately rather than silently falling back to a slow path.",
       "acceptanceCriteria": [
-        "New function load_episode_metadata_jsonl in libero_utils.py reads meta/episodes.jsonl and returns list[EpisodeDescriptor]",
-        "For episode-per-file layout, file_index equals episode_index (each file = one episode)",
-        "start_frame and end_frame computed by accumulating episode lengths sorted by episode_index",
-        "Works for multi-chunk datasets (chunk-000 has episodes 0-999, chunk-001 has 1000-1692)",
-        "Update load_episode_metadata to auto-detect: try parquet path first, fall back to JSONL",
-        "Unit test verifies correct EpisodeDescriptor values for a small JSONL fixture",
-        "cargo check passes"
+        "Import ParquetReaderCachePy, read_list_row_range_py, read_row_range_py unconditionally at module top level (no try/except ImportError)",
+        "Remove _HAS_RUST flag, _use_rust instance variable, and all if self._use_rust / else branches",
+        "Remove _pf_cache dict, _get_pf() method, and all PyArrow-based read paths in _read_list_column_range() and _read_image_range()",
+        "Remove column_name parameter from _read_list_column_range() since it was only needed for PyArrow",
+        "Remove _state_column, _action_column, _image_column instance variables (only needed for PyArrow column-name reads)",
+        "Constructor smoke test: if read_list_row_range_py raises, re-raise as RuntimeError with message about incompatible parquet encoding",
+        "Simplify __getstate__ / __setstate__: only handle Rust cache, no PyArrow branch",
+        "Update docstrings to reflect Rust-only operation",
+        "python -m py_compile submodules/youmu/python/youmu/libero_dataset.py passes"
       ],
       "priority": 1,
       "passes": true,
-      "notes": "JSONL format: {\"episode_index\": 0, \"tasks\": [\"...\"], \"length\": 214} per line. No data/file_index or dataset_from_index fields — these must be derived."
+      "notes": "Keep state_column, action_column, image_column constructor params — still needed for _find_physical_column_index. The smoke test error message should say: 'Rust parquet reader failed on {test_file}: {error}. Ensure parquet files are written with use_dictionary=False.'"
     },
     {
       "id": "US-002",
-      "title": "Adapt LiberoYoumuDataset for episode-per-file layout and flat column names",
-      "description": "As a developer, I need LiberoYoumuDataset to work with the actual LIBERO dataset where each episode is a separate file (episode_XXXXXX.parquet) with flat column names (state, actions, image) instead of the LeRobot layout (file-NNN.parquet with dotted names like observation.state).",
+      "title": "Update tests for Rust-only backend",
+      "description": "As a developer, I want all existing LIBERO tests to pass with the Rust-only LiberoYoumuDataset, confirming no regressions.",
       "acceptanceCriteria": [
-        "_load_chunk auto-detects file naming: episode_XXXXXX.parquet vs file-NNN.parquet",
-        "For episode-per-file layout, episode-to-file mapping is direct: episode N maps to episode_{N:06d}.parquet with row_offset=0",
-        "Constructor defaults updated: state_column='state', action_column='actions', image_column='image'",
-        "Output dict keys remain 'observation.state', 'action', 'observation.images.image', 'episode_index', 'frame_index' regardless of underlying column names",
-        "Image struct extraction still works: image column is struct<bytes: binary, path: string>, extract bytes child",
-        "Unit test: construct dataset on real data at /mnt/local/localcache00/libero_64KB, call __getitem__(0) and verify output shapes and dtypes",
-        "cargo check passes"
+        "pytest tests/data/test_libero_dataset_episode_per_file.py -v — all tests pass (0 skipped)",
+        "HF_DATASETS_CACHE=/mnt/local/localcache00/hf_datasets_cache pytest tests/data/test_youmu_lerobot_parity.py -v — all 12 tests pass (0 skipped)",
+        "pytest tests/data/test_libero_task_descriptions.py -v — all tests pass (0 skipped)",
+        "pytest tests/data/test_libero_metadata_jsonl.py -v — all 8 tests pass",
+        "If any test relied on PyArrow fallback behavior, update it to work with Rust-only",
+        "python -m py_compile on all changed test files passes"
       ],
       "priority": 2,
       "passes": true,
-      "notes": "Dataset schema: image: struct<bytes,path>, wrist_image: struct<bytes,path>, state: fixed_size_list<float>[8], actions: fixed_size_list<float>[7], timestamp: float, frame_index: int64, episode_index: int64, index: int64, task_index: int64. 1693 episodes across 2 chunks (1000 + 693). Each file has ~3 row groups with ~100 rows."
+      "notes": "Root FS is 97% full so HF_DATASETS_CACHE must be set for lerobot parity tests. The synthetic fixture in conftest.py already writes plain-encoded parquet, so synthetic tests should work with Rust-only. Real data at libero_64KB was re-encoded without dict encoding."
     },
     {
       "id": "US-003",
-      "title": "Adapt task description loading for JSONL metadata",
-      "description": "As a developer, I need load_libero_task_descriptions (in veomni/data/multimodal/data_transform.py) to load task descriptions from meta/episodes.jsonl since the actual dataset uses JSONL, not parquet episode metadata.",
+      "title": "Run e2e training for 5 steps and verify loss decreases",
+      "description": "As a developer, I want to run the full training pipeline for 5 steps and confirm the Rust-only dataset produces correct data that leads to decreasing loss.",
       "acceptanceCriteria": [
-        "load_libero_task_descriptions accepts a path to episodes.jsonl and reads episode_index + tasks[0] per line",
-        "Returns dict[int, str] mapping episode_index to task description string",
-        "Falls back to 'perform the task' if tasks field is missing or empty",
-        "Training script (train_qwen_vl_libero.py) metadata path resolution updated: checks for meta/episodes.jsonl in addition to existing parquet candidates",
-        "Unit test verifies correct loading from a small JSONL fixture",
-        "Typecheck passes"
+        "Set max_steps: 5 in configs/multimodal/qwen3_vl/qwen3_vl_libero.yaml (or pass as override)",
+        "Run: bash train.sh tasks/omni/train_qwen_vl_libero.py configs/multimodal/qwen3_vl/qwen3_vl_libero.yaml",
+        "Training launches without import or config errors",
+        "All 5 steps complete without crash",
+        "Loss at step 1 is finite (not NaN/inf)",
+        "Loss at step 5 is strictly less than loss at step 1",
+        "No PyArrow fallback warnings in logs",
+        "Restore max_steps to original value after verification"
       ],
       "priority": 3,
-      "passes": true,
-      "notes": "Current code in train_qwen_vl_libero.py checks meta/episodes/episodes.parquet and meta/episodes/chunk-000/file-000.parquet — neither exists. Must add meta/episodes.jsonl as a candidate."
-    },
-    {
-      "id": "US-004",
-      "title": "Exact numerical parity test (youmu vs LeRobot)",
-      "description": "As a developer, I need a pytest test that proves LiberoYoumuDataset returns exactly the same data as LeRobot's dataset for the same sample indices, giving confidence that training with youmu is correct.",
-      "acceptanceCriteria": [
-        "Test file at tests/test_youmu_lerobot_parity.py (or similar location in the test directory)",
-        "Test loads the same dataset with both youmu and lerobot backends via build_libero_dataset from tasks/omni/train_qwen_vl_libero.py",
-        "For indices [0, 1, 2, 7, 8, 9, len-3, len-2, len-1] plus 5 random indices, asserts: observation.state tensors exactly equal (torch.equal), action tensors exactly equal, observation.images.image tensors exactly equal (pixel-perfect), episode_index values match",
-        "Test passes on the 64KB parquet dataset at /mnt/local/localcache00/libero_64KB (youmu side) and /mnt/local/localcache00/libero (lerobot side if needed)",
-        "Test skips gracefully if dataset directory or lerobot package is unavailable",
-        "Typecheck passes"
-      ],
-      "priority": 4,
-      "passes": true,
-      "notes": "LeRobot may need the original dataset path if it has different parquet expectations. The youmu side should use the 64KB dataset. Both should produce identical outputs for matching indices."
-    },
-    {
-      "id": "US-005",
-      "title": "Update training config and run e2e training",
-      "description": "As a developer, I need to update the training YAML config to point to the 64KB dataset and verify the full training pipeline runs at least 1 step successfully.",
-      "acceptanceCriteria": [
-        "configs/multimodal/qwen3_vl/qwen3_vl_libero.yaml libero_data_dir set to /mnt/local/localcache00/libero_64KB",
-        "bash train.sh tasks/omni/train_qwen_vl_libero.py configs/multimodal/qwen3_vl/qwen3_vl_libero.yaml launches without import or config errors",
-        "Training completes at least 1 full step (forward + backward + optimizer step) without crash",
-        "Loss logged at step 1 is a finite number (not NaN/inf)",
-        "Typecheck passes"
-      ],
-      "priority": 5,
-      "passes": true,
-      "notes": "Single-node multi-GPU with FSDP2. Config uses: obs_len=1, pred_len=4, micro_batch_size=1, global_batch_size=64, flash_attention_2, rmpad_with_pos_ids=true. Step 1 loss=4.0726, Step 2 loss=2.3834."
+      "passes": false,
+      "notes": "Training requires NPROC_PER_NODE>=2 for FSDP2 and VEOMNI_USE_LIGER_KERNEL=0 to avoid Triton bf16 errors. Previous run showed step 1 loss=4.0726, step 2 loss=2.3834. Config already points to libero_64KB and uses youmu backend."
     }
   ]
 }

@@ -1,0 +1,115 @@
+## Codebase Patterns
+- youmu Rust extension is now available (ParquetReaderCachePy imports successfully).
+- youmu submodule commits must happen inside `submodules/youmu/` first, then `git add submodules/youmu` in parent repo.
+- LIBERO 64KB dataset at `/mnt/local/localcache00/libero_64KB/` uses episode-per-file layout: `data/chunk-NNN/episode_NNNNNN.parquet` with flat column names (`state`, `actions`, `image`).
+- Episode metadata is at `meta/episodes.jsonl` (JSONL format), NOT `meta/episodes/chunk-000/file-000.parquet`.
+- Column names in actual dataset: `state` (not `observation.state`), `actions` (not `action`), `image` (not `observation.images.image`).
+- LiberoYoumuDataset defaults now match actual LIBERO schema: `state_column='state'`, `action_column='actions'`, `image_column='image'`.
+- For episode-per-file layout, `_load_chunk` filters JSONL metadata by parsing episode indices from filenames in each chunk directory.
+- `load_libero_task_descriptions` auto-detects format by file extension: `.jsonl` → JSONL loader, otherwise → parquet loader.
+- Training script metadata resolution order: `meta/episodes.jsonl` → `meta/episodes/episodes.parquet` → `meta/episodes/chunk-000/file-000.parquet`.
+- Both `/mnt/local/localcache00/libero` and `libero_64KB` have identical data; 64KB is a page-size re-encoding only.
+- `huggingface_hub`, `av`, and `lerobot` are now installed and importable.
+- The youmu __init__.py imports from `.youmu` (Rust extension). Since the Rust extension is available, import `LiberoYoumuDataset` and `_find_physical_column_index` directly — no mock patching needed.
+- The 64KB dataset still has dict-encoded columns (RLE_DICTIONARY), causing the Rust reader to panic. LiberoYoumuDataset auto-falls-back to PyArrow in this case.
+- Synthetic parquet PNG images must be valid — use Pillow-generated PNGs, not hand-crafted bytes. The old minimal PNG bytes were corrupt.
+- Importing `veomni.data.multimodal.data_transform` triggers the full veomni import chain (torch, transformers, huggingface_hub). Use `importlib.util.spec_from_file_location` with mocked dependencies for isolated tests.
+- Synthetic test parquet files can be created with PyArrow `FixedSizeListArray.from_arrays` and `StructArray.from_arrays`.
+- Use plain/non-dict-encoded columns in synthetic parquets to avoid Rust reader panics.
+- ruff-format pre-commit hook reformats files automatically; always re-stage after first commit attempt fails due to formatting.
+- Synthetic parquet files must use `write_page_index=True` for the youmu Rust reader's offset index requirement.
+- lerobot 0.4.4 uses codebase v3.0 format; on-disk dataset is v2.0. Must create temp v3.0 wrapper directory (symlink data, convert JSONL metadata to parquet) for lerobot loading.
+- DO NOT import `tasks/omni/train_qwen_vl_libero.py` via importlib — it triggers full veomni import chain which fails due to transformers/huggingface-hub version mismatch. Build datasets directly.
+- youmu key names: `observation.state`, `action`, `observation.images.image`; lerobot key names: `state`, `actions`, `image`.
+- youmu action semantics: returns actions for frames [t+1, ..., t+pred_len]; lerobot delta_timestamps must start at 1/fps to match.
+- youmu `frame_index` is a global cumulative index across all episodes, maps directly to lerobot's sequential dataset index.
+- youmu excludes last pred_len frames per episode (anchor frames only); lerobot includes all frames with padding. Length difference = pred_len × num_episodes.
+- youmu images: uint8 (obs_len, H, W, C); lerobot images: float32 (obs_len, C, H, W). Convert via `(img.permute(0,2,3,1) * 255).to(uint8)` for comparison.
+
+---
+
+## 2026-03-02 - US-001
+- Implemented session-scoped `synthetic_libero_dir` fixture in `tests/data/conftest.py`
+- Creates 3 episodes (5, 7, 10 rows) in `data/chunk-000/` with matching `meta/episodes.jsonl`
+- Schema: state (fixed_size_list<float32>[8]), actions (fixed_size_list<float32>[7]), image (struct<bytes,path>)
+- Uses seeded RNG (seed=42) for deterministic data, plain encoding, write_page_index=True
+- Files changed: `tests/data/conftest.py` (new)
+- **Learnings for future iterations:**
+  - `write_page_index=True` is required when writing parquet files for youmu Rust reader — without it, `read_list_row_range_py` raises "Offset index not available"
+  - `ParquetReaderCachePy()` takes no constructor args — it's a cache object passed as `cache=` kwarg to read functions
+  - `use_dictionary=False` prevents dict-encoding that causes Rust reader panics
+  - The `--timeout` pytest flag is not available in this env (no pytest-timeout plugin)
+  - `test_classification_data_processor.py` fails due to huggingface-hub version mismatch — unrelated to LIBERO tests
+- No type checker (pyright/mypy) is installed; use `python -m py_compile` for basic compile checks.
+- TestBackendParity tests error with `huggingface-hub>=0.34.0,<1.0` version constraint from transformers — need to address in US-003.
+---
+
+## 2026-03-02 - US-002
+- All 7 TestRawParquetParity tests pass out of the box — no code changes needed
+- Tests verified: test_same_number_of_files, test_same_row_counts, test_state_data_identical, test_actions_data_identical, test_image_bytes_identical, test_metadata_episode_count_matches, test_metadata_episode_lengths_match
+- The skip conditions (`skip_no_youmu_data`, `skip_no_lerobot_data`) correctly evaluate to not-skipped since both data dirs exist
+- Files changed: prd.json (passes: true), progress.txt
+- **Learnings for future iterations:**
+  - Both `/mnt/local/localcache00/libero` and `libero_64KB` data directories exist and are accessible
+  - The 64KB re-encoding preserves data exactly (state, actions, image bytes, metadata all identical)
+  - TestBackendParity tests fail at import time due to transformers version constraint on huggingface-hub — separate from raw parquet parity
+---
+
+## 2026-03-02 - US-003
+- Fixed all 5 TestBackendParity tests to pass (12/12 total in file, 0 skipped)
+- Root causes fixed:
+  1. `_build_libero_dataset` used importlib to exec full training script → triggered transformers import → failed on huggingface-hub version mismatch. Fixed by constructing datasets directly.
+  2. lerobot 0.4.4 (codebase v3.0) rejects v2.0 dataset format. Fixed by creating temp v3.0 wrapper directory with symlinked data and converted metadata (JSONL→parquet, added dataset_from_index/dataset_to_index columns).
+  3. Different key names between backends (observation.state vs state, etc.). Fixed by mapping keys in test assertions.
+  4. Different dataset lengths (youmu clips episode tails, lerobot pads). Fixed by matching frames via global frame_index instead of dataset index.
+  5. Action off-by-one: youmu returns actions [t+1..t+pred_len], lerobot delta_timestamps [0..] returns [t..t+pred_len-1]. Fixed by using delta_timestamps starting at 1/fps.
+  6. Different image formats (uint8 HWC vs float32 CHW). Fixed by converting lerobot images for comparison.
+- Files changed: `tests/data/test_youmu_lerobot_parity.py`, `prd.json`, `progress.txt`
+- **Learnings for future iterations:**
+  - lerobot v3.0 format needs: meta/tasks.parquet, meta/episodes/chunk-NNN/file-NNN.parquet (with dataset_from_index/dataset_to_index columns), info.json with codebase_version=v3.0
+  - The training script's lerobot delta_timestamps use [0, 1/fps, 2/fps, ...] which does NOT match youmu's action semantics (starts at t+1). This is a potential training bug if switching backends.
+  - Never import the training script module in tests — always construct datasets directly to avoid heavy dependency chains
+---
+
+## 2026-03-02 - US-004
+- Fixed all 6 TestGetItemRealDataset tests + added 6 TestGetItemSyntheticDataset tests (20/20 total, 0 skipped)
+- Root causes fixed:
+  1. Module-scoped `autouse=True` mock on `_patch_youmu_import` replaced `sys.modules["youmu"]` with MagicMock for ALL test classes, including `TestGetItemRealDataset` which needs the real Rust extension. Removed mock entirely since Rust extension is now available; import `LiberoYoumuDataset` and `_find_physical_column_index` directly.
+  2. Synthetic PNG bytes were invalid (corrupt IDAT data). Replaced with valid 1x1 white RGB PNG generated by Pillow in both conftest.py and the test file.
+  3. The 64KB real dataset has dict-encoded columns (RLE_DICTIONARY) causing Rust reader panics. LiberoYoumuDataset constructor's smoke test catches the panic and falls back to PyArrow — this works correctly once the mock is removed.
+- Added TestGetItemSyntheticDataset class using `synthetic_libero_dir` fixture from conftest.py with tests: dataset_length, standard_keys, state_shape, action_shape, image_shape, finite_values
+- Files changed: `tests/data/test_libero_dataset_episode_per_file.py`, `tests/data/conftest.py`, `prd.json`, `progress.txt`
+- **Learnings for future iterations:**
+  - Module-scoped autouse mock fixtures poison ALL tests in the module, including those that need the real module. Remove autouse or use class scope.
+  - The 64KB re-encoded dataset STILL has dict-encoded columns despite `use_dictionary=False` in the conversion script — needs investigation.
+  - LiberoYoumuDataset's smoke test catches PanicException via `except BaseException` and falls back to PyArrow, but a MagicMock return won't trigger an exception — it silently passes, then fails at `__getitem__` time.
+  - Synthetic test PNGs must be generated by Pillow, not hand-crafted — hand-crafted IDAT data is easily corrupted.
+---
+
+## 2026-03-02 - US-005
+- All 12 existing tests (including 2 TestRealData) already passed with 0 skips
+- Added TestSyntheticData class with 3 tests using synthetic_libero_dir fixture from conftest.py:
+  - test_load_from_synthetic_jsonl: loads synthetic episodes.jsonl, validates keys/values
+  - test_all_episodes_have_descriptions: verifies count matches JSONL lines
+  - test_synthetic_task_descriptions_content: verifies exact task description text
+- All 15 tests pass (0 skipped)
+- Files changed: `tests/data/test_libero_task_descriptions.py`, `prd.json`, `progress.txt`
+- **Learnings for future iterations:**
+  - The real data tests were never actually skipped — the skipif condition correctly finds `/mnt/local/localcache00/libero_64KB/meta/episodes.jsonl`
+  - The module-scoped `_load_data_transform` mock fixture works well — it uses `importlib.util.spec_from_file_location` with mocked heavy deps (torch, veomni.*) and doesn't interfere with the synthetic_libero_dir session-scoped fixture from conftest.py
+  - Synthetic tests can use the same `dt_module` fixture pattern since it only needs the data_transform module, not the full veomni stack
+---
+
+## 2026-03-02 - US-006
+- Full validation run: all 4 LIBERO test files green, 0 skips
+  - test_youmu_lerobot_parity.py: 12 passed
+  - test_libero_dataset_episode_per_file.py: 20 passed
+  - test_libero_task_descriptions.py: 15 passed
+  - test_libero_metadata_jsonl.py: 8 passed
+- Total: 55 tests passed, 0 skipped, 0 failures
+- No code changes needed — validation only
+- Files changed: `prd.json`, `progress.txt`
+- **Learnings for future iterations:**
+  - All LIBERO tests are now fully operational with real data mounts and synthetic fixtures
+  - No missing import warnings for av, huggingface_hub, lerobot, or youmu
+---

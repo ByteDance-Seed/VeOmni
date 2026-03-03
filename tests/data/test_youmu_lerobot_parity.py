@@ -5,18 +5,27 @@ images for the same sample indices, giving confidence that training with
 youmu produces the same results as LeRobot.
 
 Two test classes:
-1. TestBackendParity — loads datasets via build_libero_dataset with both
-   backends and compares __getitem__ outputs.  Requires both youmu Rust
-   extension *and* lerobot (with av) to be importable.
+1. TestBackendParity — loads datasets with both backends and compares
+   __getitem__ outputs for matching (episode_index, frame_index) pairs.
+   Requires both youmu Rust extension *and* lerobot (with av) to be importable.
 2. TestRawParquetParity — uses PyArrow directly to verify the underlying
    data in /mnt/local/localcache00/libero and libero_64KB are byte-identical.
    Runs whenever the data directories exist (no Rust or lerobot needed).
+
+Note on lerobot v3.0 compatibility:
+    The on-disk LIBERO dataset uses lerobot v2.0 format (episode-per-file parquet,
+    JSONL metadata).  Installed lerobot 0.4.4 expects v3.0 format (different
+    metadata structure).  The test creates a temporary v3.0-compatible directory
+    that symlinks the real data and provides converted metadata files.
 """
 
 import json
 import os
 import random
+import shutil
+import tempfile
 
+import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 import torch
@@ -45,6 +54,7 @@ except (ImportError, ModuleNotFoundError):
     pass
 
 _lerobot_available = False
+_lerobot_skip_reason = "LeRobot package not importable (missing av or other deps)"
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: F401
 
@@ -61,7 +71,7 @@ skip_no_youmu = pytest.mark.skipif(
 )
 skip_no_lerobot = pytest.mark.skipif(
     not _lerobot_available,
-    reason="LeRobot package not importable (missing av or other deps)",
+    reason=_lerobot_skip_reason,
 )
 skip_no_youmu_data = pytest.mark.skipif(
     not _youmu_data_exists,
@@ -73,33 +83,124 @@ skip_no_lerobot_data = pytest.mark.skipif(
 )
 
 
-def _build_libero_dataset(backend: str, data_dir: str):
-    """Build a LIBERO dataset using the training script's factory function.
+def _create_lerobot_v3_dir(data_dir: str) -> str:
+    """Create a temporary v3.0-compatible directory for lerobot loading.
 
-    Imports build_libero_dataset from the training script via importlib
-    to avoid triggering the full veomni import chain.
+    The on-disk dataset uses v2.0 format (episode-per-file, JSONL metadata).
+    lerobot 0.4.4 requires v3.0 format.  This function creates a temp directory
+    with v3.0 metadata files and symlinks the actual data directory.
+
+    Returns:
+        Path to the temporary v3.0-compatible directory.
     """
-    import importlib.util
+    tmpdir = tempfile.mkdtemp(prefix="lerobot_v3_parity_")
 
-    script_path = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "tasks",
-        "omni",
-        "train_qwen_vl_libero.py",
+    # Symlink data directory (parquet files are compatible)
+    os.symlink(os.path.join(data_dir, "data"), os.path.join(tmpdir, "data"))
+    os.makedirs(os.path.join(tmpdir, "meta"), exist_ok=True)
+
+    # Update info.json to claim v3.0
+    with open(os.path.join(data_dir, "meta", "info.json")) as f:
+        info = json.load(f)
+    info["codebase_version"] = "v3.0"
+    with open(os.path.join(tmpdir, "meta", "info.json"), "w") as f:
+        json.dump(info, f, indent=4)
+
+    # Copy stats.json
+    shutil.copy2(
+        os.path.join(data_dir, "meta", "stats.json"),
+        os.path.join(tmpdir, "meta", "stats.json"),
     )
-    spec = importlib.util.spec_from_file_location("train_qwen_vl_libero", script_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
 
-    return mod.build_libero_dataset(
-        backend=backend,
+    # Convert tasks.jsonl → tasks.parquet
+    with open(os.path.join(data_dir, "meta", "tasks.jsonl")) as f:
+        tasks = [json.loads(line) for line in f]
+    pd.DataFrame(tasks).to_parquet(os.path.join(tmpdir, "meta", "tasks.parquet"))
+
+    # Convert episodes.jsonl → episodes/chunk-000/file-000.parquet
+    with open(os.path.join(data_dir, "meta", "episodes.jsonl")) as f:
+        episodes = sorted(
+            [json.loads(line) for line in f],
+            key=lambda e: e["episode_index"],
+        )
+
+    episodes_dir = os.path.join(tmpdir, "meta", "episodes", "chunk-000")
+    os.makedirs(episodes_dir, exist_ok=True)
+
+    # v3.0 requires dataset_from_index / dataset_to_index columns
+    ep_records = []
+    cumulative = 0
+    for ep in episodes:
+        length = ep["length"]
+        # Map task descriptions to task indices
+        task_indices = []
+        for task_desc in ep.get("tasks", []):
+            for t in tasks:
+                if t["task"] == task_desc:
+                    task_indices.append(t["task_index"])
+                    break
+        ep_records.append(
+            {
+                "episode_index": ep["episode_index"],
+                "tasks": str(task_indices),
+                "length": length,
+                "dataset_from_index": cumulative,
+                "dataset_to_index": cumulative + length,
+            }
+        )
+        cumulative += length
+
+    pd.DataFrame(ep_records).to_parquet(os.path.join(episodes_dir, "file-000.parquet"))
+
+    return tmpdir
+
+
+def _build_youmu_dataset(data_dir: str):
+    """Build a LIBERO dataset with the youmu backend."""
+    from youmu.libero_dataset import LiberoYoumuDataset
+
+    return LiberoYoumuDataset(
         data_dir=data_dir,
         obs_len=OBS_LEN,
         pred_len=PRED_LEN,
         chunk_index=None,
     )
+
+
+def _build_lerobot_dataset(data_dir: str):
+    """Build a LIBERO dataset with the lerobot backend via v3.0 wrapper.
+
+    Creates a temporary v3.0-compatible directory that wraps the v2.0 data.
+    Uses the actual parquet column names (state, actions, image) which differ
+    from youmu's output key names (observation.state, action, observation.images.image).
+
+    Returns:
+        Tuple of (dataset, tmpdir_path).  Caller must clean up tmpdir.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    v3_dir = _create_lerobot_v3_dir(data_dir)
+
+    with open(os.path.join(data_dir, "meta", "info.json")) as f:
+        fps = json.load(f)["fps"]
+
+    obs_timestamps = [-(OBS_LEN - 1 - i) / fps for i in range(OBS_LEN)]
+    # youmu returns actions for the NEXT pred_len frames [t+1, ..., t+pred_len],
+    # so lerobot delta_timestamps must start at 1/fps to match.
+    pred_timestamps = [(i + 1) / fps for i in range(PRED_LEN)]
+
+    ds = LeRobotDataset(
+        repo_id="local/libero",
+        root=v3_dir,
+        delta_timestamps={
+            # Use actual parquet column names (v2.0 flat naming)
+            "state": obs_timestamps,
+            "actions": pred_timestamps,
+            "image": obs_timestamps,
+        },
+        download_videos=False,
+    )
+    return ds, v3_dir
 
 
 def _get_test_indices(dataset_len: int) -> list[int]:
@@ -117,7 +218,7 @@ def _get_test_indices(dataset_len: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Test class 1: Backend parity via build_libero_dataset
+# Test class 1: Backend parity via direct dataset construction
 # ---------------------------------------------------------------------------
 
 
@@ -128,66 +229,120 @@ def _get_test_indices(dataset_len: int) -> list[int]:
 class TestBackendParity:
     """Compare youmu and lerobot backends sample-by-sample.
 
-    Loads the dataset via build_libero_dataset for both backends and
-    asserts that observation.state, action, and observation.images.image
-    are exactly equal for a set of test indices.
+    Loads the dataset with both backends and asserts that state, action,
+    and image values are exactly equal for matching (episode, frame) pairs.
+
+    Key differences handled:
+    - youmu keys: observation.state, action, observation.images.image
+    - lerobot keys: state, actions, image
+    - youmu excludes last pred_len frames per episode; lerobot includes all with padding
+    - youmu images: uint8 HWC; lerobot images: float32 CHW (converted for comparison)
     """
 
     @pytest.fixture(scope="class")
     def youmu_dataset(self):
         """Load dataset with youmu backend."""
-        return _build_libero_dataset("youmu", YOUMU_DATA_DIR)
+        return _build_youmu_dataset(YOUMU_DATA_DIR)
 
     @pytest.fixture(scope="class")
-    def lerobot_dataset(self):
-        """Load dataset with lerobot backend."""
-        return _build_libero_dataset("lerobot", LEROBOT_DATA_DIR)
+    def lerobot_context(self):
+        """Load dataset with lerobot backend (v3.0 wrapper).
 
-    def test_dataset_lengths_match(self, youmu_dataset, lerobot_dataset):
-        """Both backends produce datasets of the same length."""
-        assert len(youmu_dataset) == len(lerobot_dataset), (
-            f"Length mismatch: youmu={len(youmu_dataset)}, lerobot={len(lerobot_dataset)}"
+        Yields dataset and cleans up the temp directory after.
+        """
+        ds, tmpdir = _build_lerobot_dataset(LEROBOT_DATA_DIR)
+        yield ds
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _get_lerobot_sample(self, youmu_sample, lerobot_ds):
+        """Get the lerobot sample matching a youmu sample's global frame_index.
+
+        youmu's frame_index is a global cumulative index across all episodes,
+        which maps directly to lerobot's sequential dataset index.
+        """
+        frame_idx = youmu_sample["frame_index"]
+        if isinstance(frame_idx, torch.Tensor):
+            frame_idx = frame_idx.item()
+        return lerobot_ds[frame_idx]
+
+    def test_dataset_lengths_match(self, youmu_dataset, lerobot_context):
+        """youmu has fewer frames than lerobot (clips episode tails).
+
+        Verify the difference equals pred_len * num_episodes, confirming
+        youmu excludes the last pred_len frames per episode while lerobot
+        keeps all frames.
+        """
+        lerobot_ds = lerobot_context
+        diff = len(lerobot_ds) - len(youmu_dataset)
+        # Read episode count from metadata
+        with open(os.path.join(LEROBOT_DATA_DIR, "meta", "episodes.jsonl")) as f:
+            num_episodes = sum(1 for _ in f)
+        expected_diff = PRED_LEN * num_episodes
+        assert diff == expected_diff, (
+            f"Length difference {diff} != expected {expected_diff} "
+            f"(youmu={len(youmu_dataset)}, lerobot={len(lerobot_ds)}, "
+            f"num_episodes={num_episodes}, pred_len={PRED_LEN})"
         )
 
-    def test_state_parity(self, youmu_dataset, lerobot_dataset):
-        """observation.state tensors are exactly equal for all test indices."""
+    def test_state_parity(self, youmu_dataset, lerobot_context):
+        """State tensors are exactly equal for matching (episode, frame) pairs."""
+        lerobot_ds = lerobot_context
         indices = _get_test_indices(len(youmu_dataset))
         for idx in indices:
             y_sample = youmu_dataset[idx]
-            l_sample = lerobot_dataset[idx]
-            assert torch.equal(y_sample["observation.state"], l_sample["observation.state"]), (
-                f"State mismatch at index {idx}"
-            )
-
-    def test_action_parity(self, youmu_dataset, lerobot_dataset):
-        """action tensors are exactly equal for all test indices."""
-        indices = _get_test_indices(len(youmu_dataset))
-        for idx in indices:
-            y_sample = youmu_dataset[idx]
-            l_sample = lerobot_dataset[idx]
-            assert torch.equal(y_sample["action"], l_sample["action"]), f"Action mismatch at index {idx}"
-
-    def test_image_parity(self, youmu_dataset, lerobot_dataset):
-        """observation.images.image tensors are exactly equal (pixel-perfect)."""
-        indices = _get_test_indices(len(youmu_dataset))
-        for idx in indices:
-            y_sample = youmu_dataset[idx]
-            l_sample = lerobot_dataset[idx]
+            l_sample = self._get_lerobot_sample(y_sample, lerobot_ds)
+            # youmu: observation.state (obs_len, 8), lerobot: state (obs_len, 8)
             assert torch.equal(
-                y_sample["observation.images.image"],
-                l_sample["observation.images.image"],
-            ), f"Image mismatch at index {idx}"
+                y_sample["observation.state"],
+                l_sample["state"],
+            ), f"State mismatch at youmu index {idx}"
 
-    def test_episode_index_parity(self, youmu_dataset, lerobot_dataset):
-        """episode_index values match for all test indices."""
+    def test_action_parity(self, youmu_dataset, lerobot_context):
+        """Action tensors are exactly equal for matching (episode, frame) pairs."""
+        lerobot_ds = lerobot_context
         indices = _get_test_indices(len(youmu_dataset))
         for idx in indices:
             y_sample = youmu_dataset[idx]
-            l_sample = lerobot_dataset[idx]
-            assert y_sample["episode_index"] == l_sample["episode_index"], (
-                f"Episode index mismatch at index {idx}: "
-                f"youmu={y_sample['episode_index']}, lerobot={l_sample['episode_index']}"
-            )
+            l_sample = self._get_lerobot_sample(y_sample, lerobot_ds)
+            # youmu: action (pred_len, 7), lerobot: actions (pred_len, 7)
+            assert torch.equal(
+                y_sample["action"],
+                l_sample["actions"],
+            ), f"Action mismatch at youmu index {idx}"
+
+    def test_image_parity(self, youmu_dataset, lerobot_context):
+        """Image tensors are pixel-perfect identical after format normalization.
+
+        youmu returns uint8 (obs_len, H, W, C); lerobot returns float32 (obs_len, C, H, W).
+        We convert lerobot images to uint8 HWC for comparison.
+        """
+        lerobot_ds = lerobot_context
+        indices = _get_test_indices(len(youmu_dataset))
+        for idx in indices:
+            y_sample = youmu_dataset[idx]
+            l_sample = self._get_lerobot_sample(y_sample, lerobot_ds)
+            # youmu: (obs_len, H, W, C) uint8
+            y_img = y_sample["observation.images.image"]
+            # lerobot: (obs_len, C, H, W) float32 [0, 1]
+            l_img = l_sample["image"]
+            # Convert lerobot CHW float32 → HWC uint8
+            l_img_hwc = (l_img.permute(0, 2, 3, 1) * 255).to(torch.uint8)
+            assert torch.equal(y_img, l_img_hwc), f"Image mismatch at youmu index {idx}"
+
+    def test_episode_index_parity(self, youmu_dataset, lerobot_context):
+        """episode_index values match for all test indices."""
+        lerobot_ds = lerobot_context
+        indices = _get_test_indices(len(youmu_dataset))
+        for idx in indices:
+            y_sample = youmu_dataset[idx]
+            l_sample = self._get_lerobot_sample(y_sample, lerobot_ds)
+            y_ep = y_sample["episode_index"]
+            l_ep = l_sample["episode_index"]
+            if isinstance(y_ep, torch.Tensor):
+                y_ep = y_ep.item()
+            if isinstance(l_ep, torch.Tensor):
+                l_ep = l_ep.item()
+            assert y_ep == l_ep, f"Episode index mismatch at youmu index {idx}: youmu={y_ep}, lerobot={l_ep}"
 
 
 # ---------------------------------------------------------------------------

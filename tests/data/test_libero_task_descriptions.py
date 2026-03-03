@@ -277,3 +277,40 @@ class TestRealData:
             num_episodes = sum(1 for line in f if line.strip())
         result = dt_module.load_libero_task_descriptions(meta_path)
         assert len(result) == num_episodes
+
+
+# ---------------------------------------------------------------------------
+# Integration tests on synthetic data (using shared fixture from conftest.py)
+# ---------------------------------------------------------------------------
+
+
+class TestSyntheticData:
+    """Integration tests using the synthetic LIBERO dataset fixture."""
+
+    def test_load_from_synthetic_jsonl(self, dt_module, synthetic_libero_dir):
+        """Load task descriptions from the synthetic dataset's episodes.jsonl."""
+        meta_path = os.path.join(synthetic_libero_dir, "meta", "episodes.jsonl")
+        result = dt_module.load_libero_task_descriptions(meta_path)
+        assert len(result) == 3
+        # All keys should be non-negative ints, all values non-empty strings
+        for k, v in result.items():
+            assert isinstance(k, int) and k >= 0
+            assert isinstance(v, str) and len(v) > 0
+
+    def test_all_episodes_have_descriptions(self, dt_module, synthetic_libero_dir):
+        """Every episode in the synthetic JSONL maps to a dict entry."""
+        meta_path = os.path.join(synthetic_libero_dir, "meta", "episodes.jsonl")
+        with open(meta_path) as f:
+            num_episodes = sum(1 for line in f if line.strip())
+        result = dt_module.load_libero_task_descriptions(meta_path)
+        assert len(result) == num_episodes
+
+    def test_synthetic_task_descriptions_content(self, dt_module, synthetic_libero_dir):
+        """Synthetic task descriptions match what the fixture wrote."""
+        meta_path = os.path.join(synthetic_libero_dir, "meta", "episodes.jsonl")
+        result = dt_module.load_libero_task_descriptions(meta_path)
+        assert result == {
+            0: "synthetic task 0",
+            1: "synthetic task 1",
+            2: "synthetic task 2",
+        }
