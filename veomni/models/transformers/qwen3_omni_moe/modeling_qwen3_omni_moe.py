@@ -729,7 +729,6 @@ class Qwen3OmniMoeThinkerExperts(nn.Module):
         num_experts: int,
     ) -> torch.Tensor:
         return fused_moe_forward(
-            module=self,
             num_experts=num_experts,
             routing_weights=routing_weights,
             selected_experts=selected_experts,
