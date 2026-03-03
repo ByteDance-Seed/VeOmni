@@ -52,6 +52,14 @@ from .ulysses import (
     gather_seq_scatter_heads,
 )
 from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
+from .vision_dp import (
+    assign_images_to_dp_ranks,
+    create_dp_vision_forward,
+    gather_vision_embeddings,
+    get_image_embedding_counts,
+    get_image_patch_counts,
+    prepare_local_vision_inputs,
+)
 
 
 __all__ = [
@@ -88,4 +96,10 @@ __all__ = [
     "async_ulysses_output_projection",
     "divide_qkv_linear_weight",
     "divide_qkv_linear_bias",
+    "get_image_patch_counts",
+    "get_image_embedding_counts",
+    "assign_images_to_dp_ranks",
+    "prepare_local_vision_inputs",
+    "gather_vision_embeddings",
+    "create_dp_vision_forward",
 ]
