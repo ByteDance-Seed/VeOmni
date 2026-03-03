@@ -554,6 +554,10 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
     )
+    vision_dp: bool = field(
+        default=False,
+        metadata={"help": "Enable Vision DP: distribute ViT across Ulysses SP ranks."},
+    )
     context_parallel_size: int = field(
         default=1,
         metadata={"help": "Ring-attn context parallel size."},

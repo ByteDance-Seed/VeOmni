@@ -129,6 +129,7 @@ def main():
         attn_implementation=args.model.attn_implementation,
         encoder_data_balance=args.model.encoder_data_balance,
         encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+        vision_dp=args.train.vision_dp,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")

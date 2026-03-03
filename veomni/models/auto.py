@@ -80,6 +80,7 @@ def build_foundation_model(
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
+    vision_dp: bool = False,
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -185,6 +186,20 @@ def build_foundation_model(
             "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "
             "to avoid unexpected kernel loading side effects."
         )
+
+    if vision_dp and get_parallel_state().sp_enabled:
+        if config.model_type == "qwen2_5_vl":
+            from .transformers.qwen2_5vl.modeling_qwen2_5_vl import apply_vision_dp_patch_qwen25
+
+            apply_vision_dp_patch_qwen25()
+            logger.info_rank0("Applied Vision DP patch for Qwen2.5-VL")
+        elif config.model_type == "qwen3_vl":
+            from .transformers.qwen3_vl.modeling_qwen3_vl import apply_vision_dp_patch
+
+            apply_vision_dp_patch()
+            logger.info_rank0("Applied Vision DP patch for Qwen3-VL")
+        else:
+            logger.warning_rank0(f"Vision DP requested but model_type={config.model_type} is not supported")
 
     model_class_path = f"{model.__class__.__module__}.{model.__class__.__name__}"
     logger.info_rank0(f"Built foundation model class: {model_class_path}")
