@@ -158,8 +158,28 @@ def prepare_exec_cmd(
     train_path: str,
     output_dir: str,
     is_moe: bool,
+    max_sp_size: int | None = None,
 ) -> str:
+    """Build torchrun commands for every (task, parallel-mode) combination.
+
+    Args:
+        test_tasks: Script basenames under tests/e2e/ to run (e.g. ["train_text_test"]).
+        model_name: Short name used for directory naming and log output.
+        config_path: Path to the model's toy config directory or config.json.
+        model_path: Path to materialized model weights.
+        train_path: Path to the dummy training dataset directory.
+        output_dir: Root directory for per-run output (logs, checkpoints).
+        is_moe: If True, also iterates over ep_size values (expert parallelism).
+        max_sp_size: If set, filters out modes with sp_size > this value.
+            Use 1 to skip sp=2 when the model does not support sequence parallelism yet.
+
+    Returns:
+        List of (task_name, command) tuples, where command is a list of strings
+        suitable for subprocess.run.
+    """
     model_modes: ModelMode = _base_model_modes() if not is_moe else _moe_model_modes()
+    if max_sp_size is not None:
+        model_modes = [m for m in model_modes if m.sp_size <= max_sp_size]
 
     command_list = []
     for task in test_tasks:
