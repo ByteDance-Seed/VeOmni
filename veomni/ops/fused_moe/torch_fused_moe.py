@@ -13,6 +13,7 @@ def torch_fused_moe_forward(
     fc1_1_weight: torch.Tensor,
     fc1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
 ):
     """
     torch._grouped_mm based fused moe forward using pure torch token reorder/combine.
@@ -20,6 +21,9 @@ def torch_fused_moe_forward(
 
     fc1_1_weight / fc1_2_weight must already be resolved (split) before calling this
     function; merged-weight resolution is handled by the caller (group_gemm_fused_moe_forward).
+
+    When fc1_1_2_weight is provided, a fused gate+up projection is used (one grouped_mm
+    instead of two), which is more efficient.
     """
     routing_weights = routing_weights.bfloat16()
     hidden_states = hidden_states.bfloat16()
@@ -35,15 +39,26 @@ def torch_fused_moe_forward(
     routed_input = hidden_states[token_indices_experts_sorted // topk]
     top_scores_experts_sorted = routing_weights.view(-1)[token_indices_experts_sorted].reshape(-1, 1)
 
-    run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm)
-    routed_outputs = run_experts_fn(
-        fc1_1_weight,
-        fc2_weight,
-        fc1_2_weight,
-        routed_input,
-        num_tokens_per_expert=num_tokens_per_expert,
-        gate_weights=top_scores_experts_sorted,
-    )
+    if fc1_1_2_weight is not None:
+        run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm_fused_gate_up)
+        routed_outputs = run_experts_fn(
+            fc1_1_2_weight,
+            fc2_weight,
+            None,
+            routed_input,
+            num_tokens_per_expert=num_tokens_per_expert,
+            gate_weights=top_scores_experts_sorted,
+        )
+    else:
+        run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm)
+        routed_outputs = run_experts_fn(
+            fc1_1_weight,
+            fc2_weight,
+            fc1_2_weight,
+            routed_input,
+            num_tokens_per_expert=num_tokens_per_expert,
+            gate_weights=top_scores_experts_sorted,
+        )
 
     # Unsort and reduce top-k expert outputs back to token order.
     routed_output_unsorted = torch.zeros(
@@ -54,6 +69,28 @@ def torch_fused_moe_forward(
     routed_output_unsorted[token_indices_experts_sorted] = routed_outputs
     output = routed_output_unsorted.view(hidden_states.shape[0], topk, hidden_states.shape[1]).sum(dim=1)
     return output
+
+
+def _run_experts_grouped_mm_fused_gate_up(
+    w12: torch.Tensor,
+    w2: torch.Tensor,
+    _w3: torch.Tensor | None,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor | None,
+    gate_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused gate+up projection: one grouped_mm for the merged (gate, up) weight."""
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    intermediate_dim = w12.shape[1] // 2
+
+    # Single grouped_mm produces both gate and up projections.
+    gate_up = torch._grouped_mm(x.bfloat16(), w12.bfloat16().transpose(-2, -1), offs=offsets)
+    h = F.silu(gate_up[:, :intermediate_dim]) * gate_up[:, intermediate_dim:]
+
+    if gate_weights is not None:
+        h = h * gate_weights
+    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+    return out
 
 
 def _run_experts_grouped_mm(

@@ -298,7 +298,10 @@ def group_gemm_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     moe_kernel_backend: str = "triton",
 ):
-    fc1_1_weight, fc1_2_weight = _resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
+    # Skip resolve when torch backend can use the merged weight directly,
+    # avoiding unnecessary contiguous copies from slicing fc1_1_2_weight.
+    if not (moe_kernel_backend == "torch" and fc1_1_2_weight is not None):
+        fc1_1_weight, fc1_2_weight = _resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
 
     if get_parallel_state().ep_enabled:
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
@@ -360,6 +363,7 @@ def group_gemm_fused_moe_forward(
                 fc1_1_weight,
                 fc1_2_weight,
                 fc2_weight,
+                fc1_1_2_weight=fc1_1_2_weight,
             )
         elif moe_kernel_backend == "triton":
             final_hidden_states = TritonFusedMoeExpertFunction.apply(
