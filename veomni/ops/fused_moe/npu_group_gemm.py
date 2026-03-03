@@ -26,14 +26,30 @@ from ...utils.device import stream_synchronize
 from ..group_gemm.kernel.npu_group_gemm import npu_group_gemm
 
 
+def _build_npu_fc1_weight(
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
+    fc1_1_2_weight: torch.Tensor | None,
+) -> torch.Tensor:
+    if fc1_1_2_weight is not None:
+        if fc1_1_weight is not None or fc1_2_weight is not None:
+            raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
+        return fc1_1_2_weight.transpose(1, 2)
+
+    if fc1_1_weight is None or fc1_2_weight is None:
+        raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
+    return torch.cat([fc1_1_weight, fc1_2_weight], dim=1).transpose(1, 2)
+
+
 def _npu_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(
@@ -41,7 +57,7 @@ def _npu_fused_moe_forward(
     )
     tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
 
-    fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).transpose(1, 2)
+    fc1_weight = _build_npu_fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
     intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
     intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
@@ -54,9 +70,10 @@ def npu_ep_fused_moe_forward(
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -73,7 +90,7 @@ def npu_ep_fused_moe_forward(
         ep_group,
     )
 
-    fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).transpose(1, 2)
+    fc1_weight = _build_npu_fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
     intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
     intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
     hidden_states = npu_group_gemm(
@@ -188,14 +205,14 @@ def alltoall_combine(
 
 
 def npu_fused_moe_forward(
-    module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
 ):
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
@@ -206,10 +223,18 @@ def npu_fused_moe_forward(
             fc1_1_weight,
             fc1_2_weight,
             fc2_weight,
+            fc1_1_2_weight,
             ep_group=get_parallel_state().ep_group,
         )
     else:
         final_hidden_states = _npu_fused_moe_forward(
-            num_experts, routing_weights, selected_experts, hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
         )
     return final_hidden_states
