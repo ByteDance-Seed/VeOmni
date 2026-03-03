@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 
 import torch
 
@@ -211,9 +211,7 @@ def process_sample_qwen2_5_vl(
     from .multimodal.image_utils import fetch_images
     from .multimodal.video_utils import fetch_videos
 
-    source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
-    )
+    source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
 
     if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
         conversations = sample["conversations"]
@@ -275,9 +273,7 @@ def process_sample_qwen3_vl(
     from .multimodal.image_utils import fetch_images
     from .multimodal.video_utils import fetch_videos_metadata
 
-    source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
-    )
+    source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
 
     if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
         conversations = sample["conversations"]
@@ -353,11 +349,11 @@ def process_sample_qwen_omni(
     from .multimodal.audio_utils import fetch_audios
     from .multimodal.image_utils import fetch_images
     from .multimodal.video_utils import fetch_videos
+
     QWEN_OMNI_SYSTEM_MESSAGE = (
         "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
         "capable of perceiving auditory and visual inputs, as well as generating text and speech."
     )
-
 
     def get_omni_token_ids(processor: "ProcessorMixin") -> tuple[int, int, int]:
         tokenizer = getattr(processor, "tokenizer", processor)
@@ -375,9 +371,7 @@ def process_sample_qwen_omni(
 
     image_token_id, video_token_id, audio_token_id = get_omni_token_ids(processor)
 
-    source = (
-        kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
-    )
+    source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
     conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"]) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
     input_conversations = [
@@ -445,9 +439,7 @@ def process_sample_qwen_omni(
     if feature_attention_mask is not None:
         audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
         valid_mask = audio_feature_lengths != 0
-        input_features = input_features[valid_mask].permute(0, 2, 1)[
-            feature_attention_mask[valid_mask].bool()
-        ]
+        input_features = input_features[valid_mask].permute(0, 2, 1)[feature_attention_mask[valid_mask].bool()]
 
         model_inputs["input_features"] = input_features
         model_inputs["audio_feature_lengths"] = audio_feature_lengths

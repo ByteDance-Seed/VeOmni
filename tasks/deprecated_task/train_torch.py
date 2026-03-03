@@ -84,7 +84,7 @@ def main():
     chat_template = None
     if args.data.data_type == "conversation":
         chat_template = build_chat_template(args.data.chat_template, tokenizer)
-    
+
     transform = build_data_transform(
         args.data.data_type,
         tokenizer=tokenizer,

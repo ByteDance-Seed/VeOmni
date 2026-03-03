@@ -30,7 +30,6 @@ import json
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict
-from functools import partial
 from typing import Any, Callable, Dict, List
 
 import torch
