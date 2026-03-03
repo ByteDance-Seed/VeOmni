@@ -38,14 +38,13 @@ from ..utils.dist_utils import main_process_first
 from ..utils.multisource_utils import parse_multisource_config
 
 
+logger = logging.get_logger(__name__)
+
 DATASET_REGISTRY = Registry("Dataset")
 
 
 def build_dataset(dataset_name: str, **kwargs) -> "Dataset":
     return DATASET_REGISTRY[dataset_name](**kwargs)
-
-
-logger = logging.get_logger(__name__)
 
 
 class MappingDataset(Dataset):

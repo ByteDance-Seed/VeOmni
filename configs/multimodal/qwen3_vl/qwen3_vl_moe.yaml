@@ -4,7 +4,7 @@ model:
   attn_implementation: flash_attention_2
 
 data:
-  train_path: sharegpt4v_pretrain
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
   data_type: conversation
   chat_template: qwen3vl
   max_seq_len: 4096
@@ -23,8 +23,6 @@ train:
   use_wandb: false
   wandb_project: qwen3_vl_moe
   wandb_name: qwen3_vl_moe
-  rmpad: false
-  rmpad_with_pos_ids: true
   expert_parallel_size: 1
   freeze_vit: false
   lr: 1.0e-5
@@ -39,4 +37,3 @@ train:
   profile_end_step: 21
   profile_record_shapes: true
   ckpt_manager: dcp
-  save_hf_weights: false

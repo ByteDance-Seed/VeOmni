@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
+from ..utils.env import get_env
 
 
 logger = logging.get_logger(__name__)
@@ -134,16 +135,6 @@ class ModelArguments:
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
-    encoder_data_balance: Optional[bool] = field(
-        default=False, metadata={"help": "Whether to balance encoder data for qwen3-vl model"}
-    )
-    encoder_data_balance_sorting_algo: Optional[str] = field(
-        default="post_mbs_balancing_greedy_without_pad",
-        metadata={
-            "help": "The sorting algorithm of encoder data balance. All viable algorithms are defined in "
-            "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"
-        },
-    )
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
@@ -172,21 +163,22 @@ class ModelArguments:
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
             )
 
-        if self.attn_implementation == "flash_attention_2":
-            logger.info_rank0(
-                "Replacing ModelArgument attn_implementation from 'flash_attention_2' to 'veomni_flash_attention_2_with_sp'"
-            )
-            self.attn_implementation = "veomni_flash_attention_2_with_sp"
-        if self.attn_implementation == "flash_attention_3":
-            logger.info_rank0(
-                "Replacing ModelArgument attn_implementation from 'flash_attention_3' to 'veomni_flash_attention_3_with_sp'"
-            )
-            self.attn_implementation = "veomni_flash_attention_3_with_sp"
-        if self.attn_implementation == "flash_attention_4":
-            logger.info_rank0(
-                "Replacing ModelArgument attn_implementation from 'flash_attention_4' to 'veomni_flash_attention_4_with_sp'"
-            )
-            self.attn_implementation = "veomni_flash_attention_4_with_sp"
+        if get_env("MODELING_BACKEND") == "veomni":
+            if self.attn_implementation == "flash_attention_2":
+                logger.info_rank0(
+                    "Replacing ModelArgument attn_implementation from 'flash_attention_2' to 'veomni_flash_attention_2_with_sp'"
+                )
+                self.attn_implementation = "veomni_flash_attention_2_with_sp"
+            if self.attn_implementation == "flash_attention_3":
+                logger.info_rank0(
+                    "Replacing ModelArgument attn_implementation from 'flash_attention_3' to 'veomni_flash_attention_3_with_sp'"
+                )
+                self.attn_implementation = "veomni_flash_attention_3_with_sp"
+            if self.attn_implementation == "flash_attention_4":
+                logger.info_rank0(
+                    "Replacing ModelArgument attn_implementation from 'flash_attention_4' to 'veomni_flash_attention_4_with_sp'"
+                )
+                self.attn_implementation = "veomni_flash_attention_4_with_sp"
 
         suppoerted_encoder_types = ["image", "video", "audio"]
         for encoder_type, encoder_args in self.encoders.items():
@@ -220,9 +212,19 @@ class DataArguments:
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
+    eval_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
+    )
     train_size: int = field(
         default=10_000_000,
         metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
+    )
+    train_sample: int = field(
+        default=10_000,
+        metadata={
+            "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
+        },
     )
     data_type: Literal["plaintext", "conversation", "diffusion", "classification"] = field(
         default="conversation",
@@ -240,29 +242,17 @@ class DataArguments:
         default="interleave",
         metadata={"help": "Type of the datasets for multisource training."},
     )
-    enable_multisource: bool = field(
-        default=False,
-        metadata={"help": "Whether to enable multisource training."},
-    )
     source_name: str = field(
         default=None,
         metadata={"help": "Dataset name for training. If multisource, dataset name will be loaded from yaml config."},
     )
-    data_tag: Literal["default", "mmtag"] = field(
-        default="default",
-        metadata={"help": "Dataset tag for multimodal training."},
-    )
-    drop_resume_buffer: bool = field(
-        default=False,
-        metadata={"help": "drop data in saved buffer"},
+    dyn_bsz_buffer_size: int = field(
+        default=200,
+        metadata={"help": "Buffer size for dynamic batch size."},
     )
     text_keys: str = field(
         default=None,
         metadata={"help": "Key to get text from the training data."},
-    )
-    image_keys: str = field(
-        default="images",
-        metadata={"help": "Key to get images from the training data."},
     )
     chat_template: str = field(
         default="default",
@@ -288,36 +278,13 @@ class DataArguments:
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
     )
-    shuffle_shard_nums: int = field(
-        default=1,
-        metadata={"help": "Number of shards to shuffle in byted dataset."},
-    )
-    split_nums: int = field(
-        default=1,
-        metadata={"help": "Number of splits for multisoure stream to reduce memory"},
-    )
-    predownload_factor: float = field(
-        default=0.5,
-        metadata={"help": "The factor to determine the number of samples to pre-download using byted dataset"},
-    )
-    silent_exception: bool = field(
+    silent_exception: bool = field(  # TODO: add silent_exception feature
         default=False,
-        metadata={"help": "Whether to ignore exceptions using byted dataset. Defaults to ``False``"},
+        metadata={"help": "Whether to ignore exceptions when loading data. Defaults to ``False``"},
     )
 
     def __post_init__(self):
         self.enable_multisource = self.train_path.endswith(".yaml")
-        if self.enable_multisource and self.shuffle_shard_nums != 1:
-            self.shuffle_shard_nums = 1
-            logger.info_rank0("`shuffle_shard_nums` is set to 1 when using multisource dataset.")
-
-        from ..data.data_loader import DATALOADER_REGISTRY
-        from ..data.dataset import DATASET_REGISTRY
-
-        assert self.datasets_type in DATASET_REGISTRY.valid_keys(), f"Unknown datasets type: {self.datasets_type}"
-        assert self.dataloader_type in DATALOADER_REGISTRY.valid_keys(), (
-            f"Unknown dataloader type: {self.dataloader_type}"
-        )
 
         if self.enable_multisource:
             self.dataset_name = self.multisource_datasets_type
@@ -343,15 +310,15 @@ class TrainingArguments:
     output_dir: str = field(
         metadata={"help": "Path to save model checkpoints."},
     )
-    vit_lr: float = field(
-        default=5e-5,
-        metadata={"help": "Maximum learning rate specifically for the **Vision Transformer (ViT) encoder** weights."},
-    )
     train_architecture: Literal["full", "lora"] = field(
         default="full",
         metadata={
             "help": "Specifies the parameter update strategy for training the multi-modal model. 'full' for Standard SFT, lora for LoRA."
         },
+    )
+    dyn_bsz: bool = field(
+        default=True,
+        metadata={"help": "Enable dynamic batch size for padding-free training."},
     )
     lr: float = field(
         default=5e-5,
@@ -398,37 +365,9 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Epochs to train."},
     )
-    rmpad: bool = field(
-        default=True,
-        metadata={"help": "Enable padding-free training by using the cu_seqlens."},
-    )
-    rmpad_with_pos_ids: bool = field(
+    pad_to_length: bool = field(
         default=False,
-        metadata={"help": "Enable padding-free training by using the position_ids."},
-    )
-    pad_packed_to_length: Optional[int] = field(
-        default=None,
-        metadata={"help": "Pad packed sequences to a fixed length when rmpad_with_pos_ids is enabled."},
-    )
-    pad_packed_input: bool = field(
-        default=False,
-        metadata={"help": "Enable padding for packed sequences when rmpad_with_pos_ids is enabled."},
-    )
-    dyn_bsz: bool = field(
-        default=True,
-        metadata={"help": "Enable dynamic batch size for padding-free training."},
-    )
-    dyn_bsz_margin: int = field(
-        default=0,
-        metadata={"help": "Number of pad tokens in dynamic batch."},
-    )
-    dyn_bsz_runtime: Literal["main", "worker"] = field(
-        default="worker",
-        metadata={"help": "Use main process or worker process to run dynamic batch size."},
-    )
-    dyn_bsz_buffer_size: int = field(
-        default=200,
-        metadata={"help": "Buffer size for dynamic batch size."},
+        metadata={"help": "Pad packed sequences to a fixed length when using dynamic batch size."},
     )
     bsz_warmup_ratio: float = field(
         default=0,
@@ -514,6 +453,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable full determinism."},
     )
+    enable_batch_invariant_mode: bool = field(
+        default=False,
+        metadata={"help": "Enable batch invariant mode."},
+    )
     empty_cache_steps: int = field(
         default=500,
         metadata={"help": "Number of steps between two empty cache operations."},
@@ -554,6 +497,10 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
     )
+    async_enabled: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to enable async ulysses."},
+    )
     context_parallel_size: int = field(
         default=1,
         metadata={"help": "Ring-attn context parallel size."},
@@ -577,6 +524,22 @@ class TrainingArguments:
     save_epochs: int = field(
         default=1,
         metadata={"help": "Number of epochs between two checkpoint saves."},
+    )
+    hf_save_steps: int = field(
+        default=0,
+        metadata={"help": "Number of steps between two hf model weights save."},
+    )
+    hf_save_epochs: int = field(
+        default=0,
+        metadata={"help": "Number of epochs between two hf model weights save."},
+    )
+    eval_steps: int = field(
+        default=0,
+        metadata={"help": "Number of steps between two evaluations. 0 to disable."},
+    )
+    eval_epochs: int = field(
+        default=1,
+        metadata={"help": "Number of epochs between two evaluations. 0 to disable."},
     )
     save_hf_weights: bool = field(
         default=True,
@@ -644,16 +607,12 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
-    async_enabled: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether or not to enable async ulysses."},
-    )
 
     def __post_init__(self):
         self._train_steps = -1
-        self.local_rank = int(os.getenv("LOCAL_RANK"))
-        self.global_rank = int(os.getenv("RANK"))
-        self.world_size = int(os.getenv("WORLD_SIZE"))
+        self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+        self.global_rank = int(os.getenv("RANK", 0))
+        self.world_size = int(os.getenv("WORLD_SIZE", 1))
         if (
             self.world_size
             % (
@@ -681,7 +640,6 @@ class TrainingArguments:
             assert self.data_parallel_size == self.data_parallel_replicate_size * self.data_parallel_shard_size, (
                 f"data_parallel_size should be equal to data_parallel_replicate_size: {self.data_parallel_replicate_size} * data_parallel_shard_size: {self.data_parallel_shard_size}."
             )
-
         elif self.data_parallel_replicate_size > 0:
             if self.data_parallel_size % self.data_parallel_replicate_size != 0:
                 raise ValueError("data_parallel_size should be a multiple of data_parallel_replicate_size.")
@@ -694,9 +652,6 @@ class TrainingArguments:
         else:
             self.data_parallel_replicate_size = 1
             self.data_parallel_shard_size = self.data_parallel_size
-
-        if self.rmpad and self.rmpad_with_pos_ids:
-            raise ValueError("`rmpad` and `rmpad_with_pos_ids` cannot be both True.")
 
         num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
         if num_nodes > 1:
@@ -735,7 +690,7 @@ class TrainingArguments:
         # calculate dataloader batch size
         # for:
         #   - StreamingDataset and StreamingDataLoader
-        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker" and self.dyn_bsz:
+        if self.dyn_bsz:
             self.dataloader_batch_size = 1
         else:
             self.dataloader_batch_size = self.global_batch_size // self.data_parallel_size  # = micro bsz * grad accu
@@ -771,54 +726,6 @@ class TrainingArguments:
         else:
             self.profile_this_rank = False
 
-        from ..checkpoint import CHECKPOINTER_REGISTRY
-
-        assert self.ckpt_manager in CHECKPOINTER_REGISTRY.valid_keys(), f"Unknown ckpt_manager: {self.ckpt_manager}"
-
-    def compute_train_steps(
-        self, max_seq_len: Optional[int] = None, train_size: Optional[int] = None, dataset_length: Optional[int] = None
-    ) -> None:
-        """
-        Computes the training steps per epoch according to the data length.
-        """
-        if self.rmpad or self.rmpad_with_pos_ids:
-            if self.dyn_bsz:
-                assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
-                token_micro_bsz = self.micro_batch_size * max_seq_len
-                train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))
-                eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
-                self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
-            else:
-                if (
-                    dataset_length is not None
-                ):  # for dataset with __len__ attribute (e.g. mapping dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
-                    self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)
-                elif (
-                    self.max_steps is not None
-                ):  # for dataset without __len__ attribute (e.g. iterable dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
-                    self._train_steps = self.max_steps
-                else:
-                    raise ValueError(
-                        "For iterable dataset, please provide 'max_steps' or set dyn_bsz=True when removing padding."
-                    )
-        elif dataset_length is not None:
-            self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)  # assuming drop_last is true
-        elif self.max_steps is not None:
-            self._train_steps = self.max_steps
-        else:
-            raise ValueError("Please provide `dataset_length` or `max_steps`!")
-
-    @property
-    def train_steps(self) -> int:
-        if self.max_steps is not None and self._train_steps >= self.max_steps:
-            logger.warning_once(f"Set train_steps to {self.max_steps}. It should be for debug purpose only.")
-            return self.max_steps
-
-        if self._train_steps == -1:
-            raise ValueError("Please run `compute_train_steps` first!")
-
-        return self._train_steps
-
 
 @dataclass
 class VeOmniArguments:
@@ -827,19 +734,40 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
-        if self.train.pad_packed_input:
-            assert self.train.rmpad_with_pos_ids, "when using pad_packed_input, rmpad_with_pos_ids must be enabled."
-            if self.train.pad_packed_to_length is None and self.data.max_seq_len is not None:
-                self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
-                logger.info_rank0(
-                    f"pad_packed_input is set to true without pad_packed_to_length, setting pad_packed_to_length to train.micro_batch_size * data.max_seq_len = {self.train.pad_packed_to_length}"
-                )
-            if self.train.pad_packed_to_length < self.train.micro_batch_size * self.data.max_seq_len:
+        if self.train.pad_to_length:
+            if not self.train.dyn_bsz:
                 logger.warning_rank0(
-                    "pad_packed_to_length is smaller than train.micro_batch_size * data.max_seq_len, the actual input size can be larger than pad_packed_to_length"
+                    "pad_to_length is enabled without dyn_bsz, which is not supported. "
+                    "Please set pad_to_length to False or enable dyn_bsz."
                 )
+                self.train.pad_to_length = False
+            else:
+                self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
+                logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
+
+    def compute_train_steps(self, dataset_length: Optional[int] = None):
+        if self.train.dyn_bsz:
+            assert self.data.max_seq_len is not None and self.data.train_size is not None, (
+                "data.max_seq_len and data.train_size are required."
+            )
+            train_size = int(self.data.train_size * (1 + self.train.bsz_warmup_ratio / 2))
+            self._train_steps = math.ceil(train_size / (self.train.global_batch_size * self.data.max_seq_len))
         else:
-            self.train.pad_packed_to_length = None
+            if dataset_length is not None:  # mapping dataset
+                self._train_steps = math.floor(dataset_length / self.train.dataloader_batch_size)
+            else:
+                self._train_steps = math.ceil(self.data.train_sample / self.train.dataloader_batch_size)
+
+    @property
+    def train_steps(self) -> int:
+        if self.train.max_steps is not None and self._train_steps >= self.train.max_steps:
+            logger.warning_once(f"Set train_steps to {self.train.max_steps}. It should be for debug purpose only.")
+            return self.train.max_steps
+
+        if self._train_steps == -1:
+            raise ValueError("Please run `compute_train_steps` first!")
+
+        return self._train_steps
 
 
 # ================================ Infer Arguments ======================================

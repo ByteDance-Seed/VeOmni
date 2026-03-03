@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import pytest
 import torch.distributed as dist
 
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.models import build_foundation_model
 from veomni.utils import helper
@@ -17,7 +17,7 @@ logger = helper.create_logger(__name__)
 
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
@@ -27,7 +27,6 @@ class Arguments:
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_helper.py \
     --model.config_path test \
     --data.train_path tests \
-    --train.rmpad True \
     --train.output_dir .tests/cache \
 """
 

@@ -224,7 +224,6 @@ class DummyDataset:
 def process_dummy_example(
     example: Dict[str, Any],
     max_seq_len: int,
-    rmpad_with_pos_ids: bool = False,
     source_name: str = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
     tokenized_example = {}
@@ -233,12 +232,13 @@ def process_dummy_example(
             continue
         else:
             tokenized_example[k] = torch.tensor(v[:max_seq_len], dtype=torch.long)
-    if rmpad_with_pos_ids:  # precompute position_ids
-        tokenized_example["position_ids"] = torch.arange(0, len(tokenized_example["input_ids"]), dtype=torch.long)
+    tokenized_example["id"] = torch.tensor(tokenized_example["input_ids"][0].item(), dtype=torch.long)
     return [tokenized_example]
 
 
 class FakeModel(nn.Module):
+    _no_split_modules = ["ffn"]
+
     def __init__(self) -> None:
         super().__init__()
         self.ffn = nn.Linear(1, 1)
