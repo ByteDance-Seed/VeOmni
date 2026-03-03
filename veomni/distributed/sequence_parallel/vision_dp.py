@@ -12,30 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Vision Data Parallel (Vision DP) utilities for distributing ViT computation across SP ranks.
+Vision Data Parallel utilities for VeOmni.
 
-Alternative to patch-level Sequence Parallelism for Vision Transformers.
-
-Approach comparison:
-- **Patch-level SP** (existing): splits individual image patches across SP ranks,
-  requiring all-to-all communication for ViT's internal attention.
-  For Qwen2.5-VL, this means 4+ all-to-all per forward (window attention).
-- **Vision DP** (this module): distributes *whole images* across SP ranks.
-  Each rank runs the ViT on its assigned images with **zero per-layer communication**.
-  Only one all-gather is needed after ViT to collect all embeddings.
-
-Communication cost:
-- Patch-level SP: O(N_layers) for models with window attention (Qwen2.5-VL),
-  O(1) for models without (Qwen3-VL)
-- Vision DP: O(1) always — single all-gather after ViT
-
-Key design choices:
-- Image-level distribution (not patch-level): avoids breaking ViT's internal
-  cu_seqlens tracking and simplifies the implementation
-- Contiguous assignment: rank 0 gets images [0,1,...], rank 1 gets next chunk, etc.
-  No reordering needed after all-gather.
-- Gradient sync in backward: all_reduce(SUM) across SP ranks before slicing to
-  recover the complete gradient for each image.
+Distribute whole images across SP ranks, not patches within images.
+Each rank runs ViT on its assigned images, then all-gather combines embeddings.
+Backward all_reduce(SUM) recovers complete gradients before slicing by assignment.
 """
 
 import torch
@@ -50,33 +31,18 @@ logger = logging.get_logger(__name__)
 
 
 def get_image_patch_counts(grid_thw: torch.Tensor) -> list[int]:
-    """Compute number of patches per image from grid_thw.
-
-    Args:
-        grid_thw: Tensor of shape (num_images, 3) where each row is [t, h, w].
-
-    Returns:
-        List of patch counts per image.
-    """
+    """Return [t*h*w for each image] from a [num_images, 3] grid_thw tensor."""
     if grid_thw.numel() == 0:
         return []
     return (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
 
 
 def get_image_embedding_counts(grid_thw: torch.Tensor, spatial_merge_size: int = 1) -> list[int]:
-    """Compute number of embeddings per image after spatial merging.
-
-    Args:
-        grid_thw: Tensor of shape (num_images, 3) where each row is [t, h, w].
-        spatial_merge_size: Spatial merge factor (typically 2 for Qwen-VL).
-
-    Returns:
-        List of embedding counts per image.
-    """
+    """Return per-image embedding counts after spatial merging: t * (h/merge) * (w/merge)."""
     if grid_thw.numel() == 0:
         return []
     if spatial_merge_size == 1:
-        return (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
+        return get_image_patch_counts(grid_thw)
     t = grid_thw[:, 0]
     h = grid_thw[:, 1] // spatial_merge_size
     w = grid_thw[:, 2] // spatial_merge_size
@@ -87,21 +53,10 @@ def assign_images_to_dp_ranks(
     patch_counts: list[int],
     dp_size: int,
 ) -> tuple[list[list[int]], list[int]]:
-    """Assign whole images to DP ranks using load-balanced contiguous distribution.
+    """Assign whole images to DP ranks via greedy contiguous bin-packing.
 
-    The algorithm uses greedy contiguous bin-packing:
-    - Images are assigned in order (contiguous) to preserve ordering after gather
-    - Split points are chosen to balance total patch load across ranks
-    - Each rank gets at least one image when num_images >= dp_size
-
-    Args:
-        patch_counts: Number of patches per image.
-        dp_size: Number of DP ranks.
-
-    Returns:
-        Tuple of (image_assignments, rank_loads) where:
-        - image_assignments[rank] = list of image indices assigned to that rank
-        - rank_loads[rank] = total patches assigned to that rank
+    Returns (image_assignments, rank_patch_counts). Images are kept contiguous
+    so the gather result needs no reordering.
     """
     num_images = len(patch_counts)
     if num_images == 0:
@@ -151,16 +106,7 @@ def prepare_local_vision_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """Extract pixel values and grid_thw for this DP rank's assigned images.
 
-    Args:
-        pixel_values: All pixel values concatenated, shape (total_patches, dim).
-        grid_thw: Grid dimensions per image, shape (num_images, 3).
-        image_assignments: Per-rank image index assignments.
-        dp_rank: This rank's index in the DP group.
-        patch_counts: Pre-computed patch counts per image (avoids redundant
-            GPU→CPU sync when grid_thw is on GPU). Computed from grid_thw if None.
-
-    Returns:
-        Tuple of (local_pixel_values, local_grid_thw, local_indices).
+    Exploits contiguous assignment: a single slice instead of per-image cat.
     """
     local_indices = image_assignments[dp_rank]
 
@@ -231,7 +177,6 @@ class GatherVisionEmbeddings(Function):
             return local_embeddings
 
         hidden_size = local_embeddings.shape[1] if local_embeddings.dim() > 1 else 1
-        ctx.hidden_size = hidden_size
 
         if local_embeddings.shape[0] < max_count:
             pad_size = max_count - local_embeddings.shape[0]
@@ -262,47 +207,40 @@ class GatherVisionEmbeddings(Function):
         dp_rank = ctx.dp_rank
         dp_group = ctx.dp_group
 
-        # Aggregate gradient contributions from all SP ranks.
-        # Each rank only has non-zero grad for vision tokens in its own
-        # sequence shard. Summing across ranks recovers the complete
-        # gradient for every image before we slice by image assignment.
-        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=dp_group)
+        # all_reduce(SUM) aggregates partial gradients from all SP ranks:
+        # each rank only has non-zero grad for vision tokens in its sequence shard.
+        # NCCL all_reduce requires contiguous tensors — defensive guard.
+        grad = grad_output.contiguous()
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=dp_group)
 
         start = sum(all_counts[:dp_rank])
         end = start + all_counts[dp_rank]
-        local_grad = grad_output[start:end]
+        local_grad = grad[start:end]
         return local_grad, None, None
 
 
 def gather_vision_embeddings(local_embeddings, dp_group, all_counts: list[int]):
-    """All-gather vision embeddings from all DP ranks.
-
-    Args:
-        local_embeddings: This rank's vision embeddings.
-        dp_group: Process group for all-gather.
-        all_counts: Pre-computed embedding counts per rank.
-
-    Returns:
-        All-gathered embeddings concatenated across ranks.
-    """
+    """All-gather vision embeddings from all DP ranks with gradient support."""
     if dp_group is None or dist.get_world_size(dp_group) == 1:
         return local_embeddings
     return GatherVisionEmbeddings.apply(local_embeddings, dp_group, all_counts)
 
 
 def create_dp_vision_forward(original_forward):
-    """Wrap VisionTransformer.forward for Vision DP.
+    """Wrap VisionTransformer.forward for Vision DP (Data Parallel across SP ranks).
 
-    When SP size > 1, distributes whole images across SP ranks and
-    all-gathers the embeddings after ViT computation. The wrapped
-    forward passes ``_vision_dp=True`` so the inner ViT can skip its
-    own patch-level SP logic.
+    Strategy:
+    1. Distribute whole images to SP ranks (not patches within images)
+    2. Each rank processes its assigned images independently
+    3. All-gather embeddings at the end (contiguous assignment, no reordering)
 
-    Args:
-        original_forward: The original VisionTransformer.forward method.
+    Passes _vision_dp=True so the inner ViT can skip its own patch-level SP logic.
 
-    Returns:
-        Wrapped forward method with Vision DP support.
+    Gradient correctness: after all-gather in forward, each SP rank's inputs_embeds
+    contains vision tokens from ALL images. But Ulysses gives each rank only its
+    sequence shard. In backward, each rank only has non-zero gradient for vision
+    tokens in its own shard. The all_reduce(SUM) in GatherVisionEmbeddings.backward
+    aggregates partial gradients from all ranks, recovering the complete gradient.
     """
 
     def dp_vision_forward(self, hidden_states, grid_thw, **kwargs):
@@ -342,26 +280,12 @@ def create_dp_vision_forward(original_forward):
         if local_pixels.shape[0] > 0:
             local_embeddings = original_forward(self, local_pixels, local_grid_thw, _vision_dp=True, **kwargs)
         else:
-            # Determine hidden_size for empty tensor
-            if hasattr(self, "merger") and hasattr(self.merger, "ln_q"):
-                ln_q = self.merger.ln_q
-                if hasattr(ln_q, "normalized_shape"):
-                    hidden_size = ln_q.normalized_shape[0]
-                elif hasattr(ln_q, "weight"):
-                    hidden_size = ln_q.weight.shape[0]
-                else:
-                    raise RuntimeError(
-                        "Cannot determine hidden_size from merger.ln_q: "
-                        "no 'normalized_shape' or 'weight' attribute found"
-                    )
-            elif hasattr(self, "out_hidden_size"):
-                hidden_size = self.out_hidden_size
-            elif hasattr(self, "config") and hasattr(self.config, "hidden_size"):
-                hidden_size = self.config.hidden_size
-            else:
+            # This rank has no images, create empty tensor with correct hidden size
+            hidden_size = getattr(getattr(self, "config", None), "out_hidden_size", None)
+            if hidden_size is None:
                 raise RuntimeError(
-                    "Cannot determine hidden_size for empty Vision DP output. "
-                    "Expected one of: self.merger.ln_q, self.out_hidden_size, self.config.hidden_size"
+                    f"Cannot determine hidden_size: self.config.out_hidden_size not found. "
+                    f"Model type: {type(self).__name__}"
                 )
 
             local_embeddings = torch.empty(
@@ -369,6 +293,8 @@ def create_dp_vision_forward(original_forward):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+            # Empty rank must participate in autograd for backward all_reduce
+            local_embeddings.requires_grad_()
 
         # Handle Qwen3-VL which returns (embeddings, deepstack_embeddings_list)
         deepstack_outputs = None
