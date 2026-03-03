@@ -8,13 +8,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 import wandb
-from tasks.data.vlm_data_process import (
-    load_libero_task_descriptions,
-    process_libero_sample_qwen3_vl,
-)
 from tqdm import trange
 
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     LiberoActionCollator,
@@ -22,11 +18,15 @@ from veomni.data import (
     build_dataloader,
 )
 from veomni.data.dataset import MappingDataset
+from veomni.data.multimodal.data_transform import (
+    load_libero_task_descriptions,
+    process_libero_sample_qwen3_vl,
+)
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import build_foundation_model, build_processor, save_model_assets
+from veomni.models import build_processor, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.device import (
@@ -67,6 +67,22 @@ class MyTrainingArguments(TrainingArguments):
     vit_lr: float = field(
         default=1e-6,
         metadata={"help": "Maximum learning rate for vit parameters."},
+    )
+    rmpad: bool = field(
+        default=False,
+        metadata={"help": "Whether to remove padding tokens."},
+    )
+    rmpad_with_pos_ids: bool = field(
+        default=False,
+        metadata={"help": "Whether to remove padding using position IDs."},
+    )
+    pad_packed_to_length: bool = field(
+        default=False,
+        metadata={"help": "Whether to pad packed sequences to max length."},
+    )
+    dyn_bsz_margin: float = field(
+        default=0.0,
+        metadata={"help": "Margin for dynamic batch sizing."},
     )
 
 
@@ -191,7 +207,7 @@ def build_libero_dataset(
 
 
 @dataclass
-class Arguments:
+class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
@@ -230,15 +246,33 @@ def main():
     )
 
     logger.info_rank0("Prepare model")
-    model = build_foundation_model(
-        config_path=args.model.config_path,
-        weights_path=args.model.model_path,
-        init_device=args.train.init_device,
-        moe_implementation=args.model.moe_implementation,
-        attn_implementation=args.model.attn_implementation,
-        encoder_data_balance=args.model.encoder_data_balance,
-        encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+    # Build Qwen3VLForConditionalGenerationAction directly instead of the
+    # generic build_foundation_model, which would instantiate the base
+    # Qwen3VLForConditionalGeneration (language-modelling head) instead of
+    # the action-prediction variant.
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLForConditionalGenerationAction,
+        apply_veomni_qwen3vl_patch,
     )
+
+    # Apply VeOmni monkey-patches (dummy_forward, attention, etc.) before model creation
+    apply_veomni_qwen3vl_patch()
+
+    model_config = AutoConfig.from_pretrained(
+        args.model.config_path or args.model.model_path,
+        trust_remote_code=True,
+        attn_implementation=args.model.attn_implementation,
+    )
+    # Set action-prediction config attributes
+    model_config.action_dim = args.data.pred_len and 7  # LIBERO action dim
+    model_config.pred_len = args.data.pred_len
+
+    with init_empty_weights():
+        model = Qwen3VLForConditionalGenerationAction(model_config)
+
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
@@ -246,11 +280,14 @@ def main():
     processor = build_processor(args.model.tokenizer_path)
     position_id_func = model.get_position_id_func()
 
-    # Load LIBERO task descriptions
+    # Load LIBERO task descriptions — auto-detect parquet or JSONL metadata
     libero_dir = args.data.libero_data_dir
-    meta_candidate1 = os.path.join(libero_dir, "meta", "episodes", "episodes.parquet")
-    meta_candidate2 = os.path.join(libero_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
-    meta_path = meta_candidate1 if os.path.exists(meta_candidate1) else meta_candidate2
+    meta_candidates = [
+        os.path.join(libero_dir, "meta", "episodes.jsonl"),
+        os.path.join(libero_dir, "meta", "episodes", "episodes.parquet"),
+        os.path.join(libero_dir, "meta", "episodes", "chunk-000", "file-000.parquet"),
+    ]
+    meta_path = next((p for p in meta_candidates if os.path.exists(p)), meta_candidates[-1])
     task_descriptions = load_libero_task_descriptions(meta_path)
     logger.info_rank0(f"Loaded {len(task_descriptions)} LIBERO task descriptions from {meta_path}")
 
@@ -263,9 +300,9 @@ def main():
     )
 
     if args.train.rmpad_with_pos_ids:
-        data_collate_fn = [LiberoActionPackingCollator()]
+        data_collate_fn = LiberoActionPackingCollator()
     else:
-        data_collate_fn = [LiberoActionCollator()]
+        data_collate_fn = LiberoActionCollator()
 
     if args.train.rmpad:
         raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
@@ -282,7 +319,13 @@ def main():
     logger.info_rank0(f"Using LIBERO dataset backend: {args.data.libero_dataset_backend}")
     train_dataset = MappingDataset(data=libero_dataset, transform=transform)
     dataset_length = len(train_dataset) / args.train.data_parallel_size
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    # Compute train steps: dataset_length / dataloader_batch_size, capped by max_steps
+    import math
+
+    computed_steps = math.floor(dataset_length / args.train.dataloader_batch_size)
+    if args.train.max_steps is not None and computed_steps >= args.train.max_steps:
+        computed_steps = args.train.max_steps
+    args.train.train_steps = computed_steps
 
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
@@ -294,13 +337,9 @@ def main():
         collate_fn=data_collate_fn,
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train.train_steps,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         dyn_bsz=args.train.dyn_bsz,
-        pad_packed_to_length=args.train.pad_packed_to_length,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_margin=args.train.dyn_bsz_margin,
-        dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
+        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
@@ -376,8 +415,6 @@ def main():
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         enable_multisource=args.data.enable_multisource,
         dataloader=train_dataloader,
         data_path=args.data.train_path,

@@ -16,6 +16,7 @@
 
 import copy
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Optional, Union
@@ -972,6 +973,7 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         )
 
 
+@dataclass
 class Qwen3VLActionOutput(Qwen3VLCausalLMOutputWithPast):
     r"""
     Output type for ``Qwen3VLForConditionalGenerationAction``.
@@ -1107,6 +1109,13 @@ class Qwen3VLForConditionalGenerationAction(Qwen3VLForConditionalGeneration):
             if position_ids is not None:
                 next_pos = position_ids[:, :, -1:] + 1  # (B, 3, 1) for Qwen3VL 3D rope
                 position_ids = torch.cat([position_ids, next_pos], dim=-1)
+
+            # Extend image_mask and video_mask for the appended state token (False = not an image/video token)
+            for mask_key in ("image_mask", "video_mask"):
+                if mask_key in kwargs and kwargs[mask_key] is not None:
+                    mask = kwargs[mask_key]
+                    pad_false = torch.zeros(mask.shape[0], 1, dtype=mask.dtype, device=mask.device)
+                    kwargs[mask_key] = torch.cat([mask, pad_false], dim=1)
 
             # Update cu_seq_lens for the extra state token per subsequence.
             # Each packed subsequence grew by 1, so shift boundaries cumulatively.

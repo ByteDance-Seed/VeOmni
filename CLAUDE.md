@@ -10,6 +10,7 @@
 - Remember that python environment is managed by `uv` and defined by `pyproject.toml`. Use `. .venv/bin/activate` to actiavte proper python env.
     - Use `uv sync --extra gpu --extra dev --extra robotics` to update environment after every edit on `pyproject.toml`
 - It is fine to extend Youmu implementation when necessary. Youmu is also our repo, just follow the similar practice: simple design, comprehensive tests and doc, avoid fallback.
+- Our branch is tianle/qwen3-vla and only push to remote: Luosuu.
 
 ## Key files
 

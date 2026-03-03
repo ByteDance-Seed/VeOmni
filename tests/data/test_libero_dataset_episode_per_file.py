@@ -1,0 +1,372 @@
+"""Tests for LiberoYoumuDataset with episode-per-file layout and flat column names.
+
+Verifies that _load_chunk auto-detects episode_XXXXXX.parquet naming,
+maps episodes directly, and that __getitem__ returns correctly shaped
+outputs with the standard dict keys.
+"""
+
+import importlib
+import os
+import sys
+from unittest import mock
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for importing without the Rust extension
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _patch_youmu_import():
+    """Stub the youmu Rust extension so pure-Python modules can be imported."""
+    fake_youmu = mock.MagicMock()
+    with mock.patch.dict(sys.modules, {"youmu": fake_youmu, "youmu.youmu": mock.MagicMock()}):
+        # Import libero_utils
+        spec_utils = importlib.util.spec_from_file_location(
+            "youmu.libero_utils",
+            "submodules/youmu/python/youmu/libero_utils.py",
+        )
+        mod_utils = importlib.util.module_from_spec(spec_utils)
+        sys.modules["youmu.libero_utils"] = mod_utils
+        spec_utils.loader.exec_module(mod_utils)
+
+        # Import libero_dataset
+        spec_ds = importlib.util.spec_from_file_location(
+            "youmu.libero_dataset",
+            "submodules/youmu/python/youmu/libero_dataset.py",
+        )
+        mod_ds = importlib.util.module_from_spec(spec_ds)
+        sys.modules["youmu.libero_dataset"] = mod_ds
+        spec_ds.loader.exec_module(mod_ds)
+        yield
+
+
+def _get_dataset_cls():
+    return sys.modules["youmu.libero_dataset"].LiberoYoumuDataset
+
+
+def _get_utils():
+    return sys.modules["youmu.libero_utils"]
+
+
+# ---------------------------------------------------------------------------
+# Fixtures: synthetic episode-per-file dataset
+# ---------------------------------------------------------------------------
+
+
+def _write_episode_parquet(path: str, num_rows: int, episode_index: int):
+    """Write a minimal parquet file mimicking LIBERO episode-per-file layout.
+
+    Schema: image (struct<bytes,path>), state (fixed_size_list<float>[8]),
+    actions (fixed_size_list<float>[7]), plus frame_index, episode_index.
+    """
+    import numpy as np
+
+    state_data = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.random.randn(num_rows * 8).astype("float32")),
+        list_size=8,
+    )
+    action_data = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.random.randn(num_rows * 7).astype("float32")),
+        list_size=7,
+    )
+    # Minimal PNG: 1x1 white pixel
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00"
+        b"\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00"
+        b"\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    image_bytes = pa.array([png_bytes] * num_rows, type=pa.binary())
+    image_paths = pa.array([f"ep{episode_index}/frame_{i}.png" for i in range(num_rows)])
+    image_struct = pa.StructArray.from_arrays(
+        [image_bytes, image_paths],
+        names=["bytes", "path"],
+    )
+
+    table = pa.table(
+        {
+            "image": image_struct,
+            "state": state_data,
+            "actions": action_data,
+            "frame_index": pa.array(list(range(num_rows)), type=pa.int64()),
+            "episode_index": pa.array([episode_index] * num_rows, type=pa.int64()),
+        }
+    )
+    pq.write_table(table, path)
+
+
+@pytest.fixture
+def episode_per_file_dataset(tmp_path):
+    """Create a small episode-per-file dataset with 3 episodes in 1 chunk."""
+    import json
+
+    # Create directory structure
+    data_dir = tmp_path / "data" / "chunk-000"
+    meta_dir = tmp_path / "meta"
+    data_dir.mkdir(parents=True)
+    meta_dir.mkdir(parents=True)
+
+    # Write 3 episode files with known lengths
+    episode_lengths = {0: 10, 1: 15, 2: 8}
+    for ep_idx, length in episode_lengths.items():
+        fpath = data_dir / f"episode_{ep_idx:06d}.parquet"
+        _write_episode_parquet(str(fpath), length, ep_idx)
+
+    # Write episodes.jsonl
+    jsonl_path = meta_dir / "episodes.jsonl"
+    with open(jsonl_path, "w") as f:
+        for ep_idx, length in episode_lengths.items():
+            json.dump({"episode_index": ep_idx, "tasks": [f"task_{ep_idx}"], "length": length}, f)
+            f.write("\n")
+
+    return str(tmp_path), episode_lengths
+
+
+@pytest.fixture
+def multi_chunk_dataset(tmp_path):
+    """Create a dataset with 2 chunks to test multi-chunk episode-per-file."""
+    import json
+
+    # Chunk 0: episodes 0-2
+    data_dir_0 = tmp_path / "data" / "chunk-000"
+    data_dir_0.mkdir(parents=True)
+    # Chunk 1: episodes 3-4
+    data_dir_1 = tmp_path / "data" / "chunk-001"
+    data_dir_1.mkdir(parents=True)
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir(parents=True)
+
+    episode_lengths = {0: 10, 1: 12, 2: 8, 3: 14, 4: 9}
+    for ep_idx in [0, 1, 2]:
+        fpath = data_dir_0 / f"episode_{ep_idx:06d}.parquet"
+        _write_episode_parquet(str(fpath), episode_lengths[ep_idx], ep_idx)
+    for ep_idx in [3, 4]:
+        fpath = data_dir_1 / f"episode_{ep_idx:06d}.parquet"
+        _write_episode_parquet(str(fpath), episode_lengths[ep_idx], ep_idx)
+
+    jsonl_path = meta_dir / "episodes.jsonl"
+    with open(jsonl_path, "w") as f:
+        for ep_idx, length in episode_lengths.items():
+            json.dump({"episode_index": ep_idx, "tasks": [f"task_{ep_idx}"], "length": length}, f)
+            f.write("\n")
+
+    return str(tmp_path), episode_lengths
+
+
+# ---------------------------------------------------------------------------
+# Tests: _load_chunk auto-detection and mapping
+# ---------------------------------------------------------------------------
+
+
+class TestLoadChunkEpisodePerFile:
+    """Tests for _load_chunk with episode_XXXXXX.parquet file naming."""
+
+    def test_detects_episode_per_file_naming(self, episode_per_file_dataset):
+        """_load_chunk returns correct episodes for episode-per-file layout."""
+        data_dir, episode_lengths = episode_per_file_dataset
+        cls = _get_dataset_cls()
+
+        episodes, data_file_paths, episode_file_map = cls._load_chunk(data_dir, 0)
+
+        assert len(episodes) == 3
+        assert len(data_file_paths) == 3
+        assert len(episode_file_map) == 3
+
+    def test_episode_to_file_direct_mapping(self, episode_per_file_dataset):
+        """Each episode maps to its own file with row_offset=0."""
+        data_dir, episode_lengths = episode_per_file_dataset
+        cls = _get_dataset_cls()
+
+        _, _, episode_file_map = cls._load_chunk(data_dir, 0)
+
+        for ep_idx in episode_lengths:
+            fpath, row_offset = episode_file_map[ep_idx]
+            assert row_offset == 0, f"Episode {ep_idx} should have row_offset=0"
+            assert f"episode_{ep_idx:06d}.parquet" in fpath
+
+    def test_episode_descriptors_correct(self, episode_per_file_dataset):
+        """EpisodeDescriptor values are correct (cumulative frame offsets)."""
+        data_dir, episode_lengths = episode_per_file_dataset
+        cls = _get_dataset_cls()
+
+        episodes, _, _ = cls._load_chunk(data_dir, 0)
+        episodes_sorted = sorted(episodes, key=lambda e: e.episode_index)
+
+        cumulative = 0
+        for ep in episodes_sorted:
+            expected_len = episode_lengths[ep.episode_index]
+            assert ep.length == expected_len
+            assert ep.start_frame == cumulative
+            assert ep.end_frame == cumulative + expected_len
+            cumulative += expected_len
+
+    def test_multi_chunk_filtering(self, multi_chunk_dataset):
+        """_load_chunk filters episodes correctly for each chunk."""
+        data_dir, episode_lengths = multi_chunk_dataset
+        cls = _get_dataset_cls()
+
+        # Chunk 0 should have episodes 0, 1, 2
+        eps_0, _, map_0 = cls._load_chunk(data_dir, 0)
+        ep_indices_0 = {ep.episode_index for ep in eps_0}
+        assert ep_indices_0 == {0, 1, 2}
+        assert set(map_0.keys()) == {0, 1, 2}
+
+        # Chunk 1 should have episodes 3, 4
+        eps_1, _, map_1 = cls._load_chunk(data_dir, 1)
+        ep_indices_1 = {ep.episode_index for ep in eps_1}
+        assert ep_indices_1 == {3, 4}
+        assert set(map_1.keys()) == {3, 4}
+
+    def test_data_file_paths_correct(self, episode_per_file_dataset):
+        """data_file_paths contains full paths to all parquet files in chunk."""
+        data_dir, _ = episode_per_file_dataset
+        cls = _get_dataset_cls()
+
+        _, data_file_paths, _ = cls._load_chunk(data_dir, 0)
+
+        for fpath in data_file_paths:
+            assert os.path.exists(fpath), f"File {fpath} should exist"
+            assert fpath.endswith(".parquet")
+
+
+# ---------------------------------------------------------------------------
+# Tests: schema column detection
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaColumnDetection:
+    """Tests for _find_physical_column_index with flat LIBERO column names."""
+
+    def test_state_column_detection(self, episode_per_file_dataset):
+        """Physical column index found for 'state' (fixed_size_list<float>[8])."""
+        data_dir, _ = episode_per_file_dataset
+        find_idx = sys.modules["youmu.libero_dataset"]._find_physical_column_index
+
+        fpath = os.path.join(data_dir, "data", "chunk-000", "episode_000000.parquet")
+        schema = pq.ParquetFile(fpath).schema_arrow
+
+        # 'state' is a list column — should return a valid physical index
+        idx = find_idx(schema, "state")
+        assert isinstance(idx, int)
+        assert idx >= 0
+
+    def test_actions_column_detection(self, episode_per_file_dataset):
+        """Physical column index found for 'actions' (fixed_size_list<float>[7])."""
+        data_dir, _ = episode_per_file_dataset
+        find_idx = sys.modules["youmu.libero_dataset"]._find_physical_column_index
+
+        fpath = os.path.join(data_dir, "data", "chunk-000", "episode_000000.parquet")
+        schema = pq.ParquetFile(fpath).schema_arrow
+
+        idx = find_idx(schema, "actions")
+        assert isinstance(idx, int)
+        assert idx >= 0
+
+    def test_image_bytes_column_detection(self, episode_per_file_dataset):
+        """Physical column index found for 'image' struct's 'bytes' child."""
+        data_dir, _ = episode_per_file_dataset
+        find_idx = sys.modules["youmu.libero_dataset"]._find_physical_column_index
+
+        fpath = os.path.join(data_dir, "data", "chunk-000", "episode_000000.parquet")
+        schema = pq.ParquetFile(fpath).schema_arrow
+
+        idx = find_idx(schema, "image", child_name="bytes")
+        assert isinstance(idx, int)
+        assert idx >= 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: __getitem__ on real dataset (requires Youmu Rust extension)
+# ---------------------------------------------------------------------------
+
+REAL_DATASET_PATH = "/mnt/local/localcache00/libero_64KB"
+
+_rust_ext_available = False
+try:
+    from youmu import ParquetReaderCachePy  # noqa: F401
+
+    _rust_ext_available = True
+except (ImportError, ModuleNotFoundError):
+    pass
+
+_real_dataset_available = os.path.isdir(REAL_DATASET_PATH)
+
+skip_no_rust = pytest.mark.skipif(
+    not _rust_ext_available,
+    reason="Youmu Rust extension not built",
+)
+skip_no_dataset = pytest.mark.skipif(
+    not _real_dataset_available,
+    reason=f"Real dataset not found at {REAL_DATASET_PATH}",
+)
+
+
+@skip_no_rust
+@skip_no_dataset
+class TestGetItemRealDataset:
+    """Integration tests on the real 64KB LIBERO dataset.
+
+    These tests verify that __getitem__ returns correctly shaped and typed
+    outputs with the standard dict keys, regardless of underlying column names.
+    """
+
+    @pytest.fixture(scope="class")
+    def dataset(self):
+        """Construct LiberoYoumuDataset on the real 64KB dataset."""
+        from youmu.libero_dataset import LiberoYoumuDataset
+
+        return LiberoYoumuDataset(
+            data_dir=REAL_DATASET_PATH,
+            obs_len=1,
+            pred_len=4,
+            chunk_index=None,  # Load all chunks
+        )
+
+    def test_dataset_length(self, dataset):
+        """Dataset has a positive number of valid anchor frames."""
+        assert len(dataset) > 0
+
+    def test_getitem_returns_standard_keys(self, dataset):
+        """Output dict uses standard keys regardless of column names."""
+        sample = dataset[0]
+        assert "observation.state" in sample
+        assert "action" in sample
+        assert "observation.images.image" in sample
+        assert "episode_index" in sample
+        assert "frame_index" in sample
+
+    def test_getitem_state_shape(self, dataset):
+        """observation.state has shape (obs_len, 8)."""
+        sample = dataset[0]
+        state = sample["observation.state"]
+        assert state.shape == (1, 8)  # obs_len=1, state_dim=8
+        assert state.dtype == __import__("torch").float32
+
+    def test_getitem_action_shape(self, dataset):
+        """action has shape (pred_len, 7)."""
+        sample = dataset[0]
+        action = sample["action"]
+        assert action.shape == (4, 7)  # pred_len=4, action_dim=7
+        assert action.dtype == __import__("torch").float32
+
+    def test_getitem_image_shape(self, dataset):
+        """observation.images.image has shape (obs_len, H, W, 3) uint8."""
+        sample = dataset[0]
+        image = sample["observation.images.image"]
+        assert image.ndim == 4  # (obs_len, H, W, 3)
+        assert image.shape[0] == 1  # obs_len=1
+        assert image.shape[3] == 3  # RGB
+        assert image.dtype == __import__("torch").uint8
+
+    def test_getitem_finite_values(self, dataset):
+        """State and action values are finite (not NaN or inf)."""
+        import torch
+
+        sample = dataset[0]
+        assert torch.isfinite(sample["observation.state"]).all()
+        assert torch.isfinite(sample["action"]).all()

@@ -1,0 +1,88 @@
+{
+  "project": "VeOmni",
+  "branchName": "ralph/youmu-libero-e2e",
+  "description": "Adapt LiberoYoumuDataset for actual LIBERO dataset format (episode-per-file, JSONL metadata, flat column names), verify exact parity with LeRobot, and run e2e training",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Adapt metadata loading for JSONL format",
+      "description": "As a developer, I need load_episode_metadata to load episode metadata from meta/episodes.jsonl (JSONL format) since the actual LIBERO dataset does not have meta/episodes/chunk-000/file-000.parquet. The function should auto-detect which format is present.",
+      "acceptanceCriteria": [
+        "New function load_episode_metadata_jsonl in libero_utils.py reads meta/episodes.jsonl and returns list[EpisodeDescriptor]",
+        "For episode-per-file layout, file_index equals episode_index (each file = one episode)",
+        "start_frame and end_frame computed by accumulating episode lengths sorted by episode_index",
+        "Works for multi-chunk datasets (chunk-000 has episodes 0-999, chunk-001 has 1000-1692)",
+        "Update load_episode_metadata to auto-detect: try parquet path first, fall back to JSONL",
+        "Unit test verifies correct EpisodeDescriptor values for a small JSONL fixture",
+        "cargo check passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "JSONL format: {\"episode_index\": 0, \"tasks\": [\"...\"], \"length\": 214} per line. No data/file_index or dataset_from_index fields — these must be derived."
+    },
+    {
+      "id": "US-002",
+      "title": "Adapt LiberoYoumuDataset for episode-per-file layout and flat column names",
+      "description": "As a developer, I need LiberoYoumuDataset to work with the actual LIBERO dataset where each episode is a separate file (episode_XXXXXX.parquet) with flat column names (state, actions, image) instead of the LeRobot layout (file-NNN.parquet with dotted names like observation.state).",
+      "acceptanceCriteria": [
+        "_load_chunk auto-detects file naming: episode_XXXXXX.parquet vs file-NNN.parquet",
+        "For episode-per-file layout, episode-to-file mapping is direct: episode N maps to episode_{N:06d}.parquet with row_offset=0",
+        "Constructor defaults updated: state_column='state', action_column='actions', image_column='image'",
+        "Output dict keys remain 'observation.state', 'action', 'observation.images.image', 'episode_index', 'frame_index' regardless of underlying column names",
+        "Image struct extraction still works: image column is struct<bytes: binary, path: string>, extract bytes child",
+        "Unit test: construct dataset on real data at /mnt/local/localcache00/libero_64KB, call __getitem__(0) and verify output shapes and dtypes",
+        "cargo check passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Dataset schema: image: struct<bytes,path>, wrist_image: struct<bytes,path>, state: fixed_size_list<float>[8], actions: fixed_size_list<float>[7], timestamp: float, frame_index: int64, episode_index: int64, index: int64, task_index: int64. 1693 episodes across 2 chunks (1000 + 693). Each file has ~3 row groups with ~100 rows."
+    },
+    {
+      "id": "US-003",
+      "title": "Adapt task description loading for JSONL metadata",
+      "description": "As a developer, I need load_libero_task_descriptions (in veomni/data/multimodal/data_transform.py) to load task descriptions from meta/episodes.jsonl since the actual dataset uses JSONL, not parquet episode metadata.",
+      "acceptanceCriteria": [
+        "load_libero_task_descriptions accepts a path to episodes.jsonl and reads episode_index + tasks[0] per line",
+        "Returns dict[int, str] mapping episode_index to task description string",
+        "Falls back to 'perform the task' if tasks field is missing or empty",
+        "Training script (train_qwen_vl_libero.py) metadata path resolution updated: checks for meta/episodes.jsonl in addition to existing parquet candidates",
+        "Unit test verifies correct loading from a small JSONL fixture",
+        "Typecheck passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Current code in train_qwen_vl_libero.py checks meta/episodes/episodes.parquet and meta/episodes/chunk-000/file-000.parquet — neither exists. Must add meta/episodes.jsonl as a candidate."
+    },
+    {
+      "id": "US-004",
+      "title": "Exact numerical parity test (youmu vs LeRobot)",
+      "description": "As a developer, I need a pytest test that proves LiberoYoumuDataset returns exactly the same data as LeRobot's dataset for the same sample indices, giving confidence that training with youmu is correct.",
+      "acceptanceCriteria": [
+        "Test file at tests/test_youmu_lerobot_parity.py (or similar location in the test directory)",
+        "Test loads the same dataset with both youmu and lerobot backends via build_libero_dataset from tasks/omni/train_qwen_vl_libero.py",
+        "For indices [0, 1, 2, 7, 8, 9, len-3, len-2, len-1] plus 5 random indices, asserts: observation.state tensors exactly equal (torch.equal), action tensors exactly equal, observation.images.image tensors exactly equal (pixel-perfect), episode_index values match",
+        "Test passes on the 64KB parquet dataset at /mnt/local/localcache00/libero_64KB (youmu side) and /mnt/local/localcache00/libero (lerobot side if needed)",
+        "Test skips gracefully if dataset directory or lerobot package is unavailable",
+        "Typecheck passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "LeRobot may need the original dataset path if it has different parquet expectations. The youmu side should use the 64KB dataset. Both should produce identical outputs for matching indices."
+    },
+    {
+      "id": "US-005",
+      "title": "Update training config and run e2e training",
+      "description": "As a developer, I need to update the training YAML config to point to the 64KB dataset and verify the full training pipeline runs at least 1 step successfully.",
+      "acceptanceCriteria": [
+        "configs/multimodal/qwen3_vl/qwen3_vl_libero.yaml libero_data_dir set to /mnt/local/localcache00/libero_64KB",
+        "bash train.sh tasks/omni/train_qwen_vl_libero.py configs/multimodal/qwen3_vl/qwen3_vl_libero.yaml launches without import or config errors",
+        "Training completes at least 1 full step (forward + backward + optimizer step) without crash",
+        "Loss logged at step 1 is a finite number (not NaN/inf)",
+        "Typecheck passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Single-node multi-GPU with FSDP2. Config uses: obs_len=1, pred_len=4, micro_batch_size=1, global_batch_size=64, flash_attention_2, rmpad_with_pos_ids=true. Step 1 loss=4.0726, Step 2 loss=2.3834."
+    }
+  ]
+}

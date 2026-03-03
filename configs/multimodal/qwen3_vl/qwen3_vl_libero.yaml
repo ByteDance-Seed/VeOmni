@@ -1,9 +1,10 @@
 model:
-  model_path: Qwen/Qwen3-VL-8B-Instruct
+  model_path: /mnt/hdfs/models/Qwen3-VL-8B-Instruct
   attn_implementation: flash_attention_2
 
 data:
-  libero_data_dir: /path/to/libero_dataset
+  train_path: unused
+  libero_data_dir: /mnt/local/localcache00/libero_64KB
   libero_dataset_backend: youmu
   obs_len: 1
   pred_len: 4
@@ -11,6 +12,7 @@ data:
 
 train:
   output_dir: qwen3_vl_libero
+  dyn_bsz: false
   data_parallel_mode: fsdp2
   enable_reentrant: false
   rmpad_with_pos_ids: true
@@ -32,3 +34,4 @@ train:
   ckpt_manager: dcp
   save_hf_weights: true
   save_epochs: 5
+  max_steps: 20
