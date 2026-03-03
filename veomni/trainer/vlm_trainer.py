@@ -166,16 +166,11 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         model_type = self.base.model_config.model_type
 
-        if model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-            position_id_func = self.base.model.thinker.get_position_id_func()
-        else:
-            position_id_func = self.base.model.get_position_id_func()
-
         self.base.data_transform = build_data_transform(
             model_type,
             processor=self.base.processor,
             chat_template=self.base.chat_template,
-            position_id_func=position_id_func,
+            position_id_func=self.base.model.get_position_id_func(),
             **args.data.mm_configs,
         )
 

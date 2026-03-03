@@ -145,17 +145,15 @@ def main():
 
     if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
         model.disable_talker()
-        position_id_func = model.thinker.get_position_id_func()
         chat_template = None
     else:
-        position_id_func = model.get_position_id_func()
         chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
     transform = build_data_transform(
         model_config.model_type,
         processor=processor,
         chat_template=chat_template,
-        position_id_func=position_id_func,
+        position_id_func=model.get_position_id_func(),
         **args.data.mm_configs,
     )
 
