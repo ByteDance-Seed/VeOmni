@@ -27,6 +27,53 @@ logger = logging.get_logger(__name__)
 _fused_moe_forward = None
 
 
+def resolve_fc1_weights(
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
+    fc1_1_2_weight: torch.Tensor | None,
+    *,
+    return_merged_fc1: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+    """Normalize fc1 weight inputs into the format required by the backend.
+
+    Callers may pass *either* split weights (``fc1_1_weight``, ``fc1_2_weight``)
+    or a single merged weight (``fc1_1_2_weight`` with shape ``[E, 2*I, H]``).
+    This helper validates the inputs and converts to whichever format the
+    downstream kernel expects.
+
+    Args:
+        return_merged_fc1: When *False* (default) return a ``(fc1_1, fc1_2)``
+            tuple of split, contiguous tensors – suitable for Triton / torch
+            grouped-gemm kernels.  When *True* return a single merged tensor
+            ``[E, 2*I, H]`` – suitable for NPU kernels that concatenate
+            gate+up before computing.
+    """
+    has_split = fc1_1_weight is not None or fc1_2_weight is not None
+    has_merged = fc1_1_2_weight is not None
+
+    if has_split and has_merged:
+        raise ValueError("Provide either split fc1 weights (fc1_1 + fc1_2) or merged fc1_1_2_weight, not both.")
+    if not has_split and not has_merged:
+        raise ValueError("Either split fc1 weights (fc1_1 + fc1_2) or merged fc1_1_2_weight must be provided.")
+
+    if return_merged_fc1:
+        if has_merged:
+            return fc1_1_2_weight
+        assert fc1_1_weight is not None and fc1_2_weight is not None
+        return torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
+    else:
+        if has_split:
+            if fc1_1_weight is None or fc1_2_weight is None:
+                raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
+            return fc1_1_weight, fc1_2_weight
+        assert fc1_1_2_weight is not None
+        intermediate_dim = fc1_1_2_weight.shape[1] // 2
+        return (
+            fc1_1_2_weight[:, :intermediate_dim, :].contiguous(),
+            fc1_1_2_weight[:, intermediate_dim:, :].contiguous(),
+        )
+
+
 def fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
