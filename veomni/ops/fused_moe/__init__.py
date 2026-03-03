@@ -48,9 +48,12 @@ def resolve_fc1_weights(
             ``[E, 2*I, H]`` – suitable for NPU kernels that concatenate
             gate+up before computing.
     """
-    has_split = fc1_1_weight is not None or fc1_2_weight is not None
+    has_split = fc1_1_weight is not None and fc1_2_weight is not None
+    has_partial_split = (fc1_1_weight is None) != (fc1_2_weight is None)
     has_merged = fc1_1_2_weight is not None
 
+    if has_partial_split:
+        raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight, but only one was provided.")
     if has_split and has_merged:
         raise ValueError("Provide either split fc1 weights (fc1_1 + fc1_2) or merged fc1_1_2_weight, not both.")
     if not has_split and not has_merged:
@@ -59,14 +62,10 @@ def resolve_fc1_weights(
     if return_merged_fc1:
         if has_merged:
             return fc1_1_2_weight
-        assert fc1_1_weight is not None and fc1_2_weight is not None
         return torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     else:
         if has_split:
-            if fc1_1_weight is None or fc1_2_weight is None:
-                raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
             return fc1_1_weight, fc1_2_weight
-        assert fc1_1_2_weight is not None
         intermediate_dim = fc1_1_2_weight.shape[1] // 2
         return (
             fc1_1_2_weight[:, :intermediate_dim, :].contiguous(),
