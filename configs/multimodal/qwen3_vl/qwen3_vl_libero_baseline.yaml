@@ -4,8 +4,8 @@ model:
 
 data:
   train_path: unused
-  libero_data_dir: /mnt/local/localcache00/libero_64KB
-  libero_dataset_backend: youmu
+  libero_data_dir: /mnt/local/localcache00/hf_libero
+  libero_dataset_backend: lerobot
   obs_len: 4
   pred_len: 2
   max_seq_len: 2048
@@ -30,12 +30,6 @@ train:
   max_grad_norm: 1.0
   init_device: meta
   enable_profiling: false
-  profile_with_stack: true
-  profile_record_shapes: false
-  profile_profile_memory: false
-  profile_start_step: 20
-  profile_end_step: 21
-  profile_trace_dir: /mnt/local/localcache00/qwen3_vl_libero
   ckpt_manager: dcp
   save_hf_weights: true
   save_epochs: 5

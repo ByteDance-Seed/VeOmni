@@ -218,11 +218,17 @@ def process_libero_sample_qwen3_vl(
             Default ``-1`` (the anchor / most recent frame).
     """
     # --- Image processing ---
-    # Select a single observation frame as the image input (uint8 HWC).
-    images_tensor = sample["observation.images.image"]  # (obs_len, H, W, 3)
-    obs_image = images_tensor[obs_index].numpy()  # (H, W, 3) uint8 ndarray
+    # Select a single observation frame as the image input.
+    # LeRobot returns (obs_len, C, H, W) float32 in [0, 1]; Youmu returns (obs_len, H, W, C) uint8.
+    images_tensor = sample["observation.images.image"]  # (obs_len, ...)
+    obs_frame = images_tensor[obs_index]  # (C, H, W) float32 or (H, W, C) uint8
     from PIL import Image as PILImage
 
+    if obs_frame.ndim == 3 and obs_frame.shape[0] in (1, 3):
+        # CHW float32 [0,1] → HWC uint8 [0,255]
+        obs_image = (obs_frame.permute(1, 2, 0) * 255).to(torch.uint8).numpy()
+    else:
+        obs_image = obs_frame.numpy()
     pil_image = PILImage.fromarray(obs_image)
 
     image_inputs = processor.image_processor(images=[pil_image], return_tensors="pt")
@@ -261,6 +267,20 @@ def process_libero_sample_qwen3_vl(
     input_ids[image_mask] = 0
     input_ids[video_mask] = 0
 
+    # --- Append state placeholder token ---
+    # A dummy token (id=0) at the end of the sequence; the model will replace
+    # its embedding with the projected observation_state via state_mask.
+    state_placeholder = torch.zeros(1, dtype=input_ids.dtype)
+    input_ids = torch.cat([input_ids, state_placeholder])
+    attention_mask = torch.cat([attention_mask, torch.ones(1, dtype=attention_mask.dtype)])
+    next_pos = position_ids[:, -1:] + 1  # (3, 1)
+    position_ids = torch.cat([position_ids, next_pos], dim=-1)
+    image_mask = torch.cat([image_mask, torch.zeros(1, dtype=image_mask.dtype)])
+    video_mask = torch.cat([video_mask, torch.zeros(1, dtype=video_mask.dtype)])
+    # state_mask: True only for the appended state token
+    state_mask = torch.zeros(len(input_ids), dtype=torch.bool)
+    state_mask[-1] = True
+
     # --- Observation state & action labels ---
     # Use the last obs_len state frames; model will receive (obs_len, state_dim)
     # but we flatten to the last frame to match the single-token state injection.
@@ -273,6 +293,7 @@ def process_libero_sample_qwen3_vl(
         "position_ids": position_ids,
         "image_mask": image_mask,
         "video_mask": video_mask,
+        "state_mask": state_mask,
         "observation_state": observation_state,
         "labels": labels,
     }

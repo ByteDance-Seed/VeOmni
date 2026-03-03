@@ -247,6 +247,7 @@ class LiberoActionCollator(DataCollator):
             "position_ids": 0,
             "image_mask": False,
             "video_mask": False,
+            "state_mask": False,
         },
         metadata={"help": "features to padding in batch, keys are feature names, values are padding values."},
     )
@@ -309,6 +310,7 @@ class LiberoActionPackingCollator(DataCollator):
             "position_ids",
             "image_mask",
             "video_mask",
+            "state_mask",
         ],
         metadata={"help": "features to pack (cat along last dim then unsqueeze)."},
     )

@@ -166,12 +166,13 @@ def build_libero_dataset(
         pred_timestamps = [i / fps for i in range(pred_len)]
 
         return LeRobotDataset(
-            repo_id="local/libero",
+            repo_id="HuggingFaceVLA/libero",
             root=data_dir,
             delta_timestamps={
                 "observation.state": obs_timestamps,
                 "action": pred_timestamps,
                 "observation.images.image": obs_timestamps,
+                "observation.images.image2": obs_timestamps,
             },
             download_videos=False,
         )
@@ -370,7 +371,7 @@ def main():
         model,
         lr=args.train.lr,
         weight_decay=args.train.weight_decay,
-        fused=False,
+        fused=True,
         optimizer_type=args.train.optimizer,
         param_groups=get_param_groups(model, args.train.lr, args.train.vit_lr),
     )
@@ -541,10 +542,19 @@ def main():
                     )
                     wandb.log(train_metrics, step=global_step)
 
-            if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
-                profiler.step()
-                if global_step == args.train.profile_end_step:
-                    profiler.stop()
+            if args.train.enable_profiling and global_step <= args.train.profile_end_step:
+                # Synchronize CUDA and all ranks before profiler finalization.
+                # profiler.step() on the profiling rank triggers finalizeTrace
+                # (CPU-bound, holds GIL for seconds/minutes). Without this sync,
+                # pending NCCL collectives from the training step deadlock because
+                # other ranks advance while the profiling rank is blocked.
+                torch.cuda.synchronize()
+                dist.barrier()
+                if args.train.profile_this_rank:
+                    profiler.step()
+                    if global_step == args.train.profile_end_step:
+                        profiler.stop()
+                dist.barrier()
 
             if args.train.save_steps and global_step % args.train.save_steps == 0:
                 helper.empty_cache()

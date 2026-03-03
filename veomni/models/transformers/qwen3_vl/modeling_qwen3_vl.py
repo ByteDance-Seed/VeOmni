@@ -1079,56 +1079,26 @@ class Qwen3VLForConditionalGenerationAction(Qwen3VLForConditionalGeneration):
             ``loss`` (when ``labels`` is provided).
         """
         # --- State token injection ---
-        # Embed input_ids manually so we can append the state token.
+        # The collator already appended a placeholder token at the end of each
+        # (sub)sequence and provides a ``state_mask`` indicating those positions.
+        # Here we embed input_ids, then scatter the projected observation_state
+        # into the placeholder positions — same pattern as image token injection.
         if inputs_embeds is None:
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
             input_ids = None  # avoid double-embedding inside self.model
 
-        if observation_state is not None:
-            # Pad state to max_state_dim if needed
+        state_mask = kwargs.pop("state_mask", None)
+        if observation_state is not None and state_mask is not None:
             state = observation_state
             if state.shape[-1] < self.max_state_dim:
                 pad_size = self.max_state_dim - state.shape[-1]
                 state = F.pad(state, (0, pad_size), value=0.0)
 
             state_emb = self.state_proj(state.to(inputs_embeds.dtype))  # (B, hidden)
-            state_emb = state_emb.unsqueeze(1)  # (B, 1, hidden)
-            inputs_embeds = torch.cat([inputs_embeds, state_emb], dim=1)
-
-            # Extend attention_mask for the appended state token
-            if attention_mask is not None:
-                state_mask = torch.ones(
-                    attention_mask.shape[0],
-                    1,
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-                attention_mask = torch.cat([attention_mask, state_mask], dim=1)
-
-            # Extend position_ids for the appended state token
-            if position_ids is not None:
-                next_pos = position_ids[:, :, -1:] + 1  # (B, 3, 1) for Qwen3VL 3D rope
-                position_ids = torch.cat([position_ids, next_pos], dim=-1)
-
-            # Extend image_mask and video_mask for the appended state token (False = not an image/video token)
-            for mask_key in ("image_mask", "video_mask"):
-                if mask_key in kwargs and kwargs[mask_key] is not None:
-                    mask = kwargs[mask_key]
-                    pad_false = torch.zeros(mask.shape[0], 1, dtype=mask.dtype, device=mask.device)
-                    kwargs[mask_key] = torch.cat([mask, pad_false], dim=1)
-
-            # Update cu_seq_lens for the extra state token per subsequence.
-            # Each packed subsequence grew by 1, so shift boundaries cumulatively.
-            if "cu_seq_lens_q" in kwargs:
-                cu_q = kwargs["cu_seq_lens_q"]
-                # cu_q has shape (num_subseqs + 1,) with cu_q[0]=0.
-                # Each subsequence i (for i>=1) boundary shifts by +i.
-                offsets = torch.arange(len(cu_q), device=cu_q.device, dtype=cu_q.dtype)
-                kwargs["cu_seq_lens_q"] = cu_q + offsets
-                kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_q"]
-                # Update max_length to account for the extra token
-                kwargs["max_length_q"] = kwargs["max_length_q"] + 1
-                kwargs["max_length_k"] = kwargs["max_length_k"] + 1
+            # masked_scatter expects the source to be flat; state_mask marks
+            # exactly B positions (one per sample) in the packed/batched embeds.
+            embeds_state_mask = state_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            inputs_embeds = inputs_embeds.masked_scatter(embeds_state_mask, state_emb)
 
         # --- VLM forward ---
         outputs = self.model(
