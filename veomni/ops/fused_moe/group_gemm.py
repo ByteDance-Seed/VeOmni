@@ -267,6 +267,184 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         )
 
 
+class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
+    """Fused MoE autograd function that natively accepts a merged fc1_1_2 weight [E, 2I, H].
+
+    Uses a single group_gemm_same_nk call for fc1 instead of two separate calls,
+    avoiding the split+contiguous copy when the caller already has merged weights.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        num_experts,
+        gate_weights,
+        expert_index,
+        hidden_states,
+        fc1_1_2_weight,
+        fc2_weight,
+    ):
+        splits = expert_histogram(expert_index, num_experts)
+        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        scatter_output = moe_scatter(hidden_states, scatter_index)
+
+        cumsum_t = torch.cumsum(splits, dim=0)
+
+        # Single fc1 gemm: output shape [T, 2I]
+        fc1_output = group_gemm_same_nk(
+            a=scatter_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=scatter_output.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+
+        # chunk is a view, no copy
+        fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
+
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_activation = fc1_1_activation * fc1_2_output
+
+        reshaped_gate_weight = gate_weights.reshape(-1, 1)
+        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
+        scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
+
+        fc1_weighted_output = fc1_activation * scattered_gate_weight
+
+        fc2_output = group_gemm_same_nk(
+            a=fc1_weighted_output,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=scatter_output.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+
+        expert_output = moe_gather(fc2_output, scatter_index)
+        output = expert_output.reshape(hidden_states.shape)
+
+        ctx.num_experts = num_experts
+        ctx.save_for_backward(
+            gate_weights,
+            fc1_1_2_weight,
+            fc2_weight,
+            hidden_states,
+            scatter_index,
+            scatter_output,
+            cumsum_t,
+            fc1_1_output,
+            fc1_2_output,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+        )
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            gate_weights,
+            fc1_1_2_weight,
+            fc2_weight,
+            hidden_states,
+            scatter_index,
+            scatter_output,
+            cumsum_t,
+            fc1_1_output,
+            fc1_2_output,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+        ) = ctx.saved_tensors
+        hidden_dim = grad_output.shape[-1]
+        grad_output = grad_output.view(-1, hidden_dim)
+
+        # MOE Step 10
+        grad_fc2_output = moe_scatter(grad_output, scatter_index)
+
+        # MOE Step 9 - dgrad
+        grad_fc1_weighted_output = group_gemm_same_nk(
+            a=grad_fc2_output,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=grad_output.shape[0],
+            transpose_b=False,
+        )
+
+        # MOE Step 9 - wgrad
+        grad_fc2_weight = None
+        if fc2_weight.requires_grad:
+            grad_fc2_weight = torch.empty_like(fc2_weight)
+            group_gemm_same_mn(
+                a=grad_fc2_output,
+                b=fc1_weighted_output,
+                c=grad_fc2_weight,
+                cumsum_K=cumsum_t,
+                max_K=grad_output.shape[0],
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        # MOE Step 8-2
+        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
+
+        # MOE Step 8-1
+        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
+        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
+        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
+
+        # recompute during backward
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+
+        # MOE Step 7
+        grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
+        grad_fc1_2_output = fc1_1_activation * grad_fc1_activation
+
+        # MOE Step 5
+        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+
+        # Merge grad_fc1_1_output and grad_fc1_2_output back to [T, 2I]
+        grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
+
+        # MOE Step 4 - single dgrad for merged fc1
+        grad_scatter_output = group_gemm_same_nk(
+            a=grad_fc1_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=grad_output.shape[0],
+            transpose_b=False,
+        )
+
+        # MOE Step 4 - single wgrad for merged fc1
+        grad_fc1_1_2_weight = None
+        if fc1_1_2_weight.requires_grad:
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+            group_gemm_same_mn(
+                a=grad_fc1_output,
+                b=scatter_output,
+                c=grad_fc1_1_2_weight,
+                cumsum_K=cumsum_t,
+                max_K=grad_output.shape[0],
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        # MOE Step 3
+        grad_hidden_states = moe_gather(grad_scatter_output, scatter_index)
+        grad_hidden_states = grad_hidden_states.reshape(hidden_states.shape)
+
+        return (
+            None,  # num_experts
+            grad_gate_weight,  # gate_weights
+            None,  # expert_index
+            grad_hidden_states,  # hidden_states
+            grad_fc1_1_2_weight,  # fc1_1_2_weight
+            grad_fc2_weight,  # fc2_weight
+        )
+
+
 def group_gemm_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -277,11 +455,10 @@ def group_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
 ):
-    fc1_1_weight, fc1_2_weight = resolve_fc1_weights(
-        fc1_1_weight, fc1_2_weight, fc1_1_2_weight, return_merged_fc1=False
-    )
-
     if get_parallel_state().ep_enabled:
+        fc1_1_weight, fc1_2_weight = resolve_fc1_weights(
+            fc1_1_weight, fc1_2_weight, fc1_1_2_weight, return_merged_fc1=False
+        )
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
         # preprocess, permute token for ep
         input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
@@ -332,13 +509,13 @@ def group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
     else:
-        final_hidden_states = TritonFusedMoeExpertFunction.apply(
+        fc1_1_2_weight = resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight, return_merged_fc1=True)
+        final_hidden_states = MergedFc1TritonFusedMoeExpertFunction.apply(
             num_experts,
             routing_weights,
             selected_experts,
             hidden_states,
-            fc1_1_weight,
-            fc1_2_weight,
+            fc1_1_2_weight,
             fc2_weight,
         )
     return final_hidden_states
