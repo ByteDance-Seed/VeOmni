@@ -177,6 +177,130 @@ def process_sample_qwen3_vl(
     return [tokenized_example]
 
 
+# ---------------------------------------------------------------------------
+# LIBERO robotic action prediction transform for Qwen3-VL
+# ---------------------------------------------------------------------------
+
+
+def process_libero_sample_qwen3_vl(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    position_id_func: "Callable",
+    task_descriptions: Dict[int, str],
+    prompt_template: str = "Predict the next actions for the robot task: {task}",
+    obs_index: int = -1,
+    **kwargs,
+):
+    """Transform a single LiberoYoumuDataset sample for Qwen3VLForConditionalGenerationAction.
+
+    Takes the raw dict from ``LiberoYoumuDataset.__getitem__`` (images, state,
+    action, episode_index) and produces the tensor dict expected by the VeOmni
+    training pipeline (input_ids, pixel_values, position_ids, image_mask, …)
+    plus the two action-specific fields (observation_state, labels).
+
+    Args:
+        sample: Dict returned by ``LiberoYoumuDataset.__getitem__``.  Expected
+            keys: ``observation.images.image`` (obs_len, H, W, 3) uint8,
+            ``observation.state`` (obs_len, state_dim) float32,
+            ``action`` (pred_len, action_dim) float32,
+            ``episode_index`` int.
+        processor: A Qwen3-VL processor (provides ``image_processor`` and
+            ``tokenizer``).
+        position_id_func: Model-specific function that computes 3D position IDs
+            (obtained via ``model.get_position_id_func()``).
+        task_descriptions: Mapping from ``episode_index`` → task description
+            string.  Built from the LIBERO metadata ``tasks`` column.
+        prompt_template: Text template with a ``{task}`` placeholder that will
+            be filled with the task description.
+        obs_index: Which observation frame to use as the image input.
+            Default ``-1`` (the anchor / most recent frame).
+    """
+    # --- Image processing ---
+    # Select a single observation frame as the image input (uint8 HWC).
+    images_tensor = sample["observation.images.image"]  # (obs_len, H, W, 3)
+    obs_image = images_tensor[obs_index].numpy()  # (H, W, 3) uint8 ndarray
+    from PIL import Image as PILImage
+
+    pil_image = PILImage.fromarray(obs_image)
+
+    image_inputs = processor.image_processor(images=[pil_image], return_tensors="pt")
+    image_grid_thw = image_inputs["image_grid_thw"]  # (1, 3)
+    merge_length = processor.image_processor.merge_size**2
+    image_token_num = image_grid_thw.prod(dim=-1) // merge_length  # (1,)
+
+    # --- Text tokenization ---
+    ep_idx = sample["episode_index"]
+    task_desc = task_descriptions.get(ep_idx, "perform the task")
+    prompt_text = prompt_template.format(task=task_desc)
+
+    # Build a minimal input sequence: <image_placeholder> + prompt text tokens
+    # The image placeholder tokens will be replaced by visual features in the model.
+    num_img_tokens = image_token_num[0].item()
+    image_placeholder_ids = [IMAGE_INPUT_INDEX] * num_img_tokens
+
+    text_token_ids = processor.tokenizer.encode(prompt_text, add_special_tokens=False)
+
+    input_ids = torch.tensor(image_placeholder_ids + text_token_ids, dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+
+    # --- Position IDs (3D RoPE) ---
+    position_ids = position_id_func(
+        input_ids=input_ids.unsqueeze(0),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        attention_mask=attention_mask.unsqueeze(0),
+    )["position_ids"]  # (3, 1, seq_len)
+    position_ids = position_ids.squeeze().clone()  # (3, seq_len)
+
+    # --- Image / video masks ---
+    image_mask = input_ids == IMAGE_INPUT_INDEX
+    video_mask = input_ids == VIDEO_INPUT_INDEX
+    # Zero-out placeholder token IDs (model uses mask to scatter visual features)
+    input_ids[image_mask] = 0
+    input_ids[video_mask] = 0
+
+    # --- Observation state & action labels ---
+    # Use the last obs_len state frames; model will receive (obs_len, state_dim)
+    # but we flatten to the last frame to match the single-token state injection.
+    observation_state = sample["observation.state"][obs_index]  # (state_dim,)
+    labels = sample["action"]  # (pred_len, action_dim)
+
+    result = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "image_mask": image_mask,
+        "video_mask": video_mask,
+        "observation_state": observation_state,
+        "labels": labels,
+    }
+    result.update(image_inputs)  # pixel_values, image_grid_thw
+
+    return [result]
+
+
+def load_libero_task_descriptions(meta_path: str) -> Dict[int, str]:
+    """Load episode_index → task description mapping from LIBERO metadata.
+
+    Args:
+        meta_path: Path to the LIBERO episode metadata parquet file
+            (e.g. ``<data_dir>/meta/episodes/chunk-000/file-000.parquet``).
+
+    Returns:
+        Dict mapping ``episode_index`` to the first task description string.
+    """
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(meta_path, columns=["episode_index", "tasks"])
+    task_map: Dict[int, str] = {}
+    for i in range(len(table)):
+        ep_idx = table["episode_index"][i].as_py()
+        tasks_list = table["tasks"][i].as_py()
+        # Each episode has a list of task strings; take the first one.
+        task_map[ep_idx] = tasks_list[0] if tasks_list else "perform the task"
+    return task_map
+
+
 QWEN_OMNI_SYSTEM_MESSAGE = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
     "capable of perceiving auditory and visual inputs, as well as generating text and speech."
