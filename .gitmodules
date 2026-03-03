@@ -1,0 +1,3 @@
+[submodule "submodules/youmu"]
+	path = submodules/youmu
+	url = https://github.com/Luosuu/youmu.git

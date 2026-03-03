@@ -1,0 +1,34 @@
+model:
+  model_path: Qwen/Qwen3-VL-8B-Instruct
+  attn_implementation: flash_attention_2
+
+data:
+  libero_data_dir: /path/to/libero_dataset
+  libero_dataset_backend: youmu
+  obs_len: 1
+  pred_len: 4
+  max_seq_len: 2048
+
+train:
+  output_dir: qwen3_vl_libero
+  data_parallel_mode: fsdp2
+  enable_reentrant: false
+  rmpad_with_pos_ids: true
+  use_wandb: false
+  wandb_project: qwen3_vl_libero
+  wandb_name: qwen3_vl_libero
+  ulysses_parallel_size: 1
+  freeze_vit: false
+  vit_lr: 1.0e-6
+  lr: 1.0e-4
+  lr_decay_style: cosine
+  lr_warmup_ratio: 0.03
+  num_train_epochs: 20
+  micro_batch_size: 1
+  global_batch_size: 64
+  max_grad_norm: 1.0
+  init_device: meta
+  enable_profiling: false
+  ckpt_manager: dcp
+  save_hf_weights: true
+  save_epochs: 5

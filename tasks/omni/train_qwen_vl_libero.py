@@ -20,8 +20,8 @@ from veomni.data import (
     LiberoActionCollator,
     LiberoActionPackingCollator,
     build_dataloader,
-    build_dataset,
 )
+from veomni.data.dataset import MappingDataset
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -84,6 +84,110 @@ class MyDataArguments(DataArguments):
         default="Predict the next actions for the robot task: {task}",
         metadata={"help": "Prompt template for LIBERO task descriptions. Must contain {task}."},
     )
+    obs_len: int = field(
+        default=1,
+        metadata={"help": "Number of observation frames (including anchor)."},
+    )
+    pred_len: int = field(
+        default=4,
+        metadata={"help": "Number of future prediction frames."},
+    )
+    chunk_index: Optional[int] = field(
+        default=None,
+        metadata={"help": "Chunk index for multi-chunk datasets. None loads all chunks."},
+    )
+    libero_dataset_backend: str = field(
+        default="youmu",
+        metadata={"help": "Dataset backend for LIBERO data. Options: youmu, lerobot, lance."},
+    )
+    libero_lance_dir: str = field(
+        default="",
+        metadata={"help": "Path to Lance dataset directory (only used when libero_dataset_backend=lance)."},
+    )
+
+
+def build_libero_dataset(
+    backend: str,
+    data_dir: str,
+    obs_len: int,
+    pred_len: int,
+    chunk_index: Optional[int] = None,
+    lance_dir: str = "",
+    meta_path: str = "",
+):
+    """Build a LIBERO dataset using the specified backend.
+
+    Args:
+        backend: One of "youmu", "lerobot", "lance".
+        data_dir: Root directory of the LIBERO dataset.
+        obs_len: Number of observation frames (including anchor).
+        pred_len: Number of future prediction frames.
+        chunk_index: Chunk index for multi-chunk datasets. None loads all chunks.
+        lance_dir: Path to Lance dataset directory (lance backend only).
+        meta_path: Path to episode metadata parquet file (lance backend only).
+
+    Returns:
+        A PyTorch Dataset instance.
+    """
+    if backend == "youmu":
+        from youmu.libero_dataset import LiberoYoumuDataset
+
+        return LiberoYoumuDataset(
+            data_dir=data_dir,
+            obs_len=obs_len,
+            pred_len=pred_len,
+            chunk_index=chunk_index,
+        )
+    elif backend == "lerobot":
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        info_path = os.path.join(data_dir, "meta", "info.json")
+        with open(info_path) as f:
+            info = json.load(f)
+        fps = info["fps"]
+
+        obs_timestamps = [-(obs_len - 1 - i) / fps for i in range(obs_len)]
+        pred_timestamps = [i / fps for i in range(pred_len)]
+
+        return LeRobotDataset(
+            repo_id="local/libero",
+            root=data_dir,
+            delta_timestamps={
+                "observation.state": obs_timestamps,
+                "action": pred_timestamps,
+                "observation.images.image": obs_timestamps,
+            },
+            download_videos=False,
+        )
+    elif backend == "lance":
+        import importlib.util
+
+        if not lance_dir:
+            raise ValueError("libero_lance_dir must be set when using lance backend.")
+
+        # Import LiberoLanceDataset from youmu's benchmark scripts
+        lance_baseline_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "submodules",
+            "youmu",
+            "scripts",
+            "benchmarks",
+            "lance_baseline.py",
+        )
+        spec = importlib.util.spec_from_file_location("lance_baseline", lance_baseline_path)
+        lance_baseline = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lance_baseline)
+
+        return lance_baseline.LiberoLanceDataset(
+            lance_dir=lance_dir,
+            meta_path=meta_path,
+            obs_len=obs_len,
+            pred_len=pred_len,
+        )
+    else:
+        raise ValueError(f"Unknown libero_dataset_backend: {backend}. Must be one of: youmu, lerobot, lance.")
 
 
 @dataclass
@@ -166,16 +270,18 @@ def main():
     if args.train.rmpad:
         raise ValueError("QwenVL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
 
-    train_dataset = build_dataset(
-        dataset_name=args.data.dataset_name,
-        transform=transform,
-        dataloader_batch_size=args.train.dataloader_batch_size,
-        seed=args.train.seed,
-        **asdict(args.data),
+    libero_dataset = build_libero_dataset(
+        backend=args.data.libero_dataset_backend,
+        data_dir=args.data.libero_data_dir,
+        obs_len=args.data.obs_len,
+        pred_len=args.data.pred_len,
+        chunk_index=args.data.chunk_index,
+        lance_dir=args.data.libero_lance_dir,
+        meta_path=meta_path,
     )
-    dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
-    if args.data.datasets_type == "mapping":
-        dataset_length = dataset_length / args.train.data_parallel_size
+    logger.info_rank0(f"Using LIBERO dataset backend: {args.data.libero_dataset_backend}")
+    train_dataset = MappingDataset(data=libero_dataset, transform=transform)
+    dataset_length = len(train_dataset) / args.train.data_parallel_size
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
 
     train_dataloader = build_dataloader(
