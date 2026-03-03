@@ -9,6 +9,13 @@ from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+
+# See
+_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
+_v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
+_v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
 
 
 def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
@@ -23,7 +30,16 @@ def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
     model.save_pretrained(output_path)
 
 
-def main(task_name: str, model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, train_path: str):
+def main(
+    task_name: str,
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    train_path: str,
+    max_sp_size: int | None = None,
+):
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
@@ -38,6 +54,7 @@ def main(task_name: str, model_name: str, config_path: str, is_moe: bool, rtol: 
         train_path=train_path,
         output_dir=test_path,
         is_moe=is_moe,
+        max_sp_size=max_sp_size,
     )
     res = {}
     log_keys = []
@@ -62,48 +79,73 @@ def main(task_name: str, model_name: str, config_path: str, is_moe: bool, rtol: 
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
+
 text_test_cases = [
     pytest.param(
         "llama3.1",
         "./tests/toy_config/llama31_toy",
-        False,
+        False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v4_only,
     ),
     pytest.param(
         "qwen2.5",
         "./tests/toy_config/qwen25_toy",
-        False,
+        False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v4_only,
     ),
     pytest.param(
         "qwen3",
         "./tests/toy_config/qwen3_toy",
-        False,
+        False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v4_only,
     ),
     pytest.param(
         "qwen3_moe",
         "./tests/toy_config/qwen3_moe_toy",
-        True,
+        True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v4_only,
     ),
     pytest.param(
         "seed_oss",
         "./tests/toy_config/seed_oss_toy",
-        False,
+        False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v4_only,
     ),
     pytest.param(
         "deepseek_v3",
         "./tests/toy_config/deepseek_v3_toy",
-        True,
+        True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v4_only,
+    ),
+    # TODO: we only support text input now. move this to VLM test once vision input is supported.
+    pytest.param(
+        "qwen3_5",
+        "./tests/toy_config/qwen3_5_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        # TODO: remove max_sp_size limit once we support SP in qwen3_5.
+        # In addition, since SP is limited, there is only one test case now so nothing is compared.
+        1,  # max_sp_size
+        marks=_v5_only,
     ),
 ]
 
@@ -114,6 +156,7 @@ qwen2vl_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        marks=_v4_only,
     ),
     pytest.param(
         "qwen25vl",
@@ -121,6 +164,7 @@ qwen2vl_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        marks=_v4_only,
     ),
 ]
 
@@ -131,6 +175,7 @@ qwen3vl_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        marks=_v4_only,
     ),
     pytest.param(
         "qwen3vlmoe",
@@ -138,6 +183,7 @@ qwen3vl_test_cases = [
         True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        marks=_v4_only,
     ),
 ]
 
@@ -148,6 +194,7 @@ qwen2omni_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        marks=_v4_only,
     ),
 ]
 
@@ -158,6 +205,7 @@ qwen3omni_test_cases = [
         True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        marks=_v4_only,
     ),
 ]
 
@@ -202,9 +250,15 @@ def dummy_qwen3omni_dataset():
     del dummy_dataset
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", text_test_cases)
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", text_test_cases)
 def test_text_parallel_align(
-    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_text_dataset
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int | None,
+    dummy_text_dataset,
 ):
     main(
         task_name="train_text_test",
@@ -214,6 +268,7 @@ def test_text_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_text_dataset,
+        max_sp_size=max_sp_size,
     )
 
 
