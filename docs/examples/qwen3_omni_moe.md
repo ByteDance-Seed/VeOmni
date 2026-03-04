@@ -119,8 +119,17 @@ python3 scripts/download_hf_model.py \
     --local_dir .
 ```
 
+## Merge MoE
+
+```shell
+python3 scripts/moe_ckpt_merge/moe_merge.py \
+    --raw_hf_path Qwen3-Omni-30B-A3B-Instruct \
+    --merge_hf_path Qwen3-Omni-30B-A3B-Instruct-merge
+```
+
 ## Start training on GPU
 
 ```shell
-bash train.sh tasks/deprecated_task/train_qwen3_omni.py configs/multimodal/qwen3_omni/qwen3_omni.yaml
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_omni/qwen3_omni.yaml \
+    --model.model_path Qwen3-Omni-30B-A3B-Instruct-merge
 ```
