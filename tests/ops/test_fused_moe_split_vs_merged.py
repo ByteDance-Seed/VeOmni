@@ -45,8 +45,10 @@ def _eager_moe_forward(
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
     [
-        (61, 8, 128, 256, 2, 0),
-        (96, 16, 128, 384, 2, 1),
+        # Qwen3-30B-A3B config: num_experts=16, top_k=2, hidden=2048, moe_intermediate=768
+        (512, 128, 2048, 768, 8, 0),
+        # DeepSeek V3 671B config: n_routed_experts=256, top_k=8, hidden=7168, moe_intermediate=2048
+        (256, 256, 7168, 2048, 8, 1),
     ],
 )
 def test_fused_moe_split_and_merged_match_eager(
