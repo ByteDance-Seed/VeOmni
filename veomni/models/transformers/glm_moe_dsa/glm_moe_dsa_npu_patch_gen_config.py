@@ -6,4 +6,3 @@ config = PatchConfig(
     target_file="patched_modeling_glm_moe_dsa_npu.py",
     description="GLM-5 with NPU replacements",
 )
-

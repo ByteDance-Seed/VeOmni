@@ -1,6 +1,7 @@
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
+
 @MODELING_REGISTRY.register("glm_moe_dsa")
 def register_glm_moe_dsa_modeling(architecture: str):
     if is_transformers_version_greater_or_equal_to("5.2.0"):
