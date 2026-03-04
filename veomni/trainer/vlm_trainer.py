@@ -14,18 +14,12 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
-from ..data import MainCollator, build_multimodal_chat_template
-from ..data.multimodal.data_transform import (
-    process_sample_qwen2_5_vl,
-    process_sample_qwen3_vl,
-    process_sample_qwen_omni,
-)
+from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
@@ -170,25 +164,13 @@ class VLMTrainer:
 
     def _build_data_transform(self):
         args: VeOmniVLMArguments = self.base.args
-
         model_type = self.base.model_config.model_type
 
-        if model_type in ("qwen3_vl", "qwen3_vl_moe"):
-            process_function = process_sample_qwen3_vl
-            position_id_func = self.base.model.get_position_id_func()
-        elif model_type in ("qwen2_5_vl", "qwen2_vl"):
-            process_function = process_sample_qwen2_5_vl
-            position_id_func = self.base.model.get_position_id_func()
-        elif model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-            process_function = process_sample_qwen_omni
-            position_id_func = self.base.model.thinker.get_position_id_func()
-        else:
-            raise NotImplementedError(f"Unsupported model type: {model_type}.")
-        self.base.data_transform = partial(
-            process_function,
+        self.base.data_transform = build_data_transform(
+            model_type,
             processor=self.base.processor,
             chat_template=self.base.chat_template,
-            position_id_func=position_id_func,
+            position_id_func=self.base.model.get_position_id_func(),
             **args.data.mm_configs,
         )
 
@@ -230,6 +212,8 @@ class VLMTrainer:
             fused=True,
             optimizer_type=args.train.optimizer,
             param_groups=param_groups,
+            no_decay_modules=args.train.no_decay_modules,
+            no_decay_params=args.train.no_decay_params,
         )
 
     def on_train_begin(self):

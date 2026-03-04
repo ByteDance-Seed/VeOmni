@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from collections import defaultdict
-from functools import partial
 from typing import Any, Dict, List
 
 import torch
@@ -21,8 +20,8 @@ import torch
 from ..arguments import VeOmniArguments
 from ..data import (
     build_chat_template,
+    build_data_transform,
 )
-from ..data.data_transform import process_pretrain_example, process_sft_example
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..models import build_tokenizer
 from ..utils import helper
@@ -68,28 +67,20 @@ class TextTrainer:
         self.base.tokenizer = build_tokenizer(args.model.tokenizer_path)
         if args.data.data_type == "plaintext":
             self.base.model_assets = [model_config, self.base.tokenizer]
+            self.base.chat_template = None
         else:
             self.base.chat_template = build_chat_template(args.data.chat_template, self.base.tokenizer)
             self.base.model_assets = [model_config, self.base.chat_template]
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.base.args
-        if args.data.data_type == "plaintext":
-            self.basedata_transform = partial(
-                process_pretrain_example,
-                tokenizer=self.base.tokenizer,
-                max_seq_len=args.data.max_seq_len,
-                text_keys=args.data.text_keys,
-            )
-        elif args.data.data_type == "conversation":
-            self.base.data_transform = partial(
-                process_sft_example,
-                chat_template=self.base.chat_template,
-                max_seq_len=args.data.max_seq_len,
-                text_keys=args.data.text_keys,
-            )
-        else:
-            raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
+        self.base.data_transform = build_data_transform(
+            args.data.data_type,
+            tokenizer=self.base.tokenizer,
+            chat_template=self.base.chat_template,
+            max_seq_len=args.data.max_seq_len,
+            text_keys=args.data.text_keys,
+        )
 
     def on_train_begin(self):
         self.base.on_train_begin()
