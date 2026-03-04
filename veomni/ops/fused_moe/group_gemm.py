@@ -277,6 +277,12 @@ def group_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
 ):
+    """Triton grouped-gemm fused MoE forward pass.
+
+    Accepts either split fc1 weights (fc1_1_weight, fc1_2_weight) or a merged
+    fc1_1_2_weight tensor. The weights are resolved into the split format
+    required by the Triton kernel via ``resolve_fc1_weights``.
+    """
     fc1_1_weight, fc1_2_weight = resolve_fc1_weights(
         fc1_1_weight, fc1_2_weight, fc1_1_2_weight, return_merged_fc1=False
     )

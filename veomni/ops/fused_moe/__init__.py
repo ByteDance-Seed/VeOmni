@@ -34,6 +34,8 @@ def resolve_fc1_weights(
     *,
     return_merged_fc1: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+    # TODO: remove this function once merged fc1_1_2 weight format is enforced
+    # and split fc1 weights are no longer supported.
     """Normalize fc1 weight inputs into the format required by the backend.
 
     Callers may pass *either* split weights (``fc1_1_weight``, ``fc1_2_weight``)

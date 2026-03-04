@@ -37,6 +37,11 @@ def _npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """NPU single-device fused MoE forward pass (non-EP).
+
+    Accepts either split fc1 weights or a merged fc1_1_2_weight tensor.
+    Weights are merged and transposed for the NPU group-gemm kernel.
+    """
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(
         hidden_states, selected_experts.to(torch.int32)
@@ -64,6 +69,11 @@ def npu_ep_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
+    """NPU expert-parallel fused MoE forward pass.
+
+    Accepts either split fc1 weights or a merged fc1_1_2_weight tensor.
+    Handles alltoall dispatch/combine for expert parallelism.
+    """
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
         dispatch_preprocess(selected_experts, num_experts, ep_group)
