@@ -18,9 +18,30 @@ from ...distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, token
 from ...distributed.parallel_state import get_parallel_state
 from ..group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from .torch_fused_moe import torch_fused_moe_forward
 
 
-class FusedMoeExpertFunction(torch.autograd.Function):
+def _resolve_fc1_weights(
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
+    fc1_1_2_weight: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if fc1_1_2_weight is not None:
+        if fc1_1_weight is not None or fc1_2_weight is not None:
+            raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
+        intermediate_dim = fc1_1_2_weight.shape[1] // 2
+        # Slicing from merged fc1 returns strided views; Triton grouped-gemm expects contiguous weights.
+        return (
+            fc1_1_2_weight[:, :intermediate_dim, :].contiguous(),
+            fc1_1_2_weight[:, intermediate_dim:, :].contiguous(),
+        )
+
+    if fc1_1_weight is None or fc1_2_weight is None:
+        raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
+    return fc1_1_weight, fc1_2_weight
+
+
+class TritonFusedMoeExpertFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -267,15 +288,18 @@ class FusedMoeExpertFunction(torch.autograd.Function):
 
 
 def group_gemm_fused_moe_forward(
-    module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
+    moe_kernel_backend: str = "triton",
 ):
+    fc1_1_weight, fc1_2_weight = _resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
+
     if get_parallel_state().ep_enabled:
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
         # preprocess, permute token for ep
@@ -327,13 +351,26 @@ def group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
     else:
-        final_hidden_states = FusedMoeExpertFunction.apply(
-            num_experts,
-            routing_weights,
-            selected_experts,
-            hidden_states,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-        )
+        if moe_kernel_backend == "torch":
+            final_hidden_states = torch_fused_moe_forward(
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
+                fc1_1_weight,
+                fc1_2_weight,
+                fc2_weight,
+            )
+        elif moe_kernel_backend == "triton":
+            final_hidden_states = TritonFusedMoeExpertFunction.apply(
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
+                fc1_1_weight,
+                fc1_2_weight,
+                fc2_weight,
+            )
+        else:
+            raise ValueError(f"Unsupported moe_kernel_backend: {moe_kernel_backend}. Choose 'triton' or 'torch'.")
     return final_hidden_states

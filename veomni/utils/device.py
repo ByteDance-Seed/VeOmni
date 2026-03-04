@@ -132,3 +132,10 @@ def get_compute_units():
             NUM_SMS = torch.get_num_threads()
 
     return NUM_SMS
+
+
+def get_device_capability() -> tuple[int, int] | None:
+    """Get device compute capability if available."""
+    if IS_CUDA_AVAILABLE:
+        return torch.cuda.get_device_capability()
+    return None

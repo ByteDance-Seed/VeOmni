@@ -16,11 +16,12 @@ class ModelMode:
     modeling_backend: str
     attn_implementation: str
     sync_weight_func: Optional[Callable] = None
-    moe_implementation: str = "eager"  # 修正类型匹配
+    moe_implementation: str = "eager"
+    moe_kernel_backend: str = "triton"
     use_liger_kernel: bool = False
 
     def __str__(self):
-        return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]]"
+        return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[moe_kernel-{self.moe_kernel_backend}]_[ligerkernel-{self.use_liger_kernel}]]"
 
 
 # HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
@@ -41,7 +42,7 @@ def _skip_fa3_npu(attn_impl: str) -> bool:
     return attn_impl in ("flash_attention_3", "veomni_flash_attention_3_with_sp")
 
 
-def _append_veomni_modes(modes: list, moe_implementation: str = "eager"):
+def _append_veomni_modes(modes: list, moe_implementation: str = "eager", moe_kernel_backend: str = "triton"):
     """Append VeOmni modes for case; every attn uses _USE_LIGER_KERNEL (True/False)."""
     for veomni_attn in _VEOMNI_ATTN:
         if _skip_fa3_npu(veomni_attn):
@@ -52,6 +53,7 @@ def _append_veomni_modes(modes: list, moe_implementation: str = "eager"):
                     "veomni",
                     veomni_attn,
                     moe_implementation=moe_implementation,
+                    moe_kernel_backend=moe_kernel_backend,
                     use_liger_kernel=use_liger,
                 )
             )
@@ -69,12 +71,13 @@ def _base_model_modes():
 
 
 def _moe_model_modes():
-    """MoE model modes: same attn variants with moe_implementation=fused."""
+    """MoE model modes: same attn variants with moe_implementation=fused, for both triton and torch kernel backends."""
     modes = []
     for hf_attn in _HF_ATTN:
         if _skip_fa3_npu(hf_attn):
             continue
-    _append_veomni_modes(modes, moe_implementation="fused")
+    for moe_kernel_backend in ["triton", "torch"]:
+        _append_veomni_modes(modes, moe_implementation="fused", moe_kernel_backend=moe_kernel_backend)
     return modes
 
 
@@ -260,3 +263,7 @@ def set_environ_param(model_mode: ModelMode):
         os.environ["VEOMNI_USE_LIGER_KERNEL"] = "1"
     else:
         os.environ["VEOMNI_USE_LIGER_KERNEL"] = "0"
+
+    from veomni.ops import fused_moe
+
+    fused_moe._moe_kernel_backend = model_mode.moe_kernel_backend
