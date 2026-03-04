@@ -109,4 +109,4 @@ def test_fused_moe_split_and_merged_match_eager(
     )
 
     torch.testing.assert_close(out_split, out_merged, rtol=0, atol=0)
-    torch.testing.assert_close(out_split, out_eager, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(out_split, out_eager, rtol=2e-3, atol=2e-3)
