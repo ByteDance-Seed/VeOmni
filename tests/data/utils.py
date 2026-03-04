@@ -224,7 +224,6 @@ class DummyDataset:
 def process_dummy_example(
     example: Dict[str, Any],
     max_seq_len: int,
-    rmpad_with_pos_ids: bool = False,
     source_name: str = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
     tokenized_example = {}

@@ -3,7 +3,6 @@ import os
 import time
 from dataclasses import asdict
 from datetime import timedelta
-from functools import partial
 from typing import Any, Dict, List
 
 import torch
@@ -16,10 +15,10 @@ from veomni.arguments import VeOmniArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import (
     build_chat_template,
+    build_data_transform,
     build_dataloader,
     build_dataset,
 )
-from veomni.data.data_transform import process_pretrain_example, process_sft_example
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -82,23 +81,17 @@ def main():
 
     logger.info_rank0("Prepare data")
     tokenizer = build_tokenizer(args.model.tokenizer_path)
-    if args.data.data_type == "plaintext":
-        transform = partial(
-            process_pretrain_example,
-            tokenizer=tokenizer,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
-        )
-    elif args.data.data_type == "conversation":
+    chat_template = None
+    if args.data.data_type == "conversation":
         chat_template = build_chat_template(args.data.chat_template, tokenizer)
-        transform = partial(
-            process_sft_example,
-            chat_template=chat_template,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
+
+    transform = build_data_transform(
+        args.data.data_type,
+        tokenizer=tokenizer,
+        chat_template=chat_template,
+        max_seq_len=args.data.max_seq_len,
+        text_keys=args.data.text_keys,
+    )
 
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,

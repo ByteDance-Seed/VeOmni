@@ -87,6 +87,7 @@ class EnvironMeterCallback(Callback):
             enable_multisource=args.data.enable_multisource,
             dataloader=trainer.train_dataloader,
             data_path=args.data.train_path,
+            gc_steps=args.train.gc_steps,
         )
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:

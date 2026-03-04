@@ -14,27 +14,18 @@
 
 from .ops import apply_ops_patch, format_kernel_functions
 from .utils.env import format_envs
-from .utils.import_utils import is_veomni_patch_available
 from .utils.logging import get_logger
 
 
 logger = get_logger(__name__)
 
 
-def _safe_apply_patches():
+def _apply_patches():
     apply_ops_patch()
-    if is_veomni_patch_available():
-        from veomni_patch import apply_patch
-
-        apply_patch()
-        logger.info_rank0("✅ veomni_patch is available")
-    else:
-        logger.info_rank0("❌ veomni_patch is not available")
-
     logger.info_rank0(format_envs())
     logger.info_rank0(format_kernel_functions())
 
 
-_safe_apply_patches()
+_apply_patches()
 
 __version__ = "v0.1.0"

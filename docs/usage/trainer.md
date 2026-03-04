@@ -22,11 +22,11 @@ The [`BaseTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/tr
 
 ## Training Loop
 
-The core training logic is encapsulated in the `fit()` and `train_step()` methods of `BaseTrainer`.
+The core training logic is encapsulated in the `train()` and `train_step()` methods of `BaseTrainer`.
 
-### The `fit` Method
+### The `train` Method
 
-The `fit()` method is the entry point for training. It:
+The `train()` method is the entry point for training. It:
 1. Calls `on_train_begin` callback.
 2. Iterates through epochs.
 3. Calls `on_epoch_begin`.
@@ -36,7 +36,7 @@ The `fit()` method is the entry point for training. It:
 7. Calls `on_train_end` after the loop finishes.
 
 ```python
-def fit(self):
+def train(self):
     # ... setup ...
     self.callbacks.call("on_train_begin", self.state)
 

@@ -53,7 +53,7 @@ jobs:
           faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
           mlp-image: "${{ env.IMAGE }}"
 
-  gpu_unit_tests:
+  gpu_e2e_tests:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: setup
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
@@ -73,8 +73,16 @@ jobs:
           uv sync --frozen --extra gpu --extra audio --group dev
       - name: Run e2e training test
         run: |
-          uv run pytest -s -x tests/e2e/test_e2e_training.py
-          uv run pytest -s -x tests/e2e/test_e2e_parallel.py
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+      - name: Sync dependencies [transformers-v5]
+        run: |
+          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
+      - name: Run models tests [transformers-v5]
+        run: |
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+        # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:
     runs-on: ubuntu-latest

@@ -106,6 +106,8 @@ class PatchConfig:
     # Collected patches
     patches: list[Patch] = field(default_factory=list)
     additional_imports: list[ImportSpec] = field(default_factory=list)
+    post_import_blocks: list[str] = field(default_factory=list)
+    drop_imported_names: set[str] = field(default_factory=set)
 
     # Classes/functions to exclude from the output
     exclude: list[str] = field(default_factory=list)
@@ -225,6 +227,23 @@ class PatchConfig:
             is_from_import=is_from_import,
         )
         self.additional_imports.append(import_spec)
+
+    def add_post_import_block(self, block: str):
+        """
+        Add a raw Python code block to be inserted after regular imports.
+
+        This is useful for guarded or fallback import logic that cannot be
+        represented as plain import statements.
+        """
+        self.post_import_blocks.append(block)
+
+    def drop_import_names(self, *names: str):
+        """
+        Drop imported names from the original source import collection.
+
+        If all imported names in one statement are dropped, the statement is omitted.
+        """
+        self.drop_imported_names.update(names)
 
     def exclude_from_output(self, *names: str):
         """
