@@ -1269,6 +1269,9 @@ class Qwen3OmniMoeForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoeForCond
         config.thinker_config.text_config._moe_implementation = moe_implementation
         super().__init__(config)
 
+    def get_position_id_func(self):
+        return self.thinker.get_position_id_func()
+
     def forward(
         self,
         **kwargs,

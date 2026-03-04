@@ -30,7 +30,6 @@ import json
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict
-from functools import partial
 from typing import Any, Callable, Dict, List
 
 import torch
@@ -52,7 +51,7 @@ from ..data import (
 )
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
-from ..data.data_transform import process_pretrain_example
+from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import init_parallel_state
@@ -255,8 +254,8 @@ class BaseTrainer(Stateful, ABC):
         self.model_assets = [self.model_config, self.tokenizer]
 
     def _build_data_transform(self):
-        self.data_transform = partial(
-            process_pretrain_example,
+        self.data_transform = build_data_transform(
+            self.args.data.data_type,
             tokenizer=self.tokenizer,
             max_seq_len=self.args.data.max_seq_len,
             text_keys=self.args.data.text_keys,
@@ -337,6 +336,8 @@ class BaseTrainer(Stateful, ABC):
             weight_decay=args.train.weight_decay,
             fused=True,
             optimizer_type=args.train.optimizer,
+            no_decay_modules=args.train.no_decay_modules,
+            no_decay_params=args.train.no_decay_params,
         )
 
     def _build_lr_scheduler(self):

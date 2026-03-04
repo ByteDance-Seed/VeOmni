@@ -956,6 +956,9 @@ class Qwen2_5OmniForConditionalGeneration(_Qwen2_5OmniForConditionalGeneration):
     _no_split_modules = ["Qwen2_5OmniDecoderLayer", "Qwen2_5OmniVisionBlock", "Qwen2_5OmniAudioEncoderLayer"]
     # --- Patch.4 ---
 
+    def get_position_id_func(self):
+        return self.thinker.get_position_id_func()
+
     @torch.no_grad()
     # TODO: raushan, defaults should be saved in generation config
     def generate(

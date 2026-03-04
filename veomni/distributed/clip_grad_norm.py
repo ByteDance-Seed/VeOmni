@@ -15,7 +15,7 @@ def veomni_clip_grad_norm(
     elif dp_mode == "fsdp2":
         grad_norm = fsdp2_clip_grad_norm(model, max_norm, norm_type, error_if_nonfinite, foreach)
     elif dp_mode == "ddp":
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, foreach=foreach)
     else:
         raise RuntimeError(f"Unknown dp mode {dp_mode}")
 

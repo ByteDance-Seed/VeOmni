@@ -6,7 +6,7 @@ from typing import Dict
 import pytest
 import torch
 
-from veomni import _safe_apply_patches
+from veomni import _apply_patches
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -46,7 +46,7 @@ class TrainerTest(BaseTrainer):
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12345"
         set_environ_param(hf_model_mode)
-        _safe_apply_patches()
+        _apply_patches()
         super().__init__(trainer_config)
 
     def _init_callbacks(self):
@@ -76,7 +76,7 @@ class TrainerTest(BaseTrainer):
 
     def forward_backward_step(self, state_dict: Dict[str, torch.Tensor], model_mode: ModelMode, dataloader):
         set_environ_param(model_mode)
-        _safe_apply_patches()
+        _apply_patches()
 
         model_name = self.model_config.model_type
         self.args.model.attn_implementation = model_mode.attn_implementation

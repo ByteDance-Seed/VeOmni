@@ -2,7 +2,6 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -14,14 +13,10 @@ from tqdm import trange
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args, save_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import (
+    build_data_transform,
     build_dataloader,
     build_dataset,
     build_multimodal_chat_template,
-)
-from veomni.data.multimodal.data_transform import (
-    process_sample_qwen2_5_vl,
-    process_sample_qwen3_vl,
-    process_sample_qwen_omni,
 )
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -150,36 +145,17 @@ def main():
 
     if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
         model.disable_talker()
-        position_id_func = model.thinker.get_position_id_func()
+        chat_template = None
     else:
-        position_id_func = model.get_position_id_func()
         chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
-    if model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
-        transform = partial(
-            process_sample_qwen2_5_vl,
-            processor=processor,
-            chat_template=chat_template,
-            position_id_func=position_id_func,
-            **args.data.mm_configs,
-        )
-    elif model_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
-        transform = partial(
-            process_sample_qwen3_vl,
-            processor=processor,
-            chat_template=chat_template,
-            position_id_func=position_id_func,
-            **args.data.mm_configs,
-        )
-    elif model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-        transform = partial(
-            process_sample_qwen_omni,
-            processor=processor,
-            position_id_func=position_id_func,
-            **args.data.mm_configs,
-        )
-    else:
-        raise ValueError(f"Unsupported model type: {model_config.model_type}")
+    transform = build_data_transform(
+        model_config.model_type,
+        processor=processor,
+        chat_template=chat_template,
+        position_id_func=model.get_position_id_func(),
+        **args.data.mm_configs,
+    )
 
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,
