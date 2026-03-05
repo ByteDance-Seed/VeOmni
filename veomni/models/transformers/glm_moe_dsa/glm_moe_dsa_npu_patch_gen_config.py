@@ -1,17 +1,18 @@
-from veomni.patchgen.patch_spec import PatchConfig
-
 import torch
-
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
+
+from veomni.patchgen.patch_spec import PatchConfig
+
 
 config = PatchConfig(
     source_module="transformers.models.glm_moe_dsa.modeling_glm_moe_dsa",
     target_file="patched_modeling_glm_moe_dsa_npu.py",
     description="GLM-5 with NPU replacements",
 )
+
 
 @config.override_method(
     "GlmMoeDsaForCausalLM.forward",
