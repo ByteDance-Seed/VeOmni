@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import seed_omni, transformers
+from . import diffusers, seed_omni, transformers
 from .auto import build_foundation_model, build_processor, build_tokenizer
 from .module_utils import (
     init_empty_weights,
@@ -33,5 +33,6 @@ __all__ = [
     "save_model_assets",
     "save_model_weights",
     "transformers",
+    "diffusers",
     "seed_omni",
 ]

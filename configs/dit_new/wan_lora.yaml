@@ -1,6 +1,5 @@
 model:
   model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers
-  condition_model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers
   lora_config:
     rank: 128
     alpha: 64
@@ -11,14 +10,17 @@ data:
   train_size: 1000000000000
   max_seq_len: 8192
   source_name: video_generation_demo
+  mm_configs:
+    fps: 24
 
 train:
   output_dir: Wan2.1-I2V-1.3B_lora
   data_parallel_mode: fsdp1
+  ulysses_parallel_size: 1
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
-  dyn_bsz: False
+  dyn_bsz: false
   optimizer: adamw
   lr: 1.0e-4
   lr_warmup_ratio: 0.007

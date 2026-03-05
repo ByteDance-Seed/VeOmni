@@ -195,7 +195,6 @@ def smart_resize(
     scale_factor: int = None,
     video_min_pixels: int = None,
     video_max_pixels: int = None,
-    video_max_min_size: int = None,
     max_ratio: int = None,
     **kwargs,
 ):
@@ -596,7 +595,7 @@ def load_video(video: VideoInput, **kwargs):
         return videos[0], video_meta[0], audios[0], audio_meta[0]
 
 
-def images_to_video(image_list: torch.Tensor, output_file: str, fps: int = 6):
+def images_to_video(image_list: torch.Tensor, output_file: str, fps: int):
     # record the encoding time
     image_list = image_list.cpu().numpy()
     av.logging.set_level(av.logging.INFO)
@@ -622,5 +621,5 @@ def images_to_video(image_list: torch.Tensor, output_file: str, fps: int = 6):
     container.close()
 
 
-def save_video_tensors_to_file(video: torch.Tensor, output_path):
-    images_to_video(video, output_path, fps=24)
+def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
+    images_to_video(video, output_path, fps=fps)
