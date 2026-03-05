@@ -18,7 +18,7 @@ config = PatchConfig(
     "GlmMoeDsaForCausalLM.forward",
     description="Support fused cross entropy path in GlmMoeDsaForCausalLM.forward",
 )
-def glmmoedsaforcausallm_forward_patched(
+def glm_moe_dsa_forcausallm_forward_patched(
     self,
     input_ids: torch.LongTensor | None = None,
     attention_mask: torch.Tensor | None = None,
