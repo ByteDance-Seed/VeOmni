@@ -11,11 +11,11 @@ class WanConditionConfig(PretrainedConfig):
         text_encoder_subfolder: str = "text_encoder",
         vae_subfolder: str = "vae",
         scheduler_subfolder: str = "scheduler",
-        max_sequence_length: int = 226,
+        max_sequence_length: int = 512,
         num_train_timesteps: int = 1000,
         shift: float = 5.0,
         do_classifier_free_guidance: bool = False,
-        load_components: bool = True,
+        video_max_size: int = 480,
         **kwargs,
     ):
         self.base_model_path = base_model_path
@@ -27,7 +27,7 @@ class WanConditionConfig(PretrainedConfig):
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
         self.do_classifier_free_guidance = do_classifier_free_guidance
-        self.load_components = load_components
+        self.video_max_size = video_max_size
         super().__init__(**kwargs)
 
     @classmethod

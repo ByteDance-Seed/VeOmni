@@ -1,4 +1,4 @@
-from . import wan
+from . import wan_t2v
 
 
-__all__ = ["wan"]
+__all__ = ["wan_t2v"]

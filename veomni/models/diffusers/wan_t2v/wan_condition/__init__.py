@@ -3,7 +3,7 @@ from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("wan_condition")
 def register_wan_condition_config():
-    from .config_wan_condition import WanConditionConfig
+    from .configuration_wan_condition import WanConditionConfig
 
     return WanConditionConfig
 
