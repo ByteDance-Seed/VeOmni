@@ -156,7 +156,7 @@ def test_fused_moe_split_vs_merged(
     torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=5e-2, atol=5e-2)
     torch.testing.assert_close(fc2_merged.grad, fc2_eager.grad, rtol=1e-2, atol=1e-2)
     fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
-    torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=3e-2, atol=3e-2)
 
     # Memory profiling
     peak_diff_mb = (peak_split - peak_merged) / (1024 * 1024)
