@@ -20,3 +20,12 @@ def video_generation_demo_preprocess(conversations, **kwargs):
     video_info = conversations["outputs"][0]
     videos = [video_info["video_bytes"].encode("latin-1")]
     return inputs, outputs, images, videos
+
+
+@PREPROCESSOR_REGISTRY.register("webvid-10M")
+def webvid_10M_preprocess(conversations, **kwargs):
+    prompt = conversations["prompt"]
+    outputs = {}
+    images = {}
+    videos = [conversations["video_bytes"].encode("latin-1")]
+    return prompt, outputs, images, videos
