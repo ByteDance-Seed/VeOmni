@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import torch
 
 from ...utils import logging
@@ -30,14 +28,14 @@ _fused_moe_forward = None
 
 
 def fused_moe_forward(
-    module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
 ):
     if _fused_moe_forward is None:
         raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
@@ -50,7 +48,6 @@ def fused_moe_forward(
     )
 
     return _fused_moe_forward(
-        module,
         num_experts,
         routing_weights,
         selected_experts,
@@ -58,6 +55,7 @@ def fused_moe_forward(
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
+        fc1_1_2_weight,
     )
 
 
