@@ -135,6 +135,10 @@ class ModelArguments:
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
+    lora_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for lora."},
+    )
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:

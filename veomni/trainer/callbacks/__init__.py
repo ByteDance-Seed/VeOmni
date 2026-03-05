@@ -19,7 +19,7 @@ Provides callback system for customizing trainer behavior at various stages of t
 """
 
 from .base import Callback, TrainerState
-from .checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
+from .checkpoint_callback import CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback
 from .evaluate_callback import EvaluateCallback
 from .trace_callback import EnvironMeterCallback, ProfileTraceCallback, TqdmCallback, WandbTraceCallback
 
@@ -29,6 +29,7 @@ __all__ = [
     "TrainerState",
     "CheckpointerCallback",
     "HuggingfaceCkptCallback",
+    "HFLoraCkptCallback",
     "EvaluateCallback",
     "WandbTraceCallback",
     "ProfileTraceCallback",

@@ -72,6 +72,7 @@ from .callbacks import (
     CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
+    HFLoraCkptCallback,
     HuggingfaceCkptCallback,
     ProfileTraceCallback,
     TqdmCallback,
@@ -369,7 +370,10 @@ class BaseTrainer(Stateful, ABC):
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
         self.checkpointer_callback = CheckpointerCallback(self)
-        self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
+        if self.args.model.lora_config:
+            self.hf_ckpt_callback = HFLoraCkptCallback(self)
+        else:
+            self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.state = TrainerState()
 
