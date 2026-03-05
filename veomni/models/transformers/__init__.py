@@ -15,6 +15,7 @@
 from . import (
     deepseek_v3,
     flux,
+    glm_moe_dsa,
     janus,
     llama,
     movqgan,
@@ -30,7 +31,6 @@ from . import (
     qwen3_vl_moe,
     seed_oss,
     wan,
-    glm_moe_dsa,
 )
 
 
