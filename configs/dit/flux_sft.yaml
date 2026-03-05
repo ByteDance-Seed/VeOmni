@@ -47,7 +47,6 @@ train:
   enable_full_determinism: false
   empty_cache_steps: 500
   ckpt_manager: dcp
-  load_checkpoint_path: ""
   save_steps: 100
   max_steps: 500
   num_train_epochs: 100
