@@ -24,7 +24,6 @@ from ...distributed.moe.moe_utils import sort_chunks_by_idxs
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.device import stream_synchronize
 from ..group_gemm.kernel.npu_group_gemm import npu_group_gemm
-from . import resolve_fc1_weights
 
 
 def _npu_fused_moe_forward(
@@ -48,9 +47,11 @@ def _npu_fused_moe_forward(
     )
     tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
 
-    fc1_weight = resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight, return_merged_fc1=True).transpose(
-        1, 2
-    )
+    if fc1_1_2_weight is not None:
+        fc1_weight = fc1_1_2_weight
+    else:
+        fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
+    fc1_weight = fc1_weight.transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
     intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
@@ -88,9 +89,11 @@ def npu_ep_fused_moe_forward(
         ep_group,
     )
 
-    fc1_weight = resolve_fc1_weights(fc1_1_weight, fc1_2_weight, fc1_1_2_weight, return_merged_fc1=True).transpose(
-        1, 2
-    )
+    if fc1_1_2_weight is not None:
+        fc1_weight = fc1_1_2_weight
+    else:
+        fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
+    fc1_weight = fc1_weight.transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
     intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
     hidden_states = npu_group_gemm(
