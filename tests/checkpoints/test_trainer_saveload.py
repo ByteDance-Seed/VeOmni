@@ -73,7 +73,8 @@ def read_output_dir_from_yaml(yaml_path: str) -> str:
     """Read output_dir from yaml config file."""
     with open(yaml_path) as f:
         config = yaml.safe_load(f)
-    return config.get("train", {}).get("output_dir", None)
+    train = config.get("train", {})
+    return train.get("checkpoint", {}).get("output_dir") or train.get("output_dir")
 
 
 def capture_param_dtypes(model):
@@ -184,7 +185,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
             self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.optimizer.state_dict())
             self._save_checkpoint(state)
             self.trainer.dcp_weights_path = os.path.join(
-                self.trainer.args.train.save_checkpoint_path, f"global_step_{state.global_step}"
+                self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
             self.trainer.dcp_global_step = state.global_step
 
@@ -207,7 +208,7 @@ class HuggingfaceCkptCallbackTest(HuggingfaceCkptCallback):
         self._save_checkpoint(state)
         assert_param_dtypes_unchanged(self.trainer.model, dtypes_before_hf_save)
         self.trainer.hf_weights_path = os.path.join(
-            self.trainer.args.train.save_checkpoint_path, f"global_step_{state.global_step}", "hf_ckpt"
+            self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}", "hf_ckpt"
         )
 
     def on_train_end(self, state: TrainerState, **kwargs):
@@ -227,7 +228,7 @@ class CheckCallback(Callback):
                 safe_serialization=True,
             ), "HF checkpoint verification failed"
 
-        self.trainer.args.train.load_checkpoint_path = self.trainer.dcp_weights_path
+        self.trainer.args.train.checkpoint.load_path = self.trainer.dcp_weights_path
         self.trainer.checkpointer_callback._load_checkpoint()
 
         tied_weights_keys = None

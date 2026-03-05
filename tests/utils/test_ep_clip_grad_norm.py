@@ -91,15 +91,15 @@ def main():
 
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     init_parallel_state(
-        dp_size=args.train.data_parallel_size,
-        dp_replicate_size=args.train.data_parallel_replicate_size,
-        dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
-        ulysses_size=args.train.ulysses_parallel_size,
-        dp_mode=args.train.data_parallel_mode,
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        ep_size=args.train.accelerator.ep_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
     )
 
     model = ToyMoeModel()
@@ -107,13 +107,13 @@ def main():
         model,
         init_device=args.train.init_device,
         weights_path=None,
-        enable_full_shard=args.train.enable_full_shard,
+        enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
-        enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
-        enable_fsdp_offload=args.train.enable_fsdp_offload,
+        enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+        enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
         basic_modules=[],
-        enable_reentrant=args.train.enable_reentrant,
-        enable_forward_prefetch=args.train.enable_forward_prefetch,
+        enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
+        enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
     )
 
     from veomni.distributed.parallel_state import get_parallel_state
@@ -127,12 +127,12 @@ def main():
     # build optimizer to register ep param groups when ep is enabled
     _ = build_optimizer(
         model,
-        lr=args.train.lr,
-        weight_decay=args.train.weight_decay,
+        lr=args.train.optimizer.lr,
+        weight_decay=args.train.optimizer.weight_decay,
         fused=True,
-        optimizer_type=args.train.optimizer,
-        no_decay_modules=args.train.no_decay_modules,
-        no_decay_params=args.train.no_decay_params,
+        optimizer_type=args.train.optimizer.type,
+        no_decay_modules=args.train.optimizer.no_decay_modules,
+        no_decay_params=args.train.optimizer.no_decay_params,
     )
     logger.info_rank0(
         "group sizes - fsdp: %s, ep: %s, ep_fsdp: %s",
@@ -142,7 +142,7 @@ def main():
     )
     device_type = get_device_type()
     tensor_device = torch.device(f"{device_type}:{get_device_id()}")
-    max_grad_norm = args.train.max_grad_norm
+    max_grad_norm = args.train.optimizer.max_grad_norm
 
     def check_model_param_grad_one_by_one(expected_grad, ep_expected_grad, msg):
         # check them one-by-one
@@ -222,10 +222,10 @@ def test_clip_grad_norm_fsdp2_no_ep():
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
-        "--train.expert_parallel_size=1",
-        "--train.data_parallel_mode=fsdp2",
+        "--train.accelerator.ep_size=1",
+        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
         "--train.init_device=meta",
-        "--train.output_dir='debug'",
+        "--train.checkpoint.output_dir='debug'",
     ]
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
@@ -238,10 +238,10 @@ def test_clip_grad_norm_fsdp2_ep4():
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
-        "--train.expert_parallel_size=4",
-        "--train.data_parallel_mode=fsdp2",
+        "--train.accelerator.ep_size=4",
+        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
         "--train.init_device=meta",
-        "--train.output_dir='debug'",
+        "--train.checkpoint.output_dir='debug'",
     ]
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
@@ -254,10 +254,10 @@ def test_clip_grad_norm_fsdp2_ep8():
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_ep_clip_grad_norm.py",
-        "--train.expert_parallel_size=8",
-        "--train.data_parallel_mode=fsdp2",
+        "--train.accelerator.ep_size=8",
+        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
         "--train.init_device=meta",
-        "--train.output_dir='debug'",
+        "--train.checkpoint.output_dir='debug'",
     ]
     result = subprocess.run(command, check=True)
     assert result.returncode == 0

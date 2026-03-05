@@ -19,13 +19,13 @@ In this tutorial, we introduce the implementation of DeepSpeed-Ulysses for effic
 Reference Paper: [DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models](https://arxiv.org/abs/2309.14509)
 
 ## 🚀 Quick Start
-To enable Ulysses, users can specify the `ulysses_parallel_size` parameter in the configuration file or the launch command:
+To enable Ulysses, users can specify the `accelerator.ulysses_size` parameter in the configuration file or the launch command:
 
 ```shell
 bash train.sh tasks/multimodal/omni/train_qwen2_5_vl.py configs/multimodal/qwen2_5_vl/qwen2_5_vl_fsdp1.yaml \
     --model.model_path YOUR_MODEL_PATH \
     --data.train_path YOUR_DATA_PATH \
-    --train.ulysses_parallel_size 4
+    --train.accelerator.ulysses_size 4
 ```
 
 Currently, we have supported Ulysses on the following models:
@@ -123,7 +123,7 @@ Typically, enabling Ulysses for a new model involves three key steps:
 2. Shard input sequences across the sequence parallel groups.
 3. Modify the model’s attention and loss computation to support Ulysses.
 
-In VeOmni, the first two steps are automated. Users only need to specify the ulysses_parallel_size parameter, and VeOmni will handle the creation of sequence parallel groups and the sharding of input data. This allows users to focus solely on step 3—modifying the model’s architecture to implement Ulysses sequence parallelism.
+In VeOmni, the first two steps are automated. Users only need to specify the `accelerator.ulysses_size` parameter, and VeOmni will handle the creation of sequence parallel groups and the sharding of input data. This allows users to focus solely on step 3—modifying the model’s architecture to implement Ulysses sequence parallelism.
 
 To make this process easier, we provide an abstract pseudo-code example as a reference for implementing Ulysses in a new model:
 
@@ -174,14 +174,14 @@ By overlapping communication and computation, Async Ulysses:
 
 #### Enabling Async Ulysses
 
-To enable Async Ulysses, simply set the `async_enabled` parameter to `True`:
+To enable Async Ulysses, simply set the `accelerator.async_enabled` parameter to `True`:
 
-Notice: Async Ulysses works when `ulysses_parallel_size > 1`.
+Notice: Async Ulysses works when `accelerator.ulysses_size > 1`.
 
 ```shell
 bash train.sh tasks/multimodal/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
-    --train.ulysses_parallel_size 4 \
-    --train.async_enabled true
+    --train.accelerator.ulysses_size 4 \
+    --train.accelerator.async_enabled true
 ```
 
 
@@ -267,7 +267,7 @@ Args:
 To enable Async Ulysses for an existing model, you need to:
 
 1. Check if Async Ulysses is supported for your model (currently supported for Qwen3VL Dense)
-2. Set `async_enabled=True` in your training configuration
+2. Set `accelerator.async_enabled=True` in your training configuration
 3. Ensure you're using Flash Attention 2.0 and Ulysses Context Parallelism is **enabled**
 4. Verify that your hardware supports asynchronous operations
 

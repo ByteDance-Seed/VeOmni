@@ -8,7 +8,8 @@ model:
       add_projector: false
 
 data:
-  dataloader_type: native
+  dataloader:
+    type: native
   datasets_type: iterable
   train_path: sharegpt4v_pretrain
   data_type: conversation
@@ -16,12 +17,16 @@ data:
   max_seq_len: 8192
 
 train:
-  output_dir: omni_sft
-  data_parallel_mode: fsdp1
-  lr: 1.0e-5
-  lr_decay_style: cosine
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp1
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
   num_train_epochs: 3
   micro_batch_size: 2
   global_batch_size: 64
   freeze_encoder: true
-  ckpt_manager: dcp
+  checkpoint:
+    output_dir: omni_sft
+    manager: dcp

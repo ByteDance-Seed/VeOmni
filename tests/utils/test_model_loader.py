@@ -27,7 +27,7 @@ class Arguments(VeOmniArguments):
 torchrun --nnodes=1 --nproc-per-node=8 --master-port=4321 tests/utils/test_helper.py \
     --model.config_path test \
     --data.train_path tests \
-    --train.output_dir .tests/cache \
+    --train.checkpoint.output_dir .tests/cache \
 """
 
 
@@ -38,15 +38,15 @@ def run_environ_meter(args: Arguments):
     dist.init_process_group(backend=get_dist_comm_backend(), world_size=world_size, rank=rank)
 
     init_parallel_state(
-        dp_size=args.train.data_parallel_size,
-        dp_replicate_size=args.train.data_parallel_replicate_size,
-        dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
-        ulysses_size=args.train.ulysses_parallel_size,
-        dp_mode=args.train.data_parallel_mode,
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        ep_size=args.train.accelerator.ep_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
     )
 
     model = build_foundation_model(
@@ -74,7 +74,7 @@ def test_model_loader(model_path):
         "tests/utils/test_model_loader.py",
         f"--model.config_path={model_path}",
         "--data.train_path=tests",
-        "--train.output_dir=.tests/cache",
+        "--train.checkpoint.output_dir=.tests/cache",
         f"--train.init_device={get_device_type()}",
     ]
 

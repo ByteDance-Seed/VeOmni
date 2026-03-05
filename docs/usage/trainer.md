@@ -76,7 +76,7 @@ def train_step(self, data_iterator):
         # ... accumulation ...
 
     # Optimization
-    grad_norm = veomni_clip_grad_norm(self.model, self.args.train.max_grad_norm)
+    grad_norm = veomni_clip_grad_norm(self.model, self.args.train.optimizer.max_grad_norm)
     self.optimizer.step()
     self.lr_scheduler.step()
     self.optimizer.zero_grad()
@@ -168,7 +168,7 @@ To implement a specific training task (like VLM training), you should subclass `
    def build_param_groups(self):
        return [
            {"params": vit_params, "lr": self.args.train.vit_lr},
-           {"params": other_params, "lr": self.args.train.lr}
+           {"params": other_params, "lr": self.args.train.optimizer.lr}
        ]
    ```
 

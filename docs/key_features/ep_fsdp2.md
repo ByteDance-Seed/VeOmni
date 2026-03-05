@@ -2,7 +2,7 @@
 
 **Author**: Tianle Zhong
 
-> TL;DR: VeOmni now supports EP+FSDP2 from v0.1.0; Simply try it out by setting `data_parallel_mode` to `fsdp2` and `expert_parallel_size` to larger than 1.
+> TL;DR: VeOmni now supports EP+FSDP2 from v0.1.0; Simply try it out by setting `accelerator.dp_mode` to `fsdp2` and `accelerator.ep_size` to larger than 1.
 
 
 ## Motivation

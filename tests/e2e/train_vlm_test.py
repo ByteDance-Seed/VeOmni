@@ -58,7 +58,7 @@ class LogDictSaveCallback(Callback):
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.trainer.args.train.global_rank == 0:
-            output_dir = self.trainer.args.train.output_dir
+            output_dir = self.trainer.args.train.checkpoint.output_dir
             os.makedirs(output_dir, exist_ok=True)
             with open(os.path.join(output_dir, "log_dict.json"), "w") as f:
                 json.dump(self.log_dict, f, indent=4)
