@@ -595,31 +595,78 @@ def load_video(video: VideoInput, **kwargs):
         return videos[0], video_meta[0], audios[0], audio_meta[0]
 
 
-def images_to_video(image_list: torch.Tensor, output_file: str, fps: int):
-    # record the encoding time
-    image_list = image_list.cpu().numpy()
-    av.logging.set_level(av.logging.INFO)
-    height, width, channels = image_list[0].shape
-    container = av.open(output_file, mode="w")
-    stream = container.add_stream("libx264", rate=fps)
-    stream.width = width
-    stream.height = height
-    stream.pix_fmt = "yuv420p"
-    codec_context = stream.codec_context
-    codec_context.options["crf"] = "22"
-    codec_context.options["threads"] = "0"
-    codec_context.options["preset"] = "ultrafast"
+def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
+    """
+    video:
+        torch.Tensor
+        shape:
+            [T, C, H, W]  or
+            [T, H, W, C]
 
-    for frame in image_list:
+    value range:
+        [-1,1] / [0,1] / [0,255]
+    """
+
+    if isinstance(video, torch.Tensor):
+        video = video.detach().cpu()
+
+    # -----------------------------
+    # format: TCHW -> THWC
+    # -----------------------------
+    if video.ndim != 4:
+        raise ValueError("video must be 4D tensor")
+
+    if video.shape[1] in (1, 3):  # TCHW
+        video = video.permute(0, 2, 3, 1)
+
+    video = video.numpy()
+
+    # -----------------------------
+    # normalize to uint8
+    # -----------------------------
+    if video.dtype != np.uint8:
+        vmin = video.min()
+        vmax = video.max()
+
+        if vmin >= -1 and vmax <= 1:
+            video = (video + 1) / 2
+
+        video = np.clip(video, 0, 1)
+        video = (video * 255).astype(np.uint8)
+
+    # -----------------------------
+    # ensure even resolution
+    # -----------------------------
+    T, H, W, C = video.shape
+
+    H_even = H // 2 * 2
+    W_even = W // 2 * 2
+
+    video = video[:, :H_even, :W_even, :]
+
+    # -----------------------------
+    # encode video
+    # -----------------------------
+    container = av.open(output_path, mode="w")
+    stream = container.add_stream("libx264", rate=fps)
+
+    stream.width = W_even
+    stream.height = H_even
+    stream.pix_fmt = "yuv420p"
+
+    stream.codec_context.options["crf"] = "22"
+    stream.codec_context.options["preset"] = "ultrafast"
+
+    for frame in video:
         if not frame.flags["C_CONTIGUOUS"]:
-            frame = np.ascontiguousarray(frame)  # 强制转换为 C 连续
-        frame = av.VideoFrame.from_numpy_buffer(frame, format="rgb24")
-        packet = stream.encode(frame)
-        container.mux(packet)
+            frame = np.ascontiguousarray(frame)
+
+        frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+
+        for packet in stream.encode(frame):
+            container.mux(packet)
+
     for packet in stream.encode():
         container.mux(packet)
+
     container.close()
-
-
-def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
-    images_to_video(video, output_path, fps=fps)
