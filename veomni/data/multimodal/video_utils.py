@@ -631,8 +631,14 @@ def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
         if vmin >= -1 and vmax <= 1:
             video = (video + 1) / 2
 
-        video = np.clip(video, 0, 1)
-        video = (video * 255).astype(np.uint8)
+        if vmin >= 0 and vmax <= 1:
+            video = video * 255
+            video = video.astype(np.uint8)
+        elif vmin >= 0 and vmax <= 255:
+            video = video.astype(np.uint8)
+        else:
+            video = np.clip(video, 0, 255)
+            video = video.astype(np.uint8)
 
     # -----------------------------
     # ensure even resolution
