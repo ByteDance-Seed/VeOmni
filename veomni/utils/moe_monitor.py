@@ -210,15 +210,17 @@ class MoERouterMonitor:
         fig.tight_layout()
 
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=100)
-        plt.close(fig)
-        buf.seek(0)
+        try:
+            fig.savefig(buf, format="png", dpi=100)
+            plt.close(fig)
+            buf.seek(0)
 
-        from PIL import Image
+            from PIL import Image
 
-        image = wandb.Image(Image.open(buf), caption=caption)
-        buf.close()
-        return image
+            image = wandb.Image(Image.open(buf), caption=caption)
+            return image
+        finally:
+            buf.close()
 
     @staticmethod
     def compute_vio(load_matrix: torch.Tensor) -> dict:
