@@ -1,0 +1,39 @@
+# Qwen3.5 SP equivalence test: dp=2, sp=2 (Ulysses enabled)
+# Run on 4 GPUs. Loss curve should match dp4_sp1 config on 4 GPUs.
+model:
+  model_path: Qwen3.5-27B
+  attn_implementation: flash_attention_3
+
+data:
+  train_path: /root/data/tulu-3-sft-mixture/data/
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 750000
+  text_keys: messages
+
+train:
+  output_dir: /mnt/local/localcache00/qwen3_5_sp_test_dp4_sp2
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 2
+  global_batch_size: 4
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: true
+  dyn_bsz_margin: 0
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.01
+  lr_decay_style: cosine
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  num_train_epochs: 1
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  init_device: meta
+  enable_full_determinism: true
+  save_hf_weights: false
+  use_wandb: true
+  wandb_project: Qwen3.5-SP-Test
+  wandb_name: qwen3_5_dp4_sp2
