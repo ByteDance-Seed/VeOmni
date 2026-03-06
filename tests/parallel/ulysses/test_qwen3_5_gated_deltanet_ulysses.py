@@ -19,9 +19,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
+
 
 # Only run in CI when ulysses SP or Qwen3.5 model code is touched.
-pytestmark = pytest.mark.qwen3_5_ulysses
+# Skip entirely on NPU — FLA triton kernels are GPU-only.
+pytestmark = [
+    pytest.mark.qwen3_5_ulysses,
+    pytest.mark.skipif(
+        IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet Ulysses tests require GPU (FLA triton kernels)"
+    ),
+]
 
 
 try:
@@ -41,9 +49,10 @@ def _set_deterministic(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+    torch_device = get_torch_device()
+    if torch_device.is_available():
+        torch_device.manual_seed(seed)
+        torch_device.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
@@ -126,8 +135,8 @@ def test_lasp_depthwise_conv1d_slicing_matches_full(
     bsz, seq_len, num_k_heads, num_v_heads, head_k_dim, head_v_dim, sp_size, kernel_size
 ):
     """Validate local QKV slicing and conv1d weight slicing match full conv output."""
-    if causal_conv1d_fn is None or not torch.cuda.is_available():
-        pytest.skip("FLA causal_conv1d or CUDA not available")
+    if causal_conv1d_fn is None or not get_torch_device().is_available():
+        pytest.skip("FLA causal_conv1d or accelerator not available")
 
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
 
@@ -136,7 +145,7 @@ def test_lasp_depthwise_conv1d_slicing_matches_full(
     value_dim = num_v_heads * head_v_dim
     conv_dim = key_dim * 2 + value_dim
 
-    device = torch.device("cuda")
+    device = get_device_type()
     mixed_qkv_full = torch.randn(bsz, seq_len, conv_dim, device=device)
     weight_full = torch.randn(conv_dim, kernel_size, device=device)
 
@@ -148,7 +157,7 @@ def test_lasp_depthwise_conv1d_slicing_matches_full(
         linear_value_head_dim=head_v_dim,
         linear_conv_kernel_dim=kernel_size,
     )
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).cuda()
+    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device)
     layer.conv1d.weight.data.copy_(weight_full.unsqueeze(1))
 
     out_full = _causal_depthwise_conv1d(mixed_qkv_full, weight_full)
@@ -174,9 +183,10 @@ def test_lasp_depthwise_conv1d_slicing_matches_full(
 
 def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz: int, seq_len: int) -> None:
     """Compare SP vs baseline forward outputs and parameter grads for Qwen3_5 GatedDeltaNet."""
-    torch.cuda.set_device(rank)
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
     dist.init_process_group(
-        backend="nccl",
+        backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
         rank=rank,
         world_size=world_size,
@@ -185,20 +195,19 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
     from veomni.distributed.parallel_state import init_parallel_state
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
 
-    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type="cuda")
+    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
 
     _set_deterministic(42)
     config = _TinyQwen3_5Config()
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).cuda()
+    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
     layer.train()
 
     hidden = config.hidden_size
-    device = torch.device("cuda")
 
     if rank == 0:
-        full_input = torch.randn(bsz, seq_len, hidden, device=device)
+        full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
     else:
-        full_input = torch.empty(bsz, seq_len, hidden, device=device)
+        full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
     dist.broadcast(full_input, src=0)
 
     shard_len = seq_len // world_size
@@ -262,10 +271,10 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
 @pytest.mark.parametrize("seq_len", [256, 2048])
 def test_qwen3_5_gated_deltanet_sp_equivalence(world_size, bsz, seq_len):
     """Ensure SP partitioned forward outputs and grads match the non-SP baseline."""
-    if causal_conv1d_fn is None or not torch.cuda.is_available():
-        pytest.skip("FLA causal_conv1d or CUDA not available")
-    if torch.cuda.device_count() < world_size:
-        pytest.skip(f"Requires at least {world_size} GPUs for SP equivalence test")
+    if causal_conv1d_fn is None or not get_torch_device().is_available():
+        pytest.skip("FLA causal_conv1d or accelerator not available")
+    if get_torch_device().device_count() < world_size:
+        pytest.skip(f"Requires at least {world_size} devices for SP equivalence test")
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         init_file = tmp.name
 
@@ -285,9 +294,10 @@ def test_qwen3_5_gated_deltanet_sp_equivalence(world_size, bsz, seq_len):
 
 def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: str, bsz: int, seq_len: int) -> None:
     """Verify deterministic SP forward per rank."""
-    torch.cuda.set_device(rank)
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
     dist.init_process_group(
-        backend="nccl",
+        backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
         rank=rank,
         world_size=world_size,
@@ -296,20 +306,19 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
     from veomni.distributed.parallel_state import init_parallel_state
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
 
-    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type="cuda")
+    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
 
     _set_deterministic(42)
     config = _TinyQwen3_5Config()
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).cuda()
+    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
     layer.train()
 
     hidden = config.hidden_size
-    device = torch.device("cuda")
 
     if rank == 0:
-        full_input = torch.randn(bsz, seq_len, hidden, device=device)
+        full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
     else:
-        full_input = torch.empty(bsz, seq_len, hidden, device=device)
+        full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
     dist.broadcast(full_input, src=0)
 
     shard_len = seq_len // world_size
@@ -326,10 +335,10 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
 @pytest.mark.parametrize("seq_len", [8, 2048, 32768])
 def test_qwen3_5_gated_deltanet_forward_deterministic_sp(world_size, bsz, seq_len):
     """Ensure repeated SP forward passes are deterministic per rank."""
-    if causal_conv1d_fn is None or not torch.cuda.is_available():
-        pytest.skip("FLA causal_conv1d or CUDA not available")
-    if torch.cuda.device_count() < world_size:
-        pytest.skip(f"Requires at least {world_size} GPUs for SP determinism test")
+    if causal_conv1d_fn is None or not get_torch_device().is_available():
+        pytest.skip("FLA causal_conv1d or accelerator not available")
+    if get_torch_device().device_count() < world_size:
+        pytest.skip(f"Requires at least {world_size} devices for SP determinism test")
     if seq_len % world_size != 0:
         pytest.skip(f"seq_len must be divisible by world_size (seq_len={seq_len}, world_size={world_size})")
 
@@ -357,18 +366,19 @@ def test_qwen3_5_gated_deltanet_forward_deterministic_sp(world_size, bsz, seq_le
 @pytest.mark.parametrize("seq_len", [8, 2048, 32768])
 def test_qwen3_5_gated_deltanet_forward_deterministic_no_sp(bsz, seq_len):
     """Ensure repeated non-SP forward passes are deterministic."""
-    if causal_conv1d_fn is None or not torch.cuda.is_available():
-        pytest.skip("FLA causal_conv1d or CUDA not available")
+    if causal_conv1d_fn is None or not get_torch_device().is_available():
+        pytest.skip("FLA causal_conv1d or accelerator not available")
 
     from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
 
+    device_type = get_device_type()
+
     _set_deterministic(42)
     config = _TinyQwen3_5Config()
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).cuda()
+    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
     layer.train()
 
-    device = torch.device("cuda")
-    inputs = torch.randn(bsz, seq_len, config.hidden_size, device=device)
+    inputs = torch.randn(bsz, seq_len, config.hidden_size, device=device_type)
 
     no_sp_state = SimpleNamespace(ulysses_enabled=False)
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
