@@ -43,7 +43,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_position_embedding
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.device import get_device_id
 
@@ -58,7 +57,6 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.distributed.sequence_parallel", names=["slice_position_embedding"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
@@ -501,11 +499,6 @@ def qwen3_5_text_model_forward_patched(
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-    # ============================== VeOmni SP Patch Start ==============================
-    sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-    # =============================== VeOmni SP Patch End ===============================
 
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         layer_mask = linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
