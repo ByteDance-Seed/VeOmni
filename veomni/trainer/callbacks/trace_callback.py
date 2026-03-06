@@ -36,35 +36,36 @@ class MoERouterMonitorCallback(Callback):
         super().__init__(trainer)
         self.monitor = None
 
-    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.moe_load_balance_monitor_interval > 0:
-            config = self.trainer.model_config
-            if hasattr(config, "num_experts"):
-                from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
-
-                self.monitor = MoERouterMonitor(config.num_experts)
-                set_active_monitor(self.monitor)
-                logger.info_rank0(
-                    f"MoE router monitor enabled: num_experts={config.num_experts}, "
-                    f"interval={args.train.moe_load_balance_monitor_interval}"
-                )
-            else:
-                logger.warning_rank0(
-                    "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
-                    "MoE router monitor not activated."
-                )
-        else:
+        if not args.train.use_wandb:
+            logger.info_rank0("MoE router monitor disabled (wandb not enabled).")
+            return
+        if args.train.moe_load_balance_monitor_interval <= 0:
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
+            return
+
+        config = self.trainer.model_config
+        if hasattr(config, "num_experts"):
+            from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
+
+            self.monitor = MoERouterMonitor(config.num_experts)
+            set_active_monitor(self.monitor)
+            logger.info_rank0(
+                f"MoE router monitor enabled: num_experts={config.num_experts}, "
+                f"interval={args.train.moe_load_balance_monitor_interval}"
+            )
+        else:
+            logger.warning_rank0(
+                "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
+                "MoE router monitor not activated."
+            )
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
         if (
             self.monitor
-            and args.train.moe_load_balance_monitor_interval > 0
             and state.global_step % args.train.moe_load_balance_monitor_interval == 0
             and args.train.global_rank == 0
-            and args.train.use_wandb
         ):
             import wandb
 
