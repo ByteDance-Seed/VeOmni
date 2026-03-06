@@ -86,7 +86,7 @@ init_parallel_state(
     pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
     cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
     ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
-    dp_mode=args.train.accelerator.dp_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
+    fsdp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
     async_enabled=args.train.accelerator.async_enabled, # async ulysses
 )
 
