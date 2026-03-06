@@ -184,17 +184,21 @@ class EnvironMeter:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
-        if isinstance(micro_batch, List):
-            for sample in micro_batch:
-                self.batch_seqlens.extend(_compute_seqlens(sample))
-                self.images_seqlens.extend(_compute_image_seqlens(sample))
+        if getattr(self.config, "condition_model_type", None) is None:  # hf model
+            if isinstance(micro_batch, List):
+                for sample in micro_batch:
+                    self.batch_seqlens.extend(_compute_seqlens(sample))
+                    self.images_seqlens.extend(_compute_image_seqlens(sample))
+                    if self.enable_multisource:
+                        self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
+            else:
+                self.batch_seqlens.extend(_compute_seqlens(micro_batch))
+                self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
                 if self.enable_multisource:
-                    self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
-        else:
-            self.batch_seqlens.extend(_compute_seqlens(micro_batch))
-            self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
-            if self.enable_multisource:
-                self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+                    self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+        else:  # dit diffusers model
+            # TODO: dit environ_meter
+            self.batch_seqlens.extend([0])
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0:
