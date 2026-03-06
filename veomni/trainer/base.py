@@ -73,6 +73,7 @@ from .callbacks import (
     EnvironMeterCallback,
     EvaluateCallback,
     HuggingfaceCkptCallback,
+    MoERouterMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
     TrainerState,
@@ -371,6 +372,7 @@ class BaseTrainer(Stateful, ABC):
         self.checkpointer_callback = CheckpointerCallback(self)
         self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
+        self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self):
@@ -381,6 +383,7 @@ class BaseTrainer(Stateful, ABC):
         self.checkpointer_callback.on_train_begin(self.state)
         self.hf_ckpt_callback.on_train_begin(self.state)
         self.evaluate_callback.on_train_begin(self.state)
+        self.moe_monitor_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
@@ -390,6 +393,7 @@ class BaseTrainer(Stateful, ABC):
         self.checkpointer_callback.on_train_end(self.state)
         self.hf_ckpt_callback.on_train_end(self.state)
         self.evaluate_callback.on_train_end(self.state)
+        self.moe_monitor_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.environ_meter_callback.on_epoch_begin(self.state)
@@ -426,6 +430,7 @@ class BaseTrainer(Stateful, ABC):
         self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""

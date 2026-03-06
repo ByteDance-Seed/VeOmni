@@ -179,6 +179,14 @@ def main():
         lr_start=args.train.optimizer.lr_start,
     )
 
+    # Setup MoE expert load monitor
+    moe_monitor = None
+    if args.train.moe_load_balance_monitor_interval > 0 and hasattr(model_config, "num_experts"):
+        from veomni.utils.moe_monitor import MoERouterMonitor, set_active_monitor
+
+        moe_monitor = MoERouterMonitor(model_config.num_experts)
+        set_active_monitor(moe_monitor)
+
     model_assets = None
     if args.train.global_rank == 0:
         if args.train.wandb.enable:
@@ -337,6 +345,28 @@ def main():
                             "training/lr": lr,
                         }
                     )
+                    if (
+                        moe_monitor
+                        and args.train.moe_load_balance_monitor_interval > 0
+                        and global_step % args.train.moe_load_balance_monitor_interval == 0
+                    ):
+                        load_matrix = moe_monitor.get_load_matrix(current_step=global_step)
+                        train_metrics["moe/expert_load_heatmap"] = moe_monitor.create_wandb_image(load_matrix)
+                        from veomni.utils.moe_monitor import MoERouterMonitor
+
+                        vio = MoERouterMonitor.compute_vio(load_matrix)
+                        max_vio, min_vio, avg_vio = vio["max_vio"], vio["min_vio"], vio["avg_vio"]
+                        num_moe_layers = load_matrix.shape[0]
+                        for i in range(num_moe_layers):
+                            train_metrics[f"moe/max_vio/layer_{i}"] = max_vio[i].item()
+                            train_metrics[f"moe/min_vio/layer_{i}"] = min_vio[i].item()
+                            train_metrics[f"moe/avg_vio/layer_{i}"] = avg_vio[i].item()
+                        train_metrics["moe/max_vio/max"] = max_vio.max().item()
+                        train_metrics["moe/max_vio/avg"] = max_vio.mean().item()
+                        train_metrics["moe/min_vio/max"] = min_vio.max().item()
+                        train_metrics["moe/min_vio/avg"] = min_vio.mean().item()
+                        train_metrics["moe/avg_vio/max"] = avg_vio.max().item()
+                        train_metrics["moe/avg_vio/avg"] = avg_vio.mean().item()
                     wandb.log(train_metrics, step=global_step)
 
             if args.train.profile.this_rank and global_step <= args.train.profile.end_step:
