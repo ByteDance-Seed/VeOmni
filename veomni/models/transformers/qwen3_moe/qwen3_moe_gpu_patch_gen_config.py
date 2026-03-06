@@ -70,22 +70,18 @@ config.patches.append(
 )
 
 
-@config.replace_class(
-    "Qwen3MoeExperts", description="Use legacy gate/up/down expert weights and explicit VeOmni fused MoE path"
-)
+@config.replace_class("Qwen3MoeExperts", description="Bypass HF use_experts_implementation and use VeOmni MoE path")
 class PatchedQwen3MoeExperts(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.moe_intermediate_size
-        # VeOmni keeps split expert weights here (gate_proj/up_proj/down_proj),
-        # which differs from transformers v5 native gate_up_proj layout.
-        # HuggingFace safetensor checkpoints often store expert weights per expert;
-        # run scripts/moe_ckpt_merge/moe_merge.py to merge weights before training.
-        self.gate_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
-        self.up_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
+        # Match transformers v5 expert layout: gate_up_proj is [E, 2*I, H] in [gate, up] order.
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.gate_up_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+        )
         self.act_fn = ACT2FN[config.hidden_act]
         self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
@@ -108,21 +104,26 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
                     continue
                 top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
                 current_state = hidden_states[token_idx]
-                gate = torch.nn.functional.linear(current_state, self.gate_proj[expert_idx])
-                up = torch.nn.functional.linear(current_state, self.up_proj[expert_idx])
+                gate, up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
                 current_hidden_states = self.act_fn(gate) * up
                 current_hidden_states = torch.nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
                 current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
                 final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
         elif self._moe_implementation == "fused":
+            # NOTE: group_gemm fused MoE currently requires contiguous weight tensors.
+            # Slicing gate_up_proj along dim=1 produces non-contiguous views, so materialize here.
+            # TODO: Switch to a fused MoE interface that accepts stacked gate_up_proj directly
+            # to avoid split + contiguous() overhead on every forward.
+            gate_weight = self.gate_up_proj[:, : self.intermediate_dim, :].contiguous()
+            up_weight = self.gate_up_proj[:, self.intermediate_dim :, :].contiguous()
             final_hidden_states = fused_moe_forward(
                 module=self,
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
                 hidden_states=hidden_states,
-                fc1_1_weight=self.gate_proj,
-                fc1_2_weight=self.up_proj,
+                fc1_1_weight=gate_weight,
+                fc1_2_weight=up_weight,
                 fc2_weight=self.down_proj,
             )
         else:

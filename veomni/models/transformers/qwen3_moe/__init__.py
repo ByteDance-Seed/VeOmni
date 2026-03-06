@@ -15,10 +15,23 @@ from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
+def _register_checkpoint_tensor_converter_for_v5(*model_classes):
+    from .checkpoint_tensor_converter import create_qwen3_moe_checkpoint_tensor_converter
+
+    for model_cls in model_classes:
+        model_cls._create_checkpoint_tensor_converter = create_qwen3_moe_checkpoint_tensor_converter
+
+
 @MODELING_REGISTRY.register("qwen3_moe")
 def register_qwen3_moe_modeling(architecture: str):
     if is_transformers_version_greater_or_equal_to("5.0.0"):
         from .generated.patched_modeling_qwen3_moe_gpu import (
+            Qwen3MoeForCausalLM,
+            Qwen3MoeForQuestionAnswering,
+            Qwen3MoeModel,
+        )
+
+        _register_checkpoint_tensor_converter_for_v5(
             Qwen3MoeForCausalLM,
             Qwen3MoeForQuestionAnswering,
             Qwen3MoeModel,
