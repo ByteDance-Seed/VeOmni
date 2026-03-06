@@ -603,6 +603,10 @@ class TrainingArguments:
             "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
         },
     )
+    moe_load_balance_monitor_interval: int = field(
+        default=0,
+        metadata={"help": "Log MoE expert load heatmap every N steps. 0 = disabled. Requires use_wandb=True."},
+    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
