@@ -36,13 +36,17 @@ logger = logging.get_logger(__name__)
 
 
 def parallel_load_safetensors(
-    filepath: str, specific_param_name: list[str] = None, ignore_param_name: list[str] = None
+    filepath: str,
+    specific_param_name: list[str] = None,
+    ignore_param_name: list[str] = None,
 ):
     assert not (specific_param_name is not None and ignore_param_name is not None)
 
     # download the model from hdfs to cache dir if needed
     filepath = copy_to_local(src=filepath, cache_dir=f"{CACHE_DIR}/models", verbose=True)
     dist.barrier()
+
+    cpu_load_param_file = {}
 
     safetensors2param = {}
     index_file = os.path.join(filepath, "model.safetensors.index.json")
@@ -55,6 +59,7 @@ def parallel_load_safetensors(
             elif ignore_param_name is not None:
                 if param_name in ignore_param_name:
                     continue
+
             safetensors2param.setdefault(filename, []).append(param_name)
     else:
         # in this case, the model is small and we can load it all at once
@@ -85,6 +90,17 @@ def parallel_load_safetensors(
             for file in files:
                 for param_name in safetensors2param[file]:
                     shard_states[param_name] = rank
+
+    for param_name, filename in cpu_load_param_file.items():
+        if dist.get_rank() == 0:
+            safetensors_file = os.path.join(filepath, filename)
+            states = load_file(safetensors_file, device="cpu")
+            valid_states = {k: v for k, v in states.items() if k == param_name}
+            shard_states.update(valid_states)
+            del states
+        else:
+            shard_states[param_name] = 0
+
     return shard_states
 
 
@@ -139,9 +155,11 @@ def parallel_init_fsdp_fn(
         if isinstance(spec_info.placement, Replicate):
             return torch.empty_like(param.data, device=device)
         else:
-            assert isinstance(spec_info.placement, Shard)
+            assert isinstance(spec_info.placement, Shard), (
+                f"Unsupported placement type: {type(spec_info.placement)} for spec_info: {spec_info}"
+            )
             size = list(param.shape)
-            size[spec_info.placement.dim] *= spec_info.ep_mesh.size()
+            size[spec_info.placement.dim] *= spec_info.para_mesh.size()
             return torch.empty(size, dtype=param.dtype, device=device)
 
     def copy_to_local(param: torch.Tensor, full_data: torch.Tensor, spec_info: SpecInfo):
@@ -157,8 +175,8 @@ def parallel_init_fsdp_fn(
             param.data.copy_(full_data)
         else:
             assert isinstance(spec_info.placement, Shard)
-            local_data = full_data.chunk(spec_info.ep_mesh.size(), dim=spec_info.placement.dim)[
-                spec_info.ep_mesh.get_local_rank()
+            local_data = full_data.chunk(spec_info.para_mesh.size(), dim=spec_info.placement.dim)[
+                spec_info.para_mesh.get_local_rank()
             ]
             param.data.copy_(local_data.contiguous())
         param.spec_info = spec_info
@@ -168,7 +186,7 @@ def parallel_init_fsdp_fn(
         element_size = param.element_size()
         param_size = element_size * numel
         if hasattr(state, "spec_info") and isinstance(state.spec_info.placement, Shard):
-            param_size *= state.spec_info.ep_mesh.size()
+            param_size *= state.spec_info.para_mesh.size()
             return param_size >= size_gb * (1024**3)
         else:
             return False
@@ -176,10 +194,10 @@ def parallel_init_fsdp_fn(
     def chunk_and_broadcast_data(param, full_data, spec_info):
         device = param.device
         placement = spec_info.placement
-        ep_size = spec_info.ep_mesh.size()
+        para_size = spec_info.para_mesh.size()
         global_size = list(param.data.size())
 
-        global_size[placement.dim] *= ep_size
+        global_size[placement.dim] *= para_size
         global_size = torch.Size(global_size)
         loaded_size = full_data.size()
         pad_size = tuple((0, module_dim - load_dim) for module_dim, load_dim in zip(global_size, loaded_size))
@@ -187,24 +205,24 @@ def parallel_init_fsdp_fn(
         full_data = torch.nn.functional.pad(full_data, pad_size)
         chunk_loaded_data = list(
             full_data.chunk(
-                ep_size,
+                para_size,
                 dim=placement.dim,
             )
         )
         broadcast_buffer = torch.empty_like(param.data, device=device)
-        for chunk_id in range(ep_size):
+        for chunk_id in range(para_size):
             broadcast_buffer.copy_(chunk_loaded_data[chunk_id].contiguous())
             dist.broadcast(broadcast_buffer, src=dist.get_rank())
-        param.data.copy_(chunk_loaded_data[spec_info.ep_mesh.get_local_rank()].contiguous())
+        param.data.copy_(chunk_loaded_data[spec_info.para_mesh.get_local_rank()].contiguous())
         param.spec_info = spec_info
         del broadcast_buffer
 
     def receive_broadcasted_chunk_data(param, broadcast_src, spec_info):
         device = param.device
         chunk_received_data = torch.empty_like(param.data, device=device)
-        for chunk_id in range(spec_info.ep_mesh.size()):
+        for chunk_id in range(spec_info.para_mesh.size()):
             dist.broadcast(chunk_received_data, src=broadcast_src)
-            if chunk_id == spec_info.ep_mesh.get_local_rank():
+            if chunk_id == spec_info.para_mesh.get_local_rank():
                 param.data.copy_(chunk_received_data)
         param.spec_info = spec_info
         del chunk_received_data
@@ -238,7 +256,7 @@ def parallel_init_fsdp_fn(
                 if hasattr(state, "spec_info"):
                     shard = state.spec_info.placement
                     if isinstance(shard, Shard):
-                        size[shard.dim] *= state.spec_info.ep_mesh.size()
+                        size[shard.dim] *= state.spec_info.para_mesh.size()
                 shard_states[param_name] = torch.nn.Parameter(
                     torch.randn(size, dtype=state.dtype, device=device, requires_grad=state.requires_grad)
                     * initializer_range

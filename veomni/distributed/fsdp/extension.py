@@ -40,24 +40,25 @@ orig_optim_state_dict = FSDP.optim_state_dict
 orig_optim_state_dict_to_load = FSDP.optim_state_dict_to_load
 
 
-def _shard_tensor(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh, shard: Shard = Shard(0)):
+def _shard_tensor(
+    orgin_tensor: torch.Tensor, para_mesh: DeviceMesh, para_fsdp_mesh: DeviceMesh, shard: Shard = Shard(0)
+):
     """
     Shard Tensor to DTensor.
 
     args:
         orgin_tensor (torch.Tensor): The orgin tensor.
-        device_mesh (DeviceMesh): The ep device mesh.
+        device_mesh (DeviceMesh): The para (e.g. ep) device mesh.
         shard (Shard): The shard info, default Shard(0).
 
     """
-    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-    ep_mesh = device_mesh["ep"]
+    assert para_fsdp_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {para_fsdp_mesh.ndim}"
 
     if orgin_tensor.__class__.__name__ == "DTensor":
         placements = (shard,) + orgin_tensor.placements
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=device_mesh, placements=placements)
+        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=para_fsdp_mesh, placements=placements)
     elif orgin_tensor.__class__.__name__ == "Tensor":
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=ep_mesh, placements=[shard])
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=para_mesh, placements=[shard])
 
     return dtensor
 
@@ -124,12 +125,15 @@ def check_all_unflat_param_names_match(unflat_param_names: Tuple[str], fqn2spec_
 class CheckpointExtensions(FSDPExtensions):
     def __init__(
         self,
-        ep_fsdp_device_mesh: DeviceMesh,
+        extra_parallel_fsdp_device_mesh: Dict[str, DeviceMesh],
         fqn2spec_info: Dict[str, SpecInfo],
     ):
         super().__init__()
-        self.ep_fsdp_device_mesh = ep_fsdp_device_mesh
-        self.ep_mesh = ep_fsdp_device_mesh["ep"] if ep_fsdp_device_mesh is not None else None
+        self.extra_parallel_fsdp_device_mesh = extra_parallel_fsdp_device_mesh
+        self.extra_parallel_mesh = {
+            para: para_fsdp_device_mesh[para] if para_fsdp_device_mesh is not None else None
+            for para, para_fsdp_device_mesh in extra_parallel_fsdp_device_mesh.items()
+        }
         self.fqn2spec_info = fqn2spec_info
 
     def chunk_dtensor(self, tensor: torch.Tensor, rank: int, device_mesh: DeviceMesh) -> torch.Tensor:
@@ -194,24 +198,27 @@ class CheckpointExtensions(FSDPExtensions):
         self, module, state_dict, prefix, local_metadata, fqn2spec_info: Dict[str, SpecInfo] = None
     ):
         """
-        Post state dict when calling `model.state_dict()` for EP cases.
+        Post state dict when calling `model.state_dict()` for ExtraParallel cases.
 
-        This will append EP placements to the FSDP DTensor state dicts
+        This will append ExtraParallel placements to the FSDP DTensor state dicts
         """
         assert fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
 
-        if self.ep_mesh is None:
+        if all(para_mesh is None for para_mesh in self.extra_parallel_mesh.values()):
             return
-        # [pp, ep_dp, ep, tp]
-        global_device_mesh = self.ep_fsdp_device_mesh
-        assert global_device_mesh.ndim == 2
+
+        for para_fsdp_device_mesh in self.extra_parallel_fsdp_device_mesh.values():
+            if para_fsdp_device_mesh is not None:
+                assert para_fsdp_device_mesh.ndim == 2
 
         keys = list(state_dict.keys())
         for name in sorted(keys):
             if name in fqn2spec_info and isinstance(fqn2spec_info[name].placement, Shard):
                 cur_spec_info = fqn2spec_info[name]
                 tensor = state_dict[name]
-                tensor = _shard_tensor(tensor, cur_spec_info.ep_fsdp_mesh, cur_spec_info.placement)
+                tensor = _shard_tensor(
+                    tensor, cur_spec_info.para_mesh, cur_spec_info.para_fsdp_mesh, cur_spec_info.placement
+                )
                 state_dict[name] = tensor
 
     @torch.no_grad()
@@ -227,29 +234,32 @@ class CheckpointExtensions(FSDPExtensions):
         fqn2spec_info: Dict[str, SpecInfo] = None,
     ):
         """
-        Pre load state dict when calling `model.load_state_dict()` for EP cases.
+        Pre load state dict when calling `model.load_state_dict()` for ExtraParallel cases.
 
         This will shard Dtensor from ckpt to tensor state dicts
         """
         assert fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
 
-        if self.ep_mesh is None:
-            return
-        # [ep, fsdp-ep]
-        global_device_mesh = self.ep_fsdp_device_mesh
-        assert global_device_mesh.ndim == 2
-
-        if self.ep_mesh.size() != global_device_mesh.size():
+        if all(para_mesh is None for para_mesh in self.extra_parallel_mesh.values()):
             return
 
-        keys = list(state_dict.keys())
-        for name in sorted(keys):
-            tensor = state_dict[name]
-            if check_any_unflat_param_names_match(name, fqn2spec_info, "_fsdp_wrapped_module"):
-                fqn = name.split("_fsdp_wrapped_module.")[-1]
-                cur_spec_info = fqn2spec_info[fqn]
-                tensor = _shard_dtensor(tensor, cur_spec_info.ep_fsdp_mesh, cur_spec_info.placement)
-                state_dict[name] = tensor
+        for para, para_mesh in self.extra_parallel_mesh.items():
+            if para_mesh is not None:
+                # [para, fsdp-para], e.g. [ep, fsdp-ep]
+                global_para_device_mesh = self.extra_parallel_fsdp_device_mesh[para]
+                assert global_para_device_mesh is not None
+
+                if para_mesh.size() == global_para_device_mesh.size():
+                    keys = list(state_dict.keys())
+                    for name in sorted(keys):
+                        tensor = state_dict[name]
+                        if check_any_unflat_param_names_match(name, fqn2spec_info, "_fsdp_wrapped_module"):
+                            fqn = name.split("_fsdp_wrapped_module.")[-1]
+                            cur_spec_info = fqn2spec_info[fqn]
+                            cur_mesh = cur_spec_info.para_fsdp_mesh
+                            tensor = _shard_dtensor(tensor, cur_mesh, cur_spec_info.placement)
+
+                            state_dict[name] = tensor
 
     def patch_convert_state_with_flat_params(self):
         """ """
@@ -335,13 +345,14 @@ class CheckpointExtensions(FSDPExtensions):
             # NOTE we don't support diverse process group for different FSDP sub-modules
             fsdp_pg = model.process_group
             optim_state = orig_optim_state_dict(model, optim, optim_state_dict, fsdp_pg)
-            if self.ep_mesh is None:
+            if all(para_mesh is None for para_mesh in self.extra_parallel_mesh.values()):
                 return optim_state
 
-            global_device_mesh = self.ep_fsdp_device_mesh
-            assert global_device_mesh.ndim == 2
+            for para_fsdp_device_mesh in self.extra_parallel_fsdp_device_mesh.values():
+                if para_fsdp_device_mesh is not None:
+                    assert para_fsdp_device_mesh.ndim == 2
 
-            # extend placements by adding EP placement
+            # extend placements by adding ExtraParallel placement
             for fqn in sorted(optim_state["state"].keys()):
                 if fqn in fqn2spec_info and isinstance(fqn2spec_info[fqn].placement, Shard):
                     cur_spec_info = fqn2spec_info[fqn]
@@ -349,7 +360,9 @@ class CheckpointExtensions(FSDPExtensions):
                     for key, val in optim_state["state"][fqn].items():
                         # key in OPTIM_STATE_NO_SHARD_KEY in optim stat dict is scalar, like'step', should not be sharded
                         if key not in OPTIM_STATE_NO_SHARD_KEY:
-                            val = _shard_tensor(val, cur_spec_info.ep_fsdp_mesh, cur_spec_info.placement)
+                            val = _shard_tensor(
+                                val, cur_spec_info.para_mesh, cur_spec_info.para_fsdp_mesh, cur_spec_info.placement
+                            )
                         fqn_state[key] = val
                     optim_state["state"][fqn] = fqn_state
             return optim_state
@@ -384,20 +397,22 @@ class CheckpointExtensions(FSDPExtensions):
             fsdp_mesh = model._device_mesh
             assert fsdp_mesh is not None, "Please init FSDP module with device_mesh"
 
-            global_device_mesh = self.ep_fsdp_device_mesh
-            assert global_device_mesh.ndim == 2
+            for para_fsdp_device_mesh in self.extra_parallel_fsdp_device_mesh.values():
+                if para_fsdp_device_mesh is not None:
+                    assert para_fsdp_device_mesh.ndim == 2
 
             # NOTE we don't support diverse process group for different FSDP sub-modules
-            if self.ep_mesh is not None and self.ep_mesh.size() == self.ep_fsdp_device_mesh.size():
-                for fqn in sorted(optim_state_dict["state"].keys()):
-                    if check_any_unflat_param_names_match(fqn, fqn2spec_info):
-                        fqn_state = {}
-                        for key, val in optim_state_dict["state"][fqn].items():
-                            # key in OPTIM_STATE_NO_SHARD_KEY in optim stat dict is scalar, like 'step', should not be sharded
-                            if key not in OPTIM_STATE_NO_SHARD_KEY:
-                                val = _shard_dtensor(val, self.ep_mesh)
-                            fqn_state[key] = val
-                        optim_state_dict["state"][fqn] = fqn_state
+            for para, para_mesh in self.extra_parallel_mesh.items():
+                if para_mesh is not None and para_mesh.size() == self.extra_parallel_fsdp_device_mesh[para].size():
+                    for fqn in sorted(optim_state_dict["state"].keys()):
+                        if check_any_unflat_param_names_match(fqn, fqn2spec_info):
+                            fqn_state = {}
+                            for key, val in optim_state_dict["state"][fqn].items():
+                                # key in OPTIM_STATE_NO_SHARD_KEY in optim stat dict is scalar, like 'step', should not be sharded
+                                if key not in OPTIM_STATE_NO_SHARD_KEY:
+                                    val = _shard_dtensor(val, para_mesh)
+                                fqn_state[key] = val
+                            optim_state_dict["state"][fqn] = fqn_state
 
             fsdp_pg = model.process_group
             optim_state = orig_optim_state_dict_to_load(
@@ -413,19 +428,19 @@ class CheckpointExtensions(FSDPExtensions):
 
 def register_checkpoint_extension(
     fsdp_model: FSDP,
-    save_hook_mesh: DeviceMesh = None,
+    save_hook_mesh: Dict[str, DeviceMesh] = None,
     fqn2spec_info: Dict[str, SpecInfo] = None,
 ):
     """
-    Register dtensor-based hooks for FSDP+EP
+    Register dtensor-based hooks for FSDP+ExtraParallel
 
     This will:
 
-    1. Customize the FSDP extension for save / load hooks in EP scenarios.
+    1. Customize the FSDP extension for save / load hooks in ExtraParallel scenarios.
     """
 
     extension = CheckpointExtensions(
-        ep_fsdp_device_mesh=save_hook_mesh,
+        extra_parallel_fsdp_device_mesh=save_hook_mesh,
         fqn2spec_info=fqn2spec_info,
     )
     for fsdp_module in FSDP.fsdp_modules(fsdp_model):
@@ -435,7 +450,7 @@ def register_checkpoint_extension(
     fsdp_model._fsdp_extension = extension
     fsdp_model._handle._fsdp_extension = extension
 
-    # register load / save hook for ep
+    # register load / save hook for para (e.g. ep)
     if fqn2spec_info is not None:
         state_dict_post_hook_fn = partial(extension.state_dict_post_hook, fqn2spec_info=fqn2spec_info)
         fsdp_model._register_state_dict_hook(state_dict_post_hook_fn)
@@ -443,7 +458,7 @@ def register_checkpoint_extension(
         load_state_dict_pre_hook_fn = partial(extension.load_state_dict_pre_hook, fqn2spec_info=fqn2spec_info)
         fsdp_model._register_load_state_dict_pre_hook(load_state_dict_pre_hook_fn)
 
-        # patch load / save functino for ep
+        # patch load / save functino for para (e.g. ep)
         extension.patch_convert_state_with_flat_params()
         extension.patch_fsdp_optim_state_dict()
         extension.patch_fsdp_optim_state_dict_to_load()

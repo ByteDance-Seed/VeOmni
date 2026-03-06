@@ -206,12 +206,14 @@ class BaseTrainer(Stateful, ABC):
             dp_replicate_size=self.args.train.data_parallel_replicate_size,
             dp_shard_size=self.args.train.data_parallel_shard_size,
             tp_size=self.args.train.tensor_parallel_size,
-            ep_size=self.args.train.expert_parallel_size,
             pp_size=self.args.train.pipeline_parallel_size,
             cp_size=self.args.train.context_parallel_size,
             ulysses_size=self.args.train.ulysses_parallel_size,
             dp_mode=self.args.train.data_parallel_mode,
             async_enabled=self.args.train.async_enabled,
+            extra_parallel_sizes=self.args.train.extra_parallel_sizes,
+            extra_parallel_placement_innermost=self.args.train.extra_parallel_placement_innermost,
+            extra_parallel_names=self.args.train.extra_parallel_names,
         )
 
         # Set random seed

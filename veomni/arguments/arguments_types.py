@@ -489,6 +489,18 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
     )
+    extra_parallel_sizes: List[int] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism sizes."},
+    )
+    extra_parallel_placement_innermost: List[bool] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism outside in para-fsdp."},
+    )
+    extra_parallel_names: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism names."},
+    )
     pipeline_parallel_size: int = field(
         default=1,
         metadata={"help": "Pipeline parallel size."},
@@ -723,6 +735,11 @@ class TrainingArguments:
                 self.profile_this_rank = True
         else:
             self.profile_this_rank = False
+
+        # configure extra parallelism to include expert parallelism
+        self.extra_parallel_sizes.append(self.expert_parallel_size)
+        self.extra_parallel_names.append("ep")
+        self.extra_parallel_placement_innermost.append(self.ep_outside)
 
 
 @dataclass

@@ -115,12 +115,14 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         dp_replicate_size=args.train.data_parallel_replicate_size,
         dp_shard_size=args.train.data_parallel_shard_size,
         tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
         pp_size=args.train.pipeline_parallel_size,
         cp_size=args.train.context_parallel_size,
         ulysses_size=args.train.ulysses_parallel_size,
         dp_mode=args.train.data_parallel_mode,
         ep_outside=args.train.ep_outside,
+        extra_parallel_sizes=args.train.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.train.extra_parallel_placement_innermost,
+        extra_parallel_names=args.train.extra_parallel_names,
     )
 
     try:
