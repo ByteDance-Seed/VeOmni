@@ -128,7 +128,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
 
     def on_train_end(self, state: TrainerState, **kwargs):
         if self.save_hf_weights:
-            self._save_checkpoint(state)
+            self._save_checkpoint(state, stage="train_end")
 
     def on_step_end(self, state: TrainerState, **kwargs):
         if self.save_hf_weights and self.every_n_steps and state.global_step % self.every_n_steps == 0:
@@ -147,7 +147,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             save_model_assets(args.train.model_assets_dir, self.trainer.model_assets)
         dist.barrier()
 
-    def _save_checkpoint(self, state: TrainerState):
+    def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save model in HuggingFace format."""
 
         args: "VeOmniArguments" = self.trainer.args
@@ -158,6 +158,10 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
 
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
             self.trainer.checkpointer.save_future.result()
+
+        if stage == "train_end":
+            del self.trainer.optimizer
+            del self.trainer.lr_scheduler
 
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         save_hf_safetensor(
