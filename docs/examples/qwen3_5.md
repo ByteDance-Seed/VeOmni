@@ -43,8 +43,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-27B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --data.max_seq_len 128 \
-    --train.data_parallel_mode fsdp2 \
+    --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.max_steps 20 \
-    --train.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir /mnt/local/localcache00
 ```

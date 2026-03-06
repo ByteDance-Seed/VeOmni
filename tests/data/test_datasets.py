@@ -117,9 +117,9 @@ class CheckpointerCallbackTest(CheckpointerCallback):
         if state.epoch == 1 and not self.trainer.is_resume:
             self._save_checkpoint(state)
             self.trainer.resume_dcp_path = os.path.join(
-                self.trainer.args.train.save_checkpoint_path, f"global_step_{state.global_step}"
+                self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
-            self.trainer.args.train.load_checkpoint_path = self.trainer.resume_dcp_path
+            self.trainer.args.train.checkpoint.load_path = self.trainer.resume_dcp_path
             self.trainer.start_save_data = True
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
@@ -222,15 +222,15 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         "--data.max_seq_len=16",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=2",
-        "--train.data_parallel_mode=ddp",
+        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
         f"--data.datasets_type={dataset_type}",
         f"--train.dyn_bsz={dyn_bsz}",
-        "--train.use_wandb=True",
-        "--train.ulysses_parallel_size=2",
+        "--train.wandb.enable=True",
+        "--train.accelerator.ulysses_size=2",
         "--train.bsz_warmup_ratio=0",
-        "--data.num_workers=1",
+        "--data.dataloader.num_workers=1",
         "--train.num_train_epochs=5",
-        "--train.output_dir=.tests/cache",
+        "--train.checkpoint.output_dir=.tests/cache",
     ]
     return command
 

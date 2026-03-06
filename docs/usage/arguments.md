@@ -1,126 +1,348 @@
 # Arguments API Reference
 
-## Model configuration arguments
-| Name | Type | Description | Default Value |
+Training arguments use nested dataclasses defined in `veomni.arguments.arguments_types`.
+The root config `VeOmniArguments` assembles three top-level groups — **model**, **data**, and **train** —
+each of which contains further nested sub-configs.
+
+Example YAML structure:
+
+```yaml
+train:
+  wandb:
+    enable: true
+    project: VeOmni
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp1
+      full_shard: true
+  checkpoint:
+    manager: dcp
+```
+
+---
+
+## Configuration
+
+Top-level configuration that assembles all argument groups.
+
+* `VeOmniArguments` — Root config: `model` + `data` + `train`
+* `VeOmniVLMArguments` — VLM extension of `VeOmniArguments`
+
+---
+
+## Model
+
+Model architecture, paths, and multimodal encoder / decoder setup.
+
+* `ModelArguments` — `model.*`
+* `NetworkConfig` — `model.network.*`
+
+### VLM Extensions
+
+* `VLMMModelArguments` — extends `ModelArguments` with encoder data-balancing options
+
+---
+
+## Data
+
+Dataset paths, tokenization, and batching configuration.
+
+* `DataArguments` — `data.*`
+* `DataloaderConfig` — `data.dataloader.*`
+
+### VLM Extensions
+
+* `VLMMDataArguments` — extends `DataArguments` with multimodal configs (`mm_configs`)
+
+---
+
+## Training
+
+Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
+
+* `TrainingArguments` — `train.*`
+    * `OptimizerConfig` — `train.optimizer.*`
+    * `WandbArguments` — `train.wandb.*`
+    * `ProfileArguments` — `train.profile.*`
+    * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
+    * `AcceleratorArguments` — `train.accelerator.*`
+        * `FSDPConfig` — `train.accelerator.fsdp_config.*`
+        * `OffloadConfig` — `train.accelerator.offload.*`
+    * `CheckpointArguments` — `train.checkpoint.*`
+
+### VLM Extensions
+
+* `VLMTrainingArguments` — extends `TrainingArguments` with ViT / audio freeze & learning-rate options
+
+---
+
+## Inference
+
+Standalone inference configuration.
+
+* `InferArguments`
+
+---
+
+## Detailed Reference
+
+### VeOmniArguments
+
+Root config — assembles `model`, `data`, and `train`.
+
+| Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| model.config_path | str | Path to the model huggingface configuration, like `config.json` | model.model_path |
-| model.model_path | str | Path to the model parameter file. If empty, random initialization will be performed | None |
-| model.tokenizer_path | str | Path to the tokenizer | model.model_path |
-| model.safetensor_idx_path | str | Path to the safetensor index file | None |
-| model.encoders | dict | Configuration file for multi-modal encoders | {} |
-| model.decoders | dict | Configuration file for multi-modal decoders | {} |
-| model.input_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the input image | encoder |
-| model.output_encoder | str: {"encoder", "decoder"} | Use the encoder or decoder to encode the output image | decoder |
-| model.encode_target | bool | Whether to encode the training data for the diffusion model | False |
-| model.attn_implementation | str: {"eager", "sdpa", "flash_attention_2", "flash_attention_3", "native-sparse"} | The attention implementation to use. | flash_attention_2 |
-| model.moe_implementation | str: {"eager", "fused"} | The MoE implementation to use. | None |
-| model.basic_modules | List of str | Basic modules beyond model._no_split_modules to be sharded in FSDP. | [] |
+| model | `ModelArguments` | — | Model configuration |
+| data | `DataArguments` | — | Data configuration |
+| train | `TrainingArguments` | — | Training configuration |
 
+### ModelArguments
 
-## Data configuration arguments
+`model.*` — Model architecture, paths, and multimodal encoder / decoder setup.
 
-| Name | Type | Description | Default Value |
+| Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| data.train_path | str | Path of training dataset | Required |
-| data.eval_path | str | Path of evaluation dataset | None |
-| data.train_size | int | Number of tokens for training to compute training steps for dynamic batch dataloader | 10,000,000 |
-| data.train_sample | int | Number of samples for training to compute training steps for non-dynamic batch dataloader | 10,000 |
-| data.data_type | str: {"plaintext", "conversation", "classification"} | Dataset type.  | conversation |
-| data.dataloader_type | str: {"native"} | Type of the dataloader | native |
-| data.datasets_type | str: {"mapping", "iterable"} | Dataset type. `IterativeDataset` or `MappingDataset`, or your custom datsets | mapping |
-| data.multisource_datasets_type | str: {"interleave"} | Type of multisource datasets. | interleave |
-| data.source_name | str | Name of the data source. Load from multisource yaml if multisource enabled | None |
-| data.dyn_bsz_buffer_size | int | Buffer size for dynamic batch size. | 200 |
-| data.text_keys | str: {"content_split", "messages"} | The key corresponding to the text samples in the data dictionary. Generally, it is "content_split" for pretraining and "messages" for SFT. | content_split |
-| data.chat_template | str | Name of the chat template. | default |
-| data.max_seq_len | int | Maximum training length. | 2048 |
-| data.num_workers | int | Number of multi-process loaders for the dataloader. | 4 |
-| data.prefetch_factor | int | Number of samples preprocessed by the dataloader. | 2 |
-| data.drop_last | bool | Whether to discard the remaining data at the end. | True |
-| data.pin_memory | bool | Whether to pin the data in the CPU memory. | True |
-| data.silent_exception | bool | Whether to ignore exceptions in the dataloader. | False (TODO) |
+| config_path | `Optional[str]` | `None` | Path to the model HuggingFace config (e.g. `config.json`). Defaults to `model_path`. |
+| model_path | `Optional[str]` | `None` | Path to the pre-trained model weights. If unset, random init is used. |
+| tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
+| safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
+| foundation | `Dict[str, str]` | `{}` | Foundation model extra config. |
+| encoders | `Dict` | `{}` | Multimodal encoder configs keyed by modality (`image`, `video`, `audio`). |
+| decoders | `Dict` | `{}` | Multimodal decoder configs keyed by modality (`image`). |
+| input_encoder | `Literal["encoder", "decoder"]` | `"encoder"` | Whether to use the encoder or decoder to encode input images. |
+| output_encoder | `Literal["encoder", "decoder"]` | `"decoder"` | Whether to use the encoder or decoder to encode output images. |
+| encode_target | `bool` | `False` | Whether to encode training targets with decoder (diffusion only). |
+| basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
+| network | `NetworkConfig` | — | Attention / MoE kernel configuration. |
 
-### Training configuration arguments
-| Name | Type | Description | Default Value |
-| --- | --- |--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------| --- |
-| train.output_dir | str | Path to save the model. | Required |
-| train.architecture | Literal["full", "lora"] | Whether to train the full model or LoRA. | full |
-| train.dyn_bsz | bool | Whether to use dynamic batch size. | False |
-| train.lr | float | Maximum learning rate.   | 5e - 5 |
-| train.lr_min | float | Minimum learning rate.  | 1e - 7 |
-| train.lr_start | float | Starting learning rate for warmup. | 0.0 |
-| train.weight_decay | float | Weight decay coefficient.      | 0 |
-| train.no_decay_modules | List of str | Modules to exclude from weight decay. | [] |
-| train.no_decay_params | List of str | Parameters to exclude from weight decay. | [] |
-| train.optimizer | str: {"adamw", "anyprecision_adamw"} | Name of the optimizer. | adamw |
-| train.max_grad_norm | float | Gradient clipping norm. | 1.0 |
-| train.micro_batch_size | int | Number of samples processed simultaneously on each GPU. | 1 |
-| train.global_batch_size | int | Global batch size, which must be a multiple of the number of GPUs. | train.micro_batch_size * n_gpus |
-| train.num_train_epochs | int | Number of training epochs. | 1 |
-| train.pad_to_length | bool | Whether to pad the input to the maximum sequence length when using dyn_bsz. | False |
-| train.bsz_warmup_ratio | float | Proportion of batch size warmup in the total number of steps. | 0 |
-| train.bsz_warmup_init_mbtoken | int | Initial micro batch size for warmup. | 200 |
-| train.lr_warmup_ratio | float | Proportion of learning rate warmup in the total number of steps. | 0 |
-| train.lr_decay_style | str: {"constant", "linear", "cosine"} | Name of the learning rate scheduler. | cosine |
-| train.lr_decay_ratio | float | Proportion of learning rate decay in the total number of steps. | 1.0 |
-| train.enable_reshard_after_forward | bool | Enable reshard after forward for FSDP2. | False |
-| train.enable_reshard_after_backward | bool | Enable reshard after backward for FSDP2. | False |
-| train.enable_mixed_precision | bool | Whether to enable mixed precision training (higher memory usage but more stable). | True |
-| train.enable_gradient_checkpointing | bool | Whether to enable gradient checkpointing to reduce memory usage. | True |
-| train.enable_reentrant | bool | Whether to enable reentrant in gradient checkpointing. | True |
-| train.enable_full_shard | bool | Whether to use full sharding FSDP (equivalent to ZeRO3). | True |
-| train.enable_fsdp_offload | bool | Whether to enable FSDP CPU offloading (only supported for FSDP1). | False |
-| train.enable_activation_offload | bool | Whether to enable activation value CPU offloading. | False |
-| train.activation_gpu_limit | float | Size of the activation values retained on the GPU (in GB). | 0.0 |
-| train.init_device | str | "cpu", "cuda", "meta", "npu", init device for model initialization. use "meta" or cpu for large model(>30B) | cuda |
-| train.broadcast_model_weights_from_rank0 | bool | Whether to broadcast model weights from rank 0 to all other ranks. | True |
-| train.enable_full_determinism | bool | Whether to enable deterministic mode (for bitwise alignment). | False |
-| train.enable_batch_invariant_mode | bool | Whether to enable batch invariant mode. | False |
-| train.empty_cache_steps | int | Number of steps between two cache clearings. | 500 |
-| train.gc_steps | int | Number of steps between two gc.collect. | 500 |
-| train.data_parallel_mode | str: {"ddp", "fsdp1", "fsdp2"} | Data parallel algorithm.  | ddp |
-| train.data_parallel_replicate_size | int | Number of replicas for data parallel. | 1 |
-| train.data_parallel_shard_size | int | Number of shards for data parallel. | 1 |
-| train.tensor_parallel_size | int | Tensor parallel size (currently not supported). | 1 |
-| train.expert_parallel_size | int | Expert parallel size (currently only supported DeepseekMOE) | 1 |
-| train.ep_outside | bool | Whether to use expert parallel outside in ep-fsdp. | False |
-| train.pipeline_parallel_size | int | Pipeline parallel size (currently not supported). | 1 |
-| train.ulysses_parallel_size | int | Ulysses sequence parallel size. | 1 |
-| train.async_enabled | bool | Whether to enable async ulysses. | False |
-| train.context_parallel_size | int | Ring sequence parallel size (currently not supported). | 1 |
-| train.ckpt_manager | str: {"dcp"} | Checkpoint manager. | dcp |
-| train.save_async | bool | Whether to save checkpoint asynchronously. | False |
-| train.load_checkpoint_path | str | Path to the omnistore checkpoint for resuming training.  | None |
-| train.save_steps | int | Number of steps between two checkpoint saves. 0 means invalid. | 0 |
-| train.save_epochs | int | Number of epochs between two checkpoint saves. 0 means invalid. | 1 |
-| train.hf_save_steps | int | Number of steps between two huggingface model weights saves. 0 means invalid. | 0 |
-| train.hf_save_epochs | int | Number of epochs between two huggingface model weights saves. 0 means invalid. | 0 |
-| train.eval_steps | int | Number of steps between two evaluation. 0 means invalid. | 0 |
-| train.eval_epochs | int | Number of epochs between two evaluation. 0 means invalid. | 0 |
-| train.save_hf_weights | bool | Whether to save the model weights in the huggingface format at the end of training. It is recommended to set it to False for models > 30B to prevent NCCL timeout. You can convert it after training. | True |
-| train.seed | int | Random seed. | 42 |
-| train.enable_compile | bool | Whether to enable torch compile. | False |
-| train.use_wandb | bool | Whether to enable byted wandb experiment logging. | False |
-| train.wandb_project | str | Name of the wandb experiment project. | VeOmni |
-| train.wandb_name | str | Name of the wandb experiment. | None |
-| train.wandb_id | str | Wandb run ID for resuming a previous run. When specified, training logs will continue in the existing wandb run. | None |
-| train.enable_profiling | bool | Whether to use torch profiling. | False |
-| train.profile_start_step | int | Starting step of profiling. | 1 |
-| train.profile_end_step | int | Ending step of profiling. | 2 |
-| train.profile_trace_dir | str | Path to save the profiling results. | ./trace |
-| train.profile_record_shapes | bool | Whether to record the shapes of the input tensors. | True |
-| train.profile_profile_memory | bool | Whether to record the memory usage. | True |
-| train.profile_with_stack | bool | Whether to record the stack information. | True |
-| train.profile_rank0_only | bool | Whether to profile only on rank 0. | True |
-| train.max_steps | int | Number of steps per training epoch (only used for debugging). | None |
+### NetworkConfig
 
-## Inference configuration arguments
-| Name | Type | Description | Default Value |
+`model.network.*` — Attention and MoE kernel implementation.
+
+| Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| infer.model_path | str | Path to the model parameter file. | Required |
-| infer.tokenizer_path | str | Path to the tokenizer. | model.model_path |
-| infer.seed | int | Random seed. | 42 |
-| infer.do_sample | bool | Whether to enable sampling. | True |
-| infer.temperature | float | Sampling temperature. | 1.0 |
-| infer.top_p | float | Sampling Top P value. | 1.0 |
-| infer.max_tokens | int | Maximum number of tokens generated each time. | 1024 |
+| attn_implementation | `Optional[Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]]` | `"flash_attention_2"` | Attention implementation to use. |
+| moe_implementation | `Optional[Literal["eager", "fused"]]` | `None` | MoE implementation to use. |
+
+### DataArguments
+
+`data.*` — Dataset paths, tokenization, and batching.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| train_path | `str` | **Required** | Path of the training dataset. Use comma to separate multiple datasets. |
+| eval_path | `Optional[str]` | `None` | Path of the evaluation dataset. |
+| train_size | `int` | `10_000_000` | Number of tokens for training (used to compute steps under dynamic batch). |
+| train_sample | `int` | `10_000` | Number of samples for training (used to compute steps under non-dynamic batch). |
+| data_type | `Literal["plaintext", "conversation", "diffusion", "classification"]` | `"conversation"` | Type of the training data. |
+| datasets_type | `str` | `"mapping"` | `IterableDataset` or `MappingDataset` (or custom). |
+| multisource_datasets_type | `str` | `"interleave"` | Dataset type for multisource training. |
+| source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
+| dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
+| text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification. |
+| chat_template | `str` | `"default"` | Chat template name. |
+| max_seq_len | `int` | `2048` | Maximum sequence length. |
+| silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
+| dataloader | `DataloaderConfig` | — | DataLoader construction parameters. |
+
+### DataloaderConfig
+
+`data.dataloader.*` — DataLoader construction parameters.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| type | `str` | `"native"` | Type of the dataloader. |
+| num_workers | `int` | `2` | Number of workers for data loading. |
+| prefetch_factor | `int` | `2` | Number of batches loaded in advance per worker. |
+| drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
+| pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
+
+### TrainingArguments
+
+`train.*` — Top-level training configuration.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| train_architecture | `Literal["full", "lora"]` | `"full"` | Parameter update strategy: `"full"` for standard SFT, `"lora"` for LoRA. |
+| dyn_bsz | `bool` | `True` | Enable dynamic batch size for padding-free training. |
+| micro_batch_size | `int` | `1` | Number of samples per iteration on each device. |
+| global_batch_size | `Optional[int]` | `None` | Global batch size. If `None`, uses `micro_batch_size × dp_size`. |
+| num_train_epochs | `int` | `1` | Number of training epochs. |
+| pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
+| bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
+| bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
+| enable_mixed_precision | `bool` | `True` | Enable mixed precision training. |
+| init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"cuda"` | Device for model weight initialization. Use `"meta"` or `"cpu"` for large models (>30B). |
+| broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
+| enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
+| enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
+| empty_cache_steps | `int` | `500` | Steps between two `torch.cuda.empty_cache()` calls. |
+| gc_steps | `int` | `500` | Steps between two `gc.collect()` calls. Disabled if positive. |
+| eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
+| eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
+| seed | `int` | `42` | Random seed. |
+| enable_compile | `bool` | `False` | Enable `torch.compile`. |
+| max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
+| optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
+| wandb | `WandbArguments` | — | Weights & Biases logging. |
+| profile | `ProfileArguments` | — | Torch profiler settings. |
+| gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
+| accelerator | `AcceleratorArguments` | — | Parallelism and distributed-training topology. |
+| checkpoint | `CheckpointArguments` | — | Checkpoint saving and loading. |
+
+### OptimizerConfig
+
+`train.optimizer.*` — Optimizer and learning-rate schedule.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| type | `Literal["adamw", "anyprecision_adamw"]` | `"adamw"` | Optimizer type. |
+| lr | `float` | `5e-5` | Maximum / default learning rate. |
+| lr_min | `float` | `1e-7` | Minimum learning rate. |
+| lr_start | `float` | `0.0` | Starting learning rate for warmup. |
+| lr_warmup_ratio | `float` | `0` | Ratio of learning rate warmup steps. |
+| lr_decay_style | `str` | `"constant"` | Learning rate scheduler (`"constant"`, `"linear"`, `"cosine"`). |
+| lr_decay_ratio | `float` | `1.0` | Ratio of learning rate decay steps. |
+| weight_decay | `float` | `0` | L2 regularization strength. |
+| no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
+| no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
+| max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
+
+### WandbArguments
+
+`train.wandb.*` — Weights & Biases logging.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable W&B logging. |
+| project | `str` | `"VeOmni"` | W&B project name. |
+| name | `Optional[str]` | `None` | W&B experiment name. |
+| id | `Optional[str]` | `None` | W&B run ID for resuming a previous run. |
+
+### ProfileArguments
+
+`train.profile.*` — Torch profiler settings.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable profiling. |
+| start_step | `int` | `1` | Start step for profiling. |
+| end_step | `int` | `2` | End step for profiling. |
+| trace_dir | `str` | `"./trace"` | Directory to save profiling traces. |
+| record_shapes | `bool` | `True` | Record input tensor shapes. |
+| profile_memory | `bool` | `True` | Record memory usage. |
+| with_stack | `bool` | `True` | Record stack traces. |
+| rank0_only | `bool` | `True` | Profile rank 0 only. |
+
+### GradientCheckpointingConfig
+
+`train.gradient_checkpointing.*` — Activation recomputation settings.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `True` | Enable gradient checkpointing. |
+| debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
+| enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
+
+### AcceleratorArguments
+
+`train.accelerator.*` — Parallelism and distributed-training topology.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| dp_replicate_size | `int` | `-1` | Data parallel replicate size. |
+| dp_shard_size | `int` | `-1` | Data parallel shard degree. |
+| tp_size | `int` | `1` | Tensor parallel size. |
+| ep_size | `int` | `1` | Expert parallel size. |
+| ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |
+| pp_size | `int` | `1` | Pipeline parallel size. |
+| ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
+| async_enabled | `bool` | `False` | Enable async Ulysses. |
+| cp_size | `int` | `1` | Ring-attention context parallel size. |
+| fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
+| offload | `OffloadConfig` | — | Activation offload settings. |
+
+### FSDPConfig
+
+`train.accelerator.fsdp_config.*` — FSDP sharding configuration.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| fsdp_mode | `Literal["ddp", "fsdp1", "fsdp2"]` | `"ddp"` | Data parallel mode. |
+| reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
+| reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
+| full_shard | `bool` | `True` | Enable full sharding — equivalent to ZeRO-3. |
+| forward_prefetch | `bool` | `True` | Enable forward prefetch (FSDP1). |
+| offload | `bool` | `False` | Enable CPU offload (FSDP1 only). |
+
+### OffloadConfig
+
+`train.accelerator.offload.*` — Activation offload settings.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| activation_offload | `bool` | `False` | Enable activation offload to CPU. |
+| activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
+
+### CheckpointArguments
+
+`train.checkpoint.*` — Checkpoint saving and loading.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| output_dir | `str` | `"output"` | Path to save model checkpoints. |
+| manager | `str` | `"dcp"` | Checkpoint manager. |
+| save_async | `bool` | `False` | Save checkpoints asynchronously. |
+| load_path | `Optional[str]` | `None` | Path to checkpoint for resuming training. Use `"auto"` for auto-detection. |
+| save_steps | `int` | `0` | Steps between checkpoint saves. `0` to disable. |
+| save_epochs | `int` | `1` | Epochs between checkpoint saves. `0` to disable. |
+| hf_save_steps | `int` | `0` | Steps between HuggingFace weight saves. `0` to disable. |
+| hf_save_epochs | `int` | `0` | Epochs between HuggingFace weight saves. `0` to disable. |
+| save_hf_weights | `bool` | `True` | Save HuggingFace-format weights to the last checkpoint directory. |
+
+### InferArguments
+
+Standalone inference configuration.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| model_path | `str` | **Required** | Path to the pre-trained model. |
+| tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `model_path`. |
+| seed | `int` | `42` | Random seed. |
+| do_sample | `bool` | `True` | Enable sampling in decoding. |
+| temperature | `float` | `1.0` | Sampling temperature. |
+| top_p | `float` | `1.0` | Nucleus sampling top-p value. |
+| max_tokens | `int` | `1024` | Maximum tokens to generate. |
+
+---
+
+## VLM Extensions
+
+Additional fields for Vision-Language Model training, defined in `veomni.trainer.vlm_trainer`.
+
+### VLMTrainingArguments
+
+Extends `TrainingArguments` with ViT / audio tower controls.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| freeze_vit | `bool` | `False` | Freeze ViT parameters. |
+| freeze_audio_tower | `bool` | `False` | Freeze audio tower parameters. |
+| vit_lr | `float` | `1e-6` | Maximum learning rate for ViT parameters. |
+
+### VLMMModelArguments
+
+Extends `ModelArguments` with encoder data-balancing options.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| encoder_data_balance | `Optional[bool]` | `False` | Enable encoder data balancing (e.g. for Qwen3-VL). |
+| encoder_data_balance_sorting_algo | `Optional[str]` | `"post_mbs_balancing_greedy_without_pad"` | Sorting algorithm for encoder data balancing. |
+
+### VLMMDataArguments
+
+Extends `DataArguments` with multimodal input configs.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |

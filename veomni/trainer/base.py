@@ -202,16 +202,16 @@ class BaseTrainer(Stateful, ABC):
 
         # Initialize parallel state
         init_parallel_state(
-            dp_size=self.args.train.data_parallel_size,
-            dp_replicate_size=self.args.train.data_parallel_replicate_size,
-            dp_shard_size=self.args.train.data_parallel_shard_size,
-            tp_size=self.args.train.tensor_parallel_size,
-            ep_size=self.args.train.expert_parallel_size,
-            pp_size=self.args.train.pipeline_parallel_size,
-            cp_size=self.args.train.context_parallel_size,
-            ulysses_size=self.args.train.ulysses_parallel_size,
-            dp_mode=self.args.train.data_parallel_mode,
-            async_enabled=self.args.train.async_enabled,
+            dp_size=self.args.train.accelerator.dp_size,
+            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
+            dp_shard_size=self.args.train.accelerator.dp_shard_size,
+            tp_size=self.args.train.accelerator.tp_size,
+            ep_size=self.args.train.accelerator.ep_size,
+            pp_size=self.args.train.accelerator.pp_size,
+            cp_size=self.args.train.accelerator.cp_size,
+            ulysses_size=self.args.train.accelerator.ulysses_size,
+            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
+            async_enabled=self.args.train.accelerator.async_enabled,
         )
 
         # Set random seed
@@ -226,10 +226,10 @@ class BaseTrainer(Stateful, ABC):
 
         # Save arguments
         if self.args.train.global_rank == 0:
-            save_args(self.args, self.args.train.output_dir)
+            save_args(self.args, self.args.train.checkpoint.output_dir)
 
         # Gradient checkpointing debug
-        set_checkpoint_debug_enabled(self.args.train.debug_gradient_checkpointing)
+        set_checkpoint_debug_enabled(self.args.train.gradient_checkpointing.debug)
 
     def _build_model(self):
         logger.info_rank0("Build model")
@@ -237,8 +237,8 @@ class BaseTrainer(Stateful, ABC):
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
             torch_dtype="float32" if self.args.train.enable_mixed_precision else "bfloat16",
-            attn_implementation=self.args.model.attn_implementation,
-            moe_implementation=self.args.model.moe_implementation,
+            attn_implementation=self.args.model.network.attn_implementation,
+            moe_implementation=self.args.model.network.moe_implementation,
             init_device=self.args.train.init_device,
         )
         self.model_config = self.model.config
@@ -272,7 +272,7 @@ class BaseTrainer(Stateful, ABC):
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
         if args.data.datasets_type == "mapping":
-            dataset_length = dataset_length / args.train.data_parallel_size
+            dataset_length = dataset_length / args.train.accelerator.dp_size
         args.compute_train_steps(dataset_length)
         self.train_steps = args.train_steps
 
@@ -287,7 +287,7 @@ class BaseTrainer(Stateful, ABC):
     def _build_dataloader(self):
         args: VeOmniArguments = self.args
         self.train_dataloader = build_dataloader(
-            dataloader_type=args.data.dataloader_type,
+            dataloader_type=args.data.dataloader.type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
             global_batch_size=args.train.global_batch_size,
@@ -298,10 +298,10 @@ class BaseTrainer(Stateful, ABC):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
-            num_workers=args.data.num_workers,
-            drop_last=args.data.drop_last,
-            pin_memory=args.data.pin_memory,
-            prefetch_factor=args.data.prefetch_factor,
+            num_workers=args.data.dataloader.num_workers,
+            drop_last=args.data.dataloader.drop_last,
+            pin_memory=args.data.dataloader.pin_memory,
+            prefetch_factor=args.data.dataloader.prefetch_factor,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
         )
@@ -314,16 +314,16 @@ class BaseTrainer(Stateful, ABC):
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
-            enable_full_shard=args.train.enable_full_shard,
-            enable_reshard_after_forward=args.train.enable_reshard_after_forward,
+            enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
+            enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             enable_mixed_precision=args.train.enable_mixed_precision,
-            enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
-            enable_fsdp_offload=args.train.enable_fsdp_offload,
+            enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=list(
                 set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
-            enable_reentrant=args.train.enable_reentrant,
-            enable_forward_prefetch=args.train.enable_forward_prefetch,
+            enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
+            enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
         )
         self.model.train()
 
@@ -332,12 +332,12 @@ class BaseTrainer(Stateful, ABC):
         # Build optimizer
         self.optimizer = build_optimizer(
             self.model,
-            lr=args.train.lr,
-            weight_decay=args.train.weight_decay,
+            lr=args.train.optimizer.lr,
+            weight_decay=args.train.optimizer.weight_decay,
             fused=True,
-            optimizer_type=args.train.optimizer,
-            no_decay_modules=args.train.no_decay_modules,
-            no_decay_params=args.train.no_decay_params,
+            optimizer_type=args.train.optimizer.type,
+            no_decay_modules=args.train.optimizer.no_decay_modules,
+            no_decay_params=args.train.optimizer.no_decay_params,
         )
 
     def _build_lr_scheduler(self):
@@ -346,20 +346,20 @@ class BaseTrainer(Stateful, ABC):
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
             train_steps=args.train_steps * args.train.num_train_epochs,
-            lr=args.train.lr,
-            lr_min=args.train.lr_min,
-            lr_decay_style=args.train.lr_decay_style,
-            lr_decay_ratio=args.train.lr_decay_ratio,
-            lr_warmup_ratio=args.train.lr_warmup_ratio,
-            lr_start=args.train.lr_start,
+            lr=args.train.optimizer.lr,
+            lr_min=args.train.optimizer.lr_min,
+            lr_decay_style=args.train.optimizer.lr_decay_style,
+            lr_decay_ratio=args.train.optimizer.lr_decay_ratio,
+            lr_warmup_ratio=args.train.optimizer.lr_warmup_ratio,
+            lr_start=args.train.optimizer.lr_start,
         )
 
     def _build_training_context(self):
         """Build training context for distributed training."""
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
-            self.args.train.enable_activation_offload,
-            self.args.train.enable_gradient_checkpointing,
-            self.args.train.activation_gpu_limit,
+            self.args.train.accelerator.offload.activation_offload,
+            self.args.train.gradient_checkpointing.enable,
+            self.args.train.accelerator.offload.activation_gpu_limit,
         )
 
     def _init_callbacks(self):
@@ -471,8 +471,8 @@ class BaseTrainer(Stateful, ABC):
         """Reshard model after backward pass."""
         args: VeOmniArguments = self.args
         if (
-            args.train.data_parallel_mode == "fsdp2"
-            and not args.train.enable_reshard_after_backward
+            args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            and not args.train.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
         ):
             if micro_step == 0:
@@ -514,7 +514,7 @@ class BaseTrainer(Stateful, ABC):
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.optimizer.step()
@@ -556,7 +556,7 @@ class BaseTrainer(Stateful, ABC):
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
 
             self.on_epoch_end()

@@ -31,16 +31,16 @@ def run_environ_meter(args):
 
     config = Qwen2Config()
     init_parallel_state(
-        dp_size=args.train.data_parallel_size,
-        dp_replicate_size=args.train.data_parallel_replicate_size,
-        dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
-        ulysses_size=args.train.ulysses_parallel_size,
-        dp_mode=args.train.data_parallel_mode,
-        async_enabled=args.train.async_enabled,
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        ep_size=args.train.accelerator.ep_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        async_enabled=args.train.accelerator.async_enabled,
     )
 
     # Test update()
@@ -79,7 +79,7 @@ def test_environ_meter():
         "tests/utils/test_helper.py",
         "--model.config_path=test",
         "--data.train_path=tests",
-        "--train.output_dir=.tests/cache",
+        "--train.checkpoint.output_dir=.tests/cache",
     ]
 
     result = subprocess.run(command, check=True)

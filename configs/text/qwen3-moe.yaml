@@ -1,7 +1,8 @@
 model:
   model_path: Qwen3-30B-A3B-merge
-  attn_implementation: flash_attention_2
-  moe_implementation: fused
+  network:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused
 
 data:
   train_path: tulu-3-sft-mixture
@@ -12,30 +13,37 @@ data:
   text_keys: messages
 
 train:
-  output_dir: Qwen3-30B-A3B-sft-tulu
-  data_parallel_mode: fsdp1
-  ulysses_parallel_size: 1
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp1
+      full_shard: true
+      offload: false
+    offload:
+      activation_offload: false
+  gradient_checkpointing:
+    enable: true
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   dyn_bsz_buffer_size: 200
-  optimizer: adamw
-  lr: 1.0e-4
-  lr_warmup_ratio: 0.007
-  lr_decay_style: cosine
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
   num_train_epochs: 3
-  max_grad_norm: 1.0
   enable_mixed_precision: true
-  enable_gradient_checkpointing: true
-  enable_full_shard: true
-  enable_fsdp_offload: false
-  enable_activation_offload: false
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
-  ckpt_manager: dcp
-  save_steps: 100
-  save_epochs: 1
-  save_hf_weights: true
-  wandb_project: VeOmni
-  wandb_name: Qwen3-30B-A3B-sft-tulu
+  checkpoint:
+    output_dir: Qwen3-30B-A3B-sft-tulu
+    manager: dcp
+    save_steps: 100
+    save_epochs: 1
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: Qwen3-30B-A3B-sft-tulu
