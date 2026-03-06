@@ -14,9 +14,6 @@
 
 import datetime
 import gc
-import os
-import shutil
-import tempfile
 import time
 from typing import Dict, Optional, Sequence
 
@@ -118,11 +115,7 @@ def _save_hf_safetensor_distributed(
 
     All ranks must call this function.
 
-    Uses a dedicated Gloo process group for DCP save coordination
-
-    For mounted filesystems (e.g., HDFS FUSE), consolidation output is
-    redirected to a local temp directory to avoid EOPNOTSUPP errors, then
-    copied back to save_path.
+    Uses a dedicated Gloo process group for DCP save coordination.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
@@ -136,8 +129,6 @@ def _save_hf_safetensor_distributed(
     class TimedHuggingFaceStorageWriter(_TimedHuggingFaceStorageWriter, HuggingFaceStorageWriter):
         pass
 
-    output_to_mount_path = save_path.startswith("/mnt/hdfs")
-
     # Use a dedicated Gloo process group for DCP save coordination and barriers.
     # Each rank writes its own safetensor shards, and rank 0 performs consolidation,
     # We set a large timeout to accommodate I/O time.
@@ -149,14 +140,6 @@ def _save_hf_safetensor_distributed(
         fqn_to_index_mapping=fqn_to_index_mapping,
         enable_consolidation=True,
     )
-
-    # For mounted filesystems, redirect consolidation output to a local temp dir
-    # to avoid EOPNOTSUPP errors on HDFS FUSE.
-    local_tmp_dir = None
-    if output_to_mount_path:
-        local_tmp_dir = tempfile.mkdtemp(prefix="veomni_hf_save_")
-        storage_writer.consolidated_output_path = local_tmp_dir
-        logger.info_rank0(f"Mount path detected, consolidation output redirected to local temp dir: {local_tmp_dir}")
 
     save_state = get_model_save_state(model, fqn_to_index_mapping)
 
@@ -176,20 +159,6 @@ def _save_hf_safetensor_distributed(
     helper.empty_cache()
     elapsed_time = time.time() - start_time
     logger.info_rank0(f"dcp.save() save took {elapsed_time:.2f}s")
-
-    # For mount paths, rank 0 copies consolidated files from local temp dir back to save_path.
-    if is_rank_0 and output_to_mount_path:
-        logger.info(f"Copying consolidated safetensors from {local_tmp_dir} to {save_path}")
-        os.makedirs(save_path, exist_ok=True)
-        copy_start = time.time()
-        for filename in os.listdir(local_tmp_dir):
-            src_file = os.path.join(local_tmp_dir, filename)
-            dst_file = os.path.join(save_path, filename)
-            if os.path.isfile(src_file):
-                shutil.copy2(src_file, dst_file)
-        copy_elapsed = time.time() - copy_start
-        logger.info(f"Copied consolidated safetensors to {save_path} in {copy_elapsed:.2f}s")
-        shutil.rmtree(local_tmp_dir, ignore_errors=True)
 
     # Save model assets (config, tokenizer, etc.) on rank 0
     if model_assets and is_rank_0:
