@@ -34,7 +34,6 @@ train:
   enable_full_determinism: false
   empty_cache_steps: 500
   ckpt_manager: dcp
-  load_checkpoint_path: ""
   save_steps: 100
   save_hf_weights: true
   wandb_project: Meta-Llama-3-8B
