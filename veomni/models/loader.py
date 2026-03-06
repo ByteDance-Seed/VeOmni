@@ -82,7 +82,9 @@ def get_model_config(config_path: str, **kwargs):
                 return config
         except Exception:  # load from veomni
             config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
-            model_type = config_dict["model_type"]
+            model_type = (
+                config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
+            )  # diffusers use _class_name
             logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
             kwargs.pop("trust_remote_code", None)
             return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)

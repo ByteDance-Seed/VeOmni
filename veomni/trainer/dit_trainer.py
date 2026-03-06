@@ -17,7 +17,6 @@ import math
 import os
 import pickle as pk
 from collections import defaultdict
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, Literal, Optional, Sequence
@@ -28,6 +27,7 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_utils import init_empty_weights
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
@@ -35,13 +35,14 @@ from ..data.data_collator import DataCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state
 from ..models import build_foundation_model
+from ..models.auto import build_config
+from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 from ..utils import helper
 from ..utils.device import (
     synchronize,
 )
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
-from .callbacks import TrainerState
 
 
 logger = helper.create_logger(__name__)
@@ -148,11 +149,6 @@ class DiTModelArguments(ModelArguments):
         metadata={"help": "Config for trainer (condition_model_path, etc)."},
     )
 
-    def __post_init__(self):
-        super().__post_init__()
-        if self.condition_model_path is None:
-            self.condition_model_path = self.model_path
-
 
 @dataclass
 class DiTDataArguments(DataArguments):
@@ -204,34 +200,6 @@ class DiTTrainer:
     offline_embedding_save_dir: str = None
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
-    @property
-    def dit_model(self):
-        return self.base.model
-
-    @property
-    def model(self):
-        return self.base.model
-
-    @property
-    def processor(self):
-        return self.base.processor
-
-    @processor.setter
-    def processor(self, value):
-        self.base.processor = value
-
-    @property
-    def model_assets(self):
-        return self.base.model_assets
-
-    @model_assets.setter
-    def model_assets(self, value):
-        self.base.model_assets = value
-
-    @property
-    def train_dataset(self):
-        return self.base.train_dataset
-
     def __init__(self, args: VeOmniDiTArguments):
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
@@ -265,11 +233,8 @@ class DiTTrainer:
             self.base._build_optimizer()
             self.base._build_lr_scheduler()
             self.base._build_training_context()
-            self.base._init_callbacks()
-        else:
-            self.base.model_fwd_context = nullcontext()
-            self.base.model_bwd_context = nullcontext()
-            self.base.state = TrainerState()
+
+        self.base._init_callbacks()
 
     def _setup(self):
         self.base._setup()
@@ -295,65 +260,43 @@ class DiTTrainer:
     def _build_model(self):
         logger.info_rank0("Build model")
         args: VeOmniDiTArguments = self.base.args
-        trainer_config = args.model.trainer_config or {}
-
-        logger.info_rank0("Prepare condition model.")
-
-        from ..models.diffusers.wan_t2v.wan_condition.configuration_wan_condition import WanConditionConfig
-        from ..models.diffusers.wan_t2v.wan_condition.modeling_wan_condition import WanConditionModel
-
-        condition_cfg = WanConditionConfig.from_pretrained(
-            args.model.condition_model_path,
-            **(args.model.condition_model_cfg or {}),
-        )
-        self.condition_model = WanConditionModel._from_config(condition_cfg)
-
-        logger.info_rank0("Condition model loaded with diffusers WanConditionModel.")
-
-        return
-
-        if self.training_task == "offline_embedding":
-            logger.info_rank0(f"Task: {self.training_task}, prepare condition model with empty weights.")
-            weights_path = None
-        else:
-            logger.info_rank0(f"Task: {self.training_task}, prepare condition model fully loaded.")
-            weights_path = args.model.condition_model_path
-
-        self.condition_model = build_foundation_model(
-            config_path=args.model.condition_model_path,
-            weights_path=weights_path,
-            torch_dtype="bfloat16",
-            init_device="cuda",
-            config_kwargs=args.model.condition_model_cfg,
+        dit_config = build_config(args.model.config_path)
+        self.base.model_config = dit_config
+        logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
+        self._build_condition_model(
+            condition_model_type=dit_config.condition_model_type,
         )
 
         if self.training_task == "offline_training" or self.training_task == "online_training":
             logger.info_rank0(f"Task: {self.training_task}, prepare dit model.")
-            dit_loader = trainer_config.get("dit_loader", "foundation")
-            if dit_loader == "diffusers":
-                from diffusers import WanTransformer3DModel
-
-                dit_subfolder = trainer_config.get("dit_subfolder", "transformer")
-                self.base.model = WanTransformer3DModel.from_pretrained(
-                    args.model.model_path,
-                    subfolder=dit_subfolder,
-                    torch_dtype=torch.float32 if args.train.enable_mixed_precision else torch.bfloat16,
-                )
-                logger.info_rank0(f"DiT model loaded with diffusers loader from subfolder={dit_subfolder}.")
-            else:
-                self.base.model = build_foundation_model(
-                    config_path=args.model.config_path,
-                    weights_path=args.model.model_path,
-                    torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                    attn_implementation=args.model.attn_implementation,
-                    moe_implementation=args.model.moe_implementation,
-                    init_device=args.train.init_device,
-                )
+            self.base.model = build_foundation_model(
+                config_path=args.model.config_path,
+                weights_path=args.model.model_path,
+                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+                attn_implementation=args.model.attn_implementation,
+                moe_implementation=args.model.moe_implementation,
+                init_device=args.train.init_device,
+            )
             self.base.model_config = getattr(self.base.model, "config", None)
         else:
-            logger.info_rank0(f"Task: {self.training_task}, dit model is not prepared.")
             self.base.model = None
-            self.base.model_config = None
+            logger.info_rank0(f"Task: {self.training_task}, dit model is not prepared.")
+
+    def _build_condition_model(
+        self,
+        condition_model_type: str,
+    ) -> PreTrainedModel:
+        args: VeOmniDiTArguments = self.base.args
+        config_class = MODEL_CONFIG_REGISTRY[condition_model_type]()
+        condition_cfg = config_class.from_pretrained(args.model.condition_model_path, **args.model.condition_model_cfg)
+        model_class = MODELING_REGISTRY[condition_model_type]()
+        if self.training_task == "offline_training":
+            with init_empty_weights():
+                self.condition_model = model_class._from_config(condition_cfg)
+                logger.info_rank0("Condition model loaded with empty weights.")
+        else:
+            self.condition_model = model_class._from_config(condition_cfg)
+            logger.info_rank0("Condition model loaded.")
 
     def _freeze_model_module(self):
         args: VeOmniDiTArguments = self.base.args
@@ -361,7 +304,7 @@ class DiTTrainer:
         self.condition_model.requires_grad_(False)
 
         if self.training_task == "offline_training" or self.training_task == "online_training":
-            if not lora_config:
+            if not bool(lora_config):
                 self.base.lora = False
             else:
                 lora_adapter_path = lora_config.get("lora_adapter", None)
@@ -453,28 +396,22 @@ class DiTTrainer:
             self.base.train_dataloader = None
 
     def on_train_begin(self):
-        if self.training_task != "offline_embedding":
-            self.base.on_train_begin()
+        self.base.on_train_begin()
 
     def on_train_end(self):
-        if self.training_task != "offline_embedding":
-            self.base.on_train_end()
+        self.base.on_train_end()
 
     def on_epoch_begin(self):
-        if self.training_task != "offline_embedding":
-            self.base.on_epoch_begin()
+        self.base.on_epoch_begin()
 
     def on_epoch_end(self):
-        if self.training_task != "offline_embedding":
-            self.base.on_epoch_end()
+        self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
-        if self.training_task != "offline_embedding":
-            self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        if self.training_task != "offline_embedding":
-            self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
@@ -495,24 +432,6 @@ class DiTTrainer:
         loss_dict = {k: v / self.base.args.train.micro_batch_size for k, v in loss_dict.items()}
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
-
-    def _pack_raw_condition_items(self, condition_dict: Dict[str, Any]) -> list[Dict[str, torch.Tensor]]:
-        """Pack list-based condition output to per-item dicts for offline save or training."""
-        latents = condition_dict["latents"]
-        context = condition_dict["context"]
-        if not isinstance(latents, list) or not isinstance(context, list):
-            raise TypeError("Expected list-based `latents` and `context`.")
-        if len(latents) != len(context):
-            raise ValueError(f"`latents` and `context` length mismatch: {len(latents)} vs {len(context)}")
-
-        packed = []
-        for sample_idx, sample_latents in enumerate(latents):
-            sample_context = context[sample_idx]
-            if isinstance(sample_latents, torch.Tensor):
-                sample_latents = [sample_latents]
-            for latent in sample_latents:
-                packed.append({"latents": latent, "context": sample_context})
-        return packed
 
     def _compute_dit_loss(
         self,
@@ -550,19 +469,22 @@ class DiTTrainer:
 
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
-                condition_dict = self.condition_model.get_condition(**micro_batch)
+                micro_batch_condition = self.condition_model.get_condition(**micro_batch)
         else:
-            condition_dict = micro_batch
+            micro_batch_condition = micro_batch
 
+        # import ipdb;ipdb.set_trace()
         if self.training_task == "offline_embedding":
-            packed_items = self._pack_raw_condition_items(condition_dict)
-            for item in packed_items:
+            # TODO: pack here
+            for item in micro_batch_condition:
                 self.offline_embedding_saver.save(item)
             del micro_batch
-            return None, {}
+            return 0.0, {}
+
+        return
 
         with torch.no_grad():
-            condition_dict = self.condition_model.process_condition(**condition_dict)
+            condition_dict = self.condition_model.process_condition(**micro_batch_condition)
 
         packed_conditions = condition_dict.get("packed_conditions", None)
         if packed_conditions is None:
@@ -615,7 +537,7 @@ class DiTTrainer:
 
         total_loss = 0.0
         total_loss_dict = defaultdict(float)
-        grad_norm = None
+        grad_norm = 0.0
         num_micro_batches = len(micro_batches)
         self.base.num_micro_batches = num_micro_batches
 

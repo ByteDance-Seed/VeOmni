@@ -119,16 +119,16 @@ class BaseTrainer(Stateful, ABC):
     train_dataloader: DistributedDataloader
 
     # Model
-    model: PreTrainedModel
-    model_config: PretrainedConfig
-    tokenizer: PreTrainedTokenizerBase
-    processor: ProcessorMixin
-    chat_template: ChatTemplate
-    model_assets: List[Any]
+    model: PreTrainedModel = None
+    model_config: PretrainedConfig = PretrainedConfig()
+    tokenizer: PreTrainedTokenizerBase = None
+    processor: ProcessorMixin = None
+    chat_template: ChatTemplate = None
+    model_assets: List[Any] = []
 
     # Training components
-    optimizers: Optimizer
-    lr_schedulers: LRScheduler
+    optimizer: Optimizer = None
+    lr_scheduler: LRScheduler = None
 
     # Training context
     model_fwd_context: Any
@@ -528,10 +528,7 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def destroy_distributed(self):
-        # Clean up optimizer and lr scheduler
-        del self.optimizer, self.lr_scheduler
         helper.empty_cache()
-
         dist.barrier()
         dist.destroy_process_group()
 
