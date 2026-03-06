@@ -110,6 +110,7 @@ def _save_hf_safetensor_distributed(
     fqn_to_index_mapping: Optional[Dict[str, int]],
     model_assets: Optional[Sequence],
     is_rank_0: bool,
+    timeout: datetime.timedelta,
 ):
     """Distributed HuggingFace safetensors save using HuggingFaceStorageWriter (PyTorch >= 2.9).
 
@@ -132,7 +133,7 @@ def _save_hf_safetensor_distributed(
     # Use a dedicated Gloo process group for DCP save coordination and barriers.
     # Each rank writes its own safetensor shards, and rank 0 performs consolidation,
     # We set a large timeout to accommodate I/O time.
-    gloo_group = dist.new_group(backend="gloo", timeout=datetime.timedelta(hours=2)) if dist.is_initialized() else None
+    gloo_group = dist.new_group(backend="gloo", timeout=timeout) if dist.is_initialized() else None
 
     storage_writer = TimedHuggingFaceStorageWriter(
         path=save_path,
@@ -204,6 +205,7 @@ def save_hf_safetensor(
     # Distributed only
     model: Optional[torch.nn.Module] = None,
     fqn_to_index_mapping: Optional[Dict[str, int]] = None,
+    timeout: datetime.timedelta = datetime.timedelta(minutes=120),
 ):
     """Save model weights in HuggingFace safetensors format.
 
@@ -232,6 +234,8 @@ def save_hf_safetensor(
         model: [Distributed only] Live FSDP model for distributed save.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.
+        timeout: [Distributed only] Timeout for the Gloo process group used in
+            distributed save coordination. Defaults to 120 minutes.
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
@@ -251,7 +255,9 @@ def save_hf_safetensor(
             dist.barrier()
 
     if use_distributed:
-        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, is_rank_0)
+        _save_hf_safetensor_distributed(
+            model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, is_rank_0, timeout
+        )
     else:
         # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
