@@ -1,17 +1,19 @@
 model:
-  model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers
+  model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers/transformer
+  condition_model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers
   lora_config:
     rank: 128
     alpha: 64
     lora_modules: q,k,v,o,ffn.0,ffn.2
 
 data:
-  train_path: /mnt/hdfs/user_dir/seedance/dataset/avengers
+  train_path: Tom-and-Jerry-VideoGeneration-Dataset
   train_size: 1000000000000
   max_seq_len: 8192
-  source_name: video_generation_demo
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
   mm_configs:
     fps: 24
+    max_frames: 81
 
 train:
   output_dir: Wan2.1-I2V-1.3B_lora
