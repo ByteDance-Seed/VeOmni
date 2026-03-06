@@ -67,27 +67,18 @@ class WanConditionModel(PreTrainedModel):
 
     def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
         # resize video to max size
-        device = self.vae.device
         height, width = video.shape[-2:]
-        # import ipdb;ipdb.set_trace()
+
         size = min(self.config.video_max_size, min(width, height))
-        video = functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float()
+        video = functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float().clamp(0, 255)
 
         video = self.video_processor.preprocess_video(video)
         video = video.to(device=self.vae.device, dtype=self.vae.dtype)
-
         posterior = self.vae.encode(video).latent_dist
-        # import ipdb;ipdb.set_trace()
 
-        latents = posterior.mode()
-
-        latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std, device=device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
-        return (latents - latents_mean) * latents_std
+        # save mean & logvar
+        latents = posterior.parameters
+        return latents.mean(dim=1)
 
     @torch.no_grad()
     def _get_t5_prompt_embeds(self, **kwargs):
@@ -95,6 +86,10 @@ class WanConditionModel(PreTrainedModel):
 
     @torch.no_grad()
     def get_condition(self, inputs, videos, **kwargs) -> dict[str, Any]:
+        """
+        inputs: list[str], a list of samples of prompts
+        videos: list[list[torch.Tensor]] a list of samples of videos
+        """
         prompt_embeds, _ = WanPipeline.encode_prompt(
             self,
             prompt=inputs,
@@ -108,7 +103,10 @@ class WanConditionModel(PreTrainedModel):
             assert len(sample_videos) == 1, "Only one video per sample is supported for T2V"
             latents_list.append(self._encode_video_to_latents(sample_videos[0]))
 
-        return {"latents": latents_list, "context": context_list}
+        sample_condition_list = [
+            {"latents": latents, "context": context} for latents, context in zip(latents_list, context_list)
+        ]
+        return sample_condition_list
 
     @torch.no_grad()
     def process_condition(
