@@ -571,6 +571,19 @@ def qwen3_5_moe_text_model_forward_patched(
     )
 
 
+# ── ForConditionalGeneration __init__ (propagate _moe_implementation) ─────────
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.__init__",
+    description="Propagate _moe_implementation to text_config so Experts pick it up",
+)
+def qwen3_5_moe_forconditional_generation_init_patched(self, config: Qwen3_5MoeConfig):
+    moe_implementation = getattr(config, "_moe_implementation", "eager")
+    config.text_config._moe_implementation = moe_implementation
+    super().__init__(config)
+
+
 # ── ForConditionalGeneration forward (fused loss + aux_loss, no vision) ──────────
 
 
