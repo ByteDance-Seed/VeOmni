@@ -10,7 +10,7 @@ from torchvision.transforms import InterpolationMode, functional
 from transformers import AutoTokenizer, PreTrainedModel, UMT5EncoderModel
 
 from .....utils import logging
-from .configuration_wan_condition import WanConditionConfig
+from .configuration_wan_condition import WanTransformer3DConditionModelConfig
 
 
 def vis_video(video: torch.Tensor):
@@ -24,11 +24,11 @@ logger = logging.get_logger(__name__)
 
 
 # T2V only
-class WanConditionModel(PreTrainedModel):
-    config_class = WanConditionConfig
+class WanTransformer3DConditionModel(PreTrainedModel):
+    config_class = WanTransformer3DConditionModelConfig
     supports_gradient_checkpointing = False
 
-    def __init__(self, config: WanConditionConfig, **kwargs):
+    def __init__(self, config: WanTransformer3DConditionModelConfig, **kwargs):
         super().__init__(config, **kwargs)
         self.tokenizer = None
         self.text_encoder = None
@@ -43,9 +43,6 @@ class WanConditionModel(PreTrainedModel):
         return self.vae.device
 
     def _load_components(self):
-        if not self.config.base_model_path:
-            raise ValueError("`base_model_path` is required for WanConditionModel.")
-
         base = self.config.base_model_path
         logger.info_rank0(f"Loading Wan condition components from {base}.")
         self.tokenizer = AutoTokenizer.from_pretrained(base, subfolder=self.config.tokenizer_subfolder)

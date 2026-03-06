@@ -1,8 +1,8 @@
 from transformers import PretrainedConfig
 
 
-class WanConditionConfig(PretrainedConfig):
-    model_type = "wan_condition"
+class WanTransformer3DConditionModelConfig(PretrainedConfig):
+    model_type = "WanTransformer3DConditionModel"
 
     def __init__(
         self,
@@ -31,11 +31,11 @@ class WanConditionConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
     @classmethod
-    def from_pretrained(
+    def get_config_dict(
         cls,
         pretrained_model_name_or_path,
         **kwargs,
     ):
-        base_model_path = pretrained_model_name_or_path
-        config_dict = {"base_model_path": base_model_path}
-        return cls.from_dict(config_dict)
+        config_dict, kwargs = super().get_config_dict(pretrained_model_name_or_path, **kwargs)
+        config_dict["base_model_path"] = pretrained_model_name_or_path
+        return config_dict, kwargs
