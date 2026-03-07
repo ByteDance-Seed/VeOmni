@@ -153,6 +153,14 @@ qwen2vl_test_cases = [
         marks=_v4_only,
     ),
     pytest.param(
+        "qwen2vl",
+        "./tests/toy_config/qwen2vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v5_only,
+    ),
+    pytest.param(
         "qwen25vl",
         "./tests/toy_config/qwen25vl_toy",
         False,
