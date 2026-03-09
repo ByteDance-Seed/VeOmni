@@ -72,10 +72,10 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
     ):
         cu_seqlens_m, A_idx, scatter_index = _build_moe_indices(expert_index, num_experts)
 
-        # Transpose weights for forward: [E, N, K] -> [E, K, N]
-        fc1_1_w_t = fc1_1_weight.transpose(1, 2).contiguous()
-        fc1_2_w_t = fc1_2_weight.transpose(1, 2).contiguous()
-        fc2_w_t = fc2_weight.transpose(1, 2).contiguous()
+        # Transpose weights for forward: [E, N, K] -> [E, K, N] (view, no copy)
+        fc1_1_w_t = fc1_1_weight.transpose(1, 2)
+        fc1_2_w_t = fc1_2_weight.transpose(1, 2)
+        fc2_w_t = fc2_weight.transpose(1, 2)
 
         # fc1_1: [T*topk, I] (expert-sorted via A_idx)
         fc1_1_output = gemm(hidden_states, fc1_1_w_t, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
@@ -219,9 +219,9 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
     ):
         cu_seqlens_m, A_idx, scatter_index = _build_moe_indices(expert_index, num_experts)
 
-        # Transpose weights for forward: [E, N, K] -> [E, K, N]
-        fc1_1_2_w_t = fc1_1_2_weight.transpose(1, 2).contiguous()
-        fc2_w_t = fc2_weight.transpose(1, 2).contiguous()
+        # Transpose weights for forward: [E, N, K] -> [E, K, N] (view, no copy)
+        fc1_1_2_w_t = fc1_1_2_weight.transpose(1, 2)
+        fc2_w_t = fc2_weight.transpose(1, 2)
 
         # Single fc1 GEMM: output [T*topk, 2I]
         fc1_output = gemm(hidden_states, fc1_1_2_w_t, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
