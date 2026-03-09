@@ -184,7 +184,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
 class HFLoraCkptCallback(HuggingfaceCkptCallback):
     """Save LoRA HF weights once at train end."""
 
-    def _save_checkpoint(self, state: TrainerState):
+    def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
         args: "VeOmniArguments" = self.trainer.args
         save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{state.global_step}")
