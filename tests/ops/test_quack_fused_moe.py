@@ -2,6 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_quack_gemm_available
 
 
@@ -63,7 +64,7 @@ class TestQuackFusedMoe:
         """Test split fc1 weights path against eager reference."""
         from veomni.ops.fused_moe.quack_gemm import quack_gemm_fused_moe_forward
 
-        device = torch.device("cuda")
+        device = torch.device(get_device_type())
         dtype = torch.bfloat16
         hidden_states, routing_weights, selected_experts, fc1_1_weight, fc1_2_weight, fc2_weight = self._make_inputs(
             num_tokens, num_experts, hidden_dim, ffn_dim, topk, device, dtype
@@ -116,7 +117,7 @@ class TestQuackFusedMoe:
         """Test merged fc1_1_2 weights path against eager reference."""
         from veomni.ops.fused_moe.quack_gemm import quack_gemm_fused_moe_forward
 
-        device = torch.device("cuda")
+        device = torch.device(get_device_type())
         dtype = torch.bfloat16
         hidden_states, routing_weights, selected_experts, fc1_1_weight, fc1_2_weight, fc2_weight = self._make_inputs(
             num_tokens, num_experts, hidden_dim, ffn_dim, topk, device, dtype
