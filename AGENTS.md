@@ -12,7 +12,7 @@
 
 ### Key Principles
 
-- **Trainer-free**: Linear training scripts without rigid trainer classes
+- **Modular Trainer**: Composable `BaseTrainer` with specialized subtrainers; override individual methods rather than inheriting rigid monolithic classes
 - **Flexibility & Modularity**: Decouple components for custom implementations
 - **PyTorch native**: Leverage native PyTorch functions
 
@@ -64,24 +64,27 @@ VeOmni/
 
 ```bash
 uv sync --extra gpu --extra audio --dev
+source .venv/bin/activate
 ```
 
-The virtual environment is created at `.venv/`. **Always use binaries from `.venv/bin/` directly** — do not `source .venv/bin/activate`.
+The virtual environment is created at `.venv/`. **Always activate it with `source .venv/bin/activate` before running any commands.**
 
 ---
 
 ## Development Commands
 
 ```bash
+source .venv/bin/activate
+
 # Format and lint (run before committing)
-.venv/bin/python -m ruff format .
-.venv/bin/python -m ruff check .
+python -m ruff format .
+python -m ruff check .
 
 # Full pre-commit check
-.venv/bin/pre-commit install
-.venv/bin/pre-commit run --all-files --show-diff-on-failure --color=always
+pre-commit install
+pre-commit run --all-files --show-diff-on-failure --color=always
 
-# Makefile shortcuts (internally use .venv binaries)
+# Makefile shortcuts
 make style    # ruff format
 make quality  # ruff check
 make commit   # style + quality
@@ -98,15 +101,17 @@ CI workflows are defined in [.github/workflows/](.github/workflows/):
 - `gpu_e2e_test.yml` — End-to-end GPU tests
 - `check_pr_title.yml` — Enforces PR title format
 
-Run tests locally using `.venv/bin/pytest`:
+Run tests locally:
 
 ```bash
+source .venv/bin/activate
+
 # All unit tests
-.venv/bin/pytest tests/
+pytest tests/
 
 # Specific module
-.venv/bin/pytest tests/models/
-.venv/bin/pytest tests/parallel/
+pytest tests/models/
+pytest tests/parallel/
 ```
 
 ---
@@ -183,7 +188,7 @@ Use `git diff main` to view the changes in the current branch.
 
 ## Hardware Support
 
-- **GPU**: CUDA 12.8 (NVIDIA)
+- **GPU**: CUDA 12.9 (NVIDIA)
 - **NPU**: Ascend (Huawei)
 
 ---
