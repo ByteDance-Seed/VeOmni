@@ -28,7 +28,7 @@ class WanTransformer3DConditionModel(PreTrainedModel):
     config_class = WanTransformer3DConditionModelConfig
     supports_gradient_checkpointing = False
 
-    def __init__(self, config: WanTransformer3DConditionModelConfig, **kwargs):
+    def __init__(self, config: WanTransformer3DConditionModelConfig, meta_init=False, **kwargs):
         super().__init__(config, **kwargs)
         self.tokenizer = None
         self.text_encoder = None
@@ -36,6 +36,7 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         self.scheduler = None
         self.video_processor = None
         self._timesteps_ready = False
+        self.meta_init = meta_init
         self._load_components()
 
     @property
@@ -46,16 +47,30 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         base = self.config.base_model_path
         logger.info_rank0(f"Loading Wan condition components from {base}.")
         self.tokenizer = AutoTokenizer.from_pretrained(base, subfolder=self.config.tokenizer_subfolder)
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            base,
-            subfolder=self.config.text_encoder_subfolder,
-            torch_dtype=torch.bfloat16,
-        ).cuda()
-        self.vae = AutoencoderKLWan.from_pretrained(
-            base,
-            subfolder=self.config.vae_subfolder,
-            torch_dtype=torch.float32,
-        ).cuda()
+        if self.meta_init:
+            text_encoder_config = UMT5EncoderModel.config_class.from_pretrained(
+                base,
+                subfolder=self.config.text_encoder_subfolder,
+            )
+            # Build module from config to avoid loading checkpoint tensors.
+            self.text_encoder = UMT5EncoderModel._from_config(text_encoder_config)
+            self.text_encoder.to(dtype=torch.bfloat16)
+            self.vae = AutoencoderKLWan.from_config(
+                base,
+                subfolder=self.config.vae_subfolder,
+                torch_dtype=torch.float32,
+            )
+        else:
+            self.text_encoder = UMT5EncoderModel.from_pretrained(
+                base,
+                subfolder=self.config.text_encoder_subfolder,
+                torch_dtype=torch.bfloat16,
+            )
+            self.vae = AutoencoderKLWan.from_pretrained(
+                base,
+                subfolder=self.config.vae_subfolder,
+                torch_dtype=torch.float32,
+            )
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             base,
             subfolder=self.config.scheduler_subfolder,

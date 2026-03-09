@@ -254,6 +254,7 @@ class DiTTrainer:
             logger.info_rank0(
                 f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
             )
+            args.train.num_train_epochs = 1
 
         self.training_task = args.train.training_task
 
@@ -266,7 +267,6 @@ class DiTTrainer:
         self._build_condition_model(
             condition_model_type=dit_config.condition_model_type,
         )
-
         if self.training_task == "offline_training" or self.training_task == "online_training":
             logger.info_rank0(f"Task: {self.training_task}, prepare dit model.")
             self.base.model = build_foundation_model(
@@ -292,10 +292,11 @@ class DiTTrainer:
         model_class = MODELING_REGISTRY[condition_model_type]()
         if self.training_task == "offline_training":
             with init_empty_weights():
-                self.condition_model = model_class._from_config(condition_cfg)
+                self.condition_model = model_class._from_config(condition_cfg, meta_init=True)
                 logger.info_rank0("Condition model loaded with empty weights.")
         else:
             self.condition_model = model_class._from_config(condition_cfg)
+            self.condition_model.cuda()
             logger.info_rank0("Condition model loaded.")
 
     def _freeze_model_module(self):
