@@ -26,8 +26,6 @@ Patches applied:
 6. Fused loss + aux_loss in ForConditionalGeneration.
 """
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -116,27 +114,13 @@ is_fast_path_available = None
 # NOTE: Qwen3_5MoeRMSNorm is NOT replaced with LigerRMSNorm because the HF
 # implementation uses a (1 + weight) centered formulation while LigerRMSNorm
 # uses a plain (weight) formulation, making them incompatible.
-
-
-@config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
-def apply_rotary_pos_emb_liger(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+#
+# NOTE: apply_rotary_pos_emb is NOT replaced with LigerKernel rotary because
+# Qwen3_5Moe uses partial_rotary_factor=0.25 with mrope_interleaved=True.
+# The HF implementation correctly handles partial rotary (applying RoPE only
+# to the first `rotary_dim` dims and passing through the rest), while
+# liger_rotary_pos_emb applies RoPE to the full head_dim, producing incorrect
+# results and NaN in attention output.
 
 
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
