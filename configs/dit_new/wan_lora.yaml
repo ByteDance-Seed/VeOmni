@@ -4,7 +4,13 @@ model:
   lora_config:
     rank: 128
     alpha: 64
-    lora_modules: q,k,v,o,ffn.0,ffn.2
+    lora_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - ffn.net.0.proj
+      - ffn.net.2
 
 data:
   train_path: Tom-and-Jerry-VideoGeneration-Dataset
