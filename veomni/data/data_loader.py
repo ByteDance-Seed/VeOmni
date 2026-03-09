@@ -117,7 +117,11 @@ def build_native_dataloader(
                 dataset=dataset,
                 micro_batch_seq_length=batching_token_len,
                 ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
-                get_length_fn=lambda x: int(x["attention_mask"].sum()),
+                get_length_fn=lambda x: int(
+                    x["attention_mask"].sum()
+                    if "attention_mask" in x
+                    else x["chosen_attention_mask"].sum() + x["rejected_attention_mask"].sum()
+                ),
                 dynamic_batching_collate_fn=dyn_bsz_collate_fn,
                 save_by_idx=dyn_bsz_dataset_save_by_idx,
             )
