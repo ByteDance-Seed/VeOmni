@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from veomni import _apply_patches
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments
+from veomni.arguments import CheckpointConfig, DataArguments, ModelArguments, TrainingArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
@@ -79,8 +79,8 @@ class TrainerTest(BaseTrainer):
         _apply_patches()
 
         model_name = self.model_config.model_type
-        self.args.model.attn_implementation = model_mode.attn_implementation
-        self.args.model.moe_implementation = model_mode.moe_implementation
+        self.args.model.ops_implementation.attn_implementation = model_mode.attn_implementation
+        self.args.model.ops_implementation.moe_implementation = model_mode.moe_implementation
 
         self._build_model()
         self._build_optimizer()
@@ -123,7 +123,7 @@ class TrainerTest(BaseTrainer):
             )  # qwen3 omni didn't handle dtype in audio_forward
 
         loss, loss_dict = super().forward_backward_step(batch)
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
         _release_device_memory()
         print_device_mem_info(f"[Memory Info] after model {model_name} train_one_step:")
@@ -288,7 +288,7 @@ def test_models_patch_fwd_bwd(
     model_config = ModelArguments(config_path=config_path)
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
-        output_dir="./test_models_patch",
+        checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
         enable_mixed_precision=False,
         enable_full_determinism=True,
         init_device=get_device_type(),

@@ -1,6 +1,7 @@
 model:
   model_path: Qwen/Qwen3-VL-8B-Instruct
-  attn_implementation: flash_attention_2
+  ops_implementation:
+    attn_implementation: flash_attention_2
 
 data:
   train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
@@ -16,24 +17,31 @@ data:
     use_audio_in_video: false
 
 train:
-  output_dir: qwen3_vl_dense_sft
-  data_parallel_mode: fsdp2
-  enable_reentrant: false
-  use_wandb: false
-  wandb_project: qwen3_vl_dense
-  wandb_name: qwen3_vl_dense
-  ulysses_parallel_size: 1
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable_reentrant: false
+  wandb:
+    enable: false
+    project: qwen3_vl_dense
+    name: qwen3_vl_dense
   freeze_vit: false
-  lr: 1.0e-5
-  lr_decay_style: cosine
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
   num_train_epochs: 2
   micro_batch_size: 1
   global_batch_size: 16
   max_steps: 500
   init_device: meta
-  enable_profiling: true
-  profile_start_step: 20
-  profile_end_step: 21
-  profile_record_shapes: true
-  ckpt_manager: dcp
-  save_hf_weights: false
+  profile:
+    enable: true
+    start_step: 20
+    end_step: 21
+    record_shapes: true
+  checkpoint:
+    output_dir: qwen3_vl_dense_sft
+    manager: dcp
+    save_hf_weights: false
