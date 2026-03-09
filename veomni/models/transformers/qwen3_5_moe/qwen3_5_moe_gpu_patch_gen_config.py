@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.masking_utils import create_causal_mask
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
@@ -41,7 +42,6 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeDynamicCache,
     Qwen3_5MoeModelOutputWithPast,
     Qwen3_5MoeRMSNormGated,
-    Qwen3_5MoeTextConfig,
     apply_mask_to_padding_states,
     load_balancing_loss_func,
     torch_chunk_gated_delta_rule,
@@ -142,27 +142,6 @@ def apply_rotary_pos_emb_liger(
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
 
 
-@config.override_method(
-    "Qwen3_5MoeSparseMoeBlock.forward",
-    description="Use out-of-place add to avoid autograd in-place mutation errors",
-)
-def qwen3_5_moe_sparse_moe_block_forward_patched(
-    self, hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
-    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-    shared_expert_output = self.shared_expert(hidden_states_reshaped)
-    _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-    expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-
-    shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
-
-    # Modification: use out-of-place add to avoid autograd in-place mutation NaN.
-    expert_output = expert_output + shared_expert_output
-    expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
-    return expert_output
-
-
 @config.replace_class(
     "Qwen3_5MoeExperts",
     description="Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path",
@@ -237,7 +216,7 @@ class PatchedQwen3_5MoeExperts(nn.Module):
     "Qwen3_5MoeGatedDeltaNet.__init__",
     description="Use device-agnostic get_device_id() for FusedRMSNormGated init",
 )
-def qwen3_5_moe_gated_deltanet_init_patched(self, config: Qwen3_5MoeTextConfig, layer_idx: int):
+def qwen3_5_moe_gated_deltanet_init_patched(self, config: Qwen3_5MoeConfig, layer_idx: int):
     super().__init__()
     self.hidden_size = config.hidden_size
     self.num_v_heads = config.linear_num_value_heads
@@ -447,7 +426,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     position_ids: torch.LongTensor | None = None,
     past_key_values: Cache | None = None,
     cache_position: torch.LongTensor | None = None,
-    **kwargs: Unpack[TransformersKwargs],
+    **kwargs: Unpack[FlashAttentionKwargs],
 ) -> torch.FloatTensor:
     residual = hidden_states
 

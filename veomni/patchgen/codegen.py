@@ -429,13 +429,26 @@ class ModelingCodeGenerator:
             if replacement_source:
                 # Rename the class to match original using simple text replacement
                 replacement_source = textwrap.dedent(replacement_source)
-                # Remove the patch decorator line if present
+                # Remove the patch decorator lines if present (handles multi-line decorators)
                 source_lines = replacement_source.splitlines()
                 filtered_lines = []
+                in_patch_decorator = False
+                paren_depth = 0
                 for line in source_lines:
                     stripped = line.strip()
-                    # Skip decorator lines that were for patch definition
+                    # Start of a patch decorator
                     if stripped.startswith("@") and ("replace_class" in stripped or "config." in stripped):
+                        in_patch_decorator = True
+                        paren_depth = stripped.count("(") - stripped.count(")")
+                        # If decorator is closed on same line, we're done skipping
+                        if paren_depth <= 0:
+                            in_patch_decorator = False
+                        continue
+                    # Continuation of multi-line decorator
+                    if in_patch_decorator:
+                        paren_depth += stripped.count("(") - stripped.count(")")
+                        if paren_depth <= 0:
+                            in_patch_decorator = False
                         continue
                     filtered_lines.append(line)
                 replacement_source = "\n".join(filtered_lines)
@@ -588,13 +601,25 @@ class ModelingCodeGenerator:
             if replacement_source:
                 replacement_source = textwrap.dedent(replacement_source)
 
-                # Remove the patch decorator line if present
+                # Remove the patch decorator lines if present (handles multi-line decorators)
                 source_lines = replacement_source.splitlines()
                 filtered_lines = []
+                in_patch_decorator = False
+                paren_depth = 0
                 for line in source_lines:
                     stripped = line.strip()
-                    # Skip decorator lines that were for patch definition
+                    # Start of a patch decorator
                     if stripped.startswith("@") and ("replace_function" in stripped or "config." in stripped):
+                        in_patch_decorator = True
+                        paren_depth = stripped.count("(") - stripped.count(")")
+                        if paren_depth <= 0:
+                            in_patch_decorator = False
+                        continue
+                    # Continuation of multi-line decorator
+                    if in_patch_decorator:
+                        paren_depth += stripped.count("(") - stripped.count(")")
+                        if paren_depth <= 0:
+                            in_patch_decorator = False
                         continue
                     filtered_lines.append(line)
                 replacement_source = "\n".join(filtered_lines)

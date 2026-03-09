@@ -34,7 +34,9 @@ python3 scripts/download_hf_model.py \
 
 ## Start training on GPU
 
-Testing in 8x80GB GPUs.
+#### Qwen3.5 27B (Dense)
+
+Training in 8x80GB GPUs.
 ```shell
 # Note: max_seq_len is set to 128 to avoid OOM with 8x80GB GPUs since the only currently available
 # Qwen3.5 model size is 27B.
@@ -47,4 +49,24 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.init_device meta \
     --train.max_steps 20 \
     --train.output_dir /mnt/local/localcache00
+```
+
+#### Qwen3.5 35A3B
+
+Testing in 8x80GB GPUs. FSDP2 only, no ep.
+
+```shell
+# Note: max_seq_len is set to 128 to avoid OOM with 8x80GB GPUs since the only currently available
+# Qwen3.5 model size is 27B.
+# We recommend that you use more GPUs to train Qwen3.5 27B so that you can get a proper seq len.
+bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
+    --model.model_path ${HOME}/Qwen3.5-35B-A3B \
+    --model.moe_implementation fused \
+    --data.train_path ${HOME}/tulu-first2000.parquet \
+    --data.max_seq_len 128 \
+    --train.data_parallel_mode fsdp2 \
+    --train.init_device meta \
+    --train.max_steps 20 \
+    --train.output_dir /mnt/local/localcache00 \
+    --train.expert_parallel_size=1
 ```

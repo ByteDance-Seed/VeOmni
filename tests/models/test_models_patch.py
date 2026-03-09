@@ -285,22 +285,16 @@ def test_models_patch_fwd_bwd(
             mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
         ]
         # Qwen3.5 veomni eager attn is not supported (requires veomni FA2/SP path)
-        veomni_model_modes = [
-            mode for mode in veomni_model_modes if mode.attn_implementation != "eager"
-        ]
+        veomni_model_modes = [mode for mode in veomni_model_modes if mode.attn_implementation != "eager"]
         # Alternating between liger/non-liger CE within a single test causes NaN gnorm
         # due to state pollution; keep only use_liger_kernel=False for a clean run.
-        veomni_model_modes = [
-            mode for mode in veomni_model_modes if not mode.use_liger_kernel
-        ]
+        veomni_model_modes = [mode for mode in veomni_model_modes if not mode.use_liger_kernel]
 
     # For qwen3_5_moe, the first VeOmni eager-MoE run after HF modes produces NaN gnorm
     # due to test infrastructure state pollution (works fine in isolation).
     # Keep only fused MoE modes which are the primary VeOmni MoE path.
     if case_id == "qwen3_5_moe":
-        veomni_model_modes = [
-            mode for mode in veomni_model_modes if mode.moe_implementation != "eager"
-        ]
+        veomni_model_modes = [mode for mode in veomni_model_modes if mode.moe_implementation == "eager"]
 
     model_config = ModelArguments(config_path=config_path)
     data_config = DataArguments(train_path="")
