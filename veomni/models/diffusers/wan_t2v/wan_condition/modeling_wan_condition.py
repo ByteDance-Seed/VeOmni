@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.pipelines.wan.pipeline_wan import WanPipeline
 from diffusers.video_processor import VideoProcessor
 from torchvision.transforms import InterpolationMode, functional
@@ -30,11 +31,13 @@ class WanTransformer3DConditionModel(PreTrainedModel):
 
     def __init__(self, config: WanTransformer3DConditionModelConfig, meta_init=False, **kwargs):
         super().__init__(config, **kwargs)
+        self.config = config
         self.tokenizer = None
         self.text_encoder = None
         self.vae = None
         self.scheduler = None
         self.video_processor = None
+        self.negative_prompt_embeds = None
         self._timesteps_ready = False
         self.meta_init = meta_init
         self._load_components()
@@ -47,25 +50,18 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         base = self.config.base_model_path
         logger.info_rank0(f"Loading Wan condition components from {base}.")
         self.tokenizer = AutoTokenizer.from_pretrained(base, subfolder=self.config.tokenizer_subfolder)
+        self.text_encoder = UMT5EncoderModel.from_pretrained(
+            base,
+            subfolder=self.config.text_encoder_subfolder,
+            torch_dtype=torch.bfloat16,
+        )
         if self.meta_init:
-            text_encoder_config = UMT5EncoderModel.config_class.from_pretrained(
-                base,
-                subfolder=self.config.text_encoder_subfolder,
-            )
-            # Build module from config to avoid loading checkpoint tensors.
-            self.text_encoder = UMT5EncoderModel._from_config(text_encoder_config)
-            self.text_encoder.to(dtype=torch.bfloat16)
             self.vae = AutoencoderKLWan.from_config(
                 base,
                 subfolder=self.config.vae_subfolder,
                 torch_dtype=torch.float32,
             )
         else:
-            self.text_encoder = UMT5EncoderModel.from_pretrained(
-                base,
-                subfolder=self.config.text_encoder_subfolder,
-                torch_dtype=torch.bfloat16,
-            )
             self.vae = AutoencoderKLWan.from_pretrained(
                 base,
                 subfolder=self.config.vae_subfolder,
@@ -76,6 +72,21 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             subfolder=self.config.scheduler_subfolder,
         )
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae.config.scale_factor_spatial)
+        self._prepare_negative_prompt_embeds()
+        if self.meta_init:
+            del self.text_encoder
+
+    @torch.no_grad()
+    def _prepare_negative_prompt_embeds(self):
+        if self.config.cfg_negative_prob <= 0.0:
+            return
+        prompt_embeds, _ = WanPipeline.encode_prompt(
+            self,
+            prompt=[self.config.cfg_negative_prompt],
+            do_classifier_free_guidance=False,
+            max_sequence_length=self.config.max_sequence_length,
+        )
+        self.negative_prompt_embeds = prompt_embeds[0].unsqueeze(0)
 
     def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
         # resize video to max size
@@ -83,14 +94,22 @@ class WanTransformer3DConditionModel(PreTrainedModel):
 
         size = min(self.config.video_max_size, min(width, height))
         video = functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float().clamp(0, 255)
-
         video = self.video_processor.preprocess_video(video)
         video = video.to(device=self.vae.device, dtype=self.vae.dtype)
-        posterior = self.vae.encode(video).latent_dist
 
         # save mean & logvar
-        latents = posterior.parameters
-        return latents.mean(dim=1)
+        posterior: DiagonalGaussianDistribution = self.vae.encode(video).latent_dist
+
+        return posterior.parameters
+
+    def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(
+            1, self.vae.config.z_dim, 1, 1, 1
+        )
+        latents_std = torch.tensor(self.vae.config.latents_std, device=latents.device, dtype=latents.dtype).view(
+            1, self.vae.config.z_dim, 1, 1, 1
+        )
+        return (latents - latents_mean) / latents_std
 
     @torch.no_grad()
     def _get_t5_prompt_embeds(self, **kwargs):
@@ -113,47 +132,47 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         latents_list: list[list[torch.Tensor]] = []
         for sample_videos in videos:
             assert len(sample_videos) == 1, "Only one video per sample is supported for T2V"
-            latents_list.append(self._encode_video_to_latents(sample_videos[0]))
+            latents_list.append(self._encode_video_to_latents(sample_videos[0]))  # 1, c, f, h, w
 
-        sample_condition_list = [
-            {"latents": latents, "context": context} for latents, context in zip(latents_list, context_list)
-        ]
-        return sample_condition_list
+        return {"latents": latents_list, "context": context_list}
 
     @torch.no_grad()
-    def process_condition(
-        self, latents_list: list[list[torch.Tensor]], context_list: list[torch.Tensor]
-    ) -> dict[str, Any]:
+    def process_condition(self, latents: list[torch.Tensor], context: list[torch.Tensor]) -> dict[str, Any]:
         if not self._timesteps_ready:
-            self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents_list[0][0].device)
+            self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents[0].device)
             self._timesteps_ready = True
 
-        packed_conditions: list[dict[str, torch.Tensor]] = []
-        for sample_idx, sample_latents in enumerate(latents_list):
-            sample_context = context_list[sample_idx]
-            for latents in sample_latents:
-                noise = torch.randn_like(latents)
-                timestep_ids = torch.randint(
-                    0, len(self.scheduler.timesteps), (latents.shape[0],), device=latents.device
-                )
-                timestep = self.scheduler.timesteps[timestep_ids].to(device=latents.device, dtype=latents.dtype)
-                noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
-                training_target = noise - latents
+        packed_conditions: dict[str, list[torch.Tensor]] = {
+            "hidden_states": [],
+            "timestep": [],
+            "encoder_hidden_states": [],
+            "training_target": [],
+            "loss_weight": [],
+        }
+        for sample_latents, sample_context in zip(latents, context):
+            latents = DiagonalGaussianDistribution(sample_latents).mode()
+            latents = self._normalize_latents(latents)
+            noise = torch.randn_like(latents)
+            timestep_ids = torch.randint(0, len(self.scheduler.timesteps), (latents.shape[0],), device=latents.device)
+            timestep = self.scheduler.timesteps[timestep_ids].to(device=latents.device, dtype=latents.dtype)
+            noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
+            training_target = noise - latents
 
-                context = sample_context.to(latents.device)
-                if context.shape[0] != latents.shape[0]:
-                    context = context.expand(latents.shape[0], -1, -1)
+            use_negative_context = (
+                self.negative_prompt_embeds is not None
+                and torch.rand((), device=latents.device).item() < self.config.cfg_negative_prob
+            )
+            if use_negative_context:
+                sample_context = self.negative_prompt_embeds.to(device=latents.device, dtype=sample_context.dtype)
+            else:
+                sample_context = sample_context.to(latents.device)
 
-                packed_conditions.append(
-                    {
-                        "x": noisy_latents,
-                        "hidden_states": noisy_latents,
-                        "timestep": timestep,
-                        "context": context,
-                        "encoder_hidden_states": context,
-                        "training_target": training_target,
-                        "loss_weight": torch.ones(latents.shape[0], device=latents.device, dtype=latents.dtype),
-                    }
-                )
+            if sample_context.shape[0] != latents.shape[0]:
+                sample_context = sample_context.expand(latents.shape[0], -1, -1)
 
-        return {"packed_conditions": packed_conditions, "latents": latents_list, "context": context_list}
+            packed_conditions["hidden_states"].append(noisy_latents)
+            packed_conditions["timestep"].append(timestep)
+            packed_conditions["encoder_hidden_states"].append(sample_context)
+            packed_conditions["training_target"].append(training_target)
+
+        return packed_conditions

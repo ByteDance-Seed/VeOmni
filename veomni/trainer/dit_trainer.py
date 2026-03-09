@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import math
 import os
 import pickle as pk
@@ -23,11 +22,9 @@ from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from datasets import Dataset
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
-from transformers.modeling_utils import init_empty_weights
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
@@ -291,9 +288,8 @@ class DiTTrainer:
         condition_cfg = config_class.from_pretrained(args.model.condition_model_path, **args.model.condition_model_cfg)
         model_class = MODELING_REGISTRY[condition_model_type]()
         if self.training_task == "offline_training":
-            with init_empty_weights():
-                self.condition_model = model_class._from_config(condition_cfg, meta_init=True)
-                logger.info_rank0("Condition model loaded with empty weights.")
+            self.condition_model = model_class._from_config(condition_cfg, meta_init=True)
+            logger.info_rank0("Condition model loaded with empty weights.")
         else:
             self.condition_model = model_class._from_config(condition_cfg)
             self.condition_model.cuda()
@@ -434,82 +430,43 @@ class DiTTrainer:
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
-    def _compute_dit_loss(
-        self,
-        condition_dict: Dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        model_forward_sig = inspect.signature(self.dit_model.forward).parameters
-        model_inputs = {
-            k: v
-            for k, v in condition_dict.items()
-            if k in model_forward_sig and k not in ("training_target", "loss_weight")
-        }
-
-        outputs = self.dit_model(**model_inputs)
-        if isinstance(outputs, torch.Tensor):
-            prediction = outputs
-        elif hasattr(outputs, "sample"):
-            prediction = outputs.sample
-        else:
-            raise TypeError(f"Unsupported dit model output type: {type(outputs)}")
-
-        target = condition_dict.get("training_target", None)
-        if target is None:
-            raise KeyError("`training_target` not found in processed condition dict.")
-
-        per_sample_loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
-        per_sample_loss = per_sample_loss.view(per_sample_loss.shape[0], -1).mean(dim=1)
-        loss_weight = condition_dict.get("loss_weight", None)
-        if loss_weight is not None:
-            per_sample_loss = per_sample_loss * loss_weight.float().to(per_sample_loss.device)
-        loss = per_sample_loss.mean() / self.base.args.train.micro_batch_size
-        return loss, {"mse_loss": loss}
+    @staticmethod
+    def _unpack_dict_of_list(batch: Dict[str, Any]) -> list[Dict[str, Any]]:
+        if not isinstance(batch, dict) or len(batch) == 0:
+            return []
+        keys = list(batch.keys())
+        num_items = len(batch[keys[0]])
+        return [{k: batch[k][idx] for k in keys} for idx in range(num_items)]
 
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
         micro_batch = self.preforward(micro_batch)
 
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
-                micro_batch_condition = self.condition_model.get_condition(**micro_batch)
-        else:
-            micro_batch_condition = micro_batch
+                micro_batch = self.condition_model.get_condition(**micro_batch)
 
-        # import ipdb;ipdb.set_trace()
         if self.training_task == "offline_embedding":
-            # TODO: pack here
-            for item in micro_batch_condition:
+            for item in self._unpack_dict_of_list(micro_batch):
                 self.offline_embedding_saver.save(item)
             del micro_batch
             return 0.0, {}
 
-        return
-
         with torch.no_grad():
-            condition_dict = self.condition_model.process_condition(**micro_batch_condition)
+            micro_batch = self.condition_model.process_condition(**micro_batch)
 
-        packed_conditions = condition_dict.get("packed_conditions", None)
-        if packed_conditions is None:
-            packed_conditions = [condition_dict]
-
-        total_loss = None
-        total_loss_dict = defaultdict(float)
         with self.base.model_fwd_context:
-            for packed_condition in packed_conditions:
-                loss, loss_dict = self._compute_dit_loss(packed_condition)
-                total_loss = loss if total_loss is None else (total_loss + loss)
-                for k, v in loss_dict.items():
-                    total_loss_dict[k] += float(v.item())
+            outputs = self.base.model(**micro_batch)
 
-        total_loss = total_loss / len(packed_conditions)
-        loss_dict = {
-            k: torch.tensor(v / len(packed_conditions), device=total_loss.device) for k, v in total_loss_dict.items()
-        }
+        loss: torch.Tensor
+        loss_dict: Dict[str, torch.Tensor]
+        loss, loss_dict = self.postforward(outputs, micro_batch)
 
+        # Backward pass
         with self.base.model_bwd_context:
-            total_loss.backward()
+            loss.backward()
 
         del micro_batch
-        return total_loss, loss_dict
+        return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         args = self.base.args

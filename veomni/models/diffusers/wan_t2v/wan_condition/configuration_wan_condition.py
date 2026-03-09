@@ -15,6 +15,14 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         num_train_timesteps: int = 1000,
         shift: float = 5.0,
         do_classifier_free_guidance: bool = False,
+        cfg_negative_prompt: str = (
+            "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, "
+            "static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, "
+            "extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, "
+            "fused fingers, still picture, messy background, three legs, many people in the background, "
+            "walking backwards"
+        ),
+        cfg_negative_prob: float = 0.1,
         video_max_size: int = 480,
         **kwargs,
     ):
@@ -27,6 +35,8 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
         self.do_classifier_free_guidance = do_classifier_free_guidance
+        self.cfg_negative_prompt = cfg_negative_prompt
+        self.cfg_negative_prob = cfg_negative_prob
         self.video_max_size = video_max_size
         super().__init__(**kwargs)
 
