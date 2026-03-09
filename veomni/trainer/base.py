@@ -324,6 +324,7 @@ class BaseTrainer(Stateful, ABC):
             ),
             enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+            broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
         )
         self.model.train()
 
