@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import copy
+from ast import Dict
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as _WanTransformer3DModel
 from transformers import PreTrainedModel
+from transformers.modeling_outputs import ModelOutput
 
 from .....utils import logging
 from .configuration_wan_transformer import WanTransformer3DModelConfig
 
 
 logger = logging.get_logger(__name__)
+
+
+@dataclass
+class WanModelOutput(ModelOutput):
+    loss: Dict[str, torch.FloatTensor] | None = None
+    predictions: list[torch.FloatTensor] | None = None
 
 
 class WanTransformer3DModel(PreTrainedModel, _WanTransformer3DModel):
@@ -75,18 +84,21 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformer3DModel):
         training_target: torch.Tensor,
     ):
         per_sample_losses = []
+        predictions = []
         for hidden_state, timestep, encoder_hidden_state, training_target in zip(
             hidden_states, timestep, encoder_hidden_states, training_target
         ):
             outputs = _WanTransformer3DModel.forward(
                 self, hidden_states=hidden_state, timestep=timestep, encoder_hidden_states=encoder_hidden_state
             )
-            prediction = outputs.sample if hasattr(outputs, "sample") else outputs
+            prediction = outputs.sample
+            predictions.append(prediction)
             target = training_target
             per_sample_loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
             per_sample_loss = per_sample_loss.view(per_sample_loss.shape[0], -1).mean(dim=1)
             per_sample_losses.append(per_sample_loss)
-        return torch.stack(per_sample_losses).mean()
+        loss = torch.stack(per_sample_losses).mean()
+        return WanModelOutput(loss={"mse_loss": loss}, predictions=predictions)
 
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)

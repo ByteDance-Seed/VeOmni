@@ -453,7 +453,6 @@ class DiTTrainer:
 
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
-
         with self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
