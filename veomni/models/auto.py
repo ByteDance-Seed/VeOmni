@@ -98,6 +98,10 @@ def build_foundation_model(
         if moe_implementation not in ["eager", "fused"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
         config._moe_implementation = moe_implementation
+        # Propagate to text_config for VLM-style models (e.g. qwen3_5_moe)
+        # so that sub-modules like Experts can read _moe_implementation.
+        if hasattr(config, "text_config"):
+            config.text_config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
         if moe_implementation == "eager":
             logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")

@@ -23,8 +23,7 @@ Patches applied:
 3. Device-agnostic GatedDeltaNet init and varlen FLA forward.
 4. DecoderLayer forward with cu_seq_lens_q passthrough.
 5. SP slicing in Qwen3_5MoeTextModel.forward.
-6. Fused loss + aux_loss in ForConditionalGeneration and ForCausalLM.
-7. Expert parallel plan registration on ForCausalLM.
+6. Fused loss + aux_loss in ForConditionalGeneration.
 """
 
 from typing import Optional
@@ -35,7 +34,7 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.masking_utils import create_causal_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast, MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
     Qwen3_5MoeConfig,
@@ -53,7 +52,7 @@ from transformers.utils import TransformersKwargs, logging
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import slice_position_embedding
 from veomni.ops import fused_moe_forward
-from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.device import get_device_id
 
 
@@ -114,24 +113,9 @@ is_fast_path_available = None
 
 
 # ── Liger replacements ──────────────────────────────────────────────────────────
-
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3_5MoeRMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNorm",
-        description="Use LigerKernel RMSNorm",
-    )
-)
-
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3_5MoeMLP",
-        replacement_module="liger_kernel.transformers.swiglu",
-        replacement_name="LigerSwiGLUMLP",
-        description="Use LigerKernel SwiGLU MLP",
-    )
-)
+# NOTE: Qwen3_5MoeRMSNorm is NOT replaced with LigerRMSNorm because the HF
+# implementation uses a (1 + weight) centered formulation while LigerRMSNorm
+# uses a plain (weight) formulation, making them incompatible.
 
 
 @config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
@@ -158,21 +142,49 @@ def apply_rotary_pos_emb_liger(
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
 
 
-@config.replace_class("Qwen3_5MoeExperts", description="Use merged gate_up_proj layout with VeOmni fused MoE path")
-class PatchedQwen3_5MoeExperts(torch.nn.Module):
+@config.override_method(
+    "Qwen3_5MoeSparseMoeBlock.forward",
+    description="Use out-of-place add to avoid autograd in-place mutation errors",
+)
+def qwen3_5_moe_sparse_moe_block_forward_patched(
+    self, hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+    shared_expert_output = self.shared_expert(hidden_states_reshaped)
+    _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+    expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+
+    shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+
+    # Modification: use out-of-place add to avoid autograd in-place mutation NaN.
+    expert_output = expert_output + shared_expert_output
+    expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
+    return expert_output
+
+
+@config.replace_class(
+    "Qwen3_5MoeExperts",
+    description="Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path",
+)
+class PatchedQwen3_5MoeExperts(nn.Module):
+    """Collection of expert weights stored as 3D tensors.
+
+    Replaces the HF class to remove the @use_experts_implementation decorator
+    (which routes to grouped_mm and bypasses our fused MoE path) and to add
+    VeOmni fused MoE dispatch via _moe_implementation config flag.
+    """
+
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.moe_intermediate_size
-        # Keep the HF v5 merged gate_up_proj layout: [E, 2*I, H]
-        self.gate_up_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
-        )
-        self.down_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
-        )
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        # Modification: read _moe_implementation to switch between eager and fused MoE paths.
         self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
     def forward(
@@ -182,7 +194,20 @@ class PatchedQwen3_5MoeExperts(torch.nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
-        if self._moe_implementation == "eager":
+        # Modification: dispatch to fused MoE when _moe_implementation is set.
+        # Split gate_up_proj into gate_proj and up_proj for the split-weight fused MoE path.
+        if self._moe_implementation == "fused":
+            gate_proj, up_proj = self.gate_up_proj.chunk(2, dim=1)
+            final_hidden_states = fused_moe_forward(
+                num_experts=self.num_experts,
+                routing_weights=top_k_weights.to(final_hidden_states.dtype),
+                selected_experts=top_k_index,
+                hidden_states=hidden_states,
+                fc1_1_weight=gate_proj.contiguous(),
+                fc1_2_weight=up_proj.contiguous(),
+                fc2_weight=self.down_proj,
+            )
+        elif self._moe_implementation == "eager":
             with torch.no_grad():
                 expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
                 expert_mask = expert_mask.permute(2, 1, 0)
@@ -194,26 +219,11 @@ class PatchedQwen3_5MoeExperts(torch.nn.Module):
                     continue
                 top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
                 current_state = hidden_states[token_idx]
-                gate, up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(
-                    2, dim=-1
-                )
+                gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
                 current_hidden_states = self.act_fn(gate) * up
-                current_hidden_states = torch.nn.functional.linear(
-                    current_hidden_states, self.down_proj[expert_idx]
-                )
+                current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
                 current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
                 final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-        elif self._moe_implementation == "fused":
-            final_hidden_states = fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
         else:
             raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
 
@@ -571,19 +581,6 @@ def qwen3_5_moe_text_model_forward_patched(
     )
 
 
-# ── ForConditionalGeneration __init__ (propagate _moe_implementation) ─────────
-
-
-@config.override_method(
-    "Qwen3_5MoeForConditionalGeneration.__init__",
-    description="Propagate _moe_implementation to text_config so Experts pick it up",
-)
-def qwen3_5_moe_forconditional_generation_init_patched(self, config: Qwen3_5MoeConfig):
-    moe_implementation = getattr(config, "_moe_implementation", "eager")
-    config.text_config._moe_implementation = moe_implementation
-    super().__init__(config)
-
-
 # ── ForConditionalGeneration forward (fused loss + aux_loss, no vision) ──────────
 
 
@@ -668,92 +665,3 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         router_logits=outputs.router_logits,
     )
-
-
-# ── ForCausalLM forward (fused loss + aux_loss) ─────────────────────────────────
-
-
-@config.override_method(
-    "Qwen3_5MoeForCausalLM.forward",
-    description="Support fused cross entropy path in Qwen3_5MoeForCausalLM.forward",
-)
-def qwen3_5_moe_forcausallm_forward_patched(
-    self,
-    input_ids: torch.LongTensor | None = None,
-    attention_mask: torch.Tensor | None = None,
-    position_ids: torch.LongTensor | None = None,
-    past_key_values: Qwen3_5MoeDynamicCache | None = None,
-    inputs_embeds: torch.FloatTensor | None = None,
-    labels: torch.LongTensor | None = None,
-    use_cache: bool | None = None,
-    output_router_logits: bool | None = None,
-    cache_position: torch.LongTensor | None = None,
-    logits_to_keep: int | torch.Tensor = 0,
-    **kwargs: Unpack[TransformersKwargs],
-) -> MoeCausalLMOutputWithPast:
-    output_router_logits = (
-        output_router_logits if output_router_logits is not None else self.config.output_router_logits
-    )
-
-    outputs: MoeModelOutputWithPast = self.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        use_cache=use_cache,
-        output_router_logits=output_router_logits,
-        cache_position=cache_position,
-        **kwargs,
-    )
-
-    hidden_states = outputs.last_hidden_state
-    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-
-    loss = None
-    logits = None
-    if labels is not None:
-        loss, logits = self.loss_function(
-            logits=logits,
-            labels=labels,
-            vocab_size=self.config.vocab_size,
-            hidden_states=hidden_states,
-            weights=self.lm_head.weight,
-            **kwargs,
-        )
-    else:
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-    aux_loss = None
-    if output_router_logits:
-        aux_loss = load_balancing_loss_func(
-            outputs.router_logits,
-            self.num_experts,
-            self.num_experts_per_tok,
-            attention_mask,
-        )
-        if labels is not None:
-            loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
-
-    return MoeCausalLMOutputWithPast(
-        loss=loss,
-        aux_loss=aux_loss,
-        logits=logits,
-        past_key_values=outputs.past_key_values,
-        hidden_states=outputs.hidden_states,
-        attentions=outputs.attentions,
-        router_logits=outputs.router_logits,
-    )
-
-
-# ── Expert parallel plan ────────────────────────────────────────────────────────
-
-
-@config.override_method(
-    "Qwen3_5MoeForCausalLM.get_parallel_plan",
-    description="Register Qwen3_5Moe expert parallel plan for v5 generated modeling",
-)
-def qwen3_5_moe_get_parallel_plan_patched(self):
-    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
-
-    return _get_parallel_plan()
