@@ -248,6 +248,8 @@ class DiTTrainer:
 
             args.data.drop_last = False
             args.data.shuffle = False
+            args.train.save_epochs = 0
+            args.train.save_hf_weights = False
             logger.info_rank0(
                 f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
             )
