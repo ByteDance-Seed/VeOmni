@@ -56,26 +56,6 @@ def _build_moe_indices(expert_index: torch.Tensor, num_experts: int):
     return cu_seqlens_m, A_idx, scatter_index
 
 
-def _wgrad_gemm(grad: torch.Tensor, input: torch.Tensor, cu_seqlens_m: torch.Tensor) -> torch.Tensor:
-    """Compute per-expert weight gradient: grad.T @ input using cu_seqlens_k.
-
-    Args:
-        grad: [T*topk, out_dim] in expert-sorted order.
-        input: [T*topk, in_dim] in expert-sorted order.
-        cu_seqlens_m: [E+1] expert boundaries (reused as cu_seqlens_k).
-
-    Returns:
-        weight_grad: [E, out_dim, in_dim].
-    """
-    # cu_seqlens_k mode: A=[M, total_K] @ B=[total_K, N] → [L, M, N] per group
-    # Here: A=grad.T [out_dim, T*topk], B=input [T*topk, in_dim]
-    # Result: [E, out_dim, in_dim]
-    # NOTE: pass grad.T (a non-contiguous view) rather than grad.T.contiguous(),
-    # because quack's varlen_k mode requires A to be "m-major" (M-dim contiguous),
-    # which is the natural stride layout of a .T view on a row-major tensor.
-    return gemm(grad.T, input, cu_seqlens_k=cu_seqlens_m)
-
-
 class QuackFusedMoeExpertFunction(torch.autograd.Function):
     """Fused MoE with split fc1 weights using quack GEMM."""
 
@@ -165,9 +145,11 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         grad_fc1_weighted_output = gemm(grad_fc2_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
 
         # Step 9 wgrad: grad_fc2_output.T @ fc1_weighted_output → [E, H, I]
+        # cu_seqlens_k mode: A=[M, total_K] @ B=[total_K, N] → [L, M, N] per expert group.
+        # Pass .T view (not .T.contiguous()) — quack varlen_k requires A to be m-major.
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
-            grad_fc2_weight = _wgrad_gemm(grad_fc2_output, fc1_weighted_output, cu_seqlens_m)
+            grad_fc2_weight = gemm(grad_fc2_output.T, fc1_weighted_output, cu_seqlens_k=cu_seqlens_m)
 
         # Step 8-2: routing weight backward
         grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
@@ -199,12 +181,12 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         # Step 6 wgrad: grad_fc1_2_output.T @ scatter_output → [E, I, H]
         grad_fc1_2_weight = None
         if fc1_2_weight.requires_grad:
-            grad_fc1_2_weight = _wgrad_gemm(grad_fc1_2_output, scatter_output, cu_seqlens_m)
+            grad_fc1_2_weight = gemm(grad_fc1_2_output.T, scatter_output, cu_seqlens_k=cu_seqlens_m)
 
         # Step 4 wgrad: grad_fc1_1_output.T @ scatter_output → [E, I, H]
         grad_fc1_1_weight = None
         if fc1_1_weight.requires_grad:
-            grad_fc1_1_weight = _wgrad_gemm(grad_fc1_1_output, scatter_output, cu_seqlens_m)
+            grad_fc1_1_weight = gemm(grad_fc1_1_output.T, scatter_output, cu_seqlens_k=cu_seqlens_m)
 
         # Step 3: gather gradients back to original token order
         grad_scatter_output = grad_scatter_output_1 + grad_scatter_output_2
@@ -302,9 +284,11 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         grad_fc1_weighted_output = gemm(grad_fc2_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
 
         # Step 9 wgrad: grad_fc2_output.T @ fc1_weighted_output → [E, H, I]
+        # cu_seqlens_k mode: A=[M, total_K] @ B=[total_K, N] → [L, M, N] per expert group.
+        # Pass .T view (not .T.contiguous()) — quack varlen_k requires A to be m-major.
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
-            grad_fc2_weight = _wgrad_gemm(grad_fc2_output, fc1_weighted_output, cu_seqlens_m)
+            grad_fc2_weight = gemm(grad_fc2_output.T, fc1_weighted_output, cu_seqlens_k=cu_seqlens_m)
 
         # Step 8-2
         grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
@@ -334,7 +318,7 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         grad_fc1_1_2_weight = None
         if fc1_1_2_weight.requires_grad:
             scatter_output = moe_scatter(hidden_states, scatter_index)
-            grad_fc1_1_2_weight = _wgrad_gemm(grad_fc1_output, scatter_output, cu_seqlens_m)
+            grad_fc1_1_2_weight = gemm(grad_fc1_output.T, scatter_output, cu_seqlens_k=cu_seqlens_m)
 
         # Step 3
         grad_hidden_states = moe_gather(grad_scatter_output, scatter_index)
