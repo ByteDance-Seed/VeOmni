@@ -14,16 +14,21 @@ data:
     use_audio_in_video: false
 
 train:
-  output_dir: qwen2vl_sft
-  data_parallel_mode: fsdp2
-  wandb_project: qwen2vl
-  wandb_name: qwen2vl
-  ulysses_parallel_size: 1
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  wandb:
+    project: qwen2vl
+    name: qwen2vl
   freeze_vit: false
-  lr: 1.0e-5
-  init_device: meta
-  lr_decay_style: cosine
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
   num_train_epochs: 2
   micro_batch_size: 1
   global_batch_size: 32
   max_steps: 2000
+  init_device: meta
+  checkpoint:
+    output_dir: qwen2vl_sft

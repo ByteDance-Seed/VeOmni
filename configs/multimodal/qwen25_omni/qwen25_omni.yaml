@@ -6,7 +6,8 @@ data:
   data_type: conversation
   max_seq_len: 8196
   train_size: 80000000
-  num_workers: 0
+  dataloader:
+    num_workers: 0
   mm_configs:
     scale_factor: 28
     image_min_pixels: 3136 # 4 * 28 * 28
@@ -23,15 +24,20 @@ data:
     use_audio_in_video: true
 
 train:
-  output_dir: qwen2_5_omni_sft
-  init_device: meta
-  data_parallel_mode: fsdp2
-  wandb_project: qwen2_5_omni
-  wandb_name: qwen2_5_omni
-  ulysses_parallel_size: 1
-  lr: 1.0e-5
-  lr_decay_style: cosine
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  wandb:
+    project: qwen2_5_omni
+    name: qwen2_5_omni
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
   num_train_epochs: 3
   micro_batch_size: 1
   global_batch_size: 8
   max_steps: 20
+  init_device: meta
+  checkpoint:
+    output_dir: qwen2_5_omni_sft

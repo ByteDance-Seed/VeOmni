@@ -86,7 +86,7 @@ jobs:
 
   cleanup:
     runs-on: ubuntu-latest
-    needs: [setup, gpu_unit_tests]
+    needs: [setup, gpu_e2e_tests]
     if: always()
     steps:
       - id: destroy-runner
