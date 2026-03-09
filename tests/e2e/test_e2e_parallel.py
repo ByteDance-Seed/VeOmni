@@ -143,16 +143,6 @@ text_test_cases = [
     ),
     # TODO: we only support text input now. move this to VLM test once vision input is supported.
     pytest.param(
-        "qwen3_5",
-        "./tests/toy_config/qwen3_5_toy/config.json",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v5_only,
-    ),
-    # TODO: we only support text input now. move this to VLM test once vision input is supported.
-    pytest.param(
         "qwen3_5_moe",
         "./tests/toy_config/qwen3_5_moe_toy/config.json",
         # TODO: Test with EP once Merged fc1_1_2_weight is supported with expert parallelism.
@@ -190,6 +180,7 @@ qwen3vl_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
         marks=_v4_only,
     ),
     pytest.param(
@@ -198,7 +189,17 @@ qwen3vl_test_cases = [
         True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3_5",
+        "./tests/toy_config/qwen3_5_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
     ),
 ]
 
@@ -302,9 +303,15 @@ def test_qwen2vl_parallel_align(
     )
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen3vl_test_cases)
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen3vl_test_cases)
 def test_qwen3vl_parallel_align(
-    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen3vl_dataset
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int | None,
+    dummy_qwen3vl_dataset,
 ):
     main(
         task_name="train_vlm_test",
@@ -313,6 +320,7 @@ def test_qwen3vl_parallel_align(
         is_moe=is_moe,
         rtol=rtol,
         atol=atol,
+        max_sp_size=max_sp_size,
         train_path=dummy_qwen3vl_dataset,
     )
 

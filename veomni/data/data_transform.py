@@ -337,6 +337,88 @@ def process_sample_qwen3_vl(
     return [tokenized_example]
 
 
+@DATA_TRANSFORM_REGISTRY.register("qwen3_5")
+def process_sample_qwen3_vl_transformers_v5(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    **kwargs,
+):
+    from .multimodal import conv_preprocess
+    from .multimodal.image_utils import fetch_images
+    from .multimodal.video_utils import fetch_videos_metadata
+
+    source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+
+    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
+        conversations = sample["conversations"]
+    else:
+        conversations = sample
+
+    conversations = conv_preprocess(source, conversations, **kwargs)
+
+    token_num_inputs, image_inputs, video_inputs = {}, {}, {}
+    image_grid_thw, video_grid_thw = None, None
+
+    tokenized_example = {}
+    if "images" in sample and sample["images"]:
+        images = fetch_images(sample["images"], **kwargs)
+        image_inputs = processor.image_processor(images=images, return_tensors="pt")
+        image_grid_thw = image_inputs["image_grid_thw"]
+        merge_length = processor.image_processor.merge_size**2
+        image_token_num = image_grid_thw.prod(dim=-1) // merge_length
+        token_num_inputs["image"] = image_token_num
+        tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
+    if "videos" in sample and sample["videos"]:
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        video_inputs = processor.video_processor(
+            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
+        )
+        video_grid_thw = video_inputs["video_grid_thw"]
+        merge_length = processor.video_processor.merge_size**2
+        video_token_num = video_grid_thw.prod(dim=-1) // merge_length
+        token_num_inputs["video"] = video_token_num
+
+        video_metadata = video_inputs.pop("video_metadata")
+
+        tokenized_example = chat_template.encode_messages(
+            conversations, token_num_inputs, video_metadata=video_metadata
+        )
+
+    if not tokenized_example:
+        tokenized_example = chat_template.encode_messages(conversations)
+
+    tokenized_example = {
+        k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
+    }
+
+    input_ids = tokenized_example["input_ids"]
+    tokenized_example["image_mask"] = input_ids == IMAGE_INPUT_INDEX
+    tokenized_example["video_mask"] = input_ids == VIDEO_INPUT_INDEX
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[tokenized_example["image_mask"]] = 1
+    mm_token_type_ids[tokenized_example["video_mask"]] = 2
+    tokenized_example["mm_token_type_ids"] = mm_token_type_ids
+
+    tokenized_example["position_ids"] = position_id_func(
+        input_ids=input_ids.unsqueeze(0),
+        mm_token_type_ids=mm_token_type_ids.unsqueeze(0),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
+    )["position_ids"]
+
+    tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
+
+    tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
+    tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
+    tokenized_example.update(image_inputs)
+    tokenized_example.update(video_inputs)
+
+    return [tokenized_example]
+
+
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_omni_moe")
 def process_sample_qwen_omni(
