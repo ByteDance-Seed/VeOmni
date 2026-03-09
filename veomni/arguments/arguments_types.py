@@ -551,6 +551,10 @@ class OpsImplementationConfig:
         default=None,
         metadata={"help": "MoE implementation to use."},
     )
+    moe_kernel_backend: Literal["triton", "quack"] = field(
+        default="triton",
+        metadata={"help": "GEMM kernel backend for fused MoE: 'triton' (default) or 'quack' (SM90+)."},
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":

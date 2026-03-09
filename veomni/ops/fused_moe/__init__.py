@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Literal
+
 import torch
 
 from ...utils import logging
 from ...utils.env import get_env
 from ...utils.import_utils import (
     is_fused_moe_available,
-    is_quack_gemm_available,
     is_torch_npu_available,
 )
 
@@ -60,21 +61,30 @@ def fused_moe_forward(
     )
 
 
-def apply_veomni_fused_moe_patch():
+def apply_veomni_fused_moe_patch(
+    backend: Literal["triton", "quack"] = "triton",
+):
+    """Bind the global ``_fused_moe_forward`` function pointer.
+
+    Args:
+        backend: GEMM kernel backend for fused MoE.
+            ``"triton"`` uses the Triton group-gemm kernels (default).
+            ``"quack"`` uses the Quack CUTLASS/CuTe kernels (SM90+).
+            On NPU devices the backend parameter is ignored and the NPU
+            kernel is always selected.
+    """
     global _fused_moe_forward
     if is_torch_npu_available():
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
+    elif backend == "quack":
+        from .quack_gemm import quack_gemm_fused_moe_forward
+
+        _fused_moe_forward = quack_gemm_fused_moe_forward
+    elif backend == "triton" and is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
+        from .group_gemm import group_gemm_fused_moe_forward
+
+        _fused_moe_forward = group_gemm_fused_moe_forward
     else:
-        backend = get_env("FUSED_MOE_BACKEND")
-        if backend == "quack":
-            from .quack_gemm import quack_gemm_fused_moe_forward
-
-            _fused_moe_forward = quack_gemm_fused_moe_forward
-        elif backend in ("triton", "auto") and is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
-            from .group_gemm import group_gemm_fused_moe_forward
-
-            _fused_moe_forward = group_gemm_fused_moe_forward
-        else:
-            _fused_moe_forward = None
+        _fused_moe_forward = None
