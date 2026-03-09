@@ -50,7 +50,13 @@ class DynBszBuffer:
                     - attention_mask: torch.Tensor of shape (seq_len, )
         """
         self._buffer.append(item)
-        self._buffer_sample_lens.append(item["attention_mask"].sum())
+        if "attention_mask" in item:
+            sample_len = item["attention_mask"].sum()
+        elif "chosen_attention_mask" in item:
+            sample_len = item["chosen_attention_mask"].sum() + item["rejected_attention_mask"].sum()
+        else:
+            raise KeyError("Expected 'attention_mask' or 'chosen_attention_mask' in item")
+        self._buffer_sample_lens.append(sample_len)
         self.all_token_cnt += self._buffer_sample_lens[-1]
 
     def get_samples(self, n_token_per_iter: int, force: bool = True):
@@ -154,7 +160,8 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
 
     def put_item(self, item: Dict[str, Any]):
-        if len(item["input_ids"]) == 1:
+        ids_key = "input_ids" if "input_ids" in item else "chosen_input_ids"
+        if len(item[ids_key]) == 1:
             print("WARNING: EMPTY STRING.")
             return
         self.buffer.append(item)
