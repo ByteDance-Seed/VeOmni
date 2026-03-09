@@ -24,6 +24,7 @@ ENV_DEFAULTS = {
     "MODELING_BACKEND": "veomni",
     "VEOMNI_USE_LIGER_KERNEL": "1",
     "USE_GROUP_GEMM": "1",
+    "FUSED_MOE_BACKEND": "triton",
 }
 
 

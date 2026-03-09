@@ -48,6 +48,7 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
     "librosa": _is_package_available("librosa"),
     "soundfile": _is_package_available("soundfile"),
     "triton": _is_package_available("triton"),
+    "quack": _is_package_available("quack"),
     "veomni_patch": _is_package_available("veomni_patch"),
 }
 
@@ -72,6 +73,15 @@ def is_fused_moe_available() -> bool:
     import torch
 
     return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
+
+
+def is_quack_gemm_available() -> bool:
+    import torch
+
+    if not (torch.cuda.is_available() and _PACKAGE_FLAGS["quack"] and not _PACKAGE_FLAGS["torch_npu"]):
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 9  # SM90+
 
 
 def is_video_audio_available() -> bool:
