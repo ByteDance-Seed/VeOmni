@@ -78,8 +78,6 @@ class WanTransformer3DConditionModel(PreTrainedModel):
 
     @torch.no_grad()
     def _prepare_negative_prompt_embeds(self):
-        if self.config.cfg_negative_prob <= 0.0:
-            return
         prompt_embeds, _ = WanPipeline.encode_prompt(
             self,
             prompt=[self.config.cfg_negative_prompt],
@@ -147,7 +145,6 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             "timestep": [],
             "encoder_hidden_states": [],
             "training_target": [],
-            "loss_weight": [],
         }
         for sample_latents, sample_context in zip(latents, context):
             latents = DiagonalGaussianDistribution(sample_latents).mode()
@@ -158,17 +155,11 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
             training_target = noise - latents
 
-            use_negative_context = (
-                self.negative_prompt_embeds is not None
-                and torch.rand((), device=latents.device).item() < self.config.cfg_negative_prob
-            )
+            use_negative_context = torch.rand(()) < self.config.cfg_negative_prob
             if use_negative_context:
                 sample_context = self.negative_prompt_embeds.to(device=latents.device, dtype=sample_context.dtype)
             else:
                 sample_context = sample_context.to(latents.device)
-
-            if sample_context.shape[0] != latents.shape[0]:
-                sample_context = sample_context.expand(latents.shape[0], -1, -1)
 
             packed_conditions["hidden_states"].append(noisy_latents)
             packed_conditions["timestep"].append(timestep)

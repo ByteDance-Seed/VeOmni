@@ -67,18 +67,26 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformer3DModel):
     def config(self, value):
         self._internal_dict = value
 
-    def forward(self, condition_dict: dict[str, torch.Tensor]):
-        outputs = _WanTransformer3DModel.forward(
-            self,
-            hidden_states=condition_dict["hidden_states"],
-            timestep=condition_dict["timestep"],
-            encoder_hidden_states=condition_dict["encoder_hidden_states"],
-        )
-        prediction = outputs.sample if hasattr(outputs, "sample") else outputs
-        target = condition_dict["training_target"]
-        per_sample_loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
-        per_sample_loss = per_sample_loss.view(per_sample_loss.shape[0], -1).mean(dim=1)
-        return per_sample_loss.mean()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        training_target: torch.Tensor,
+    ):
+        per_sample_losses = []
+        for hidden_state, timestep, encoder_hidden_state, training_target in zip(
+            hidden_states, timestep, encoder_hidden_states, training_target
+        ):
+            outputs = _WanTransformer3DModel.forward(
+                self, hidden_states=hidden_state, timestep=timestep, encoder_hidden_states=encoder_hidden_state
+            )
+            prediction = outputs.sample if hasattr(outputs, "sample") else outputs
+            target = training_target
+            per_sample_loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
+            per_sample_loss = per_sample_loss.view(per_sample_loss.shape[0], -1).mean(dim=1)
+            per_sample_losses.append(per_sample_loss)
+        return torch.stack(per_sample_losses).mean()
 
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
