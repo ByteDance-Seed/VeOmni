@@ -4,7 +4,7 @@ model:
   pretrained_text_encoder_2_path: FLUX.1-dev/text_encoder_2
   pretrained_vae_path: FLUX.1-dev/ae.safetensors
   config_path: ./configs/model_configs/flux/flux.json
-  network:
+  ops_implementation:
     attn_implementation: flash_attention_3
   tokenizer_1_path: FLUX.1-dev/tokenizer
   tokenizer_2_path: FLUX.1-dev/tokenizer_2
@@ -35,7 +35,7 @@ train:
       full_shard: true
       offload: false
     offload:
-      activation_offload: false
+      enable_activation: false
   gradient_checkpointing:
     enable: false
   global_batch_size: 8

@@ -1,6 +1,6 @@
 model:
   model_path: Qwen/Qwen3-VL-8B-Instruct
-  network:
+  ops_implementation:
     attn_implementation: flash_attention_2
 
 data:

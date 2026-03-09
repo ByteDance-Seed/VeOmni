@@ -174,14 +174,14 @@ By overlapping communication and computation, Async Ulysses:
 
 #### Enabling Async Ulysses
 
-To enable Async Ulysses, simply set the `accelerator.async_enabled` parameter to `True`:
+To enable Async Ulysses, simply set the `accelerator.enable_async` parameter to `True`:
 
 Notice: Async Ulysses works when `accelerator.ulysses_size > 1`.
 
 ```shell
 bash train.sh tasks/multimodal/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --train.accelerator.ulysses_size 4 \
-    --train.accelerator.async_enabled true
+    --train.accelerator.enable_async true
 ```
 
 
@@ -267,7 +267,7 @@ Args:
 To enable Async Ulysses for an existing model, you need to:
 
 1. Check if Async Ulysses is supported for your model (currently supported for Qwen3VL Dense)
-2. Set `accelerator.async_enabled=True` in your training configuration
+2. Set `accelerator.enable_async=True` in your training configuration
 3. Ensure you're using Flash Attention 2.0 and Ulysses Context Parallelism is **enabled**
 4. Verify that your hardware supports asynchronous operations
 

@@ -40,7 +40,7 @@ def run_environ_meter(args):
         cp_size=args.train.accelerator.cp_size,
         ulysses_size=args.train.accelerator.ulysses_size,
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
-        async_enabled=args.train.accelerator.async_enabled,
+        async_enabled=args.train.accelerator.enable_async,
     )
 
     # Test update()

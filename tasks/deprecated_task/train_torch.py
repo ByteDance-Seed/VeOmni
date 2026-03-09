@@ -135,8 +135,8 @@ def main():
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-        attn_implementation=args.model.network.attn_implementation,
-        moe_implementation=args.model.network.moe_implementation,
+        attn_implementation=args.model.ops_implementation.attn_implementation,
+        moe_implementation=args.model.ops_implementation.moe_implementation,
         init_device=args.train.init_device,
     )
     model_config = model.config
@@ -236,9 +236,9 @@ def main():
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
-        args.train.accelerator.offload.activation_offload,
+        args.train.accelerator.offload_config.enable_activation,
         args.train.gradient_checkpointing.enable,
-        args.train.accelerator.offload.activation_gpu_limit,
+        args.train.accelerator.offload_config.activation_gpu_limit,
     )
     model.train()
     logger.info(

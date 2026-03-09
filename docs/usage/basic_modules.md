@@ -86,8 +86,8 @@ init_parallel_state(
     pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
     cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
     ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
-    fsdp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
-    async_enabled=args.train.accelerator.async_enabled, # async ulysses
+    mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
+    async_enabled=args.train.accelerator.enable_async, # async ulysses
 )
 
 parallel_state = get_parallel_state()
@@ -338,8 +338,8 @@ model = build_foundation_model(
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
     init_device=args.train.init_device, # model init device
     torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-    attn_implementation=args.model.network.attn_implementation,
-    moe_implementation=args.model.network.moe_implementation,
+    attn_implementation=args.model.ops_implementation.attn_implementation,
+    moe_implementation=args.model.ops_implementation.moe_implementation,
     config_kwargs=config_kwargs,
 )
 

@@ -35,7 +35,7 @@ Top-level configuration that assembles all argument groups.
 Model architecture, paths, and multimodal encoder / decoder setup.
 
 * `ModelArguments` — `model.*`
-* `NetworkConfig` — `model.network.*`
+* `OpsImplementationConfig` — `model.ops_implementation.*`
 
 ### VLM Extensions
 
@@ -62,13 +62,13 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
 
 * `TrainingArguments` — `train.*`
     * `OptimizerConfig` — `train.optimizer.*`
-    * `WandbArguments` — `train.wandb.*`
-    * `ProfileArguments` — `train.profile.*`
+    * `WandbConfig` — `train.wandb.*`
+    * `ProfileConfig` — `train.profile.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
-    * `AcceleratorArguments` — `train.accelerator.*`
+    * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
-        * `OffloadConfig` — `train.accelerator.offload.*`
-    * `CheckpointArguments` — `train.checkpoint.*`
+        * `OffloadConfig` — `train.accelerator.offload_config.*`
+    * `CheckpointConfig` — `train.checkpoint.*`
 
 ### VLM Extensions
 
@@ -113,11 +113,11 @@ Root config — assembles `model`, `data`, and `train`.
 | output_encoder | `Literal["encoder", "decoder"]` | `"decoder"` | Whether to use the encoder or decoder to encode output images. |
 | encode_target | `bool` | `False` | Whether to encode training targets with decoder (diffusion only). |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
-| network | `NetworkConfig` | — | Attention / MoE kernel configuration. |
+| ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
 
-### NetworkConfig
+### OpsImplementationConfig
 
-`model.network.*` — Attention and MoE kernel implementation.
+`model.ops_implementation.*` — Attention and MoE kernel implementation.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -184,11 +184,11 @@ Root config — assembles `model`, `data`, and `train`.
 | enable_compile | `bool` | `False` | Enable `torch.compile`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
-| wandb | `WandbArguments` | — | Weights & Biases logging. |
-| profile | `ProfileArguments` | — | Torch profiler settings. |
+| wandb | `WandbConfig` | — | Weights & Biases logging. |
+| profile | `ProfileConfig` | — | Torch profiler settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
-| accelerator | `AcceleratorArguments` | — | Parallelism and distributed-training topology. |
-| checkpoint | `CheckpointArguments` | — | Checkpoint saving and loading. |
+| accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
+| checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
 
 ### OptimizerConfig
 
@@ -208,7 +208,7 @@ Root config — assembles `model`, `data`, and `train`.
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
 
-### WandbArguments
+### WandbConfig
 
 `train.wandb.*` — Weights & Biases logging.
 
@@ -219,7 +219,7 @@ Root config — assembles `model`, `data`, and `train`.
 | name | `Optional[str]` | `None` | W&B experiment name. |
 | id | `Optional[str]` | `None` | W&B run ID for resuming a previous run. |
 
-### ProfileArguments
+### ProfileConfig
 
 `train.profile.*` — Torch profiler settings.
 
@@ -244,7 +244,7 @@ Root config — assembles `model`, `data`, and `train`.
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
 | enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
 
-### AcceleratorArguments
+### AcceleratorConfig
 
 `train.accelerator.*` — Parallelism and distributed-training topology.
 
@@ -257,10 +257,10 @@ Root config — assembles `model`, `data`, and `train`.
 | ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |
 | pp_size | `int` | `1` | Pipeline parallel size. |
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
-| async_enabled | `bool` | `False` | Enable async Ulysses. |
+| enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
-| offload | `OffloadConfig` | — | Activation offload settings. |
+| offload_config | `OffloadConfig` | — | Activation offload settings. |
 
 ### FSDPConfig
 
@@ -277,14 +277,14 @@ Root config — assembles `model`, `data`, and `train`.
 
 ### OffloadConfig
 
-`train.accelerator.offload.*` — Activation offload settings.
+`train.accelerator.offload_config.*` — Activation offload settings.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| activation_offload | `bool` | `False` | Enable activation offload to CPU. |
+| enable_activation | `bool` | `False` | Enable activation offload to CPU. |
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
 
-### CheckpointArguments
+### CheckpointConfig
 
 `train.checkpoint.*` — Checkpoint saving and loading.
 

@@ -1,7 +1,7 @@
 model:
   model_path: Wan-AI/Wan2.1-I2V-14B-480P
   config_path: ./configs/model_configs/wan/wani2v_14b.json
-  network:
+  ops_implementation:
     attn_implementation: flash_attention_2
 
 data:
@@ -24,7 +24,7 @@ train:
       full_shard: true
       offload: false
     offload:
-      activation_offload: false
+      enable_activation: false
   gradient_checkpointing:
     enable: true
   global_batch_size: 8

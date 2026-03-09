@@ -1,6 +1,6 @@
 model:
   model_path: Qwen3-VL-30B-A3B-Instruct
-  network:
+  ops_implementation:
     moe_implementation: fused
     attn_implementation: flash_attention_2
 

@@ -1,6 +1,6 @@
 model:
   # model_path: deepseek-ai/DeepSeek-V3-0324
-  network:
+  ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused
 
@@ -24,7 +24,7 @@ train:
       full_shard: true
       offload: false
     offload:
-      activation_offload: false
+      enable_activation: false
   gradient_checkpointing:
     enable: true
   global_batch_size: 32

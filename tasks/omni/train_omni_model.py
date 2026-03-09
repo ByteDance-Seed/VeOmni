@@ -335,9 +335,9 @@ def main():
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
-        args.train.accelerator.offload.activation_offload,
+        args.train.accelerator.offload_config.enable_activation,
         args.train.gradient_checkpointing.enable,
-        args.train.accelerator.offload.activation_gpu_limit,
+        args.train.accelerator.offload_config.activation_gpu_limit,
     )
     model.train()
     logger.info(

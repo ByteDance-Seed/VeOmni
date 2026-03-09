@@ -30,13 +30,13 @@ logger = logging.get_logger(__name__)
 # Hierarchy:
 #   train.*
 #   ├── optimizer.*          → OptimizerConfig
-#   ├── wandb.*              → WandbArguments
-#   ├── profile.*            → ProfileArguments
+#   ├── wandb.*              → WandbConfig
+#   ├── profile.*            → ProfileConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
-#   ├── accelerator.*        → AcceleratorArguments
+#   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
-#   │   └── offload.*        → OffloadConfig
-#   └── checkpoint.*         → CheckpointArguments
+#   │   └── offload_config.* → OffloadConfig
+#   └── checkpoint.*         → CheckpointConfig
 #
 
 
@@ -91,7 +91,7 @@ class OptimizerConfig:
 
 
 @dataclass
-class WandbArguments:
+class WandbConfig:
     """train.wandb.* — Weights & Biases logging."""
 
     enable: bool = field(
@@ -113,7 +113,7 @@ class WandbArguments:
 
 
 @dataclass
-class ProfileArguments:
+class ProfileConfig:
     """train.profile.* — Torch profiler settings."""
 
     enable: bool = field(
@@ -204,9 +204,9 @@ class FSDPConfig:
 
 @dataclass
 class OffloadConfig:
-    """train.accelerator.offload.* — Activation offload settings."""
+    """train.accelerator.offload_config.* — Activation offload settings."""
 
-    activation_offload: bool = field(
+    enable_activation: bool = field(
         default=False,
         metadata={"help": "Enable activation offload to CPU."},
     )
@@ -219,7 +219,7 @@ class OffloadConfig:
 
 
 @dataclass
-class AcceleratorArguments:
+class AcceleratorConfig:
     """train.accelerator.* — Parallelism and distributed-training topology."""
 
     dp_replicate_size: int = field(
@@ -250,7 +250,7 @@ class AcceleratorArguments:
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
     )
-    async_enabled: bool = field(
+    enable_async: bool = field(
         default=False,
         metadata={"help": "Whether or not to enable async ulysses."},
     )
@@ -259,11 +259,11 @@ class AcceleratorArguments:
         metadata={"help": "Ring-attn context parallel size."},
     )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
-    offload: OffloadConfig = field(default_factory=OffloadConfig)
+    offload_config: OffloadConfig = field(default_factory=OffloadConfig)
 
 
 @dataclass
-class CheckpointArguments:
+class CheckpointConfig:
     """train.checkpoint.* — Checkpoint saving and loading."""
 
     output_dir: str = field(
@@ -397,11 +397,11 @@ class TrainingArguments:
 
     # sub-argument groups
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    wandb: WandbArguments = field(default_factory=WandbArguments)
-    profile: ProfileArguments = field(default_factory=ProfileArguments)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+    profile: ProfileConfig = field(default_factory=ProfileConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
-    accelerator: AcceleratorArguments = field(default_factory=AcceleratorArguments)
-    checkpoint: CheckpointArguments = field(default_factory=CheckpointArguments)
+    accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
         self._train_steps = -1
@@ -522,13 +522,13 @@ class TrainingArguments:
 #
 # Hierarchy:
 #   model.*
-#   └── network.*            → NetworkConfig
+#   └── ops_implementation.* → OpsImplementationConfig
 #
 
 
 @dataclass
-class NetworkConfig:
-    """model.network.* — Attention / MoE kernel implementation."""
+class OpsImplementationConfig:
+    """model.ops_implementation.* — Attention / MoE kernel implementation."""
 
     attn_implementation: Optional[
         Literal[
@@ -611,7 +611,7 @@ class ModelArguments:
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
-    network: NetworkConfig = field(default_factory=NetworkConfig)
+    ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:

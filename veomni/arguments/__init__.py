@@ -14,20 +14,20 @@
 
 
 from .arguments_types import (
-    AcceleratorArguments,
-    CheckpointArguments,
+    AcceleratorConfig,
+    CheckpointConfig,
     DataArguments,
     DataloaderConfig,
     FSDPConfig,
     GradientCheckpointingConfig,
     InferArguments,
     ModelArguments,
-    NetworkConfig,
     OffloadConfig,
+    OpsImplementationConfig,
     OptimizerConfig,
-    ProfileArguments,
+    ProfileConfig,
     TrainingArguments,
     VeOmniArguments,
-    WandbArguments,
+    WandbConfig,
 )
 from .parser import parse_args, save_args

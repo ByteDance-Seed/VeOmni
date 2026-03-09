@@ -127,7 +127,7 @@ def main():
         cp_size=args.train.accelerator.cp_size,
         ulysses_size=args.train.accelerator.ulysses_size,
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
-        async_enabled=args.train.accelerator.async_enabled,
+        async_enabled=args.train.accelerator.enable_async,
     )
 
     logger.info_rank0("Prepare model")
@@ -135,8 +135,8 @@ def main():
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
-        moe_implementation=args.model.network.moe_implementation,
-        attn_implementation=args.model.network.attn_implementation,
+        moe_implementation=args.model.ops_implementation.moe_implementation,
+        attn_implementation=args.model.ops_implementation.attn_implementation,
         encoder_data_balance=args.model.encoder_data_balance,
         encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
     )
@@ -304,9 +304,9 @@ def main():
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
-        args.train.accelerator.offload.activation_offload,
+        args.train.accelerator.offload_config.enable_activation,
         args.train.gradient_checkpointing.enable,
-        args.train.accelerator.offload.activation_gpu_limit,
+        args.train.accelerator.offload_config.activation_gpu_limit,
     )
     model.train()
     logger.info_rank0("Start training")

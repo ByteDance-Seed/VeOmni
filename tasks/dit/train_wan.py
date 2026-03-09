@@ -152,7 +152,7 @@ def main():
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
         torch_dtype="bfloat16",
-        attn_implementation=args.model.network.attn_implementation,
+        attn_implementation=args.model.ops_implementation.attn_implementation,
     )
     model.micro_batch_size = args.train.micro_batch_size
 
@@ -285,9 +285,9 @@ def main():
     helper.empty_cache()
 
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
-        args.train.accelerator.offload.activation_offload,
+        args.train.accelerator.offload_config.enable_activation,
         args.train.gradient_checkpointing.enable,
-        args.train.accelerator.offload.activation_gpu_limit,
+        args.train.accelerator.offload_config.activation_gpu_limit,
     )
 
     helper.empty_cache()

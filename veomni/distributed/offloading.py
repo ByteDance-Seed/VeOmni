@@ -69,12 +69,12 @@ class custom_save_on_cpu(saved_tensors_hooks):
 
 
 def build_activation_offloading_context(
-    enable_activation_offload: bool = False,
+    enable_activation: bool = False,
     enable_gradient_checkpointing: bool = False,
     activation_gpu_limit: float = 0.0,
 ) -> Tuple[Union["saved_tensors_hooks", "nullcontext"], Union["saved_tensors_hooks", "nullcontext"]]:
     model_fwd_context, model_bwd_context = nullcontext(), nullcontext()
-    if enable_activation_offload:
+    if enable_activation:
         # pin_memory=False since CachingHostAllocator caches pinned memory aggressively.
         # torch._C._host_emptyCache() can be used after version 2.5.
         if enable_gradient_checkpointing:

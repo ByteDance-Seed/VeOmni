@@ -211,7 +211,7 @@ class BaseTrainer(Stateful, ABC):
             cp_size=self.args.train.accelerator.cp_size,
             ulysses_size=self.args.train.accelerator.ulysses_size,
             dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
-            async_enabled=self.args.train.accelerator.async_enabled,
+            async_enabled=self.args.train.accelerator.enable_async,
         )
 
         # Set random seed
@@ -237,8 +237,8 @@ class BaseTrainer(Stateful, ABC):
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
             torch_dtype="float32" if self.args.train.enable_mixed_precision else "bfloat16",
-            attn_implementation=self.args.model.network.attn_implementation,
-            moe_implementation=self.args.model.network.moe_implementation,
+            attn_implementation=self.args.model.ops_implementation.attn_implementation,
+            moe_implementation=self.args.model.ops_implementation.moe_implementation,
             init_device=self.args.train.init_device,
         )
         self.model_config = self.model.config
@@ -357,9 +357,9 @@ class BaseTrainer(Stateful, ABC):
     def _build_training_context(self):
         """Build training context for distributed training."""
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
-            self.args.train.accelerator.offload.activation_offload,
+            self.args.train.accelerator.offload_config.enable_activation,
             self.args.train.gradient_checkpointing.enable,
-            self.args.train.accelerator.offload.activation_gpu_limit,
+            self.args.train.accelerator.offload_config.activation_gpu_limit,
         )
 
     def _init_callbacks(self):
