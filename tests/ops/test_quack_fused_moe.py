@@ -44,6 +44,10 @@ def _eager_moe_forward(
     [
         (64, 8, 256, 128, 2),
         (128, 128, 2048, 768, 8),
+        # Qwen3-MoE-like: 128 experts, top-8, hidden=2048, ffn=1024
+        (512, 128, 2048, 1024, 8),
+        # DeepSeek-V2-like: 64 experts, top-6, hidden=2048, ffn=1408
+        (1024, 64, 2048, 1408, 6),
     ],
 )
 class TestQuackFusedMoe:
@@ -167,3 +171,63 @@ class TestQuackFusedMoe:
         torch.testing.assert_close(fc2_q.grad, fc2_e.grad, rtol=1e-2, atol=1e-2)
         fc1_eager_grad = torch.cat([fc1_1_e.grad, fc1_2_e.grad], dim=1)
         torch.testing.assert_close(fc1_q.grad, fc1_eager_grad, rtol=3e-2, atol=3e-2)
+
+
+class TestBuildMoeIndices:
+    """Unit tests for _build_moe_indices with concrete examples."""
+
+    def test_basic_example(self):
+        """Verify cu_seqlens_m, A_idx, and scatter_index on a small hand-crafted input.
+
+        Setup: 4 tokens, 3 experts, topk=2
+            expert_index = [[0, 2],   # token 0 -> experts 0, 2
+                            [1, 0],   # token 1 -> experts 1, 0
+                            [2, 1],   # token 2 -> experts 2, 1
+                            [0, 1]]   # token 3 -> experts 0, 1
+
+        Flat expert assignments: [0, 2, 1, 0, 2, 1, 0, 1]
+        Sorted by expert (stable): expert 0 appears at flat indices 0, 3, 6
+                                    expert 1 appears at flat indices 2, 5, 7
+                                    expert 2 appears at flat indices 1, 4
+
+        Expected:
+            cu_seqlens_m = [0, 3, 6, 8]
+            A_idx (token indices) = [0, 1, 3, 1, 2, 3, 0, 2]  (flat_idx // topk)
+            scatter_index: inverse of sorted_order, reshaped to [4, 2]
+        """
+        from veomni.ops.fused_moe.quack_gemm import _build_moe_indices
+
+        device = torch.device(get_device_type())
+        expert_index = torch.tensor([[0, 2], [1, 0], [2, 1], [0, 1]], device=device)
+        num_experts = 3
+
+        cu_seqlens_m, A_idx, scatter_index = _build_moe_indices(expert_index, num_experts)
+
+        # cu_seqlens_m: cumulative counts [0, 3, 6, 8]
+        assert cu_seqlens_m.tolist() == [0, 3, 6, 8]
+
+        # A_idx: token index for each expert-sorted position
+        assert A_idx.tolist() == [0, 1, 3, 1, 2, 3, 0, 2]
+
+        # scatter_index round-trip: gathering from expert-sorted output by scatter_index
+        # should recover the original token order
+        T, topk = expert_index.shape
+        dummy_sorted = torch.arange(T * topk, device=device, dtype=torch.float32)
+        gathered = dummy_sorted[scatter_index.flatten().long()]
+        # Re-scattering and re-gathering should be identity
+        re_sorted = torch.empty_like(dummy_sorted)
+        re_sorted[scatter_index.flatten().long()] = gathered
+        assert torch.equal(re_sorted, dummy_sorted)
+
+    def test_all_same_expert(self):
+        """All tokens routed to the same expert."""
+        from veomni.ops.fused_moe.quack_gemm import _build_moe_indices
+
+        device = torch.device(get_device_type())
+        expert_index = torch.zeros(8, 1, dtype=torch.long, device=device)
+        num_experts = 4
+
+        cu_seqlens_m, A_idx, scatter_index = _build_moe_indices(expert_index, num_experts)
+
+        assert cu_seqlens_m.tolist() == [0, 8, 8, 8, 8]
+        assert A_idx.tolist() == list(range(8))

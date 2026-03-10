@@ -12,8 +12,7 @@ configure it.
 | Attention | `attn_implementation` | — | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | Cross-entropy loss | — | `VEOMNI_USE_LIGER_KERNEL` | `"1"` | Import time |
 | Liger fused ops (RMSNorm, RoPE, SwiGLU) | — | `VEOMNI_USE_LIGER_KERNEL` | `"1"` | Model registration (import time) |
-| MoE (eager vs fused) | `moe_implementation` | — | `None` | `build_foundation_model` |
-| MoE GEMM backend | `moe_kernel_backend` | — | `"triton"` | `build_foundation_model` |
+| MoE implementation | `moe_implementation` | — | `None` | `build_foundation_model` |
 
 All config fields live in `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`),
 accessible via `model.ops_implementation.*` in YAML.
@@ -173,42 +172,29 @@ Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
 
 ## 4. MoE Kernel
 
-MoE kernel selection has two orthogonal dimensions:
-
-### 4a. Eager vs Fused (`moe_implementation`)
+MoE kernel selection is controlled by a single `moe_implementation` field:
 
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused    # or "eager" (very slow, debug only)
+    moe_implementation: fused          # Triton group-gemm (default fused path)
+    # moe_implementation: fused_quack  # Quack CUTLASS/CuTe kernels (SM90+)
+    # moe_implementation: eager        # Reference PyTorch loop (very slow, debug only)
 ```
 
 **Field:** `OpsImplementationConfig.moe_implementation`
 **Default:** `None` (falls back to `"eager"` per model config)
 
-This is stored on `config._moe_implementation` and read by each model's
-`SparseMoeBlock.__init__` to decide between the naive PyTorch expert loop
-and `fused_moe_forward()`.
-
-### 4b. GEMM Backend (`moe_kernel_backend`)
-
-```yaml
-model:
-  ops_implementation:
-    moe_kernel_backend: triton    # or "quack"
-```
-
-**Field:** `OpsImplementationConfig.moe_kernel_backend`
-**Default:** `"triton"`
-
-This controls **which kernel** backs `fused_moe_forward` when
-`moe_implementation="fused"`.
-
-| Backend | Kernel | Hardware | EP support |
-|---------|--------|----------|:----------:|
-| `triton` | Triton group-gemm (`group_gemm_same_nk`) | SM70+ (V100+) | Yes |
-| `quack` | Quack CUTLASS/CuTe (`quack.gemm_interface.gemm`) | SM90+ (H100+) | No |
+| Value | Kernel | Hardware | EP support |
+|-------|--------|----------|:----------:|
+| `eager` | PyTorch expert loop | Any | No |
+| `fused` | Triton group-gemm (`group_gemm_same_nk`) | SM70+ (V100+) | Yes |
+| `fused_quack` | Quack CUTLASS/CuTe (`quack.gemm_interface.gemm`) | SM90+ (H100+) | No |
 | *(NPU auto)* | NPU group-gemm | Ascend NPU | Yes |
+
+Models only see `_moe_implementation` as `"eager"` or `"fused"` — the
+`fused_quack` variant is mapped to `"fused"` on the config, with the kernel
+backend selected separately via `apply_veomni_fused_moe_patch`.
 
 On NPU devices, the backend parameter is ignored — the NPU kernel is always
 selected.
@@ -219,9 +205,9 @@ Unlike attention and loss, the MoE patch is **not** applied at import time.
 It is applied inside `build_foundation_model()`:
 
 ```python
-def build_foundation_model(..., moe_kernel_backend="triton"):
-    # ...
-    apply_veomni_fused_moe_patch(backend=moe_kernel_backend)
+def build_foundation_model(..., moe_implementation="fused_quack"):
+    config._moe_implementation = "fused"
+    apply_veomni_fused_moe_patch(moe_implementation="fused_quack")
 ```
 
 This deferred approach allows the config to drive kernel selection without
@@ -234,8 +220,7 @@ env vars.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused
-    moe_kernel_backend: quack
+    moe_implementation: fused_quack
 ```
 
 **Via `build_foundation_model` (standalone scripts):**
@@ -243,8 +228,7 @@ model:
 ```python
 model = build_foundation_model(
     config_path="...",
-    moe_implementation="fused",
-    moe_kernel_backend="quack",
+    moe_implementation="fused_quack",
 )
 ```
 
@@ -252,7 +236,7 @@ model = build_foundation_model(
 
 ```python
 from veomni.ops.fused_moe import apply_veomni_fused_moe_patch
-apply_veomni_fused_moe_patch(backend="quack")
+apply_veomni_fused_moe_patch(moe_implementation="fused_quack")
 ```
 
 ### Key files
@@ -262,7 +246,7 @@ apply_veomni_fused_moe_patch(backend="quack")
 - Triton impl: `veomni/ops/fused_moe/group_gemm.py`
 - Quack impl: `veomni/ops/fused_moe/quack_gemm.py`
 - NPU impl: `veomni/ops/fused_moe/npu_group_gemm.py`
-- Plumbing: `veomni/models/auto.py` — `build_foundation_model(moe_kernel_backend=...)`
+- Plumbing: `veomni/models/auto.py` — `build_foundation_model(moe_implementation=...)`
 
 ---
 

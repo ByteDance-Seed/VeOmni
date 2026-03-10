@@ -547,13 +547,13 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
-    moe_implementation: Optional[Literal["eager", "fused"]] = field(
+    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = field(
         default=None,
-        metadata={"help": "MoE implementation to use."},
-    )
-    moe_kernel_backend: Literal["triton", "quack"] = field(
-        default="triton",
-        metadata={"help": "GEMM kernel backend for fused MoE: 'triton' (default) or 'quack' (SM90+)."},
+        metadata={
+            "help": "MoE implementation to use. "
+            "'eager' for reference loop, 'fused' for Triton group-gemm, "
+            "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
+        },
     )
 
     def __post_init__(self):

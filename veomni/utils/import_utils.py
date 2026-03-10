@@ -75,13 +75,16 @@ def is_fused_moe_available() -> bool:
     return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
 
 
-def is_quack_gemm_available() -> bool:
-    import torch
+def is_quack_package_available() -> bool:
+    """Check if the quack package is installed."""
+    return _PACKAGE_FLAGS["quack"]
 
-    if not (torch.cuda.is_available() and _PACKAGE_FLAGS["quack"] and not _PACKAGE_FLAGS["torch_npu"]):
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9  # SM90+
+
+def is_quack_gemm_available() -> bool:
+    """Check if quack GEMM kernels can run (package installed + SM90+ GPU)."""
+    from .device import is_sm90_or_above
+
+    return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and is_sm90_or_above()
 
 
 def is_video_audio_available() -> bool:

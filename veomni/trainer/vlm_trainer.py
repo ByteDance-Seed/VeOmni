@@ -124,7 +124,6 @@ class VLMTrainer:
             torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
             attn_implementation=args.model.ops_implementation.attn_implementation,
             moe_implementation=args.model.ops_implementation.moe_implementation,
-            moe_kernel_backend=args.model.ops_implementation.moe_kernel_backend,
             init_device=args.train.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,

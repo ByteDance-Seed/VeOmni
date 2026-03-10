@@ -45,8 +45,8 @@ def apply_ops_patch():
 
         apply_veomni_attention_patch()
         apply_veomni_loss_patch()
-        # NOTE: fused MoE patch is applied in build_foundation_model() with
-        # the moe_kernel_backend parameter, not at import time.
+        # NOTE: fused MoE patch is applied in build_foundation_model() based on
+        # the moe_implementation parameter, not at import time.
         logger.info_rank0("✅ VeOmni ops patch applied.")
 
 
