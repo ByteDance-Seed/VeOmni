@@ -346,3 +346,16 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         router_logits=outputs.router_logits,
     )
+
+
+# ── Expert parallel plan ─────────────────────────────────────────────────────
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_parallel_plan",
+    description="Register Qwen3_5Moe expert parallel plan for v5 generated modeling",
+)
+def qwen3_5_moe_get_parallel_plan_patched(self):
+    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+
+    return _get_parallel_plan()

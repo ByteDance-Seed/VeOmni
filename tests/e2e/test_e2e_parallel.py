@@ -142,21 +142,18 @@ text_test_cases = [
         False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # TODO: remove max_sp_size limit once we support SP in qwen3_5.
-        # In addition, since SP is limited, there is only one test case now so nothing is compared.
-        1,  # max_sp_size
+        None,  # max_sp_size
         marks=_v5_only,
     ),
     # TODO: we only support text input now. move this to VLM test once vision input is supported.
     pytest.param(
         "qwen3_5_moe",
-        "./tests/toy_config/qwen3_5_toy/config.json",
+        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        # TODO: Test with EP once Merged fc1_1_2_weight is supported with expert parallelism.
         False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # TODO: remove max_sp_size limit once we support SP in qwen3_5.
-        # In addition, since SP is limited, there is only one test case now so nothing is compared.
-        1,  # max_sp_size
+        None,  # max_sp_size
         marks=_v5_only,
     ),
 ]
