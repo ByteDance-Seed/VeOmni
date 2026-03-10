@@ -15,6 +15,7 @@
 from . import (
     deepseek_v3,
     flux,
+    glm_moe_dsa,
     janus,
     llama,
     movqgan,
@@ -51,4 +52,5 @@ __all__ = [
     "wan",
     "qwen3_vl",
     "qwen3_vl_moe",
+    "glm_moe_dsa",
 ]

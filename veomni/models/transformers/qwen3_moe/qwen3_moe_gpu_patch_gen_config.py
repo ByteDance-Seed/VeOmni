@@ -224,7 +224,7 @@ def qwen3_moe_model_forward_patched(
     "Qwen3MoeForCausalLM.forward",
     description="Support fused cross entropy path in Qwen3MoeForCausalLM.forward",
 )
-def qwen3_moe_forcausal_lm_forward_patched(
+def qwen3_moe_forcausallm_forward_patched(
     self,
     input_ids: torch.LongTensor | None = None,
     attention_mask: torch.Tensor | None = None,

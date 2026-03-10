@@ -4,7 +4,8 @@ model:
   pretrained_text_encoder_2_path: FLUX.1-dev/text_encoder_2
   pretrained_vae_path: FLUX.1-dev/ae.safetensors
   config_path: ./configs/model_configs/flux/flux.json
-  attn_implementation: flash_attention_2
+  ops_implementation:
+    attn_implementation: flash_attention_2
   tokenizer_1_path: FLUX.1-dev/tokenizer
   tokenizer_2_path: FLUX.1-dev/tokenizer_2
 
@@ -12,49 +13,55 @@ model:
 data:
   train_path: X2I-text-to-image
   train_size: 1000000000000
-  dataloader_type: native
+  dataloader:
+    type: native
+    drop_last: true
   datasets_type: iterable
   data_type: diffusion
   max_seq_len: 8192
   text_keys: text
-  drop_last: true
   height: 1024
   width: 768
   datasets_repeat: 10
 
 train:
-  output_dir: Flux_SFT
-  train_architecture: full
-  data_parallel_mode: fsdp1
-  ulysses_parallel_size: 1
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp1
+      full_shard: true
+      offload: false
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   dyn_bsz_buffer_size: 200
-  optimizer: adamw
-  lr: 1.0e-4
-  lr_warmup_ratio: 0.007
-  lr_decay_style: constant
-  lr_decay_ratio: 1.0
-  weight_decay: 0.01
-  max_grad_norm: 1.0
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
   enable_mixed_precision: true
-  enable_gradient_checkpointing: true
-  enable_full_shard: true
-  enable_fsdp_offload: false
-  enable_activation_offload: false
   init_device: cuda
   enable_full_determinism: false
   empty_cache_steps: 500
-  ckpt_manager: dcp
-  load_checkpoint_path: ""
-  save_steps: 100
+  checkpoint:
+    output_dir: Flux_SFT
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true
   max_steps: 500
   num_train_epochs: 100
-  save_hf_weights: true
-  use_wandb: false
-  wandb_project: Flux
-  wandb_name: Flux
+  wandb:
+    enable: false
+    project: Flux
+    name: Flux
   ops_to_save:
     - aten.addmm.default
     - torch.ops.flash_attn._flash_attn_forward.default

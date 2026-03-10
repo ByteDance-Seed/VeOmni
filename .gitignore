@@ -161,3 +161,6 @@ nsysoutput/
 
 # vscode config
 .vscode/
+
+# for personal specific claude instructions.
+.claude/CLAUDE.md

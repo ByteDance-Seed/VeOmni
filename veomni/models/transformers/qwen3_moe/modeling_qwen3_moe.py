@@ -100,7 +100,6 @@ class PatchQwen3MoeExperts(nn.Module):
             top_k_weights = top_k_weights.to(final_hidden_states.dtype)
 
             final_hidden_states = fused_moe_forward(
-                module=self,
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights,
                 selected_experts=top_k_index,
@@ -123,6 +122,11 @@ class PatchQwen3MoeTopKRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
+
+        # Always register the monitoring hook; it's a no-op when no monitor is active.
+        from veomni.utils.moe_monitor import router_forward_hook
+
+        self.register_forward_hook(router_forward_hook)
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
