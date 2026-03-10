@@ -1,7 +1,8 @@
 model:
   model_path: Qwen3-Omni-30B-A3B-Instruct
-  moe_implementation: fused
-  attn_implementation: flash_attention_2
+  ops_implementation:
+    moe_implementation: fused
+    attn_implementation: flash_attention_2
 
 data:
   train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
@@ -9,7 +10,8 @@ data:
   max_seq_len: 8196
   train_size: 80000000
   source_name: sharegpt4v_captioner_sft
-  num_workers: 0
+  dataloader:
+    num_workers: 0
   mm_configs:
     scale_factor: 28
     image_min_pixels: 3136 # 4 * 28 * 28
@@ -25,15 +27,20 @@ data:
     use_audio_in_video: True
 
 train:
-  output_dir: qwen3_omni_sft
-  init_device: meta
-  data_parallel_mode: fsdp2
-  wandb_project: qwen3_omni
-  wandb_name: qwen3_omni
-  ulysses_parallel_size: 1
-  lr: 1.0e-5
-  lr_decay_style: cosine
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
   num_train_epochs: 3
   micro_batch_size: 1
   global_batch_size: 32
   max_steps: 20
+  init_device: meta
+  checkpoint:
+    output_dir: qwen3_omni_sft
+  wandb:
+    project: qwen3_omni
+    name: qwen3_omni

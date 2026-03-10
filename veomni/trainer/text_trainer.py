@@ -134,7 +134,7 @@ class TextTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()
@@ -168,7 +168,7 @@ class TextTrainer:
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
 
             self.on_epoch_end()

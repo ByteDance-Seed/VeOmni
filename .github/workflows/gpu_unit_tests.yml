@@ -70,6 +70,16 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --extra gpu --extra audio --group dev
+      - name: Detect changed paths for conditional tests
+        id: changes
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA" HEAD -- || true)
+          if echo "$CHANGED" | grep -qE '(veomni/distributed/sequence_parallel/|veomni/models/transformers/qwen3_5/)'; then
+            echo "qwen3_5_ulysses=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "qwen3_5_ulysses=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run parallel tests
         # TODO: run all tests under tests/parallel/ulysses after we verify
         #       tests/parallel/ulysses/test_ulysses_async.py still works
@@ -103,6 +113,10 @@ jobs:
         run: |
           uv run  --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
+        if: steps.changes.outputs.qwen3_5_ulysses == 'true'
+        run: |
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
       # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:

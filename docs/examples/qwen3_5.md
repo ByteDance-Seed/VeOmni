@@ -43,8 +43,50 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-27B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --data.max_seq_len 128 \
-    --train.data_parallel_mode fsdp2 \
+    --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.max_steps 20 \
-    --train.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir /mnt/local/localcache00
 ```
+
+## Ulysses Sequence Parallelism
+
+Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention layers and
+linear attention (GatedDeltaNet) layers. This enables training with longer sequences by
+distributing the sequence across multiple GPUs.
+
+To enable Ulysses SP, set `ulysses_parallel_size` in your config. The total GPU count must
+equal `data_parallel_size * ulysses_parallel_size`.
+
+```shell
+# Example: 8 GPUs, dp=4, sp=2
+bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
+    --model.model_path ${HOME}/Qwen3.5-27B \
+    --data.train_path ${HOME}/tulu-first2000.parquet \
+    --train.data_parallel_size 4 \
+    --train.ulysses_parallel_size 2 \
+    --train.attn_implementation flash_attention_3
+```
+
+### Requirements
+
+- `flash_attention_2` or `flash_attention_3` attention implementation (softmax layers use
+  VeOmni's flash attention with built-in SP support).
+- [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) installed
+  (for GatedDeltaNet triton kernels).
+- `num_k_heads` and `num_v_heads` (linear attention head counts) must be divisible by
+  `ulysses_parallel_size`.
+
+### How It Works
+
+Qwen3.5 is a hybrid model alternating between softmax and linear attention layers:
+
+- **Softmax attention layers** — SP is handled transparently by VeOmni's `flash_attention_forward`,
+  which performs all-to-all gather/scatter around the flash attention kernel.
+- **Linear attention layers (GatedDeltaNet)** — SP is handled explicitly in the patched
+  `Qwen3_5GatedDeltaNet.forward`. Q/K/V/b/a projections are all-to-all'd to gather the full
+  sequence with local heads, the causal conv1d runs with sharded weights, the recurrent attention
+  kernel runs on local heads, and the output is all-to-all'd back.
+
+For detailed implementation notes, see the
+[Ulysses documentation](../key_features/ulysses.md#-linear-attention-ulysses-gateddeltanet).

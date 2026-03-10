@@ -43,7 +43,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_position_embedding
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.device import get_device_id
 
@@ -58,8 +57,11 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.distributed.sequence_parallel", names=["slice_position_embedding"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import(
+    "veomni.distributed.sequence_parallel.ulysses",
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+)
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -101,6 +103,8 @@ torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for th
 fused_recurrent_gated_delta_rule = None
 torch_recurrent_gated_delta_rule = None
 is_fast_path_available = None
+gather_seq_scatter_heads = None
+gather_heads_scatter_seq = None
 
 
 @config.override_method(
@@ -175,8 +179,29 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
 
 
 @config.override_method(
+    "Qwen3_5GatedDeltaNet._get_local_conv1d_weight",
+    description="Shard depthwise conv1d weights for local heads under Ulysses SP",
+)
+def qwen3_5_gated_deltanet_get_local_conv1d_weight(
+    self, ulysses_rank: int, local_key_dim: int, local_value_dim: int
+) -> torch.Tensor:
+    # Modification: shard depthwise conv1d weights to match head-sharded mixed_qkv channels.
+    w_full = self.conv1d.weight.squeeze(1)
+    assert w_full.shape[0] == self.key_dim * 2 + self.value_dim, (
+        f"conv1d weight dim ({w_full.shape[0]}) must match "
+        f"(2 * key_dim + value_dim) ({self.key_dim * 2 + self.value_dim})"
+    )
+    k_off = ulysses_rank * local_key_dim
+    v_off = ulysses_rank * local_value_dim
+    w_q = w_full[k_off : k_off + local_key_dim]
+    w_k = w_full[self.key_dim + k_off : self.key_dim + k_off + local_key_dim]
+    w_v = w_full[2 * self.key_dim + v_off : 2 * self.key_dim + v_off + local_value_dim]
+    return torch.cat([w_q, w_k, w_v], dim=0)
+
+
+@config.override_method(
     "Qwen3_5GatedDeltaNet.forward",
-    description="Support varlen flash linear attention in Qwen3_5GatedDeltaNet.forward",
+    description="Support varlen flash linear attention and Ulysses SP in Qwen3_5GatedDeltaNet.forward",
 )
 def qwen3_5_gated_deltanet_forward_patched(
     self,
@@ -202,7 +227,6 @@ def qwen3_5_gated_deltanet_forward_patched(
         recurrent_state = cache_params.recurrent_states[self.layer_idx]
 
     mixed_qkv = self.in_proj_qkv(hidden_states)
-    mixed_qkv = mixed_qkv.transpose(1, 2)
 
     z = self.in_proj_z(hidden_states)
     z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -210,48 +234,103 @@ def qwen3_5_gated_deltanet_forward_patched(
     b = self.in_proj_b(hidden_states)
     a = self.in_proj_a(hidden_states)
 
+    # Modification: Ulysses SP all-to-all for linear attention heads.
+    ulysses_enabled = get_parallel_state().ulysses_enabled
+    if ulysses_enabled:
+        ulysses_group = get_parallel_state().ulysses_group
+        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_rank = get_parallel_state().ulysses_rank
+        assert self.num_k_heads % ulysses_size == 0 and self.num_v_heads % ulysses_size == 0, (
+            f"SP size ({ulysses_size}) must divide num_k_heads ({self.num_k_heads}) "
+            f"and num_v_heads ({self.num_v_heads}) for gated deltanet LASP"
+        )
+
+        local_num_k_heads = self.num_k_heads // ulysses_size
+        local_num_v_heads = self.num_v_heads // ulysses_size
+        local_key_dim = self.head_k_dim * local_num_k_heads
+        local_value_dim = self.head_v_dim * local_num_v_heads
+
+        # Reshape mixed_qkv to head layout for all-to-all: [B, S_local, D] -> split+reshape to heads
+        q_proj, k_proj, v_proj = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q_proj = q_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        k_proj = k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
+        q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+        k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+        v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+
+        b = b.reshape(batch_size, seq_len, self.num_v_heads)
+        a = a.reshape(batch_size, seq_len, self.num_v_heads)
+        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
+        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+
+        # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
+        q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
+        k_proj = k_proj.reshape(k_proj.shape[0], k_proj.shape[1], -1)
+        v_proj = v_proj.reshape(v_proj.shape[0], v_proj.shape[1], -1)
+        mixed_qkv = torch.cat((q_proj, k_proj, v_proj), dim=-1)
+    else:
+        local_num_k_heads = self.num_k_heads
+        local_num_v_heads = self.num_v_heads
+        local_key_dim = self.key_dim
+        local_value_dim = self.value_dim
+
     if use_precomputed_states:
-        # 2. Convolution sequence transformation
-        # NOTE: the conv state is updated in `causal_conv1d_update`
         # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
         raise NotImplementedError("use_precomputed_states=True is not supported yet for causal_conv1d_update now.")
     else:
         if cache_params is not None:
-            conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+            mixed_qkv_t = mixed_qkv.transpose(1, 2)
+            conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
             cache_params.conv_states[self.layer_idx] = conv_state
         if self.causal_conv1d_fn is not None:
-            # Modification: FLA causal_conv1d expects [B, S, D], while upstream tensor is [B, D, S].
+            # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
+            if ulysses_enabled:
+                conv_weight = self._get_local_conv1d_weight(
+                    ulysses_rank=ulysses_rank,
+                    local_key_dim=local_key_dim,
+                    local_value_dim=local_value_dim,
+                )
+            else:
+                conv_weight = self.conv1d.weight.squeeze(1)
+            # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
             mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv.transpose(1, 2),
-                weight=self.conv1d.weight.squeeze(1),
+                x=mixed_qkv,
+                weight=conv_weight,
                 bias=self.conv1d.bias,
                 activation=self.activation,
                 seq_idx=None,
                 backend="triton",
-                # Modification: pass varlen boundaries to FLA conv kernel.
                 cu_seqlens=cu_seq_lens_q,
-            )[0].transpose(1, 2)
+            )[0]
         else:
             raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
 
-    mixed_qkv = mixed_qkv.transpose(1, 2)
     query, key, value = torch.split(
         mixed_qkv,
         [
-            self.key_dim,
-            self.key_dim,
-            self.value_dim,
+            local_key_dim,
+            local_key_dim,
+            local_value_dim,
         ],
         dim=-1,
     )
 
-    query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-    value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+    query = query.reshape(query.shape[0], query.shape[1], local_num_k_heads, self.head_k_dim)
+    key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
+    value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
 
     beta = b.sigmoid()
     # If the model is loaded in fp16, without the .float() here, A might be -inf
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    # Modification: slice A_log/dt_bias for local V-heads under Ulysses SP.
+    if ulysses_enabled:
+        v_head_offset = ulysses_rank * local_num_v_heads
+        v_head_slice = slice(v_head_offset, v_head_offset + local_num_v_heads)
+        g = -self.A_log[v_head_slice].float().exp() * F.softplus(a.float() + self.dt_bias[v_head_slice])
+    else:
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
     if self.num_v_heads // self.num_k_heads > 1:
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -291,6 +370,12 @@ def qwen3_5_gated_deltanet_forward_patched(
     # Update cache
     if cache_params is not None:
         cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+
+    # Modification: gather attention output back to sequence-sharded layout before gated norm.
+    if ulysses_enabled:
+        core_attn_out = gather_heads_scatter_seq(
+            core_attn_out, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
+        )
 
     # reshape input data into 2D tensor
     core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -414,11 +499,6 @@ def qwen3_5_text_model_forward_patched(
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-    # ============================== VeOmni SP Patch Start ==============================
-    sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-    # =============================== VeOmni SP Patch End ===============================
 
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         layer_mask = linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask

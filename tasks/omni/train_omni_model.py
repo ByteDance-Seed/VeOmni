@@ -105,20 +105,22 @@ def main():
         helper.enable_third_party_logging()
 
     # Gradient checkpointing debug
-    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.gradient_checkpointing.debug)
 
-    Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
+    Checkpointer = build_checkpointer(
+        dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
+    )
 
     init_parallel_state(
-        dp_size=args.train.data_parallel_size,
-        dp_replicate_size=args.train.data_parallel_replicate_size,
-        dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
-        ulysses_size=args.train.ulysses_parallel_size,
-        dp_mode=args.train.data_parallel_mode,
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        ep_size=args.train.accelerator.ep_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
     )
     logger.info_rank0("Prepare model")
     model: SeedOmniModel = build_omni_model(
@@ -167,7 +169,7 @@ def main():
     )
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
     if args.data.datasets_type == "mapping":
-        dataset_length = dataset_length / args.train.data_parallel_size
+        dataset_length = dataset_length / args.train.accelerator.dp_size
     args.compute_train_steps(dataset_length)
 
     data_collate_info = {
@@ -194,7 +196,7 @@ def main():
     }
 
     train_dataloader = build_dataloader(
-        dataloader_type=args.data.dataloader_type,
+        dataloader_type=args.data.dataloader.type,
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
@@ -205,10 +207,10 @@ def main():
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        num_workers=args.data.num_workers,
-        drop_last=args.data.drop_last,
-        pin_memory=args.data.pin_memory,
-        prefetch_factor=args.data.prefetch_factor,
+        num_workers=args.data.dataloader.num_workers,
+        drop_last=args.data.dataloader.drop_last,
+        pin_memory=args.data.dataloader.pin_memory,
+        prefetch_factor=args.data.dataloader.prefetch_factor,
         seed=args.train.seed,
         collate_fn_kwargs=collate_fn_kwargs,
     )
@@ -230,7 +232,7 @@ def main():
 
     fsdp_kwargs = {}
     if freeze_any:
-        if args.train.data_parallel_mode == "fsdp1":
+        if args.train.accelerator.fsdp_config.fsdp_mode == "fsdp1":
             fsdp_kwargs["use_orig_params"] = True
 
     model_config = model.config
@@ -238,7 +240,9 @@ def main():
 
     if args.train.save_initial_model:
         if args.train.global_rank == 0:
-            save_model_weights(args.train.output_dir, model.state_dict(), model_assets=[model_config, processor])
+            save_model_weights(
+                args.train.checkpoint.output_dir, model.state_dict(), model_assets=[model_config, processor]
+            )
 
         dist.barrier()
         return
@@ -246,56 +250,56 @@ def main():
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
-        enable_full_shard=args.train.enable_full_shard,
-        enable_reshard_after_forward=args.train.enable_reshard_after_forward,
+        enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
+        enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
         enable_mixed_precision=args.train.enable_mixed_precision,
-        enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
+        enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         init_device=args.train.init_device,
-        enable_fsdp_offload=args.train.enable_fsdp_offload,
+        enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
         fsdp_kwargs=fsdp_kwargs,
         basic_modules=model._no_split_modules,
-        enable_reentrant=args.train.enable_reentrant,
-        enable_forward_prefetch=args.train.enable_forward_prefetch,
+        enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
+        enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
     )
     optimizer = build_optimizer(
         model,
-        lr=args.train.lr,
-        weight_decay=args.train.weight_decay,
+        lr=args.train.optimizer.lr,
+        weight_decay=args.train.optimizer.weight_decay,
         fused=False,
-        optimizer_type=args.train.optimizer,
+        optimizer_type=args.train.optimizer.type,
     )
     lr_scheduler = build_lr_scheduler(
         optimizer,
         train_steps=args.train.train_steps * args.train.num_train_epochs,
-        lr=args.train.lr,
-        lr_min=args.train.lr_min,
-        lr_decay_style=args.train.lr_decay_style,
-        lr_decay_ratio=args.train.lr_decay_ratio,
-        lr_warmup_ratio=args.train.lr_warmup_ratio,
-        lr_start=args.train.lr_start,
+        lr=args.train.optimizer.lr,
+        lr_min=args.train.optimizer.lr_min,
+        lr_decay_style=args.train.optimizer.lr_decay_style,
+        lr_decay_ratio=args.train.optimizer.lr_decay_ratio,
+        lr_warmup_ratio=args.train.optimizer.lr_warmup_ratio,
+        lr_start=args.train.optimizer.lr_start,
     )
 
     model_assets = None
     if args.train.global_rank == 0:
-        if args.train.use_wandb:
+        if args.train.wandb.enable:
             wandb.init(
-                project=args.train.wandb_project,
-                name=args.train.wandb_name,
+                project=args.train.wandb.project,
+                name=args.train.wandb.name,
                 settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
         model_assets = [model_config, processor]
-        save_model_assets(args.train.model_assets_dir, model_assets)
+        save_model_assets(args.train.checkpoint.model_assets_dir, model_assets)
 
-    if args.train.profile_this_rank:
+    if args.train.profile.this_rank:
         profiler = helper.create_profiler(
-            start_step=args.train.profile_start_step,
-            end_step=args.train.profile_end_step,
-            trace_dir=args.train.profile_trace_dir,
-            record_shapes=args.train.profile_record_shapes,
-            profile_memory=args.train.profile_profile_memory,
-            with_stack=args.train.profile_with_stack,
+            start_step=args.train.profile.start_step,
+            end_step=args.train.profile.end_step,
+            trace_dir=args.train.profile.trace_dir,
+            record_shapes=args.train.profile.record_shapes,
+            profile_memory=args.train.profile.profile_memory,
+            with_stack=args.train.profile.with_stack,
             global_rank=args.train.global_rank,
         )
         profiler.start()
@@ -311,9 +315,9 @@ def main():
         data_path=args.data.train_path,
     )
 
-    if args.train.load_checkpoint_path:
+    if args.train.checkpoint.load_path:
         state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
-        Checkpointer.load(args.train.load_checkpoint_path, state)
+        Checkpointer.load(args.train.checkpoint.load_path, state)
         global_step = state["extra_state"]["global_step"]
         start_epoch = global_step // args.train.train_steps
         start_step = global_step % args.train.train_steps
@@ -327,11 +331,13 @@ def main():
             iter(train_dataloader)  # clear resume state and prefetch data
 
         dist.barrier()
-        logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
+        logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
-        args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit
+        args.train.accelerator.offload_config.enable_activation,
+        args.train.gradient_checkpointing.enable,
+        args.train.accelerator.offload_config.activation_gpu_limit,
     )
     model.train()
     logger.info(
@@ -355,7 +361,7 @@ def main():
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
-                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                 break
 
             if global_step == 1:
@@ -369,8 +375,8 @@ def main():
 
             for micro_step, micro_batch in enumerate(micro_batches):
                 if (
-                    args.train.data_parallel_mode == "fsdp2"
-                    and not args.train.enable_reshard_after_backward
+                    args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+                    and not args.train.accelerator.fsdp_config.reshard_after_backward
                     and num_micro_steps > 1
                 ):
                     if micro_step == 0:
@@ -402,7 +408,7 @@ def main():
 
                 del micro_batch
 
-            grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(model, args.train.optimizer.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
@@ -431,19 +437,19 @@ def main():
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
-                if args.train.use_wandb:
+                if args.train.wandb.enable:
                     train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
                     wandb.log(train_metrics, step=global_step)
 
-            if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
+            if args.train.profile.this_rank and global_step <= args.train.profile.end_step:
                 profiler.step()
-                if global_step == args.train.profile_end_step:
+                if global_step == args.train.profile.end_step:
                     profiler.stop()
-                    helper.upload_trace(args.train.wandb_project, args.train.wandb_name, args.train.profile_trace_dir)
+                    helper.upload_trace(args.train.wandb.project, args.train.wandb.name, args.train.profile.trace_dir)
 
-            if args.train.save_steps and global_step % args.train.save_steps == 0:
+            if args.train.checkpoint.save_steps and global_step % args.train.checkpoint.save_steps == 0:
                 helper.empty_cache()
-                save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+                save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
                 state = {
                     "model": model,
                     "optimizer": optimizer,
@@ -455,16 +461,16 @@ def main():
                         "torch_rng_state": torch.get_rng_state(),
                     },
                 }
-                Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
         data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-        if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
+        if args.train.checkpoint.save_epochs and (epoch + 1) % args.train.checkpoint.save_epochs == 0:
             helper.empty_cache()
-            save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+            save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
             state = {
                 "model": model,
                 "optimizer": optimizer,
@@ -476,7 +482,7 @@ def main():
                     "torch_rng_state": torch.get_rng_state(),
                 },
             }
-            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+            Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
@@ -485,15 +491,15 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
-    if args.train.save_hf_weights and save_checkpoint_path is not None:
+    if args.train.checkpoint.save_hf_weights and save_checkpoint_path is not None:
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         save_hf_safetensor(
             save_hf_safetensor_path=hf_weights_path,
-            ckpt_manager=args.train.ckpt_manager,
+            ckpt_manager=args.train.checkpoint.manager,
             model_assets=model_assets,
             train_architecture=args.train.train_architecture,
             save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
+            output_dir=args.train.checkpoint.output_dir,
             is_rank_0=args.train.global_rank == 0,
             model=model,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
