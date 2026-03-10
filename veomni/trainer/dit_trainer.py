@@ -141,10 +141,6 @@ class DiTModelArguments(ModelArguments):
         default_factory=dict,
         metadata={"help": "Config for condition model."},
     )
-    trainer_config: Optional[Dict] = field(
-        default_factory=dict,
-        metadata={"help": "Config for trainer (condition_model_path, etc)."},
-    )
 
 
 @dataclass
@@ -165,10 +161,6 @@ class DiTDataArguments(DataArguments):
 
 @dataclass
 class DiTTrainingArguments(TrainingArguments):
-    hf_weights_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to hf weights."},
-    )
     training_task: Literal["offline_training", "online_training", "offline_embedding"] = field(
         default="online_training",
         metadata={
@@ -272,8 +264,8 @@ class DiTTrainer:
                 config_path=args.model.config_path,
                 weights_path=args.model.model_path,
                 torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                attn_implementation=args.model.attn_implementation,
-                moe_implementation=args.model.moe_implementation,
+                attn_implementation=args.model.ops_implementation.attn_implementation,
+                moe_implementation=args.model.ops_implementation.moe_implementation,
                 init_device=args.train.init_device,
             )
             self.base.model_config = getattr(self.base.model, "config", None)
@@ -352,8 +344,9 @@ class DiTTrainer:
         self.base._build_dataset()
         args: VeOmniDiTArguments = self.base.args
         if self.training_task == "offline_embedding":
-            base = len(self.base.train_dataset) // args.train.data_parallel_size
-            extra = len(self.base.train_dataset) % args.train.data_parallel_size
+            dp_size = get_parallel_state().dp_size
+            base = len(self.base.train_dataset) // dp_size
+            extra = len(self.base.train_dataset) % dp_size
             extra_for_rank = max(0, min(1, extra - args.train.local_rank))
             valid_data_length = base + extra_for_rank
             logger.info(f"Rank {args.train.global_rank} data length to save: {valid_data_length}")
@@ -373,7 +366,7 @@ class DiTTrainer:
         args = self.base.args
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
-                dataloader_type=args.data.dataloader_type,
+                dataloader_type=args.data.dataloader.type,
                 dataset=self.base.train_dataset,
                 micro_batch_size=args.train.micro_batch_size,
                 global_batch_size=args.train.global_batch_size,
@@ -384,10 +377,10 @@ class DiTTrainer:
                 bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
                 dyn_bsz=args.train.dyn_bsz,
                 dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
-                num_workers=args.data.num_workers,
-                drop_last=args.data.drop_last,
-                pin_memory=args.data.pin_memory,
-                prefetch_factor=args.data.prefetch_factor,
+                num_workers=args.data.dataloader.num_workers,
+                drop_last=args.data.dataloader.drop_last,
+                pin_memory=args.data.dataloader.pin_memory,
+                prefetch_factor=args.data.dataloader.prefetch_factor,
                 seed=args.train.seed,
                 collate_fn=DiTDataCollator(),
             )
@@ -515,7 +508,7 @@ class DiTTrainer:
                     total_loss_dict[k] += v.item()
 
         if self.training_task != "offline_embedding":
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
             self.base.optimizer.step()
             self.base.lr_scheduler.step()
             self.base.optimizer.zero_grad()
@@ -551,7 +544,7 @@ class DiTTrainer:
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
 
             self.on_epoch_end()

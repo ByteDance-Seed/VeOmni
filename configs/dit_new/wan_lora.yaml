@@ -20,25 +20,33 @@ data:
     max_frames: 81
 
 train:
-  output_dir: Wan2.1-I2V-1.3B_lora
-  data_parallel_mode: fsdp1
-  ulysses_parallel_size: 1
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   dyn_bsz: false
-  optimizer: adamw
-  lr: 1.0e-4
-  lr_warmup_ratio: 0.007
-  lr_decay_style: constant
-  lr_decay_ratio: 1.0
-  weight_decay: 0.01
-  max_grad_norm: 1.0
   init_device: cuda
   num_train_epochs: 20
-  save_hf_weights: true
-  hf_save_epochs: 5
+  training_task: online_training
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp1
+  checkpoint:
+    output_dir: Wan2.1-I2V-1.3B_lora
+    save_hf_weights: true
+    hf_save_epochs: 5
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  wandb:
+    enable: true
+    project: veomni_dit
+    name: Wan2.1-I2V-1.3B_lora
   use_wandb: true
   wandb_project: veomni_dit
   wandb_name: Wan2.1-I2V-1.3B_lora
-  training_task: online_training
