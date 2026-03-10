@@ -36,10 +36,10 @@ class CheckpointerCallback(Callback):
     def __init__(self, trainer: "BaseTrainer"):
         super().__init__(trainer)
         args: "VeOmniArguments" = self.trainer.args
-        self.every_n_steps = args.train.save_steps
-        self.every_n_epochs = args.train.save_epochs
+        self.every_n_steps = args.train.checkpoint.save_steps
+        self.every_n_epochs = args.train.checkpoint.save_epochs
         self.trainer.checkpointer: CheckpointerBase = build_checkpointer(
-            dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager
+            dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
         )
 
     def on_step_end(self, state: TrainerState, **kwargs):
@@ -56,7 +56,7 @@ class CheckpointerCallback(Callback):
     def _load_checkpoint(self):
         """Load checkpoint from path."""
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.load_checkpoint_path is None:
+        if args.train.checkpoint.load_path is None:
             return
 
         state = {
@@ -68,7 +68,7 @@ class CheckpointerCallback(Callback):
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
             self.trainer.checkpointer.save_future.result()
 
-        self.trainer.checkpointer.load(args.train.load_checkpoint_path, state)
+        self.trainer.checkpointer.load(args.train.checkpoint.load_path, state)
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
         self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
@@ -83,13 +83,13 @@ class CheckpointerCallback(Callback):
             iter(self.trainer.train_dataloader)
 
         dist.barrier()
-        logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
+        logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
 
     def _save_checkpoint(self, state: TrainerState):
         """Save distributed checkpoint and optimizer state at each save_steps."""
         args: "VeOmniArguments" = self.trainer.args
 
-        save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
 
         ckpt_state = {
             "model": self.trainer.model,
@@ -102,7 +102,7 @@ class CheckpointerCallback(Callback):
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
-        self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.save_async)
+        self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
 
         # Empty cache and barrier
         helper.empty_cache()
@@ -115,9 +115,9 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
     def __init__(self, trainer: "BaseTrainer"):
         super().__init__(trainer)
         args: "VeOmniArguments" = self.trainer.args
-        self.save_hf_weights = args.train.save_hf_weights
-        self.every_n_steps = args.train.hf_save_steps
-        self.every_n_epochs = args.train.hf_save_epochs
+        self.save_hf_weights = args.train.checkpoint.save_hf_weights
+        self.every_n_steps = args.train.checkpoint.hf_save_steps
+        self.every_n_epochs = args.train.checkpoint.hf_save_epochs
 
     def on_train_end(self, state: TrainerState, **kwargs):
         if self.save_hf_weights:
@@ -137,14 +137,14 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
     def _save_model_assets(self):
         args: "VeOmniArguments" = self.trainer.args
         if args.train.global_rank == 0:
-            save_model_assets(args.train.model_assets_dir, self.trainer.model_assets)
+            save_model_assets(args.train.checkpoint.model_assets_dir, self.trainer.model_assets)
         dist.barrier()
 
     def _save_checkpoint(self, state: TrainerState):
         """Save model in HuggingFace format."""
 
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             super()._save_checkpoint(state)
@@ -156,9 +156,9 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         save_hf_safetensor(
             save_hf_safetensor_path=hf_weights_path,
             model_assets=self.trainer.model_assets,
-            ckpt_manager=args.train.ckpt_manager,
+            ckpt_manager=args.train.checkpoint.manager,
             train_architecture=args.train.train_architecture,
-            output_dir=args.train.output_dir,
+            output_dir=args.train.checkpoint.output_dir,
             save_checkpoint_path=save_checkpoint_path,
             model=self.trainer.model,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,

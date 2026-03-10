@@ -387,9 +387,9 @@ def build_command(shuffle=True, save_by_idx=True):
         "--train.micro_batch_size=2",
         f"--shuffle={str(shuffle).lower()}",
         "--train.global_batch_size=16",
-        "--train.data_parallel_mode=ddp",
-        "--train.ckpt_manager=dcp",
-        "--train.output_dir=.tests/cache",
+        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--train.checkpoint.manager=dcp",
+        "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
         "--dyn_bsz_in_dataloader=false",
         f"--save_by_idx={str(save_by_idx).lower()}",
@@ -470,18 +470,20 @@ def _run_distributed_test():
     dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
 
     init_parallel_state(
-        dp_size=args.train.data_parallel_size,
-        dp_replicate_size=args.train.data_parallel_replicate_size,
-        dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
-        ulysses_size=args.train.ulysses_parallel_size,
-        dp_mode=args.train.data_parallel_mode,
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        ep_size=args.train.accelerator.ep_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
     )
 
-    Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
+    Checkpointer = build_checkpointer(
+        dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
+    )
 
     # Create DummyMappingDataset and DummyIterableDataset
     mapping_dataset = DummyMappingDataset(size=DATASET_SIZE)
@@ -507,8 +509,8 @@ def _run_distributed_test():
         dyn_bsz_dataset_save_by_idx=test_args.save_by_idx,
         num_workers=2,
         drop_last=False,
-        pin_memory=args.data.pin_memory,
-        prefetch_factor=args.data.prefetch_factor,
+        pin_memory=args.data.dataloader.pin_memory,
+        prefetch_factor=args.data.dataloader.prefetch_factor,
     )
 
     config = PretrainedConfig()
@@ -581,8 +583,8 @@ def _run_distributed_test():
                         "environ_meter": environ_meter.state_dict(),
                     },
                 }
-                save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
-                Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
+                Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
                 dist.barrier()
 
         start_step = 0  # Reset for next epoch

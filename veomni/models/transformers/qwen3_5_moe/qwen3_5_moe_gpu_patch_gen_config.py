@@ -38,6 +38,7 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_forward_patched,
+    qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
 )
 from veomni.ops import fused_moe_forward
@@ -53,8 +54,13 @@ config = PatchConfig(
     description="Qwen3_5Moe with LigerKernel GPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
 
+config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import(
+    "veomni.distributed.sequence_parallel.ulysses",
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+)
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -179,10 +185,17 @@ config.override_method(
 )
 
 config.override_method(
+    "Qwen3_5MoeGatedDeltaNet._get_local_conv1d_weight",
+    replacement=qwen3_5_gated_deltanet_get_local_conv1d_weight,
+    name_map=_NAME_MAP,
+    description="Shard depthwise conv1d weights for local heads under Ulysses SP",
+)
+
+config.override_method(
     "Qwen3_5MoeGatedDeltaNet.forward",
     replacement=qwen3_5_gated_deltanet_forward_patched,
     name_map=_NAME_MAP,
-    description="Support varlen flash linear attention in Qwen3_5MoeGatedDeltaNet.forward",
+    description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
 )
 
 

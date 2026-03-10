@@ -122,8 +122,8 @@ class VLMTrainer:
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
             torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-            attn_implementation=args.model.attn_implementation,
-            moe_implementation=args.model.moe_implementation,
+            attn_implementation=args.model.ops_implementation.attn_implementation,
+            moe_implementation=args.model.ops_implementation.moe_implementation,
             init_device=args.train.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
@@ -202,18 +202,21 @@ class VLMTrainer:
                 else:
                     other_params.append(param)
 
-        param_groups = [{"params": vit_params, "lr": args.train.vit_lr}, {"params": other_params, "lr": args.train.lr}]
+        param_groups = [
+            {"params": vit_params, "lr": args.train.vit_lr},
+            {"params": other_params, "lr": args.train.optimizer.lr},
+        ]
 
         # Build optimizer
         self.base.optimizer = build_optimizer(
             self.base.model,
-            lr=args.train.lr,
-            weight_decay=args.train.weight_decay,
+            lr=args.train.optimizer.lr,
+            weight_decay=args.train.optimizer.weight_decay,
             fused=True,
-            optimizer_type=args.train.optimizer,
+            optimizer_type=args.train.optimizer.type,
             param_groups=param_groups,
-            no_decay_modules=args.train.no_decay_modules,
-            no_decay_params=args.train.no_decay_params,
+            no_decay_modules=args.train.optimizer.no_decay_modules,
+            no_decay_params=args.train.optimizer.no_decay_params,
         )
 
     def on_train_begin(self):
@@ -268,7 +271,7 @@ class VLMTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()
@@ -302,7 +305,7 @@ class VLMTrainer:
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
 
             self.on_epoch_end()
