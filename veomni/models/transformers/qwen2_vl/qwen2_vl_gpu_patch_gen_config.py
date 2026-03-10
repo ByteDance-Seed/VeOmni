@@ -48,7 +48,7 @@ from veomni.distributed.sequence_parallel import (
     pad_tensor,
     sp_pad_and_slice,
 )
-from veomni.patchgen.patch_spec import PatchConfig, PatchType, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
 
@@ -69,42 +69,42 @@ config.add_import(
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen2RMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNorm",
-        description="Use LigerKernel RMSNorm",
-    )
-)
+# config.patches.append(
+#     create_patch_from_external(
+#         target="Qwen2RMSNorm",
+#         replacement_module="liger_kernel.transformers.rms_norm",
+#         replacement_name="LigerRMSNorm",
+#         description="Use LigerKernel RMSNorm",
+#     )
+# )
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen2MLP",
-        replacement_module="liger_kernel.transformers.swiglu",
-        replacement_name="LigerSwiGLUMLP",
-        description="Use LigerKernel SwiGLU MLP",
-    )
-)
+# config.patches.append(
+#     create_patch_from_external(
+#         target="Qwen2MLP",
+#         replacement_module="liger_kernel.transformers.swiglu",
+#         replacement_name="LigerSwiGLUMLP",
+#         description="Use LigerKernel SwiGLU MLP",
+#     )
+# )
 
-config.patches.append(
-    create_patch_from_external(
-        target="LayerNorm",
-        replacement_module="liger_kernel.transformers.layer_norm",
-        replacement_name="LigerLayerNorm",
-        description="Use LigerKernel LayerNorm",
-    )
-)
+# config.patches.append(
+#     create_patch_from_external(
+#         target="LayerNorm",
+#         replacement_module="liger_kernel.transformers.layer_norm",
+#         replacement_name="LigerLayerNorm",
+#         description="Use LigerKernel LayerNorm",
+#     )
+# )
 
-config.patches.append(
-    create_patch_from_external(
-        target="apply_multimodal_rotary_pos_emb",
-        replacement_module="liger_kernel.transformers.qwen2vl_mrope",
-        replacement_name="liger_multimodal_rotary_pos_emb",
-        patch_type=PatchType.FUNCTION_REPLACEMENT,
-        description="Use LigerKernel multimodal rotary embedding",
-    )
-)
+# config.patches.append(
+#     create_patch_from_external(
+#         target="apply_multimodal_rotary_pos_emb",
+#         replacement_module="liger_kernel.transformers.qwen2vl_mrope",
+#         replacement_name="liger_multimodal_rotary_pos_emb",
+#         patch_type=PatchType.FUNCTION_REPLACEMENT,
+#         description="Use LigerKernel multimodal rotary embedding",
+#     )
+# )
 
 
 @config.override_method(
