@@ -158,17 +158,17 @@ class PatchedQwen3_5MoeExperts(nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         # Modification: dispatch to fused MoE when _moe_implementation is set.
-        # Split gate_up_proj into gate_proj and up_proj for the split-weight fused MoE path.
+        # Pass gate_up_proj directly as fc1_1_2_weight to avoid chunk + contiguous overhead.
         if self._moe_implementation == "fused":
-            gate_proj, up_proj = self.gate_up_proj.chunk(2, dim=1)
             final_hidden_states = fused_moe_forward(
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
                 hidden_states=hidden_states,
-                fc1_1_weight=gate_proj.contiguous(),
-                fc1_2_weight=up_proj.contiguous(),
+                fc1_1_weight=None,
+                fc1_2_weight=None,
                 fc2_weight=self.down_proj,
+                fc1_1_2_weight=self.gate_up_proj,
             )
         elif self._moe_implementation == "eager":
             with torch.no_grad():
