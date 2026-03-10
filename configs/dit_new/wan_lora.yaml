@@ -14,8 +14,6 @@ model:
 
 data:
   train_path: Tom-and-Jerry-VideoGeneration-Dataset
-  train_size: 1000000000000
-  max_seq_len: 8192
   source_name: Tom-and-Jerry-VideoGeneration-Dataset
   mm_configs:
     fps: 24
@@ -37,9 +35,9 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
   init_device: cuda
-  max_steps: 20
-  num_train_epochs: 1
+  num_train_epochs: 20
   save_hf_weights: true
+  hf_save_epochs: 5
   use_wandb: true
   wandb_project: veomni_dit
   wandb_name: Wan2.1-I2V-1.3B_lora
