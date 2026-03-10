@@ -27,6 +27,12 @@ file mode for random write access.
 import types
 
 
+_dcp_consolidation_patch_applied = False
+
+# Fixed torch version for this patch - update when upgrading torch
+_REQUIRED_TORCH_VERSION = "2.9"
+
+
 def apply_dcp_consolidation_patch():
     """Patch DCP safetensors consolidation to use append mode for HDFS FUSE compatibility.
 
@@ -48,6 +54,20 @@ def apply_dcp_consolidation_patch():
     bound to the target module, enabling access to internal functions like
     _read_tensor_data_mmap and _write_sub_tensor_to_file_optimized.
     """
+    global _dcp_consolidation_patch_applied
+
+    if _dcp_consolidation_patch_applied:
+        return
+
+    # Verify torch version matches exactly
+    import torch
+
+    if not torch.__version__.startswith(_REQUIRED_TORCH_VERSION):
+        raise RuntimeError(
+            f"DCP consolidation patch requires torch {_REQUIRED_TORCH_VERSION}.x, "
+            f"but got {torch.__version__}. Please update the patch or verify compatibility."
+        )
+
     try:
         import torch.distributed.checkpoint._consolidate_hf_safetensors as hf_module
     except ImportError:
@@ -110,3 +130,4 @@ def apply_dcp_consolidation_patch():
     )
 
     hf_module._process_output_file = patched_func
+    _dcp_consolidation_patch_applied = True

@@ -49,11 +49,6 @@ def apply_ops_patch():
         apply_veomni_fused_moe_patch()
         logger.info_rank0("✅ VeOmni ops patch applied.")
 
-    # Always apply DCP consolidation patch for HDFS FUSE compatibility
-    from .dcp_consolidation import apply_dcp_consolidation_patch
-
-    apply_dcp_consolidation_patch()
-
 
 def format_kernel_functions() -> str:
     lines = []
