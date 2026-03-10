@@ -67,7 +67,7 @@ model:
 | `sdpa` | `F.scaled_dot_product_attention` | No | — |
 | `flash_attention_2` | Flash Attention v2 | Yes | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes | `flash-attn-interface` |
-| `flash_attention_4` | Flash Attention v4 | Yes | `flash-attn`, `transformers>=5.0.0` |
+| `flash_attention_4` | Flash Attention v4 | Yes | `flash-attn.cute` |
 | `native-sparse` | Sparse attention | No | — |
 
 When `MODELING_BACKEND=veomni` (the default), `__post_init__` automatically

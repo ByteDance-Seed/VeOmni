@@ -138,13 +138,10 @@ def build_foundation_model(
         "trust_remote_code": True,
     }
 
-    if attn_implementation in (
-        "flash_attention_4",
-        "veomni_flash_attention_4_with_sp",
-    ) and not is_transformers_version_greater_or_equal_to("5.0.0"):
+    if attn_implementation == "flash_attention_4" and not is_transformers_version_greater_or_equal_to("5.0.0"):
         raise RuntimeError(
-            f"attn_implementation '{attn_implementation}' requires Transformers>=5.0.0. "
-            "Install it with: uv sync --extra gpu --extra fa4 --extra transformers5-exp --no-group transformers-stable"
+            f"attn_implementation '{attn_implementation}' bare name requires Transformers>=5.0.0. "
+            'For Transformers v4, please use attn_implementation="veomni_flash_attention_4_with_sp".'
         )
 
     if attn_implementation not in (

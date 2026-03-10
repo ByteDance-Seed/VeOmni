@@ -79,9 +79,13 @@ After `import veomni`:
   no-op for those two in practice, but is kept for safety.
 - FA4 (`veomni_flash_attention_4_with_sp`) has no such branch in `_lazy_imports` and
   always falls through to the hub-kernel path in Transformers v5. The adapter is the
-  **critical** component that makes FA4 usable. FA4 is not supported on Transformers v4.
-- FA4 requires the `flash-attn-cute` package (`flash_attn.cute`). To install Transformers v5
-  and FA4 together, run:
-  ```
-  uv sync --extra gpu --extra fa4 --extra transformers5-exp --no-group transformers-stable
-  ```
+  **critical** component that makes FA4 usable on v5.
+- On Transformers v4, FA4 is supported via the VeOmni SP variant
+  (`veomni_flash_attention_4_with_sp`). Instead of the string name, VeOmni passes
+  a `SimpleNamespace` object (from `_load_veomni_local_flash_kernel`) directly to
+  `_lazy_imports`, which v4 accepts in its kernels-fallback branch via `getattr()`.
+  The bare `flash_attention_4` name still requires Transformers v5; for Transformers v4,
+  use `attn_implementation="veomni_flash_attention_4_with_sp"`.
+- FA4 requires the `flash-attn-cute` package (`flash_attn.cute`). To install FA4:
+  - **Transformers v5**: `uv sync --extra gpu --extra fa4 --extra transformers5-exp --no-group transformers-stable`
+  - **Transformers v4**: `uv sync --extra gpu --extra fa4`
