@@ -93,6 +93,7 @@ gpu = [
   "torch-c-dlpack-ext",
   # For models with linear attention like Qwen 3.5
   "flash-linear-attention",
+  "quack-kernels==0.3.2",
 ]
 megatron = [
   "megatron-energon>=7.2.1"
@@ -102,7 +103,7 @@ trl = [
 ]
 
 fa4 = [
-  "flash-attn-cute",
+  "flash-attn-4==0.1.0",
   "nvidia-cutlass-dsl>=4.4.0"
 ]
 
@@ -210,11 +211,6 @@ conflicts = [
     { group = "transformers-stable" },
     { extra = "transformers5-exp" },
   ],
-  # FA4 only works for transformers v5
-  [
-    { group = "transformers-stable" },
-    { extra = "fa4" },
-  ],
 ]
 
 [tool.uv.sources]
@@ -244,8 +240,8 @@ flash-attn-3 = [
   { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
-# Pinned to 02/20/2026 latest main commit.
-flash-attn-cute = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "6079a9bf4cfd7af8e7586afea6c49a97ebddf46e" }
+# Pinned to 03/10/2026 latest main commit.
+flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "7fd16f28bffe71c9ab6b7eecc5dd14bf87c1dc9e" }
 
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
 av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video'" }
