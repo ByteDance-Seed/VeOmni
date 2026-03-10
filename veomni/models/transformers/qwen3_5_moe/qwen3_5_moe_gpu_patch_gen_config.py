@@ -18,12 +18,10 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5_moe/generated --diff
 
 Patches applied:
-1. Liger replacements for rotary/rms_norm/mlp.
-2. Fused MoE expert replacement (merged gate_up_proj layout).
-3. Device-agnostic GatedDeltaNet init and varlen FLA forward.
-4. DecoderLayer forward with cu_seq_lens_q passthrough.
-5. SP slicing in Qwen3_5MoeTextModel.forward.
-6. Fused loss + aux_loss in ForConditionalGeneration.
+1. Fused MoE expert replacement (merged gate_up_proj layout).
+2. Device-agnostic GatedDeltaNet init and varlen FLA forward.
+3. DecoderLayer forward with cu_seq_lens_q passthrough.
+4. Fused loss + aux_loss in ForConditionalGeneration.
 """
 
 import torch
@@ -41,7 +39,6 @@ from transformers.utils import TransformersKwargs, logging
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_init_patched,
-    qwen3_5_text_model_forward_patched,
 )
 from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
@@ -56,8 +53,6 @@ config = PatchConfig(
     description="Qwen3_5Moe with LigerKernel GPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
 
-config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.distributed.sequence_parallel", names=["slice_position_embedding"])
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.drop_import_names(
@@ -252,16 +247,6 @@ def qwen3_5_moe_decoder_layer_forward_patched(
         hidden_states, _ = hidden_states
     hidden_states = residual + hidden_states
     return hidden_states
-
-
-# ── TextModel forward (SP, shared with qwen3_5 via name_map) ─────────────────
-
-config.override_method(
-    "Qwen3_5MoeTextModel.forward",
-    replacement=qwen3_5_text_model_forward_patched,
-    name_map=_NAME_MAP,
-    description="Support SP in Qwen3_5MoeTextModel.forward",
-)
 
 
 # ── ForConditionalGeneration forward (fused loss + aux_loss, no vision) ──────────
