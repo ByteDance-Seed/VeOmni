@@ -467,6 +467,13 @@ class TrainingArguments:
         )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
+        else:
+            if self.broadcast_model_weights_from_rank0:
+                logger.warning_rank0(
+                    "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
+                    "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
+                    f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
+                )
 
     def _derive_batch_config(self):
         acc = self.accelerator
