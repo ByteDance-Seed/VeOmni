@@ -372,7 +372,7 @@ def process_sample_qwen_omni(
     image_token_id, video_token_id, audio_token_id = get_omni_token_ids(processor)
 
     source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
-    conversations = sample["conversations"] if ("conversations" in sample and len(sample["conversations"]) > 0) else sample
+    conversations = sample["conversations"] if ("conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0) else sample
     conversations = conv_preprocess(source, conversations, **kwargs)
     input_conversations = [
         {
