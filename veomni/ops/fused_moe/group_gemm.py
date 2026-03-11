@@ -103,7 +103,6 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         expert_output = moe_gather(fc2_output, scatter_index)
 
         # reshape the output with input shape
-        # reshape the output with input shape
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
@@ -322,7 +321,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         )
 
         expert_output = moe_gather(fc2_output, scatter_index)
-        # reshape the output with input shape
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
