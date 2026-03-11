@@ -79,6 +79,10 @@ class Patch:
     # For method overrides, we may need to specify where to get the replacement
     replacement_source: Optional[str] = None  # e.g., "liger_kernel.transformers.rms_norm"
 
+    # Optional text substitutions applied to the extracted source at codegen time.
+    # Useful for sharing patch functions across models that differ only in class-name prefixes.
+    name_map: Optional[dict[str, str]] = None
+
 
 @dataclass
 class ImportSpec:
@@ -115,15 +119,34 @@ class PatchConfig:
     # Optional: specify HF transformers version this is based on
     transformers_version: Optional[str] = None
 
-    def replace_class(self, target_class: str, description: Optional[str] = None):
+    def replace_class(
+        self,
+        target_class: str,
+        replacement: Any = None,
+        name_map: Optional[dict[str, str]] = None,
+        description: Optional[str] = None,
+    ):
         """
-        Decorator to register a class replacement.
+        Register a class replacement — as a decorator or directly.
 
-        Usage:
+        Decorator usage:
             @config.replace_class("Qwen3RMSNorm")
-            class LigerRMSNorm(nn.Module):
-                ...
+            class LigerRMSNorm(nn.Module): ...
+
+        Direct usage (with an already-defined replacement):
+            config.replace_class("Qwen3RMSNorm", replacement=MyRMSNorm, name_map={...})
         """
+        if replacement is not None:
+            patch = Patch(
+                patch_type=PatchType.CLASS_REPLACEMENT,
+                target=target_class,
+                replacement=replacement,
+                source_module=replacement.__module__ if hasattr(replacement, "__module__") else None,
+                description=description or f"Replace {target_class} with {replacement.__name__}",
+                name_map=name_map,
+            )
+            self.patches.append(patch)
+            return None
 
         def decorator(cls: type) -> type:
             patch = Patch(
@@ -132,21 +155,42 @@ class PatchConfig:
                 replacement=cls,
                 source_module=cls.__module__ if hasattr(cls, "__module__") else None,
                 description=description or f"Replace {target_class} with {cls.__name__}",
+                name_map=name_map,
             )
             self.patches.append(patch)
             return cls
 
         return decorator
 
-    def override_method(self, target_method: str, description: Optional[str] = None):
+    def override_method(
+        self,
+        target_method: str,
+        replacement: Any = None,
+        name_map: Optional[dict[str, str]] = None,
+        description: Optional[str] = None,
+    ):
         """
-        Decorator to register a method override.
+        Register a method override — as a decorator or directly.
 
-        Usage:
+        Decorator usage:
             @config.override_method("Qwen3Attention.forward")
-            def optimized_forward(self, hidden_states, ...):
-                ...
+            def optimized_forward(self, hidden_states, ...): ...
+
+        Direct usage (with an already-defined replacement):
+            config.override_method("Qwen3Attention.forward",
+                                   replacement=my_func, name_map={...})
         """
+        if replacement is not None:
+            patch = Patch(
+                patch_type=PatchType.METHOD_OVERRIDE,
+                target=target_method,
+                replacement=replacement,
+                source_module=replacement.__module__ if hasattr(replacement, "__module__") else None,
+                description=description or f"Override {target_method}",
+                name_map=name_map,
+            )
+            self.patches.append(patch)
+            return None
 
         def decorator(func: Callable) -> Callable:
             patch = Patch(
@@ -155,21 +199,42 @@ class PatchConfig:
                 replacement=func,
                 source_module=func.__module__ if hasattr(func, "__module__") else None,
                 description=description or f"Override {target_method}",
+                name_map=name_map,
             )
             self.patches.append(patch)
             return func
 
         return decorator
 
-    def replace_function(self, target_func: str, description: Optional[str] = None):
+    def replace_function(
+        self,
+        target_func: str,
+        replacement: Any = None,
+        name_map: Optional[dict[str, str]] = None,
+        description: Optional[str] = None,
+    ):
         """
-        Decorator to register a function replacement.
+        Register a function replacement — as a decorator or directly.
 
-        Usage:
+        Decorator usage:
             @config.replace_function("apply_rotary_pos_emb")
-            def liger_rotary_pos_emb(q, k, cos, sin, ...):
-                ...
+            def liger_rotary_pos_emb(q, k, cos, sin, ...): ...
+
+        Direct usage (with an already-defined replacement):
+            config.replace_function("apply_rotary_pos_emb",
+                                    replacement=my_func, name_map={...})
         """
+        if replacement is not None:
+            patch = Patch(
+                patch_type=PatchType.FUNCTION_REPLACEMENT,
+                target=target_func,
+                replacement=replacement,
+                source_module=replacement.__module__ if hasattr(replacement, "__module__") else None,
+                description=description or f"Replace {target_func} with {replacement.__name__}",
+                name_map=name_map,
+            )
+            self.patches.append(patch)
+            return None
 
         def decorator(func: Callable) -> Callable:
             patch = Patch(
@@ -178,6 +243,7 @@ class PatchConfig:
                 replacement=func,
                 source_module=func.__module__ if hasattr(func, "__module__") else None,
                 description=description or f"Replace {target_func} with {func.__name__}",
+                name_map=name_map,
             )
             self.patches.append(patch)
             return func

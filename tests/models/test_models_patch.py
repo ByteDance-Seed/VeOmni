@@ -248,6 +248,13 @@ _TEST_CASES_TRANSFORMERS_V5 = [
         _DEFAULT_ATOL,
         id="qwen3_5",
     ),
+    pytest.param(
+        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_5_moe",
+    ),
 ]
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
@@ -286,7 +293,7 @@ def test_models_patch_fwd_bwd(
     # Qwen3.5 compatibility:
     # - HF backend doesn't support the test's position_ids test cases.
     # - VeOmni backend doesn't support the padded_bsh cases as we only support packed sequence case.
-    if case_id == "qwen3_5":
+    if case_id in ("qwen3_5", "qwen3_5_moe"):
         #    hf_model_modes = [mode for mode in hf_model_modes if mode.attn_case != "position_ids"]
         hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
         veomni_model_modes = [
