@@ -211,7 +211,7 @@ def process_sample_qwen2_5_vl(
     from .multimodal.image_utils import fetch_images
     from .multimodal.video_utils import fetch_videos
 
-    source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+    source = kwargs.get("source_name") or sample.get("source_name") or sample.get("source")
 
     if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
         conversations = sample["conversations"]
@@ -273,7 +273,7 @@ def process_sample_qwen3_vl(
     from .multimodal.image_utils import fetch_images
     from .multimodal.video_utils import fetch_videos_metadata
 
-    source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+    source = kwargs.get("source_name") or sample.get("source_name") or sample.get("source")
 
     if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
         conversations = sample["conversations"]
@@ -371,7 +371,7 @@ def process_sample_qwen_omni(
 
     image_token_id, video_token_id, audio_token_id = get_omni_token_ids(processor)
 
-    source = kwargs["source_name"] if "source_name" in kwargs else sample["source_name"]
+    source = kwargs.get("source_name") or sample.get("source_name") or sample.get("source")
     conversations = (
         sample["conversations"] if ("conversations" in sample and len(sample["conversations"]) > 0) else sample
     )
