@@ -13,7 +13,7 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
-from utils import DummyIterableDataset, DummyMappingDataset, FakeModel, compare_global_batch
+from utils import DummyIterableDataset, FakeModel, compare_global_batch
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
@@ -69,26 +69,27 @@ def run_multisource_dataset_test():
     dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
 
     init_parallel_state(
-        dp_size=args.train.data_parallel_size,
-        dp_replicate_size=args.train.data_parallel_replicate_size,
-        dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
-        ulysses_size=args.train.ulysses_parallel_size,
-        dp_mode=args.train.data_parallel_mode,
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        ep_size=args.train.accelerator.ep_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
     )
 
-    Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
+    Checkpointer = build_checkpointer(
+        dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
+    )
 
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
 
     # Build DummyIterableDataset instances directly (bypasses HuggingFace shuffle bug)
     iterable_datasets = [
-        DummyIterableDataset(DummyMappingDataset(size=100), shuffle=True, seed=args.train.seed + i)
-        for i in range(len(multisource_names))
+        DummyIterableDataset(size=100, shuffle=True, seed=args.train.seed + i) for i in range(len(multisource_names))
     ]
 
     args.data.enable_multisource = True
@@ -127,7 +128,7 @@ def run_multisource_dataset_test():
     assert sorted(state["runtime"]["dataset_states"].keys()) == sorted(source_ids)
 
     dataset_length = None
-    args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    args.compute_train_steps(dataset_length)
 
     global_batch_size = cast(int, args.train.global_batch_size)
     dataloader = build_dataloader(
@@ -137,24 +138,21 @@ def run_multisource_dataset_test():
         global_batch_size=global_batch_size,
         dataloader_batch_size=args.train.dataloader_batch_size,
         max_seq_len=args.data.max_seq_len,
-        train_steps=args.train.train_steps,
-        rmpad=args.train.rmpad,
-        bsz_warmup_ratio=0.0,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-        num_workers=1,
-        drop_last=args.data.drop_last,
-        pin_memory=args.data.pin_memory,
-        prefetch_factor=args.data.prefetch_factor,
+        train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
+        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_buffer_size=1,
+        num_workers=1,
+        drop_last=args.data.dataloader.drop_last,
+        pin_memory=args.data.dataloader.pin_memory,
+        prefetch_factor=args.data.dataloader.prefetch_factor,
     )
 
     config = PretrainedConfig()
     environ_meter = helper.EnvironMeter(
         config=config,
         global_batch_size=global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         empty_cache_steps=args.train.empty_cache_steps,
         enable_multisource=args.data.enable_multisource,
         dataloader=dataloader,
@@ -163,21 +161,21 @@ def run_multisource_dataset_test():
 
     gt_global_batch_list = []
     epoch_num = 3
-    train_steps = args.train.train_steps
+    train_steps = args.train_steps
     start_epoch, start_step, global_step = 0, 0, 0
-    save_epoch, save_step = 1, args.train.train_steps - 1
+    save_epoch, save_step = 1, args.train_steps - 1
 
     fake_model = FakeModel().to(get_device_type())
     for epoch in range(start_epoch, epoch_num):
         dataloader.set_epoch(epoch)
         data_iterator = iter(dataloader)
         start_time = time.time()
-        for local_step in range(start_step, args.train.train_steps):
+        for local_step in range(start_step, args.train_steps):
             global_step += 1
             try:
                 micro_batches = next(data_iterator)
             except StopIteration:
-                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                 break
 
             if global_step == 1:
@@ -229,8 +227,8 @@ def run_multisource_dataset_test():
                         "environ_meter": environ_meter.state_dict(),
                     },
                 }
-                save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
-                Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
+                Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
                 dist.barrier()
     state = {"model": fake_model, "extra_state": {}}
     Checkpointer.load(save_checkpoint_path, state)
@@ -725,7 +723,6 @@ def build_command():
         "--nproc_per_node=2",
         f"--master_port={port}",
         "tests/data/test_multisource_dataset.py",
-        "--data.enable_multisource=True",
         "--model.config_path=test",
         "--data.train_path=None",
         "--data.train_size=1000",
@@ -733,13 +730,12 @@ def build_command():
         "--data.datasets_type=iterable",
         "--train.global_batch_size=8",
         "--train.micro_batch_size=2",
-        "--train.data_parallel_mode=ddp",
-        "--train.ckpt_manager=dcp",
-        "--train.ulysses_parallel_size=1",
+        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--train.checkpoint.manager=dcp",
+        "--train.checkpoint.output_dir=.tests/cache",
+        "--train.dyn_bsz=true",
+        "--train.dyn_bsz_runtime=worker",
         "--train.bsz_warmup_ratio=0",
-        "--train.output_dir=.tests/cache",
-        "--train.rmpad=True",
-        "--train.dyn_bsz=True",
         "--train.max_steps=6",
     ]
     return command

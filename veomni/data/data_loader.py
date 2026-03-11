@@ -29,7 +29,8 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dynamic_batching import DynamicBatchingSizeDataset, DynamicBatchSizeDataLoader, TextBatchingStrategy, get_length_by_attention_mask_fn
+from .dataset import DynamicBatchingSizeDataset, get_length_by_attention_mask_fn
+from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
 DATALOADER_REGISTRY = Registry("dataloader")
@@ -64,7 +65,7 @@ def build_native_dataloader(
     dyn_bsz: bool = True,
     dyn_bsz_runtime: Literal["main", "worker"] = "main",
     dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_in_dataloader is False.
-    dyn_bsz_buffer_size: int = 500,
+    dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
     drop_last: bool = True,
     pin_memory: bool = True,
@@ -113,7 +114,6 @@ def build_native_dataloader(
 
             collate_fn = UnpackDataCollator()
         else:
-            dataloader_batch_size = num_micro_batch
             dataset = DynamicBatchingSizeDataset(
                 dataset=dataset,
                 micro_batch_seq_length=batching_token_len,
@@ -144,18 +144,21 @@ def build_native_dataloader(
             seed=seed,
         )
 
-    dataloader = DistributedDataloader(
-        dataset,
-        batch_size=dataloader_batch_size,
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=pin_memory,
-        pin_memory_device=get_device_type(),
-        drop_last=drop_last,
-        prefetch_factor=prefetch_factor,
-        multiprocessing_context=multiprocessing_context,
-    )
+    dataloader_kwargs = {
+        "batch_size": dataloader_batch_size,
+        "sampler": sampler,
+        "num_workers": num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": pin_memory,
+        "pin_memory_device": get_device_type(),
+        "drop_last": drop_last,
+        "prefetch_factor": prefetch_factor,
+    }
+    if multiprocessing_context is not None:
+        dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
+
+    dataloader = DistributedDataloader(dataset, **dataloader_kwargs)
+
     if dyn_bsz and dyn_bsz_runtime == "main":
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
