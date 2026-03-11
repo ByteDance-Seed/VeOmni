@@ -21,7 +21,19 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -44,6 +56,10 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
+from .hf_checkpoint_tensor_converter import (
+    get_hf_checkpoint_tensor_converter,
+    maybe_convert_hf_checkpoint_tensor,
+)
 
 
 if TYPE_CHECKING:
@@ -284,6 +300,7 @@ def load_model_weights(
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
+    converter = get_hf_checkpoint_tensor_converter(model)
 
     state_dict_iterators = _load_state_dict(weights_path)
     for state_dict_iterator in tqdm(
@@ -293,6 +310,10 @@ def load_model_weights(
             # IMPORTANT: Call this function to adapt to transformers 4.52 breaking change
             # on model structure. See the comment for details.
             name = _convert_weight_key(name, model)
+            converted = maybe_convert_hf_checkpoint_tensor(name, tensor, converter)
+            if converted is None:
+                continue
+            name, tensor = converted.name, converted.tensor
 
             if name in buffer_dict.keys():  # persistent buffers
                 buffer_dict[name] = tensor.clone()
@@ -332,6 +353,7 @@ def rank0_load_and_broadcast_weights(
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
+    converter = get_hf_checkpoint_tensor_converter(model)
 
     global_rank = get_parallel_state().global_rank
     torch_device = torch.device(init_device)
@@ -367,19 +389,38 @@ def rank0_load_and_broadcast_weights(
         iterator = iter(state_dict_iterator) if global_rank == 0 else None
 
         while True:
-            # read tensors from safetensor
+            # Each outer iteration prepares and broadcasts exactly one tensor metadata/payload
+            # across all ranks. When rank0 reaches `done=True`, all ranks break together.
             tensor: Optional["torch.Tensor"] = None
 
             if global_rank == 0:
-                try:
-                    key, tensor = next(iterator)  # type: ignore[arg-type]
-                    key = _convert_weight_key(key, model)
-                    logger.info_rank0(f"loading {key=}")
-                    if torch.count_nonzero(tensor) == 0:
-                        logger.warning_rank0(f"Detected tensor with all-zero values when reading safetensor: {key=}")
-                    metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
-                except StopIteration:
-                    metadata = BroadcastMetadata(True, None, None, None)
+                while True:
+                    # Rank0 keeps reading local checkpoint entries until:
+                    # 1) a tensor is ready to broadcast, or
+                    # 2) this shard iterator is exhausted.
+                    #
+                    # Converter may return `None` to indicate "handled but still accumulating"
+                    # (e.g, it reads one expert weight [H, I] for a [E, H, I] weight),
+                    # so this inner loop continues without broadcasting that entry.
+                    try:
+                        key, tensor = next(iterator)  # type: ignore[arg-type]
+                        key = _convert_weight_key(key, model)
+                        converted = maybe_convert_hf_checkpoint_tensor(key, tensor, converter)
+                        if converted is None:
+                            continue
+                        key, tensor = converted.name, converted.tensor
+                        logger.info_rank0(f"loading {key=}")
+                        if torch.count_nonzero(tensor) == 0:
+                            logger.warning_rank0(
+                                f"Detected tensor with all-zero values when reading safetensor: {key=}"
+                            )
+                        metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
+                        break
+                    except StopIteration:
+                        # Rank0 has no more broadcastable tensors in this shard.
+                        # Send a terminal metadata message so other ranks exit their outer loop.
+                        metadata = BroadcastMetadata(True, None, None, None)
+                        break
             else:
                 metadata = BroadcastMetadata(False, None, None, None)
 
