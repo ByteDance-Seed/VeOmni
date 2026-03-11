@@ -15,7 +15,9 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from veomni.data import build_multimodal_chat_template
-from veomni.data.data_transform import process_sample_qwen3_vl, process_sample_qwen3_vl_transformers_v5
+from veomni.data.data_transform import (
+    process_sample_qwen_vl,
+)
 from veomni.models import build_foundation_model, build_processor
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -26,8 +28,7 @@ _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
 # Mapping from function name to actual function
 PROCESS_SAMPLE_FUNCTION_MAP = {
-    "process_sample_qwen3_vl": process_sample_qwen3_vl,
-    "process_sample_qwen3_vl_transformers_v5": process_sample_qwen3_vl_transformers_v5,
+    "process_sample_qwen_vl": process_sample_qwen_vl,
 }
 
 
@@ -73,11 +74,6 @@ def load_hf_model(model_path):
 
 def hf_process_sample(config: ModelTestConfig, hf_processor, hf_model):
     conversation = [
-        {
-            # To ensure compatibility with the implementation of Qwen3VLChatTemplate in veomni/data/multimodal/multimodal_chat_template.py
-            "role": "system",
-            "content": [{"type": "text", "text": "You are a helpful assistant."}],
-        },
         {
             "role": "user",
             "content": [
@@ -192,23 +188,46 @@ def veomni_process_sample(
     return output
 
 
-@pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
-def test_qwen3_vl_processor_comparison():
-    """Test that HF and VeOmni processors produce identical outputs.
-
-    This test validates:
-    1. Core tensors (input_ids, attention_mask, etc.) are identical
-    2. Masks have correct shapes and properties
-    """
-    # Model configurations
-    # Note: model_id will be used to download processor from HDFS cache
-    config = ModelTestConfig(
-        model_id="Qwen/Qwen3-VL-2B-Instruct",
-        config_path="./tests/toy_config/qwen3vl_toy/config.json",
-        process_sample_func_name="process_sample_qwen3_vl",
-        chat_template_name="qwen3vl",
-    )
-
+@pytest.mark.parametrize(
+    "config, check_mm_token_type_ids",
+    [
+        pytest.param(
+            ModelTestConfig(
+                model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+                config_path="./tests/toy_config/qwen25vl_toy/config.json",
+                process_sample_func_name="process_sample_qwen_vl",
+                chat_template_name="qwen2_5vl",
+            ),
+            False,  # check_mm_token_type_ids
+            marks=pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0"),
+            id="qwen2_5_vl",
+        ),
+        pytest.param(
+            ModelTestConfig(
+                model_id="Qwen/Qwen3-VL-2B-Instruct",
+                config_path="./tests/toy_config/qwen3vl_toy/config.json",
+                process_sample_func_name="process_sample_qwen_vl",
+                chat_template_name="qwen3vl",
+            ),
+            False,  # check_mm_token_type_ids
+            marks=pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0"),
+            id="qwen3_vl",
+        ),
+        pytest.param(
+            ModelTestConfig(
+                model_id="Qwen/Qwen3.5-0.8B",
+                config_path="./tests/toy_config/qwen3_5_toy/config.json",
+                process_sample_func_name="process_sample_qwen_vl",
+                chat_template_name="qwen3vl",
+            ),
+            True,  # check_mm_token_type_ids
+            marks=pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0"),
+            id="qwen3_5",
+        ),
+    ],
+)
+def test_vlm_processor_comparison(config, check_mm_token_type_ids):
+    """Test that HF and VeOmni processors produce identical outputs."""
     # Process data with both processors
     hf_processor = load_hf_processor(config.model_id)
     hf_model = load_hf_model(config.model_id)
@@ -253,69 +272,9 @@ def test_qwen3_vl_processor_comparison():
         veomni_output["attention_mask"],
     )
 
-
-@pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
-def test_qwen3_5_processor_comparison():
-    """Test that HF and VeOmni processors produce identical outputs.
-
-    This test validates:
-    1. Core tensors (input_ids, attention_mask, etc.) are identical
-    2. Masks have correct shapes and properties
-    """
-    # Model configurations
-    # Note: model_id will be used to download processor from HDFS cache
-    config = ModelTestConfig(
-        model_id="Qwen/Qwen3.5-0.8B",
-        config_path="./tests/toy_config/qwen3_5_toy/config.json",
-        process_sample_func_name="process_sample_qwen3_vl_transformers_v5",
-        chat_template_name="qwen3vl",
-    )
-
-    # Process data with both processors
-    hf_processor = load_hf_processor(config.model_id)
-    hf_model = load_hf_model(config.model_id)
-    hf_output = hf_process_sample(config, hf_processor, hf_model)
-
-    veomni_processor = load_veomni_processor(config.model_id)
-    veomni_model = load_veomni_model(config.config_path, device)
-    veomni_output = veomni_process_sample(config, veomni_processor, veomni_model)
-
-    # Compare core tensors - these should be IDENTICAL
-    hf_image_mask = hf_output["input_ids"] == hf_processor.image_token_id
-    hf_output["input_ids"][hf_image_mask] = 0
-    hf_video_mask = hf_output["input_ids"] == hf_processor.video_token_id
-    hf_output["input_ids"][hf_video_mask] = 0
-
-    torch.testing.assert_close(
-        hf_output["input_ids"][0],
-        veomni_output["input_ids"],
-        atol=0.0,
-        rtol=0.0,
-        msg="Veomni input_ids mismatch vs HF generate!",
-    )
-
-    for key in ["pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"]:
-        if hf_output.get(key) is not None:
-            assert veomni_output.get(key) is not None, f"HF has {key} but VeOmni does not"
-            torch.testing.assert_close(
-                hf_output[key],
-                veomni_output[key],
-            )
-            print(f"VeOmni {key} Output matches HF!")
-        else:
-            assert veomni_output.get(key) is None, f"VeOmni has {key} but HF does not"
-
-    torch.testing.assert_close(
-        hf_output["position_ids"].squeeze(1),
-        veomni_output["position_ids"],
-    )
-
-    torch.testing.assert_close(
-        hf_output["attention_mask"].squeeze(0),
-        veomni_output["attention_mask"],
-    )
-
-    torch.testing.assert_close(
-        hf_output["mm_token_type_ids"].squeeze(0),
-        veomni_output["mm_token_type_ids"],
-    )
+    if check_mm_token_type_ids:
+        torch.testing.assert_close(
+            hf_output["mm_token_type_ids"].squeeze(0),
+            veomni_output["mm_token_type_ids"],
+        )
+        print("VeOmni mm_token_type_ids Output matches HF!")
