@@ -31,6 +31,8 @@ from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
+    Qwen3_5MoeTextModel,
+    Qwen3_5MoeVisionModel,
     load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
@@ -101,6 +103,27 @@ config.add_post_import_block(
 # to the first `rotary_dim` dims and passing through the rest), while
 # liger_rotary_pos_emb applies RoPE to the full head_dim, producing incorrect
 # results and NaN in attention output.
+
+
+# ── Propagate _moe_implementation from top-level config to text_config ────────
+
+
+@config.override_method(
+    "Qwen3_5MoeModel.__init__",
+    description="Propagate _moe_implementation from top-level config to text_config",
+)
+def qwen3_5_moe_model_init_patched(self, config):
+    # Propagate _moe_implementation so SparseMoeBlock picks up the correct mode.
+    moe_implementation = getattr(config, "_moe_implementation", "eager")
+    config.text_config._moe_implementation = moe_implementation
+
+    super().__init__(config)
+    self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
+    self.rope_deltas = None  # cache rope_deltas here
+
+    # Initialize weights and apply final processing
+    self.post_init()
 
 
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
