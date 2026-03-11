@@ -238,7 +238,6 @@ from veomni.distributed.sequence_parallel import (
     gather_outputs,             # all-gather along a dim (no autograd)
     gather_seq_scatter_heads,   # (bs, seq//sp, h) → (bs, seq, h//sp)
     slice_input_tensor,         # slice along a dim for this SP rank
-    slice_position_embedding,   # slice position embeddings for SP
     sp_pad_and_slice,           # pad to multiple of pad_scale, then slice
     unpad_tensor,               # remove padding from a tensor
 )

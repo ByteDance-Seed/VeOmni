@@ -219,8 +219,7 @@ hidden_states [B, S_local, D]           # already local from collator
 
 **Important:** Position embeddings (`cos`, `sin`) must match `hidden_states` length (`S_local`).
 Since `position_ids` is already sliced by the collator, `rotary_emb(hidden_states, position_ids)`
-produces local-length position embeddings. **Do NOT apply `slice_position_embedding` on top of this** —
-it would double-slice, causing a shape mismatch in `apply_rotary_pos_emb`.
+produces local-length position embeddings — no additional slicing is needed.
 
 > **Note on Qwen3/Qwen3-MoE:** These models use LigerKernel's `apply_rotary_pos_emb` which tolerates
 > mismatched sequence lengths between q/k and cos/sin. Qwen3.5 uses the standard HuggingFace

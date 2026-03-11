@@ -37,8 +37,6 @@ from transformers.modeling_outputs import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_position_embedding
 from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
 
 
@@ -48,8 +46,6 @@ config = PatchConfig(
     description="Qwen3 with LigerKernel GPU replacements",
 )
 
-config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.distributed.sequence_parallel", names=["slice_position_embedding"])
 config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 
 config.patches.append(
@@ -144,11 +140,6 @@ def qwen3_model_forward_patched(
     hidden_states = inputs_embeds
 
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-    # ============================== VeOmni SP Patch Start ==============================
-    sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-    # =============================== VeOmni SP Patch End ===============================
 
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         hidden_states = decoder_layer(
