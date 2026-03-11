@@ -187,7 +187,7 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)
@@ -202,8 +202,8 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
 
         model_state_dict = ckpt_to_state_dict(
             save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
-            ckpt_manager=args.train.ckpt_manager,
+            output_dir=args.train.checkpoint.output_dir,
+            ckpt_manager=args.train.checkpoint.manager,
         )
 
         model_state_dict = get_peft_model_state_dict(self.trainer.model, model_state_dict)
