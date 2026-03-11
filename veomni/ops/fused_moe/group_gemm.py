@@ -103,11 +103,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         expert_output = moe_gather(fc2_output, scatter_index)
 
         # reshape the output with input shape
-        # Clone to avoid returning a view from a custom autograd Function.
-        # Downstream ops (e.g. SparseMoeBlock's `+=`) modify this in-place,
-        # which PyTorch forbids on views created by custom Functions.
-        output = expert_output.reshape(hidden_states.shape).clone()
-        del expert_output  # Release the original tensor from HBM immediately
+        # reshape the output with input shape
+        output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
         ctx.save_for_backward(
@@ -325,11 +322,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         )
 
         expert_output = moe_gather(fc2_output, scatter_index)
-        # Clone to avoid returning a view from a custom autograd Function.
-        # Downstream ops (e.g. SparseMoeBlock's `+=`) modify this in-place,
-        # which PyTorch forbids on views created by custom Functions.
-        output = expert_output.reshape(hidden_states.shape).clone()
-        del expert_output  # Release the original tensor from HBM immediately
+        # reshape the output with input shape
+        output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
         ctx.save_for_backward(

@@ -26,6 +26,7 @@ Patches applied:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -124,6 +125,32 @@ def qwen3_5_moe_model_init_patched(self, config):
 
     # Initialize weights and apply final processing
     self.post_init()
+
+
+# ── SparseMoeBlock forward (avoid in-place op on autograd Function output) ────
+
+
+@config.override_method(
+    "Qwen3_5MoeSparseMoeBlock.forward",
+    description="Avoid in-place += on custom autograd Function output",
+)
+def qwen3_5_moe_sparse_moe_block_forward_patched(
+    self, hidden_states: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+    shared_expert_output = self.shared_expert(hidden_states_reshaped)
+    _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+    expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+
+    shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+
+    # Modification: use out-of-place add instead of `expert_output += shared_expert_output`
+    # to avoid "Output of MergedFc1TritonFusedMoeExpertFunctionBackward is a view and is
+    # being modified inplace" RuntimeError from PyTorch autograd.
+    expert_output = expert_output + shared_expert_output
+    expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
+    return expert_output
 
 
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
