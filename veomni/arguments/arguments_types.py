@@ -365,6 +365,10 @@ class TrainingArguments:
         default=200,
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
     )
+    dyn_bsz_runtime: Literal["main", "worker"] = field(
+        default="worker",
+        metadata={"help": "Use main process or worker process to run dynamic batch size."},
+    )
     enable_mixed_precision: bool = field(
         default=True,
         metadata={"help": "Enable mixed precision training."},
@@ -516,7 +520,13 @@ class TrainingArguments:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # dataloader batch size
-        self.dataloader_batch_size = 1 if self.dyn_bsz else self.global_batch_size // acc.dp_size
+        if self.dyn_bsz:
+            if self.dyn_bsz_runtime == "main":
+                self.dataloader_batch_size = 1
+            else:
+                self.dataloader_batch_size = self.global_batch_size // acc.dp_size // self.micro_batch_size
+        else:
+            self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
 
     def _resolve_checkpoint_paths(self):
         ckpt = self.checkpoint
@@ -858,9 +868,9 @@ class VeOmniArguments:
             self._train_steps = math.ceil(train_size / (self.train.global_batch_size * self.data.max_seq_len))
         else:
             if dataset_length is not None:  # mapping dataset
-                self._train_steps = math.floor(dataset_length / self.train.dataloader_batch_size)
+                self._train_steps = math.floor(dataset_length / self.data.dataloader_batch_size)
             else:
-                self._train_steps = math.ceil(self.data.train_sample / self.train.dataloader_batch_size)
+                self._train_steps = math.ceil(self.data.train_sample / self.data.dataloader_batch_size)
 
     @property
     def train_steps(self) -> int:

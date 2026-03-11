@@ -44,13 +44,13 @@ import torch.distributed as dist
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
-from utils import DummyIterableDataset, DummyMappingDataset, FakeModel
+from utils import DummyIterableDataset, FakeModel
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
-from veomni.data.dynamic_batching import DynamicBatchingSizeDataset
+from veomni.data.dataset import DynamicBatchingSizeDataset
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -80,10 +80,9 @@ def setup_dynamic_batching_dataset():
     """Fixture to create DynamicBatchingSizeDataset with standard configuration.
 
     Returns:
-        A tuple of (mapping_dataset, iterable_dataset, dynamic_ds)
+        A tuple of (iterable_dataset, dynamic_ds)
     """
-    mapping_dataset = DummyMappingDataset(size=DATASET_SIZE)
-    iterable_dataset = DummyIterableDataset(mapping_dataset, shuffle=False)
+    iterable_dataset = DummyIterableDataset(size=DATASET_SIZE, shuffle=False)
 
     dynamic_ds = DynamicBatchingSizeDataset(
         dataset=iterable_dataset,
@@ -93,7 +92,7 @@ def setup_dynamic_batching_dataset():
         get_length_fn=get_length_fn,
     )
 
-    return mapping_dataset, iterable_dataset, dynamic_ds
+    return iterable_dataset, dynamic_ds
 
 
 # Unit tests (can run without distributed setup)
@@ -120,8 +119,7 @@ def test_dynamic_batching_basic(shuffle, seed):
         seed: Random seed for shuffling.
     """
     # Create a simple dataset
-    mapping_ds = DummyMappingDataset(size=DATASET_SIZE)
-    iterable_ds = DummyIterableDataset(mapping_ds, shuffle=shuffle, seed=seed)
+    iterable_ds = DummyIterableDataset(size=DATASET_SIZE, shuffle=shuffle, seed=seed)
 
     # Create data collator
     collator = MainCollator()
@@ -204,7 +202,7 @@ def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
     buffer items until the buffer is empty, even if they don't meet the normal
     threshold conditions.
     """
-    mapping_dataset, iterable_dataset, dynamic_ds = setup_dynamic_batching_dataset
+    iterable_dataset, dynamic_ds = setup_dynamic_batching_dataset
 
     iterator = iter(dynamic_ds)
     batch_count = 0
@@ -281,8 +279,7 @@ def test_save_load_state_dict(save_by_idx):
         save_by_idx: Whether to save the buffer by index (True) or by full
             sample tensors (False).
     """
-    mapping_ds = DummyMappingDataset(size=DATASET_SIZE)
-    iterable_ds = DummyIterableDataset(mapping_ds, shuffle=False)
+    iterable_ds = DummyIterableDataset(size=DATASET_SIZE, shuffle=False)
 
     dynamic_ds = DynamicBatchingSizeDataset(
         dataset=iterable_ds,
@@ -305,8 +302,7 @@ def test_save_load_state_dict(save_by_idx):
     batches_original = list(iterator)
 
     # Restore state into a fresh dataset instance
-    mapping_ds2 = DummyMappingDataset(size=DATASET_SIZE)
-    iterable_ds2 = DummyIterableDataset(mapping_ds2, shuffle=False)
+    iterable_ds2 = DummyIterableDataset(size=DATASET_SIZE, shuffle=False)
 
     dynamic_ds2 = DynamicBatchingSizeDataset(
         dataset=iterable_ds2,
@@ -486,12 +482,11 @@ def _run_distributed_test():
         dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
     )
 
-    # Create DummyMappingDataset and DummyIterableDataset
-    mapping_dataset = DummyMappingDataset(size=DATASET_SIZE)
-    iterable_dataset = DummyIterableDataset(mapping_dataset, shuffle=test_args.shuffle, seed=args.train.seed)
+    # Create DummyIterableDataset
+    iterable_dataset = DummyIterableDataset(size=DATASET_SIZE, shuffle=test_args.shuffle, seed=args.train.seed)
 
     # Compute train_steps based on dataset size
-    dataset_length = len(mapping_dataset)
+    dataset_length = len(iterable_dataset)
     args.compute_train_steps(dataset_length)
     train_steps = args.train_steps
 
@@ -509,7 +504,7 @@ def _run_distributed_test():
         dyn_bsz_buffer_size=READY_FOR_MICRO_BATCH_THRESHOLD,
         dyn_bsz_dataset_save_by_idx=test_args.save_by_idx,
         num_workers=2,
-        drop_last=False,
+        drop_last=args.data.dataloader.drop_last,
         pin_memory=args.data.dataloader.pin_memory,
         prefetch_factor=args.data.dataloader.prefetch_factor,
     )
@@ -549,6 +544,7 @@ def _run_distributed_test():
 
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
+                assert 1 < len(micro_batches) <= 4, f"Expected 2-4 micro batches, got {len(micro_batches)}"
 
             # Print batch info for debugging
             """

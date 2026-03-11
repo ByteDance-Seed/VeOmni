@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from datasets import Dataset as HuggingFaceDataset
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import IterableDataset
 
 from veomni.utils import helper
 from veomni.utils.device import get_device_type
@@ -16,54 +16,13 @@ from veomni.utils.helper import get_cache_dir
 logger = helper.create_logger(__name__)
 
 
-class DummyMappingDataset(Dataset):
-    """Mapping-style dataset that generates deterministic dummy samples by index.
-
-    * Sample at 0-based index ``i`` contains **i + 1** tokens, each with value
-      ``i + 1``.  For example index 0 → ``[1]``, index 4 → ``[5, 5, 5, 5, 5]``.
-    """
-
-    def __init__(self, size: int = 100):
-        """
-        Args:
-            size: Total number of samples in the dataset.
-        """
-        self.size = size
-
-    def __len__(self):
-        return self.size
-
-    def __getitem__(self, idx):
-        """Return the dummy sample at position *idx*.
-
-        Args:
-            idx: 0-based integer index into the dataset.
-
-        Returns:
-            dict with keys:
-
-            * ``"input_ids"`` – 1-D ``LongTensor`` of length ``idx + 1``, filled
-              with the scalar value ``idx + 1``.
-            * ``"attention_mask"`` – all-ones tensor of the same shape.
-            * ``"labels"`` – clone of ``input_ids``.
-
-        Raises:
-            IndexError: If ``idx`` is outside ``[0, size)``.
-        """
-        if idx < 0 or idx >= self.size:
-            raise IndexError(f"Index {idx} out of range [0, {self.size})")
-
-        # Follow the same generation pattern: index + 1
-        index = idx + 1
-        input_ids = torch.tensor([index] * index, dtype=torch.long)
-        return {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "labels": input_ids.clone()}
-
-
 class DummyIterableDataset(IterableDataset):
-    """Iterable wrapper around ``DummyMappingDataset`` with built-in sharding and optional shuffle.
+    """Deterministic dummy dataset with iterable sharding and optional shuffle.
 
     Designed to tested with ``DynamicBatchingSizeDataset`` and ``StatefulDataLoader`` checkpointing:
 
+    * **Deterministic sample generation** – sample at 0-based index ``i`` contains
+      **i + 1** tokens, each with value ``i + 1``.
     * **Sharding** – samples are distributed across distributed ranks *and* DataLoader
       workers using a round-robin interleave strategy (rank-major, then worker-minor),
       so each dataloader worker on each rank sees a disjoint, deterministic subset of the data.
@@ -80,16 +39,16 @@ class DummyIterableDataset(IterableDataset):
       exact position of the iterator.
     """
 
-    def __init__(self, mapping_dataset: DummyMappingDataset, shuffle: bool = False, seed: int = 42):
+    def __init__(self, size: int = 100, shuffle: bool = False, seed: int = 42):
         """
         Args:
-            mapping_dataset: The upstream ``DummyMappingDataset`` to read from.
+            size: Total number of samples in the dataset.
             shuffle: Whether to shuffle the reading order.  Shuffling is performed
                 once at construction time using ``seed`` so that it is stable across
                 distributed workers.
             seed: Random seed used to generate the permutation when ``shuffle=True``.
         """
-        self.mapping_dataset = mapping_dataset
+        self.size = size
         self.shuffle = shuffle
         self.seed = seed
         self.output_refetch_idx = False  # Will be set by DynamicBatchingSizeDataset if needed
@@ -99,9 +58,21 @@ class DummyIterableDataset(IterableDataset):
         if self.shuffle:
             generator = torch.Generator()
             generator.manual_seed(self.seed)
-            self.indices = torch.randperm(len(self.mapping_dataset), generator=generator).tolist()
+            self.indices = torch.randperm(self.size, generator=generator).tolist()
         else:
-            self.indices = list(range(len(self.mapping_dataset)))
+            self.indices = list(range(self.size))
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        """Return the dummy sample at position *idx*."""
+        if idx < 0 or idx >= self.size:
+            raise IndexError(f"Index {idx} out of range [0, {self.size})")
+
+        index = idx + 1
+        input_ids = torch.tensor([index] * index, dtype=torch.long)
+        return {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "labels": input_ids.clone()}
 
     def __iter__(self):
         """Iterate through the dataset in order or shuffled order with rank and worker sharding.
@@ -145,9 +116,9 @@ class DummyIterableDataset(IterableDataset):
             idx = self.indices[i]
             self._current_idx = i + total_workers
             if self.output_refetch_idx:
-                yield (self.mapping_dataset[idx], idx)
+                yield (self[idx], idx)
             else:
-                yield self.mapping_dataset[idx]
+                yield self[idx]
 
     def get_item(self, idx):
         """Fetch a single sample by its original dataset index.
@@ -157,12 +128,12 @@ class DummyIterableDataset(IterableDataset):
         back here one-by-one to rebuild the exact pre-checkpoint buffer.
 
         Args:
-            idx: 0-based integer index into the underlying ``DummyMappingDataset``.
+            idx: 0-based integer index into the dataset.
 
         Returns:
-            Sample as returned by ``DummyMappingDataset.__getitem__``.
+            Sample as returned by ``DummyIterableDataset.__getitem__``.
         """
-        return self.mapping_dataset[idx]
+        return self[idx]
 
     def state_dict(self):
         """Save the current iteration state."""
