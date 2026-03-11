@@ -47,6 +47,7 @@ hardware_support/get_started_npu.md
 :caption: Examples
 
 examples/qwen3.md
+examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
@@ -62,6 +63,13 @@ key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
 key_features/ulysses.md
 
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Design
+
+design/kernel_selection.md
 ```
 
 ```{toctree}

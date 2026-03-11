@@ -48,6 +48,7 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
     "librosa": _is_package_available("librosa"),
     "soundfile": _is_package_available("soundfile"),
     "triton": _is_package_available("triton"),
+    "quack": _is_package_available("quack"),
     "veomni_patch": _is_package_available("veomni_patch"),
 }
 
@@ -72,6 +73,18 @@ def is_fused_moe_available() -> bool:
     import torch
 
     return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
+
+
+def is_quack_package_available() -> bool:
+    """Check if the quack package is installed."""
+    return _PACKAGE_FLAGS["quack"]
+
+
+def is_quack_gemm_available() -> bool:
+    """Check if quack GEMM kernels can run (package installed + SM90+ GPU)."""
+    from .device import is_sm90_or_above
+
+    return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and is_sm90_or_above()
 
 
 def is_video_audio_available() -> bool:

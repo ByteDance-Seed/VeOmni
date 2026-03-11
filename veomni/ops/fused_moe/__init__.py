@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Literal
+
 import torch
 
 from ...utils import logging
 from ...utils.env import get_env
 from ...utils.import_utils import (
     is_fused_moe_available,
+    is_quack_gemm_available,
     is_torch_npu_available,
 )
 
@@ -41,10 +44,10 @@ def fused_moe_forward(
         raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
 
     assert routing_weights.dtype in [torch.bfloat16, torch.float16], (
-        f"routing_weights dtype must be bfloat16 or float16 for triton kernel, but got {routing_weights.dtype}"
+        f"routing_weights dtype must be bfloat16 or float16 for fused MoE kernel, but got {routing_weights.dtype}"
     )
     assert hidden_states.dtype in [torch.bfloat16, torch.float16], (
-        f"hidden_states dtype must be bfloat16 or float16 for triton kernel, but got {hidden_states.dtype}"
+        f"hidden_states dtype must be bfloat16 or float16 for fused MoE kernel, but got {hidden_states.dtype}"
     )
 
     return _fused_moe_forward(
@@ -59,13 +62,33 @@ def fused_moe_forward(
     )
 
 
-def apply_veomni_fused_moe_patch():
+def apply_veomni_fused_moe_patch(
+    moe_implementation: Literal["fused", "fused_quack"] = "fused",
+):
+    """Bind the global ``_fused_moe_forward`` function pointer.
+
+    Args:
+        moe_implementation: Which fused MoE kernel to activate.
+            ``"fused"`` uses the Triton group-gemm kernels (default).
+            ``"fused_quack"`` uses the Quack CUTLASS/CuTe kernels (SM90+).
+            On NPU devices the parameter is ignored and the NPU kernel is
+            always selected.
+    """
     global _fused_moe_forward
     if is_torch_npu_available():
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
-    elif is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
+    elif moe_implementation == "fused_quack":
+        if not is_quack_gemm_available():
+            raise RuntimeError(
+                "moe_implementation='fused_quack' requires the quack package and an SM90+ GPU. "
+                "Please install quack or use moe_implementation='fused'."
+            )
+        from .quack_gemm import quack_gemm_fused_moe_forward
+
+        _fused_moe_forward = quack_gemm_fused_moe_forward
+    elif moe_implementation == "fused" and is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
