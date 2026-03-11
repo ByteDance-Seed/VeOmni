@@ -85,22 +85,19 @@ def list_patch_configs(models_dir: Path = MODELS_DIR) -> list[str]:
     if not models_dir.exists():
         return configs
 
-    for patches_dir in models_dir.rglob("patches"):
-        if not patches_dir.is_dir():
+    for py_file in models_dir.rglob("*_patch_gen_config.py"):
+        if py_file.name.startswith("_"):
             continue
-        for py_file in patches_dir.glob("*.py"):
-            if py_file.name.startswith("_"):
-                continue
-            module_path = py_file.relative_to(VEOMNI_DIR).with_suffix("")
-            module_name = ".".join(("veomni",) + module_path.parts)
-            try:
-                module = importlib.import_module(module_name)
-                if hasattr(module, "config") and isinstance(module.config, PatchConfig):
-                    configs.append(module_name)
-            except ImportError:
-                continue
+        module_path = py_file.relative_to(VEOMNI_DIR).with_suffix("")
+        module_name = ".".join(("veomni",) + module_path.parts)
+        try:
+            module = importlib.import_module(module_name)
+            if hasattr(module, "config") and isinstance(module.config, PatchConfig):
+                configs.append(module_name)
+        except ImportError:
+            continue
 
-    return configs
+    return sorted(configs)
 
 
 def normalize_patch_module(patch_module: str) -> str:
@@ -115,7 +112,7 @@ def default_output_dir_for_module(module: object) -> Path:
     module_path = Path(module.__file__).resolve()
     if module_path.parent.name == "patches":
         return module_path.parent.parent / "generated"
-    return MODULE_DIR / "generated"
+    return module_path.parent / "generated"
 
 
 def print_config_summary(config: PatchConfig) -> None:
@@ -272,6 +269,11 @@ Examples:
         help="List available patch configurations",
     )
     parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Regenerate all patch configurations at once",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be generated without writing files",
@@ -301,9 +303,30 @@ Examples:
             print("  (none found)")
         return 0
 
+    # All mode
+    if args.all:
+        configs = list_patch_configs()
+        if not configs:
+            print("No patch configurations found.", file=sys.stderr)
+            return 1
+        print(f"Regenerating {len(configs)} patch configurations...")
+        all_ok = True
+        for config_module in configs:
+            result = run_codegen(
+                patch_module=config_module,
+                output_dir=None,
+                config_name="config",
+                dry_run=args.dry_run,
+                save_diff=args.diff,
+                verbose=args.verbose,
+            )
+            if result is None:
+                all_ok = False
+        return 0 if all_ok else 1
+
     # Require patch_module for generation
     if not args.patch_module:
-        parser.error("patch_module is required unless using --list")
+        parser.error("patch_module is required unless using --list or --all")
 
     # Run generation
     result = run_codegen(

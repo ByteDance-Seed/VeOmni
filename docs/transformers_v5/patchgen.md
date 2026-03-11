@@ -31,14 +31,15 @@ veomni/
 ├── patchgen/
 │   ├── patch_spec.py              # Patch specification DSL
 │   ├── codegen.py                 # AST-based code generator
-│   └── run_codegen.py             # CLI runner script
+│   ├── run_codegen.py             # CLI runner script
+│   └── check_patchgen.py          # CI consistency check
 └── models/
     └── transformers/
         └── qwen3/
-            ├── patches/
-            │   └── qwen3_gpu_patch_gen_config.py       # Qwen3 GPU patches
+            ├── qwen3_gpu_patch_gen_config.py      # Qwen3 GPU patches
             └── generated/
-                └── patched_modeling_qwen3_gpu.py  # Generated output
+                ├── patched_modeling_qwen3_gpu.py   # Generated output
+                └── patched_modeling_qwen3_gpu.diff  # Unified diff vs HF source
 ```
 
 ## Core Design
@@ -112,7 +113,7 @@ class Qwen3RMSNorm(nn.Module):
 
 ### 1. Create a Patch Configuration
 
-Create a new file under `veomni/models/transformers/qwen3/` (for now we only ship Qwen3):
+Create a new file under `veomni/models/transformers/<model>/` with a `*_patch_gen_config.py` suffix:
 
 ```python
 from veomni.patchgen.patch_spec import PatchConfig
@@ -207,8 +208,7 @@ The generated file includes:
     #  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
     # ==============================================================================
     #  Source: transformers.models.qwen3.modeling_qwen3
-    #  Based on: transformers==4.57.3
-    #  Generated: 2026-01-25T10:30:00
+    #  Based on: transformers==5.2.0
     #
     #  Patches applied:
     #    - class_replacement: Qwen3RMSNorm
@@ -345,7 +345,7 @@ def modified_init(original_init, self, config, layer_idx):
 
 ```
 usage: python -m veomni.patchgen.run_codegen [-h] [-o OUTPUT_DIR] [-c CONFIG_NAME] [--list]
-                      [--dry-run] [--diff] [-v]
+                      [--all] [--dry-run] [--diff] [-v]
                       [patch_module]
 
 positional arguments:
@@ -356,6 +356,7 @@ options:
   -o, --output-dir      Output directory (default: sibling generated/ next to patch module)
   -c, --config-name     Config variable name in the patch module (default: config)
   --list                List available patch configurations
+  --all                 Regenerate all patch configurations at once
   --dry-run             Show what would be generated without writing files
   --diff                Save a unified .diff file alongside generated modeling code
   -v, --verbose         Print detailed progress
@@ -393,6 +394,60 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 | Custom loss                 | Function replacement | cross_entropy        |
 | VLM modifications           | Method override      | Model.forward        |
 
+## CI and Regeneration
+
+### Regenerating All Generated Files
+
+To regenerate all generated modeling files at once:
+
+```bash
+make patchgen
+# or equivalently:
+python -m veomni.patchgen.check_patchgen --fix
+```
+
+This regenerates code from all `*_patch_gen_config.py` files, applies ruff
+formatting, and writes the result to the corresponding `generated/` directory.
+
+### CI Consistency Check
+
+A GitHub Actions workflow (`check_patchgen.yml`) automatically verifies that
+generated files match their patch configs on every PR. The check:
+
+1. Discovers all `*_patch_gen_config.py` files
+2. Regenerates each into a temp file
+3. Runs `ruff format` and `ruff check --fix` on the temp file
+4. Compares the formatted output against the checked-in `.py` file
+5. Compares the regenerated `.diff` file against the checked-in `.diff` file
+6. Fails with a unified diff if any file has drifted
+
+If the check fails after modifying a patch config, run:
+
+```bash
+make patchgen
+```
+
+### Checking Locally
+
+```bash
+make check-patchgen
+```
+
+### Adding a New Model
+
+1. Create `veomni/models/transformers/<model>/<model>_<target>_patch_gen_config.py`
+2. Name the file with the `*_patch_gen_config.py` suffix (required for auto-discovery)
+3. Define a `config` variable of type `PatchConfig`
+4. Generate: `make patchgen`
+5. Commit both the config and the generated file
+6. The CI will automatically include the new config in consistency checks
+
+### Listing All Configs
+
+```bash
+python -m veomni.patchgen.run_codegen --list
+```
+
 ## Limitations
 
 - **Python 3.9+** required (uses `ast.unparse`)
@@ -404,8 +459,8 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 
 To add support for a new model:
 
-1. Create `veomni/models/transformers/<model>/patches/<model>_patches.py`
+1. Create `veomni/models/transformers/<model>/<model>_<target>_patch_gen_config.py`
 1. Define your `PatchConfig` and patches
-1. Test with `python -m veomni.patchgen.run_codegen veomni.models.transformers.<model>.patches.<model>_patches --dry-run`
+1. Test with `python -m veomni.patchgen.run_codegen veomni.models.transformers.<model>.<model>_<target>_patch_gen_config --dry-run`
 1. Generate and verify the output in `veomni/models/transformers/<model>/generated/`
 1. Use `--diff` to review changes against original HF code

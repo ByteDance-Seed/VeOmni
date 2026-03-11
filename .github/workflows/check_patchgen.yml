@@ -1,0 +1,31 @@
+name: Check Patchgen Consistency
+
+on:
+  pull_request:
+    paths:
+      - "veomni/patchgen/**"
+      - "veomni/models/transformers/**"
+      - "pyproject.toml"
+      - "uv.lock"
+  push:
+    branches: [main]
+    paths:
+      - "veomni/patchgen/**"
+      - "veomni/models/transformers/**"
+
+permissions:
+  contents: read
+
+jobs:
+  check-patchgen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --dev
+      - name: Check patchgen consistency
+        run: |
+          uv run --frozen python -m veomni.patchgen.check_patchgen
