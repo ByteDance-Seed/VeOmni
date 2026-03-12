@@ -33,10 +33,7 @@ jobs:
         uses: astral-sh/setup-uv@v6
 
       - name: Install dependencies
-        run: uv sync --no-group transformers-stable --extra transformers5-exp --dev
-
-      - name: Install torch (CPU) for veomni imports
-        run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev
 
       - name: Check patchgen drift
         run: uv run python -m veomni.patchgen.check_patchgen
