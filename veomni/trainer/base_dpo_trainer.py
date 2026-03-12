@@ -146,80 +146,30 @@ class BaseDPOTrainer(BaseTrainer):
             return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
         return (per_token_logps * loss_mask).sum(-1)
 
-    def _concatenate_inputs(self, micro_batch: Dict[str, Any]) -> Tuple[Dict[str, torch.Tensor], int]:
-        """Concatenate chosen and rejected inputs along batch dim for a single forward pass.
-
-        Returns:
-            (concatenated_batch, num_chosen) where num_chosen is the batch size of chosen samples.
-        """
-        chosen_ids = micro_batch["chosen_input_ids"]
-        rejected_ids = micro_batch["rejected_input_ids"]
-
-        if chosen_ids.dim() == 1:
-            chosen_ids = chosen_ids.unsqueeze(0)
-            rejected_ids = rejected_ids.unsqueeze(0)
-            micro_batch["chosen_attention_mask"] = micro_batch["chosen_attention_mask"].unsqueeze(0)
-            micro_batch["rejected_attention_mask"] = micro_batch["rejected_attention_mask"].unsqueeze(0)
-            micro_batch["chosen_labels"] = micro_batch["chosen_labels"].unsqueeze(0)
-            micro_batch["rejected_labels"] = micro_batch["rejected_labels"].unsqueeze(0)
-
-        num_chosen = chosen_ids.shape[0]
-        max_len = max(chosen_ids.shape[1], rejected_ids.shape[1])
-
-        def _pad(tensor: torch.Tensor, length: int, value: int) -> torch.Tensor:
-            if tensor.shape[1] >= length:
-                return tensor
-            pad_size = length - tensor.shape[1]
-            return F.pad(tensor, (0, pad_size), value=value)
-
-        cat_input_ids = torch.cat([_pad(chosen_ids, max_len, 0), _pad(rejected_ids, max_len, 0)], dim=0)
-        cat_attention_mask = torch.cat(
-            [
-                _pad(micro_batch["chosen_attention_mask"], max_len, 0),
-                _pad(micro_batch["rejected_attention_mask"], max_len, 0),
-            ],
-            dim=0,
-        )
-        cat_labels = torch.cat(
-            [
-                _pad(micro_batch["chosen_labels"], max_len, IGNORE_INDEX),
-                _pad(micro_batch["rejected_labels"], max_len, IGNORE_INDEX),
-            ],
-            dim=0,
-        )
-
-        concatenated = {
-            "input_ids": cat_input_ids,
-            "attention_mask": cat_attention_mask,
-            "labels": cat_labels,
-        }
-        return concatenated, num_chosen
-
     def concatenated_forward(self, model: nn.Module, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run a single forward pass on concatenated chosen+rejected inputs.
+        """Run a single forward pass on the pre-concatenated chosen+rejected batch.
+
+        The collator produces ``input_ids`` / ``attention_mask`` / ``labels`` of
+        shape ``[2*B, L]`` where the first B rows are chosen and the last B rows
+        are rejected.  ``preforward`` has already moved all tensors to the correct
+        device before this method is called.
 
         Returns:
-            (chosen_logps, rejected_logps) each of shape (batch_size,).
+            (chosen_logps, rejected_logps) each of shape ``(B,)``.
         """
-        concatenated, num_chosen = self._concatenate_inputs(micro_batch)
-        concatenated = {
-            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in concatenated.items()
-        }
+        num_chosen = micro_batch["input_ids"].shape[0] // 2
 
         outputs = model(
-            input_ids=concatenated["input_ids"],
-            attention_mask=concatenated["attention_mask"],
+            input_ids=micro_batch["input_ids"],
+            attention_mask=micro_batch["attention_mask"],
             use_cache=False,
         )
         all_logits = outputs.logits.float()
 
         average_log_prob = getattr(self.args, "dpo_config", None) and self.args.dpo_config.average_log_prob
-        all_logps = self.get_batch_logps(all_logits, concatenated["labels"], average_log_prob=average_log_prob)
+        all_logps = self.get_batch_logps(all_logits, micro_batch["labels"], average_log_prob=average_log_prob)
 
-        chosen_logps = all_logps[:num_chosen]
-        rejected_logps = all_logps[num_chosen:]
-        return chosen_logps, rejected_logps
+        return all_logps[:num_chosen], all_logps[num_chosen:]
 
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
