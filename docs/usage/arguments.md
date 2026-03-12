@@ -76,6 +76,15 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
 
 ---
 
+## DPO
+
+DPO-specific hyperparameters, accessed via `dpo.*`.  
+Root config: `VeOmniDPOArguments` (extends `VeOmniArguments`).
+
+* `DPOConfig` — `dpo.*`
+
+---
+
 ## Inference
 
 Standalone inference configuration.
@@ -346,3 +355,20 @@ Extends `DataArguments` with multimodal input configs.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
+
+---
+
+## DPO Reference
+
+(dpo-arguments)=
+### DPOConfig
+
+`dpo.*` — Direct Preference Optimization hyperparameters.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| beta | `float` | `0.1` | KL penalty coefficient. Controls deviation from the reference model. |
+| label_smoothing | `float` | `0.0` | Label smoothing for DPO loss. Non-zero values assume noisy preference labels. |
+| reference_free | `bool` | `False` | If `True`, ignore the reference model and use an implicit uniform reference. |
+| loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
+| average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
