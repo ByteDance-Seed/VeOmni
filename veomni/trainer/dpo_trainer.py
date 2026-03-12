@@ -32,7 +32,7 @@ from .base_dpo_trainer import BaseDPOTrainer
 
 logger = helper.create_logger(__name__)
 
-DPO_PAD_VALUES = {
+_DPO_PAD_VALUES = {
     "input_ids": 0,
     "attention_mask": 0,
     "labels": IGNORE_INDEX,
@@ -41,22 +41,26 @@ DPO_PAD_VALUES = {
 
 @dataclass
 class DPOCollator(DataCollator):
-    """Collator for DPO preference data with chosen_*/rejected_* keys.
+    """Collator for DPO preference data.
 
-    Pads and stacks each prefix group independently, producing a single
-    dict with batched tensors for all chosen_* and rejected_* keys.
+    Each sample from the dataset has shape ``[2, L]`` (row 0 = chosen, row 1 =
+    rejected), with standard keys ``input_ids``, ``attention_mask``, ``labels``.
+
+    This collator pads a list of B such samples to a common length and
+    concatenates them along the batch dimension, producing tensors of shape
+    ``[2*B, max_L]``.  The first B rows are chosen, the last B rows are rejected,
+    matching the layout expected by ``BaseDPOTrainer.concatenated_forward``.
     """
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         batch = {}
-        keys = list(features[0].keys())
-        for key in keys:
-            tensors = [f[key] for f in features]
-            suffix = key.split("_", 1)[1] if "_" in key else key
-            pad_value = DPO_PAD_VALUES.get(suffix, 0)
-            max_len = max(t.size(-1) for t in tensors)
-            padded = [F.pad(t, (0, max_len - t.size(-1)), value=pad_value) for t in tensors]
-            batch[key] = torch.stack(padded)
+        for key in features[0].keys():
+            tensors = [f[key] for f in features]  # each [2, L_i]
+            pad_value = _DPO_PAD_VALUES.get(key, 0)
+            max_len = max(t.shape[-1] for t in tensors)
+            padded = [F.pad(t, (0, max_len - t.shape[-1]), value=pad_value) for t in tensors]
+            # cat along dim=0: [2, L], [2, L], ... → [2*B, max_L]
+            batch[key] = torch.cat(padded, dim=0)
         return batch
 
 

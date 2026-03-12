@@ -45,18 +45,13 @@ class DynBszBuffer:
         Append a sample to the buffer.
         Args:
             item: a sample to append to the buffer.
-                The sample should be a dict with the following keys:
-                    - input_ids: torch.Tensor of shape (seq_len, )
-                    - attention_mask: torch.Tensor of shape (seq_len, )
+                The sample should be a dict containing an ``attention_mask`` tensor
+                whose ``.sum()`` gives the number of valid tokens for batching.
         """
         self._buffer.append(item)
-        if "attention_mask" in item:
-            sample_len = item["attention_mask"].sum()
-        elif "chosen_attention_mask" in item:
-            sample_len = item["chosen_attention_mask"].sum() + item["rejected_attention_mask"].sum()
-        else:
-            raise KeyError("Expected 'attention_mask' or 'chosen_attention_mask' in item")
-        self._buffer_sample_lens.append(sample_len)
+        if "attention_mask" not in item:
+            raise KeyError("Expected 'attention_mask' in item")
+        self._buffer_sample_lens.append(item["attention_mask"].sum())
         self.all_token_cnt += self._buffer_sample_lens[-1]
 
     def get_samples(self, n_token_per_iter: int, force: bool = True):
@@ -160,8 +155,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
 
     def put_item(self, item: Dict[str, Any]):
-        ids_key = "input_ids" if "input_ids" in item else "chosen_input_ids"
-        if len(item[ids_key]) == 1:
+        if item["input_ids"].shape[-1] <= 1:
             print("WARNING: EMPTY STRING.")
             return
         self.buffer.append(item)
