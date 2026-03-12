@@ -68,20 +68,22 @@ def apply_dcp_consolidation_patch():
             f"but got {torch.__version__}. Please update the patch or verify compatibility."
         )
 
-    try:
-        import torch.distributed.checkpoint._consolidate_hf_safetensors as hf_module
-    except ImportError:
-        return
+    import torch.distributed.checkpoint._consolidate_hf_safetensors as hf_module
 
     if not hasattr(hf_module, "_process_output_file"):
-        return
+        raise RuntimeError(
+            f"torch.distributed.checkpoint._consolidate_hf_safetensors does not have "
+            f"_process_output_file attribute. Please verify torch {_REQUIRED_TORCH_VERSION}.x compatibility."
+        )
 
     # Define the replacement function logic
+    # This is a modified version of torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
+    # Original: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
+    # Key change: Use append mode ("ab") instead of read-write mode ("r+b") for HDFS FUSE compatibility
     def _process_output_file_impl(output_file, output_data, input_files_data):
-        """Process output file using append mode instead of r+b."""
         sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
 
-        with open(output_file, "ab") as output_stream:
+        with open(output_file, "ab") as output_stream:  # Changed from "r+b"
             for tensor_fqn, tensor_fqn_data in sorted_tensors:
                 full_tensor_mv = memoryview(
                     bytearray(math.prod(tensor_fqn_data.shape_in_file) * tensor_fqn_data.dtype_size)
