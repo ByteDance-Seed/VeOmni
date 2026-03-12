@@ -39,10 +39,8 @@ from .comm import (
 )
 from .data import (
     gather_outputs,
-    sequence_parallel_preprocess,
     slice_input_tensor,
     slice_input_tensor_scale_grad,
-    slice_position_embedding,
     sp_pad_and_slice,
 )
 from .loss import reduce_sequence_parallel_loss
@@ -73,9 +71,7 @@ __all__ = [
     "get_unified_sequence_parallel_world_size",
     "slice_input_tensor",
     "slice_input_tensor_scale_grad",
-    "slice_position_embedding",
     "sp_pad_and_slice",
-    "sequence_parallel_preprocess",
     "gather_heads_scatter_seq",
     "gather_seq_scatter_heads",
     "all_to_all_images",
