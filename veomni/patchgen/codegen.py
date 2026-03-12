@@ -29,6 +29,7 @@ The generated file will:
 import ast
 import importlib
 import inspect
+import re
 import textwrap
 from pathlib import Path
 from typing import Any, Optional
@@ -252,22 +253,14 @@ def strip_patch_decorators(source: str) -> str:
 
     by tracking parenthesis depth until the decorator is fully closed.
     """
+    _PATCH_DECORATOR_RE = re.compile(r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init)\b")
     source_lines = source.splitlines()
     filtered_lines: list[str] = []
     in_patch_decorator = False
     paren_depth = 0
     for line in source_lines:
         stripped = line.strip()
-        if (
-            not in_patch_decorator
-            and stripped.startswith("@")
-            and (
-                "config." in stripped
-                or "replace_class" in stripped
-                or "replace_function" in stripped
-                or "override_method" in stripped
-            )
-        ):
+        if not in_patch_decorator and _PATCH_DECORATOR_RE.match(stripped):
             in_patch_decorator = True
             paren_depth = stripped.count("(") - stripped.count(")")
             if paren_depth <= 0:

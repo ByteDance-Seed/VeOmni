@@ -45,15 +45,22 @@ from .run_codegen import (
 
 
 def _ruff_fix_and_format(path: Path) -> None:
-    """Run ``ruff check --fix`` and ``ruff format`` on *path*."""
+    """Run ``ruff check --fix`` and ``ruff format`` on *path*.
+
+    We pass ``--ignore E402`` because generated files may have imports
+    after non-import code (e.g. ``create_patch_from_external`` inline
+    import aliases) which is unavoidable.  In the real repo this is
+    handled by per-file-ignores in pyproject.toml, but temp files live
+    outside the project tree so the config does not apply.
+    """
     subprocess.run(
-        ["ruff", "check", "--fix", "--quiet", str(path)],
-        check=False,
+        ["ruff", "check", "--fix", "--quiet", "--ignore", "E402", str(path)],
+        check=True,
         capture_output=True,
     )
     subprocess.run(
         ["ruff", "format", "--quiet", str(path)],
-        check=False,
+        check=True,
         capture_output=True,
     )
 
