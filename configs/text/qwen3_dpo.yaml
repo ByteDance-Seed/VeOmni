@@ -48,8 +48,9 @@ train:
     project: VeOmni
     name: Qwen3-0.6B-dpo-ultrafeedback
 
-dpo:
+dpo_config:
   beta: 0.1
   label_smoothing: 0.0
   loss_type: sigmoid
   reference_free: false
+  refer_model_precision: bfloat16

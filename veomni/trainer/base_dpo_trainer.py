@@ -56,7 +56,7 @@ class BaseDPOTrainer(BaseTrainer):
         self.reference_model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
-            torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+            torch_dtype=args.dpo_config.refer_model_precision,
             attn_implementation=args.model.ops_implementation.attn_implementation,
             moe_implementation=args.model.ops_implementation.moe_implementation,
             init_device=args.train.init_device,
@@ -214,7 +214,7 @@ class BaseDPOTrainer(BaseTrainer):
         )
         all_logits = outputs.logits.float()
 
-        average_log_prob = getattr(self.args, "dpo", None) and self.args.dpo.average_log_prob
+        average_log_prob = getattr(self.args, "dpo_config", None) and self.args.dpo_config.average_log_prob
         all_logps = self.get_batch_logps(all_logits, concatenated["labels"], average_log_prob=average_log_prob)
 
         chosen_logps = all_logps[:num_chosen]
@@ -225,7 +225,7 @@ class BaseDPOTrainer(BaseTrainer):
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         args: VeOmniDPOArguments = self.args
-        dpo_config = args.dpo
+        dpo_config = args.dpo_config
 
         micro_batch = self.preforward(micro_batch)
 
