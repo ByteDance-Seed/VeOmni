@@ -269,6 +269,19 @@ def strip_patch_decorators(source: str) -> str:
     return "\n".join(filtered_lines)
 
 
+def _apply_name_map(source: str, name_map: dict[str, str] | None) -> str:
+    """Apply text substitutions from *name_map* to *source*.
+
+    Keys are sorted by descending length so that longer prefixes are replaced
+    first (e.g. ``Qwen3_5Moe`` before ``Qwen3_5``).
+    """
+    if not name_map:
+        return source
+    for old, new in sorted(name_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+        source = source.replace(old, new)
+    return source
+
+
 class ModelingCodeGenerator:
     """
     Main code generator class that applies patches and generates output.
@@ -456,6 +469,7 @@ class ModelingCodeGenerator:
             if replacement_source:
                 # Rename the class to match original using simple text replacement
                 replacement_source = textwrap.dedent(replacement_source)
+                replacement_source = _apply_name_map(replacement_source, patch.name_map)
                 # Remove the patch decorator lines if present (handles multi-line decorators)
                 replacement_source = strip_patch_decorators(replacement_source)
 
@@ -510,6 +524,7 @@ class ModelingCodeGenerator:
 
         # Dedent and clean up the replacement source
         replacement_source = textwrap.dedent(replacement_source)
+        replacement_source = _apply_name_map(replacement_source, patch.name_map)
 
         # Remove the patch decorator lines if present (handles multi-line decorators)
         cleaned_replacement_source = strip_patch_decorators(replacement_source)
@@ -585,6 +600,7 @@ class ModelingCodeGenerator:
             replacement_source = get_object_source(patch.replacement)
             if replacement_source:
                 replacement_source = textwrap.dedent(replacement_source)
+                replacement_source = _apply_name_map(replacement_source, patch.name_map)
 
                 # Remove the patch decorator lines if present (handles multi-line decorators)
                 replacement_source = strip_patch_decorators(replacement_source)

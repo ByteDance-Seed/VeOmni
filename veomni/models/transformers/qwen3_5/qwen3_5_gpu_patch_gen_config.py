@@ -18,8 +18,8 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5/generated --diff
 
 Language-model focused patches from qwen3_next example:
-1. Disable use_cache when gradient checkpointing is enabled.
-2. Slice RoPE position embeddings for sequence parallel.
+1. Device-agnostic GatedDeltaNet init and varlen FLA forward.
+2. DecoderLayer forward with cu_seq_lens_q passthrough.
 3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
 """
 
@@ -28,13 +28,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Config,
     Qwen3_5DynamicCache,
-    Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
     apply_mask_to_padding_states,
     torch_chunk_gated_delta_rule,
@@ -442,84 +439,6 @@ def qwen3_5_decoder_layer_forward_patched(
     hidden_states = self.mlp(hidden_states)
     hidden_states = residual + hidden_states
     return hidden_states
-
-
-@config.override_method("Qwen3_5TextModel.forward", description="Support SP in Qwen3_5TextModel.forward")
-def qwen3_5_text_model_forward_patched(
-    self,
-    input_ids: torch.LongTensor | None = None,
-    attention_mask: torch.Tensor | None = None,
-    position_ids: torch.LongTensor | None = None,
-    past_key_values: Cache | None = None,
-    inputs_embeds: torch.FloatTensor | None = None,
-    use_cache: bool | None = None,
-    cache_position: torch.LongTensor | None = None,
-    **kwargs: Unpack[TransformersKwargs],
-) -> BaseModelOutputWithPast:
-    if (input_ids is None) ^ (inputs_embeds is not None):
-        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-    if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids)
-
-    if self.gradient_checkpointing and self.training and use_cache:
-        logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
-        use_cache = False
-
-    if use_cache and past_key_values is None:
-        past_key_values = Qwen3_5DynamicCache(config=self.config)
-
-    if cache_position is None:
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-        )
-
-    # mrope: the hard coded `3` is for temporal, height and width.
-    if position_ids is None:
-        position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-    elif position_ids.ndim == 2:
-        position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-
-    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-        text_position_ids = position_ids[0]
-        position_ids = position_ids[1:]
-    else:
-        text_position_ids = position_ids[0]
-
-    causal_mask = create_causal_mask(
-        config=self.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        cache_position=cache_position,
-        past_key_values=past_key_values,
-        position_ids=text_position_ids,
-    )
-    linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
-
-    hidden_states = inputs_embeds
-    position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-        layer_mask = linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
-
-        hidden_states = decoder_layer(
-            hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=layer_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-    hidden_states = self.norm(hidden_states)
-
-    return Qwen3_5ModelOutputWithPast(
-        last_hidden_state=hidden_states,
-        past_key_values=past_key_values,
-    )
 
 
 @config.override_method(

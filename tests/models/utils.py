@@ -25,9 +25,8 @@ class ModelMode:
 
 # HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
 # On NPU skip FA3.
-_HF_ATTN = ["eager", "flash_attention_2", "flash_attention_3"]
+_HF_ATTN = ["flash_attention_2", "flash_attention_3"]
 _VEOMNI_ATTN = [
-    "eager",
     "veomni_flash_attention_2_with_sp",
     "veomni_flash_attention_3_with_sp",
 ]
@@ -135,50 +134,45 @@ def parse_token_id_from_config(model_config):
     return token_ids_dict
 
 
+def _to_feature_dict(example: list, token_ids_dict: dict) -> dict:
+    """Convert dataset item to feature dict for MainCollator (no batch dim, no precomputed cu_seqlens)."""
+    example = example[0]
+    example = {key: (v.clone() if isinstance(v, torch.Tensor) else torch.tensor(v)) for key, v in example.items()}
+
+    if "image_mask" in example and "image_token_id" in token_ids_dict:
+        example["input_ids"] = example["input_ids"].masked_fill(
+            example["image_mask"], token_ids_dict["image_token_id"]
+        )
+    if "video_mask" in example and "video_token_id" in token_ids_dict:
+        example["input_ids"] = example["input_ids"].masked_fill(
+            example["video_mask"], token_ids_dict["video_token_id"]
+        )
+    if "audio_mask" in example and "audio_token_id" in token_ids_dict:
+        example["input_ids"] = example["input_ids"].masked_fill(
+            example["audio_mask"], token_ids_dict["audio_token_id"]
+        )
+
+    return example
+
+
 def prepare_data(model_name: str, max_seq_len: int, model_config):
+    """
+    Build a DummyDataLoader that yields raw features (list of 2 dicts).
+    MainCollator packing + cu_seqlens precompute is done in the trainer (TrainerTest).
+    """
     dataset_name = MODEL_TO_DATASET.get(model_name, "text")
-    dataset = build_dummy_dataset(dataset_name, 1, max_seq_len)
+    dataset = build_dummy_dataset(dataset_name, 2, max_seq_len)
 
     token_ids_dict = parse_token_id_from_config(model_config)
 
     class DummyDataLoader:
-        def process(self, example):
-            example = example[0]
-            example = {key: torch.tensor(v) for key, v in example.items()}
-            for key in UNSQUEECE_KEYS:
-                if key not in example:
-                    continue
-                example[key] = example[key].unsqueeze(0)
-
-            if "image_mask" in example:
-                example["input_ids"].masked_fill_(example["image_mask"], token_ids_dict["image_token_id"])
-            if "video_mask" in example:
-                example["input_ids"].masked_fill_(example["video_mask"], token_ids_dict["video_token_id"])
-            if "audio_mask" in example:
-                example["input_ids"].masked_fill_(example["audio_mask"], token_ids_dict["audio_token_id"])
-
-            if example["position_ids"].dim() == 3:
-                example["position_ids"] = example["position_ids"].transpose(0, 1).contiguous()
-
-            # NOTE: position_ids mode (args.rmpad_with_pos_ids=True)
-            # requires cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k as input to avoid
-            # recomputing them in the forward pass (which causes device-to-host sync that kills performance).
-            # For models with linear attention like Qwen3.5, we also assert the presence of
-            # cu_seq_lens_q to make sure the linear attention layer ops like causal_conv1d can properly handle
-            # the sequence packing case.
-            if "position_ids" in example:
-                seq_len = example["position_ids"].shape[-1]
-                cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
-                example["cu_seq_lens_q"] = cu_seqlens
-                example["cu_seq_lens_k"] = cu_seqlens
-                example["max_length_q"] = seq_len
-                example["max_length_k"] = seq_len
-
-            return example
-
         def __iter__(self):
             set_seed(42)
-            yield self.process(dataset[0])
+            features = [
+                _to_feature_dict(dataset[0], token_ids_dict),
+                _to_feature_dict(dataset[1], token_ids_dict),
+            ]
+            yield features
 
     return DummyDataLoader()
 
