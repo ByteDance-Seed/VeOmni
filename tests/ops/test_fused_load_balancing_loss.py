@@ -20,6 +20,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     load_balancing_loss_func as _reference_load_balancing_loss,
 )
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+
 
 # (num_experts, top_k, num_layers, batch_size, seq_len)
 _CONFIGS = [
@@ -30,9 +32,11 @@ _CONFIGS = [
     (128, 4, 32, 1, 8192),
 ]
 
+_DEVICE = get_device_type()
+
 
 def _skip_no_cuda():
-    if not torch.cuda.is_available():
+    if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA not available")
 
 
@@ -44,16 +48,17 @@ def _get_triton_impl():
 
 def _make_gate_logits(batch_size, seq_len, num_experts, num_layers):
     N = batch_size * seq_len
-    return tuple(torch.randn(N, num_experts, device="cuda", dtype=torch.float32) for _ in range(num_layers))
+    return tuple(torch.randn(N, num_experts, device=_DEVICE, dtype=torch.float32) for _ in range(num_layers))
 
 
 def _measure_peak_memory(fn):
-    """Run fn after resetting CUDA peak memory stats and return peak memory in bytes."""
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
+    """Run fn after resetting peak memory stats and return peak memory in bytes."""
+    dev = get_torch_device()
+    dev.reset_peak_memory_stats()
+    dev.synchronize()
     fn()
-    torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated()
+    dev.synchronize()
+    return dev.max_memory_allocated()
 
 
 class TestFusedLoadBalancingLoss:
@@ -67,15 +72,15 @@ class TestFusedLoadBalancingLoss:
     def test_non_tuple_input(self):
         _skip_no_cuda()
         triton_fn = _get_triton_impl()
-        logits = torch.randn(32, 8, device="cuda")
+        logits = torch.randn(32, 8, device=_DEVICE)
         assert triton_fn(logits, 8, 2) == 0
 
     def test_forward_full_mask(self):
         """All tokens masked out should return 0 in the Triton implementation."""
         _skip_no_cuda()
         triton_fn = _get_triton_impl()
-        gate_logits = tuple(torch.randn(8, 4, device="cuda") for _ in range(2))
-        attention_mask = torch.zeros(2, 4, device="cuda")
+        gate_logits = tuple(torch.randn(8, 4, device=_DEVICE) for _ in range(2))
+        attention_mask = torch.zeros(2, 4, device=_DEVICE)
 
         out = triton_fn(gate_logits, 4, 2, attention_mask)
         assert out.item() == pytest.approx(0.0, abs=1e-6)
@@ -100,7 +105,7 @@ class TestFusedLoadBalancingLoss:
 
         torch.manual_seed(123)
         gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
-        attention_mask = torch.ones(batch_size, seq_len, device="cuda")
+        attention_mask = torch.ones(batch_size, seq_len, device=_DEVICE)
         attention_mask[:, seq_len // 2 :] = 0
 
         ref = _reference_load_balancing_loss(gate_logits, num_experts, top_k, attention_mask)
@@ -117,7 +122,7 @@ class TestFusedLoadBalancingLoss:
         torch.manual_seed(99)
         N = batch_size * seq_len
         gate_logits_ref = tuple(
-            torch.randn(N, num_experts, device="cuda", dtype=torch.float32, requires_grad=True)
+            torch.randn(N, num_experts, device=_DEVICE, dtype=torch.float32, requires_grad=True)
             for _ in range(num_layers)
         )
         ref_loss = _reference_load_balancing_loss(gate_logits_ref, num_experts, top_k)
@@ -141,11 +146,11 @@ class TestFusedLoadBalancingLoss:
 
         torch.manual_seed(77)
         N = batch_size * seq_len
-        attention_mask = torch.ones(batch_size, seq_len, device="cuda")
+        attention_mask = torch.ones(batch_size, seq_len, device=_DEVICE)
         attention_mask[:, seq_len // 2 :] = 0
 
         gate_logits_ref = tuple(
-            torch.randn(N, num_experts, device="cuda", dtype=torch.float32, requires_grad=True)
+            torch.randn(N, num_experts, device=_DEVICE, dtype=torch.float32, requires_grad=True)
             for _ in range(num_layers)
         )
         ref_loss = _reference_load_balancing_loss(gate_logits_ref, num_experts, top_k, attention_mask)
@@ -171,9 +176,9 @@ class TestFusedLoadBalancingLoss:
         gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
 
         # Warm-up triton compilation
-        _warmup = tuple(torch.randn(16, num_experts, device="cuda") for _ in range(2))
+        _warmup = tuple(torch.randn(16, num_experts, device=_DEVICE) for _ in range(2))
         triton_fn(_warmup, num_experts, top_k)
-        torch.cuda.synchronize()
+        get_torch_device().synchronize()
 
         ref_mem = _measure_peak_memory(lambda: _reference_load_balancing_loss(gate_logits, num_experts, top_k))
         triton_mem = _measure_peak_memory(lambda: triton_fn(gate_logits, num_experts, top_k))
