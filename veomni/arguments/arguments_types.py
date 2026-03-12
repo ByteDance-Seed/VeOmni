@@ -874,13 +874,17 @@ class DPOConfig:
         default=False,
         metadata={"help": "If True, average log probs per token instead of summing."},
     )
+    refer_model_precision: Literal["float32", "bfloat16"] = field(
+        default="bfloat16",
+        metadata={"help": "Precision of the reference model."},
+    )
 
 
 @dataclass
 class VeOmniDPOArguments(VeOmniArguments):
     """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters."""
 
-    dpo: DPOConfig = field(default_factory=DPOConfig)
+    dpo_config: DPOConfig = field(default_factory=DPOConfig)
 
 
 # ================================ Infer Arguments ======================================

@@ -78,10 +78,10 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
 
 ## DPO
 
-DPO-specific hyperparameters, accessed via `dpo.*`.  
+DPO-specific hyperparameters, accessed via `dpo_config.*`.  
 Root config: `VeOmniDPOArguments` (extends `VeOmniArguments`).
 
-* `DPOConfig` — `dpo.*`
+* `DPOConfig` — `dpo_config.*`
 
 ---
 
@@ -363,7 +363,7 @@ Extends `DataArguments` with multimodal input configs.
 (dpo-arguments)=
 ### DPOConfig
 
-`dpo.*` — Direct Preference Optimization hyperparameters.
+`dpo_config.*` — Direct Preference Optimization hyperparameters.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -372,3 +372,4 @@ Extends `DataArguments` with multimodal input configs.
 | reference_free | `bool` | `False` | If `True`, ignore the reference model and use an implicit uniform reference. |
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
+| refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
