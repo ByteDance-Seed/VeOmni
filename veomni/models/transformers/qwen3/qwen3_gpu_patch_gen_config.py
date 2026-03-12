@@ -24,8 +24,6 @@ This file itself is not runnable. It's used to generate the runnable explicitly 
 "generated/patched_modeling_qwen3_gpu.py".
 """
 
-from typing import Optional
-
 import torch
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -37,7 +35,7 @@ from transformers.modeling_outputs import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
 
 
 config = PatchConfig(
@@ -48,44 +46,44 @@ config = PatchConfig(
 
 config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3RMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNorm",
-        description="Use LigerKernel RMSNorm",
-    )
-)
+# config.patches.append(
+#     create_patch_from_external(
+#         target="Qwen3RMSNorm",
+#         replacement_module="liger_kernel.transformers.rms_norm",
+#         replacement_name="LigerRMSNorm",
+#         description="Use LigerKernel RMSNorm",
+#     )
+# )
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3MLP",
-        replacement_module="liger_kernel.transformers.swiglu",
-        replacement_name="LigerSwiGLUMLP",
-        description="Use LigerKernel SwiGLU MLP",
-    )
-)
+# config.patches.append(
+#     create_patch_from_external(
+#         target="Qwen3MLP",
+#         replacement_module="liger_kernel.transformers.swiglu",
+#         replacement_name="LigerSwiGLUMLP",
+#         description="Use LigerKernel SwiGLU MLP",
+#     )
+# )
 
 
-@config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
-def apply_rotary_pos_emb_liger(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
+# @config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
+# def apply_rotary_pos_emb_liger(
+#     q: torch.Tensor,
+#     k: torch.Tensor,
+#     cos: torch.Tensor,
+#     sin: torch.Tensor,
+#     position_ids: Optional[torch.Tensor] = None,
+#     unsqueeze_dim: int = 1,
+# ) -> tuple[torch.Tensor, torch.Tensor]:
+#     from liger_kernel.transformers.rope import liger_rotary_pos_emb
 
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+#     return liger_rotary_pos_emb(
+#         q,
+#         k,
+#         cos,
+#         sin,
+#         position_ids=position_ids,
+#         unsqueeze_dim=unsqueeze_dim,
+#     )
 
 
 @config.override_method("Qwen3Model.forward", description="Support SP in Qwen3Model.forward")

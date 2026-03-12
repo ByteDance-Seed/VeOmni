@@ -14,6 +14,7 @@
 
 
 import functools
+import pathlib
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
@@ -27,7 +28,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from ..utils.import_utils import is_transformers_version_greater_or_equal_to
-from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
+from .loader import LIGER_KERNEL_MAPPING_REGISTRY, BaseModelLoader, get_loader, get_model_config, get_model_processor
 
 
 if TYPE_CHECKING:
@@ -58,6 +59,52 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
+def _build_liger_kernel_mapping(kernel_mapping: Dict[str, Dict[str, str]]) -> Dict:
+    """
+    Build a kernels-library compatible mapping from the KERNEL_MAPPING registry entries.
+
+    Each entry specifies a ``type`` ("layer" or "func"), a ``module`` (dotted Python module path),
+    and a ``name`` (class or function name within that module).
+
+    For "layer" entries, a ``LocalLayerRepository`` is created.
+    For "func" entries, a ``LocalFuncRepository`` is created.
+
+    Returns a dict suitable for ``use_kernel_mapping``, e.g.::
+
+        {
+            "RMSNorm": {"cuda": LocalLayerRepository(...)},
+            "rotary_pos_emb": {"cuda": LocalFuncRepository(...)},
+        }
+    """
+    import importlib
+
+    from kernels import LocalFuncRepository, LocalLayerRepository
+
+    resolved = {}
+    for entry_name, entry in kernel_mapping.items():
+        entry_type = entry["type"]
+        module_path = entry["module"]
+        name = entry["name"]
+
+        mod = importlib.import_module(module_path)
+        mod_file = pathlib.Path(mod.__file__)
+        repo_path = mod_file.parent
+        # Packages (__init__.py) use the directory name; plain modules use the file stem.
+        package_name = mod_file.parent.name if mod_file.name == "__init__.py" else mod_file.stem
+
+        if entry_type == "layer":
+            repo = LocalLayerRepository(repo_path=repo_path, package_name=package_name, layer_name=name)
+        elif entry_type == "func":
+            repo = LocalFuncRepository(repo_path=repo_path, package_name=package_name, func_name=name)
+        else:
+            raise ValueError(f"Unknown kernel mapping type '{entry_type}' for entry '{entry_name}'")
+
+        logger.info_rank0(f"Resolved kernel mapping '{entry_name}' ({entry_type}): {module_path}.{name} -> {repo}")
+        resolved[entry_name] = {"cuda": repo}
+
+    return resolved
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
@@ -80,6 +127,7 @@ def build_foundation_model(
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
+    use_liger: bool = False,
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -165,6 +213,30 @@ def build_foundation_model(
         init_device=init_device,
     )
 
+    # Build and apply liger kernel mapping if use_liger is enabled
+    if use_liger:
+        logger.info_rank0("use_liger is enabled, attempting to build Liger kernel mapping...")
+
+        model_type = config.model_type
+        if model_type in LIGER_KERNEL_MAPPING_REGISTRY.valid_keys():
+            kernel_mapping = LIGER_KERNEL_MAPPING_REGISTRY[model_type]()
+            resolved_mapping = _build_liger_kernel_mapping(kernel_mapping)
+            logger.info_rank0(f"Liger kernel mapping for {model_type}: {resolved_mapping}")
+
+            from kernels import Mode, kernelize, use_kernel_mapping
+
+            mode = Mode.TRAINING if model.training else Mode.INFERENCE
+            with use_kernel_mapping(resolved_mapping, inherit_mapping=False):
+                kernelize(model, mode=mode, device="cuda")
+            model._use_kernels = True
+
+            logger.info_rank0("Setup Liger kernels completed.")
+        else:
+            logger.warning_rank0(
+                f"use_liger=True but no liger kernel mapping registered for model type '{model_type}'. "
+                f"Available: {LIGER_KERNEL_MAPPING_REGISTRY.valid_keys()}"
+            )
+
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
         # due to the behavior in https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/fsdp/_fully_shard/_fsdp_state.py#L130
@@ -183,7 +255,7 @@ def build_foundation_model(
 
         model.forward = wrapped_forward
 
-    if is_transformers_version_greater_or_equal_to("5.0.0"):
+    if is_transformers_version_greater_or_equal_to("5.0.0") and not use_liger:
         assert not getattr(model, "use_kernels", False), (
             "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "
             "to avoid unexpected kernel loading side effects."

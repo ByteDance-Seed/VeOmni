@@ -562,6 +562,10 @@ class OpsImplementationConfig:
             "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
         },
     )
+    use_liger: bool = field(
+        default=False,
+        metadata={"help": "Whether to use Liger kernel optimizations (e.g., fused RMSNorm, SwiGLU, RoPE)."},
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":

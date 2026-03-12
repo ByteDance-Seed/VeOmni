@@ -1000,6 +1000,21 @@ wheels = [
 ]
 
 [[package]]
+name = "kernels"
+version = "0.12.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "huggingface-hub", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-fa4' or extra == 'extra-6-veomni-transformers5-exp' or extra != 'group-6-veomni-transformers-stable' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "packaging" },
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a9/07/d2b635e965b232cae1aa873c6e0458947196be8dca7bb02e64d3cd6e8d19/kernels-0.12.2.tar.gz", hash = "sha256:812fc43c2814f046cee655cbebf3918cddd489715773670bdb38cca3f5203b5b", size = 57108, upload-time = "2026-03-04T10:03:00.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/be/f5d6758b48633e4f6a28198fcf4bf9f763cc6a82e2335d9fe8802a5cb440/kernels-0.12.2-py3-none-any.whl", hash = "sha256:1289261804748cf3cf8e3afab80b505b0f1b28e4ec88379cdf08dc31e64964b8", size = 55205, upload-time = "2026-03-04T10:02:59.305Z" },
+]
+
+[[package]]
 name = "lark"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3007,6 +3022,7 @@ dependencies = [
     { name = "datasets" },
     { name = "diffusers" },
     { name = "einops" },
+    { name = "kernels" },
     { name = "packaging" },
     { name = "psutil" },
     { name = "setuptools" },
@@ -3127,6 +3143,7 @@ requires-dist = [
     { name = "flash-attn-4", marker = "extra == 'fa4'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=7fd16f28bffe71c9ab6b7eecc5dd14bf87c1dc9e" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
     { name = "hf-transfer", marker = "extra == 'gpu'" },
+    { name = "kernels", specifier = "==0.12.2" },
     { name = "librosa", marker = "extra == 'audio'", specifier = ">=0.11.0,<0.12" },
     { name = "librosa", marker = "extra == 'video'", specifier = ">=0.11.0,<0.12" },
     { name = "liger-kernel", marker = "extra == 'gpu'" },

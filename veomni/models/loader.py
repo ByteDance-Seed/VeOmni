@@ -55,6 +55,7 @@ else:
 MODELING_REGISTRY = Registry("Modeling")
 MODEL_CONFIG_REGISTRY = Registry("ModelConfig")
 MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
+LIGER_KERNEL_MAPPING_REGISTRY = Registry("LigerKernelMapping")
 
 logger = logging.get_logger(__name__)
 
