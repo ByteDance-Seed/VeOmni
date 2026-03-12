@@ -35,6 +35,7 @@ dependencies = [
   "wandb",
   "setuptools",
   "einops>=0.8.1",
+  "kernels==0.12.2",
 ]
 
 [project.optional-dependencies]

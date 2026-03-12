@@ -127,6 +127,7 @@ class VLMTrainer:
             init_device=args.train.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+            use_liger=args.model.ops_implementation.use_liger,
         )
         self.base.model_config = self.base.model.config
 
