@@ -1,15 +1,20 @@
 # DPO training with trl-lib/ultrafeedback_binarized (same dataset as HuggingFace TRL's DPO example)
 #
-# Step 1 - Prepare data:
-#   python scripts/prepare_ultrafeedback.py --output_dir data/ultrafeedback_binarized
+# Step 1 - Download model:
+#   python scripts/download_hf_model.py --repo_id Qwen/Qwen3-0.6B --local_dir .
+#   # saves to ./Qwen3-0.6B
+#
+# Step 2 - Prepare data:
+#   python scripts/download_hf_data.py --repo_id trl-lib/ultrafeedback_binarized \
+#       --local_dir ./ultrafeedback_binarized --allow_patterns "*.parquet"
 
 model:
-  model_path: /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B
+  model_path: ./Qwen3-0.6B
   ops_implementation:
     attn_implementation: flash_attention_2
 
 data:
-  train_path: /mnt/hdfs/veomni/dataset/ultrafeedback_binarized
+  train_path: ./ultrafeedback_binarized
   data_type: dpo
   chat_template: chatml
   max_seq_len: 2048
