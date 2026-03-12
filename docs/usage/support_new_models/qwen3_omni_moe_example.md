@@ -215,7 +215,6 @@ class YourModelExperts(nn.Module):
 
     def forward(self, hidden_states, routing_weights, selected_experts, num_experts):
         return fused_moe_forward(
-            module=self,
             num_experts=num_experts,
             routing_weights=routing_weights,
             selected_experts=selected_experts,
