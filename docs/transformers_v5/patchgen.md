@@ -31,14 +31,17 @@ veomni/
 ├── patchgen/
 │   ├── patch_spec.py              # Patch specification DSL
 │   ├── codegen.py                 # AST-based code generator
-│   └── run_codegen.py             # CLI runner script
+│   ├── run_codegen.py             # CLI runner script
+│   └── check_patchgen.py          # CI check for generated file drift
 └── models/
     └── transformers/
         └── qwen3/
+            ├── qwen3_gpu_patch_gen_config.py      # Qwen3 GPU patch config
             ├── patches/
-            │   └── qwen3_gpu_patch_gen_config.py       # Qwen3 GPU patches
+            │   └── qwen3_gpu_patches.py           # Qwen3 GPU patch implementations
             └── generated/
-                └── patched_modeling_qwen3_gpu.py  # Generated output
+                ├── patched_modeling_qwen3_gpu.py   # Generated output
+                └── patched_modeling_qwen3_gpu.diff # Unified diff vs original
 ```
 
 ## Core Design
@@ -208,7 +211,6 @@ The generated file includes:
     # ==============================================================================
     #  Source: transformers.models.qwen3.modeling_qwen3
     #  Based on: transformers==4.57.3
-    #  Generated: 2026-01-25T10:30:00
     #
     #  Patches applied:
     #    - class_replacement: Qwen3RMSNorm
@@ -345,7 +347,7 @@ def modified_init(original_init, self, config, layer_idx):
 
 ```
 usage: python -m veomni.patchgen.run_codegen [-h] [-o OUTPUT_DIR] [-c CONFIG_NAME] [--list]
-                      [--dry-run] [--diff] [-v]
+                      [--all] [--dry-run] [--diff] [-v]
                       [patch_module]
 
 positional arguments:
@@ -356,10 +358,62 @@ options:
   -o, --output-dir      Output directory (default: sibling generated/ next to patch module)
   -c, --config-name     Config variable name in the patch module (default: config)
   --list                List available patch configurations
+  --all                 Regenerate all discovered patch configs at once
   --dry-run             Show what would be generated without writing files
   --diff                Save a unified .diff file alongside generated modeling code
   -v, --verbose         Print detailed progress
 ```
+
+## CI and Regeneration
+
+Generated files are checked into the repo and guarded by CI to prevent drift.
+
+### Regenerating all configs
+
+```bash
+# Regenerate all configs at once (writes .py and .diff files)
+python -m veomni.patchgen.run_codegen --all --diff
+
+# Or use the Makefile shortcut
+make patchgen
+```
+
+### CI check
+
+The `check_patchgen.yml` workflow runs on PRs that touch `veomni/patchgen/**`, `veomni/models/transformers/**`, `pyproject.toml`, or `uv.lock`. It:
+
+1. Discovers all `*_patch_gen_config.py` files
+2. Regenerates each config to a temp file
+3. Runs `ruff check --fix` and `ruff format` on the output
+4. Compares against checked-in `.py` and `.diff` files
+5. Fails with a unified diff if there is any drift
+
+### Checking locally
+
+```bash
+# Check for drift (exits 1 on mismatch)
+python -m veomni.patchgen.check_patchgen
+
+# Or use the Makefile shortcut
+make check-patchgen
+
+# Fix drift by overwriting checked-in files
+python -m veomni.patchgen.check_patchgen --fix
+```
+
+### Listing configs
+
+```bash
+python -m veomni.patchgen.run_codegen --list
+```
+
+### Adding a new model
+
+1. Create `veomni/models/transformers/<model>/<model>_gpu_patch_gen_config.py` at the model root
+2. Define your `PatchConfig` and patches
+3. Run `python -m veomni.patchgen.run_codegen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --diff -v`
+4. Verify the generated output in `veomni/models/transformers/<model>/generated/`
+5. Run `python -m veomni.patchgen.check_patchgen` to confirm CI will pass
 
 ## Background: Why Not Monkey Patching?
 
@@ -404,8 +458,9 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 
 To add support for a new model:
 
-1. Create `veomni/models/transformers/<model>/patches/<model>_patches.py`
+1. Create `veomni/models/transformers/<model>/<model>_gpu_patch_gen_config.py` at the model root
 1. Define your `PatchConfig` and patches
-1. Test with `python -m veomni.patchgen.run_codegen veomni.models.transformers.<model>.patches.<model>_patches --dry-run`
+1. Test with `python -m veomni.patchgen.run_codegen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --dry-run`
 1. Generate and verify the output in `veomni/models/transformers/<model>/generated/`
 1. Use `--diff` to review changes against original HF code
+1. Run `make check-patchgen` to ensure CI will pass
