@@ -23,6 +23,7 @@ data:
   height: 1024
   width: 768
   datasets_repeat: 10
+  dyn_bsz_buffer_size: 200
 
 train:
   accelerator:
@@ -38,7 +39,6 @@ train:
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
-  dyn_bsz_buffer_size: 200
   optimizer:
     type: adamw
     lr: 1.0e-4
