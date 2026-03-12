@@ -1,0 +1,39 @@
+name: Check Patchgen Drift
+
+on:
+  pull_request:
+    paths:
+      - "veomni/patchgen/**"
+      - "veomni/models/transformers/**"
+      - "pyproject.toml"
+      - "uv.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - "veomni/patchgen/**"
+      - "veomni/models/transformers/**"
+      - "pyproject.toml"
+      - "uv.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  check_patchgen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-python@v3
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --no-group transformers-stable --extra transformers5-exp --dev
+
+      - name: Check patchgen drift
+        run: uv run python -m veomni.patchgen.check_patchgen
