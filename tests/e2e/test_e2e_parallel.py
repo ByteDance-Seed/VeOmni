@@ -18,7 +18,7 @@ _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with t
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
 
 
-def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
+def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
@@ -27,7 +27,7 @@ def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
         moe_implementation="eager",
         init_device=get_device_type(),
     )
-    model.save_pretrained(output_path)
+    model.save_pretrained(output_path, save_original_format=save_original_format)
 
 
 def main(
@@ -43,7 +43,13 @@ def main(
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
-    _materialize_weights_dir(config_path, test_path)
+    # Qwen3_5Moe uses stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I])
+    # which is also the native HF safetensor format for this model. HF's save_pretrained() with
+    # save_original_format=True calls revert_weight_conversion() that splits them into per-expert
+    # keys (experts.*.gate_proj.weight, etc.), but VeOmni's load_model_weights doesn't apply the
+    # reverse merge. Disable save_original_format for qwen3_5_moe to save in native stacked format.
+    save_original_format = model_name != "qwen3_5_moe"
+    _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
 
     test_tasks = [task_name]
     command_list = prepare_exec_cmd(
@@ -142,9 +148,18 @@ text_test_cases = [
         False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # TODO: remove max_sp_size limit once we support SP in qwen3_5.
-        # In addition, since SP is limited, there is only one test case now so nothing is compared.
-        1,  # max_sp_size
+        None,  # max_sp_size
+        marks=_v5_only,
+    ),
+    # TODO: we only support text input now. move this to VLM test once vision input is supported.
+    pytest.param(
+        "qwen3_5_moe",
+        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        # TODO: Test with EP once Merged fc1_1_2_weight is supported with expert parallelism.
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
         marks=_v5_only,
     ),
 ]

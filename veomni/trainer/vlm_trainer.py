@@ -145,7 +145,11 @@ class VLMTrainer:
 
         if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.model.thinker.audio_tower.requires_grad_(False)
-            self.base.model.thinker.audio_tower.proj.requires_grad_(True)
+            # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
+            audio_proj = (
+                getattr(self.base.model.thinker.audio_tower, "proj1", None) or self.base.model.thinker.audio_tower.proj
+            )
+            audio_proj.requires_grad_(True)
 
         pretty_print_trainable_parameters(self.base.model)
         helper.print_device_mem_info("VRAM usage after building model")

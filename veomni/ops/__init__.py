@@ -42,11 +42,11 @@ def apply_ops_patch():
     else:
         from .flash_attn import apply_veomni_attention_patch
         from .fused_cross_entropy import apply_veomni_loss_patch
-        from .fused_moe import apply_veomni_fused_moe_patch
 
         apply_veomni_attention_patch()
         apply_veomni_loss_patch()
-        apply_veomni_fused_moe_patch()
+        # NOTE: fused MoE patch is applied in build_foundation_model() based on
+        # the moe_implementation parameter, not at import time.
         logger.info_rank0("✅ VeOmni ops patch applied.")
 
 

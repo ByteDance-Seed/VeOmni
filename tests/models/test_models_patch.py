@@ -8,6 +8,7 @@ import torch
 
 from veomni import _apply_patches
 from veomni.arguments import CheckpointConfig, DataArguments, ModelArguments, TrainingArguments
+from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
@@ -65,7 +66,17 @@ class TrainerTest(BaseTrainer):
         pass
 
     def _build_collate_fn(self):
-        pass
+        data_collate_info = {}
+        if self.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            data_collate_info = {
+                "audio_feature_lengths": (0, False, None, None),
+                "input_features": (0, True, 0, 1),
+                "audio_mask": (-1, False, 0, 1),
+                # Pack along dim 0 to match input_features (4, 400, 128): (2,400)+(2,400) -> (4, 400).
+                # HF expects feature_attention_mask (num_audios, seq_len) for indexing.
+                "feature_attention_mask": (0, False, None, None),
+            }
+        self.collate_fn = MainCollator(seq_classification=False, data_collate_info=data_collate_info)
 
     def _build_dataloader(self):
         pass
@@ -104,7 +115,8 @@ class TrainerTest(BaseTrainer):
         loss_dict: Dict[str, torch.Tensor]
 
         data_iter = iter(dataloader)
-        batch = next(data_iter)
+        raw_features = next(data_iter)
+        batch = self.collate_fn(raw_features)
         self.micro_batches_token_len = count_loss_token(batch)
         self.micro_batch_token_len = count_loss_token(batch)
 
@@ -121,6 +133,9 @@ class TrainerTest(BaseTrainer):
             batch["input_features"] = batch["input_features"].to(
                 dtype=self.model.dtype
             )  # qwen3 omni didn't handle dtype in audio_forward
+
+        if batch["position_ids"].dim() == 3 and batch["position_ids"].shape[1] == 3:
+            batch["position_ids"] = batch["position_ids"].transpose(0, 1).contiguous()
 
         loss, loss_dict = super().forward_backward_step(batch)
         grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
@@ -233,6 +248,13 @@ _TEST_CASES_TRANSFORMERS_V5 = [
         _DEFAULT_ATOL,
         id="qwen3_5",
     ),
+    pytest.param(
+        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_5_moe",
+    ),
 ]
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
@@ -271,7 +293,7 @@ def test_models_patch_fwd_bwd(
     # Qwen3.5 compatibility:
     # - HF backend doesn't support the test's position_ids test cases.
     # - VeOmni backend doesn't support the padded_bsh cases as we only support packed sequence case.
-    if case_id == "qwen3_5":
+    if case_id in ("qwen3_5", "qwen3_5_moe"):
         #    hf_model_modes = [mode for mode in hf_model_modes if mode.attn_case != "position_ids"]
         hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
         veomni_model_modes = [

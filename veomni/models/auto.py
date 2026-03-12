@@ -75,7 +75,7 @@ def build_foundation_model(
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
-    moe_implementation: Optional[Literal["eager", "fused"]] = None,
+    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
@@ -95,12 +95,18 @@ def build_foundation_model(
         config = build_config(config_path, **config_kwargs)
 
     if moe_implementation is not None:
-        if moe_implementation not in ["eager", "fused"]:
+        if moe_implementation not in ["eager", "fused", "fused_quack"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
-        config._moe_implementation = moe_implementation
-        logger.info_rank0(f"Moe implementation: {moe_implementation}")
+        logger.info_rank0(f"MoE implementation: {moe_implementation}")
+
         if moe_implementation == "eager":
             logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
+            config._moe_implementation = "eager"
+        else:
+            config._moe_implementation = "fused"
+            from ..ops.fused_moe import apply_veomni_fused_moe_patch
+
+            apply_veomni_fused_moe_patch(moe_implementation=moe_implementation)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
@@ -132,13 +138,10 @@ def build_foundation_model(
         "trust_remote_code": True,
     }
 
-    if attn_implementation in (
-        "flash_attention_4",
-        "veomni_flash_attention_4_with_sp",
-    ) and not is_transformers_version_greater_or_equal_to("5.0.0"):
+    if attn_implementation == "flash_attention_4" and not is_transformers_version_greater_or_equal_to("5.0.0"):
         raise RuntimeError(
-            f"attn_implementation '{attn_implementation}' requires Transformers>=5.0.0. "
-            "Install it with: uv sync --extra gpu --extra fa4 --extra transformers5-exp --no-group transformers-stable"
+            f"attn_implementation '{attn_implementation}' bare name requires Transformers>=5.0.0. "
+            'For Transformers v4, please use attn_implementation="veomni_flash_attention_4_with_sp".'
         )
 
     if attn_implementation not in (

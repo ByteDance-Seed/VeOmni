@@ -552,12 +552,13 @@ class Qwen3OmniMoeAudioEncoder(hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder):
     def dummy_forward(self):
         """
         Dummy forward to avoid FSDP reduce-scatter hang when some ranks have no audio data.
-        input_features shape is (num_mel_bins, total_len), feature_lens is (num_audios,).
+        input_features shape is (total_len, num_mel_bins), feature_lens is (num_audios,).
         """
         if getattr(self, "_dummy_data", None) is None:
             # Minimal valid input: one audio clip of length n_window*2 (smallest non-zero chunk)
+            # Note: patched forward expects (len, num_mel_bins) and permutes to (num_mel_bins, len)
             min_len = self.n_window * 2
-            input_features = torch.zeros((self.num_mel_bins, min_len), dtype=self.dtype, device=self.device)
+            input_features = torch.zeros((min_len, self.num_mel_bins), dtype=self.dtype, device=self.device)
             feature_lens = torch.tensor([min_len], dtype=torch.long, device=self.device)
             self._dummy_data = {
                 "input_features": input_features,

@@ -309,7 +309,12 @@ def flash_attention_forward(
     elif module.config._attn_implementation == "veomni_flash_attention_3_with_sp":
         fa_kernel_implementation = "flash_attention_3"
     elif module.config._attn_implementation == "veomni_flash_attention_4_with_sp":
-        fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
+        if is_transformers_version_greater_or_equal_to("5.0.0"):
+            fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
+        else:
+            # Transformers v4 has no hub-kernel fallback but supports module objects
+            # in _lazy_imports' kernels-fallback branch via getattr().
+            fa_kernel_implementation = _load_veomni_local_flash_kernel("veomni_flash_attention_4_with_sp")
     else:
         raise ValueError(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"

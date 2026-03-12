@@ -3,7 +3,7 @@
 **TLDR:** VeOmni patches HuggingFace models at runtime to add FSDP, Sequence Parallelism (SP), Expert Parallelism (EP), and fused kernels. This guide walks you through the integration steps with checklists per model type. For worked examples, see:
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)
- 
+
 > **Scope note:** This guide currently targets the **transformers v4** integration/patchgen flow.
 > **TODO:** Add a dedicated **transformers v5** section, since modeling code patchgen requires a slightly different approach.
 
@@ -238,7 +238,6 @@ from veomni.distributed.sequence_parallel import (
     gather_outputs,             # all-gather along a dim (no autograd)
     gather_seq_scatter_heads,   # (bs, seq//sp, h) → (bs, seq, h//sp)
     slice_input_tensor,         # slice along a dim for this SP rank
-    slice_position_embedding,   # slice position embeddings for SP
     sp_pad_and_slice,           # pad to multiple of pad_scale, then slice
     unpad_tensor,               # remove padding from a tensor
 )
