@@ -1,5 +1,5 @@
 --- a/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
-+++ b/patched_modeling_glm_moe_dsa_npu.py
++++ b/patched_modeling_glm_moe_dsa_gpu.py
 @@ -1,23 +1,18 @@
 -#                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 -#           This file was automatically generated from src/transformers/models/glm_moe_dsa/modular_glm_moe_dsa.py.

@@ -122,7 +122,7 @@ Root config — assembles `model`, `data`, and `train`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]]` | `"flash_attention_2"` | Attention implementation to use. |
-| moe_implementation | `Optional[Literal["eager", "fused"]]` | `None` | MoE implementation to use. |
+| moe_implementation | `Optional[Literal["eager", "fused", "fused_quack"]]` | `None` | MoE implementation: `eager` (reference loop), `fused` (Triton), `fused_quack` (Quack CUTLASS, SM90+). |
 
 ### DataArguments
 

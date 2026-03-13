@@ -57,18 +57,9 @@ The same applies to the audio encoder for omni-modal models.
 
 ---
 
-## P3. SP: Language Model Position Embedding Slicing
+## P3. SP: Language Model Position Embeddings
 
-VeOmni's data collator pre-slices `inputs_embeds` along the sequence dimension (`seq // sp_size` per rank). The LM's rotary position embeddings are computed from the full position IDs but must be sliced to match:
-
-```python
-from ....distributed.sequence_parallel import slice_position_embedding
-
-position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-```
+Since `position_ids` is already sliced by `SequenceParallelCollator`, calling `rotary_emb(hidden_states, position_ids)` directly produces local-length position embeddings — no additional slicing is needed.
 
 VeOmni automatically registers a wrapped FlashAttention implementation, so attention layers require no further changes.
 

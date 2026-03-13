@@ -59,14 +59,9 @@ The same condition and pattern applies to `pixel_values_videos`.
 
 ## 2. Sequence Parallelism
 
-### 2.1 Language Model — Position Embedding Slicing
+### 2.1 Language Model — Position Embeddings
 
-```python
-position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-```
+Since `position_ids` is already sliced by `SequenceParallelCollator`, calling `rotary_emb(hidden_states, position_ids)` directly produces local-length position embeddings — no additional slicing is needed.
 
 VeOmni automatically registers a wrapped FlashAttention, so attention layers need no further changes.
 

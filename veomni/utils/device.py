@@ -110,6 +110,14 @@ def is_hccl_backend() -> bool:
     return get_dist_comm_backend() == "hccl"
 
 
+def is_sm90_or_above() -> bool:
+    """Check if the current CUDA device has SM90+ capability."""
+    if not IS_CUDA_AVAILABLE:
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 9
+
+
 def get_compute_units():
     """
     Returns the number of streaming multiprocessors (SMs) or equivalent compute units
