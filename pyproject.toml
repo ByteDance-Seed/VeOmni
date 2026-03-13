@@ -23,7 +23,6 @@ dependencies = [
   "packaging>=23.0,<26.0",
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
-  "diffusers>=0.30.0,<=0.31.0",
   # Comment out transformers version for pip user compatibility (not to accidentally install v5 which is still WIP
   # and experimental)
   # For uv user: The actual version is controlled by the "transformers-stable" default
@@ -59,9 +58,12 @@ video = [
 ]
 dit = [
   "diffusers==0.36.0",
-  "huggingface-hub==0.36.0",
-  "mageio==2.37.2",
-  "imageio-ffmpeg==0.6.0",
+  "torchcodec",
+  "av>=14.3.0,<15.0",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14",
+  "ftfy",
+  "peft"
 ]
 npu_aarch64 = [
   "torch==2.7.1",
@@ -246,7 +248,7 @@ flash-attn-3 = [
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "7fd16f28bffe71c9ab6b7eecc5dd14bf87c1dc9e" }
 
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
-av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video'" }
+av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video' or extra == 'dit'" }
 
 [[tool.uv.index]]
 name = "pytorch"
