@@ -94,8 +94,10 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
-      - name: Run fsdp2/ep+fsdp2 clip grad norm test
+      - name: Run utils tests
+        # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |
+          uv run --frozen pytest -s -x tests/utils/test_count_flops.py
           uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
       - name: Run e2e dcp save and load test
         run: |
