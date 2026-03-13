@@ -100,7 +100,7 @@ def _lb_loss_bwd_kernel(
     expert_count_ptr,  # [E] from forward
     mask_weights_ptr,  # [N] per-token weight (or unused)
     grad_logits_ptr,  # [N, E] output gradient
-    grad_scale,  # scalar: upstream_grad * E / total_weight^2
+    grad_scale_ptr,  # [1] scalar tensor: upstream_grad * E / total_weight^2
     stride_logits_row,
     stride_grad_row,
     N,
@@ -138,6 +138,7 @@ def _lb_loss_bwd_kernel(
     counts = tl.load(expert_count_ptr + expert_offs, mask=emask, other=0.0).to(tl.float32)
 
     # grad = grad_scale * w * probs * (counts - dot(counts, probs))
+    grad_scale = tl.load(grad_scale_ptr).to(tl.float32)
     dot_cs = tl.sum(counts * probs, axis=0)
     grad = grad_scale * w * probs * (counts - dot_cs)
 
@@ -159,7 +160,7 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
         num_experts: int,
         top_k: int,
         mask_weights: Optional[torch.Tensor],
-        total_weight: float,
+        total_weight: torch.Tensor,
     ) -> torch.Tensor:
         N, E = concatenated_gate_logits.shape
         device = concatenated_gate_logits.device
@@ -190,9 +191,11 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
 
         # Save for backward
         ctx.save_for_backward(
-            concatenated_gate_logits, expert_count, mask_weights if has_mask else torch.empty(0, device=device)
+            concatenated_gate_logits,
+            expert_count,
+            mask_weights if has_mask else torch.empty(0, device=device),
+            total_weight,
         )
-        ctx.total_weight = total_weight
         ctx.has_mask = has_mask
         ctx.E = E
         ctx.N = N
@@ -201,14 +204,13 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        gate_logits, expert_count, mask_weights = ctx.saved_tensors
+        gate_logits, expert_count, mask_weights, total_weight = ctx.saved_tensors
         N, E = ctx.N, ctx.E
         has_mask = ctx.has_mask
-        total_weight = ctx.total_weight
 
         grad_logits = torch.empty_like(gate_logits, dtype=torch.float32)
         BLOCK_E = triton.next_power_of_2(E)
-        grad_scale = grad_output.item() * E / (total_weight * total_weight)
+        grad_scale = grad_output * E / (total_weight * total_weight)
 
         mask_ptr = mask_weights if has_mask else gate_logits  # dummy
 
@@ -217,7 +219,7 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
             expert_count,
             mask_ptr,
             grad_logits,
-            grad_scale,
+            grad_scale.contiguous(),
             gate_logits.stride(0),
             grad_logits.stride(0),
             N,
@@ -258,7 +260,14 @@ def load_balancing_loss_triton(
 
     if attention_mask is not None:
         batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = N // (batch_size * sequence_length)
+        num_hidden_layers = len(gate_logits)
+        expected_tokens = num_hidden_layers * batch_size * sequence_length
+        if N != expected_tokens:
+            raise ValueError(
+                f"Mismatch between gate_logits total tokens ({N}) and attention_mask shape. "
+                f"Expected {num_hidden_layers} * {batch_size} * {sequence_length} = {expected_tokens} tokens, "
+                f"but got {N}."
+            )
         mask_weights = (
             attention_mask[None, :, :]
             .expand(num_hidden_layers, batch_size, sequence_length)
@@ -266,11 +275,11 @@ def load_balancing_loss_triton(
             .to(compute_device, dtype=torch.float32)
             .contiguous()
         )
-        total_weight = mask_weights.sum().item()
+        total_weight = mask_weights.sum()
         if total_weight == 0:
             return torch.tensor(0.0, device=compute_device)
     else:
         mask_weights = None
-        total_weight = float(N)
+        total_weight = torch.tensor(float(N), device=compute_device)
 
     return _FusedLoadBalancingLoss.apply(concatenated_gate_logits, num_experts, top_k, mask_weights, total_weight)
