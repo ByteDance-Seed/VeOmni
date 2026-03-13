@@ -80,25 +80,27 @@ def default_diff_path(output_dir: Path, target_file: str) -> Path:
 
 
 def list_patch_configs(models_dir: Path = MODELS_DIR) -> list[str]:
-    """List all available patch configurations under veomni/models/transformers."""
+    """List all available patch configurations under veomni/models/transformers.
+
+    Configs live at the model root (e.g. ``qwen3/qwen3_gpu_patch_gen_config.py``),
+    not inside ``patches/`` subdirectories.  We discover them by globbing for
+    ``*_patch_gen_config.py`` recursively.
+    """
     configs = []
     if not models_dir.exists():
         return configs
 
-    for patches_dir in models_dir.rglob("patches"):
-        if not patches_dir.is_dir():
+    for py_file in sorted(models_dir.rglob("*_patch_gen_config.py")):
+        if py_file.name.startswith("_"):
             continue
-        for py_file in patches_dir.glob("*.py"):
-            if py_file.name.startswith("_"):
-                continue
-            module_path = py_file.relative_to(VEOMNI_DIR).with_suffix("")
-            module_name = ".".join(("veomni",) + module_path.parts)
-            try:
-                module = importlib.import_module(module_name)
-                if hasattr(module, "config") and isinstance(module.config, PatchConfig):
-                    configs.append(module_name)
-            except ImportError:
-                continue
+        module_path = py_file.relative_to(VEOMNI_DIR).with_suffix("")
+        module_name = ".".join(("veomni",) + module_path.parts)
+        try:
+            module = importlib.import_module(module_name)
+            if hasattr(module, "config") and isinstance(module.config, PatchConfig):
+                configs.append(module_name)
+        except ImportError:
+            continue
 
     return configs
 
@@ -115,7 +117,7 @@ def default_output_dir_for_module(module: object) -> Path:
     module_path = Path(module.__file__).resolve()
     if module_path.parent.name == "patches":
         return module_path.parent.parent / "generated"
-    return MODULE_DIR / "generated"
+    return module_path.parent / "generated"
 
 
 def print_config_summary(config: PatchConfig) -> None:
@@ -272,6 +274,11 @@ Examples:
         help="List available patch configurations",
     )
     parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Regenerate all discovered patch configs at once",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be generated without writing files",
@@ -301,9 +308,36 @@ Examples:
             print("  (none found)")
         return 0
 
+    # --all mode: regenerate every discovered config
+    if args.all:
+        configs = list_patch_configs()
+        if not configs:
+            print("No patch configs found.", file=sys.stderr)
+            return 1
+        failed = []
+        for cfg in configs:
+            print(f"\n{'=' * 70}")
+            print(f"Generating: {cfg}")
+            print("=" * 70)
+            result = run_codegen(
+                patch_module=cfg,
+                output_dir=None,
+                config_name=args.config_name,
+                dry_run=args.dry_run,
+                save_diff=args.diff,
+                verbose=args.verbose,
+            )
+            if result is None:
+                failed.append(cfg)
+        if failed:
+            print(f"\nFailed configs: {failed}", file=sys.stderr)
+            return 1
+        print(f"\nAll {len(configs)} configs generated successfully.")
+        return 0
+
     # Require patch_module for generation
     if not args.patch_module:
-        parser.error("patch_module is required unless using --list")
+        parser.error("patch_module is required unless using --list or --all")
 
     # Run generation
     result = run_codegen(
