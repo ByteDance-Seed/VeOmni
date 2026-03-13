@@ -83,8 +83,8 @@ class VeomniFlopsCounter:
             # RMSNorm layers have minimal impact at the MFU and can be ignored.
             "qwen3": self._estimate_qwen2_flops,
             "seed_oss": self._estimate_seed_flops,
-            "qwen3_5": self._estimate_qwen3_5_flops,
-            "qwen3_5_moe": self._estimate_qwen3_5_moe_flops,
+            "qwen3_5": self._estimate_qwen3_5_family_flops,
+            "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
         }
 
         self.config = config
@@ -596,8 +596,13 @@ class VeomniFlopsCounter:
             o_t = S_t @ q_t
 
         where S_t is the state matrix of shape (linear_value_head_dim, linear_key_head_dim)
-        per value head. The chunked implementation (chunk_gated_delta_rule) is an optimization;
-        we use the recurrent form as the theoretical FLOPs baseline.
+        per value head.
+
+        Note: in practice, training uses the chunked implementation (chunk_gated_delta_rule)
+        which reorganizes the computation into chunk-level matrix multiplications for better
+        hardware utilization. However, chunking is purely an implementation optimization that
+        does not change the total arithmetic — it computes the same result as the recurrent
+        form. We therefore use the recurrent form as the theoretical FLOPs baseline.
 
         Per step per head, the dominant ops (forward) are:
             S_{t-1} @ k_t        (mat-vec, (d_v,d_k)@(d_k,)=(d_v,)):  2 * d_v * d_k FLOPs
@@ -657,79 +662,20 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_5_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
+    def _estimate_qwen3_5_family_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
         """
-        Estimate the FLOPS of the Qwen3.5 VLM (dense MLP + hybrid attention + ViT).
+        Estimate the FLOPS of the Qwen3.5 model family (dense/MoE MLP + hybrid attention + ViT).
 
-        Qwen3.5 is a VLM with nested text_config and vision_config. The text model uses
-        dense SwiGLU MLP and hybrid attention (full + GatedDeltaNet), while the vision
-        encoder is the same ViT as Qwen3-VL.
+        Handles both Qwen3.5 (dense) and Qwen3.5-MoE by checking for MoE-specific config
+        attributes. Both variants share hybrid attention and ViT; only the MLP differs.
 
         Text model (from text_config):
-            MLP per layer (SwiGLU, 3 projections):
+            Dense MLP per layer (SwiGLU, 3 projections):
                 gate_proj:  hidden_size -> intermediate_size
                 up_proj:    hidden_size -> intermediate_size
                 down_proj:  intermediate_size -> hidden_size
 
-            Hybrid attention: see _compute_hybrid_attn_params docstring.
-
-            Embeddings + LM head:
-                embed_tokens:  vocab_size -> hidden_size
-                lm_head:       hidden_size -> vocab_size
-
-        Quadratic attention FLOPs (only full attention layers):
-            Per layer: 2 * seq_len^2 * head_dim * num_attention_heads (Q@K + attn@V)
-            fwd + bwd (3x) -> 6x total -> coefficient 12
-
-        Vision encoder: delegates to _estimate_qwen3_vit_flop.
-        """
-        text_config = self.config.text_config
-        hidden_size = text_config.hidden_size
-        vocab_size = text_config.vocab_size
-        num_hidden_layers = text_config.num_hidden_layers
-
-        # hybrid attention linear projection params (full + GatedDeltaNet)
-        attn_linear_N, num_full_attn_layers, head_dim, num_attention_heads = self._compute_hybrid_attn_params(
-            text_config
-        )
-
-        # dense MLP per layer: gate_proj + up_proj + down_proj (SwiGLU)
-        mlp_N = hidden_size * text_config.intermediate_size * 3
-
-        # embed_tokens + lm_head
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
-        # linear projection flops: 6 (fwd + bwd) * params * tokens
-        dense_N_flops = 6 * (mlp_N * num_hidden_layers + attn_linear_N + emd_and_lm_head_N) * tokens_sum
-
-        # quadratic attention flops (Q@K and attn@V), only for full attention layers
-        seqlen_square_sum = 0
-        for seqlen in batch_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
-
-        # GatedDeltaNet recurrence flops (state update + query, for all GDN layers)
-        gdn_recurrence_flops = self._compute_gdn_recurrence_flops(text_config, tokens_sum, num_full_attn_layers)
-
-        # vit flops (Qwen3-VL ViT)
-        images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
-            vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, self.config.vision_config)
-        else:
-            vit_flops = 0
-
-        # all_layer & all_token fwd & bwd flops
-        flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops
-        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        return flops_achieved
-
-    def _estimate_qwen3_5_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-        """
-        Estimate the FLOPS of the Qwen3.5 MoE VLM (MoE MLP + hybrid attention + ViT).
-
-        Same structure as Qwen3.5 dense but replaces dense MLP with MoE per layer.
-
-        Text model (from text_config):
-            MoE per layer:
+            MoE per layer (when num_experts is present):
                 TopkGate router:   hidden_size -> num_experts
                 Routed experts (top-k activated, each SwiGLU):
                     gate_proj:  hidden_size -> moe_intermediate_size
@@ -763,16 +709,22 @@ class VeomniFlopsCounter:
             text_config
         )
 
-        # MoE per layer: router gate + routed expert MLPs (top-k) + shared expert MLP
-        moe_gata_N = hidden_size * text_config.num_experts
-        moe_expertmlp_N = hidden_size * text_config.moe_intermediate_size * text_config.num_experts_per_tok * 3
-        moe_sharedexpertmlp_N = hidden_size * text_config.shared_expert_intermediate_size * 3
-        moe_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N) * num_hidden_layers
+        # MLP params: MoE or dense depending on config
+        is_moe = hasattr(text_config, "num_experts")
+        if is_moe:
+            # MoE per layer: router gate + routed expert MLPs (top-k) + shared expert MLP
+            moe_gata_N = hidden_size * text_config.num_experts
+            moe_expertmlp_N = hidden_size * text_config.moe_intermediate_size * text_config.num_experts_per_tok * 3
+            moe_sharedexpertmlp_N = hidden_size * text_config.shared_expert_intermediate_size * 3
+            mlp_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N) * num_hidden_layers
+        else:
+            # dense MLP per layer: gate_proj + up_proj + down_proj (SwiGLU)
+            mlp_N = hidden_size * text_config.intermediate_size * 3 * num_hidden_layers
 
         # embed_tokens + lm_head
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # linear projection flops: 6 (fwd + bwd) * params * tokens
-        dense_N_flops = 6 * (moe_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+        dense_N_flops = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
 
         # quadratic attention flops (Q@K and attn@V), only for full attention layers
         seqlen_square_sum = 0
