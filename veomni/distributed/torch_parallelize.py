@@ -461,7 +461,7 @@ def parallelize_model_fsdp2(
                     layer_mod._fsdp_modules.append(sub_mod)
 
         # shard everything else in the module:
-        #   for example: 
+        #   for example:
         #      if we have a model like the following:
         #          ToyMoeAndEmbedModel(
         #           (embed_tokens): ToyEmbed()
@@ -471,8 +471,8 @@ def parallelize_model_fsdp2(
         #            )
         #          )
         #       then, layer_pairs_list = [
-        #           ('decoder.embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})), 
-        #           ('embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})), 
+        #           ('decoder.embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})),
+        #           ('embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})),
         #           ('decoder', (ToyMoeAndEmbedDecoderLayer(
         #               (embed_tokens): ToyEmbed()
         #               (moe): ToyMoeExperts()
