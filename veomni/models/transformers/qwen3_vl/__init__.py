@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ...loader import MODELING_REGISTRY
+from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 @MODELING_REGISTRY.register("qwen3_vl")
 def register_qwen3_vl_modeling(architecture: str):
-    from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLModel, apply_veomni_qwen3vl_patch
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        from .generated.patched_modeling_qwen3_vl import (
+            Qwen3VLForConditionalGeneration,
+            Qwen3VLModel,
+        )
+    else:
+        from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLModel, apply_veomni_qwen3vl_patch
 
-    apply_veomni_qwen3vl_patch()
+        apply_veomni_qwen3vl_patch()
 
     if "ForConditionalGeneration" in architecture:
         return Qwen3VLForConditionalGeneration
