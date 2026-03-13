@@ -460,8 +460,26 @@ def parallelize_model_fsdp2(
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     layer_mod._fsdp_modules.append(sub_mod)
 
-        # shard everything else in the module
-        # if the module is in extra_parallel, no need to shard again
+        # shard everything else in the module:
+        #   for example: 
+        #      if we have a model like the following:
+        #          ToyMoeAndEmbedModel(
+        #           (embed_tokens): ToyEmbed()
+        #           (decoder): ToyMoeAndEmbedDecoderLayer(
+        #             (embed_tokens): ToyEmbed()
+        #             (moe): ToyMoeExperts()
+        #            )
+        #          )
+        #       then, layer_pairs_list = [
+        #           ('decoder.embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})), 
+        #           ('embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})), 
+        #           ('decoder', (ToyMoeAndEmbedDecoderLayer(
+        #               (embed_tokens): ToyEmbed()
+        #               (moe): ToyMoeExperts()
+        #           ), {'emb': ToyEmbed(), 'ep': ToyMoeExperts()}))
+        #       ]
+        #   if layer_mod (e.g. decoder.embed_tokens) is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed())
+        #   no need to shard layer_mod again
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
             layer_mod._fsdp_modules.append(layer_mod)
