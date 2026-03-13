@@ -11,6 +11,8 @@ test_cases = [
 ]
 
 
+@pytest.mark.L5
+@pytest.mark.multi_gpu
 @pytest.mark.parametrize("task_name", test_cases)
 def test_e2e_training(task_name):
     exec_script = E2E_TEST_SCRIPT[task_name]

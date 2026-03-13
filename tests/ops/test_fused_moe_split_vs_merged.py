@@ -9,6 +9,9 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_de
 from veomni.utils.import_utils import is_fused_moe_available
 
 
+pytestmark = [pytest.mark.L1, pytest.mark.moe]
+
+
 def _skip_if_unsupported():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA is required for fused MoE split/merged parity test.")

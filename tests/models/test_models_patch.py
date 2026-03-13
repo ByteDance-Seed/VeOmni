@@ -28,6 +28,8 @@ from .utils import (
 from .weight_sync_adapters import get_sync_weight_func
 
 
+pytestmark = [pytest.mark.L1]
+
 os.environ["NCCL_DEBUG"] = "OFF"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # enable_full_determinism(42)
@@ -265,6 +267,7 @@ else:
     print("[test_models_patch] Using transformers v4 test cases.")
 
 
+@pytest.mark.L1
 @pytest.mark.parametrize("config_path, is_moe, rtol, atol", test_cases)
 def test_models_patch_fwd_bwd(
     request: pytest.FixtureRequest,

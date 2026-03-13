@@ -6,6 +6,9 @@ from veomni.data.data_transform import process_classification_example
 from veomni.utils.constants import IGNORE_INDEX
 
 
+pytestmark = [pytest.mark.L0]
+
+
 class DummyTokenizer:
     """
     Minimal tokenizer stub:

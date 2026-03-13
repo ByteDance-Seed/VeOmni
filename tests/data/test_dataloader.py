@@ -7,6 +7,9 @@ from utils import DummyDataset, process_dummy_example
 from veomni.data import build_dataloader, build_dataset
 
 
+pytestmark = [pytest.mark.L0]
+
+
 def _fake_ps(sp_size: int):
     sp_enabled = sp_size > 1
     return types.SimpleNamespace(

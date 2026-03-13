@@ -299,4 +299,14 @@ line-ending = "auto"
 markers = [
     "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
     "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
+    "L0: Level 0 - Data processing & transform correctness (no GPU)",
+    "L1: Level 1 - Kernel & operator consistency (single GPU)",
+    "L2: Level 2 - Single-GPU vs FSDP equivalence (2+ GPUs)",
+    "L3: Level 3 - Parallelism combination consistency (2-8 GPUs)",
+    "L4: Level 4 - Corner cases & robustness",
+    "L5: Level 5 - Integration / smoke test",
+    "v4_only: Requires transformers < 5.0.0",
+    "v5_only: Requires transformers >= 5.0.0",
+    "multi_gpu: Requires multiple GPUs",
+    "moe: MoE model specific test",
 ]

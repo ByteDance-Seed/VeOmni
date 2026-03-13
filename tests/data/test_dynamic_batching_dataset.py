@@ -56,6 +56,9 @@ from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
+pytestmark = [pytest.mark.L0]
+
+
 logger = helper.create_logger(__name__)
 
 
