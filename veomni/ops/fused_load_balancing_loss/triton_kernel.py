@@ -55,7 +55,8 @@ def _lb_loss_fwd_kernel(
     else:
         w = 1.0
 
-    # Load gate logits for this token
+    # Load gate logits for this token and upcast to float32 for stable softmax.
+    # Input can be float16/bfloat16/float32; all arithmetic is done in float32.
     row_start = row_idx * stride_logits_row
     logits = tl.load(gate_logits_ptr + row_start + expert_offs, mask=emask, other=float("-inf")).to(tl.float32)
 
@@ -153,6 +154,20 @@ def _lb_loss_bwd_kernel(
 
 
 class _FusedLoadBalancingLoss(torch.autograd.Function):
+    """Autograd wrapper for the fused load balancing loss kernels.
+
+    Dtype handling:
+        - ``concatenated_gate_logits`` can be any floating-point dtype
+          (float16, bfloat16, float32). The Triton kernels cast inputs to
+          float32 internally for numerical stability (softmax, atomics).
+        - ``mask_weights`` must be float32 (pre-cast by the caller).
+        - All intermediate accumulators (``expert_count``, ``router_prob_sum``)
+          are allocated in float32.
+        - The output ``loss`` is float32.
+        - Backward produces float32 gradients and casts them back to the
+          input dtype before returning.
+    """
+
     @staticmethod
     def forward(
         ctx,
@@ -165,6 +180,8 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
         N, E = concatenated_gate_logits.shape
         device = concatenated_gate_logits.device
 
+        # Accumulators are always float32 — the kernels use atomic_add which
+        # requires float32, and this avoids precision loss from softmax sums.
         expert_count = torch.zeros(E, device=device, dtype=torch.float32)
         router_prob_sum = torch.zeros(E, device=device, dtype=torch.float32)
 
@@ -208,6 +225,7 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
         N, E = ctx.N, ctx.E
         has_mask = ctx.has_mask
 
+        # Compute gradients in float32 for precision; cast to input dtype at the end.
         grad_logits = torch.empty_like(gate_logits, dtype=torch.float32)
         BLOCK_E = triton.next_power_of_2(E)
         grad_scale = grad_output * E / (total_weight * total_weight)
@@ -228,6 +246,7 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
             HAS_MASK=has_mask,
         )
 
+        # Cast gradients back to the original input dtype (e.g. bfloat16).
         return grad_logits.to(gate_logits.dtype), None, None, None, None
 
 
@@ -246,6 +265,12 @@ def load_balancing_loss_triton(
 
     Fuses softmax + top-k + accumulation into a single kernel, avoiding
     the ``[N, top_k, num_experts]`` one-hot intermediate tensor.
+
+    Dtype:
+        ``gate_logits`` may be any floating-point dtype (float16, bfloat16,
+        float32). All internal computation is performed in float32 for
+        numerical stability. Gradients are returned in the original input
+        dtype.
     """
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
