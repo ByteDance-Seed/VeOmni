@@ -82,6 +82,7 @@ config.add_post_import_block(
         causal_conv1d_update, causal_conv1d_fn = None, None
         logging.get_logger(__name__).warning(
             "Failed to import FLA modules: fallback to eager implementation."
+            "This case can't support dynamic batching packing!"
         )
     """
 )
