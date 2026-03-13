@@ -98,7 +98,7 @@ class TestEagerCrossEntropyVsReference:
         torch.testing.assert_close(eager_loss, ref_loss, rtol=1e-4, atol=1e-4)
 
     def test_loss_all_ignored(self):
-        """If all labels are ignore_index, loss should be 0."""
+        """If all labels are ignore_index, both implementations should agree (0 or NaN)."""
         set_seed(42)
         vocab_size = 128
         seq_len = 32
@@ -112,7 +112,11 @@ class TestEagerCrossEntropyVsReference:
             vocab_size=vocab_size,
         )
 
-        torch.testing.assert_close(eager_loss, ref_loss, rtol=1e-5, atol=1e-5)
+        # Both should be NaN or both should be 0 when all labels are ignored
+        if torch.isnan(ref_loss):
+            assert torch.isnan(eager_loss), f"Expected NaN but got {eager_loss}"
+        else:
+            torch.testing.assert_close(eager_loss, ref_loss, rtol=1e-5, atol=1e-5)
 
     def test_gradient_matches_reference(self):
         """Gradients through eager CE should match reference."""

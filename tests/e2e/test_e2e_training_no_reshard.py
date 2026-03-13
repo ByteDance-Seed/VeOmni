@@ -1,8 +1,8 @@
 import subprocess
 
 import pytest
+from e2e_test_helpers import parse_training_log
 from exec_scripts import E2E_TEST_SCRIPT
-from utils import parse_training_log
 
 
 test_cases = [

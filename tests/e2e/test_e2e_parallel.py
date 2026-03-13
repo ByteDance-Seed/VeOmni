@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
+from e2e_test_helpers import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type

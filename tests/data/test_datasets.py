@@ -7,8 +7,15 @@ from typing import Any, Dict, List
 
 import pytest
 import yaml
+from data_test_fixtures import (
+    DummyDataset,
+    FakeModel,
+    compare_global_batch,
+    compare_items,
+    compare_metrics,
+    process_dummy_example,
+)
 from transformers import PretrainedConfig
-from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
 
 from veomni.arguments import parse_args
 from veomni.distributed.parallel_state import get_parallel_state
