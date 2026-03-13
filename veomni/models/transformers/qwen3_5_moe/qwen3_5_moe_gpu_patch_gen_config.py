@@ -45,7 +45,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
 )
 from veomni.ops import fused_moe_forward
-from veomni.patchgen.patch_spec import PatchConfig
+from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
 
 
 logger = logging.get_logger(__name__)
@@ -94,10 +94,15 @@ config.add_post_import_block(
 
 
 # ── Liger replacements ──────────────────────────────────────────────────────────
-# NOTE: Qwen3_5MoeRMSNorm is NOT replaced with LigerRMSNorm because the HF
-# implementation uses a (1 + weight) centered formulation while LigerRMSNorm
-# uses a plain (weight) formulation, making them incompatible.
-#
+config.patches.append(
+    create_patch_from_external(
+        target="Qwen3_5MoeRMSNorm",
+        replacement_module="liger_kernel.transformers.rms_norm",
+        replacement_name="LigerRMSNormForQwen3Next",
+        description="Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)",
+    )
+)
+
 # NOTE: apply_rotary_pos_emb is NOT replaced with LigerKernel rotary because
 # Qwen3_5Moe uses partial_rotary_factor=0.25 with mrope_interleaved=True.
 # The HF implementation correctly handles partial rotary (applying RoPE only
