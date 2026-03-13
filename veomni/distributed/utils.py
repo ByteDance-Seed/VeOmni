@@ -36,6 +36,17 @@ def get_module_from_path(model: nn.Module, path: str):
         return get_module_from_path(next_obj, ".".join(attrs[1:]))
 
 
+def is_parent_module_from_path(model: nn.Module, module_name: str, path: str):
+    attrs = path.split(".")
+    if len(attrs) == 1:
+        return getattr(model, attrs[0]).__class__.__name__ == module_name
+    else:
+        next_obj = getattr(model, attrs[0])
+        if next_obj.__class__.__name__ == module_name:
+            return True
+        return is_parent_module_from_path(next_obj, module_name, ".".join(attrs[1:]))
+
+
 def check_all_fqn_match(path_patterns: List[str], path_keys: List[str]):
     """
     Check
@@ -111,3 +122,22 @@ def check_fqn_match(fqn_pattern: str, fqn: str, prefix: str = None):
     match = regex.match(fqn)
 
     return match
+
+
+def sort_fqn_by_submodule_first(fqn_list: list[str]) -> list[str]:
+    """
+    Sort FQN list purely by string nesting relationship (ignore depth calculation)
+    """
+
+    def _fqn_nesting_compare(a: str, b: str) -> int:
+        if a in b and a != b:
+            return 1
+        elif b in a and b != a:
+            return -1
+        else:
+            return 0
+
+    from functools import cmp_to_key
+
+    sorted_list = sorted(fqn_list, key=cmp_to_key(_fqn_nesting_compare))
+    return sorted_list
