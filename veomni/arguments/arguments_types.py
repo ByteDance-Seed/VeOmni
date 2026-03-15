@@ -755,7 +755,7 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification"] = field(
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -808,6 +808,8 @@ class DataArguments:
                 self.text_keys = "messages"
             elif self.data_type == "classification":
                 self.text_keys = "text"
+            elif self.data_type == "dpo":
+                self.text_keys = "chosen"
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 
@@ -861,6 +863,46 @@ class VeOmniArguments:
             raise ValueError("Please run `compute_train_steps` first!")
 
         return self._train_steps
+
+
+# ================================ DPO Arguments ======================================
+
+
+@dataclass
+class DPOConfig:
+    """dpo.* — Direct Preference Optimization hyperparameters."""
+
+    beta: float = field(
+        default=0.1,
+        metadata={"help": "Temperature parameter for the DPO loss. Controls deviation from the reference model."},
+    )
+    label_smoothing: float = field(
+        default=0.0,
+        metadata={"help": "Label smoothing for DPO loss. Non-zero values assume noisy preference labels."},
+    )
+    reference_free: bool = field(
+        default=False,
+        metadata={"help": "If True, ignore the reference model and use an implicit uniform reference."},
+    )
+    loss_type: Literal["sigmoid", "ipo"] = field(
+        default="sigmoid",
+        metadata={"help": "DPO loss variant: 'sigmoid' for standard DPO, 'ipo' for Identity Preference Optimization."},
+    )
+    average_log_prob: bool = field(
+        default=False,
+        metadata={"help": "If True, average log probs per token instead of summing."},
+    )
+    refer_model_precision: Literal["float32", "bfloat16"] = field(
+        default="bfloat16",
+        metadata={"help": "Precision of the reference model."},
+    )
+
+
+@dataclass
+class VeOmniDPOArguments(VeOmniArguments):
+    """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters."""
+
+    dpo_config: DPOConfig = field(default_factory=DPOConfig)
 
 
 # ================================ Infer Arguments ======================================

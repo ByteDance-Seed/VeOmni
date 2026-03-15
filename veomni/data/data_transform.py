@@ -16,6 +16,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 
 import torch
+import torch.nn.functional as F
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.registry import Registry
@@ -103,6 +104,76 @@ def process_conversation_example(
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
+
+
+_DPO_PAD_VALUES = {"input_ids": 0, "attention_mask": 0, "labels": IGNORE_INDEX}
+
+
+@DATA_TRANSFORM_REGISTRY.register("dpo")
+def process_dpo_example(
+    example: Dict[str, Any],
+    chat_template: "ChatTemplate" = None,
+    tokenizer: "PreTrainedTokenizer" = None,
+    max_seq_len: int = 2048,
+    **kwargs,
+) -> List[Dict[str, "torch.Tensor"]]:
+    """Process a DPO preference pair into a single sample with concatenated chosen/rejected rows.
+
+    Supported input formats:
+      1. Conversation: {"chosen": [messages...], "rejected": [messages...]}
+      2. Plaintext with prompt: {"prompt": str, "chosen": str, "rejected": str}
+
+    Returns:
+        A list with one dict whose tensors have shape ``[2, L]`` where row 0 is the
+        chosen sequence and row 1 is the rejected sequence, both padded to the same
+        length ``L = max(len_chosen, len_rejected)``.  Keys are the standard
+        ``input_ids``, ``attention_mask``, and ``labels`` — no ``chosen_*`` /
+        ``rejected_*`` prefixes — so the sample flows through the generic data
+        pipeline without any DPO-specific handling.
+    """
+    chosen_raw = example["chosen"]
+    rejected_raw = example["rejected"]
+
+    if isinstance(chosen_raw, list):
+        assert chat_template is not None, "chat_template is required for conversation-format DPO data"
+        chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
+        rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
+    else:
+        assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"
+        prompt = example.get("prompt", "")
+        chosen_text = prompt + chosen_raw
+        rejected_text = prompt + rejected_raw
+
+        chosen_ids = tokenizer.encode(chosen_text, add_special_tokens=True)[:max_seq_len]
+        rejected_ids = tokenizer.encode(rejected_text, add_special_tokens=True)[:max_seq_len]
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True) if prompt else []
+        prompt_len = len(prompt_ids)
+
+        chosen_tok = {
+            "input_ids": chosen_ids,
+            "attention_mask": [1] * len(chosen_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + chosen_ids[prompt_len:],
+        }
+        rejected_tok = {
+            "input_ids": rejected_ids,
+            "attention_mask": [1] * len(rejected_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + rejected_ids[prompt_len:],
+        }
+
+    def _to_tensor(v):
+        return v if isinstance(v, torch.Tensor) else torch.tensor(v)
+
+    result = {}
+    for key in ("input_ids", "attention_mask", "labels"):
+        c = _to_tensor(chosen_tok[key])
+        r = _to_tensor(rejected_tok[key])
+        max_len = max(c.shape[-1], r.shape[-1])
+        pad_val = _DPO_PAD_VALUES[key]
+        c = F.pad(c, (0, max_len - c.shape[-1]), value=pad_val)
+        r = F.pad(r, (0, max_len - r.shape[-1]), value=pad_val)
+        result[key] = torch.stack([c, r])  # [2, max_len]
+
+    return [result]
 
 
 @DATA_TRANSFORM_REGISTRY.register("classification")

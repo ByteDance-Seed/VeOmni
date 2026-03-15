@@ -52,6 +52,7 @@ examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
 examples/wan2.1.md
+examples/qwen3_dpo.md
 ```
 
 ```{toctree}
