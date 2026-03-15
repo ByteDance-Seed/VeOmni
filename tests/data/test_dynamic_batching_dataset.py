@@ -41,10 +41,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 import torch
 import torch.distributed as dist
+from data_test_fixtures import DummyIterableDataset, DummyMappingDataset, FakeModel
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
-from utils import DummyIterableDataset, DummyMappingDataset, FakeModel
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.checkpoint import build_checkpointer
@@ -54,6 +54,9 @@ from veomni.data.dynamic_batching import DynamicBatchingSizeDataset
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+pytestmark = [pytest.mark.L0]
 
 
 logger = helper.create_logger(__name__)

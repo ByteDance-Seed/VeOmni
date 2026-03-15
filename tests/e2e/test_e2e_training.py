@@ -1,8 +1,8 @@
 import subprocess
 
 import pytest
+from e2e_test_helpers import parse_training_log
 from exec_scripts import E2E_TEST_SCRIPT
-from utils import parse_training_log
 
 
 test_cases = [
@@ -11,6 +11,8 @@ test_cases = [
 ]
 
 
+@pytest.mark.L5
+@pytest.mark.multi_gpu
 @pytest.mark.parametrize("task_name", test_cases)
 def test_e2e_training(task_name):
     exec_script = E2E_TEST_SCRIPT[task_name]

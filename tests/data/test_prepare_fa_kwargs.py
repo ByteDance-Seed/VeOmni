@@ -1,6 +1,10 @@
+import pytest
 import torch
 
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
+
+
+pytestmark = [pytest.mark.L0]
 
 
 def make_pos_ids_concat(lengths):

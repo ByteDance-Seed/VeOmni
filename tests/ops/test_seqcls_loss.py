@@ -6,6 +6,9 @@ from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_torch_device
 
 
+pytestmark = [pytest.mark.L1]
+
+
 def _manual_ce_one_token(logits_1d: torch.Tensor, target: int) -> float:
     """
     calculate cross-entropy manually： -log softmax[target]

@@ -2,9 +2,12 @@ import types
 from functools import partial
 
 import pytest
-from utils import DummyDataset, process_dummy_example
+from data_test_fixtures import DummyDataset, process_dummy_example
 
 from veomni.data import build_dataloader, build_dataset
+
+
+pytestmark = [pytest.mark.L0]
 
 
 def _fake_ps(sp_size: int):

@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
+from e2e_test_helpers import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
@@ -265,6 +265,8 @@ def dummy_qwen3omni_dataset():
     del dummy_dataset
 
 
+@pytest.mark.L3
+@pytest.mark.multi_gpu
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", text_test_cases)
 def test_text_parallel_align(
     model_name: str,
@@ -287,6 +289,8 @@ def test_text_parallel_align(
     )
 
 
+@pytest.mark.L3
+@pytest.mark.multi_gpu
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2vl_test_cases)
 def test_qwen2vl_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2vl_dataset
@@ -302,6 +306,8 @@ def test_qwen2vl_parallel_align(
     )
 
 
+@pytest.mark.L3
+@pytest.mark.multi_gpu
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen3vl_test_cases)
 def test_qwen3vl_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen3vl_dataset
@@ -317,6 +323,8 @@ def test_qwen3vl_parallel_align(
     )
 
 
+@pytest.mark.L3
+@pytest.mark.multi_gpu
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2omni_test_cases)
 def test_qwen2omni_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2omni_dataset
@@ -332,6 +340,8 @@ def test_qwen2omni_parallel_align(
     )
 
 
+@pytest.mark.L3
+@pytest.mark.multi_gpu
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen3omni_test_cases)
 def test_qwen3omni_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen3omni_dataset
