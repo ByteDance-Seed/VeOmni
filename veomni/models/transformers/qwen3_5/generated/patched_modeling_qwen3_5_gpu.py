@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - class_replacement: Qwen3_5RMSNorm
+#      Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
 #      Use device-agnostic get_device_id() for FusedRMSNormGated init
 #    - method_override: Qwen3_5GatedDeltaNet._get_local_conv1d_weight
@@ -908,24 +910,14 @@ class Qwen3_5MLP(nn.Module):
         return down_proj
 
 
-class Qwen3_5RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
+# ======================================================================
+# [PATCHED CLASS] Qwen3_5RMSNorm
+# Original class replaced with: external
+# Reason: Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
+# Source: liger_kernel.transformers.rms_norm
+# ======================================================================
+# Import from: liger_kernel.transformers.rms_norm.LigerRMSNormForQwen3Next
+from liger_kernel.transformers.rms_norm import LigerRMSNormForQwen3Next as Qwen3_5RMSNorm
 
 
 # ======================================================================
