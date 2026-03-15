@@ -230,18 +230,8 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
 
 
 class Qwen3VLChatTemplate(Qwen2VLTemplate):
-    system_prompt = "You are a helpful assistant."
-
     # Qwen3-VL default temporal_patch_size
     MERGE_SIZE = 2
-
-    def _get_system_mesage(self):
-        system_message = {
-            "role": "system",
-            "content": self.system_prompt,
-            "loss_mask": 0,
-        }
-        return system_message
 
     # ================= [New: Official Timestamp Calculation Logic] =================
     def _calculate_timestamps(self, indices: List[int], video_fps: float, merge_size: int = 2):
@@ -266,8 +256,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
     def encode_messages(
         self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = defaultdict(list), **kwargs
     ) -> Dict[str, List[int]]:
-        sys_msg = self._get_system_mesage()
-        messages = [] if sys_msg is None else [sys_msg]
+        messages = []
         data_type = ""
         image_token_num_list = iter(num_tokens.pop("image", []))
         video_token_num_list = iter(num_tokens.pop("video", []))

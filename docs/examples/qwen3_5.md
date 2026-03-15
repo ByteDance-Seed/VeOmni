@@ -1,6 +1,6 @@
 # Qwen3.5 training guide
 
-> **Note:** Qwen3.5 requires transformers v5. Vision input is not supported yet; only text-only training is available.
+> **Note:** Qwen3.5 requires transformers v5.
 
 ## Install dependencies
 
@@ -12,7 +12,30 @@ uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu
 
 ## Download dataset
 
-Since vision input is not yet supported, use a text-only dataset for now. Download the [tulu-3-sft-mixture](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) dataset.
+### Vision-Language Dataset
+
+Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset and download the data annotation JSON file [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main).
+
+Modify the sharegpt4v_instruct_gpt4-vision_cap100k.json:
+
+```python
+import json
+with open('sharegpt4v_instruct_gpt4-vision_cap100k.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+filtered_data = []
+for item in data:
+    if item.get('image', '').startswith('coco'):
+        new_item = item.copy()
+        image_path = new_item.pop('image')
+        new_item['images'] = [image_path]
+        filtered_data.append(new_item)
+with open('sharegpt4v_instruct_gpt4-vision_cap100k_coco.json', 'w', encoding='utf-8') as f:
+    json.dump(filtered_data, f, ensure_ascii=False, indent=4)
+```
+
+### Text-only Dataset (Optional)
+
+If you want to train on text-only data, download the [tulu-3-sft-mixture](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) dataset.
 
 ```python
 import pyarrow.parquet as pq
@@ -29,11 +52,11 @@ pq.write_table(table_first_2000, output_path)
 Dense 27B:
 ```shell
 python3 scripts/download_hf_model.py \
-    --repo_id Qwen/Qwen3.5-27B \
-    --local_dir ${HOME}/Qwen3.5-27B
+    --repo_id Qwen/Qwen3.5-9B \
+    --local_dir ${HOME}/Qwen3.5-9B
 ```
 
-
+MoE 35B:
 ```shell
 python3 scripts/download_hf_model.py \
     --repo_id Qwen/Qwen3.5-35B-A3B \
@@ -41,6 +64,17 @@ python3 scripts/download_hf_model.py \
 ```
 
 ## Start training on GPU
+
+### Qwen3.5-9B VL Training
+
+```shell
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
+    --model.model_path ./Qwen/Qwen3.5-9B \
+    --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
+    --train.max_steps 20
+```
+
+### Text-only training on GPU
 
 Testing in 8x80GB GPUs.
 
@@ -50,7 +84,7 @@ Qwen3.5 Dense 27B:
 # Qwen3.5 model size is 27B.
 # We recommend that you use more GPUs to train Qwen3.5 27B so that you can get a proper seq len.
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
-    --model.model_path ${HOME}/Qwen3.5-27B \
+    --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --data.max_seq_len 128 \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
@@ -84,7 +118,7 @@ equal `data_parallel_size * ulysses_parallel_size`.
 ```shell
 # Example: 8 GPUs, dp=4, sp=2
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
-    --model.model_path ${HOME}/Qwen3.5-27B \
+    --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --train.data_parallel_size 4 \
     --train.ulysses_parallel_size 2 \
