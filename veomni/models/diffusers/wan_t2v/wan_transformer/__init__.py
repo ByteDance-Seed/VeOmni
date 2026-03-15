@@ -10,6 +10,11 @@ def register_wan_diffusers_transformer_config():
 
 @MODELING_REGISTRY.register("WanTransformer3DModel")
 def register_wan_diffusers_transformer_modeling(architecture: str):
-    from .modeling_wan_transformer import WanTransformer3DModel
+    from .modeling_wan_transformer import WanTransformer3DModel as VeOmniWanTransformer3DModel
+    from .modeling_wan_transformer import apply_veomni_wan_sp_patch
 
-    return WanTransformer3DModel
+    # Patch the base diffusers class so that SP slicing/gathering is injected
+    # into its forward pass at model-load time (mirroring the qwen3 patch pattern).
+    apply_veomni_wan_sp_patch()
+
+    return VeOmniWanTransformer3DModel

@@ -36,6 +36,7 @@ from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 from ..utils import helper
 from ..utils.device import (
+    get_device_type,
     synchronize,
 )
 from ..utils.model_utils import pretty_print_trainable_parameters
@@ -230,6 +231,9 @@ class DiTTrainer:
         args: VeOmniDiTArguments = self.base.args
         args.train.dyn_bsz = False
         args.train.micro_batch_size = 1
+        # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
+        # (default), so it was set to 1. Recompute now that dyn_bsz=False.
+        args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
         if args.train.training_task == "offline_embedding":
             assert args.train.ulysses_parallel_size == 1, "Ulysses parallel size must be 1 for offline embedding."
             assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
@@ -341,8 +345,25 @@ class DiTTrainer:
             )
 
     def _build_dataset(self):
-        self.base._build_dataset()
         args: VeOmniDiTArguments = self.base.args
+        self.base._build_dataset()
+        if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
+            self.base.train_dataset = None
+
+        # Sync _train_steps across the SP group so every rank runs the same number
+        # of training steps (required to avoid deadlocks in broadcast_object_list).
+        if get_parallel_state().sp_enabled:
+            steps_t = torch.zeros(1, dtype=torch.int64, device=torch.device(get_device_type()))
+            if get_parallel_state().sp_rank == 0:
+                steps_t[0] = args._train_steps
+            dist.broadcast(
+                steps_t,
+                src=dist.get_global_rank(get_parallel_state().sp_group, 0),
+                group=get_parallel_state().sp_group,
+            )
+            args._train_steps = int(steps_t.item())
+            self.base.train_steps = args.train_steps
+
         if self.training_task == "offline_embedding":
             dp_size = get_parallel_state().dp_size
             base = len(self.base.train_dataset) // dp_size
@@ -407,10 +428,15 @@ class DiTTrainer:
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
-        micro_batch = {
-            k: v.to(self.base.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in micro_batch.items()
-        }
+
+        def _to_device(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                return v.to(self.base.device, non_blocking=True)
+            if isinstance(v, list):
+                return [_to_device(item) for item in v]
+            return v
+
+        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self.base, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.base.args.train.local_rank)
             self.base.LOG_SAMPLE = False
@@ -435,7 +461,6 @@ class DiTTrainer:
 
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
         micro_batch = self.preforward(micro_batch)
-
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
                 micro_batch = self.condition_model.get_condition(**micro_batch)

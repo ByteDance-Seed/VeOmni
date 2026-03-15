@@ -40,6 +40,9 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         self.negative_prompt_embeds = None
         self._timesteps_ready = False
         self.meta_init = meta_init
+        # Persistent per-SP-group RNG generators; initialized lazily on first use.
+        self._sp_cuda_gen: torch.Generator | None = None
+        self._sp_cpu_gen: torch.Generator | None = None
         self._load_components()
 
     @property
@@ -134,11 +137,67 @@ class WanTransformer3DConditionModel(PreTrainedModel):
 
         return {"latents": latents_list, "context": context_list}
 
-    @torch.no_grad()
+    def _sp_generators(self, device: torch.device) -> tuple[torch.Generator | None, torch.Generator | None]:
+        """Return persistent (CUDA, CPU) generators synchronized across the SP group.
+
+        **Initialization (first call only):** a seed is drawn on SP rank-0 and
+        broadcast to every peer in the Ulysses group so all ranks start from an
+        identical state.
+
+        **Subsequent calls:** the generators are returned as-is and continue to
+        advance naturally — exactly like a normal RNG.  Because all SP ranks in the
+        same group make the same sequence of ``randn_like / randint / rand`` calls
+        inside ``process_condition``, their generator states remain in lock-step
+        automatically, with genuine randomness across training steps.
+
+        If Ulysses SP is not active, ``(None, None)`` is returned so callers fall
+        back to the global RNG (unchanged behaviour from before SP was added).
+        """
+        if self._sp_cuda_gen is not None:
+            # Already initialized; just hand back the live generators.
+            return self._sp_cuda_gen, self._sp_cpu_gen
+
+        import torch.distributed as dist
+
+        from .....distributed.parallel_state import get_parallel_state
+
+        if not get_parallel_state().sp_enabled:
+            return None, None
+
+        # First-time setup: broadcast the initial seed from SP rank-0 so every
+        # rank in the group starts from the exact same generator state.
+        # The collective backend (NCCL / HCCL) only supports device tensors, so
+        # we always create the seed on the current accelerator device regardless
+        # of where the latents live (they may still be on CPU at this point).
+        from .....utils.device import get_device_type
+
+        accel_device = torch.device(get_device_type())
+        seed = torch.randint(0, 2**31, (), dtype=torch.int64, device=accel_device)
+        dist.broadcast(
+            seed,
+            src=dist.get_global_rank(get_parallel_state().sp_group, 0),
+            group=get_parallel_state().sp_group,
+        )
+        seed_val = seed.item()
+
+        self._sp_cuda_gen = torch.Generator(device=accel_device)
+        self._sp_cuda_gen.manual_seed(seed_val)
+
+        self._sp_cpu_gen = torch.Generator(device="cpu")
+        self._sp_cpu_gen.manual_seed(seed_val)
+
+        return self._sp_cuda_gen, self._sp_cpu_gen
+
     def process_condition(self, latents: list[torch.Tensor], context: list[torch.Tensor]) -> dict[str, Any]:
         if not self._timesteps_ready:
             self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents[0].device)
             self._timesteps_ready = True
+
+        # Obtain persistent generators that are synchronized across the SP group.
+        # All SP ranks start from the same seed (set once) and advance in lock-step
+        # because they always call the same random ops in the same order, so
+        # every step naturally produces different but identical-across-ranks samples.
+        cuda_gen, cpu_gen = self._sp_generators(latents[0].device)
 
         packed_conditions: dict[str, list[torch.Tensor]] = {
             "hidden_states": [],
@@ -149,13 +208,27 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         for sample_latents, sample_context in zip(latents, context):
             latents = DiagonalGaussianDistribution(sample_latents).mode()
             latents = self._normalize_latents(latents)
-            noise = torch.randn_like(latents)
-            timestep_ids = torch.randint(0, len(self.scheduler.timesteps), (latents.shape[0],), device=latents.device)
+            # When cuda_gen is active (SP mode) we generate on the generator's
+            # own device (accelerator) and then move the result to the latent
+            # device.  torch.randn / torch.randint require that the generator
+            # device matches the output device, so we cannot pass latents.device
+            # directly when the generator lives on a different device.
+            gen_device = cuda_gen.device if cuda_gen is not None else latents.device
+            noise = torch.randn(latents.shape, dtype=latents.dtype, device=gen_device, generator=cuda_gen).to(
+                latents.device
+            )
+            timestep_ids = torch.randint(
+                0,
+                len(self.scheduler.timesteps),
+                (latents.shape[0],),
+                device=gen_device,
+                generator=cuda_gen,
+            ).to(latents.device)
             timestep = self.scheduler.timesteps[timestep_ids].to(device=latents.device, dtype=latents.dtype)
             noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
             training_target = noise - latents
 
-            use_negative_context = torch.rand(()) < self.config.cfg_negative_prob
+            use_negative_context = torch.rand((), generator=cpu_gen) < self.config.cfg_negative_prob
             if use_negative_context:
                 sample_context = self.negative_prompt_embeds.to(device=latents.device, dtype=sample_context.dtype)
             else:

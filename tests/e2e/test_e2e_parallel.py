@@ -223,6 +223,17 @@ qwen3omni_test_cases = [
     ),
 ]
 
+wan_dit_test_cases = [
+    pytest.param(
+        "wan_t2v",
+        "./tests/toy_config/wan_t2v_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v4_only,
+    ),
+]
+
 
 @pytest.fixture(scope="session")
 def dummy_text_dataset():
@@ -259,6 +270,14 @@ def dummy_qwen2omni_dataset():
 @pytest.fixture(scope="session")
 def dummy_qwen3omni_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen3omni")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_wan_t2v_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="wan_t2v")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
@@ -343,4 +362,22 @@ def test_qwen3omni_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_qwen3omni_dataset,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
+def test_wan_dit_parallel_align(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_wan_t2v_dataset
+):
+    """Validate that WanTransformer3DModel loss and grad_norm are identical with
+    and without Ulysses sequence-parallelism at equal DP sizes.
+    """
+    main(
+        task_name="train_dit_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_wan_t2v_dataset,
     )
