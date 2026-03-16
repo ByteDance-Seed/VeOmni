@@ -75,7 +75,7 @@ python3 scripts/multimodal/convert_data/tom-and-jerry.py \
 This step encodes every video with the VAE and every caption with the T5 text encoder, saving the embeddings as Parquet shards. It only needs to run once per dataset.
 
 ```shell
-NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit_new/wan_lora.yaml \
+NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
     --model.model_path           ./Wan2.1-T2V-1.3B-Diffusers/transformer \
     --model.condition_model_path ./Wan2.1-T2V-1.3B-Diffusers \
     --data.train_path            ./Tom-and-Jerry-VideoGeneration-Dataset-parquet \
@@ -99,7 +99,7 @@ The resulting `Tom-and-Jerry-VideoGeneration-Dataset_offline/` directory contain
 SP_SIZE=2
 NPROC_PER_NODE=8   # 4 DP replicas × SP_SIZE=2
 
-bash train.sh tasks/train_dit.py configs/dit_new/wan_lora.yaml \
+bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
     --model.model_path           ./Wan2.1-T2V-1.3B-Diffusers/transformer \
     --model.condition_model_path ./Wan2.1-T2V-1.3B-Diffusers \
     --data.train_path            ./Tom-and-Jerry-VideoGeneration-Dataset_offline \
@@ -121,7 +121,7 @@ bash train.sh tasks/train_dit.py configs/dit_new/wan_lora.yaml \
 Pass raw Parquet videos directly during training. The VAE and text encoder run each step.
 
 ```shell
-NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit_new/wan_lora.yaml \
+NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
     --model.model_path           ./Wan2.1-T2V-1.3B-Diffusers/transformer \
     --model.condition_model_path ./Wan2.1-T2V-1.3B-Diffusers \
     --data.train_path            ./Tom-and-Jerry-VideoGeneration-Dataset-parquet \
