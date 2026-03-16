@@ -13,6 +13,8 @@ def get_parallel_plan():
         "thinker.model.layers.*.mlp.experts.down_proj": Shard(0),
     }
     parallel_plan = ParallelPlan(
-        ep_plan=ep_plan,
+        extra_parallel_plan={
+            "ep": ep_plan,
+        }
     )
     return parallel_plan

@@ -96,7 +96,11 @@ def _add_arguments_recursive(parser: argparse.ArgumentParser, cls: Type[Any], pr
             # Handle List (Simple handling, no deep recursion for lists of objects)
             elif hasattr(field_type, "__origin__") and field_type.__origin__ is list:
                 kwargs["nargs"] = "+"
-                kwargs["type"] = field_type.__args__[0]
+                list_item_type = field_type.__args__[0]
+                if list_item_type is bool:
+                    kwargs["type"] = _string_to_bool
+                else:
+                    kwargs["type"] = list_item_type
             elif hasattr(field_type, "__origin__") and field_type.__origin__ is Literal:
                 kwargs["choices"] = list(field_type.__args__)
                 kwargs["type"] = type(field_type.__args__[0])

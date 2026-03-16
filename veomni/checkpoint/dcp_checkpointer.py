@@ -59,22 +59,24 @@ class ModelState(Stateful):
     def __init__(self, model):
         self.model = model
 
-        # Determine whether this is EP+FSDP2 case
-        # If so, we need to restore EP-dim before saving to DCP
+        # Determine whether this is ExtraParallel+FSDP2 case
+        # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
         # For FSDP1, it is implemented by FSDPExtension and state_dict hooks
         # which is aumatically triggered by get_model_state_dict
         self.parallel_state = get_parallel_state()
-        self.ep_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
-        self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
+        self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
+        self.should_extra_parallel_aware = (
+            self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
+        )
 
     @torch.no_grad()
     def state_dict(self):
         model_state_dict = get_model_state_dict(model=self.model)
-        if self.should_ep_aware:
+        if self.should_extra_parallel_aware:
             logger.info_rank0(
-                "Getting model state_dict from ModelState wrapper, would restore EP dim for Experts module"
+                "Getting model state_dict from ModelState wrapper, would restore Paralit dim for Paralit (e.g. Experts/Embeds) module"
             )
-            model_state_dict = self.get_state_dict_with_ep_dim_preprocess(model_state_dict, "restore")
+            model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "restore")
 
         return model_state_dict
 
@@ -82,36 +84,63 @@ class ModelState(Stateful):
     def load_state_dict(self, state_dict):
         """
         perform the reverse operation for state_dict()
-        need to drop EP-dim when loading from DCP checkpoints
-        so that EP-FSDP would not be confused
+        need to drop ExtraParallel-dim when loading from DCP checkpoints
+        so that ExtraParallel-FSDP would not be confused
         """
         model_state_dict = state_dict
-        if self.should_ep_aware:
-            model_state_dict = self.get_state_dict_with_ep_dim_preprocess(model_state_dict, "drop")
+        if self.should_extra_parallel_aware:
+            model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
 
         set_model_state_dict(model=self.model, model_state_dict=model_state_dict)
 
-    def get_state_dict_with_ep_dim_preprocess(self, state_dict, action):
-        ep_fqn2spec_info = self.ep_fqn2spec_info
-        assert ep_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
+    def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
+        extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
+        assert extra_parallel_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
 
-        ep_mesh = self.parallel_state.ep_fsdp_device_mesh["ep"]
-        assert ep_mesh is not None
+        extra_parallel_mesh = {
+            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para][para]
+            if self.parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
+            else None
+            for para in self.parallel_state.extra_parallel_names
+        }
 
-        global_device_mesh = self.parallel_state.ep_fsdp_device_mesh
-        assert global_device_mesh.ndim == 2
+        assert any(para_mesh is not None for para_mesh in extra_parallel_mesh.values()), (
+            "At least one extra_parallel mesh should be not None"
+        )
+
+        global_extra_parallel_device_mesh = {
+            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para]
+            for para in self.parallel_state.extra_parallel_names
+        }
+        assert any(
+            global_para_device_mesh is not None and global_para_device_mesh.ndim == 2
+            for global_para_device_mesh in global_extra_parallel_device_mesh.values()
+        ), "At least one extra_parallel fsdp_device_mesh should be not None"
 
         assert action in ["restore", "drop"]
 
         keys = list(state_dict.keys())
         for name in sorted(keys):
-            if name in ep_fqn2spec_info and isinstance(ep_fqn2spec_info[name].placement, Shard):
-                cur_spec_info = ep_fqn2spec_info[name]
+            if name in extra_parallel_fqn2spec_info and isinstance(
+                extra_parallel_fqn2spec_info[name].placement, Shard
+            ):
+                cur_spec_info = extra_parallel_fqn2spec_info[name]
+                assert cur_spec_info.para_fsdp_mesh is not None, (
+                    f"ExtraParallel spec {name} must have either ExtraParallel FSDP mesh"
+                )
+
                 tensor = state_dict[name]
+
                 if action == "drop":
-                    tensor = drop_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+                    tensor = drop_extra_parallel_dim(
+                        tensor, cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"]
+                    )
                 else:
-                    tensor = restore_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+                    tensor = restore_extra_parallel_dim(
+                        tensor,
+                        cur_spec_info.para_fsdp_mesh,
+                        cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"],
+                    )
                 state_dict[name] = tensor
 
         return state_dict
@@ -128,22 +157,28 @@ class OptimizerState(Stateful):
     def __init__(self, model, optimizer):
         self.model = model
         self.optimizer = optimizer
-        # Similar to ModelState, OptimizerState also need to be EP+FSDP2 aware
+        # Similar to ModelState, OptimizerState also need to be ExtraParallel+FSDP2 aware
         self.parallel_state = get_parallel_state()
-        self.ep_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
-        self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
+        self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
+        self.should_extra_parallel_aware = (
+            self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
+        )
 
     def state_dict(self):
-        if self.should_ep_aware:
+        if self.should_extra_parallel_aware:
             logger.info_rank0(
-                "Getting optimizer state_dict from OptimizerState wrapper, would restore EP dim for Experts module"
+                "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
             )
-            # MultiOptimizer is only used for EP+FSDP2 case for now,
+            # MultiOptimizer is only used for ExtraParallel+FSDP2 case for now,
             # and it knows how to produce a merged, flattened dict already
-            assert self.optimizer._is_multi_optimizer, "EP is enabled but optimizer is not a MultiOptimizer instance"
+            assert self.optimizer._is_multi_optimizer, (
+                "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
+            )
             vanilla_optim_sd = self.optimizer.state_dict()
-            optim_sd_with_ep_dim = self.get_state_dict_with_ep_dim_preprocess(vanilla_optim_sd, "restore")
-            return optim_sd_with_ep_dim
+            optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                vanilla_optim_sd, "restore"
+            )
+            return optim_sd_with_extra_parallel_dim
 
         # Single torch optimizer
         sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
@@ -151,11 +186,13 @@ class OptimizerState(Stateful):
 
     def load_state_dict(self, state_dict):
         optim_state_from_dcp_load = state_dict
-        if self.should_ep_aware:
-            # we need to drop EP dim before loading them into optimizers
-            optim_state_without_ep_dim = self.get_state_dict_with_ep_dim_preprocess(optim_state_from_dcp_load, "drop")
+        if self.should_extra_parallel_aware:
+            # we need to drop ExtraParallel dim before loading them into optimizers
+            optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                optim_state_from_dcp_load, "drop"
+            )
             # Delegate to MultiOptimizer (it will split/filter correctly)
-            self.optimizer.load_state_dict(optim_state_without_ep_dim)
+            self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
             return
 
         # Single torch optimizer
@@ -165,37 +202,51 @@ class OptimizerState(Stateful):
             optim_state_dict=optim_state_from_dcp_load,
         )
 
-    def get_state_dict_with_ep_dim_preprocess(self, state_dict, action):
-        ep_fqn2spec_info = self.ep_fqn2spec_info
-        assert ep_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
+    def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
+        extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
+        assert extra_parallel_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
 
-        ep_mesh = self.parallel_state.ep_fsdp_device_mesh["ep"]
-        assert ep_mesh is not None
+        extra_parallel_mesh = {
+            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para][para]
+            if self.parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
+            else None
+            for para in self.parallel_state.extra_parallel_names
+        }
 
-        global_device_mesh = self.parallel_state.ep_fsdp_device_mesh
-        assert global_device_mesh.ndim == 2
+        assert any(para_mesh is not None for para_mesh in extra_parallel_mesh.values()), (
+            "At least one extra_parallel mesh should be not None"
+        )
+
+        global_extra_parallel_device_mesh = {
+            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para]
+            for para in self.parallel_state.extra_parallel_names
+        }
+        assert any(
+            global_para_device_mesh is not None and global_para_device_mesh.ndim == 2
+            for global_para_device_mesh in global_extra_parallel_device_mesh.values()
+        ), "At least one extra_parallel fsdp_device_mesh should be not None"
 
         assert action in ["drop", "restore"]
 
         keys = list(state_dict.keys())
-        ep_keys = list(ep_fqn2spec_info.keys())
+        extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys())
 
         for name in sorted(keys):
-            # Find EP spec whose FQN appears in the state_dict key
+            # Find ExtraParallel spec whose FQN appears in the state_dict key
             # e.g. name = "state.model.layers.0.mlp.experts.gate_proj.step"
-            #      ep_key = "model.layers.0.mlp.experts.gate_proj"
-            matches = [ep_key for ep_key in ep_keys if ep_key in name]
+            #      extra_parallel_key = "model.layers.0.mlp.experts.gate_proj"
+            matches = [extra_parallel_key for extra_parallel_key in extra_parallel_keys if extra_parallel_key in name]
             if not matches:
-                # ignore non-ep tensor
+                # ignore non-extra_parallel tensor
                 continue
 
-            # each tensor in the state dict should only belong to one EP entry
-            assert len(matches) == 1, f"Ambiguous EP spec match for state key '{name}': {matches}"
+            # each tensor in the state dict should only belong to one ExtraParallel entry
+            assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
 
-            ep_key = matches[0]
-            cur_spec_info = ep_fqn2spec_info[ep_key]
+            extra_parallel_key = matches[0]
+            cur_spec_info = extra_parallel_fqn2spec_info[extra_parallel_key]
 
-            # skip non-ep params which has Replicate placement in model spec info
+            # skip non-extra_parallel params which has Replicate placement in model spec info
             if not isinstance(cur_spec_info.placement, Shard):
                 continue
 
@@ -207,57 +258,64 @@ class OptimizerState(Stateful):
             if tensor.ndim == 0:
                 continue
 
+            assert cur_spec_info.para_fsdp_mesh is not None, (
+                f"ExtraParallel spec {name} must have either ExtraParallel FSDP mesh"
+            )
+
             if action == "drop":
-                tensor = drop_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+                tensor = drop_extra_parallel_dim(
+                    tensor, cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"]
+                )
             elif action == "restore":
-                tensor = restore_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+                tensor = restore_extra_parallel_dim(
+                    tensor,
+                    cur_spec_info.para_fsdp_mesh,
+                    cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"],
+                )
             state_dict[name] = tensor
 
         return state_dict
 
 
-def drop_ep_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
+def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
     """
-    Drop EP dims after loading from DCP so that EP-FSDP would not be confused
+    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused
     """
-    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-    ep_fsdp_mesh = device_mesh["ep_fsdp"]
 
     if len(loaded_tensor.placements) == 2:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=ep_fsdp_mesh, placements=[Shard(1)]
-        )
+        tensor_to_put = DTensor.from_local(loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(1)])
     elif len(loaded_tensor.placements) == 1:
         tensor_to_put = loaded_tensor.to_local()
     else:
         raise RuntimeError(
-            f"Expect EP paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
+            f"Expect ExtraParallel paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (ExtraParallel+FSDP), got {loaded_tensor}"
         )
 
     return tensor_to_put
 
 
-def restore_ep_dim(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh):
+def restore_extra_parallel_dim(
+    orgin_tensor: torch.Tensor, fsdp_mesh: DeviceMesh, extra_parallel_fsdp_mesh: DeviceMesh
+):
     """
-    Restore EP dim so that DCP can be aware about EP ranks
+    Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
 
     args:
         orgin_tensor (torch.Tensor): The orgin tensor.
-        device_mesh (DeviceMesh): The ep device mesh.
+        fsdp_mesh (DeviceMesh): The extra_parallel fsdp device mesh.
         shard (Shard): The shard info, default Shard(0).
 
     """
-    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-    ep_mesh = device_mesh["ep"]
+    assert fsdp_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {fsdp_mesh.ndim}"
 
     if isinstance(orgin_tensor, DTensor):
-        # EP+FSDP2
+        # ExtraParallel+FSDP2
         dtensor = DTensor.from_local(
-            orgin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
+            orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=[Shard(0), Shard(1)]
         )
     elif torch.is_tensor(orgin_tensor):
-        # If there is no FSDP but only EP
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
+        # If there is no FSDP but only ExtraParallel
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 

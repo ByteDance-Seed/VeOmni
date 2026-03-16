@@ -242,6 +242,18 @@ class AcceleratorConfig:
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
     )
+    extra_parallel_sizes: List[int] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism sizes."},
+    )
+    extra_parallel_placement_innermost: List[bool] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism outside in para-fsdp."},
+    )
+    extra_parallel_names: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Extra parallelism names."},
+    )
     pp_size: int = field(
         default=1,
         metadata={"help": "Pipeline parallel size."},
@@ -260,6 +272,12 @@ class AcceleratorConfig:
     )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
+
+    def __post_init__(self):
+        # configure extra parallelism to include expert parallelism
+        self.extra_parallel_sizes.append(self.ep_size)
+        self.extra_parallel_names.append("ep")
+        self.extra_parallel_placement_innermost.append(self.ep_outside)
 
 
 @dataclass

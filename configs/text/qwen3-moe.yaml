@@ -11,6 +11,7 @@ data:
   max_seq_len: 2048
   train_size: 750000
   text_keys: messages
+  dyn_bsz_buffer_size: 200
 
 train:
   accelerator:
@@ -26,7 +27,6 @@ train:
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
-  dyn_bsz_buffer_size: 200
   optimizer:
     type: adamw
     lr: 1.0e-4

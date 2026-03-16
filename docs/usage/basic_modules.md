@@ -82,10 +82,12 @@ init_parallel_state(
     dp_replicate_size=args.train.accelerator.dp_replicate_size, # data parallel replicate size
     dp_shard_size=args.train.accelerator.dp_shard_size, # data parallel shard degree
     tp_size=args.train.accelerator.tp_size, # tensor parallel size
-    ep_size=args.train.accelerator.ep_size, # expert parallel size
     pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
     cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
     ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
+    extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
+    extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
+    extra_parallel_names=args.train.accelerator.extra_parallel_names,
     mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
     async_enabled=args.train.accelerator.enable_async, # async ulysses
 )

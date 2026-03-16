@@ -154,6 +154,7 @@ def transformers_flash_attention_forward(
     otherwise.  It is harmless on v5.
     """
     attn_implementation = kwargs.pop("attn_implementation")
+
     return _transformers_flash_attention_forward(
         query,
         key,

@@ -13,6 +13,7 @@ data:
   data_type: plaintext
   max_seq_len: 8192
   text_keys: text
+  dyn_bsz_buffer_size: 200
 
 train:
   accelerator:
@@ -28,7 +29,6 @@ train:
   global_batch_size: 32
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
-  dyn_bsz_buffer_size: 200
   optimizer:
     type: adamw
     lr: 3.0e-4

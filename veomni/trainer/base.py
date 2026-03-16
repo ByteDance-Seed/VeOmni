@@ -208,10 +208,12 @@ class BaseTrainer(Stateful, ABC):
             dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
             dp_shard_size=self.args.train.accelerator.dp_shard_size,
             tp_size=self.args.train.accelerator.tp_size,
-            ep_size=self.args.train.accelerator.ep_size,
             pp_size=self.args.train.accelerator.pp_size,
             cp_size=self.args.train.accelerator.cp_size,
             ulysses_size=self.args.train.accelerator.ulysses_size,
+            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
+            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
+            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
             dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
             async_enabled=self.args.train.accelerator.enable_async,
         )

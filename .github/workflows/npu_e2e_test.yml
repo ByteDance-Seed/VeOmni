@@ -1,6 +1,6 @@
 # # Tests layout
 
-name: NPU unit tests
+name: NPU e2e tests
 
 on:
   # Trigger the workflow on push or pull request,
@@ -11,7 +11,7 @@ on:
       - v0.*
     paths:
       - "**/*.py"
-      - .github/workflows/npu_unit_tests.yml
+      - .github/workflows/npu_e2e_tests.yml
       - "pyproject.toml"
       - "uv.lock"
   pull_request:
@@ -19,7 +19,7 @@ on:
       - main
     paths:
       - "**/*.py"
-      - .github/workflows/npu_unit_tests.yml
+      - .github/workflows/npu_e2e_tests.yml
       - "pyproject.toml"
       - "uv.lock"
 
@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 jobs:
-  npu_unit_tests:
+  npu_e2e_tests:
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
     runs-on: [self-hosted, npu-0]
@@ -91,23 +91,14 @@ jobs:
       - name: Check final pip list
         run: |
           uv pip list
-      - name: Run parallel tests
+      - name: Run e2e training test
         run: |
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
-      - name: Run models tests
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+      - name: Sync dependencies [transformers-v5]
         run: |
-          uv run --frozen pytest -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -s -x tests/models/test_models_patch.py
-          uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
-      - name: Run fsdp2/ep+fsdp2 clip grad norm test
+          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
+      - name: Run models tests [transformers-v5]
         run: |
-          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
-      - name: Run e2e dcp save and load test
-        run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
-      - name: Run data tests
-        run: |
-          uv run --frozen pytest -s -x tests/data
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
