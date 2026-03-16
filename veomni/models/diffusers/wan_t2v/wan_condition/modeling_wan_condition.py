@@ -161,7 +161,9 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             noisy_latents = self.scheduler.scale_noise(latents, timestep, noise)
             training_target = noise - latents
 
-            use_negative_context = torch.rand((), generator=self.generator) < self.config.cfg_negative_prob
+            use_negative_context = (
+                torch.rand((), device=self.generator.device, generator=self.generator) < self.config.cfg_negative_prob
+            )
             if use_negative_context:
                 sample_context = self.negative_prompt_embeds.to(device=latents.device, dtype=sample_context.dtype)
             else:
