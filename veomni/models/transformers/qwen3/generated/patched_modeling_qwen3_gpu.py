@@ -9,18 +9,18 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: Qwen3RMSNorm
-#      Use LigerKernel RMSNorm
-#    - class_replacement: Qwen3MLP
-#      Use LigerKernel SwiGLU MLP
+#    - method_override: Qwen3RMSNorm.forward
+#      OpSlot guard for Liger fused RMSNorm (standard formulation)
+#    - method_override: Qwen3MLP.forward
+#      OpSlot guard for Liger fused SwiGLU MLP
 #    - function_replacement: apply_rotary_pos_emb
-#      Use LigerKernel rotary embedding
+#      OpSlot guard for Liger fused RoPE
 #    - method_override: Qwen3Model.forward
 #      Support SP in Qwen3Model.forward
 #    - method_override: Qwen3ForCausalLM.forward
-#      Support fused cross entropy path in Qwen3ForCausalLM.forward
+#      OpSlot guard for fused cross entropy in Qwen3ForCausalLM.forward
 #    - method_override: Qwen3ForSequenceClassification.forward
-#      Support SP in Qwen3ForSequenceClassification.forward
+#      OpSlot guard for fused cross entropy in Qwen3ForSequenceClassification.forward
 #
 # ==============================================================================
 
@@ -28,28 +28,11 @@ from collections.abc import Callable
 from typing import Optional
 
 import torch
-
-# ======================================================================
-# [PATCHED CLASS] Qwen3RMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm
-# Source: liger_kernel.transformers.rms_norm
-# ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNorm
-from liger_kernel.transformers.rms_norm import LigerRMSNorm as Qwen3RMSNorm
-
-# ======================================================================
-# [PATCHED CLASS] Qwen3MLP
-# Original class replaced with: external
-# Reason: Use LigerKernel SwiGLU MLP
-# Source: liger_kernel.transformers.swiglu
-# ======================================================================
-# Import from: liger_kernel.transformers.swiglu.LigerSwiGLUMLP
-from liger_kernel.transformers.swiglu import LigerSwiGLUMLP as Qwen3MLP
 from torch import nn
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernelized_func
+from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
@@ -58,13 +41,7 @@ from transformers.modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-
-# Additional imports for patches
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-    SequenceClassifierOutputWithPast,
-)
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -72,6 +49,77 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
+
+# Additional import blocks for patches
+# ── OpSlot declarations ──────────────────────────────────────────────────
+# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+from veomni.ops.dispatch import OpSlot
+
+
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "full")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
+veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
+
+# Additional imports for patches
+from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3RMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class Qwen3RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        Qwen3RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.has_kernel:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        # Original HF code below, unchanged.
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MLP
+# Methods patched: forward
+# ======================================================================
+
+
+class Qwen3MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
+        if veomni_swiglu_mlp.has_kernel:
+            return veomni_swiglu_mlp(self, x)
+        # Original HF code below, unchanged.
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 
 class Qwen3RotaryEmbedding(nn.Module):
@@ -148,7 +196,7 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Use LigerKernel rotary embedding
+# Reason: OpSlot guard for Liger fused RoPE
 # Source: veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(
@@ -159,16 +207,15 @@ def apply_rotary_pos_emb(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.has_kernel:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -501,14 +548,25 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         loss = None
         logits = None
         if labels is not None:
-            loss, logits = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
+            # Modification: OpSlot guard for cross-entropy loss.
+            if veomni_cross_entropy_loss.has_kernel:
+                loss, logits = veomni_cross_entropy_loss(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+            else:
+                loss, logits = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
 
@@ -555,14 +613,25 @@ class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreT
         loss = None
         logits = None
         if labels is not None:
-            loss, logits = self.loss_function(
-                logits=logits,
-                labels=labels,
-                num_labels=self.num_labels,
-                hidden_states=hidden_states,
-                weights=self.score.weight,
-                **kwargs,
-            )
+            # Modification: OpSlot guard for cross-entropy loss.
+            if veomni_cross_entropy_loss.has_kernel:
+                loss, logits = veomni_cross_entropy_loss(
+                    logits=logits,
+                    labels=labels,
+                    num_labels=self.num_labels,
+                    hidden_states=hidden_states,
+                    weights=self.score.weight,
+                    **kwargs,
+                )
+            else:
+                loss, logits = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    num_labels=self.num_labels,
+                    hidden_states=hidden_states,
+                    weights=self.score.weight,
+                    **kwargs,
+                )
         else:
             logits = self.score(hidden_states)
 

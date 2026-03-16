@@ -116,12 +116,27 @@ KERNEL_REGISTRY.register(
 
 # ── Liger SwiGLU MLP ─────────────────────────────────────────────────────────
 
+
+def _liger_swiglu_factory():
+    """Return a functional SwiGLU MLP kernel using LigerSiLUMulFunction.
+
+    Matches LigerSwiGLUMLP.forward in:
+    https://github.com/linkedin/Liger-Kernel/blob/v0.7.0/src/liger_kernel/transformers/swiglu.py
+    """
+    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+    def liger_swiglu_forward(self, x):
+        return self.down_proj(LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
+
+    return liger_swiglu_forward
+
+
 KERNEL_REGISTRY.register(
     KernelSpec(
         name="liger",
         op_name="swiglu_mlp",
         variant="standard",
-        factory=lambda: __import__("liger_kernel.transformers.swiglu", fromlist=["LigerSwiGLUMLP"]).LigerSwiGLUMLP,
+        factory=_liger_swiglu_factory,
         hardware=HardwareRequirement(device_type="cuda"),
         description="LigerKernel fused SwiGLU MLP",
     )

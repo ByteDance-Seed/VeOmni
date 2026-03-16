@@ -598,6 +598,20 @@ class OpsImplementationConfig:
             "'eager' for standard PyTorch, 'liger' for LigerKernel fused RMSNorm."
         },
     )
+    swiglu_mlp_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "SwiGLU MLP kernel implementation. "
+            "'eager' for standard PyTorch, 'liger' for LigerKernel fused SwiGLU."
+        },
+    )
+    apply_rotary_pos_emb_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Rotary positional embedding kernel implementation. "
+            "'eager' for standard PyTorch, 'liger' for LigerKernel fused RoPE."
+        },
+    )
 
     # Map from user-facing moe_implementation values to kernel registry names.
     _MOE_IMPL_TO_KERNEL = {
