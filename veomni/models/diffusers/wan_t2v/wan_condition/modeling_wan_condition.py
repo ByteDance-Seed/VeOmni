@@ -14,13 +14,6 @@ from .....utils import logging
 from .configuration_wan_condition import WanTransformer3DConditionModelConfig
 
 
-def vis_video(video: torch.Tensor):
-    from veomni.data.multimodal.video_utils import save_video_tensors_to_file
-
-    video = video.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)
-    save_video_tensors_to_file(video, "video.mp4", fps=24)
-
-
 logger = logging.get_logger(__name__)
 
 
@@ -204,6 +197,7 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             "timestep": [],
             "encoder_hidden_states": [],
             "training_target": [],
+            "latents": [],
         }
         for sample_latents, sample_context in zip(latents, context):
             latents = DiagonalGaussianDistribution(sample_latents).mode()
@@ -238,5 +232,6 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             packed_conditions["timestep"].append(timestep)
             packed_conditions["encoder_hidden_states"].append(sample_context)
             packed_conditions["training_target"].append(training_target)
+            packed_conditions["latents"].append(latents)
 
         return packed_conditions

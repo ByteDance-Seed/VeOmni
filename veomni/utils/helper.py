@@ -106,6 +106,23 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     return image_seqlens
 
 
+def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    dit_latents_seqlens = []
+    for latents in micro_batch["latents"]:
+        latent_shape = latents.shape
+        if len(latent_shape) == 5:
+            B = latent_shape[0]
+        else:
+            B = 1
+        C, T, H, W = latent_shape[-4:]
+        T_out = int((T - 1) / 1 + 1)
+        H_out = int((H - 2) / 2 + 1)
+        W_out = int((W - 2) / 2 + 1)
+        seqlens = B * T_out * H_out * W_out
+        dit_latents_seqlens.append(seqlens)
+    return dit_latents_seqlens
+
+
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     ds_idx = micro_batch.pop("ds_idx")
     micro_batch.pop("source_name", None)
@@ -197,8 +214,7 @@ class EnvironMeter:
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
         else:  # dit diffusers model
-            # TODO: dit environ_meter
-            self.batch_seqlens.extend([0])
+            self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0:

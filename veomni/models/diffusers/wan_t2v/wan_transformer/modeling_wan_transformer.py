@@ -325,6 +325,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformer3DModel):
 
     def forward(
         self,
+        latents: torch.Tensor,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
