@@ -40,7 +40,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.patchgen.patch_spec import PatchConfig
+from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
 from veomni.utils.device import get_device_id
 
 
@@ -59,6 +59,15 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
+config.patches.append(
+    create_patch_from_external(
+        target="Qwen3_5RMSNorm",
+        replacement_module="liger_kernel.transformers.rms_norm",
+        replacement_name="LigerRMSNormForQwen3Next",
+        description="Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)",
+    )
+)
+
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -82,6 +91,7 @@ config.add_post_import_block(
         causal_conv1d_update, causal_conv1d_fn = None, None
         logging.get_logger(__name__).warning(
             "Failed to import FLA modules: fallback to eager implementation."
+            "This case can't support dynamic batching packing!"
         )
     """
 )

@@ -17,9 +17,9 @@
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property, wraps
-from typing import TYPE_CHECKING, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import distributed as dist
@@ -54,22 +54,24 @@ def requires_mesh(fn: Callable) -> Callable:
     return _inner
 
 
-def init_ep_mesh_matrix(ep_size: int, ep_fsdp_size: int, ep_outside: bool = False) -> "DeviceMesh":
+def init_para_mesh_matrix(para_size: int, para_fsdp_size: int, para_outside: bool = False) -> "DeviceMesh":
     """
-    Initialize the device mesh matrix for the EP.
+    Initialize the device mesh matrix for the XXX_Parallel.
     Args:
-        ep_size (int): The size of the EP.
-        ep_fsdp_size (int): The size of the EP-FSDP.
-        ep_outside (bool): Whether the EP is outside in ep-fsdp group.
+        para_size (int): The size of the XXX_Parallel.
+        para_fsdp_size (int): The size of the XXX_Parallel-FSDP.
+        para_outside (bool): Whether the XXX_Parallel is outside in para-fsdp group.
     """
-    if ep_outside:
+    if para_outside:
         with torch.device("cpu"):
-            mesh = torch.arange(math.prod((ep_size, ep_fsdp_size)), dtype=torch.int).view(ep_size, ep_fsdp_size)
+            mesh = torch.arange(math.prod((para_size, para_fsdp_size)), dtype=torch.int).view(
+                para_size, para_fsdp_size
+            )
     else:
         with torch.device("cpu"):
             mesh = (
-                torch.arange(math.prod((ep_size, ep_fsdp_size)), dtype=torch.int)
-                .view(ep_fsdp_size, ep_size)
+                torch.arange(math.prod((para_size, para_fsdp_size)), dtype=torch.int)
+                .view(para_fsdp_size, para_size)
                 .transpose(0, 1)
             )
     return mesh
@@ -81,7 +83,6 @@ class ParallelState:
     dp_replicate_size: int = 1
     dp_shard_size: int = 1
     tp_size: int = 1
-    ep_size: int = 1
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
@@ -89,7 +90,9 @@ class ParallelState:
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
-    ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
+    extra_parallel_names: Tuple[str] = ("ep",)
+    extra_parallel_sizes: Dict[str, int] = field(default_factory=lambda: {"ep": 1})
+    extra_parallel_fsdp_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
 
     def __post_init__(self):
@@ -320,35 +323,62 @@ class ParallelState:
     @property
     @requires_mesh
     def ep_mesh(self) -> "DeviceMesh":
-        return self.ep_fsdp_device_mesh["ep"]
+        return self.extra_parallel_mesh("ep")
 
     @property
     @requires_mesh
     def ep_fsdp_mesh(self) -> "DeviceMesh":
-        return self.ep_fsdp_device_mesh["ep", "ep_fsdp"]
+        return self.extra_parallel_fsdp_mesh("ep")
 
     @cached_property
     def ep_group(self) -> "ProcessGroup":
-        if self.ep_enabled:
-            return self.ep_mesh.get_group()
-        else:
-            return None
+        return self.extra_parallel_group("ep")
 
     @property
     def ep_enabled(self) -> bool:
-        return self.ep_size > 1
+        return self.extra_parallel_enabled("ep")
 
     @property
     def ep_rank(self) -> int:
-        return self.ep_fsdp_device_mesh.get_local_rank("ep")
+        return self.extra_parallel_rank("ep")
 
     @property
     def ep_fsdp_size(self) -> int:
-        assert self.ep_enabled, "ep_fsdp_size is only available when ep is enabled (ep_size > 1)"
-        return self.fsdp_size // self.ep_size
+        return self.extra_parallel_fsdp_size("ep")
 
     @property
     def ep_gradient_divide_factor(self) -> int:
+        return self.extra_parallel_gradient_divide_factor("ep")
+
+    # ------------------------------ Parallel list ------------------------------ #
+    @requires_mesh
+    def extra_parallel_mesh(self, para_name) -> "DeviceMesh":
+        return self.extra_parallel_fsdp_device_mesh[para_name][para_name]
+
+    @requires_mesh
+    def extra_parallel_fsdp_mesh(self, para_name) -> "DeviceMesh":
+        return self.extra_parallel_fsdp_device_mesh[para_name][para_name, f"{para_name}_fsdp"]
+
+    @requires_mesh
+    def extra_parallel_group(self, para_name) -> "ProcessGroup":
+        if self.extra_parallel_enabled(para_name):
+            return self.extra_parallel_mesh(para_name).get_group()
+        else:
+            return None
+
+    def extra_parallel_enabled(self, para_name) -> bool:
+        return self.extra_parallel_sizes[para_name] > 1
+
+    def extra_parallel_rank(self, para_name) -> int:
+        return self.extra_parallel_fsdp_device_mesh[para_name].get_local_rank(para_name)
+
+    def extra_parallel_fsdp_size(self, para_name) -> int:
+        assert self.extra_parallel_enabled(para_name), (
+            f"{para_name}_fsdp_size is only available when {para_name} is enabled ({para_name}_size > 1)"
+        )
+        return self.fsdp_size // self.extra_parallel_sizes[para_name]
+
+    def extra_parallel_gradient_divide_factor(self, para_name) -> int:
         # We assume the world size is the total dp size by now
         # TP and PP would make this assumption not true
         assert self.tp_size == 1
@@ -357,6 +387,10 @@ class ParallelState:
         # SP does not affect this since SP groups still replicate params
         # and their grads are all-reduced which would match grads for the same data without SP.
         return self.world_size
+
+    @property
+    def any_extra_parallel_enabled(self) -> bool:
+        return any(self.extra_parallel_enabled(para_name) for para_name in self.extra_parallel_names)
 
     # ------------------------------ SP ------------------------------ #
     @property
@@ -453,14 +487,15 @@ def init_parallel_state(
     dp_replicate_size: int = 1,
     dp_shard_size: int = 1,
     tp_size: int = 1,
-    ep_size: int = 1,
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
     dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
-    ep_outside: bool = False,
+    extra_parallel_sizes: Tuple[int] = (1,),
+    extra_parallel_placement_innermost: Tuple[bool] = (1,),
+    extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
 ) -> None:
     """
@@ -478,11 +513,23 @@ def init_parallel_state(
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
         dp_shard_size = dp_size
 
+    assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names)
+
     logger.info_rank0(
-        f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size}, tp_size {tp_size}, pp_size {pp_size}, ep_size {ep_size}, cp_size {cp_size}, ulysses_size {ulysses_size}"
+        f"Initializing parallel state: dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, "
+        + f"dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, cp_size {cp_size}, ulysses_size {ulysses_size}, "
+        + ", ".join(
+            [
+                f"{para_name}_size {para_size}"
+                for para_name, para_size in zip(extra_parallel_names, extra_parallel_sizes)
+            ]
+        )
     )
 
-    device_mesh, ep_fsdp_device_mesh = None, None
+    device_mesh = None
+
+    extra_parallel_fsdp_device_mesh = {f"{para_name}": None for para_name in extra_parallel_names}
+
     if is_torch_version_greater_than("2.4"):
         mesh_shape = []
         mesh_dim_names = []
@@ -537,27 +584,31 @@ def init_parallel_state(
         if sp_mesh_dim_names != []:
             device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
 
-        if ep_size > 1:
-            world_size = dist.get_world_size()
-            assert world_size % ep_size == 0, "ep_size must be a factor of world_size"
-            ep_fsdp_size = world_size // ep_size
-
-            mesh = init_ep_mesh_matrix(ep_size=ep_size, ep_fsdp_size=ep_fsdp_size, ep_outside=ep_outside)
-            ep_fsdp_device_mesh = DeviceMesh(
-                device_type=device_type,
-                mesh=mesh,
-                mesh_dim_names=("ep", "ep_fsdp"),
-            )
+        for para_size, para_outside, para_name in zip(
+            extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
+        ):
+            if para_size > 1:
+                world_size = dist.get_world_size()
+                assert world_size % para_size == 0, f"{para_name}_size must be a factor of world_size"
+                para_fsdp_size = world_size // para_size
+                mesh = init_para_mesh_matrix(
+                    para_size=para_size, para_fsdp_size=para_fsdp_size, para_outside=para_outside
+                )
+                extra_parallel_fsdp_device_mesh[f"{para_name}"] = DeviceMesh(
+                    device_type=device_type,
+                    mesh=mesh,
+                    mesh_dim_names=(para_name, f"{para_name}_fsdp"),
+                )
 
         logger.info_rank0(f"Device mesh: {device_mesh}")
-        logger.info_rank0(f"EP FSDP device mesh: {ep_fsdp_device_mesh}")
+        for para_name in extra_parallel_names:
+            logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
 
     _PARALLEL_STATE = ParallelState(
         dp_size=dp_size,
         dp_replicate_size=dp_replicate_size,
         dp_shard_size=dp_shard_size,
         tp_size=tp_size,
-        ep_size=ep_size,
         pp_size=pp_size,
         cp_size=cp_size,
         ulysses_size=ulysses_size,
@@ -565,7 +616,9 @@ def init_parallel_state(
         device_type=device_type,
         include_sp_in_fsdp=include_sp_in_fsdp,
         device_mesh=device_mesh,
-        ep_fsdp_device_mesh=ep_fsdp_device_mesh,
+        extra_parallel_names=extra_parallel_names,
+        extra_parallel_sizes=dict(zip(extra_parallel_names, extra_parallel_sizes)),
+        extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
         async_enabled=async_enabled,
     )
 

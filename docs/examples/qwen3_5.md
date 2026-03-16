@@ -26,11 +26,11 @@ pq.write_table(table_first_2000, output_path)
 
 ## Download Qwen3.5 model
 
-Dense 27B:
+Dense 9B:
 ```shell
 python3 scripts/download_hf_model.py \
-    --repo_id Qwen/Qwen3.5-27B \
-    --local_dir ${HOME}/Qwen3.5-27B
+    --repo_id Qwen/Qwen3.5-9B \
+    --local_dir ${HOME}/Qwen3.5-9B
 ```
 
 
@@ -44,15 +44,11 @@ python3 scripts/download_hf_model.py \
 
 Testing in 8x80GB GPUs.
 
-Qwen3.5 Dense 27B:
+Qwen3.5 Dense 9B:
 ```shell
-# Note: max_seq_len is set to 128 to avoid OOM with 8x80GB GPUs since the only currently available
-# Qwen3.5 model size is 27B.
-# We recommend that you use more GPUs to train Qwen3.5 27B so that you can get a proper seq len.
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
-    --model.model_path ${HOME}/Qwen3.5-27B \
+    --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --data.max_seq_len 128 \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.max_steps 20 \
@@ -84,7 +80,7 @@ equal `data_parallel_size * ulysses_parallel_size`.
 ```shell
 # Example: 8 GPUs, dp=4, sp=2
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
-    --model.model_path ${HOME}/Qwen3.5-27B \
+    --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --train.data_parallel_size 4 \
     --train.ulysses_parallel_size 2 \

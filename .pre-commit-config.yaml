@@ -20,6 +20,7 @@ repos:
       hooks:
           - id: pyupgrade
             args: [--py38-plus]
+            exclude: ^veomni/models/transformers/.*/generated/.*\.py$
 
     - repo: https://github.com/astral-sh/ruff-pre-commit
       rev: v0.13.1
@@ -27,4 +28,3 @@ repos:
           - id: ruff
             args: [--fix]
           - id: ruff-format
-            exclude: ^veomni/models/transformers/.*/generated/.*\.py$

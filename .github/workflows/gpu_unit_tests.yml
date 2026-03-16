@@ -94,9 +94,9 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
-      - name: Run fsdp2/ep+fsdp2 clip grad norm test
+      - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
-          uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
@@ -117,6 +117,11 @@ jobs:
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
+      - name: Run utils tests [transformers-v5]
+        # TODO: run all tests under tests/utils/ once all util tests are verified
+        run: |
+          # Need v5 to support newer models like Qwen3.5 count flops tests.
+          uv run --frozen pytest -s -x tests/utils/test_count_flops.py
       # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:
