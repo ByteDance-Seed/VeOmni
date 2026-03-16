@@ -64,6 +64,8 @@ jobs:
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
       CI_SAMPLES_DIR: "/data00/assets/samples"
+      CI_MODEL_DIR: "/data00/assets/models/Qwen"
+      CI_DATASET_DIR: "/data00/assets/dataset"
 
     steps:
       - name: Set up proxy
