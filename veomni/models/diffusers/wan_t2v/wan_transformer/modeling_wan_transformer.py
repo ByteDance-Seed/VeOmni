@@ -100,7 +100,6 @@ class WanSPAttnProcessor:
             image_context_length = encoder_hidden_states.shape[1] - 512
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
         query = attn.norm_q(query)
         key = attn.norm_k(key)
@@ -170,7 +169,7 @@ def apply_veomni_wan_sp_patch() -> None:
     _original_forward = _WanTransformer3DModel.forward
 
     def _sp_forward(
-        self,
+        self: _WanTransformer3DModel,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
@@ -225,7 +224,6 @@ def apply_veomni_wan_sp_patch() -> None:
             freqs_cos = freqs_cos[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
             freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
             rotary_emb = (freqs_cos, freqs_sin)
-
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
