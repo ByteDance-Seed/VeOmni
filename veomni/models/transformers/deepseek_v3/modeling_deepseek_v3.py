@@ -184,6 +184,13 @@ class PatchDeepseekV3MoE(nn.Module):
 # PATCH: DeepseekV3Attention.forward
 # 1. Support for veomni attention implementation
 # ================================================================
+
+FA2_TYPES = [
+    "flash_attention_2",
+    "veomni_flash_attention_2_with_sp",
+]
+
+
 def deepseek_v3_attention_forward(
     self: DeepseekV3Attention,
     hidden_states: torch.Tensor,
@@ -230,7 +237,7 @@ def deepseek_v3_attention_forward(
     # --- Patch.1 ---
     # Flash Attention 2 requires Q/K and V to have the same head dimension for Ampere GPUs.
     # For DeepSeek V3 MLA architecture where qk_head_dim != v_head_dim, we pad V to match Q/K.
-    if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+    if self.config._attn_implementation in FA2_TYPES and self.qk_head_dim != self.v_head_dim:
         value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
     # --- Patch.1 ---
 
@@ -251,7 +258,7 @@ def deepseek_v3_attention_forward(
 
     # --- Patch.1 ---
     # Truncate the output back to the original v_head_dim after Flash Attention 2.
-    if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+    if self.config._attn_implementation in FA2_TYPES and self.qk_head_dim != self.v_head_dim:
         attn_output = attn_output[:, :, :, : self.v_head_dim]
     # --- Patch.1 ---
 
