@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as _WanTransformer3DModel
 from diffusers.models.transformers.transformer_wan import (
+    WanAttention,
+    WanAttnProcessor,
     _get_added_kv_projections,
     _get_qkv_projections,
 )
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -26,66 +31,39 @@ from .configuration_wan_transformer import WanTransformer3DModelConfig
 
 logger = logging.get_logger(__name__)
 
-_VEOMNI_SP_ATTN_IMPLS = frozenset(
-    {
-        "veomni_flash_attention_2_with_sp",
-        "veomni_flash_attention_3_with_sp",
-        "veomni_flash_attention_4_with_sp",
-    }
-)
+
+# ================================================================
+# Eager attention forward for WanTransformer (SDPA fallback).
+# Inputs/output follow the ALL_ATTENTION_FUNCTIONS convention:
+#   input : (B, heads, seq, head_dim)
+#   output: (B, seq,   heads, head_dim), None
+# ================================================================
+def wan_eager_attention_forward(
+    module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask=None,
+    scaling: float | None = None,
+    dropout: float = 0.0,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    attn_output = F.scaled_dot_product_attention(
+        query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
+    )
+    return attn_output.transpose(1, 2), None
 
 
-def _get_flash_attn_fn(attn_implementation: str):
-    """Return the flash-attention callable matching *attn_implementation*."""
-    if attn_implementation in ("veomni_flash_attention_2_with_sp", "flash_attention_2"):
-        from flash_attn import flash_attn_func
-
-        return flash_attn_func
-    elif attn_implementation in ("veomni_flash_attention_3_with_sp", "flash_attention_3"):
-        from flash_attn_interface import flash_attn_func
-
-        return flash_attn_func
-    elif attn_implementation == "veomni_flash_attention_4_with_sp":
-        from flash_attn.cute import flash_attn_func
-
-        return flash_attn_func
-    return None
-
-
-class WanSPAttnProcessor:
-    """Flash-attention processor with Ulysses sequence-parallelism for WanTransformer.
-
-    For self-attention this processor performs the standard Ulysses AllToAll before
-    and after flash attention so that each rank holds a full-sequence slice with
-    scattered heads.  For cross-attention the query slice is kept local while K/V
-    are replicated across ranks, which is equivalent to skipping the AllToAll.
-
-    The ``apply_rotary_emb`` logic is intentionally identical to the one inside
-    ``WanAttnProcessor`` so that RoPE is applied correctly to the local sequence
-    slice *before* the AllToAll.
-    """
-
-    def __init__(self, flash_attn_fn):
-        self.flash_attn_fn = flash_attn_fn
-
-    @staticmethod
-    def _apply_rotary_emb(
-        hidden_states: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Identical to the inner ``apply_rotary_emb`` in diffusers WanAttnProcessor."""
-        x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-        cos = freqs_cos[..., 0::2]
-        sin = freqs_sin[..., 1::2]
-        out = torch.empty_like(hidden_states)
-        out[..., 0::2] = x1 * cos - x2 * sin
-        out[..., 1::2] = x1 * sin + x2 * cos
-        return out.type_as(hidden_states)
+class WanSPAttnProcessor(WanAttnProcessor):
+    def __init__(self, attn_implementation: str):
+        self.attn_implementation = attn_implementation
+        # build config for veomni_flash_attention_forward
+        self.config = SimpleNamespace(_attn_implementation=attn_implementation)
+        super().__init__()
 
     def __call__(
         self,
-        attn,
+        attn: WanAttention,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -101,46 +79,82 @@ class WanSPAttnProcessor:
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+
         query = attn.norm_q(query)
         key = attn.norm_k(key)
 
-        # Reshape to (B, seq, heads, head_dim)
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
-        # Apply RoPE on the per-rank sequence slice *before* Ulysses AllToAll so
-        # that each token gets the embedding for its global position index.
         if rotary_emb is not None:
-            query = self._apply_rotary_emb(query, *rotary_emb)
-            key = self._apply_rotary_emb(key, *rotary_emb)
 
-        # Ulysses SP for self-attention: scatter heads, gather full sequence.
-        # Cross-attention skips AllToAll because encoder states are replicated.
-        ulysses_enabled = get_parallel_state().ulysses_enabled
-        if ulysses_enabled and not is_cross_attention:
-            ulysses_group = get_parallel_state().ulysses_group
-            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=ulysses_group)
-            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=ulysses_group)
-            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=ulysses_group)
+            def apply_rotary_emb(
+                hidden_states: torch.Tensor,
+                freqs_cos: torch.Tensor,
+                freqs_sin: torch.Tensor,
+            ):
+                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos[..., 0::2]
+                sin = freqs_sin[..., 1::2]
+                out = torch.empty_like(hidden_states)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.type_as(hidden_states)
+
+            query = apply_rotary_emb(query, *rotary_emb)
+            key = apply_rotary_emb(key, *rotary_emb)
+
+        if get_parallel_state().sp_enabled and not is_cross_attention:
+            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+
+        # Route to the right attention kernel via ALL_ATTENTION_FUNCTIONS.
+        # SP has already been handled above, so skip it inside the kernel.
+        attention_interface: Callable = wan_eager_attention_forward
+        if self.attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
 
         # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
             key_img = attn.norm_added_k(key_img)
+
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
-            hidden_states_img = self.flash_attn_fn(query, key_img, value_img)
+            hidden_states_img = attention_interface(
+                self,
+                query.transpose(1, 2),
+                key_img.transpose(1, 2),
+                value_img.transpose(1, 2),
+                attention_mask=None,
+                dropout=0.0,
+                is_causal=False,
+                skip_ulysses=True,
+            )[0]
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
-        hidden_states_out = self.flash_attn_fn(query, key, value)
+        hidden_states_out = attention_interface(
+            self,
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attention_mask=None,
+            dropout=0.0,
+            is_causal=False,
+            skip_ulysses=True,
+        )[0]
 
         # Inverse AllToAll: scatter sequence, gather heads back.
-        if ulysses_enabled and not is_cross_attention:
-            hidden_states_out = gather_heads_scatter_seq(hidden_states_out, seq_dim=1, head_dim=2, group=ulysses_group)
+        if get_parallel_state().sp_enabled and not is_cross_attention:
+            hidden_states_out = gather_heads_scatter_seq(
+                hidden_states_out, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
+            )
 
-        hidden_states_out = hidden_states_out.flatten(2, 3).type_as(query)
+        hidden_states_out = hidden_states_out.flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
 
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
@@ -150,135 +164,97 @@ class WanSPAttnProcessor:
         return hidden_states_out
 
 
-def apply_veomni_wan_sp_patch() -> None:
-    """Monkey-patch ``_WanTransformer3DModel.forward`` with Ulysses SP support.
+# ================================================================
+# Patch: WanTransformer3DModel.forward
+# 1. Slice the patchified sequence across Ulysses SP ranks before the
+#    transformer blocks, and gather it back before the output head.
+# ================================================================
+def WanTransformer3DModel_forward(
+    self: _WanTransformer3DModel,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states_image: torch.Tensor | None = None,
+    **kwargs,
+):
+    batch_size, num_channels, num_frames, height, width = hidden_states.shape
+    p_t, p_h, p_w = self.config.patch_size
+    post_patch_num_frames = num_frames // p_t
+    post_patch_height = height // p_h
+    post_patch_width = width // p_w
 
-    The patch is structurally identical to the original diffusers forward but
-    inserts two SP operations:
+    # 1. Rotary position embeddings for the full sequence
+    rotary_emb = self.rope(hidden_states)
+    # 2. Patch embedding: (B, C, F, H, W) → (B, seq, inner_dim)
+    hidden_states = self.patch_embedding(hidden_states)
+    hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-    1. **Sequence slice** (with gradient scaling) after patchification – each SP
-       rank processes a contiguous chunk of video tokens.
-    2. **Sequence gather** before the output head – all ranks see the full output
-       so that the loss is identical across SP ranks.
+    # 3. Condition embedding
+    if timestep.ndim == 2:
+        ts_seq_len = timestep.shape[1]
+        timestep = timestep.flatten()
+    else:
+        ts_seq_len = None
 
-    Slicing only takes effect when BOTH ``ulysses_enabled`` is True AND an SP-aware
-    attention implementation (``veomni_flash_attention_*_with_sp``) is configured.
-    Without the SP attention processor the required AllToAll in self-attention
-    would be absent, making sequence slicing incorrect.
-    """
-    _original_forward = _WanTransformer3DModel.forward
+    temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+        timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
+    )
+    if ts_seq_len is not None:
+        timestep_proj = timestep_proj.unflatten(2, (6, -1))
+    else:
+        timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
-    def _sp_forward(
-        self: _WanTransformer3DModel,
-        hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        encoder_hidden_states_image: torch.Tensor | None = None,
-        **kwargs,
-    ):
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        p_t, p_h, p_w = self.config.patch_size
-        post_patch_num_frames = num_frames // p_t
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
+    if encoder_hidden_states_image is not None:
+        encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-        # 1. Rotary position embeddings for the full sequence
-        rotary_emb = self.rope(hidden_states)
-        # 2. Patch embedding: (B, C, F, H, W) → (B, seq, inner_dim)
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+    if get_parallel_state().sp_enabled:
+        hidden_states = slice_input_tensor_scale_grad(hidden_states, dim=1)
 
-        # 3. Condition embedding
-        if timestep.ndim == 2:
-            ts_seq_len = timestep.shape[1]
-            timestep = timestep.flatten()
-        else:
-            ts_seq_len = None
+        # Slice rotary embeddings to the local rank's positions (no gradient).
+        freqs_cos, freqs_sin = rotary_emb
+        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_rank = get_parallel_state().ulysses_rank
+        seq_len = freqs_cos.shape[1]
+        chunk = seq_len // ulysses_size
+        freqs_cos = freqs_cos[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
+        freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
+        rotary_emb = (freqs_cos, freqs_sin)
+    # 4. Transformer blocks
+    if torch.is_grad_enabled() and self.gradient_checkpointing:
+        for block in self.blocks:
+            hidden_states = self._gradient_checkpointing_func(
+                block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+            )
+    else:
+        for block in self.blocks:
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
-        )
-        if ts_seq_len is not None:
-            timestep_proj = timestep_proj.unflatten(2, (6, -1))
-        else:
-            timestep_proj = timestep_proj.unflatten(1, (6, -1))
+    # SP: gather before output head – every rank holds the full sequence so
+    # that the loss is identical across SP ranks.
+    if get_parallel_state().sp_enabled:
+        hidden_states = gather_outputs(hidden_states, gather_dim=1)
 
-        if encoder_hidden_states_image is not None:
-            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+    # 5. Output: norm → projection → unpatchify
+    if temb.ndim == 3:
+        shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
+        shift = shift.squeeze(2)
+        scale = scale.squeeze(2)
+    else:
+        shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
 
-        # SP: slice the sequence only when a SP-aware attention processor is
-        # installed. Without ``WanSPAttnProcessor`` the self-attention lacks the
-        # AllToAll that is required for Ulysses SP to be correct.
-        attn_impl = getattr(self.config, "_attn_implementation", None)
-        _sp_active = get_parallel_state().ulysses_enabled and (attn_impl in _VEOMNI_SP_ATTN_IMPLS)
+    shift = shift.to(hidden_states.device)
+    scale = scale.to(hidden_states.device)
+    hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+    hidden_states = self.proj_out(hidden_states)
 
-        if _sp_active:
-            hidden_states = slice_input_tensor_scale_grad(hidden_states, dim=1)
+    hidden_states = hidden_states.reshape(
+        batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+    )
+    hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+    output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
-            # Slice rotary embeddings to the local rank's positions (no gradient).
-            freqs_cos, freqs_sin = rotary_emb
-            ulysses_size = get_parallel_state().ulysses_size
-            ulysses_rank = get_parallel_state().ulysses_rank
-            seq_len = freqs_cos.shape[1]
-            chunk = seq_len // ulysses_size
-            freqs_cos = freqs_cos[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-            freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-            rotary_emb = (freqs_cos, freqs_sin)
-        # 4. Transformer blocks
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for block in self.blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
-                )
-        else:
-            for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
-
-        # SP: gather before output head – every rank holds the full sequence so
-        # that the loss is identical across SP ranks.
-        if _sp_active:
-            hidden_states = gather_outputs(hidden_states, gather_dim=1)
-
-        # 5. Output: norm → projection → unpatchify
-        if temb.ndim == 3:
-            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
-            shift = shift.squeeze(2)
-            scale = scale.squeeze(2)
-        else:
-            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
-
-        shift = shift.to(hidden_states.device)
-        scale = scale.to(hidden_states.device)
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
-        hidden_states = self.proj_out(hidden_states)
-
-        hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
-        )
-        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-
-        # Return a plain tensor to simplify the DiT wrapper's forward.
-        return output
-
-    _WanTransformer3DModel.forward = _sp_forward
-    logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
-
-
-def _setup_sp_attention(model: _WanTransformer3DModel, attn_implementation: str) -> None:
-    """Install ``WanSPAttnProcessor`` in every transformer block of *model*."""
-    flash_attn_fn = _get_flash_attn_fn(attn_implementation)
-    if flash_attn_fn is None:
-        logger.warning_rank0(
-            f"WanTransformer3DModel: could not resolve flash-attn function for "
-            f"{attn_implementation!r}. Falling back to default attention processor."
-        )
-        return
-    sp_processor = WanSPAttnProcessor(flash_attn_fn=flash_attn_fn)
-    for block in model.blocks:
-        block.attn1.set_processor(sp_processor)
-        block.attn2.set_processor(sp_processor)
-    logger.info_rank0(f"WanTransformer3DModel: installed SP-aware attention ({attn_implementation}).")
+    # Return a plain tensor to simplify the DiT wrapper's forward.
+    return output
 
 
 @dataclass
@@ -301,17 +277,10 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformer3DModel):
         self.config: WanTransformer3DModelConfig = config
         self.config.tie_word_embeddings = False
 
-        # Install the SP-aware attention processor when an SP implementation is
-        # requested.  The patched forward (applied at module import time) will
-        # activate sequence slicing/gathering only when this processor is present.
-        attn_impl = getattr(self.config, "_attn_implementation", None)
-        if attn_impl in _VEOMNI_SP_ATTN_IMPLS:
-            _setup_sp_attention(self, attn_impl)
-        elif attn_impl is not None:
-            logger.info_rank0(
-                f"WanTransformer3DModel: attn_implementation={attn_impl!r} does not enable "
-                "SP-aware attention. Use veomni_flash_attention_*_with_sp for SP training."
-            )
+        sp_processor = WanSPAttnProcessor(attn_implementation=config._attn_implementation)
+        for block in self.blocks:
+            block.attn1.set_processor(sp_processor)
+            block.attn2.set_processor(sp_processor)
 
     @property
     def config(self):
@@ -352,3 +321,23 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformer3DModel):
     @classmethod
     def from_pretrained(cls, path, **kwargs):
         return _WanTransformer3DModel.from_pretrained(path, **kwargs)
+
+
+def apply_veomni_wan_transformer_patch() -> None:
+    """Monkey-patch ``_WanTransformer3DModel.forward`` with Ulysses SP support.
+
+    The patch is structurally identical to the original diffusers forward but
+    inserts two SP operations:
+
+    1. **Sequence slice** (with gradient scaling) after patchification – each SP
+       rank processes a contiguous chunk of video tokens.
+    2. **Sequence gather** before the output head – all ranks see the full output
+       so that the loss is identical across SP ranks.
+
+    Slicing only takes effect when BOTH ``ulysses_enabled`` is True AND an SP-aware
+    attention implementation (``veomni_flash_attention_*_with_sp``) is configured.
+    Without the SP attention processor the required AllToAll in self-attention
+    would be absent, making sequence slicing incorrect.
+    """
+    _WanTransformer3DModel.forward = WanTransformer3DModel_forward
+    logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
