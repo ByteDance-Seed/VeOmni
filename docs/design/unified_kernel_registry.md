@@ -55,12 +55,12 @@ if they implement the same variant.
 
 | `op_name` | Variants | Description |
 |-----------|----------|-------------|
-| `rms_norm` | `standard`, `offset_1` | Standard: `w * x/rms`. Offset: `(1+w) * x/rms` |
+| `rms_norm` | `standard`, `qwen3_5` | Standard: `w * x/rms`. Qwen3.5: `(1+w) * x/rms` (weight init zeros) |
 | `rms_norm_gated` | `standard` | `rms_norm(x) * silu(gate)` |
 | `apply_rotary_pos_emb` | `full`, `partial` | Full: rotate all dims. Partial: rotate first `rotary_dim`, passthrough rest |
 | `swiglu_mlp` | `standard` | SwiGLU MLP (gate/up/down) |
 | `attention` | `standard` | Multi-head / GQA attention (existing `ALL_ATTENTION_FUNCTIONS` — unchanged) |
-| `moe_experts` | `merged_gate_up`, `split_gate_up` | Expert GEMM dispatch |
+| `moe_experts` | `standard` | Expert GEMM dispatch (merged gate+up projection, HF v5 convention) |
 | `cross_entropy_loss` | `standard` | Cross-entropy with optional fused logit projection |
 | `moe_load_balancing_loss` | `standard` | Switch Transformer auxiliary loss |
 
@@ -153,7 +153,7 @@ KERNEL_REGISTRY.register(KernelSpec(
     ).LigerRMSNorm,
     hardware=HardwareRequirement("cuda"),
 ))
-# Note: no liger for rms_norm variant="offset_1" — only "eager" is available.
+# Note: no liger for rms_norm variant="qwen3_5" — only "eager" is available.
 
 # -- apply_rotary_pos_emb (full) --
 KERNEL_REGISTRY.register(KernelSpec(
@@ -179,7 +179,7 @@ KERNEL_REGISTRY.register(KernelSpec(
 # -- moe_experts --
 KERNEL_REGISTRY.register(KernelSpec(
     name="triton_group_gemm",
-    op_name="moe_experts", variant="merged_gate_up",
+    op_name="moe_experts", variant="standard",
     factory=lambda: __import__(
         "veomni.ops.fused_moe.group_gemm", fromlist=["group_gemm_fused_moe_forward"]
     ).group_gemm_fused_moe_forward,
@@ -187,7 +187,7 @@ KERNEL_REGISTRY.register(KernelSpec(
 ))
 KERNEL_REGISTRY.register(KernelSpec(
     name="quack_cutlass",
-    op_name="moe_experts", variant="merged_gate_up",
+    op_name="moe_experts", variant="standard",
     factory=lambda: __import__(
         "veomni.ops.fused_moe.quack_gemm", fromlist=["quack_gemm_fused_moe_forward"]
     ).quack_gemm_fused_moe_forward,
@@ -264,32 +264,119 @@ model:
 Preset expansion is best-effort: if the model's variant for an op has no `liger`
 registration, that op stays `eager` (no error).
 
-### 4. Patchgen Integration — Two Options
+### 4. Op Slots
+
+Each replaceable op gets a lightweight slot object. The slot holds only the
+kernel binding (or None for eager). It does **not** hold the eager fallback —
+the original HF code stays in place and the caller falls through to it via an
+if-else. This keeps the diff from upstream HF minimal.
+
+```python
+# veomni/ops/dispatch.py
+
+class OpSlot:
+    """A slot for an optional kernel replacement.
+
+    Created at module level in the generated file when the module is first
+    imported. Starts unbound (_kernel = None). build_foundation_model()
+    later calls .bind() to resolve a kernel from the registry.
+    """
+    def __init__(self, op_name: str, variant: str):
+        self.op_name = op_name
+        self.variant = variant
+        self._kernel: callable | None = None
+
+    def bind(self, impl_name: str):
+        """Resolve from registry and bind. Called by build_foundation_model."""
+        self._kernel = KERNEL_REGISTRY.resolve(self.op_name, self.variant, impl_name)
+
+    @property
+    def has_kernel(self) -> bool:
+        return self._kernel is not None
+
+    def __call__(self, *args, **kwargs):
+        return self._kernel(*args, **kwargs)
+
+    def __repr__(self):
+        bound = self._kernel.__name__ if self._kernel else "eager"
+        return f"OpSlot({self.op_name}/{self.variant} -> {bound})"
+```
+
+### 5. Config → OpSlot Binding Flow
+
+`OpSlot` instances are **module-level globals** in the generated modeling file.
+They are created when the module is first imported and start unbound. The user's
+config values are passed down during `build_foundation_model`:
+
+```
+User YAML                    OpsImplementationConfig              OpSlot.bind()
+─────────                    ───────────────────────              ─────────────
+model:                       @dataclass
+  ops_implementation:  ───→  class OpsImplementationConfig:
+    moe_experts_impl:            moe_experts_implementation: str
+      triton_group_gemm                    │
+                                           ▼
+                             build_foundation_model(config)
+                               ├─ import patched_modeling_qwen3_5_moe_gpu
+                               │    └─ module-level OpSlot instances created:
+                               │         veomni_apply_rotary_pos_emb = OpSlot(...)
+                               │         veomni_moe_experts_forward  = OpSlot(...)
+                               │         veomni_load_balancing_loss   = OpSlot(...)
+                               │    (all start with _kernel = None)
+                               │
+                               ├─ _bind_veomni_ops(module, ops_config):
+                               │    for name, obj in vars(module).items():
+                               │        if isinstance(obj, OpSlot):
+                               │            impl = ops_config.<obj.op_name>_implementation
+                               │            obj.bind(impl)     ← resolves via KERNEL_REGISTRY
+                               │
+                               └─ model init + weight loading
+```
+
+After binding, the `OpSlot` globals are live. When methods call
+`veomni_moe_experts_forward.has_kernel`, they reference the same bound
+module-level object. No additional plumbing is needed — Python's normal
+module-global lookup does the work.
+
+```python
+# veomni/models/auto.py
+
+def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig):
+    """Find all OpSlot instances in the module and bind them."""
+    for name, obj in vars(modeling_module).items():
+        if isinstance(obj, OpSlot):
+            impl_name = getattr(
+                ops_config, f"{obj.op_name}_implementation", "eager"
+            )
+            obj.bind(impl_name)  # validates variant + hardware
+```
+
+### 6. Patchgen Integration — Two Options
 
 Both options use `veomni/patchgen/codegen.py`. The generated file is a
 self-contained copy of the HF modeling file. The key question is how the
-generated code dispatches between eager and fused kernels.
+kernel dispatch is wired in.
 
-#### Option A: Inline Conditional Dispatch (Recommended)
+#### Option A: If-Else Guard (Recommended)
 
-The generated code **keeps the original HF eager implementation inline** and
-adds a single `if` guard that calls the registry-resolved kernel when the user
-selects a non-eager implementation. The variant declaration lives in this same
-generated code — no separate `ModelOpsProfile` is needed.
+The only diff from upstream HF is a 2-line early-return guard at the top of
+each replaceable function or method. Call sites stay unchanged.
 
 **How it works:**
 
-1. The patchgen config wraps each replaceable function/class with a thin
-   conditional: if the resolved kernel is not None, call it; otherwise run the
-   original HF code.
-
-2. At `build_foundation_model` time, `KERNEL_REGISTRY.resolve()` is called for
-   each op. The resolved callable (or None for eager) is stored on the model
-   config as `config._veomni_ops["op_name"]`.
-
-3. The variant is declared in the patchgen config as a string constant in the
-   generated code. `build_foundation_model` reads it and passes it to
-   `KERNEL_REGISTRY.resolve()`.
+1. Patchgen emits the original HF function/class body verbatim.
+2. Patchgen adds `OpSlot` instances at module level (one per replaceable op).
+3. Patchgen adds a 2-line guard at the **top of each replaceable function or
+   method**:
+   ```python
+   if veomni_<op>.has_kernel:
+       return veomni_<op>(...)
+   # original HF code below, unchanged
+   ```
+4. Call sites (e.g., `Attention.forward` calling `apply_rotary_pos_emb(...)`)
+   remain **identical to upstream HF** — no changes needed.
+5. At `build_foundation_model` time, `.bind(impl_name)` is called on each
+   slot.
 
 **Concrete example — `apply_rotary_pos_emb` in Qwen3.5 MoE:**
 
@@ -298,16 +385,20 @@ Patchgen config:
 ```python
 # qwen3_5_moe_gpu_patch_gen_config.py
 
-@config.replace_function(
-    "apply_rotary_pos_emb",
-    description="Add VeOmni kernel dispatch with eager fallback",
-)
+config.add_import("veomni.ops.dispatch", names=["OpSlot"])
+
+# Declare op slots
+config.add_post_import_block("""
+veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "partial")
+""")
+
+# Add guard at top of function — body is original HF code
+@config.replace_function("apply_rotary_pos_emb")
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    # Dispatch to registered kernel if available, else run original HF code.
-    _kernel = _VEOMNI_OPS.get("apply_rotary_pos_emb")
-    if _kernel is not None:
-        return _kernel(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-    # --- original HF eager code (variant: partial) ---
+    # +++ veomni: kernel dispatch +++
+    if veomni_apply_rotary_pos_emb.has_kernel:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
+    # --- original HF code below, unchanged ---
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     rotary_dim = cos.shape[-1]
@@ -318,22 +409,25 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
     k_embed = torch.cat([k_embed, k_pass], dim=-1)
     return q_embed, k_embed
+
+# Attention.forward: NO PATCH — call site stays as HF original:
+#   query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 ```
 
-Generated output (diff from upstream is just the 3-line guard at the top):
+Generated output:
 
 ```python
 # In generated/patched_modeling_qwen3_5_moe_gpu.py
 
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Add VeOmni kernel dispatch with eager fallback
-# ======================================================================
+from veomni.ops.dispatch import OpSlot
+
+veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "partial")
+
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    _kernel = _VEOMNI_OPS.get("apply_rotary_pos_emb")       # +
-    if _kernel is not None:                                   # +
-        return _kernel(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)  # +
-    # --- original HF code below (unchanged) ---
+    # +++ veomni: kernel dispatch (2 lines added) +++
+    if veomni_apply_rotary_pos_emb.has_kernel:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
+    # --- original HF code below, unchanged ---
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     rotary_dim = cos.shape[-1]
@@ -344,113 +438,106 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
     k_embed = torch.cat([k_embed, k_pass], dim=-1)
     return q_embed, k_embed
+
+class Qwen3_5MoeAttention(nn.Module):
+    ...
+    def forward(self, ...):
+        ...
+        # UNCHANGED from upstream HF — no patching needed at call site
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
+        ...
 ```
 
-**Concrete example — `Qwen3_5MoeExperts`:**
+The diff from upstream HF: **2 lines** added at the top of the function.
+The function body is unchanged. All call sites are unchanged.
+
+**Concrete example — `Qwen3_5MoeExperts.forward`:**
+
+Same pattern — early-return guard at the top of the method.
 
 ```python
 # In generated/patched_modeling_qwen3_5_moe_gpu.py
 
-# ======================================================================
-# [PATCHED CLASS] Qwen3_5MoeExperts
-# Reason: Add VeOmni kernel dispatch with eager fallback
-# ======================================================================
+veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
+
 class Qwen3_5MoeExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.num_experts = config.num_experts
-        self.hidden_dim = config.hidden_size
-        self.intermediate_dim = config.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
-        self.act_fn = ACT2FN[config.hidden_act]
+        # ... identical to upstream HF ...
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
-        _kernel = _VEOMNI_OPS.get("moe_experts")                    # +
-        if _kernel is not None:                                       # +
-            return _kernel(                                           # +
-                self, hidden_states, top_k_index, top_k_weights       # +
-            )                                                         # +
-        # --- original HF eager code below (unchanged) ---
+        # +++ veomni: kernel dispatch (2 lines added) +++
+        if veomni_moe_experts_forward.has_kernel:
+            return veomni_moe_experts_forward(
+                self, hidden_states, top_k_index, top_k_weights
+            )
+        # --- original HF code below, unchanged ---
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = torch.nn.functional.one_hot(
+                top_k_index, num_classes=self.num_experts
+            )
             expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            expert_hit = torch.greater(
+                expert_mask.sum(dim=(-1, -2)), 0
+            ).nonzero()
         for expert_idx in expert_hit:
             expert_idx = expert_idx[0]
             if expert_idx == self.num_experts:
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            gate, up = nn.functional.linear(
+                current_state, self.gate_up_proj[expert_idx]
+            ).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+            current_hidden_states = nn.functional.linear(
+                current_hidden_states, self.down_proj[expert_idx]
+            )
+            current_hidden_states = (
+                current_hidden_states
+                * top_k_weights[token_idx, top_k_pos, None]
+            )
+            final_hidden_states.index_add_(
+                0, token_idx,
+                current_hidden_states.to(final_hidden_states.dtype),
+            )
         return final_hidden_states
 ```
 
-**Concrete example — `Qwen3_5MoeRMSNorm`:**
+The diff from upstream HF is **2 lines** at the top of `forward`. Everything
+below the guard is the original HF code, verbatim.
+
+**Concrete example — `Qwen3_5MoeRMSNorm` (no dispatch needed):**
 
 ```python
 # In generated/patched_modeling_qwen3_5_moe_gpu.py
-# NOTE: NOT patched with dispatch guard. Qwen3.5 MoE uses offset_1 variant;
-# no non-eager kernel is registered. The original HF code is emitted verbatim.
+# Qwen3.5 MoE uses qwen3_5 variant; no non-eager kernel exists.
+# Original HF code emitted verbatim. No slot, no guard.
 
 class Qwen3_5MoeRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         # ... identical to upstream ...
 ```
 
-**`_VEOMNI_OPS` binding** — a module-level dict in the generated file,
-populated by `build_foundation_model`:
-
-```python
-# At top of generated file (added by patchgen config via add_post_import_block):
-_VEOMNI_OPS: dict[str, callable] = {}
-
-# Variant declarations — patchgen config emits these as constants:
-_VEOMNI_OP_VARIANTS: dict[str, str] = {
-    "rms_norm": "offset_1",
-    "apply_rotary_pos_emb": "partial",
-    "swiglu_mlp": "standard",
-    "moe_experts": "merged_gate_up",
-    "cross_entropy_loss": "standard",
-    "moe_load_balancing_loss": "standard",
-}
-```
-
-```python
-# veomni/models/auto.py — build_foundation_model()
-
-def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig):
-    """Resolve kernels and populate the module's _VEOMNI_OPS dict."""
-    variants = modeling_module._VEOMNI_OP_VARIANTS
-    ops = modeling_module._VEOMNI_OPS
-    for op_name, variant in variants.items():
-        impl_name = getattr(ops_config, f"{op_name}_implementation", "eager")
-        # resolve() returns None for "eager", raises on invalid/unsupported
-        ops[op_name] = KERNEL_REGISTRY.resolve(op_name, variant, impl_name)
-```
-
 **Properties:**
 
-- The generated code is self-documenting: you can read the function and see
-  both the dispatch path and the full eager fallback.
-- The variant declaration lives in the generated file (`_VEOMNI_OP_VARIANTS`),
-  so each model's generated code is the single source of truth — no separate
-  profile object to keep in sync.
-- No global mutable state outside the generated module's own `_VEOMNI_OPS` dict.
-- Internal users register new kernels via `KERNEL_REGISTRY.register()`;
-  the generated code does not need to change.
+- **Minimal diff from HF.** 2-line guard at the top of each replaceable
+  function/method. Function bodies unchanged. Call sites unchanged.
+- **Easy to read.** The guard is self-explanatory: "if veomni has a kernel,
+  use it and return; otherwise, fall through to the original HF code below."
+- **Easy to diff against upstream.** When HF updates a function body, the
+  merge is trivial — only the 2 guard lines at the top are ours.
+- Grep `veomni_` to find all dispatch points.
+- `repr()` shows what is bound: `OpSlot(moe_experts/standard -> triton_group_gemm)`.
 
 #### Option B: Annotation + Runtime Forward Replacement
 
-Instead of inline conditionals, mark replaceable points with decorators.
-At `build_foundation_model` time, the resolved kernel is patched onto the
-object via `setattr` / method replacement.
+Instead of if-else guards, mark replaceable points with decorators. At
+`build_foundation_model` time, the resolved kernel is patched onto the
+module/class via `setattr`.
 
 **Patchgen config** — annotate the function:
 
@@ -469,254 +556,98 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     ...
 ```
 
-**Decorator definition:**
-
-```python
-# veomni/ops/replaceable.py
-
-def veomni_replaceable(op_name: str, variant: str):
-    """Mark a function/method as replaceable by the kernel registry.
-
-    Stores metadata on the function. build_foundation_model() inspects
-    these markers and swaps the function if a non-eager impl is selected.
-    """
-    def decorator(fn):
-        fn._veomni_op_name = op_name
-        fn._veomni_variant = variant
-        return fn
-    return decorator
-```
-
 **Runtime replacement** in `build_foundation_model`:
 
 ```python
 def _apply_kernel_replacements(modeling_module, ops_config):
-    """Walk the module namespace, find @veomni_replaceable markers, replace."""
+    """Walk module namespace, find @veomni_replaceable markers, replace."""
     for name, obj in vars(modeling_module).items():
         if callable(obj) and hasattr(obj, "_veomni_op_name"):
-            op_name = obj._veomni_op_name
-            variant = obj._veomni_variant
-            impl_name = getattr(ops_config, f"{op_name}_implementation", "eager")
-            kernel = KERNEL_REGISTRY.resolve(op_name, variant, impl_name)
+            impl_name = getattr(ops_config, f"{obj._veomni_op_name}_implementation", "eager")
+            kernel = KERNEL_REGISTRY.resolve(obj._veomni_op_name, obj._veomni_variant, impl_name)
             if kernel is not None:
                 setattr(modeling_module, name, kernel)
-
-    # For class methods: walk classes, find decorated methods
-    for name, cls in vars(modeling_module).items():
-        if isinstance(cls, type) and issubclass(cls, nn.Module):
-            for attr_name, method in vars(cls).items():
-                if callable(method) and hasattr(method, "_veomni_op_name"):
-                    op_name = method._veomni_op_name
-                    variant = method._veomni_variant
-                    impl_name = getattr(ops_config, f"{op_name}_implementation", "eager")
-                    kernel = KERNEL_REGISTRY.resolve(op_name, variant, impl_name)
-                    if kernel is not None:
-                        setattr(cls, attr_name, kernel)
+    # Similar walk for class methods...
 ```
-
-For `nn.Module` classes like `Qwen3_5MoeRMSNorm` where the replacement is an
-entire class (not just a method), use a class-level annotation:
-
-```python
-@veomni_replaceable_class(op_name="rms_norm", variant="offset_1")
-class Qwen3_5MoeRMSNorm(nn.Module):
-    # ... original HF code, unchanged ...
-```
-
-The replacement logic in `build_foundation_model` would swap the class in the
-module namespace before model instantiation.
 
 **Properties:**
 
-- Zero diff in function/method bodies — the original HF code is completely
-  untouched. Only a decorator is added.
-- Replacement is a module-level `setattr`, which means it affects all instances
-  of the model in the process (same trade-off as HF's `kernels` hub).
-- Harder to debug: reading the generated code doesn't tell you what actually
-  runs — you need to know what was patched at build time.
-- Class replacement for `nn.Module` subclasses (RMSNorm, Experts) requires
-  careful handling: the replacement class must have identical `__init__`
-  signature and weight parameter names for checkpoint loading to work.
+- Zero diff in function bodies — only a decorator line is added.
+- Harder to debug: reading the generated code doesn't tell you what runs.
+- Module-level `setattr` affects all instances in the process.
+- Class replacement needs matching `__init__` signature and parameter names
+  for checkpoint loading to work.
 
-### 5. Option Comparison
+### 7. Option Comparison
 
-| Aspect | Option A: Inline Conditional | Option B: Annotation + Runtime Replace |
-|--------|------------------------------|----------------------------------------|
-| **Diff from HF** | 3-line guard per op | 1-line decorator per op |
-| **Readability** | Self-documenting — both paths visible inline | Must trace build-time patching to understand runtime behavior |
-| **Internal extension** | Works out of the box — registry provides the callable | Works out of the box — same registry |
-| **Global side effects** | None — dispatch dict is per-module | Module-level setattr affects all instances |
-| **Class replacement** | Straightforward — eager code stays inline | Needs matching `__init__` signature and parameter names |
-| **Debugging** | Set breakpoint inside the function, see the `if` | Must know replacement was applied |
-| **`torch.compile` compatibility** | Guard is a simple dict lookup — graph-safe | Module-level function swap before compile — ok if done before `torch.compile()` |
+| Aspect | Option A: If-Else Guard | Option B: Annotation + Replace |
+|--------|------------------------|-------------------------------|
+| **Diff from HF** | 2-line guard at top of function; body + call sites unchanged | 1-line decorator; body + call sites unchanged |
+| **Readability** | Guard is inline and self-explanatory | Must trace build-time `setattr` to understand runtime behavior |
+| **Debugging** | Read the code — eager path is right there below the guard | Must inspect module namespace after build |
+| **Upstream merges** | Function bodies merge cleanly; only guard lines conflict | Decorator line may conflict; bodies merge cleanly |
+| **Internal extension** | Works — registry provides the callable | Works — same registry |
+| **Global side effects** | Guard is per-call, no namespace mutation | Module-level `setattr` affects all instances |
+| **`torch.compile`** | Simple branch — graph-safe | Function swap before compile — ok if ordered correctly |
 
-**Recommendation: Option A.** The 3-line guard is a trivial diff, the code is
-fully self-documenting, and there is no hidden mutation of module namespaces.
+**Recommendation: Option A.** The if-else guard makes every dispatch point
+visible by reading the generated code. The original HF code is right there
+below the guard — no renaming, no wrapping, no hidden mutation. Upstream merges
+only touch the guard lines, not the function bodies.
 
-### 6. Loss and MoE LB Coverage
+### 8. Loss and MoE LB Coverage
 
-Both loss ops follow the same pattern as other ops.
+Both loss ops use the same `OpSlot` + if-else guard pattern.
 
 #### Cross-Entropy Loss
 
-Currently VeOmni patches `LOSS_MAPPING["ForCausalLM"]` and sets a global
-`_cross_entropy` at import time. Under the new design, it is just another op
-in the generated code.
-
-In `ForConditionalGeneration.forward` (Qwen3.5 MoE example):
-
 ```python
-# Patchgen keeps the existing override that calls self.loss_function(...),
-# but build_foundation_model now binds it via the registry:
-loss_impl = ops_config.cross_entropy_loss_implementation
-loss_fn = KERNEL_REGISTRY.resolve("cross_entropy_loss", "standard", loss_impl)
-if loss_fn is not None:
-    model.loss_function = loss_fn
-```
+veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
 
-No change to the generated forward code — the existing
-`self.loss_function(logits, labels, ...)` call already works.
+# In ForConditionalGeneration.forward:
+    if labels is not None:
+        # +++ veomni: kernel dispatch +++
+        if veomni_cross_entropy_loss.has_kernel:
+            loss = veomni_cross_entropy_loss(logits, labels, self.config)
+        else:
+            loss = self.loss_function(logits, labels, self.vocab_size, ...)
+```
 
 #### MoE Load-Balancing Loss
 
-`load_balancing_loss_func` is a standalone function. Same inline conditional
-pattern as other ops:
-
 ```python
-# In generated code:
+veomni_load_balancing_loss = OpSlot("moe_load_balancing_loss", "standard")
+
+# Original HF function — UNCHANGED
 def load_balancing_loss_func(gate_logits, num_experts, top_k, attention_mask=None):
-    _kernel = _VEOMNI_OPS.get("moe_load_balancing_loss")
-    if _kernel is not None:
-        return _kernel(gate_logits, num_experts, top_k, attention_mask)
-    # --- original HF code below ---
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-    ...
-```
-
-### 7. Full Example: Qwen3.5 MoE
-
-Current state (from `qwen3_5_moe_gpu_patch_gen_config.py`):
-- RMSNorm: not replaced (offset_1, incompatible with LigerRMSNorm) — **stays unchanged**
-- RoPE: not replaced (partial, incompatible with liger) — **gets dispatch guard** (for future kernels)
-- MoE: replaced with `PatchedQwen3_5MoeExperts` — **gets dispatch guard**
-- Loss: overridden in `ForConditionalGeneration.forward` — **bound via registry**
-- MoE LB loss: uses upstream unchanged — **gets dispatch guard**
-- SwiGLU MLP: per-expert, not standalone — **not applicable for Qwen3.5 MoE**
-
-**Patchgen config** (changes from current):
-
-```python
-# qwen3_5_moe_gpu_patch_gen_config.py
-
-config = PatchConfig(
-    source_module="transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
-    target_file="patched_modeling_qwen3_5_moe_gpu.py",
-)
-
-# Emit variant declarations + dispatch dict at top of generated file
-config.add_post_import_block("""
-_VEOMNI_OPS: dict[str, callable] = {}
-_VEOMNI_OP_VARIANTS: dict[str, str] = {
-    "rms_norm": "offset_1",
-    "apply_rotary_pos_emb": "partial",
-    "moe_experts": "merged_gate_up",
-    "cross_entropy_loss": "standard",
-    "moe_load_balancing_loss": "standard",
-}
-""")
-
-# ── RoPE: dispatch guard + original partial-rotary code ──────────────────
-@config.replace_function(
-    "apply_rotary_pos_emb",
-    description="Add VeOmni kernel dispatch with eager fallback",
-)
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    _kernel = _VEOMNI_OPS.get("apply_rotary_pos_emb")
-    if _kernel is not None:
-        return _kernel(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-    q_embed = torch.cat([q_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_embed, k_pass], dim=-1)
-    return q_embed, k_embed
-
-
-# ── MoE Experts: dispatch guard + original eager loop ────────────────────
-@config.replace_class(
-    "Qwen3_5MoeExperts",
-    description="Add VeOmni kernel dispatch with eager fallback",
-)
-class PatchedQwen3_5MoeExperts(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.num_experts = config.num_experts
-        self.hidden_dim = config.hidden_size
-        self.intermediate_dim = config.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, hidden_states, top_k_index, top_k_weights):
-        _kernel = _VEOMNI_OPS.get("moe_experts")
-        if _kernel is not None:
-            return _kernel(self, hidden_states, top_k_index, top_k_weights)
-        # --- original HF eager code ---
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(
-                current_state, self.gate_up_proj[expert_idx]
-            ).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(
-                current_hidden_states, self.down_proj[expert_idx]
-            )
-            current_hidden_states = (
-                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            )
-            final_hidden_states.index_add_(
-                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
-            )
-        return final_hidden_states
-
-
-# ── MoE LB Loss: dispatch guard + original eager code ───────────────────
-@config.replace_function(
-    "load_balancing_loss_func",
-    description="Add VeOmni kernel dispatch with eager fallback",
-)
-def load_balancing_loss_func(gate_logits, num_experts=None, top_k=2, attention_mask=None):
-    _kernel = _VEOMNI_OPS.get("moe_load_balancing_loss")
-    if _kernel is not None:
-        return _kernel(gate_logits, num_experts, top_k, attention_mask)
-    # --- original HF code (unchanged) ---
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
     ...
 
-
-# ── Remaining patches (SP, GatedDeltaNet, loss forward) — unchanged ──────
-# ... same as current qwen3_5_moe_gpu_patch_gen_config.py ...
+# Call site in ForCausalLM/ForConditionalGeneration.forward:
+    # +++ veomni: kernel dispatch +++
+    if veomni_load_balancing_loss.has_kernel:
+        aux_loss = veomni_load_balancing_loss(outputs.router_logits, ...)
+    else:
+        aux_loss = load_balancing_loss_func(outputs.router_logits, ...)
 ```
+
+### 9. Full Example: Qwen3.5 MoE
+
+**Summary of generated code changes from upstream HF:**
+
+| Component | Change from HF | Lines added |
+|-----------|---------------|-------------|
+| `apply_rotary_pos_emb` | 2-line guard at top of function | +2 |
+| `Qwen3_5MoeExperts.forward` | 2-line guard at top of method | +2 |
+| `load_balancing_loss_func` | 2-line guard at top of function | +2 |
+| `ForConditionalGeneration.forward` | If-else guard around loss call | +3 |
+| `Qwen3_5MoeRMSNorm` | **Unchanged** (qwen3_5 variant, no kernel) | 0 |
+| `Qwen3_5MoeAttention.forward` | **Unchanged** (call sites not modified) | 0 |
+| Module-level `OpSlot` declarations | New lines | +4 |
+
+Total diff from upstream HF: ~13 lines added. Function bodies unchanged
+(only 2-line guards prepended). All call sites unchanged.
 
 **User YAML:**
 
@@ -724,8 +655,8 @@ def load_balancing_loss_func(gate_logits, num_experts=None, top_k=2, attention_m
 model:
   ops_implementation:
     attn_implementation: flash_attention_2
-    rms_norm_implementation: eager              # only eager available for offset_1
-    apply_rotary_pos_emb_implementation: eager  # only eager available for partial
+    rms_norm_implementation: eager              # only eager for qwen3_5 variant
+    apply_rotary_pos_emb_implementation: eager  # only eager for partial variant
     moe_experts_implementation: triton_group_gemm
     cross_entropy_loss_implementation: liger_fused
     moe_load_balancing_loss_implementation: eager
@@ -737,12 +668,12 @@ model:
 # User mistakenly sets:
 rms_norm_implementation: liger
 
-# Error:
-KeyError: No kernel 'liger' for op='rms_norm', variant='offset_1'.
+# Error (from KERNEL_REGISTRY.resolve):
+KeyError: No kernel 'liger' for op='rms_norm', variant='qwen3_5'.
 Available: ['eager']
 ```
 
-### 8. Lifecycle
+### 10. Lifecycle
 
 ```
 import veomni                                     # (1) import time
@@ -755,21 +686,34 @@ OpsImplementationConfig.__post_init__()            # (3) config parse time
   └─ rewrite attn_implementation for SP
   └─ expand preset if set
 
-build_foundation_model(...)                        # (4) model build time
-  ├─ import generated modeling module
-  ├─ read _VEOMNI_OP_VARIANTS from module          #     variant declarations
-  ├─ for each op: KERNEL_REGISTRY.resolve(          #     validate + resolve
-  │       op, variant, user_impl)
-  ├─ populate module._VEOMNI_OPS dict               #     bind resolved kernels
-  ├─ bind model.loss_function if loss impl != eager
+build_foundation_model(config)                     # (4) model build time
+  ├─ import patched_modeling_qwen3_5_moe_gpu       #     generated module
+  │    └─ module-level OpSlot instances created:    #     (at import time)
+  │         veomni_apply_rotary_pos_emb  = OpSlot("apply_rotary_pos_emb", "partial")
+  │         veomni_moe_experts_forward   = OpSlot("moe_experts", "standard")
+  │         veomni_load_balancing_loss   = OpSlot("moe_load_balancing_loss", "standard")
+  │         veomni_cross_entropy_loss    = OpSlot("cross_entropy_loss", "standard")
+  │         (all start with _kernel = None)
+  │
+  ├─ _bind_veomni_ops(module, ops_config):          #     bind from config
+  │    for each OpSlot in vars(module):
+  │        impl = ops_config.<slot.op_name>_implementation   # e.g. "triton_group_gemm"
+  │        slot.bind(impl)                                   # KERNEL_REGISTRY.resolve()
+  │
   └─ model init + weight loading
 
 model.forward()                                    # (5) runtime
-  ├─ apply_rotary_pos_emb: _VEOMNI_OPS lookup → eager or kernel
-  ├─ attention: ALL_ATTENTION_FUNCTIONS[...]        #     unchanged
-  ├─ moe_experts: _VEOMNI_OPS lookup → eager or kernel
-  ├─ loss: self.loss_function(...)                  #     bound at step 4
-  └─ moe_lb_loss: _VEOMNI_OPS lookup → eager or kernel
+  ├─ apply_rotary_pos_emb(...)                     #     function called as normal
+  │   └─ if veomni_apply_rotary_pos_emb.has_kernel:#     guard checks module global
+  │        return veomni_apply_rotary_pos_emb(...)  #     → fused kernel
+  │      else: <original HF code>                   #     → eager fallback
+  ├─ attention: ALL_ATTENTION_FUNCTIONS[...]         #     unchanged
+  ├─ experts.forward(...)
+  │   └─ if veomni_moe_experts_forward.has_kernel:
+  │        return veomni_moe_experts_forward(...)    #     → fused kernel
+  │      else: <original HF expert loop>             #     → eager fallback
+  ├─ if veomni_cross_entropy_loss.has_kernel: ...    #     guard in forward
+  └─ if veomni_load_balancing_loss.has_kernel: ...   #     guard in forward
 ```
 
 ---
@@ -779,9 +723,9 @@ model.forward()                                    # (5) runtime
 | Current mechanism | New mechanism | Migration |
 |---|---|---|
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | `rms_norm_implementation: liger` etc. | Deprecate env var; keep compat for 1 release |
-| `gpu_patch.py` monkey-patching | patchgen inline conditionals | Remove `gpu_patch.py` files |
-| `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + build-time bind | Remove import-time patch |
-| `apply_veomni_fused_moe_patch()` | `moe_experts_implementation` + registry | Remove standalone patch function |
+| `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
+| `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
+| `apply_veomni_fused_moe_patch()` | `moe_experts_implementation` + `OpSlot` | Remove standalone patch function |
 | `moe_implementation` config field | `moe_experts_implementation` | Rename, keep alias for 1 release |
 
 ---
@@ -794,7 +738,7 @@ model.forward()                                    # (5) runtime
    under `KERNEL_REGISTRY`?
 3. **NPU auto-selection:** Should NPU be an explicit `npu_group_gemm`
    implementation name, or remain automatic?
-4. **Multi-model processes:** `_VEOMNI_OPS` is per-module, so loading two
-   different models in the same process works. But if two instances of the same
-   model with different ops configs are needed, the module-level dict is shared.
+4. **Multi-model processes:** Each generated module has its own `OpSlot`
+   instances, so different models work independently. But two instances of the
+   same model with different ops configs share the same `OpSlot` objects.
    Is this a real use case?
