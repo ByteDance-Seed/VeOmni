@@ -294,7 +294,7 @@ class DiTTrainer:
             logger.info_rank0("Condition model loaded with empty weights.")
         else:
             self.condition_model = model_class._from_config(condition_cfg)
-            self.condition_model.cuda()
+            self.condition_model.to(get_device_type())
             logger.info_rank0("Condition model loaded.")
 
     def _freeze_model_module(self):
