@@ -12,16 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Base DPO Trainer class for Direct Preference Optimization.
-
-Extends BaseTrainer with:
-    1. A frozen reference model for computing reference log probabilities
-    2. Concatenated forward pass (chosen + rejected in one batch)
-    3. DPO preference loss computation
-"""
-
-from typing import Any, Dict, Tuple
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,28 +22,102 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 from ..arguments import VeOmniDPOArguments
+from ..data import build_chat_template, build_data_transform
+from ..data.data_collator import DataCollator
+from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.torch_parallelize import build_parallelize_model
-from ..models import build_foundation_model
+from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
+from ..utils.device import synchronize
 from .base import BaseTrainer
 
 
 logger = logging.get_logger(__name__)
 
+_DPO_PAD_VALUES = {
+    "input_ids": 0,
+    "attention_mask": 0,
+    "labels": IGNORE_INDEX,
+}
 
-class BaseDPOTrainer(BaseTrainer):
-    """Base trainer for DPO that handles reference model management and DPO loss."""
 
+@dataclass
+class DPOCollator(DataCollator):
+    """Collator for DPO preference data.
+
+    Each sample from the dataset has shape ``[2, L]`` (row 0 = chosen, row 1 =
+    rejected), with standard keys ``input_ids``, ``attention_mask``, ``labels``.
+
+    This collator pads a list of B such samples to a common length and
+    concatenates them along the batch dimension, producing tensors of shape
+    ``[2*B, max_L]``.  The first B rows are chosen, the last B rows are rejected,
+    matching the layout expected by ``TextDPOTrainer.concatenated_forward``.
+    """
+
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        batch = {}
+        for key in features[0].keys():
+            tensors = [f[key] for f in features]  # each [2, L_i]
+            pad_value = _DPO_PAD_VALUES.get(key, 0)
+            max_len = max(t.shape[-1] for t in tensors)
+            padded = [F.pad(t, (0, max_len - t.shape[-1]), value=pad_value) for t in tensors]
+            stacked = torch.stack(padded, dim=0)  # [B, 2, max_L]
+            batch[key] = torch.cat([stacked[:, 0], stacked[:, 1]], dim=0)  # [2*B, max_L]
+        return batch
+
+
+class TextDPOTrainer:
+    """Text DPO trainer that composes BaseTrainer with DPO-specific logic."""
+
+    base: BaseTrainer
     reference_model: PreTrainedModel
 
     def __init__(self, args: VeOmniDPOArguments):
-        super().__init__(args)
+        self.base = BaseTrainer.__new__(BaseTrainer)
+        self.base.args = args
+
+        self.base._setup()
+        self.base._build_model()
+        self.base._freeze_model_module()
+
+        self._build_model_assets()
+        self._build_data_transform()
+
+        self.base._build_dataset()
+        self._build_collate_fn()
+        self.base._build_dataloader()
+        self.base._build_parallelized_model()
+        self.base._build_optimizer()
+        self.base._build_lr_scheduler()
+        self.base._build_training_context()
+        self.base._init_callbacks()
+
+        self._build_reference_model()
+
+    def _build_model_assets(self):
+        args: VeOmniDPOArguments = self.base.args
+        model_config = self.base.model_config
+        self.base.tokenizer = build_tokenizer(args.model.tokenizer_path)
+        self.base.chat_template = build_chat_template(args.data.chat_template, self.base.tokenizer)
+        self.base.model_assets = [model_config, self.base.chat_template]
+
+    def _build_data_transform(self):
+        args: VeOmniDPOArguments = self.base.args
+        self.base.data_transform = build_data_transform(
+            "dpo",
+            tokenizer=self.base.tokenizer,
+            chat_template=self.base.chat_template,
+            max_seq_len=args.data.max_seq_len,
+        )
+
+    def _build_collate_fn(self):
+        self.base.collate_fn = DPOCollator()
 
     def _build_reference_model(self):
         """Build and freeze a reference model with the same architecture and FSDP sharding."""
-        args: VeOmniDPOArguments = self.args
+        args: VeOmniDPOArguments = self.base.args
         logger.info_rank0("Building frozen reference model for DPO")
 
         self.reference_model = build_foundation_model(
@@ -70,7 +137,7 @@ class BaseDPOTrainer(BaseTrainer):
             weights_path=args.model.model_path,
             enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-            enable_mixed_precision=args.train.enable_mixed_precision,
+            enable_mixed_precision=False,  # In reference model, we will not use mixed precision
             enable_gradient_checkpointing=False,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=list(
@@ -96,7 +163,7 @@ class BaseDPOTrainer(BaseTrainer):
         """Compute the DPO/IPO loss for a batch of policy and reference model log probabilities.
 
         Returns:
-            (losses, chosen_rewards, rejected_rewards) — each of shape (batch_size,).
+            (losses, chosen_rewards, rejected_rewards) -- each of shape (batch_size,).
         """
         pi_logratios = policy_chosen_logps - policy_rejected_logps
         ref_logratios = reference_chosen_logps - reference_rejected_logps
@@ -166,7 +233,7 @@ class BaseDPOTrainer(BaseTrainer):
         )
         all_logits = outputs.logits.float()
 
-        average_log_prob = getattr(self.args, "dpo_config", None) and self.args.dpo_config.average_log_prob
+        average_log_prob = getattr(self.base.args, "dpo_config", None) and self.base.args.dpo_config.average_log_prob
         all_logps = self.get_batch_logps(all_logits, micro_batch["labels"], average_log_prob=average_log_prob)
 
         return all_logps[:num_chosen], all_logps[num_chosen:]
@@ -174,16 +241,16 @@ class BaseDPOTrainer(BaseTrainer):
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        args: VeOmniDPOArguments = self.args
+        args: VeOmniDPOArguments = self.base.args
         dpo_config = args.dpo_config
 
-        micro_batch = self.preforward(micro_batch)
+        micro_batch = self.base.preforward(micro_batch)
 
         with torch.no_grad():
             ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
-        with self.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.model, micro_batch)
+        with self.base.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
 
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
             policy_chosen_logps,
@@ -207,8 +274,94 @@ class BaseDPOTrainer(BaseTrainer):
             "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
         }
 
-        with self.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+        with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
             loss.backward()
 
         del micro_batch
         return loss, loss_dict
+
+    def on_train_begin(self):
+        self.base.on_train_begin()
+
+    def on_train_end(self):
+        self.base.on_train_end()
+
+    def on_epoch_begin(self):
+        self.base.on_epoch_begin()
+
+    def on_epoch_end(self):
+        self.base.on_epoch_end()
+
+    def on_step_begin(self, micro_batches=None):
+        self.base.on_step_begin(micro_batches=micro_batches)
+
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        args: VeOmniDPOArguments = self.base.args
+        self.base.state.global_step += 1
+
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+
+        self.on_step_begin(micro_batches=micro_batches)
+
+        synchronize()
+
+        total_loss = 0.0
+        total_loss_dict: Dict[str, float] = defaultdict(float)
+
+        num_micro_steps = len(micro_batches)
+        for micro_step, micro_batch in enumerate(micro_batches):
+            self.base.model_reshard(micro_step, num_micro_steps)
+            loss, loss_dict = self.forward_backward_step(micro_batch)
+
+            total_loss += loss.item()
+            for k, v in loss_dict.items():
+                total_loss_dict[k] += v.item()
+
+        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+
+        self.base.optimizer.step()
+        self.base.lr_scheduler.step()
+        self.base.optimizer.zero_grad()
+
+        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+
+    def train(self):
+        args: VeOmniDPOArguments = self.base.args
+        self.on_train_begin()
+        logger.info(
+            f"Rank{args.train.local_rank} Start DPO training. "
+            f"Start step: {self.base.start_step}. "
+            f"Train steps: {args.train_steps}. "
+            f"Start epoch: {self.base.start_epoch}. "
+            f"Train epochs: {args.train.num_train_epochs}."
+        )
+
+        for epoch in range(self.base.start_epoch, args.train.num_train_epochs):
+            if hasattr(self.base.train_dataloader, "set_epoch"):
+                self.base.train_dataloader.set_epoch(epoch)
+            self.base.state.epoch = epoch
+
+            self.on_epoch_begin()
+
+            data_iterator = iter(self.base.train_dataloader)
+
+            for _ in range(self.base.start_step, args.train_steps):
+                try:
+                    self.train_step(data_iterator)
+                except StopIteration:
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
+                    break
+
+            self.on_epoch_end()
+
+            self.base.start_step = 0
+            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+        self.on_train_end()
+
+        synchronize()
+
+        self.base.destroy_distributed()
