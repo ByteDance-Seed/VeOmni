@@ -16,7 +16,7 @@ from veomni.utils.import_utils import is_diffusers_available, is_transformers_ve
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
-_dit_only = pytest.mark.skipif(is_diffusers_available(), reason="Requires diffusers")
+_dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
