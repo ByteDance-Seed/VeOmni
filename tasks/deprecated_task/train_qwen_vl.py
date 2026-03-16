@@ -122,10 +122,12 @@ def main():
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
         tp_size=args.train.accelerator.tp_size,
-        ep_size=args.train.accelerator.ep_size,
         pp_size=args.train.accelerator.pp_size,
         cp_size=args.train.accelerator.cp_size,
         ulysses_size=args.train.accelerator.ulysses_size,
+        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.train.accelerator.extra_parallel_names,
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
         async_enabled=args.train.accelerator.enable_async,
     )

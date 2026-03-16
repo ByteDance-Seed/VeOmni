@@ -21,9 +21,10 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
-    # EP-aware path (FSDP2 + EP): maintain mathematical parity with FSDP1 clipper
-    if hasattr(model, "_ep_param_groups"):
-        return ep_fsdp2_clip_grad_norm(
+    # ExtraParallel-aware path (FSDP2 + ExtraParallel): maintain mathematical parity with FSDP1 clipper
+
+    if hasattr(model, "_extra_parallel_param_groups"):
+        return extra_parallel_fsdp2_clip_grad_norm(
             model,
             max_norm,
             norm_type=norm_type,
@@ -44,57 +45,82 @@ def clip_grad_norm(
 
 
 @torch.no_grad()
-def ep_fsdp2_clip_grad_norm(
+def extra_parallel_fsdp2_clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
     """
-    EP-aware gradient clipping for composable FSDP2 with reductions mirroring FSDP1:
+    ExtraParallel-aware gradient clipping for composable FSDP2 with reductions mirroring FSDP1:
 
-    - Compute local norms for non-EP and EP parameter groups separately.
+    - Compute local norms for non-ExtraParallel and ExtraParallel parameter groups separately.
     - For finite p: sum p-th powers across the appropriate groups, then take 1/p.
-      • non-EP: all-reduce over FSDP group.
-      • EP: all-reduce over EP-FSDP group, then over EP group.
+      • non-ExtraParallel: all-reduce over FSDP group.
+      • ExtraParallel: all-reduce over Para-FSDP group, then over Para group, e.g. EP-FSDP.
     - For inf-norm: take elementwise MAX with the same reduction groups (MAX).
     - Use a single global clip coefficient for both groups.
     """
-
     ps = get_parallel_state()
     fsdp_group = ps.fsdp_group
-    ep_group = ps.ep_group if ps.ep_enabled else None
-    # For EP params sharded by FSDP2 along hidden dimension
-    ep_fsdp_group = None
-    if ps.ep_enabled and ps.ep_fsdp_device_mesh is not None:
-        ep_fsdp_group = ps.ep_fsdp_device_mesh["ep_fsdp"].get_group()
+    extra_parallel_group = {
+        para: ps.extra_parallel_group(para) if ps.extra_parallel_enabled(para) else None
+        for para in ps.extra_parallel_names
+    }
+    # For Para (e.g. EP) params sharded by FSDP2 along hidden dimension
+    extra_parallel_fsdp_group = {
+        para: ps.extra_parallel_fsdp_device_mesh[para][f"{para}_fsdp"].get_group()
+        if ps.extra_parallel_enabled(para) and ps.extra_parallel_fsdp_device_mesh[para] is not None
+        else None
+        for para in ps.extra_parallel_names
+    }
 
     # Build param groups (filter out params without grads)
-    ep_params: List[torch.nn.Parameter] = [p for p in model._ep_param_groups.get("ep", []) if p.grad is not None]
-    non_ep_params: List[torch.nn.Parameter] = [
-        p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
+    extra_parallel_params = {
+        para: [p for p in model._extra_parallel_param_groups.get(para, []) if p.grad is not None]
+        for para in ps.extra_parallel_names
+    }
+    non_extra_parallel_params: List[torch.nn.Parameter] = [
+        p for p in model._extra_parallel_param_groups.get("non_extra_parallel", []) if p.grad is not None
     ]
-    # Compute and reduce non-EP
-    non_ep_total = _fsdp2_reduce_group(
-        params=non_ep_params,
+
+    # Compute and reduce non-ExtraParallel
+    non_extra_parallel_total = _fsdp2_reduce_group(
+        params=non_extra_parallel_params,
         norm_type=norm_type,
         reduce_groups=[("fsdp", fsdp_group)],
     )
-    logger.debug_rank0(f"non_ep total grad norm: {non_ep_total}")
-    logger.debug_rank0(f"ep_params reduces groups: {ep_fsdp_group=}, {ep_group=}")
-    # Compute and reduce EP: first across ep_fsdp, then across ep
-    ep_total = _fsdp2_reduce_group(
-        params=ep_params,
-        norm_type=norm_type,
-        reduce_groups=[("ep_fsdp", ep_fsdp_group), ("ep", ep_group)],
-    )
-    logger.debug_rank0(f"ep total grad norm: {ep_total}")
+    logger.debug_rank0(f"non_extra_parallel total grad norm: {non_extra_parallel_total}")
+
+    for para in ps.extra_parallel_names:
+        logger.debug_rank0(
+            f"{para}_params reduces groups: {extra_parallel_fsdp_group[para]=}, {extra_parallel_group[para]=}"
+        )
+
+    # Compute and reduce ExtraParallel: first across para_fsdp (e.g. ep_fsdp), then across para (e.g. ep)
+    extra_parallel_total = {
+        para: torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
+        for para in ps.extra_parallel_names
+    }
+    for para in ps.extra_parallel_names:
+        if len(extra_parallel_params[para]) > 0:
+            para_total = _fsdp2_reduce_group(
+                params=extra_parallel_params[para],
+                norm_type=norm_type,
+                reduce_groups=[
+                    (f"{para}_fsdp", extra_parallel_fsdp_group[para]),
+                    (f"{para}", extra_parallel_group[para]),
+                ],
+            )
+            extra_parallel_total[para] = para_total
+            logger.debug_rank0(f"{para} total grad norm: {para_total}")
 
     if math.isinf(norm_type):
-        total_norm = torch.maximum(non_ep_total, ep_total)
+        total_norm = torch.maximum(non_extra_parallel_total, *extra_parallel_total.values())
     else:
-        total_norm = (non_ep_total + ep_total) ** (1.0 / float(norm_type))
+        total_norm = (non_extra_parallel_total + sum(extra_parallel_total.values())) ** (1.0 / float(norm_type))
 
     # Apply the same clip coefficient to both groups
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
+    for para in ps.extra_parallel_names:
+        torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
+    torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
 
@@ -106,6 +132,7 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
         g.to_local().detach().to(torch.float32) if isinstance(g, DTensor) else g.detach().to(torch.float32)
         for g in grads
     ]
+
     default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
     res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
     with torch.no_grad():

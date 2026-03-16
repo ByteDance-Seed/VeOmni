@@ -29,83 +29,126 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class SpecInfo:
-    ep_fsdp_mesh: DeviceMesh
+    para_name: str
     placement: Union[Shard, Replicate]
     fqn: str
+    para_fsdp_mesh: DeviceMesh
 
     @property
-    def ep_mesh(self):
-        if self.ep_fsdp_mesh is not None:
-            return self.ep_fsdp_mesh["ep"]
+    def para_mesh(self):
+        if self.para_fsdp_mesh is not None:
+            return self.para_fsdp_mesh[self.para_name]
         else:
             return None
 
 
 class ParallelPlan:
-    def __init__(self, ep_plan: Dict[str, Shard]):
-        self.ep_plan = ep_plan
-        self.ep_param_suffix = {k.split(".")[-1] for k in ep_plan.keys()}
-        self.fsdp_no_shard_module = {".".join(list(ep_plan.keys())[0].split(".")[:-1])}
+    def __init__(self, extra_parallel_plan: Dict[str, Dict[str, Shard]]):
+        self.extra_parallel_plan = extra_parallel_plan
+        self.extra_parallel_fsdp_no_shard_module = {
+            para_name: {".".join(list(plan.keys())[0].split(".")[:-1])}
+            for para_name, plan in self.extra_parallel_plan.items()
+        }
 
-    def apply(self, model: nn.Module, ep_fsdp_mesh: DeviceMesh):
+    def apply(self, model: nn.Module, extra_parallel_fsdp_device_mesh: Dict[str, DeviceMesh]):
         """
-        ep_fsdp_mesh: [replicate, replicate, ... , shard]
+        xxx_fsdp_mesh: [replicate, replicate, ... , shard]
         """
-        ep_mesh = ep_fsdp_mesh["ep"]
-        # ep_plan
+        extra_parallel_mesh = {
+            para: para_fsdp_mesh[para] if para_fsdp_mesh is not None else None
+            for para, para_fsdp_mesh in extra_parallel_fsdp_device_mesh.items()
+        }
+
         fqn2spec_info = {}
-        if self.ep_plan:
-            ep_size = ep_mesh.size(-1)
-            ep_replicate = [Replicate() for _ in range(ep_mesh.ndim)]
-            for fqn, param in model.named_parameters():
-                for fqn_pattern, shard in self.ep_plan.items():
-                    if check_fqn_match(fqn_pattern, fqn):
-                        assert param.size(shard.dim) % ep_size == 0
-                        ep_placement = ep_replicate[:-1] + [shard]
-                        logger.info_rank0(
-                            f"EP sharding: slicing param {fqn} along ep_mesh with placement {ep_placement}"
+        for para, para_plan in self.extra_parallel_plan.items():
+            para_mesh = extra_parallel_mesh[para]
+            para_fsdp_mesh = extra_parallel_fsdp_device_mesh[para]
+            if para_plan and para_mesh is not None:
+                para_size = para_mesh.size(-1)
+                para_replicate = [Replicate() for _ in range(para_mesh.ndim)]
+                for fqn, param in model.named_parameters():
+                    for fqn_pattern, shard in para_plan.items():
+                        if check_fqn_match(fqn_pattern, fqn):
+                            assert param.size(shard.dim) % para_size == 0
+                            para_placement = para_replicate[:-1] + [shard]
+                            logger.info_rank0(
+                                f"{para} sharding: slicing param {fqn} along {para}_mesh with placement {para_placement}"
+                            )
+                            dtensor = DTensor.from_local(
+                                local_tensor=param.data, device_mesh=para_mesh, placements=para_replicate
+                            )
+                            dtensor = dtensor.redistribute(device_mesh=para_mesh, placements=para_placement)
+                            local_chunk = torch.nn.Parameter(dtensor.to_local(), requires_grad=param.requires_grad)
+                            local_chunk.spec_info = SpecInfo(
+                                para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=shard, fqn=fqn
+                            )
+                            set_module_from_path(model, fqn, local_chunk)
+                            fqn2spec_info[fqn] = SpecInfo(
+                                para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=shard, fqn=fqn
+                            )
+                            break
+                    if fqn not in fqn2spec_info:  # not sharded
+                        param.spec_info = SpecInfo(
+                            para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=Replicate(), fqn=fqn
                         )
-                        dtensor = DTensor.from_local(
-                            local_tensor=param.data, device_mesh=ep_mesh, placements=ep_replicate
+                        fqn2spec_info[fqn] = SpecInfo(
+                            para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=Replicate(), fqn=fqn
                         )
-                        dtensor = dtensor.redistribute(device_mesh=ep_mesh, placements=ep_placement)
-                        local_chunk = torch.nn.Parameter(dtensor.to_local(), requires_grad=param.requires_grad)
-                        local_chunk.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
-                        set_module_from_path(model, fqn, local_chunk)
-                        fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
-                        break
-                if fqn not in fqn2spec_info:  # not sharded
-                    param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-                    fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-        for param in model.parameters():
-            assert hasattr(param, "spec_info"), f"Internal Error: {param} is omitted"
+
+        for fqn, param in model.named_parameters():
+            assert hasattr(param, "spec_info"), f"Internal Error: {fqn=} with {param=} is omitted"
 
         return fqn2spec_info
 
     def get_fsdp_no_shard_info(self, model: nn.Module):
-        if self.fsdp_no_shard_module is None:
+        if self.extra_parallel_fsdp_no_shard_module is None:
+            return None
+
+        fsdp_no_shard_states_fqn_to_module = {}
+        fsdp_no_shard_states_fqn_to_para = {}
+        for fqn, param in model.named_modules():
+            for para, no_shard_patterns in self.extra_parallel_fsdp_no_shard_module.items():
+                for no_shard_pattern in no_shard_patterns:
+                    if check_fqn_match(no_shard_pattern, fqn):
+                        fsdp_no_shard_states_fqn_to_module[fqn] = get_module_from_path(model, fqn)
+                        fsdp_no_shard_states_fqn_to_para[fqn] = para
+        assert len(fsdp_no_shard_states_fqn_to_module) > 0, (
+            "no module in model match `extra_parallel_fsdp_no_shard_module`"
+        )
+
+        return fsdp_no_shard_states_fqn_to_module, fsdp_no_shard_states_fqn_to_para
+
+    def get_extra_parallel_fsdp_no_shard_info(self, model: nn.Module, para_name: str):
+        if self.extra_parallel_fsdp_no_shard_module[para_name] is None:
             return None
 
         fsdp_no_shard_states_fqn_to_module = {}
         for fqn, param in model.named_modules():
-            for no_shard_pattern in self.fsdp_no_shard_module:
+            for no_shard_pattern in self.extra_parallel_fsdp_no_shard_module[para_name]:
                 if check_fqn_match(no_shard_pattern, fqn):
                     fsdp_no_shard_states_fqn_to_module[fqn] = get_module_from_path(model, fqn)
-        assert len(fsdp_no_shard_states_fqn_to_module) > 0, "no module in model match `fsdp_no_shard_module`"
+        assert len(fsdp_no_shard_states_fqn_to_module) > 0, (
+            "no module in model match `extra_parallel_fsdp_no_shard_module`"
+        )
 
         return fsdp_no_shard_states_fqn_to_module
 
     def update_prefix(self, prefix: str):
         """
-        Update ep_plan when model is wrappered.
+        Update extra_parallel_plan when model is wrappered.
         """
-        self.ep_plan = {prefix + "." + k: v for k, v in self.ep_plan.items()}
-        self.ep_param_suffix = {k.split(".")[-1] for k in self.ep_plan.keys()}
-        self.fsdp_no_shard_module = {prefix + "." + k for k in self.fsdp_no_shard_module}
+        self.extra_parallel_plan = {
+            para_name: {prefix + "." + k: v for k, v in plan.items()}
+            for para_name, plan in self.extra_parallel_plan.items()
+        }
+        self.extra_parallel_fsdp_no_shard_module = {
+            para_name: {prefix + "." + no_shard_pattern for no_shard_pattern in para_fsdp_no_shard_module}
+            for para_name, para_fsdp_no_shard_module in self.extra_parallel_fsdp_no_shard_module.items()
+        }
 
     def shard_tensor(self, tensor: "torch.Tensor", full_param_name: str, target_shape: tuple) -> "torch.Tensor":
         """
-        Shard tensor for expert parallelism if needed.
+        Shard tensor for one extra_parallel parallelism if needed.
         In the future, we may add other tensor slicing in this function to determine TP parameter and its sharding.
 
         Args:
@@ -114,27 +157,25 @@ class ParallelPlan:
             target_shape: The expected shape of the target parameter
 
         Returns:
-            The original tensor or a sliced version for EP
+            The original tensor or a sliced version for one extra_parallel parallelism
         """
-        if not self._is_expert_parameter(full_param_name):
-            return tensor
-        return self._slice_expert_tensor_for_ep(tensor, full_param_name, target_shape)
+        shard_group = self._get_shard_parameter_groupname(full_param_name)
+        if shard_group:
+            return self._slice_shard_tensor(tensor, full_param_name, target_shape, shard_group)
+        return tensor
 
-    def _is_expert_parameter(self, parameter_name: str) -> bool:
-        """Check if parameter is an expert parameter that needs EP-aware loading based on parallel_plan."""
-        if not self.ep_plan:
-            return False
+    def _get_shard_parameter_groupname(self, parameter_name: str) -> bool:
+        # note that parameter_name should be full name
+        for para_name, para_plan in self.extra_parallel_plan.items():
+            for fqn_pattern in para_plan.keys():
+                if check_fqn_match(fqn_pattern, parameter_name):
+                    return para_name
+        return None
 
-        # Check if this parameter matches any pattern in the EP plan
-        for fqn_pattern in self.ep_plan.keys():
-            if check_fqn_match(fqn_pattern, parameter_name):
-                return True
-        return False
-
-    def _slice_expert_tensor_for_ep(
-        self, tensor: "torch.Tensor", parameter_name: str, target_shape: tuple
+    def _slice_shard_tensor(
+        self, tensor: "torch.Tensor", parameter_name: str, target_shape: tuple, shard_group: str
     ) -> "torch.Tensor":
-        """Slice expert tensor for expert parallelism."""
+        """Slice shard tensor for extra_parallel parallelism."""
         try:
             from .parallel_state import get_parallel_state
 
@@ -142,21 +183,23 @@ class ParallelPlan:
 
             # Check if we need to slice based on tensor vs target shape mismatch
             if len(tensor.shape) >= 1 and len(target_shape) >= 1:
-                tensor_experts = tensor.shape[0]
-                target_experts = target_shape[0]
+                # If tensor has more feature than target, we need to slice
+                if tensor.shape[0] > target_shape[0] and tensor.shape[0] % target_shape[0] == 0:
+                    para_size = tensor.shape[0] // target_shape[0]
+                    para_rank = (
+                        parallel_state.extra_parallel_rank(shard_group)
+                        if parallel_state.extra_parallel_enabled(shard_group)
+                        else 0
+                    )
 
-                # If tensor has more experts than target, we need to slice
-                if tensor_experts > target_experts and tensor_experts % target_experts == 0:
-                    ep_size = tensor_experts // target_experts
-                    ep_rank = parallel_state.ep_rank if parallel_state.ep_enabled else 0
-                    start_idx = ep_rank * target_experts
-                    end_idx = start_idx + target_experts
+                    start_idx = para_rank * target_shape[0]
+                    end_idx = start_idx + target_shape[0]
 
                     sliced_tensor = tensor[start_idx:end_idx]
 
                     logger.info_rank0(
-                        f"Expert parameter {parameter_name}: sliced {tensor.shape} -> {sliced_tensor.shape} "
-                        f"for EP rank {ep_rank}/{ep_size}"
+                        f"{shard_group} parameter {parameter_name}: sliced {tensor.shape} -> {sliced_tensor.shape} "
+                        f"for {shard_group} rank {para_rank}/{para_size}"
                     )
 
                     return sliced_tensor
@@ -166,5 +209,5 @@ class ParallelPlan:
 
         except Exception as e:
             # Fallback: if anything fails, return original tensor
-            logger.warning(f"Failed to slice expert tensor {parameter_name}: {e}")
+            logger.warning(f"Failed to slice extra_parallel tensor {parameter_name}: {e}")
             return tensor
