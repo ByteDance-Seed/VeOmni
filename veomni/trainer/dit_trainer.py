@@ -283,7 +283,11 @@ class DiTTrainer:
     ) -> PreTrainedModel:
         args: VeOmniDiTArguments = self.base.args
         config_class = MODEL_CONFIG_REGISTRY[condition_model_type]()
-        condition_cfg = config_class.from_pretrained(args.model.condition_model_path, **args.model.condition_model_cfg)
+        condition_cfg = config_class.from_pretrained(
+            args.model.condition_model_path,
+            seed=args.train.seed,  # seed for randn noise and scheduler
+            **args.model.condition_model_cfg,
+        )
         model_class = MODELING_REGISTRY[condition_model_type]()
         if self.training_task == "offline_training":
             self.condition_model = model_class._from_config(condition_cfg, meta_init=True)

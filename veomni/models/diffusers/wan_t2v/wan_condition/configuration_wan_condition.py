@@ -1,3 +1,5 @@
+from typing import Optional
+
 from transformers import PretrainedConfig
 
 
@@ -24,6 +26,7 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         ),
         cfg_negative_prob: float = 0.1,
         video_max_size: int = 480,
+        seed: Optional[int] = 42,
         **kwargs,
     ):
         self.base_model_path = base_model_path
@@ -38,6 +41,7 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         self.cfg_negative_prompt = cfg_negative_prompt
         self.cfg_negative_prob = cfg_negative_prob
         self.video_max_size = video_max_size
+        self.seed = seed
         super().__init__(**kwargs)
 
     @classmethod
