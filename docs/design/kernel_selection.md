@@ -261,3 +261,133 @@ apply_veomni_fused_moe_patch(moe_implementation="fused_quack")
 
 All env vars are registered in `veomni/utils/env.py` with defaults and can be
 overridden by setting the corresponding shell environment variable.
+
+---
+
+## 5. Comparison with Transformers v5+ Kernel Selection
+
+Transformers v5 (`transformers>=4.57`) introduces a unified kernel selection
+framework that replaces the ad-hoc patching used in earlier versions.
+This section compares VeOmni's approach (Sections 1-4 above) with the four
+mechanisms available in Transformers v5, using `Qwen3MoE` and `Qwen3.5MoE` as
+reference models.
+
+### 5.1 Transformers v5 Mechanisms Overview
+
+| # | Mechanism | Decorator / API | What it replaces | Scope |
+|---|-----------|----------------|------------------|-------|
+| 1 | Hub kernel layers | `@use_kernel_forward_from_hub("RMSNorm")` | `nn.Module.forward` | Per-class, via `kernels` library from HF Hub |
+| 2 | Hub kernel functions | `@use_kernel_func_from_hub("rotary_pos_emb")` | Standalone functions (e.g. `apply_rotary_pos_emb`) | Per-function, via `kernels` library from HF Hub |
+| 3 | Attention interface | `ALL_ATTENTION_FUNCTIONS.get_interface(...)` | Attention forward pass | Per-model via `config._attn_implementation` |
+| 4 | Experts interface | `@use_experts_implementation` | MoE expert forward pass | Per-class via `config._experts_implementation` |
+
+All four are defined in `transformers.integrations`:
+- `hub_kernels.py` — mechanisms 1 & 2
+- `moe.py` — mechanism 4
+- `modeling_utils.py` — mechanism 3 (`ALL_ATTENTION_FUNCTIONS`)
+
+### 5.2 Side-by-Side Comparison
+
+#### RMSNorm
+
+| | VeOmni | Transformers v5 |
+|---|--------|----------------|
+| **Mechanism** | `gpu_patch.py` replaces `{Model}RMSNorm` class with `LigerRMSNorm` at import time | `@use_kernel_forward_from_hub("RMSNorm")` decorator on `Qwen3MoeRMSNorm`; at `model.kernelize()` time the `kernels` library downloads and swaps in `LigerRMSNorm` from `kernels-community/liger_kernels` |
+| **Config** | `VEOMNI_USE_LIGER_KERNEL` env var | `USE_HUB_KERNELS` env var + `model.kernelize()` call |
+| **When** | Model registration (import time) | Deferred — `kernelize()` after model init |
+| **SP support** | N/A (norm is local) | N/A |
+| **Qwen3.5 MoE gap** | Same as Qwen3 — Liger swap works | **Not annotated.** `Qwen3_5MoeRMSNorm` uses `weight * (1.0 + self.weight)` (offset-by-1 convention, weight init to zeros) instead of the standard `self.weight * x` (weight init to ones). No `@use_kernel_forward_from_hub("RMSNorm")` decorator. Standard `LigerRMSNorm` cannot replace it without accounting for the `+1.0` offset. |
+
+#### Rotary Position Embedding (RoPE)
+
+| | VeOmni | Transformers v5 |
+|---|--------|----------------|
+| **Mechanism** | `gpu_patch.py` replaces `apply_rotary_pos_emb` function with `liger_rotary_pos_emb` at import time | `@use_kernel_func_from_hub("rotary_pos_emb")` on the `apply_rotary_pos_emb` function; `kernels` library downloads `apply_rotary_transformers` from `kernels-community/rotary`. The function is also attached to the Attention module via `@use_kernelized_func(apply_rotary_pos_emb)` so `kernelize()` can find it. |
+| **Config** | `VEOMNI_USE_LIGER_KERNEL` env var | `USE_HUB_KERNELS` env var |
+| **When** | Model registration (import time) | Import time (decorator) + `kernelize()` |
+| **Qwen3.5 MoE gap** | N/A — VeOmni does not yet support Qwen3.5 MoE | **Partially annotated.** `apply_rotary_pos_emb` in `Qwen3_5MoeAttention` is annotated with `@use_kernelized_func` but **not** with `@use_kernel_func_from_hub("rotary_pos_emb")`. This is because Qwen3.5 MoE uses *partial RoPE* (`partial_rotary_factor < 1.0`): it splits Q/K into rotary and pass-through parts, applies RoPE only to the rotary part, then concatenates. The standard hub kernel `apply_rotary_transformers` does not handle this split-and-concat pattern. A dedicated partial-RoPE kernel could still be used. |
+
+#### Attention
+
+| | VeOmni | Transformers v5 |
+|---|--------|----------------|
+| **Mechanism** | `apply_veomni_attention_patch()` registers SP-wrapped variants (`veomni_flash_attention_2_with_sp`, etc.) into `ALL_ATTENTION_FUNCTIONS` | Same `ALL_ATTENTION_FUNCTIONS` registry. Additionally supports hub-based attention kernels via `attn_implementation="kernels-community/flash-mla"` syntax (loaded by `load_and_register_attn_kernel()`). |
+| **Config** | `OpsImplementationConfig.attn_implementation` | `config._attn_implementation` (set via `AutoModel.from_pretrained(attn_implementation=...)`) |
+| **SP rewrite** | `__post_init__` rewrites `flash_attention_2` → `veomni_flash_attention_2_with_sp` | No SP support — upstream Transformers does not handle Ulysses SP |
+| **Compatibility** | VeOmni registers into the **same** `ALL_ATTENTION_FUNCTIONS` registry that Transformers uses, so the two are compatible by design |
+
+#### MoE Experts
+
+| | VeOmni | Transformers v5 |
+|---|--------|----------------|
+| **Mechanism** | `apply_veomni_fused_moe_patch()` replaces the global `fused_moe_forward` function pointer, keyed by `config._moe_implementation ∈ {"eager", "fused"}`. The actual GEMM backend (Triton vs Quack) is selected inside the patch function. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused"` / `"fused_quack"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **EP support** | Triton `fused` path supports Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
+| **When** | Deferred to `build_foundation_model()` | Decorator at class definition time; dispatch at forward time |
+
+NOTE: transformers v5 moe hard codes 2 impl "batched_mm" and "grouped_mm" and does not provide a registration way for others to register other moe impl.
+
+### 5.3 Gaps — What Transformers v5 Does NOT Cover
+
+The following areas have kernel selection in VeOmni but **no corresponding
+mechanism** in Transformers v5:
+
+#### 1. Fused Cross-Entropy Loss
+
+Transformers v5 uses a `loss_function` property on `PreTrainedModel` that looks
+up `LOSS_MAPPING[self.loss_type]` — this returns a standard PyTorch
+`F.cross_entropy`-based loss. There is no decorator, no hub kernel, and no
+env-var-based kernel swap for the loss function.
+
+VeOmni replaces this at import time with `apply_veomni_loss_patch()`, binding
+either `fused_liger_kernel_cross_entropy` (GPU) or `chunk_loss_function` (NPU).
+The fused Liger cross-entropy computes the loss without materializing the full
+logits tensor, which significantly reduces memory for large-vocabulary models.
+
+**Implication:** When using VeOmni's trainer, the fused loss is transparent.
+When using a standalone Transformers training loop, users would need to manually
+set `model.loss_function = custom_fused_loss` or monkey-patch `LOSS_MAPPING`.
+
+#### 2. MoE Load-Balancing Auxiliary Loss
+
+Both Qwen3MoE and Qwen3.5MoE in Transformers v5 include a standalone
+`load_balancing_loss_func()` that computes the Switch Transformer auxiliary
+loss. This function is called directly in `Qwen3MoeForCausalLM.forward()` —
+there is no kernel selection, no registry, and no hub kernel for it.
+
+VeOmni similarly does not provide a fused kernel for the auxiliary loss, but
+this is worth noting because the load-balancing loss involves several
+`one_hot → mean → dot` operations that could benefit from fusion, especially
+at scale with many experts.
+
+#### 3. Qwen3.5 MoE Variant-Specific Ops
+
+Qwen3.5 MoE introduces architectural differences that prevent direct use of
+the standard hub kernel annotations:
+
+| Component | Qwen3 MoE | Qwen3.5 MoE | Why standard kernel fails |
+|-----------|-----------|-------------|--------------------------|
+| RMSNorm | `self.weight * x` (weight init ones) | `(1.0 + self.weight) * x` (weight init zeros) | LigerRMSNorm assumes no offset; applying it would produce incorrect results |
+| RoPE | Full rotary on all dims | Partial rotary (`partial_rotary_factor`) — split, rotate, concat | Hub `apply_rotary_transformers` assumes full-dim rotation |
+| RMSNormGated | N/A | `Qwen3_5MoeRMSNormGated` — norm then SiLU gate multiply | Entirely different op signature; no hub kernel exists |
+
+In Transformers v5, these Qwen3.5 MoE ops are left un-annotated — they always
+run the eager PyTorch implementation. In theory, fused kernels could still be
+written for each (e.g., a Triton RMSNorm with `+1` offset, a partial-RoPE
+kernel, a gated-RMSNorm kernel), but no such kernels currently exist in the
+`kernels-community` hub.
+
+
+
+### 5.4 Summary Table
+
+| Component | VeOmni mechanism | Transformers v5 mechanism | Compatible? | Gap |
+|-----------|-----------------|--------------------------|:-----------:|-----|
+| RMSNorm | `gpu_patch.py` Liger swap | `@use_kernel_forward_from_hub` | Parallel — both can apply | Qwen3.5 MoE `+1` offset norm not covered by either |
+| RoPE | `gpu_patch.py` Liger swap | `@use_kernel_func_from_hub` + `@use_kernelized_func` | Parallel | Qwen3.5 MoE partial RoPE not covered by either |
+| SwiGLU MLP | `gpu_patch.py` Liger swap | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
+| Attention | `ALL_ATTENTION_FUNCTIONS` (shared registry) | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
+| MoE experts | `apply_veomni_fused_moe_patch` (Triton/Quack) | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses custom Triton kernels; HF uses PyTorch native `grouped_mm` |
+| Cross-entropy | `apply_veomni_loss_patch` (Liger fused) | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss |
+| MoE aux loss | Eager (same as HF) | Eager `load_balancing_loss_func` | Same | Neither provides a fused kernel |
+| RMSNormGated | N/A | N/A (Qwen3.5 MoE only, no kernel) | — | No fused kernel in either |
