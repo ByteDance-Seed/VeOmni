@@ -283,6 +283,8 @@ select = ["C", "E", "F", "I", "W"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
 "veomni/models/transformers/**/generated/*.py" = ["E402"]
+# Patch gen configs are not real code to run and often misses imports
+"veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2

@@ -14,12 +14,14 @@
 
 from ..utils import logging
 from ..utils.env import get_env
-from . import flash_attn, fused_cross_entropy, fused_moe
+from . import flash_attn, fused_cross_entropy, fused_moe, kernel_defaults  # noqa: F401
+from .dispatch import OpSlot
 from .fused_moe import fused_moe_forward
 
 
 __all__ = [
     "fused_moe_forward",
+    "OpSlot",
 ]
 
 logger = logging.get_logger(__name__)

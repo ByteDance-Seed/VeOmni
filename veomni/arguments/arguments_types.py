@@ -580,6 +580,42 @@ class OpsImplementationConfig:
             "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
         },
     )
+    cross_entropy_loss_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Cross-entropy loss kernel implementation. "
+            "'eager' for standard PyTorch, 'liger_fused' for Liger fused linear CE."
+        },
+    )
+    moe_load_balancing_loss_implementation: str = field(
+        default="eager",
+        metadata={"help": "MoE load-balancing loss kernel implementation. 'eager' for standard PyTorch."},
+    )
+    rms_norm_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "RMSNorm kernel implementation. "
+            "'eager' for standard PyTorch, 'liger' for LigerKernel fused RMSNorm."
+        },
+    )
+
+    # Map from user-facing moe_implementation values to kernel registry names.
+    _MOE_IMPL_TO_KERNEL = {
+        "eager": "eager",
+        "fused": "triton_group_gemm",
+        "fused_quack": "quack_cutlass",
+    }
+
+    @property
+    def moe_experts_implementation(self) -> str:
+        """Resolve moe_implementation to a kernel registry name for the ``moe_experts`` OpSlot."""
+        raw = self.moe_implementation
+        if raw is None:
+            return "eager"
+        mapped = self._MOE_IMPL_TO_KERNEL.get(raw)
+        if mapped is None:
+            raise ValueError(f"Unknown moe_implementation='{raw}'. Valid: {list(self._MOE_IMPL_TO_KERNEL.keys())}")
+        return mapped
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
