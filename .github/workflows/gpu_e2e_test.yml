@@ -80,8 +80,8 @@ jobs:
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
       - name: Run models tests [transformers-v5]
         run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/e2e/test_e2e_training.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/e2e/test_e2e_parallel.py
         # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:

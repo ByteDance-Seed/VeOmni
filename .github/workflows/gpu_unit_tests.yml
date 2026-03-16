@@ -111,17 +111,17 @@ jobs:
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
       - name: Run models tests [transformers-v5]
         run: |
-          uv run  --frozen pytest -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/models/test_models_patch.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
       - name: Run utils tests [transformers-v5]
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |
           # Need v5 to support newer models like Qwen3.5 count flops tests.
-          uv run --frozen pytest -s -x tests/utils/test_count_flops.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/utils/test_count_flops.py
       # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:
