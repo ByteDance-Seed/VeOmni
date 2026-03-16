@@ -369,13 +369,63 @@ the standard hub kernel annotations:
 |-----------|-----------|-------------|--------------------------|
 | RMSNorm | `self.weight * x` (weight init ones) | `(1.0 + self.weight) * x` (weight init zeros) | LigerRMSNorm assumes no offset; applying it would produce incorrect results |
 | RoPE | Full rotary on all dims | Partial rotary (`partial_rotary_factor`) — split, rotate, concat | Hub `apply_rotary_transformers` assumes full-dim rotation |
-| RMSNormGated | N/A | `Qwen3_5MoeRMSNormGated` — norm then SiLU gate multiply | Entirely different op signature; no hub kernel exists |
+| RMSNormGated | N/A | `Qwen3_5MoeRMSNormGated` — norm then SiLU gate multiply | Uses explicit `fla` library selection (see below) |
 
-In Transformers v5, these Qwen3.5 MoE ops are left un-annotated — they always
-run the eager PyTorch implementation. In theory, fused kernels could still be
-written for each (e.g., a Triton RMSNorm with `+1` offset, a partial-RoPE
-kernel, a gated-RMSNorm kernel), but no such kernels currently exist in the
-`kernels-community` hub.
+**RMSNormGated: explicit `fla` library selection (not the hub kernel framework)**
+
+Unlike RMSNorm and RoPE above, Qwen3.5 MoE's `RMSNormGated` **does** have a
+fused kernel path — but it bypasses the Transformers v5 `@use_kernel_forward_from_hub`
+framework entirely. Instead, `Qwen3_5MoeGatedDeltaNet.__init__` performs a
+hard-coded conditional selection at model init time:
+
+```python
+# transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+
+# At module top level:
+if is_flash_linear_attention_available():
+    from fla.modules import FusedRMSNormGated
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+else:
+    chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
+    FusedRMSNormGated = None
+
+# In Qwen3_5MoeGatedDeltaNet.__init__:
+self.norm = (
+    Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+    if FusedRMSNormGated is None
+    else FusedRMSNormGated(
+        self.head_v_dim,
+        eps=self.layer_norm_epsilon,
+        activation=self.activation,
+        device=torch.cuda.current_device(),
+        dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
+    )
+)
+```
+
+This is a **5th kernel selection pattern** — not covered by any of the four
+Transformers v5 mechanisms. It is a simple `if library_available else fallback`
+check, similar to how the same file selects between `causal_conv1d_fn` (from
+the `causal-conv1d` library) and a pure-PyTorch `torch_causal_conv1d_update`
+fallback, and between `chunk_gated_delta_rule` (from `fla.ops`) and
+`torch_chunk_gated_delta_rule`.
+
+Key characteristics of this pattern:
+- **No decorator, no registry, no env var** — purely hard-coded `if/else` in `__init__`
+- **Library:** `flash-linear-attention` (`fla`) — a separate library from
+  both Liger and the `kernels` hub
+- **Scope:** Only the Gated DeltaNet linear attention layers in Qwen3.5 MoE;
+  the standard full-attention `Qwen3_5MoeAttention` layers do not use this norm
+- **Not configurable at runtime** — determined solely by whether `fla` is installed
+- **`FusedRMSNormGated`** fuses the RMSNorm + SiLU gate multiply into a single
+  Triton kernel, which the eager `Qwen3_5MoeRMSNormGated` does in two steps:
+  `hidden = weight * (x / rms)` then `hidden = hidden * silu(gate)`
+
+In Transformers v5, these remaining Qwen3.5 MoE ops (RMSNorm with `+1` offset,
+partial RoPE) are left un-annotated — they always run the eager PyTorch
+implementation. In theory, fused kernels could still be written for each (e.g.,
+a Triton RMSNorm with `+1` offset, a partial-RoPE kernel), but no such kernels
+currently exist in the `kernels-community` hub.
 
 
 
@@ -390,4 +440,4 @@ kernel, a gated-RMSNorm kernel), but no such kernels currently exist in the
 | MoE experts | `apply_veomni_fused_moe_patch` (Triton/Quack) | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses custom Triton kernels; HF uses PyTorch native `grouped_mm` |
 | Cross-entropy | `apply_veomni_loss_patch` (Liger fused) | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss |
 | MoE aux loss | Eager (same as HF) | Eager `load_balancing_loss_func` | Same | Neither provides a fused kernel |
-| RMSNormGated | N/A | N/A (Qwen3.5 MoE only, no kernel) | — | No fused kernel in either |
+| RMSNormGated | N/A | Hard-coded `fla.modules.FusedRMSNormGated` if `fla` installed, else eager (Qwen3.5 MoE only) | — | Bypasses all 4 HF v5 mechanisms; 5th ad-hoc pattern |
