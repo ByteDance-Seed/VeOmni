@@ -9,13 +9,14 @@ from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
 
 # See
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
+_dit_only = pytest.mark.skipif(is_diffusers_available(), reason="Requires diffusers")
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -230,7 +231,7 @@ wan_dit_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        marks=_v4_only,
+        marks=_dit_only,
     ),
 ]
 
