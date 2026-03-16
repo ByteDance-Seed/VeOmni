@@ -93,6 +93,12 @@ jobs:
       - name: Check final pip list
         run: |
           uv pip list
+      - name: Check model path
+        run: |
+          ls -l /data00/assets/models/Qwen/Qwen3-0.6B-Base
+      - name: Check dataset path
+        run: |
+          ls -l /data00/assets/dataset
       - name: Run e2e training test
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
