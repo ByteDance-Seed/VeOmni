@@ -109,14 +109,15 @@ jobs:
       - name: Sync dependencies [transformers-v5]
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
-      - name: Run models tests [transformers-v5]
-          # TODO: run all tests under tests/models/ once all models tests are verified with v5
-        run: |
-          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/models/test_models_patch.py
-      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
-        if: steps.changes.outputs.qwen3_5_ulysses == 'true'
-        run: |
-          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
+      # TODO: Re-enable v5 models tests once we can migrate those tests to internal larger vram GPU. currently OOM in Github L20 workers.
+      # - name: Run models tests [transformers-v5]
+      #    # TODO: run all tests under tests/models/ once all models tests are verified with v5
+      #  run: |
+      #    uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/models/test_models_patch.py
+      #- name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
+      #  if: steps.changes.outputs.qwen3_5_ulysses == 'true'
+      #  run: |
+      #    uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
       - name: Run utils tests [transformers-v5]
         # TODO: run all tests under tests/utils/ once all util tests are verified with v5
         run: |
