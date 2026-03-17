@@ -103,6 +103,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        marks=_v5_only,
     ),
     pytest.param(
         "qwen2.5",
