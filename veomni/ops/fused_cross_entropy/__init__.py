@@ -41,6 +41,7 @@ def ForCausalLMLoss(
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
+    cross_entropy_fn: Optional[Callable] = None,
     **kwargs,
 ) -> torch.Tensor:
     # pop fused loss kwargs
@@ -76,6 +77,8 @@ def ForCausalLMLoss(
     # Enable model parallelism
     shift_labels = shift_labels.to(device)
 
+    # Resolve the cross-entropy implementation: explicit arg > module global > eager fallback.
+    loss_func = cross_entropy_fn or _cross_entropy
     if hidden_states is None or weights is None:
         logger.warning_once(
             "hidden_states or weights is None, use eager loss implementation."
@@ -83,8 +86,6 @@ def ForCausalLMLoss(
             "to pass `hidden_states` and `weights` to `loss_function`."
         )
         loss_func = eager_cross_entropy
-    else:
-        loss_func = _cross_entropy
     loss, logits = loss_func(
         logits,
         shift_labels,

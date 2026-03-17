@@ -1,6 +1,7 @@
 import copy
 import gc
 import os
+import sys
 from typing import Dict
 
 import pytest
@@ -56,6 +57,28 @@ class TrainerTest(BaseTrainer):
     def _build_model_assets(self):
         self.model_assets = []
 
+    # Op names whose OpSlot state should match use_liger_kernel.
+    _LIGER_OP_NAMES = {"rms_norm", "swiglu_mlp", "apply_rotary_pos_emb", "cross_entropy_loss"}
+
+    def _verify_opslot_state(self, model_mode: ModelMode):
+        """Assert OpSlot binding matches use_liger_kernel after model build."""
+        from veomni.ops.dispatch import OpSlot
+
+        modeling_module = sys.modules.get(self.model.__class__.__module__)
+        if modeling_module is None:
+            return
+        for name, obj in vars(modeling_module).items():
+            if not isinstance(obj, OpSlot) or obj.op_name not in self._LIGER_OP_NAMES:
+                continue
+            if model_mode.use_liger_kernel:
+                assert obj.has_kernel, (
+                    f"OpSlot {name} ({obj.op_name}/{obj.variant}) should have kernel when use_liger_kernel=True"
+                )
+            else:
+                assert not obj.has_kernel, (
+                    f"OpSlot {name} ({obj.op_name}/{obj.variant}) should be eager when use_liger_kernel=False"
+                )
+
     def _build_data_transform(self):
         pass
 
@@ -93,7 +116,19 @@ class TrainerTest(BaseTrainer):
         self.args.model.ops_implementation.attn_implementation = model_mode.attn_implementation
         self.args.model.ops_implementation.moe_implementation = model_mode.moe_implementation
 
+        if model_mode.use_liger_kernel:
+            self.args.model.ops_implementation.rms_norm_implementation = "liger"
+            self.args.model.ops_implementation.swiglu_mlp_implementation = "liger"
+            self.args.model.ops_implementation.apply_rotary_pos_emb_implementation = "liger"
+            self.args.model.ops_implementation.cross_entropy_loss_implementation = "liger_fused"
+        else:
+            self.args.model.ops_implementation.rms_norm_implementation = "eager"
+            self.args.model.ops_implementation.swiglu_mlp_implementation = "eager"
+            self.args.model.ops_implementation.apply_rotary_pos_emb_implementation = "eager"
+            self.args.model.ops_implementation.cross_entropy_loss_implementation = "eager"
+
         self._build_model()
+        self._verify_opslot_state(model_mode)
         self._build_optimizer()
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")

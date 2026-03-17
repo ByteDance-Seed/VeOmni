@@ -209,15 +209,28 @@ KERNEL_REGISTRY.register(
 
 # ── Cross-entropy loss: Liger fused ──────────────────────────────────────────
 
+
+def _liger_fused_ce_factory():
+    """Return ForCausalLMLoss with the Liger fused CE kernel bound via partial.
+
+    This ensures the OpSlot path gets the full preprocessing (label shifting,
+    flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
+    """
+    from functools import partial
+
+    from veomni.ops.fused_cross_entropy import ForCausalLMLoss
+    from veomni.ops.fused_cross_entropy.liger_kernel import fused_liger_kernel_cross_entropy
+
+    return partial(ForCausalLMLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
 KERNEL_REGISTRY.register(
     KernelSpec(
         name="liger_fused",
         op_name="cross_entropy_loss",
         variant="standard",
-        factory=lambda: __import__(
-            "veomni.ops.fused_cross_entropy.liger_kernel", fromlist=["fused_liger_kernel_cross_entropy"]
-        ).fused_liger_kernel_cross_entropy,
+        factory=_liger_fused_ce_factory,
         hardware=HardwareRequirement(device_type="cuda"),
-        description="Liger fused linear cross-entropy loss",
+        description="Liger fused linear cross-entropy loss (with label shifting and SP reduction)",
     )
 )
