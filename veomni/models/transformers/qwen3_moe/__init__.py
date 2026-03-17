@@ -13,6 +13,7 @@
 # limitations under the License.
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from . import liger_kernel_mapping as _liger_kernel_mapping  # noqa: F401
 
 
 @MODELING_REGISTRY.register("qwen3_moe")
