@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
+from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("qwen3_vl")

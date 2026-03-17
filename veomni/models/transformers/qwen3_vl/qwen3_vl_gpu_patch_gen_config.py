@@ -39,7 +39,6 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -54,7 +53,9 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
 )
 from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
 
 # NOTE:
 # - Names like ALL_ATTENTION_FUNCTIONS, eager_attention_forward, apply_rotary_pos_emb,
@@ -76,7 +77,7 @@ config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("copy", is_from_import=False)
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
-config.add_import("veomni.data.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import(
     "veomni.distributed.sequence_parallel",
@@ -116,10 +117,7 @@ def qwen3vl_vision_attention_forward_patched(
 ) -> torch.Tensor:
     seq_length = hidden_states.shape[0]
     query_states, key_states, value_states = (
-        self.qkv(hidden_states)
-        .reshape(seq_length, 3, self.num_heads, -1)
-        .permute(1, 0, 2, 3)
-        .unbind(0)
+        self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
 
     cos, sin = position_embeddings
@@ -129,7 +127,9 @@ def qwen3vl_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, eager_attention_forward)
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
 
     if (self.config._attn_implementation in VARLEN_ATTENTION_TYPES) or is_flash_attention_requested(self.config):
         if max_seqlen is None:
@@ -220,9 +220,16 @@ def qwen3vl_text_attention_async_ulysses_forward(
     v = v.transpose(1, 2)
 
     cos, sin = position_embeddings
+
+    # TODO: check this, wehther we need to unpad sp padding?
+    cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
+    sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
+
     query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, eager_attention_forward)
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
     attn_output, attn_weights = attention_interface(
         self,
         query_states,
@@ -281,7 +288,9 @@ def qwen3vl_text_attention_forward_patched(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, eager_attention_forward)
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
     attn_output, attn_weights = attention_interface(
         self,
         query_states,
@@ -368,7 +377,9 @@ def qwen3vl_text_model_forward_patched(
             **kwargs,
         )
         if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-            hidden_states = self._deepstack_process(hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx])
+            hidden_states = self._deepstack_process(
+                hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+            )
 
     hidden_states = self.norm(hidden_states)
     return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values)
@@ -732,9 +743,24 @@ def qwen3vl_model_get_rope_index_patched(
                     torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
                 )
 
-                t_index = torch.arange(llm_grid_t, device=input_ids.device).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
-                h_index = torch.arange(llm_grid_h, device=input_ids.device).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                w_index = torch.arange(llm_grid_w, device=input_ids.device).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                t_index = (
+                    torch.arange(llm_grid_t, device=input_ids.device)
+                    .view(-1, 1)
+                    .expand(-1, llm_grid_h * llm_grid_w)
+                    .flatten()
+                )
+                h_index = (
+                    torch.arange(llm_grid_h, device=input_ids.device)
+                    .view(1, -1, 1)
+                    .expand(llm_grid_t, -1, llm_grid_w)
+                    .flatten()
+                )
+                w_index = (
+                    torch.arange(llm_grid_w, device=input_ids.device)
+                    .view(1, 1, -1)
+                    .expand(llm_grid_t, llm_grid_h, -1)
+                    .flatten()
+                )
                 llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
 
                 st = ed + llm_grid_t * llm_grid_h * llm_grid_w
@@ -760,7 +786,9 @@ def qwen3vl_model_get_rope_index_patched(
         max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
         mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
     else:
-        position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).view(1, 1, -1).expand(3, input_ids.shape[0], -1)
+        position_ids = (
+            torch.arange(input_ids.shape[1], device=input_ids.device).view(1, 1, -1).expand(3, input_ids.shape[0], -1)
+        )
         mrope_position_deltas = torch.zeros([input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype)
 
     return position_ids, mrope_position_deltas
@@ -798,23 +826,13 @@ def qwen3vl_model_forward_patched(
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
 
-    # If masks are not provided, infer them. SP-enabled path gathers full seq first.
-    if image_mask is None and video_mask is None:
-        if input_ids is not None:
-            if get_parallel_state().sp_enabled:
-                input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
-                dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-                full_input_ids = torch.cat(input_ids_list, dim=0)
-                image_mask = full_input_ids == self.config.image_token_id
-                video_mask = full_input_ids == self.config.video_token_id
-            else:
-                image_mask = input_ids == self.config.image_token_id
-                video_mask = input_ids == self.config.video_token_id
-        else:
-            # inputs_embeds-only fallback: use placeholder mask API then squeeze.
-            img_m, vid_m = self.get_placeholder_mask(input_ids=None, inputs_embeds=inputs_embeds)
-            image_mask = img_m[..., 0]
-            video_mask = vid_m[..., 0]
+    # if None, calculate mask
+    if video_mask is None and image_mask is None:
+        if get_parallel_state().sp_enabled:
+            input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+            dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+            input_ids = torch.cat(input_ids_list, dim=0)
+        image_mask, video_mask = self.get_placeholder_mask(input_ids)
 
     # Pop flash-attn kwargs for ViT; they should go only to the language model.
     flash_attn_kwargs = {}
@@ -851,7 +869,9 @@ def qwen3vl_model_forward_patched(
             ]
 
         n_image_tokens = int(image_mask.sum().long().item())
-        embeds_image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        embeds_image_mask = (
+            image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        )
 
         image_embeds = image_embeds[:n_image_tokens]
         deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
@@ -896,7 +916,9 @@ def qwen3vl_model_forward_patched(
             ]
 
         n_video_tokens = int(video_mask.sum().long().item())
-        embeds_video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        embeds_video_mask = (
+            video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        )
 
         video_embeds = video_embeds[:n_video_tokens]
         deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
@@ -954,7 +976,9 @@ def qwen3vl_model_forward_patched(
 
     # Position ids (v4 semantics, non-compiled path)
     if position_ids is None and input_ids is not None:
-        attention_mask_tensor = attention_mask if not isinstance(attention_mask, dict) else attention_mask.get("full_attention", None)
+        attention_mask_tensor = (
+            attention_mask if not isinstance(attention_mask, dict) else attention_mask.get("full_attention", None)
+        )
         if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
             attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
             if attention_mask_tensor.dtype.is_floating_point:
@@ -974,7 +998,9 @@ def qwen3vl_model_forward_patched(
             self.rope_deltas = rope_deltas
         else:
             batch_size, seq_length, _ = inputs_embeds.shape
-            delta = (cache_position[0] + self.rope_deltas).to(inputs_embeds.device) if cache_position is not None else 0
+            delta = (
+                (cache_position[0] + self.rope_deltas).to(inputs_embeds.device) if cache_position is not None else 0
+            )
             pos_1d = torch.arange(seq_length, device=inputs_embeds.device).view(1, -1).expand(batch_size, -1)
             if cache_position is not None:
                 delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
@@ -984,9 +1010,6 @@ def qwen3vl_model_forward_patched(
         # handle (bs, 3, seq) precomputed position_ids
         if position_ids.dim() == 3 and position_ids.shape[1] == 3:
             position_ids = position_ids.transpose(0, 1).contiguous()
-
-    if get_parallel_state().sp_enabled and not get_parallel_state().async_enabled and position_ids is not None:
-        position_ids = sp_pad_and_slice(position_ids, dim=-1)
 
     # Restore flash-attn kwargs to LM
     kwargs.update(flash_attn_kwargs)
