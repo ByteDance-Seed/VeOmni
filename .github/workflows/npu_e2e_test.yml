@@ -47,8 +47,8 @@ jobs:
         - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
         - /etc/ascend_install.info:/etc/ascend_install.info
         - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
-        # - /data00/dataset:/github/home/dataset
-        # - /data00/models:/github/home/models
+        - /data00/dataset:/github/home/dataset
+        - /data00/models:/github/home/models
         # Use self-host cache speed up pip and model download
         # - /home/action/actions-runner/_work/cache:/github/home/.cache/
       options: >-
@@ -64,8 +64,8 @@ jobs:
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
       CI_SAMPLES_DIR: "/data00/assets/samples"
-      CI_MODEL_DIR: "/data00/assets/models/Qwen"
-      CI_DATASET_DIR: "/data00/assets/dataset"
+      CI_MODEL_DIR: "/github/home/models/Qwen"
+      CI_DATASET_DIR: "/github/home/dataset"
 
     steps:
       - name: Set up proxy
@@ -95,10 +95,10 @@ jobs:
           uv pip list
       - name: Check model path
         run: |
-          ls -l /data00/assets/models/Qwen/Qwen3-0.6B-Base
+          ls -l /github/home/models/Qwen/Qwen3-0.6B-Base
       - name: Check dataset path
         run: |
-          ls -l /data00/assets/dataset
+          ls -l /github/home/dataset
       - name: Run e2e training test
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
