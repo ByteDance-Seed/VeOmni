@@ -107,6 +107,7 @@ def prepare_model_modes(
 
 MODEL_TO_DATASET = {
     "qwen3_vl": "qwen3vl",
+    "qwen3_5": "qwen3vl",
     "qwen3_vl_moe": "qwen3vl",
     "qwen2_vl": "qwen2vl",
     "qwen2_5_vl": "qwen2vl",

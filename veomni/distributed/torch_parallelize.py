@@ -207,13 +207,13 @@ def parallelize_model_fsdp1(
         _extra_parallel_sharding_strategy = {}
         _extra_parallel_fsdp_device_mesh = {}
         for para in parallel_state.extra_parallel_names:
-            if (
-                parallel_state.extra_parallel_fsdp_device_mesh[para] is None
-                or parallel_state.extra_parallel_fsdp_mesh(para)[f"{para}_fsdp"].size() == 1
-            ):
+            if parallel_state.extra_parallel_fsdp_device_mesh[para] is None:
                 _extra_parallel_sharding_strategy[para] = ShardingStrategy.NO_SHARD
                 _extra_parallel_fsdp_device_mesh[para] = parallel_state.fsdp_mesh
             else:
+                # Always use FULL_SHARD with ep_fsdp mesh, even when ep_fsdp size is 1.
+                # FULL_SHARD on a size-1 mesh is a no-op for communication but still
+                # applies mixed precision and gradient postdivide factor correctly.
                 _extra_parallel_sharding_strategy[para] = ShardingStrategy.FULL_SHARD
                 _extra_parallel_fsdp_device_mesh[para] = parallel_state.extra_parallel_fsdp_mesh(para)[f"{para}_fsdp"]
 
@@ -232,9 +232,6 @@ def parallelize_model_fsdp1(
             para = fsdp_no_shard_states_fqn_to_para[fqn]
 
             assert para is not None, f"para is None for fqn {fqn}"
-            assert _extra_parallel_sharding_strategy[para] != ShardingStrategy.NO_SHARD, (
-                f"ShardingStrategy.NO_SHARD is not expected for fqn={fqn} at para={para}"
-            )
 
             fsdp_kwargs["sharding_strategy"] = _extra_parallel_sharding_strategy[para]
             fsdp_kwargs["device_mesh"] = _extra_parallel_fsdp_device_mesh[para]

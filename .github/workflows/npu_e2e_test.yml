@@ -11,7 +11,7 @@ on:
       - v0.*
     paths:
       - "**/*.py"
-      - .github/workflows/npu_e2e_tests.yml
+      - .github/workflows/npu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
   pull_request:
@@ -19,7 +19,7 @@ on:
       - main
     paths:
       - "**/*.py"
-      - .github/workflows/npu_e2e_tests.yml
+      - .github/workflows/npu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
 
@@ -47,8 +47,8 @@ jobs:
         - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
         - /etc/ascend_install.info:/etc/ascend_install.info
         - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
-        # - /data00/dataset:/github/home/dataset
-        # - /data00/models:/github/home/models
+        - /data00/assets/dataset:/github/home/dataset
+        - /data00/assets/models:/github/home/models
         # Use self-host cache speed up pip and model download
         # - /home/action/actions-runner/_work/cache:/github/home/.cache/
       options: >-
@@ -64,6 +64,8 @@ jobs:
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
       CI_SAMPLES_DIR: "/data00/assets/samples"
+      CI_MODEL_DIR: "/github/home/models/Qwen"
+      CI_DATASET_DIR: "/github/home/dataset"
 
     steps:
       - name: Set up proxy
