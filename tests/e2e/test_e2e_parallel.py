@@ -97,6 +97,14 @@ text_test_cases = [
         marks=_v4_only,
     ),
     pytest.param(
+        "qwen2",
+        "./tests/toy_config/qwen2_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+    ),
+    pytest.param(
         "qwen2.5",
         "./tests/toy_config/qwen25_toy",
         False,  # is_moe
