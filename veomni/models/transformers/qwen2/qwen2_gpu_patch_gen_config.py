@@ -30,8 +30,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_position_embedding
 from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
 
 
@@ -41,8 +39,6 @@ config = PatchConfig(
     description="Qwen2 with LigerKernel GPU replacements",
 )
 
-config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.distributed.sequence_parallel", names=["slice_position_embedding"])
 
 config.patches.append(
     create_patch_from_external(
@@ -130,10 +126,8 @@ def qwen2_model_forward_patched(
             causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
     hidden_states = inputs_embeds
-    position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-    sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-    position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         hidden_states = decoder_layer(
