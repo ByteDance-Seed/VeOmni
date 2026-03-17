@@ -128,7 +128,7 @@ class ModelMode:
     ep_size: int
 
     def __str__(self):
-        return f"_[sp-{self.sp_size}]_[ep-{self.ep_size}]"
+        return f"sp{self.sp_size}_ep{self.ep_size}"
 
 
 _SP_SIZE = [1, 2]
@@ -220,10 +220,10 @@ def prepare_exec_cmd(
 
 
 def print_all_values(output_dict, value_key: str, model_type: str = ""):
-    console = Console()
+    console = Console(width=200)
     table = Table(title=f"Alignment Result: [bold magenta]{model_type} {value_key}[/bold magenta]")
 
-    table.add_column("Task", style="cyan", justify="left")
+    table.add_column("Task", style="cyan", justify="left", no_wrap=True)
 
     table.add_column(value_key.upper(), style="bold green", justify="right")
 
