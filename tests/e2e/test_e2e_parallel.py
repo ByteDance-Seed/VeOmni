@@ -8,7 +8,7 @@ import pytest
 from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
@@ -16,6 +16,7 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
+_gpu_only = pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Requires GPU(CUDA) device")
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -209,7 +210,7 @@ qwen2omni_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        marks=_v4_only,
+        marks=[_v4_only, _gpu_only],
     ),
 ]
 
