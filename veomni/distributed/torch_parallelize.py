@@ -232,9 +232,11 @@ def parallelize_model_fsdp1(
             para = fsdp_no_shard_states_fqn_to_para[fqn]
 
             assert para is not None, f"para is None for fqn {fqn}"
-            assert _extra_parallel_sharding_strategy[para] != ShardingStrategy.NO_SHARD, (
-                f"ShardingStrategy.NO_SHARD is not expected for fqn={fqn} at para={para}"
-            )
+
+            # When extra_parallel_fsdp size is 1 (e.g., ep_size == world_size),
+            # there is no FSDP replication for expert modules, skip wrapping.
+            if _extra_parallel_sharding_strategy[para] == ShardingStrategy.NO_SHARD:
+                continue
 
             fsdp_kwargs["sharding_strategy"] = _extra_parallel_sharding_strategy[para]
             fsdp_kwargs["device_mesh"] = _extra_parallel_fsdp_device_mesh[para]
