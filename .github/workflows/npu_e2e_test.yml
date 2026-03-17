@@ -47,8 +47,8 @@ jobs:
         - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
         - /etc/ascend_install.info:/etc/ascend_install.info
         - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
-        - /data00/dataset:/github/home/dataset
-        - /data00/models:/github/home/models
+        - /data00/assets/dataset:/github/home/dataset
+        - /data00/assets/models:/github/home/models
         # Use self-host cache speed up pip and model download
         # - /home/action/actions-runner/_work/cache:/github/home/.cache/
       options: >-
