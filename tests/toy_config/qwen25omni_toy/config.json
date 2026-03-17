@@ -2,7 +2,7 @@
     "architectures": [
       "Qwen2_5OmniModel"
     ],
-    "enable_audio_output": true,
+    "enable_audio_output": false,
     "enable_talker": true,
     "model_type": "qwen2_5_omni",
     "talker_config": {

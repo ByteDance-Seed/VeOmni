@@ -1,5 +1,5 @@
 model:
-  model_path: Qwen3.5-27B
+  model_path: Qwen3.5-9B
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -37,11 +37,11 @@ train:
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: Qwen3.5-27B-sft-tulu
+    output_dir: Qwen3.5-9B-sft-tulu
     manager: dcp
     save_steps: 100
     save_epochs: 1
     save_hf_weights: false
   wandb:
     project: VeOmni
-    name: Qwen3.5-27B-sft-tulu
+    name: Qwen3.5-9B-sft-tulu
