@@ -16,6 +16,9 @@ from types import SimpleNamespace
 from typing import Callable, Optional
 
 import torch
+from transformers.modeling_flash_attention_utils import (
+    _flash_attention_forward as _transformers_flash_attention_forward,
+)
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...distributed.parallel_state import get_parallel_state
@@ -151,6 +154,7 @@ def transformers_flash_attention_forward(
     otherwise.  It is harmless on v5.
     """
     attn_implementation = kwargs.pop("attn_implementation")
+    
     return _transformers_flash_attention_forward(
         query,
         key,
