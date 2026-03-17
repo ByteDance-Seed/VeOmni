@@ -93,6 +93,9 @@ jobs:
       - name: Check final pip list
         run: |
           uv pip list
+      - name: Check home path
+        run: |
+          ls -l /github/home
       - name: Check model path
         run: |
           ls -l /github/home/models/Qwen/Qwen3-0.6B-Base
