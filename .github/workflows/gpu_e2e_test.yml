@@ -79,6 +79,8 @@ jobs:
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
       - name: Run models tests [transformers-v5]
+        # TODO: Run the following tests with proper `--no-group transformers-stable --extra transformers5-exp` to enable transformers v5.
+        # Currently those tests are effectively skipped (but it's not straightforward to enable due to L20 OOM).
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_training.py
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
