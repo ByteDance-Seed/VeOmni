@@ -263,7 +263,21 @@ class WanModelOutput(ModelOutput):
     predictions: list[torch.FloatTensor] | None = None
 
 
-class WanTransformer3DModel(PreTrainedModel, _WanTransformer3DModel):
+class _WanTransformerInitShim(_WanTransformer3DModel):
+    """Breaks the init chain from PreTrainedModel to diffusers WanTransformer3DModel.
+
+    When PreTrainedModel.__init__ calls super().__init__(), the MRO would normally
+    invoke diffusers WanTransformer3DModel.__init__() with no arguments (default
+    config), building a large default model that wastes memory. This shim intercepts
+    that call and only runs nn.Module.__init__(), so the actual model is built once
+    in WanTransformer3DModel.__init__ with the correct config.
+    """
+
+    def __init__(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+
+
+class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     config_class = WanTransformer3DModelConfig
     supports_gradient_checkpointing = True
 
