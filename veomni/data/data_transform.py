@@ -368,6 +368,7 @@ def _process_sample_qwen_vl_base(
 @DATA_TRANSFORM_REGISTRY.register("qwen3_vl")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_vl_moe")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_5")
+@DATA_TRANSFORM_REGISTRY.register("qwen3_5_moe")
 def process_sample_qwen_vl(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",

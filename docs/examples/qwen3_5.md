@@ -74,8 +74,16 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
     --train.max_steps 20
 ```
 
-### Text-only training on GPU
+### Qwen3.5 MoE 35B VL Training
 
+```shell
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl.yaml \
+    --model.model_path ./Qwen/Qwen3.5-35B-A3B \
+    --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
+    --train.max_steps 20
+```
+
+### Text-only training on GPU
 Testing in 8x80GB GPUs.
 
 Qwen3.5 Dense 9B:
