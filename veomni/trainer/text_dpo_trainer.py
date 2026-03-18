@@ -173,6 +173,9 @@ class TextDPOTrainer:
         model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
         outputs = model(**model_inputs, use_cache=False)
 
+        # PackingPostCollator.split expects 2-D logits [packed_L, V];
+        # the model returns [1, packed_L, V] so squeeze the batch dim.
+        outputs.logits = outputs.logits.squeeze(0)
         outputs = self.post_forward(outputs, micro_batch)
         logits_list = outputs.logits  # list of 2*B tensors, each [L_i, V]
         seq_lens = [lg.shape[0] for lg in logits_list]
