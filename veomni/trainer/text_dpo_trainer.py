@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -23,8 +22,10 @@ from transformers import PreTrainedModel
 
 from ..arguments import VeOmniDPOArguments
 from ..data import build_chat_template, build_data_transform
-from ..data.data_collator import DataCollator
+from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.parallel_state import get_parallel_state
+from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -36,36 +37,7 @@ from .base import BaseTrainer
 
 logger = logging.get_logger(__name__)
 
-_DPO_PAD_VALUES = {
-    "input_ids": 0,
-    "attention_mask": 0,
-    "labels": IGNORE_INDEX,
-}
-
-
-@dataclass
-class DPOCollator(DataCollator):
-    """Collator for DPO preference data.
-
-    Each sample from the dataset has shape ``[2, L]`` (row 0 = chosen, row 1 =
-    rejected), with standard keys ``input_ids``, ``attention_mask``, ``labels``.
-
-    This collator pads a list of B such samples to a common length and
-    concatenates them along the batch dimension, producing tensors of shape
-    ``[2*B, max_L]``.  The first B rows are chosen, the last B rows are rejected,
-    matching the layout expected by ``TextDPOTrainer.concatenated_forward``.
-    """
-
-    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        batch = {}
-        for key in features[0].keys():
-            tensors = [f[key] for f in features]  # each [2, L_i]
-            pad_value = _DPO_PAD_VALUES.get(key, 0)
-            max_len = max(t.shape[-1] for t in tensors)
-            padded = [F.pad(t, (0, max_len - t.shape[-1]), value=pad_value) for t in tensors]
-            stacked = torch.stack(padded, dim=0)  # [B, 2, max_L]
-            batch[key] = torch.cat([stacked[:, 0], stacked[:, 1]], dim=0)  # [2*B, max_L]
-        return batch
+_NON_MODEL_KEYS = {"labels"}
 
 
 class TextDPOTrainer:
@@ -86,8 +58,9 @@ class TextDPOTrainer:
         self._build_data_transform()
 
         self.base._build_dataset()
-        self._build_collate_fn()
+        self.base._build_collate_fn()
         self.base._build_dataloader()
+        self._build_postforward()
         self.base._build_parallelized_model()
         self.base._build_optimizer()
         self.base._build_lr_scheduler()
@@ -112,8 +85,9 @@ class TextDPOTrainer:
             max_seq_len=args.data.max_seq_len,
         )
 
-    def _build_collate_fn(self):
-        self.base.collate_fn = DPOCollator()
+    def _build_postforward(self):
+        self.post_forward = PostCollator()
+        self.sp_enabled = get_parallel_state().sp_enabled
 
     def _build_reference_model(self):
         """Build and freeze a reference model with the same architecture and FSDP sharding."""
@@ -185,58 +159,49 @@ class TextDPOTrainer:
 
         return losses, chosen_rewards, rejected_rewards
 
-    @staticmethod
-    def get_batch_logps(
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        average_log_prob: bool = False,
-    ) -> torch.Tensor:
-        """Compute per-sample log probabilities from model logits and labels.
-
-        Args:
-            logits: (batch_size, seq_len, vocab_size)
-            labels: (batch_size, seq_len) with IGNORE_INDEX for masked positions
-            average_log_prob: if True, return mean log-prob per valid token; else sum.
-
-        Returns:
-            (batch_size,) log probabilities
-        """
-        labels = labels[:, 1:].clone()
-        logits = logits[:, :-1, :]
-        loss_mask = labels != IGNORE_INDEX
-
-        labels[labels == IGNORE_INDEX] = 0
-
-        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
-
-        if average_log_prob:
-            return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
-        return (per_token_logps * loss_mask).sum(-1)
-
     def concatenated_forward(self, model: nn.Module, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run a single forward pass on the pre-concatenated chosen+rejected batch.
+        """Run a single forward pass on the packed batch containing chosen+rejected pairs.
 
-        The collator produces ``input_ids`` / ``attention_mask`` / ``labels`` of
-        shape ``[2*B, L]`` where the first B rows are chosen and the last B rows
-        are rejected.  ``preforward`` has already moved all tensors to the correct
-        device before this method is called.
+        Each DPO sample contributes two consecutive sequences (chosen then
+        rejected) to the packed sequence.  ``PostCollator`` gathers SP outputs and
+        splits logits per-sequence; even-indexed sequences are chosen and
+        odd-indexed are rejected.
 
         Returns:
             (chosen_logps, rejected_logps) each of shape ``(B,)``.
         """
-        num_chosen = micro_batch["input_ids"].shape[0] // 2
+        model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
+        outputs = model(**model_inputs, use_cache=False)
 
-        outputs = model(
-            input_ids=micro_batch["input_ids"],
-            attention_mask=micro_batch["attention_mask"],
-            use_cache=False,
-        )
-        all_logits = outputs.logits.float()
+        outputs = self.post_forward(outputs, micro_batch)
+        logits_list = outputs.logits  # list of 2*B tensors, each [L_i, V]
+        seq_lens = [lg.shape[0] for lg in logits_list]
+
+        if self.sp_enabled:
+            labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=get_parallel_state().sp_group)
+            labels = labels.view(-1)[: sum(seq_lens)]
+        else:
+            labels = micro_batch["labels"].view(-1)
+            labels = F.pad(labels[1:], (0, 1), value=IGNORE_INDEX)
+
+        labels_list = labels.split(seq_lens)
 
         average_log_prob = getattr(self.base.args, "dpo_config", None) and self.base.args.dpo_config.average_log_prob
-        all_logps = self.get_batch_logps(all_logits, micro_batch["labels"], average_log_prob=average_log_prob)
+        all_logps: List[torch.Tensor] = []
+        for seq_logits, seq_labels in zip(logits_list, labels_list):
+            loss_mask = seq_labels != IGNORE_INDEX
+            safe_labels = seq_labels.clamp(min=0)
+            per_token_logps = torch.gather(
+                seq_logits.float().log_softmax(-1), dim=1, index=safe_labels.unsqueeze(1)
+            ).squeeze(1)
+            if average_log_prob:
+                logp = (per_token_logps * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+            else:
+                logp = (per_token_logps * loss_mask).sum()
+            all_logps.append(logp)
 
-        return all_logps[:num_chosen], all_logps[num_chosen:]
+        all_logps_t = torch.stack(all_logps)
+        return all_logps_t[0::2], all_logps_t[1::2]
 
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]

@@ -16,7 +16,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 
 import torch
-import torch.nn.functional as F
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -110,9 +109,6 @@ def process_conversation_example(
     return [tokenized_example]
 
 
-_DPO_PAD_VALUES = {"input_ids": 0, "attention_mask": 0, "labels": IGNORE_INDEX}
-
-
 @DATA_TRANSFORM_REGISTRY.register("dpo")
 def process_dpo_example(
     example: Dict[str, Any],
@@ -121,19 +117,21 @@ def process_dpo_example(
     max_seq_len: int = 2048,
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
-    """Process a DPO preference pair into a single sample with concatenated chosen/rejected rows.
+    """Process a DPO preference pair into a single flat sample.
+
+    Chosen and rejected sequences are concatenated into one 1-D tensor with
+    ``position_ids`` that reset at the boundary so that flash-attention treats
+    them as two independent sequences.  This format is directly compatible with
+    ``MainCollator`` (packing + SP) — no DPO-specific collator is needed.
 
     Supported input formats:
       1. Conversation: {"chosen": [messages...], "rejected": [messages...]}
       2. Plaintext with prompt: {"prompt": str, "chosen": str, "rejected": str}
 
     Returns:
-        A list with one dict whose tensors have shape ``[2, L]`` where row 0 is the
-        chosen sequence and row 1 is the rejected sequence, both padded to the same
-        length ``L = max(len_chosen, len_rejected)``.  Keys are the standard
-        ``input_ids``, ``attention_mask``, and ``labels`` — no ``chosen_*`` /
-        ``rejected_*`` prefixes — so the sample flows through the generic data
-        pipeline without any DPO-specific handling.
+        A list with one dict.  Each value is a 1-D tensor of length
+        ``len_chosen + len_rejected``.  Keys: ``input_ids``, ``attention_mask``,
+        ``labels``, ``position_ids``.
     """
     chosen_raw = example["chosen"]
     rejected_raw = example["rejected"]
@@ -167,16 +165,19 @@ def process_dpo_example(
     def _to_tensor(v):
         return v if isinstance(v, torch.Tensor) else torch.tensor(v)
 
-    result = {}
-    for key in ("input_ids", "attention_mask", "labels"):
-        c = _to_tensor(chosen_tok[key])
-        r = _to_tensor(rejected_tok[key])
-        max_len = max(c.shape[-1], r.shape[-1])
-        pad_val = _DPO_PAD_VALUES[key]
-        c = F.pad(c, (0, max_len - c.shape[-1]), value=pad_val)
-        r = F.pad(r, (0, max_len - r.shape[-1]), value=pad_val)
-        result[key] = torch.stack([c, r])  # [2, max_len]
+    c_ids = _to_tensor(chosen_tok["input_ids"])
+    r_ids = _to_tensor(rejected_tok["input_ids"])
+    c_len = c_ids.shape[-1]
+    r_len = r_ids.shape[-1]
 
+    result = {
+        "input_ids": torch.cat([c_ids, r_ids]),
+        "attention_mask": torch.cat(
+            [_to_tensor(chosen_tok["attention_mask"]), _to_tensor(rejected_tok["attention_mask"])]
+        ),
+        "labels": torch.cat([_to_tensor(chosen_tok["labels"]), _to_tensor(rejected_tok["labels"])]),
+        "position_ids": torch.cat([torch.arange(c_len, dtype=torch.int64), torch.arange(r_len, dtype=torch.int64)]),
+    }
     return [result]
 
 
