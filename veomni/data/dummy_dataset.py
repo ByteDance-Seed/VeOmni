@@ -329,7 +329,7 @@ class WanT2VDataset(Dataset):
     (``tests/toy_config/wan_t2v_toy/config.json``):
 
     * ``in_channels = 16``, ``patch_size = (1, 2, 2)``
-    * ``text_dim = 64``
+    * ``text_dim = 512``
     * latent shape ``(1, 4, 1, 16, 16)`` → 64 patches after patchification,
       which is divisible by SP size 2.
 
@@ -347,7 +347,7 @@ class WanT2VDataset(Dataset):
     HEIGHT = 16  # latent spatial size; gives 8 patches with patch_size=2
     WIDTH = 16
     TEXT_SEQ_LEN = 10
-    TEXT_DIM = 4096  # matches toy config text_dim
+    TEXT_DIM = 512  # matches toy config text_dim
     TIMESTEP = 500.0
 
     def __init__(self, size: int = 16) -> None:
@@ -361,6 +361,7 @@ class WanT2VDataset(Dataset):
         hidden_states = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
         training_target = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
         encoder_hidden_states = torch.randn(1, self.TEXT_SEQ_LEN, self.TEXT_DIM, generator=gen)
+        latents = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
         timestep = torch.tensor([self.TIMESTEP])
         return [
             {
@@ -368,6 +369,7 @@ class WanT2VDataset(Dataset):
                 "training_target": training_target,
                 "encoder_hidden_states": encoder_hidden_states,
                 "timestep": timestep,
+                "latents": latents,
             }
         ]
 
