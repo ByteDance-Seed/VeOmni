@@ -33,7 +33,7 @@
 +#    - class_replacement: Qwen3MoeMLP
 +#      Use LigerKernel SwiGLU MLP
 +#    - class_replacement: Qwen3MoeExperts
-+#      Use legacy gate/up/down expert weights and explicit VeOmni fused MoE path
++#      Use v5 gate_up_proj expert weights and explicit VeOmni fused MoE path
 +#    - function_replacement: apply_rotary_pos_emb
 +#      Use LigerKernel rotary embedding
 +#    - method_override: Qwen3MoeModel.forward
@@ -154,7 +154,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -198,34 +204,37 @@
+@@ -198,34 +204,34 @@
          return attn_output, attn_weights
 
 
@@ -191,7 +191,7 @@
 +# ======================================================================
 +# [PATCHED CLASS] Qwen3MoeExperts
 +# Original class replaced with: PatchedQwen3MoeExperts
-+# Reason: Use legacy gate/up/down expert weights and explicit VeOmni fused MoE path
++# Reason: Use v5 gate_up_proj expert weights and explicit VeOmni fused MoE path
 +# Source: veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config
 +# ======================================================================
 +class Qwen3MoeExperts(torch.nn.Module):
@@ -202,19 +202,16 @@
          self.intermediate_dim = config.moe_intermediate_size
 -        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
 -        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
-+        # VeOmni keeps split expert weights here (gate_proj/up_proj/down_proj),
-+        # which differs from transformers v5 native gate_up_proj layout.
-+        # HuggingFace safetensor checkpoints often store expert weights per expert;
-+        # run scripts/moe_ckpt_merge/moe_merge.py to merge weights before training.
-+        self.gate_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
-+        self.up_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
++        self.gate_up_proj = torch.nn.Parameter(
++            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
++        )
 +        self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
 +        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
      def forward(
          self,
-@@ -234,22 +243,37 @@
+@@ -234,22 +240,38 @@
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
          final_hidden_states = torch.zeros_like(hidden_states)
@@ -246,29 +243,30 @@
 +                    continue
 +                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
 +                current_state = hidden_states[token_idx]
-+                gate = torch.nn.functional.linear(current_state, self.gate_proj[expert_idx])
-+                up = torch.nn.functional.linear(current_state, self.up_proj[expert_idx])
++                gate_up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx])
++                gate, up = gate_up.chunk(2, dim=-1)
 +                current_hidden_states = self.act_fn(gate) * up
 +                current_hidden_states = torch.nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
 +                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
 +                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 +        elif self._moe_implementation == "fused":
++            top_k_weights = top_k_weights.to(final_hidden_states.dtype)
 +            final_hidden_states = fused_moe_forward(
-+                module=self,
 +                num_experts=self.num_experts,
-+                routing_weights=top_k_weights.to(final_hidden_states.dtype),
++                routing_weights=top_k_weights,
 +                selected_experts=top_k_index,
 +                hidden_states=hidden_states,
-+                fc1_1_weight=self.gate_proj,
-+                fc1_2_weight=self.up_proj,
++                fc1_1_weight=None,
++                fc1_2_weight=None,
 +                fc2_weight=self.down_proj,
++                fc1_1_2_weight=self.gate_up_proj,
 +            )
 +        else:
 +            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
 
          return final_hidden_states
 
-@@ -289,25 +313,14 @@
+@@ -289,25 +311,14 @@
          return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
@@ -302,7 +300,7 @@
 
 
  class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
-@@ -454,6 +467,12 @@
+@@ -454,6 +465,12 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -315,7 +313,7 @@
  @auto_docstring
  class Qwen3MoeModel(Qwen3MoePreTrainedModel):
      def __init__(self, config: Qwen3MoeConfig):
-@@ -500,6 +519,7 @@
+@@ -500,6 +517,7 @@
              cache_position = torch.arange(
                  past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
              )
@@ -323,7 +321,7 @@
          if position_ids is None:
              position_ids = cache_position.unsqueeze(0)
 
-@@ -616,6 +636,12 @@
+@@ -616,6 +634,12 @@
 
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
@@ -336,7 +334,7 @@
 
 
  @auto_docstring
-@@ -652,34 +678,10 @@
+@@ -652,34 +676,10 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> MoeCausalLMOutputWithPast:
@@ -371,7 +369,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -693,13 +695,21 @@
+@@ -693,13 +693,21 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -396,7 +394,7 @@
 
          aux_loss = None
          if output_router_logits:
-@@ -710,7 +720,7 @@
+@@ -710,7 +718,7 @@
                  attention_mask,
              )
              if labels is not None:
@@ -405,7 +403,7 @@
 
          return MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -722,6 +732,11 @@
+@@ -722,6 +730,11 @@
              router_logits=outputs.router_logits,
          )
 
