@@ -2,6 +2,7 @@ import types
 
 import torch
 
+from veomni.data.data_transform import process_dpo_example
 from veomni.utils.constants import IGNORE_INDEX
 
 
@@ -9,8 +10,58 @@ def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
     return types.SimpleNamespace(sp_enabled=sp_enabled, sp_size=sp_size, sp_rank=sp_rank)
 
 
+class _FakeChatTemplate:
+    """Returns messages directly as tokenized output, enabling deterministic tests."""
+
+    def encode_messages(self, messages, max_seq_len=None):
+        return {"input_ids": messages, "attention_mask": [1] * len(messages), "labels": [IGNORE_INDEX] + messages[1:]}
+
+
+class _FakeTokenizer:
+    def encode(self, text, add_special_tokens=True):
+        return list(range(len(text)))
+
+
+# ---- process_dpo_example tests ----
+
+
+def test_dpo_conversation_format():
+    """Conversation-format DPO: flat 1-D concat with position_ids reset and correct keys."""
+    sample = process_dpo_example({"chosen": [10, 20, 30], "rejected": [40, 50]}, chat_template=_FakeChatTemplate())[0]
+
+    assert set(sample.keys()) == {"input_ids", "attention_mask", "labels", "position_ids"}
+    assert sample["input_ids"].tolist() == [10, 20, 30, 40, 50]
+    assert sample["position_ids"].tolist() == [0, 1, 2, 0, 1]
+    assert sample["attention_mask"].sum().item() == 5
+    for v in sample.values():
+        assert v.ndim == 1
+
+
+def test_dpo_plaintext_prompt_masking():
+    """Plaintext DPO: prompt tokens masked with IGNORE_INDEX in both chosen and rejected."""
+    sample = process_dpo_example({"prompt": "ab", "chosen": "cd", "rejected": "efg"}, tokenizer=_FakeTokenizer())[0]
+
+    chosen_len, rejected_len = 4, 5  # "abcd"=4, "abefg"=5
+    assert sample["input_ids"].shape == (chosen_len + rejected_len,)
+    assert sample["position_ids"].tolist() == [*range(chosen_len), *range(rejected_len)]
+    assert sample["labels"][:2].tolist() == [IGNORE_INDEX, IGNORE_INDEX]
+    assert sample["labels"][chosen_len : chosen_len + 2].tolist() == [IGNORE_INDEX, IGNORE_INDEX]
+
+
+def test_dpo_plaintext_truncation():
+    """max_seq_len truncates each sequence independently before concatenation."""
+    sample = process_dpo_example({"chosen": "abcdefgh", "rejected": "xyz"}, tokenizer=_FakeTokenizer(), max_seq_len=4)[
+        0
+    ]
+
+    assert sample["input_ids"].shape == (4 + 3,)
+    assert sample["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2]
+
+
+# ---- MainCollator integration tests ----
+
+
 def _make_flat_dpo_sample(chosen_ids, rejected_ids):
-    """Build a flat DPO sample (chosen+rejected concatenated, position_ids reset)."""
     c = torch.tensor(chosen_ids, dtype=torch.long)
     r = torch.tensor(rejected_ids, dtype=torch.long)
     return {
@@ -21,15 +72,7 @@ def _make_flat_dpo_sample(chosen_ids, rejected_ids):
     }
 
 
-def test_dpo_flat_sample_structure():
-    """Flat DPO sample has concatenated chosen+rejected with position_ids reset."""
-    sample = _make_flat_dpo_sample([10, 20, 30], [40, 50])
-    assert sample["input_ids"].shape == (5,)
-    assert torch.equal(sample["input_ids"], torch.tensor([10, 20, 30, 40, 50]))
-    assert torch.equal(sample["position_ids"], torch.tensor([0, 1, 2, 0, 1]))
-
-
-def test_dpo_flat_with_main_collator_sp_disabled(monkeypatch):
+def test_dpo_main_collator_sp_disabled(monkeypatch):
     """MainCollator packs flat DPO samples; position_ids resets mark sequence boundaries."""
     import veomni.data.data_collator as m
 
@@ -37,93 +80,18 @@ def test_dpo_flat_with_main_collator_sp_disabled(monkeypatch):
 
     s1 = _make_flat_dpo_sample([1, 2, 3], [4, 5, 6])
     s2 = _make_flat_dpo_sample([7, 8], [9, 10])
+    batch = m.MainCollator()([s1, s2])
 
-    collator = m.MainCollator()
-    batch = collator([s1, s2])
-
-    # s1 chosen(3) + s1 rejected(3) + s2 chosen(2) + s2 rejected(2) = 10 tokens
-    packed_ids = batch["input_ids"].view(-1).tolist()
-    assert packed_ids == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-
-    # position_ids: [0,1,2, 0,1,2, 0,1, 0,1]
-    packed_pos = batch["position_ids"].view(-1).tolist()
-    assert packed_pos == [0, 1, 2, 0, 1, 2, 0, 1, 0, 1]
-
-    # cu_seq_lens should have 4 sequences (2 per DPO sample)
-    cu = batch["cu_seq_lens_q"].tolist()
-    assert cu == [0, 3, 6, 8, 10]
+    assert batch["input_ids"].view(-1).tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert batch["position_ids"].view(-1).tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 0, 1]
+    assert batch["cu_seq_lens_q"].tolist() == [0, 3, 6, 8, 10]
 
 
-def test_dpo_flat_with_main_collator_sp_enabled(monkeypatch):
+def test_dpo_main_collator_sp_enabled(monkeypatch):
     """MainCollator packs and SP-slices flat DPO samples."""
     import veomni.data.data_collator as m
 
-    sp_size = 2
-    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=0))
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=2, sp_rank=0))
 
-    s1 = _make_flat_dpo_sample([1, 2, 3, 4], [5, 6, 7, 8])
-
-    collator = m.MainCollator()
-    batch = collator([s1])
-
-    total_tokens = 8
-    chunk_len = total_tokens // sp_size
-    assert batch["input_ids"].view(-1).shape[0] == chunk_len
-
-
-def test_process_dpo_example_conversation_format(monkeypatch):
-    """process_dpo_example produces flat concatenated sample from conversation-format data."""
-    from veomni.data.data_transform import process_dpo_example
-
-    chosen_ids = [10, 20, 30]
-    rejected_ids = [40, 50]
-
-    class FakeChatTemplate:
-        def encode_messages(self, messages, max_seq_len=None):
-            return {
-                "input_ids": messages,
-                "attention_mask": [1] * len(messages),
-                "labels": [IGNORE_INDEX] + messages[1:],
-            }
-
-    result = process_dpo_example(
-        {"chosen": chosen_ids, "rejected": rejected_ids},
-        chat_template=FakeChatTemplate(),
-        max_seq_len=2048,
-    )
-
-    assert len(result) == 1
-    sample = result[0]
-
-    assert sample["input_ids"].shape == (5,)
-    assert torch.equal(sample["input_ids"], torch.tensor([10, 20, 30, 40, 50]))
-    assert torch.equal(sample["position_ids"], torch.tensor([0, 1, 2, 0, 1]))
-    assert sample["attention_mask"].shape == (5,)
-    assert sample["attention_mask"].sum().item() == 5
-
-
-def test_process_dpo_example_plaintext_format():
-    """process_dpo_example produces flat concatenated sample from plaintext-format data."""
-    from veomni.data.data_transform import process_dpo_example
-
-    class FakeTokenizer:
-        def encode(self, text, add_special_tokens=True):
-            return list(range(len(text)))
-
-    result = process_dpo_example(
-        {"prompt": "ab", "chosen": "cd", "rejected": "efg"},
-        tokenizer=FakeTokenizer(),
-        max_seq_len=2048,
-    )
-
-    assert len(result) == 1
-    sample = result[0]
-
-    chosen_len = 4  # "ab" + "cd"
-    rejected_len = 5  # "ab" + "efg"
-    assert sample["input_ids"].shape == (chosen_len + rejected_len,)
-    assert torch.equal(
-        sample["position_ids"],
-        torch.cat([torch.arange(chosen_len), torch.arange(rejected_len)]),
-    )
-    assert sample["labels"][:2].tolist() == [IGNORE_INDEX, IGNORE_INDEX]
+    batch = m.MainCollator()([_make_flat_dpo_sample([1, 2, 3, 4], [5, 6, 7, 8])])
+    assert batch["input_ids"].view(-1).shape[0] == 4  # 8 tokens / sp_size=2
