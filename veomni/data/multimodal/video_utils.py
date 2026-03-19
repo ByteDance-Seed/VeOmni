@@ -367,8 +367,7 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
     video_fps = metadata.average_fps
     total_frames = metadata.num_frames
 
-    # Safety margin for inaccurate frame counts
-    effective_total_frames = max(1, total_frames - 1)
+    effective_total_frames = max(1, total_frames)
 
     indices, pad_count = calculate_frame_indices(total_frames=effective_total_frames, video_fps=video_fps, **kwargs)
 
