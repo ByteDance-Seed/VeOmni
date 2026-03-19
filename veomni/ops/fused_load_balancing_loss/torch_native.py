@@ -41,9 +41,11 @@ def load_balancing_loss_pytorch(
     where ``f_e`` is the fraction of tokens routed to expert *e* and ``P_e`` is
     the average router probability assigned to expert *e* across all tokens.
 
-    This implementation loops over layers and uses ``scatter_add_`` to accumulate
-    expert counts, avoiding the large ``[N, top_k, num_experts]`` one-hot
-    intermediate. Peak memory per layer is ``O(N_layer * E)``.
+    Compared to the HuggingFace reference (``transformers.models.qwen3_moe.
+    modeling_qwen3_moe.load_balancing_loss_func``), this implementation avoids
+    materializing the ``[N, top_k, num_experts]`` one-hot tensor by using
+    ``scatter_add_`` instead. It loops over layers so peak memory per layer is
+    ``O(N_layer * E)``. The HF reference is used as the ground-truth in tests.
 
     Args:
         gate_logits: Tuple of per-layer gate logits, each shaped

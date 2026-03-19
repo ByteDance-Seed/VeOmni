@@ -20,7 +20,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     load_balancing_loss_func as _reference_load_balancing_loss,
 )
 
-from veomni.ops.fused_load_balancing_loss.torch_native import load_balancing_loss_pytorch
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
@@ -47,6 +46,12 @@ def _get_triton_impl():
     from veomni.ops.fused_load_balancing_loss.triton_kernel import load_balancing_loss_triton
 
     return load_balancing_loss_triton
+
+
+def _get_pytorch_impl():
+    from veomni.ops.fused_load_balancing_loss.torch_native import load_balancing_loss_pytorch
+
+    return load_balancing_loss_pytorch
 
 
 def _make_gate_logits(batch_size, seq_len, num_experts, num_layers):
@@ -95,7 +100,7 @@ class TestTritonLoadBalancingLoss:
         attention_mask = torch.zeros(2, 4, device=_DEVICE)
 
         out = triton_fn(gate_logits, 4, 2, attention_mask)
-        assert out.item() == pytest.approx(0.0, abs=1e-6)
+        assert out.item() == 0.0
 
     @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
     def test_forward_no_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
@@ -254,11 +259,13 @@ class TestPytorchLoadBalancingLoss:
     """Test suite comparing PyTorch for-loop implementation against HF reference."""
 
     def test_none_input(self):
-        assert load_balancing_loss_pytorch(None, 8, 2) == 0
+        pytorch_fn = _get_pytorch_impl()
+        assert pytorch_fn(None, 8, 2) == 0
 
     def test_non_tuple_input(self):
+        pytorch_fn = _get_pytorch_impl()
         logits = torch.randn(32, 8, device=_DEVICE)
-        assert load_balancing_loss_pytorch(logits, 8, 2) == 0
+        assert pytorch_fn(logits, 8, 2) == 0
 
     def test_forward_full_mask(self):
         """All tokens masked out should return 0.
@@ -266,31 +273,36 @@ class TestPytorchLoadBalancingLoss:
         MoE load balancing loss supports masking padded tokens via attention_mask
         so that padding does not skew expert routing statistics.
         """
+        pytorch_fn = _get_pytorch_impl()
         gate_logits = tuple(torch.randn(8, 4, device=_DEVICE) for _ in range(2))
         attention_mask = torch.zeros(2, 4, device=_DEVICE)
 
-        out = load_balancing_loss_pytorch(gate_logits, 4, 2, attention_mask)
-        assert out.item() == pytest.approx(0.0, abs=1e-6)
+        out = pytorch_fn(gate_logits, 4, 2, attention_mask)
+        assert out.item() == 0.0
 
     @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
     def test_forward_no_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
+        pytorch_fn = _get_pytorch_impl()
+
         torch.manual_seed(42)
         gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
 
         ref = _reference_load_balancing_loss(gate_logits, num_experts, top_k)
-        out = load_balancing_loss_pytorch(gate_logits, num_experts, top_k)
+        out = pytorch_fn(gate_logits, num_experts, top_k)
 
         torch.testing.assert_close(out, ref, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
 
     @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
     def test_forward_with_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
+        pytorch_fn = _get_pytorch_impl()
+
         torch.manual_seed(123)
         gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
         attention_mask = torch.ones(batch_size, seq_len, device=_DEVICE)
         attention_mask[:, seq_len // 2 :] = 0
 
         ref = _reference_load_balancing_loss(gate_logits, num_experts, top_k, attention_mask)
-        out = load_balancing_loss_pytorch(gate_logits, num_experts, top_k, attention_mask)
+        out = pytorch_fn(gate_logits, num_experts, top_k, attention_mask)
 
         torch.testing.assert_close(out, ref, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
 
@@ -300,9 +312,11 @@ class TestPytorchLoadBalancingLoss:
     )
     def test_determinism(self, num_experts, top_k, num_layers, batch_size, seq_len):
         """PyTorch implementation must produce bitwise-identical results across runs."""
+        pytorch_fn = _get_pytorch_impl()
+
         torch.manual_seed(42)
         gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
 
-        results = [load_balancing_loss_pytorch(gate_logits, num_experts, top_k) for _ in range(5)]
+        results = [pytorch_fn(gate_logits, num_experts, top_k) for _ in range(5)]
         for r in results[1:]:
             assert torch.equal(results[0], r), "PyTorch forward is non-deterministic"
