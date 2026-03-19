@@ -14,7 +14,7 @@
 
 import torch
 
-from ...distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
+from ...distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
 from ...distributed.parallel_state import get_parallel_state
 from ..group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
@@ -465,10 +465,12 @@ def group_gemm_fused_moe_forward(
     - EP path: always resolves to split format for ``EPGroupGemm``.
     """
     if get_parallel_state().ep_enabled:
-        assert fc1_1_2_weight is None, "Merged fc1_1_2_weight is not supported with expert parallelism."
-        assert fc1_1_weight is not None and fc1_2_weight is not None, (
-            "EP requires split fc1 weights (fc1_1_weight and fc1_2_weight)."
-        )
+        if fc1_1_2_weight is not None:
+            if fc1_1_weight is not None or fc1_2_weight is not None:
+                raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
+        else:
+            if fc1_1_weight is None or fc1_2_weight is None:
+                raise ValueError("EP requires split fc1 weights (fc1_1_weight and fc1_2_weight).")
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
         # preprocess, permute token for ep
         input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
@@ -488,21 +490,23 @@ def group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
 
-        final_permute_tokens = torch.zeros(
-            (permute_tokens.shape),
-            dtype=permute_tokens.dtype,
-            device=permute_tokens.device,
-        )
-
         cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
-        final_permute_tokens = EPGroupGemm.apply(
-            permute_tokens,
-            cumsum,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-        )
+        if fc1_1_2_weight is not None:
+            final_permute_tokens = EPMergedFc1GroupGemm.apply(
+                permute_tokens,
+                cumsum,
+                fc1_1_2_weight,
+                fc2_weight,
+            )
+        else:
+            final_permute_tokens = EPGroupGemm.apply(
+                permute_tokens,
+                cumsum,
+                fc1_1_weight,
+                fc1_2_weight,
+                fc2_weight,
+            )
 
         # unpermute with routing_weight
         final_hidden_states = tokens_post_all2all(

@@ -2,11 +2,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from veomni.distributed.moe.moe_layer import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops import fused_moe
 from veomni.ops.fused_moe import fused_moe_forward
 from veomni.ops.fused_moe.group_gemm import group_gemm_fused_moe_forward
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
-from veomni.utils.import_utils import is_fused_moe_available
+from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
 
 def _skip_if_unsupported():
@@ -166,3 +167,192 @@ def test_fused_moe_split_vs_merged(
         f"\n  merged peak: {peak_merged / (1024 * 1024):.1f} MiB"
         f"\n  diff (split - merged): {peak_diff_mb:+.1f} MiB"
     )
+
+
+def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
+    """Create synthetic EP test inputs: permute_tokens, cumsum, and weights."""
+    torch.manual_seed(seed)
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+
+    tokens_per_expert = torch.full((num_experts,), num_tokens // num_experts, dtype=torch.int64)
+    remainder = num_tokens - tokens_per_expert.sum().item()
+    for i in range(remainder):
+        tokens_per_expert[i] += 1
+    total_tokens = tokens_per_expert.sum().item()
+    cumsum = torch.cumsum(tokens_per_expert, dim=0).to(device)
+
+    permute_tokens = 0.1 * torch.randn(total_tokens, hidden_dim, device=device, dtype=dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+
+    return cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
+    [
+        (256, 8, 1024, 512, 0),
+        (128, 4, 512, 256, 1),
+    ],
+)
+def test_ep_split_vs_merged(
+    num_tokens: int,
+    num_experts: int,
+    hidden_dim: int,
+    ffn_dim: int,
+    seed: int,
+):
+    """Verify EPGroupGemm (split) and EPMergedFc1GroupGemm (merged) produce identical results."""
+    _skip_if_unsupported()
+
+    cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight = _make_ep_inputs(
+        num_tokens, num_experts, hidden_dim, ffn_dim, seed
+    )
+
+    # --- Split path ---
+    pt_split = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+
+    out_split = EPGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split)
+    # Use a contiguous grad tensor; .sum().backward() produces non-contiguous expand grads
+    grad_output = torch.randn_like(out_split)
+    out_split.backward(grad_output)
+
+    # --- Merged path ---
+    pt_merged = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
+
+    out_merged = EPMergedFc1GroupGemm.apply(pt_merged, cumsum, fc1_merged, fc2_merged)
+    out_merged.backward(grad_output)
+
+    # Forward: bitwise identical
+    torch.testing.assert_close(out_split, out_merged, rtol=0, atol=0)
+
+    # Backward: fc2 weight grad bitwise identical
+    torch.testing.assert_close(fc2_split.grad, fc2_merged.grad, rtol=0, atol=0)
+
+    # Backward: fc1 weight grad bitwise identical
+    fc1_split_grad = torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1)
+    torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=0, atol=0)
+
+    # Backward: hidden grad approximate match (bf16 accumulation differences)
+    torch.testing.assert_close(pt_split.grad, pt_merged.grad, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
+    [
+        (256, 8, 1024, 512, 0),
+        (128, 4, 512, 256, 1),
+    ],
+)
+def test_ep_quack_split_vs_merged(
+    num_tokens: int,
+    num_experts: int,
+    hidden_dim: int,
+    ffn_dim: int,
+    seed: int,
+):
+    """Verify EPMergedFc1QuackGroupGemm matches EPGroupGemm (triton split) in forward/backward."""
+    _skip_if_unsupported()
+    if not is_quack_gemm_available():
+        pytest.skip("quack not available or GPU < SM90")
+
+    from veomni.ops.fused_moe.quack_gemm import EPMergedFc1QuackGroupGemm
+
+    cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight = _make_ep_inputs(
+        num_tokens, num_experts, hidden_dim, ffn_dim, seed
+    )
+
+    # --- Triton split path (reference) ---
+    pt_split = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+
+    out_split = EPGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split)
+    grad_output = torch.randn_like(out_split)
+    out_split.backward(grad_output)
+
+    # --- Quack merged path ---
+    pt_quack = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_quack = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_quack = fc2_weight.clone().detach().requires_grad_(True)
+
+    out_quack = EPMergedFc1QuackGroupGemm.apply(pt_quack, cumsum, fc1_quack, fc2_quack)
+    out_quack.backward(grad_output)
+
+    # Forward: approximate match (different GEMM backends)
+    torch.testing.assert_close(out_split, out_quack, rtol=1e-2, atol=1e-2)
+
+    # Backward: fc2 weight grad
+    torch.testing.assert_close(fc2_split.grad, fc2_quack.grad, rtol=1e-2, atol=1e-2)
+
+    # Backward: fc1 weight grad
+    fc1_split_grad = torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1)
+    torch.testing.assert_close(fc1_split_grad, fc1_quack.grad, rtol=3e-2, atol=3e-2)
+
+    # Backward: hidden grad
+    torch.testing.assert_close(pt_split.grad, pt_quack.grad, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
+    [
+        (256, 8, 1024, 512, 0),
+        (128, 4, 512, 256, 1),
+    ],
+)
+def test_ep_quack_split(
+    num_tokens: int,
+    num_experts: int,
+    hidden_dim: int,
+    ffn_dim: int,
+    seed: int,
+):
+    """Verify EPQuackGroupGemm (quack split) matches EPGroupGemm (triton split) in forward/backward."""
+    _skip_if_unsupported()
+    if not is_quack_gemm_available():
+        pytest.skip("quack not available or GPU < SM90")
+
+    from veomni.ops.fused_moe.quack_gemm import EPQuackGroupGemm
+
+    cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, _, fc2_weight = _make_ep_inputs(
+        num_tokens, num_experts, hidden_dim, ffn_dim, seed
+    )
+
+    # --- Triton split path (reference) ---
+    pt_triton = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_1_triton = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_triton = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_triton = fc2_weight.clone().detach().requires_grad_(True)
+
+    out_triton = EPGroupGemm.apply(pt_triton, cumsum, fc1_1_triton, fc1_2_triton, fc2_triton)
+    grad_output = torch.randn_like(out_triton)
+    out_triton.backward(grad_output)
+
+    # --- Quack split path ---
+    pt_quack = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_1_quack = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_quack = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_quack = fc2_weight.clone().detach().requires_grad_(True)
+
+    out_quack = EPQuackGroupGemm.apply(pt_quack, cumsum, fc1_1_quack, fc1_2_quack, fc2_quack)
+    out_quack.backward(grad_output)
+
+    # Forward: approximate match (different GEMM backends)
+    torch.testing.assert_close(out_triton, out_quack, rtol=1e-2, atol=1e-2)
+
+    # Backward: weight grads
+    torch.testing.assert_close(fc2_triton.grad, fc2_quack.grad, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(fc1_1_triton.grad, fc1_1_quack.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(fc1_2_triton.grad, fc1_2_quack.grad, rtol=3e-2, atol=3e-2)
+
+    # Backward: hidden grad
+    torch.testing.assert_close(pt_triton.grad, pt_quack.grad, rtol=3e-2, atol=3e-2)
