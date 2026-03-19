@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 logger = helper.create_logger(__name__)
 
-_DEFAULT_MAX_RETRIES = 10
+_DEFAULT_MAX_RETRIES = 5
 _DEFAULT_RETRY_INTERVAL = 60  # seconds
 
 
