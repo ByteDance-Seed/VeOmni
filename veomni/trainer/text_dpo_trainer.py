@@ -222,18 +222,20 @@ class TextDPOTrainer:
         seq_lens = [lg.shape[0] for lg in logits_list]
 
         if self.sp_enabled:
+            # Labels already globally shifted by SequenceParallelCollator;
+            # gather back and split by sequence lengths directly.
             all_labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=get_parallel_state().sp_group)
             all_labels = all_labels.view(-1)[: sum(seq_lens)]
+            labels_list = list(all_labels.split(seq_lens))
         else:
+            # Shift labels per-sequence
             all_labels = micro_batch["labels"].view(-1)
-
-        # Shift labels per-sequence
-        offset = 0
-        labels_list = []
-        for sl in seq_lens:
-            seq_labels = all_labels[offset : offset + sl]
-            labels_list.append(F.pad(seq_labels[1:], (0, 1), value=IGNORE_INDEX))
-            offset += sl
+            offset = 0
+            labels_list = []
+            for sl in seq_lens:
+                seq_labels = all_labels[offset : offset + sl]
+                labels_list.append(F.pad(seq_labels[1:], (0, 1), value=IGNORE_INDEX))
+                offset += sl
 
         average_log_prob = getattr(self.base.args, "dpo_config", None) and self.base.args.dpo_config.average_log_prob
         all_logps: List[torch.Tensor] = []
