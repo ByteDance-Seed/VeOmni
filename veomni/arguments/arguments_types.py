@@ -274,7 +274,8 @@ class AcceleratorConfig:
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
 
     def __post_init__(self):
-        # configure extra parallelism to include expert parallelism
+        # although expert parallel and extra parallel are both provided in the arguments,
+        # the implementation is configuring extra parallelism to include expert parallelism
         self.extra_parallel_sizes.append(self.ep_size)
         self.extra_parallel_names.append("ep")
         self.extra_parallel_placement_innermost.append(self.ep_outside)
