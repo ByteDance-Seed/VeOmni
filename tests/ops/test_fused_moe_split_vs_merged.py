@@ -6,7 +6,8 @@ from veomni.distributed.moe.moe_layer import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops import fused_moe
 from veomni.ops.fused_moe import fused_moe_forward
 from veomni.ops.fused_moe.group_gemm import group_gemm_fused_moe_forward
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+from veomni.ops.group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, is_sm90_or_above
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
 
@@ -356,3 +357,215 @@ def test_ep_quack_split(
 
     # Backward: hidden grad
     torch.testing.assert_close(pt_triton.grad, pt_quack.grad, rtol=3e-2, atol=3e-2)
+
+
+def _scatter_tokens(hidden_states, selected_experts, num_experts):
+    """Scatter tokens by expert and return (scatter_output, cumsum, scatter_index, scattered_gw_fn).
+
+    Mirrors the token-sorting logic in TritonFusedMoeExpertFunction, allowing
+    the EP autograd functions to be tested without a real distributed process group.
+    """
+    splits = expert_histogram(selected_experts, num_experts)
+    scatter_index = selected_experts.flatten().argsort(stable=True).argsort().int().view(selected_experts.shape)
+    scatter_output = moe_scatter(hidden_states, scatter_index)
+    cumsum = torch.cumsum(splits, dim=0)
+    return scatter_output, cumsum, scatter_index
+
+
+def _scatter_routing_weights(routing_weights, scatter_index):
+    """Reorder routing weights into expert-sorted order matching scatter_output."""
+    reshaped = routing_weights.reshape(-1, 1)
+    scattered = torch.empty_like(reshaped)
+    scattered[scatter_index.flatten()] = reshaped
+    return scattered
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
+    [
+        (256, 8, 1024, 512, 2, 0),
+        (128, 4, 512, 256, 2, 1),
+        (256, 16, 1024, 512, 4, 2),
+    ],
+)
+def test_ep_vs_non_ep(
+    num_tokens: int,
+    num_experts: int,
+    hidden_dim: int,
+    ffn_dim: int,
+    topk: int,
+    seed: int,
+):
+    """Verify EP autograd functions produce the same output as the non-EP eager path.
+
+    The EP path (EPGroupGemm) computes fc2(silu(fc1_1(x)) * fc1_2(x)) per expert,
+    then applies routing weights externally.  The non-EP path applies routing weights
+    before fc2.  Since fc2 is linear, w * fc2(x) == fc2(w * x), so both should match
+    up to bf16 rounding differences.
+
+    Forward comparison uses the full scatter → EP gemm → routing weight → gather pipeline.
+    Backward comparison uses scattered routing weights as grad_output to EPGroupGemm,
+    which is equivalent to backprop through sum(routing_weight * ep_output).
+    """
+    _skip_if_unsupported()
+
+    torch.manual_seed(seed)
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
+    routing_weights = routing_weights.to(dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+
+    # Scatter tokens by expert (shared preprocessing)
+    scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
+    scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
+
+    # --- Forward: eager reference vs EP ---
+    out_eager = _eager_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hidden_states,
+        fc1_1_weight=fc1_1_weight,
+        fc1_2_weight=fc1_2_weight,
+        fc2_weight=fc2_weight,
+    )
+
+    ep_raw = EPGroupGemm.apply(
+        scatter_output.clone().detach(),
+        cumsum,
+        fc1_1_weight.clone().detach(),
+        fc1_2_weight.clone().detach(),
+        fc2_weight.clone().detach(),
+    )
+    out_ep = moe_gather(ep_raw * scattered_gw, scatter_index).reshape(hidden_states.shape)
+
+    # SM90+ (Hopper): bitwise for topk=2, atol<=1.95e-3 for topk=4.
+    # Pre-SM90 (e.g. L20/Ada): group_gemm has larger rounding diffs, atol<=1.56e-2 observed.
+    fwd_atol = 4e-3 if is_sm90_or_above() else 3.2e-2
+    torch.testing.assert_close(out_eager, out_ep, rtol=0, atol=fwd_atol)
+
+    # --- Backward: weight grads via EPGroupGemm with scattered routing weights as grad ---
+    # d/d(ep_raw) of sum(gather(w * ep_raw)) = w (broadcast), so passing scattered_gw
+    # as grad_output to EPGroupGemm.backward produces the same weight grads as eager.
+    hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
+    out_e = _eager_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_eager,
+        fc1_1_weight=fc1_1_eager,
+        fc1_2_weight=fc1_2_eager,
+        fc2_weight=fc2_eager,
+    )
+    out_e.sum().backward()
+
+    pt_ep = scatter_output.clone().detach().requires_grad_(True)
+    fc1_1_ep = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_ep = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
+    ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep)
+    ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
+
+    # SM90+: bitwise; pre-SM90 (L20 CI): atol<=1.56e-2 observed.
+    fc2_atol = 0 if is_sm90_or_above() else 3.2e-2
+    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=fc2_atol)
+    # SM90+: atol<=1.95e-3; pre-SM90: larger bf16 accumulation rounding.
+    fc1_atol = 4e-3 if is_sm90_or_above() else 3.2e-2
+    torch.testing.assert_close(fc1_1_eager.grad, fc1_1_ep.grad, rtol=0, atol=fc1_atol)
+    torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, rtol=0, atol=fc1_atol)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
+    [
+        (256, 8, 1024, 512, 2, 0),
+        (128, 4, 512, 256, 2, 1),
+    ],
+)
+def test_ep_merged_vs_non_ep(
+    num_tokens: int,
+    num_experts: int,
+    hidden_dim: int,
+    ffn_dim: int,
+    topk: int,
+    seed: int,
+):
+    """Verify EPMergedFc1GroupGemm produces the same output as the non-EP eager path."""
+    _skip_if_unsupported()
+
+    torch.manual_seed(seed)
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
+    routing_weights = routing_weights.to(dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+
+    # Scatter tokens by expert
+    scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
+    scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
+
+    # --- Forward: eager reference vs EP merged ---
+    out_eager = _eager_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hidden_states,
+        fc1_1_weight=fc1_1_weight,
+        fc1_2_weight=fc1_2_weight,
+        fc2_weight=fc2_weight,
+    )
+
+    ep_raw = EPMergedFc1GroupGemm.apply(
+        scatter_output.clone().detach(),
+        cumsum,
+        fc1_1_2_weight.clone().detach(),
+        fc2_weight.clone().detach(),
+    )
+    out_ep = moe_gather(ep_raw * scattered_gw, scatter_index).reshape(hidden_states.shape)
+
+    # SM90+: bitwise; pre-SM90 (L20 CI): larger rounding diffs.
+    fwd_atol = 0 if is_sm90_or_above() else 3.2e-2
+    torch.testing.assert_close(out_eager, out_ep, rtol=0, atol=fwd_atol)
+
+    # --- Backward: weight grads ---
+    hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
+    out_e = _eager_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_eager,
+        fc1_1_weight=fc1_1_eager,
+        fc1_2_weight=fc1_2_eager,
+        fc2_weight=fc2_eager,
+    )
+    out_e.sum().backward()
+
+    pt_ep = scatter_output.clone().detach().requires_grad_(True)
+    fc1_merged_ep = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
+    ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep)
+    ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
+
+    fc2_atol = 0 if is_sm90_or_above() else 3.2e-2
+    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=fc2_atol)
+    fc1_atol = 4e-3 if is_sm90_or_above() else 3.2e-2
+    fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
+    torch.testing.assert_close(fc1_eager_grad, fc1_merged_ep.grad, rtol=0, atol=fc1_atol)
