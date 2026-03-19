@@ -100,6 +100,11 @@ def calculate_frame_indices(
         (indices, pad_count): Frame indices to sample and padding count
     """
     r = frame_factor_remainder
+    if frame_factor is not None:
+        if frame_factor <= 0:
+            raise ValueError(f"frame_factor must be a positive integer, got {frame_factor}")
+        if not 0 <= r < frame_factor:
+            raise ValueError(f"frame_factor_remainder must be in [0, {frame_factor}), got {r}")
 
     # Calculate target frame count
     nframes = total_frames / video_fps * fps
