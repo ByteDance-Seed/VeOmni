@@ -15,6 +15,7 @@
 
 from typing import Any, Callable, Dict, Literal, Optional
 
+import torch
 from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -52,6 +53,13 @@ class DistributedDataloader(StatefulDataLoader):
             self.dataset.set_epoch(epoch)
 
 
+def _build_worker_init_fn(worker_num_threads: int) -> Callable[[int], None]:
+    def worker_init_fn(_worker_id: int) -> None:
+        torch.set_num_threads(worker_num_threads)
+
+    return worker_init_fn
+
+
 @DATALOADER_REGISTRY.register("native")
 def build_native_dataloader(
     dataset: "Dataset",
@@ -67,6 +75,7 @@ def build_native_dataloader(
     dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_in_dataloader is False.
     dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
+    worker_num_threads: Optional[int] = None,
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
@@ -158,6 +167,8 @@ def build_native_dataloader(
     }
     if multiprocessing_context is not None:
         dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
+    if worker_num_threads is not None:
+        dataloader_kwargs["worker_init_fn"] = _build_worker_init_fn(worker_num_threads)
 
     dataloader = DistributedDataloader(dataset, **dataloader_kwargs)
 
