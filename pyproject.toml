@@ -240,7 +240,7 @@ flash-attn-3 = [
   { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
-# Pinned to 03/10/2026 latest main commit.
+# Pinned to 03/18/2026 latest main commit.
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
