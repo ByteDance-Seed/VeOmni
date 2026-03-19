@@ -24,6 +24,7 @@ else
   fi
   # NPU env that may optimize performance
   export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:='expandable_segments:True'}
+  export MULTI_STREAM_MEMORY_REUSE=${MULTI_STREAM_MEMORY_REUSE:=2}
 fi
 NODE_RANK=${NODE_RANK:=0}
 MASTER_ADDR=${MASTER_ADDR:=0.0.0.0}

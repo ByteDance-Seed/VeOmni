@@ -630,6 +630,7 @@ def create_profiler(
     record_shapes: bool,
     profile_memory: bool,
     with_stack: bool,
+    with_modules: bool,
     global_rank: int,
 ):
     """
@@ -728,7 +729,7 @@ def create_profiler(
         on_trace_ready=handler_fn,
         record_shapes=record_shapes,
         profile_memory=profile_memory,
-        with_modules=True,
+        with_modules=with_modules,
         with_stack=with_stack,
         experimental_config=experimental_config,
     )

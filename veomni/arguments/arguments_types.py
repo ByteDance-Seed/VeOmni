@@ -144,6 +144,10 @@ class ProfileConfig:
         default=True,
         metadata={"help": "Whether or not to record the stack traces."},
     )
+    with_modules: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to record module hierarchy in profiling traces."},
+    )
     rank0_only: bool = field(
         default=True,
         metadata={
