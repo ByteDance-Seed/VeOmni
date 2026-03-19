@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from veomni.data.multimodal.video_utils import (
+    calculate_frame_indices,
     fetch_videos,
     fetch_videos_metadata,
     load_video,
@@ -565,6 +566,98 @@ def test_frames_indices_for_qwen3vl():
     print(f"FPS: {fps}")
     print(f"Calculated timestamps: {merged_timestamps}")
     print("-------------------------------------------")
+
+
+class TestCalculateFrameIndicesRemainder:
+    """Tests for frame_factor_remainder support in calculate_frame_indices."""
+
+    def test_remainder_zero_backward_compatible(self):
+        """frame_factor_remainder=0 should behave identically to the old logic."""
+        # 100 frames at 30fps, sample at 2fps -> ~6.67 frames -> floor to 4 (multiple of 4)
+        indices, pad = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=0
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 0, f"Expected multiple of 4, got {nframes}"
+
+    def test_remainder_one_with_factor_four(self):
+        """frame_factor=4, remainder=1 should produce 4k+1 frame counts (1, 5, 9, 13...)."""
+        indices, pad = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=1
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 1, f"Expected 4k+1, got {nframes} (nframes % 4 = {nframes % 4})"
+
+    def test_remainder_one_with_min_max_frames(self):
+        """min_frames and max_frames should also align to factor*k + remainder."""
+        indices, pad = calculate_frame_indices(
+            total_frames=200,
+            video_fps=30,
+            fps=2.0,
+            frame_factor=4,
+            frame_factor_remainder=1,
+            min_frames=8,
+            max_frames=20,
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 1, f"Expected 4k+1, got {nframes}"
+        # min_frames=8 -> ceil to 9 (4*2+1), max_frames=20 -> floor to 17 (4*4+1)
+        assert nframes >= 9, f"Expected >= 9 (aligned min), got {nframes}"
+        assert nframes <= 17, f"Expected <= 17 (aligned max), got {nframes}"
+
+    def test_remainder_one_small_video(self):
+        """Small video with remainder=1 should produce at least 1 frame."""
+        indices, pad = calculate_frame_indices(
+            total_frames=3, video_fps=30, fps=1.0, frame_factor=4, frame_factor_remainder=1
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 1, f"Expected 4k+1, got {nframes}"
+        assert nframes >= 1, f"Expected at least 1 frame, got {nframes}"
+
+    def test_remainder_two_with_factor_four(self):
+        """frame_factor=4, remainder=2 should produce 4k+2 frame counts (2, 6, 10, 14...)."""
+        indices, pad = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=2
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 2, f"Expected 4k+2, got {nframes} (nframes % 4 = {nframes % 4})"
+
+    @pytest.mark.parametrize(
+        "total_frames,video_fps,fps,factor,remainder",
+        [
+            (100, 30, 2.0, 4, 1),  # Normal case
+            (50, 24, 1.0, 4, 1),  # Different fps
+            (200, 30, 3.0, 4, 1),  # Higher target fps
+            (10, 30, 2.0, 4, 1),  # Few frames
+            (500, 60, 2.0, 4, 1),  # Many frames, high fps
+            (100, 30, 2.0, 2, 1),  # factor=2, remainder=1 -> odd numbers
+            (100, 30, 2.0, 3, 1),  # factor=3, remainder=1
+            (100, 30, 2.0, 3, 2),  # factor=3, remainder=2
+        ],
+    )
+    def test_remainder_alignment_parametrized(self, total_frames, video_fps, fps, factor, remainder):
+        """Parametrized test: output frame count should always satisfy nframes % factor == remainder."""
+        indices, pad = calculate_frame_indices(
+            total_frames=total_frames,
+            video_fps=video_fps,
+            fps=fps,
+            frame_factor=factor,
+            frame_factor_remainder=remainder,
+        )
+        nframes = len(indices) + pad
+        assert nframes % factor == remainder, (
+            f"Expected nframes % {factor} == {remainder}, got {nframes} (mod={nframes % factor})"
+        )
+        assert nframes >= remainder, f"Expected at least {remainder} frames, got {nframes}"
+
+    def test_default_remainder_is_zero(self):
+        """When frame_factor_remainder is not specified, it defaults to 0 (backward compat)."""
+        indices1, pad1 = calculate_frame_indices(total_frames=100, video_fps=30, fps=2.0, frame_factor=4)
+        indices2, pad2 = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=0
+        )
+        assert indices1 == indices2
+        assert pad1 == pad2
 
 
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
