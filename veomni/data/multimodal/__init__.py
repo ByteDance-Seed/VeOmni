@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .dit import data_transform, preprocess  # noqa: F401
 from .preprocess import PREPROCESSOR_REGISTRY, conv_preprocess  # noqa: F401
 
 

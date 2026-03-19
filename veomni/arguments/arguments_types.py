@@ -644,6 +644,10 @@ class ModelArguments:
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
+    lora_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for lora."},
+    )
     ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
 
     def __post_init__(self):

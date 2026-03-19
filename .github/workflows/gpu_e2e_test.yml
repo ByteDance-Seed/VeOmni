@@ -82,6 +82,12 @@ jobs:
         # Currently those tests are effectively skipped (but it's not straightforward to enable due to L20 OOM).
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+      - name: Sync dependencies [diffusers]
+        run: |
+          uv sync --frozen --extra gpu --extra dit --group dev
+      - name: Run tests [diffusers]
+        run: |
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
         # TODO: Run other tests in transformers v5 env as well.
 
   cleanup:

@@ -200,8 +200,9 @@ class EnvironMeterCallback(Callback):
             for k, v in step_train_metrics.items()
         }
 
-        lr = max(self.trainer.lr_scheduler.get_last_lr())
-        step_train_metrics["training/lr"] = lr
+        if self.trainer.lr_scheduler is not None:
+            lr = max(self.trainer.lr_scheduler.get_last_lr())
+            step_train_metrics["training/lr"] = lr
 
         step_env_metrics.update(step_train_metrics)
 

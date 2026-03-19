@@ -113,6 +113,23 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     return image_seqlens
 
 
+def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    dit_latents_seqlens = []
+    for latents in micro_batch["latents"]:
+        latent_shape = latents.shape
+        if len(latent_shape) == 5:
+            B = latent_shape[0]
+        else:
+            B = 1
+        C, T, H, W = latent_shape[-4:]
+        T_out = int((T - 1) / 1 + 1)
+        H_out = int((H - 2) / 2 + 1)
+        W_out = int((W - 2) / 2 + 1)
+        seqlens = B * T_out * H_out * W_out
+        dit_latents_seqlens.append(seqlens)
+    return dit_latents_seqlens
+
+
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     ds_idx = micro_batch.pop("ds_idx")
     micro_batch.pop("source_name", None)
@@ -191,17 +208,20 @@ class EnvironMeter:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
-        if isinstance(micro_batch, List):
-            for sample in micro_batch:
-                self.batch_seqlens.extend(_compute_seqlens(sample))
-                self.images_seqlens.extend(_compute_image_seqlens(sample))
+        if getattr(self.config, "condition_model_type", None) is None:  # hf model
+            if isinstance(micro_batch, List):
+                for sample in micro_batch:
+                    self.batch_seqlens.extend(_compute_seqlens(sample))
+                    self.images_seqlens.extend(_compute_image_seqlens(sample))
+                    if self.enable_multisource:
+                        self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
+            else:
+                self.batch_seqlens.extend(_compute_seqlens(micro_batch))
+                self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
                 if self.enable_multisource:
-                    self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
-        else:
-            self.batch_seqlens.extend(_compute_seqlens(micro_batch))
-            self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
-            if self.enable_multisource:
-                self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+                    self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+        else:  # dit diffusers model
+            self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0:
