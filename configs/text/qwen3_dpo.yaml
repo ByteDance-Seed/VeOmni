@@ -18,7 +18,7 @@ data:
   data_type: dpo
   chat_template: chatml
   max_seq_len: 2048
-  train_size: 62000
+  train_size: 20000000
 
 train:
   accelerator:
