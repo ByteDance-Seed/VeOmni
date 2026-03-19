@@ -734,6 +734,10 @@ class DataloaderConfig:
         default=2,
         metadata={"help": "Number of workers to load data."},
     )
+    worker_num_threads: Optional[int] = field(
+        default=None,
+        metadata={"help": "Per-worker torch thread count for dataloader subprocesses."},
+    )
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
@@ -863,9 +867,9 @@ class VeOmniArguments:
             self._train_steps = math.ceil(train_size / (self.train.global_batch_size * self.data.max_seq_len))
         else:
             if dataset_length is not None:  # mapping dataset
-                self._train_steps = math.floor(dataset_length / self.data.dataloader_batch_size)
+                self._train_steps = math.floor(dataset_length / self.train.dataloader_batch_size)
             else:
-                self._train_steps = math.ceil(self.data.train_sample / self.data.dataloader_batch_size)
+                self._train_steps = math.ceil(self.data.train_sample / self.train.dataloader_batch_size)
 
     @property
     def train_steps(self) -> int:
