@@ -45,6 +45,9 @@ RUN userdel -r $(id -un 1000) 2>/dev/null || true && \
     mkdir -p /var/log/tiger && \
     chown tiger:tiger /var/log/tiger
 
+# enable VFS (Virtual File System) used by UCX for tiger user
+RUN mkdir -p /run/user/1000 && chown tiger:tiger /run/user/1000
+
 # Enable sudo for tiger user
 RUN mkdir -p /etc/sudoers.d && \
     echo "tiger ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tiger && \
