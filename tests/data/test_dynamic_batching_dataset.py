@@ -1,6 +1,6 @@
 """Tests for DynamicBatchingSizeDataset functionality.
 
-This module tests the ``DynamicBatchingSizeDataset`` class using ``DummyIterableDataset``.
+This module tests the ``DynamicBatchingSizeDataset`` class using ``ShardedIterableDataset``.
 It validates that ``DynamicBatchingSizeDataset`` can properly:
 
 1. Batch samples based on token count (``micro_batch_seq_length``).
@@ -28,12 +28,13 @@ The test suite includes:
 """
 
 import argparse
+import copy
 import os
 import subprocess
 import sys
-import time
-from dataclasses import dataclass, field
-from unittest.mock import patch
+from contextlib import nullcontext
+from dataclasses import asdict
+from typing import Any, Dict, List
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -44,25 +45,20 @@ import torch.distributed as dist
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
-from utils import DummyIterableDataset, FakeModel
+from utils import FakeModel, ShardedIterableDataset, compare_global_batch, compare_items, compare_metrics
 
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
-from veomni.checkpoint import build_checkpointer
+from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
 from veomni.data.dataset import DynamicBatchingSizeDataset
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.trainer.base import BaseTrainer
+from veomni.trainer.callbacks import Callback, CheckpointerCallback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
-
-
-# Patch empty_cache to avoid AttributeError on CPU
-def _mock_empty_cache():
-    """Mock empty_cache that does nothing on CPU."""
-    pass
 
 
 MICRO_BATCH_SEQ_LENGTH = 32  # Max tokens per batch
@@ -82,7 +78,7 @@ def setup_dynamic_batching_dataset():
     Returns:
         A tuple of (iterable_dataset, dynamic_ds)
     """
-    iterable_dataset = DummyIterableDataset(size=DATASET_SIZE, shuffle=False)
+    iterable_dataset = ShardedIterableDataset(size=DATASET_SIZE, shuffle=False)
 
     dynamic_ds = DynamicBatchingSizeDataset(
         dataset=iterable_dataset,
@@ -119,7 +115,7 @@ def test_dynamic_batching_basic(shuffle, seed):
         seed: Random seed for shuffling.
     """
     # Create a simple dataset
-    iterable_ds = DummyIterableDataset(size=DATASET_SIZE, shuffle=shuffle, seed=seed)
+    iterable_ds = ShardedIterableDataset(size=DATASET_SIZE, shuffle=shuffle, seed=seed)
 
     # Create data collator
     collator = MainCollator()
@@ -249,12 +245,12 @@ def test_dynamic_batching_without_get_item():
     when the dataset doesn't have get_item method.
     """
 
-    class DummyIterableDatasetWithoutGetItem(IterableDataset):
+    class IterableDatasetWithoutGetItem(IterableDataset):
         def __iter__(self):
             for i in range(10):
                 yield {"input_ids": [i] * i, "attention_mask": [1] * i}
 
-    iterable_dataset = DummyIterableDatasetWithoutGetItem()
+    iterable_dataset = IterableDatasetWithoutGetItem()
 
     # Test with save_by_idx=True (should raise ValueError)
     with pytest.raises(ValueError, match="save_by_idx is True, but dataset does not have get_item method"):
@@ -279,7 +275,7 @@ def test_save_load_state_dict(save_by_idx):
         save_by_idx: Whether to save the buffer by index (True) or by full
             sample tensors (False).
     """
-    iterable_ds = DummyIterableDataset(size=DATASET_SIZE, shuffle=False)
+    iterable_ds = ShardedIterableDataset(size=DATASET_SIZE, shuffle=False)
 
     dynamic_ds = DynamicBatchingSizeDataset(
         dataset=iterable_ds,
@@ -302,7 +298,7 @@ def test_save_load_state_dict(save_by_idx):
     batches_original = list(iterator)
 
     # Restore state into a fresh dataset instance
-    iterable_ds2 = DummyIterableDataset(size=DATASET_SIZE, shuffle=False)
+    iterable_ds2 = ShardedIterableDataset(size=DATASET_SIZE, shuffle=False)
 
     dynamic_ds2 = DynamicBatchingSizeDataset(
         dataset=iterable_ds2,
@@ -379,7 +375,10 @@ def build_command(shuffle=True, save_by_idx=True):
         "--model.config_path=test",
         "--data.train_path=None",
         "--data.train_size=2000",
+        f"--data.dyn_bsz_buffer_size={READY_FOR_MICRO_BATCH_THRESHOLD}",
         "--data.max_seq_len=16",
+        "--data.dataloader.num_workers=2",
+        "--data.dataloader.drop_last=false",
         "--train.micro_batch_size=2",
         f"--shuffle={str(shuffle).lower()}",
         "--train.global_batch_size=16",
@@ -394,20 +393,225 @@ def build_command(shuffle=True, save_by_idx=True):
     return command
 
 
-@dataclass
-class Arguments(VeOmniArguments):
-    """
-    Container for training arguments.
+class TrainerTest(BaseTrainer):
+    gt_data_list: List[List[Dict[str, Any]]] = []
+    pred_data_list: List[List[Dict[str, Any]]] = []
+    golden_env_metrics: Dict[str, Any] = {}
+    resume_dcp_path: str
 
-    Attributes:
-        model: Model configuration arguments.
-        data: Data loading and processing arguments.
-        train: Training loop and optimization arguments.
-    """
+    save_epoch, save_step = 1, 0
+    is_resume_train: bool = False
 
-    model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
+    def __init__(self, args: VeOmniArguments, shuffle: bool, save_by_idx: bool):
+        self.shuffle = shuffle
+        self.save_by_idx = save_by_idx
+        super().__init__(args)
+
+    def _setup(self):
+        args = self.args
+        device_type = get_device_type()
+        if device_type != "cpu":
+            device_str = f"{device_type}:{args.train.local_rank}"
+            get_torch_device().set_device(device_str)
+            self.device = torch.device(device_str)
+        else:
+            self.device = torch.device("cpu")
+
+        backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend=backend,
+                world_size=int(os.environ["WORLD_SIZE"]),
+                rank=int(os.environ["RANK"]),
+            )
+
+        init_parallel_state(
+            dp_size=args.train.accelerator.dp_size,
+            dp_replicate_size=args.train.accelerator.dp_replicate_size,
+            dp_shard_size=args.train.accelerator.dp_shard_size,
+            tp_size=args.train.accelerator.tp_size,
+            pp_size=args.train.accelerator.pp_size,
+            cp_size=args.train.accelerator.cp_size,
+            ulysses_size=args.train.accelerator.ulysses_size,
+            extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
+            extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
+            extra_parallel_names=args.train.accelerator.extra_parallel_names,
+            dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        )
+        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+
+    def _freeze_model_module(self):
+        pass
+
+    def _build_model(self):
+        self.model = FakeModel().to(get_device_type())
+        self.model_config = PretrainedConfig()
+
+    def _build_model_assets(self):
+        self.model_assets = [self.model_config]
+
+    def _build_data_transform(self):
+        pass
+
+    def _build_dataset(self):
+        args = self.args
+        self.train_dataset = ShardedIterableDataset(size=DATASET_SIZE, shuffle=self.shuffle, seed=args.train.seed)
+        args.compute_train_steps(len(self.train_dataset))
+        args.train.num_train_epochs = 2
+        self.train_steps = args.train_steps
+
+    def _build_dataloader(self):
+        args = self.args
+        dataloader_kwargs = asdict(args.data.dataloader)
+        dataloader_type = dataloader_kwargs.pop("type")
+        self.train_dataloader = build_dataloader(
+            dataloader_type=dataloader_type,
+            dataset=self.train_dataset,
+            micro_batch_size=args.train.micro_batch_size,
+            global_batch_size=args.train.global_batch_size,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            max_seq_len=args.data.max_seq_len,
+            train_steps=args.train_steps,
+            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+            bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+            dyn_bsz=args.train.dyn_bsz,
+            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            dyn_bsz_dataset_save_by_idx=self.save_by_idx,
+            seed=args.train.seed,
+            collate_fn=self.collate_fn,
+            **dataloader_kwargs,
+        )
+
+    def _build_parallelized_model(self):
+        self.model.train()
+
+    def _build_optimizer(self):
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.train.optimizer.lr)
+
+    def _build_lr_scheduler(self):
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
+
+    def _build_training_context(self):
+        self.model_fwd_context = nullcontext()
+        self.model_bwd_context = nullcontext()
+
+    def _init_callbacks(self):
+        self.environ_meter_callback = EnvironMeterCallback(self)
+        self.checkpointer_callback = CheckpointerCallbackTest(self)
+        self.check_callback = CheckCallback(self)
+        self.state = TrainerState()
+
+    def on_train_begin(self):
+        self.environ_meter_callback.on_train_begin(self.state)
+        self.checkpointer_callback.on_train_begin(self.state)
+        self.check_callback.on_train_begin(self.state)
+
+    def on_train_end(self):
+        self.environ_meter_callback.on_train_end(self.state)
+        self.checkpointer_callback.on_train_end(self.state)
+        self.check_callback.on_train_end(self.state)
+
+    def on_epoch_begin(self):
+        self.state.curr_step = self.start_step - 1
+        self.environ_meter_callback.on_epoch_begin(self.state)
+        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.check_callback.on_epoch_begin(self.state)
+
+    def on_epoch_end(self):
+        self.environ_meter_callback.on_epoch_end(self.state)
+        self.checkpointer_callback.on_epoch_end(self.state)
+        self.check_callback.on_epoch_end(self.state)
+
+    def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
+
+    def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
+        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        self.state.global_step += 1
+        self.state.curr_step += 1
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.on_step_begin(micro_batches=micro_batches)
+        self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
+
+    def resume_train(self):
+        self.is_resume_train = True
+        super().train()
+
+    def destroy_distributed(self):
+        if self.is_resume_train:
+            super().destroy_distributed()
+
+
+class CheckpointerCallbackTest(CheckpointerCallback):
+    trainer: TrainerTest
+
+    def on_step_end(self, state: TrainerState, **kwargs):
+        # logger.error(f"[END][rank{self.trainer.args.train.global_rank}][epoch{state.epoch}][step{state.curr_step}][global_step{state.global_step}] metrics {getattr(getattr(self.trainer, 'step_env_metrics', None), 'consume_tokens(M)', None)}")
+        if (
+            not self.trainer.is_resume_train
+            and state.epoch == self.trainer.save_epoch
+            and state.curr_step == self.trainer.save_step
+        ):
+            # logger.error(f"save checkpoint {state.global_step} {state.epoch} {state.curr_step} {self.trainer.environ_meter.state_dict()}")
+            self._save_checkpoint(state)
+            self.trainer.resume_dcp_path = os.path.join(
+                self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
+            )
+            self.trainer.args.train.checkpoint.load_path = self.trainer.resume_dcp_path
+
+    def on_epoch_end(self, state: TrainerState, **kwargs):
+        pass
+
+
+class CheckCallback(Callback):
+    trainer: TrainerTest
+
+    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+        # micro_batch_output = [list(set(d['input_ids'].tolist()[0])) for d in micro_batches]
+        # logger.error(f"[BEGIN][rank{self.trainer.args.train.global_rank}][epoch{state.epoch}][step{state.curr_step}][global_step{state.global_step}] metrics {  getattr(getattr(self.trainer, 'step_env_metrics', None), 'consume_tokens(M)', None)} micro_batches: {micro_batch_output}")
+        if state.global_step == 1:
+            helper.print_example(example=micro_batches[0], rank=self.trainer.args.train.local_rank)
+            assert 1 < len(micro_batches) <= 4, f"Unexpected micro batch count: {len(micro_batches)}"
+            if get_parallel_state().sp_enabled:
+                assert (
+                    micro_batches[0]["input_ids"].shape[-1] * get_parallel_state().sp_size
+                    == micro_batches[0]["attention_mask"].shape[-1]
+                )
+                assert compare_items(
+                    micro_batches[0]["attention_mask"],
+                    rank=get_parallel_state().sp_rank,
+                    group_size=get_parallel_state().sp_size,
+                    group=get_parallel_state().sp_group,
+                )
+
+        if state.epoch == self.trainer.save_epoch and state.curr_step > self.trainer.save_step:
+            if not self.trainer.is_resume_train:
+                self.trainer.gt_data_list.append(micro_batches)
+            else:
+                self.trainer.pred_data_list.append(micro_batches)
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self.trainer.is_resume_train:
+            assert len(self.trainer.gt_data_list) == len(self.trainer.pred_data_list), (
+                f"Batch count mismatch: gt={len(self.trainer.gt_data_list)}, pred={len(self.trainer.pred_data_list)}"
+            )
+
+            for i, (gt_batch, pred_batch) in enumerate(zip(self.trainer.gt_data_list, self.trainer.pred_data_list)):
+                assert len(gt_batch) == len(pred_batch), f"Micro batch count mismatch at batch {i}"
+
+            compare_global_batch(self.trainer.gt_data_list, self.trainer.pred_data_list)
+            compare_metrics(self.trainer.step_env_metrics, self.trainer.golden_env_metrics)
+
+            logger.info(f"[rank{self.trainer.args.train.global_rank}] ✅ All batches matched successfully!")
+        else:
+            self.trainer.golden_env_metrics = copy.deepcopy(self.trainer.step_env_metrics)
 
 
 def _main_distributed_test():
@@ -416,259 +620,17 @@ def _main_distributed_test():
     It wraps ``_run_distributed_test()` and in the testing it is supposed to be
     triggered by test_dynamic_batching_dataset_distributed().
     """
-    # Patch empty_cache to avoid AttributeError on CPU
-    with patch("veomni.utils.device.empty_cache", _mock_empty_cache):
-        _run_distributed_test()
-
-
-def _run_distributed_test():
-    """Run a full checkpoint-resume cycle and assert batch reproducibility.
-
-    Procedure
-    ---------
-    1. **Parse CLI flags**
-    2. **Initialise torch distributed state**
-    3. **Build a StatefulDataLoader** wrapping ``DummyIterableDataset`` →
-       ``DynamicBatchingSizeDataset`` with ``num_workers=2``.
-    4. **First pass (2 epochs)** – iterate the dataloader for both epochs.  Batches
-       before the designated save point (``epoch=1, step=2``) are discarded; batches
-       *after* that point are stored in ``batches_after_save_step`` as ground truth.
-       At the save point a checkpoint is written via ``Checkpointer.save()``,
-       capturing model weights, ``dataloader.state_dict()``, and
-       ``environ_meter.state_dict()``.
-    5. **Load checkpoint** – ``Checkpointer.load()`` restores all state; the
-       dataloader, dataset and environ-meter are restored through ``load_state_dict()``.
-    6. **Second pass (resume)** – iterate from the saved epoch / step through the
-       end of both epochs, collecting resumed batches in ``batch_after_resume``.
-    7. **Assert equality** – verify that ``batches_after_save_step`` and
-       ``batch_after_resume`` have the same length and that every tensor in every
-       micro-batch is identical element-wise.
-    """
     _parser = argparse.ArgumentParser()
     _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
     _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
     test_args, remaining_argv = _parser.parse_known_args()
     sys.argv = [sys.argv[0]] + remaining_argv
 
-    args = parse_args(Arguments)
-    world_size = int(os.environ["WORLD_SIZE"])
-    rank = int(os.environ["RANK"])
-    get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-
-    # Use gloo backend for CPU, otherwise use get_dist_comm_backend()
-    try:
-        backend = get_dist_comm_backend()
-    except RuntimeError:
-        # Fallback to gloo for CPU
-        backend = "gloo"
-
-    dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
-
-    init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
-    )
-
-    Checkpointer = build_checkpointer(
-        dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
-    )
-
-    # Create DummyIterableDataset
-    iterable_dataset = DummyIterableDataset(size=DATASET_SIZE, shuffle=test_args.shuffle, seed=args.train.seed)
-
-    # Compute train_steps based on dataset size
-    dataset_length = len(iterable_dataset)
-    args.compute_train_steps(dataset_length)
-    train_steps = args.train_steps
-
-    dataloader = build_dataloader(
-        dataloader_type="native",
-        dataset=iterable_dataset,
-        micro_batch_size=args.train.micro_batch_size,
-        global_batch_size=args.train.global_batch_size,
-        dataloader_batch_size=args.train.dataloader_batch_size,
-        max_seq_len=args.data.max_seq_len,
-        train_steps=train_steps,
-        dyn_bsz=args.train.dyn_bsz,
-        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
-        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_buffer_size=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dyn_bsz_dataset_save_by_idx=test_args.save_by_idx,
-        num_workers=2,
-        drop_last=args.data.dataloader.drop_last,
-        pin_memory=args.data.dataloader.pin_memory,
-        prefetch_factor=args.data.dataloader.prefetch_factor,
-    )
-
-    config = PretrainedConfig()
-    environ_meter = helper.EnvironMeter(
-        config=config,
-        global_batch_size=args.train.global_batch_size,
-        empty_cache_steps=args.train.empty_cache_steps,
-    )
-
-    batches_after_save_step = []
-    epoch_num = 2  # Run 2 epochs
-    start_epoch, start_step, global_step = 0, 0, 0
-    save_epoch, save_step = 1, 0
-
-    fake_model = FakeModel().to(get_device_type())
-
-    # First pass: run 2 epochs and collect batches after save_step
-    logger.info(
-        f"[rank{rank}] Starting first pass: running {epoch_num} epochs, train_steps={train_steps}, save_step={save_step}"
-    )
-    for epoch in range(start_epoch, epoch_num):
-        dataloader.set_epoch(epoch)
-        data_iterator = iter(dataloader)
-        start_time = time.time()
-
-        for local_step in range(start_step, train_steps):
-            global_step += 1
-            try:
-                micro_batches = next(data_iterator)
-            except StopIteration:
-                logger.info(
-                    f"[rank{rank}] epoch:{epoch} Dataloader finished at global_step={global_step - 1}, local_step={local_step}"
-                )
-                break
-
-            if global_step == 1:
-                helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
-                assert 1 < len(micro_batches) <= 4, f"Expected 2-4 micro batches, got {len(micro_batches)}"
-
-            # Print batch info for debugging
-            """
-            logger.error(f"[rank{rank}] epoch:{epoch} step:{local_step} global_step:{global_step} num_micro_batches:{len(micro_batches)} dataset_iter: {dataloader.dataset._data_iter}")
-            for micro_idx, micro_batch in enumerate(micro_batches):
-                # Extract sample indices from input_ids (each sample has all same values)
-                input_ids = micro_batch["input_ids"].squeeze(0)  # Remove batch dim
-                input_ids = set(input_ids.tolist())
-                logger.error(f"[rank{rank}] epoch:{epoch} step:{local_step} global_step:{global_step} micro_batch[{micro_idx}]: {input_ids}")
-            """
-
-            if epoch > save_epoch or (epoch == save_epoch and local_step > save_step):
-                batches_after_save_step.append(micro_batches)
-
-            for _, micro_batch in enumerate(micro_batches):
-                environ_meter.add(micro_batch)
-
-            delta_time = time.time() - start_time
-            try:
-                metrics = environ_meter.step(delta_time, global_step=global_step)
-            except AttributeError as e:
-                # Skip metrics on CPU (torch.cpu has no attribute 'get_device_name')
-                logger.warning(f"[rank{rank}] Skipping metrics: {e}")
-                metrics = {}
-
-            if epoch == save_epoch and local_step == save_step:
-                state = {
-                    "model": fake_model,
-                    "extra_state": {
-                        "curr_epoch": epoch,
-                        "curr_step": local_step,
-                        "global_step": global_step,
-                        "train_dataloader": dataloader.state_dict(),
-                        "environ_meter": environ_meter.state_dict(),
-                    },
-                }
-                save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
-                Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
-                dist.barrier()
-
-        start_step = 0  # Reset for next epoch
-
-    logger.info(f"[rank{rank}] Collected {len(batches_after_save_step)} batches after save_step in first pass")
-
-    # Resume from checkpoint
-    logger.info(f"[rank{rank}] Loading checkpoint from {save_checkpoint_path}")
-    state = {"model": fake_model, "extra_state": {}}
-    Checkpointer.load(save_checkpoint_path, state)
-    dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
-    environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
-    start_epoch = state["extra_state"]["curr_epoch"]
-    assert start_epoch == save_epoch
-    start_step = state["extra_state"]["curr_step"] + 1
-    assert start_step == save_step + 1
-    global_step = state["extra_state"]["global_step"]
-    dl_state = state["extra_state"]["train_dataloader"]
-    logger.error(f"[rank{rank}] Loaded dataloader state: {dl_state}")
-
-    # Second pass: resume and collect batches
-    batch_after_resume = []
-    logger.info(f"[rank{rank}] Resuming from epoch {start_epoch}, step {start_step}")
-
-    for epoch in range(start_epoch, epoch_num):
-        dataloader.set_epoch(epoch)
-        data_iter = iter(dataloader)
-
-        for local_step in range(start_step, train_steps):
-            global_step += 1
-            try:
-                micro_batches = next(data_iter)
-            except StopIteration:
-                logger.info(f"[rank{rank}] epoch:{epoch} step:{local_step} Dataloader finished on resume")
-                break
-
-            if epoch > save_epoch or (epoch == save_epoch and local_step > save_step):
-                batch_after_resume.append(micro_batches)
-
-            for _, micro_batch in enumerate(micro_batches):
-                environ_meter.add(micro_batch)
-
-            delta_time = time.time() - start_time
-            try:
-                metrics_resume = environ_meter.step(delta_time, global_step=global_step)
-            except AttributeError as e:
-                # Skip metrics on CPU
-                logger.warning(f"[rank{rank}] Skipping metrics: {e}")
-                metrics_resume = {}
-
-        start_step = 0  # Reset for next epoch
-
-    logger.info(f"[rank{rank}] Collected {len(batch_after_resume)} batches after save_step in second pass")
-
-    # Compare batches
-    assert len(batches_after_save_step) == len(batch_after_resume), (
-        f"[rank{rank}] Batch count mismatch: {len(batches_after_save_step)} vs {len(batch_after_resume)}"
-    )
-
-    for i, (gt_batches, pred_batches) in enumerate(zip(batches_after_save_step, batch_after_resume)):
-        assert len(gt_batches) == len(pred_batches), (
-            f"[rank{rank}] Micro batch count mismatch at step {i}: {len(gt_batches)} vs {len(pred_batches)}"
-        )
-
-        for j, (gt_batch, pred_batch) in enumerate(zip(gt_batches, pred_batches)):
-            for key in gt_batch.keys():
-                if torch.is_tensor(gt_batch[key]):
-                    assert torch.all(gt_batch[key] == pred_batch[key]), (
-                        f"[rank{rank}] Batch {i} micro_batch {j} key {key} mismatch"
-                    )
-
-    if (
-        metrics is not None
-        and metrics_resume is not None
-        and "consume_tokens(M)" in metrics
-        and "consume_tokens(M)" in metrics_resume
-    ):
-        assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]
-
-    logger.info(f"[rank{rank}] ✅ All batches matched successfully!")
-
-    if dist.is_initialized():
-        dist.barrier()
-
-    if world_size > 1:
-        dist.destroy_process_group()
+    args = parse_args(VeOmniArguments)
+    trainer = TrainerTest(args, shuffle=test_args.shuffle, save_by_idx=test_args.save_by_idx)
+    trainer.train()
+    assert trainer.args.train.checkpoint.load_path is not None
+    trainer.resume_train()
 
 
 if __name__ == "__main__":

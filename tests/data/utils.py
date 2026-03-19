@@ -16,8 +16,8 @@ from veomni.utils.helper import get_cache_dir
 logger = helper.create_logger(__name__)
 
 
-class DummyIterableDataset(IterableDataset):
-    """Deterministic dummy dataset with iterable sharding and optional shuffle.
+class ShardedIterableDataset(IterableDataset):
+    """Deterministic iterable dataset with rank/worker sharding and optional shuffle.
 
     Designed to tested with ``DynamicBatchingSizeDataset`` and ``StatefulDataLoader`` checkpointing:
 
@@ -131,7 +131,7 @@ class DummyIterableDataset(IterableDataset):
             idx: 0-based integer index into the dataset.
 
         Returns:
-            Sample as returned by ``DummyIterableDataset.__getitem__``.
+            Sample as returned by ``ShardedIterableDataset.__getitem__``.
         """
         return self[idx]
 
@@ -230,12 +230,18 @@ def compare_items(item, rank, group_size, group):
 
 
 def compare_global_batch(global_batch_list, global_batch_resume_list):
-    for global_batch, global_batch_resume in zip(global_batch_list, global_batch_resume_list):
-        for micro_batch, micro_batch_resume in zip(global_batch, global_batch_resume):
+    for global_batch, global_batch_resume in zip(global_batch_list, global_batch_resume_list, strict=True):
+        for micro_batch, micro_batch_resume in zip(global_batch, global_batch_resume, strict=True):
             for key in micro_batch.keys():
                 if torch.is_tensor(micro_batch[key]):
                     assert torch.all(micro_batch[key] == micro_batch_resume[key])
 
 
 def compare_metrics(metrics, metrics_resume):
-    assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]
+    if (
+        metrics is not None
+        and metrics_resume is not None
+        and "consume_tokens(M)" in metrics
+        and "consume_tokens(M)" in metrics_resume
+    ):
+        assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]
