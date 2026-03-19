@@ -276,6 +276,10 @@ class DataArguments:
         default=2,
         metadata={"help": "Number of workers to load data."},
     )
+    worker_num_threads: Optional[int] = field(
+        default=None,
+        metadata={"help": "Per-worker torch thread count for dataloader subprocesses."},
+    )
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},

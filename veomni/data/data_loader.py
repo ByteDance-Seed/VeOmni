@@ -15,6 +15,7 @@
 
 from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Union
 
+import torch
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -60,6 +61,16 @@ class DistributedDataloader(StatefulDataLoader):
             self.dataset.set_epoch(epoch)
 
 
+def _build_worker_init_fn(worker_num_threads: Optional[int]) -> Optional[Callable[[int], None]]:
+    if worker_num_threads is None:
+        return None
+
+    def worker_init_fn(_worker_id: int) -> None:
+        torch.set_num_threads(worker_num_threads)
+
+    return worker_init_fn
+
+
 @DATALOADER_REGISTRY.register("native")
 def build_native_dataloader(
     dataset: "Dataset",
@@ -80,6 +91,7 @@ def build_native_dataloader(
     dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_runtime is "worker".
     collate_fn: Optional[Union[Callable, List[Callable]]] = None,
     num_workers: int = 8,
+    worker_num_threads: int = 1,
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
@@ -164,6 +176,7 @@ def build_native_dataloader(
         batch_size=dataloader_batch_size,
         sampler=sampler,
         num_workers=num_workers,
+        worker_init_fn=_build_worker_init_fn(worker_num_threads),
         collate_fn=collate_fn,
         pin_memory=pin_memory,
         pin_memory_device=get_device_type(),
