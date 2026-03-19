@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
@@ -21,6 +22,30 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+_DEFAULT_MAX_RETRIES = 10
+_DEFAULT_RETRY_INTERVAL = 60  # seconds
+
+
+def _load_shard_with_retry(
+    shard_keys,
+    checkpoint_path,
+    save_dtype,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+    retry_interval: int = _DEFAULT_RETRY_INTERVAL,
+):
+    """Load a shard from DCP checkpoint with retry for incomplete writes (e.g. async save not yet flushed)."""
+    for attempt in range(max_retries + 1):
+        try:
+            return _process_shard(shard_keys, checkpoint_path, save_dtype)
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            logger.warning(
+                f"Failed to load shard (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                f"Checkpoint may still be writing. Retrying in {retry_interval}s..."
+            )
+            time.sleep(retry_interval)
 
 
 @torch.no_grad()
@@ -65,7 +90,7 @@ def save_model_weights(
         save_path = os.path.join(output_dir, filename)
         logger.info(f"Processing shard {shard_idx + 1}/{num_shards}: {filename} ({len(shard_keys)} tensors)")
 
-        processed_dict = _process_shard(shard_keys, checkpoint_path, save_dtype)
+        processed_dict = _load_shard_with_retry(shard_keys, checkpoint_path, save_dtype)
 
         # Save shard
         if safe_serialization:
