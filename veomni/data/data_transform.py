@@ -109,6 +109,78 @@ def process_conversation_example(
     return [tokenized_example]
 
 
+@DATA_TRANSFORM_REGISTRY.register("dpo")
+def process_dpo_example(
+    example: Dict[str, Any],
+    chat_template: "ChatTemplate" = None,
+    tokenizer: "PreTrainedTokenizer" = None,
+    max_seq_len: int = 2048,
+    **kwargs,
+) -> List[Dict[str, "torch.Tensor"]]:
+    """Process a DPO preference pair into a single flat sample.
+
+    Chosen and rejected sequences are concatenated into one 1-D tensor with
+    ``position_ids`` that reset at the boundary so that flash-attention treats
+    them as two independent sequences.  This format is directly compatible with
+    ``MainCollator`` (packing + SP) — no DPO-specific collator is needed.
+
+    Supported input formats:
+      1. Conversation: {"chosen": [messages...], "rejected": [messages...]}
+      2. Plaintext with prompt: {"prompt": str, "chosen": str, "rejected": str}
+
+    Returns:
+        A list with one dict.  Each value is a 1-D tensor of length
+        ``len_chosen + len_rejected``.  Keys: ``input_ids``, ``attention_mask``,
+        ``labels``, ``position_ids``.
+    """
+    chosen_raw = example["chosen"]
+    rejected_raw = example["rejected"]
+
+    if isinstance(chosen_raw, list):
+        assert chat_template is not None, "chat_template is required for conversation-format DPO data"
+        chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
+        rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
+    else:
+        assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"
+        prompt = example.get("prompt", "")
+        chosen_text = prompt + chosen_raw
+        rejected_text = prompt + rejected_raw
+
+        chosen_ids = tokenizer.encode(chosen_text, add_special_tokens=True)[:max_seq_len]
+        rejected_ids = tokenizer.encode(rejected_text, add_special_tokens=True)[:max_seq_len]
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True) if prompt else []
+        prompt_len = len(prompt_ids)
+
+        chosen_tok = {
+            "input_ids": chosen_ids,
+            "attention_mask": [1] * len(chosen_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + chosen_ids[prompt_len:],
+        }
+        rejected_tok = {
+            "input_ids": rejected_ids,
+            "attention_mask": [1] * len(rejected_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + rejected_ids[prompt_len:],
+        }
+
+    def _to_tensor(v):
+        return v if isinstance(v, torch.Tensor) else torch.tensor(v)
+
+    c_ids = _to_tensor(chosen_tok["input_ids"])
+    r_ids = _to_tensor(rejected_tok["input_ids"])
+    c_len = c_ids.shape[-1]
+    r_len = r_ids.shape[-1]
+
+    result = {
+        "input_ids": torch.cat([c_ids, r_ids]),
+        "attention_mask": torch.cat(
+            [_to_tensor(chosen_tok["attention_mask"]), _to_tensor(rejected_tok["attention_mask"])]
+        ),
+        "labels": torch.cat([_to_tensor(chosen_tok["labels"]), _to_tensor(rejected_tok["labels"])]),
+        "position_ids": torch.cat([torch.arange(c_len, dtype=torch.int64), torch.arange(r_len, dtype=torch.int64)]),
+    }
+    return [result]
+
+
 @DATA_TRANSFORM_REGISTRY.register("classification")
 def process_classification_example(
     example: dict[str, Any],

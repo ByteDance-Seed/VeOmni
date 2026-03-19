@@ -632,10 +632,10 @@ wheels = [
 
 [[package]]
 name = "flash-attn"
-version = "2.8.3+cu129torch2.9"
-source = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl" }
+version = "2.8.4"
+source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl" }
 wheels = [
-    { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl", hash = "sha256:9f9b86c3e94bd3c559453c94510f5f1198b81c19f35838e767e2392a6558dcea" },
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", hash = "sha256:fc499ab2bcf1aa543326754d99de10fe611144223d48c52ba70c513be5d4cb6f" },
 ]
 
 [package.metadata]
@@ -643,10 +643,10 @@ requires-dist = [{ name = "torch" }]
 
 [[package]]
 name = "flash-attn-3"
-version = "3.0.0b1+20260112.cu129torch291cxx11abitrue.ea8f73"
-source = { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl" }
+version = "3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b"
+source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl" }
 wheels = [
-    { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl", hash = "sha256:5e8d4444e98c5752de88cdb3c68929e9f4aa8528ba1a6d78b2feec69a7ee7227" },
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", hash = "sha256:beb74a96cc670f561748a17f2eab9e1049885c3a512c570c761d021bf3fa3728" },
 ]
 
 [package.metadata]
@@ -654,14 +654,13 @@ requires-dist = [{ name = "torch" }]
 
 [[package]]
 name = "flash-attn-4"
-version = "4.0.0b5.dev16+g7fd16f2"
-source = { git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=7fd16f28bffe71c9ab6b7eecc5dd14bf87c1dc9e#7fd16f28bffe71c9ab6b7eecc5dd14bf87c1dc9e" }
+version = "4.0.0b5.dev70+g9397816"
+source = { git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d#9397816f6094f5ba0de52c221093637054590d0d" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "einops" },
     { name = "nvidia-cutlass-dsl" },
     { name = "quack-kernels" },
-    { name = "setuptools" },
     { name = "torch-c-dlpack-ext" },
     { name = "typing-extensions" },
 ]
@@ -1623,18 +1622,18 @@ wheels = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.4.1"
+version = "4.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nvidia-cutlass-dsl-libs-base" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0d/a8/d9f2b82bf6f6b48502267fcf2fa7b229392affb68a6092da92b0edef7476/nvidia_cutlass_dsl-4.4.1-py3-none-any.whl", hash = "sha256:7b8ffa0117be35ef6c9a88f4462ee2a794efd0f7d9f65090e10a953e434fbfce", size = 10167, upload-time = "2026-02-27T09:37:34.551Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/03/678dab0383db1ddfc449da216220f40404189eb36eeed9d87a4fa4bdb0e6/nvidia_cutlass_dsl-4.4.2-py3-none-any.whl", hash = "sha256:7cfb9ef19062b055b9372c7a627004724e2755e4c8b16c3cc88807d64501a4ae", size = 10167, upload-time = "2026-03-16T02:18:59.043Z" },
 ]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-base"
-version = "4.4.1"
+version = "4.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-python", version = "12.9.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-gpu' or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
@@ -1643,8 +1642,8 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/92/84/8601ac8308f8cd3121663d934d645458ebc92849aae4b78f811db36ff3e8/nvidia_cutlass_dsl_libs_base-4.4.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:f7e9f9c2407a5397482dfca6f5e649c36f508f7cc9e059b9be12093154b14dcb", size = 75459322, upload-time = "2026-02-27T09:44:32.765Z" },
-    { url = "https://files.pythonhosted.org/packages/85/82/02999d772e2cbdf203299d4389278c2c5f4261a10bf54fb69e26eea2b12d/nvidia_cutlass_dsl_libs_base-4.4.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:649b422f166bd7905b69d1a089b2d1c68ac70f58d34d8f2ecd9403b6b574751a", size = 74346984, upload-time = "2026-02-27T09:43:10.223Z" },
+    { url = "https://files.pythonhosted.org/packages/60/bf/b9d0fd1ba281b111c941d9616dd9f98a509d84bf35076e60fef27ec7abd6/nvidia_cutlass_dsl_libs_base-4.4.2-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:261832dafe7579dc83cd3816ab9ea845e3de3737d876c215f01fb4edff1f4473", size = 75476977, upload-time = "2026-03-16T02:26:40.932Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/23/86dda6d69a3fc29d0cde2a8b54c056ad69b73a6e5e230e18d906d2ec3b7c/nvidia_cutlass_dsl_libs_base-4.4.2-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:40c2352b2fcc80789a216cbeb9b2ee10c85c15de839cda8f5c1d18166b8249df", size = 74356100, upload-time = "2026-03-16T02:26:12.778Z" },
 ]
 
 [[package]]
@@ -2096,16 +2095,16 @@ wheels = [
 
 [[package]]
 name = "quack-kernels"
-version = "0.3.2"
+version = "0.3.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "nvidia-cutlass-dsl" },
     { name = "torch-c-dlpack-ext" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/22/cd/d2b2309d62cf492fdced724f445903285c0e41e8f8822605c0baa72763a6/quack_kernels-0.3.2.tar.gz", hash = "sha256:ada1288712d46b1c92b251c456d249d940991e730380078d0a090f5eb7682249", size = 172633, upload-time = "2026-03-10T05:14:30.55Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b1/cf/faf4d6af611211016efe38efe9e5ddcf3f1a8dd91023124f566b501d7f20/quack_kernels-0.3.4.tar.gz", hash = "sha256:2cf1545065ea90acca40360dfcc40ea0cafd07056a8afa859b62a27aa070e78a", size = 177914, upload-time = "2026-03-18T18:46:46.625Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/2e/bd0cca682daa8e5c6ff68821560273c697f05413ca97621bb90f717f6fa5/quack_kernels-0.3.2-py3-none-any.whl", hash = "sha256:dca60278c4bd873c8d3102898e034b85e51a0f8aa8b2e5c939a3a2ff76004dcb", size = 177248, upload-time = "2026-03-10T05:14:29.545Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/0a/ccc1fc353e2aa68973159a13f87efacbb98cdbd950c3648da2d7d6f6bf0b/quack_kernels-0.3.4-py3-none-any.whl", hash = "sha256:aafab366098017b3a8af371d1eba5c2fa3be5282beef9a5de73b3d36f05d691b", size = 181472, upload-time = "2026-03-18T18:46:45.44Z" },
 ]
 
 [[package]]
@@ -2764,9 +2763,9 @@ dependencies = [
     { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or sys_platform == 'darwin' or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:4addf626e2b57fc22fd6d329cf1346d474497672e6af8383b7b5b636fba94a53" },
-    { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:8b4a53a6067d63adba0c52f2b8dd2290db649d642021674ee43c0c922f0c6a69" },
-    { url = "https://download.pytorch.org/whl/cu128/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:299fbd935f02b424e9166b7689de57067e24a228edc00abd5faf84f86c0643a0" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:4addf626e2b57fc22fd6d329cf1346d474497672e6af8383b7b5b636fba94a53" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:8b4a53a6067d63adba0c52f2b8dd2290db649d642021674ee43c0c922f0c6a69" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:299fbd935f02b424e9166b7689de57067e24a228edc00abd5faf84f86c0643a0" },
 ]
 
 [[package]]
@@ -2792,8 +2791,8 @@ dependencies = [
     { name = "pillow", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:4e0cbc165a472605d0c13da68ae22e84b17a6b815d5e600834777823e1bcb658" },
-    { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1%2Bcpu-cp311-cp311-win_amd64.whl", hash = "sha256:9482adee074f60a45fd69892f7488281aadfda7836948c94b0a9b0caf55d1d67" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:4e0cbc165a472605d0c13da68ae22e84b17a6b815d5e600834777823e1bcb658" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1%2Bcpu-cp311-cp311-win_amd64.whl", hash = "sha256:9482adee074f60a45fd69892f7488281aadfda7836948c94b0a9b0caf55d1d67" },
 ]
 
 [[package]]
@@ -2809,7 +2808,7 @@ dependencies = [
     { name = "pillow" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl" },
 ]
 
 [[package]]
@@ -3146,9 +3145,9 @@ requires-dist = [
     { name = "diffusers", marker = "extra == 'dit'", specifier = "==0.36.0" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "expecttest", marker = "extra == 'dev'", specifier = ">=0.3.0,<0.4" },
-    { name = "flash-attn", marker = "extra == 'gpu'", url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl" },
-    { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl" },
-    { name = "flash-attn-4", marker = "extra == 'fa4'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=7fd16f28bffe71c9ab6b7eecc5dd14bf87c1dc9e" },
+    { name = "flash-attn", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl" },
+    { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl" },
+    { name = "flash-attn-4", marker = "extra == 'fa4'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
     { name = "ftfy", marker = "extra == 'dit'" },
     { name = "hf-transfer", marker = "extra == 'gpu'" },
@@ -3158,14 +3157,14 @@ requires-dist = [
     { name = "liger-kernel", marker = "extra == 'gpu'" },
     { name = "megatron-energon", marker = "extra == 'megatron'", specifier = ">=7.2.1" },
     { name = "nvidia-cusparselt-cu12", marker = "extra == 'gpu'" },
-    { name = "nvidia-cutlass-dsl", marker = "extra == 'fa4'", specifier = ">=4.4.0" },
+    { name = "nvidia-cutlass-dsl", marker = "extra == 'fa4'", specifier = ">=4.4.2" },
     { name = "nvidia-nccl-cu12", marker = "extra == 'gpu'" },
     { name = "packaging", specifier = ">=23.0,<26.0" },
     { name = "peft", marker = "extra == 'dit'" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0.0,<5.0" },
     { name = "psutil" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=6.0.0,<8.0" },
-    { name = "quack-kernels", marker = "extra == 'gpu'", specifier = "==0.3.2" },
+    { name = "quack-kernels", marker = "extra == 'gpu'", specifier = "==0.3.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7.0,<1.0" },
     { name = "scipy", marker = "extra == 'npu'", specifier = ">=1.16.2" },
     { name = "scipy", marker = "extra == 'npu-aarch64'", specifier = ">=1.16.2" },

@@ -97,7 +97,7 @@ gpu = [
   "torch-c-dlpack-ext",
   # For models with linear attention like Qwen 3.5
   "flash-linear-attention",
-  "quack-kernels==0.3.2",
+  "quack-kernels==0.3.4",
 ]
 megatron = [
   "megatron-energon>=7.2.1"
@@ -107,8 +107,8 @@ trl = [
 ]
 
 fa4 = [
-  "flash-attn-4==0.1.0",
-  "nvidia-cutlass-dsl>=4.4.0"
+  "flash-attn-4",
+  "nvidia-cutlass-dsl>=4.4.2"
 ]
 
 # Experimental dep to install transformers 5.x.
@@ -237,15 +237,15 @@ torchaudio = { index = "pytorch" }
 flash-attn = [
   # torch 2.9+cu129
   # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.9+.
-  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3+cu129torch2.9-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"},
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
 flash-attn-3 = [
   # torch 2.9+cu129
-  { url = "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.12-6b9e0bf/flash_attn_3-3.0.0b1%2B20260112.cu129torch291cxx11abitrue.ea8f73-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
-# Pinned to 03/10/2026 latest main commit.
-flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "7fd16f28bffe71c9ab6b7eecc5dd14bf87c1dc9e" }
+# Pinned to 03/18/2026 latest main commit.
+flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
 av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video' or extra == 'dit'" }

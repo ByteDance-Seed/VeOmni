@@ -121,7 +121,7 @@ def get_parallel_plan():
         "model.layers.*.mlp.experts.up_proj":   Shard(0),
         "model.layers.*.mlp.experts.down_proj": Shard(0),
     }
-    return ParallelPlan(ep_plan=ep_plan)
+    return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 ```
 
 > **Finding correct paths:** run `for name, _ in model.named_parameters(): print(name)` on the unpatched HF model.

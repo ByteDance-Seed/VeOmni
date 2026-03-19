@@ -88,11 +88,18 @@ def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
         # packed micro batch
         seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
         return seqlens
-    else:
+    elif "attention_mask" in micro_batch:
         # unpacked sample
         attention_mask = micro_batch["attention_mask"]
         seqlens = attention_mask.sum().item()
         return [seqlens]
+    elif "chosen_attention_mask" in micro_batch:
+        # DPO preference pair — report combined chosen + rejected length
+        chosen_len = micro_batch["chosen_attention_mask"].sum().item()
+        rejected_len = micro_batch["rejected_attention_mask"].sum().item()
+        return [chosen_len + rejected_len]
+    else:
+        return [0]
 
 
 def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:

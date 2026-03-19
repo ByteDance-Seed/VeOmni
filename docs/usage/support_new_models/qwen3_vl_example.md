@@ -205,7 +205,7 @@ def get_parallel_plan():
         "model.language_model.layers.*.mlp.experts.gate_up_proj": Shard(0),
         "model.language_model.layers.*.mlp.experts.down_proj": Shard(0),
     }
-    return ParallelPlan(ep_plan=ep_plan)
+    return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 ```
 
 ### 3.2 Fused MoE Forward
