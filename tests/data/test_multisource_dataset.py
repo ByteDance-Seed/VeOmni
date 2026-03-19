@@ -1,9 +1,11 @@
+import copy
 import os
 import random
 import subprocess
 import sys
 import time
-from typing import Literal, cast
+from contextlib import nullcontext
+from typing import Any, Dict, List, Literal, cast
 from unittest.mock import patch
 
 import numpy as np
@@ -13,15 +15,17 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
-from utils import DummyIterableDataset, FakeModel, compare_global_batch
+from utils import FakeModel, ShardedIterableDataset, compare_global_batch
 
 from veomni.arguments import VeOmniArguments, parse_args
-from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dataloader
 from veomni.data.multisource_dataset import MultiSourceDataset
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.trainer.base import BaseTrainer
+from veomni.trainer.callbacks import Callback, CheckpointerCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
 
 
@@ -58,233 +62,329 @@ class MockIterableDataset(IterableDataset):
         self._state = dict(state)
 
 
-def run_multisource_dataset_test():
-    args = parse_args(VeOmniArguments)
-    world_size = int(os.environ["WORLD_SIZE"])
-    rank = int(os.environ["RANK"])
-    device_type = get_device_type()
-    if device_type != "cpu":
-        get_torch_device().set_device(f"{device_type}:{args.train.local_rank}")
-    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
-    dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
+class TrainerTest(BaseTrainer):
+    gt_data_list: List[List[Dict[str, Any]]] = []
+    pred_data_list: List[List[Dict[str, Any]]] = []
+    golden_env_metrics: Dict[str, Any] = {}
+    resume_dcp_path: str
+    tmp_yaml_path: str
 
-    init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        ep_size=args.train.accelerator.ep_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
-    )
-
-    Checkpointer = build_checkpointer(
-        dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
-    )
-
+    is_resume: bool = False
+    start_save_data: bool = False
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
 
-    # Build DummyIterableDataset instances directly (bypasses HuggingFace shuffle bug)
-    iterable_datasets = [
-        DummyIterableDataset(size=100, shuffle=True, seed=args.train.seed + i) for i in range(len(multisource_names))
-    ]
+    def _setup(self):
+        args = self.args
+        device_type = get_device_type()
+        if device_type != "cpu":
+            device_str = f"{device_type}:{args.train.local_rank}"
+            get_torch_device().set_device(device_str)
+            self.device = torch.device(device_str)
+        else:
+            self.device = torch.device("cpu")
 
-    args.data.enable_multisource = True
-    train_dataset = MultiSourceDataset(
-        datasets=iterable_datasets,
-        weights=multisource_weights,
-        seed=args.train.seed,
-        level="token",
-        source_names=multisource_names,
-        sharded=True,
-        stopping_strategy="all_exhausted",
-    )
+        backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend=backend,
+                world_size=int(os.environ["WORLD_SIZE"]),
+                rank=int(os.environ["RANK"]),
+            )
 
-    # YAML config for EnvironMeter's MultiSourceInfoTracker
-    multisource_config = dict(
-        sources=multisource_names,
-        names=multisource_names,
-        schedule=[dict(schedule_type="const", weights=multisource_weights)],
-    )
-    tmp_yaml_path = os.path.join(get_cache_dir("./tmp_simple_ms.yaml"), "tmp_simple_ms.yaml")
-    if dist.get_rank() == 0:
-        with open(tmp_yaml_path, "w") as f:
-            yaml.safe_dump(multisource_config, f)
-    dist.barrier()
+        init_parallel_state(
+            dp_size=args.train.accelerator.dp_size,
+            dp_replicate_size=args.train.accelerator.dp_replicate_size,
+            dp_shard_size=args.train.accelerator.dp_shard_size,
+            tp_size=args.train.accelerator.tp_size,
+            pp_size=args.train.accelerator.pp_size,
+            cp_size=args.train.accelerator.cp_size,
+            ulysses_size=args.train.accelerator.ulysses_size,
+            extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
+            extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
+            extra_parallel_names=args.train.accelerator.extra_parallel_names,
+            dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        )
+        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
 
-    state = cast(MultiSourceDataset, train_dataset).state_dict()
-    assert state["version"] == 0
-    assert state["topology"]["stopping_strategy"] == "all_exhausted"
-    assert state["topology"]["level"] == "token"
-    assert state["topology"]["source_names"] == multisource_names
-    source_ids = state["topology"]["source_ids"]
-    assert len(source_ids) == len(multisource_names)
-    assert len(set(source_ids)) == len(source_ids)
-    assert sorted(state["runtime"]["avg_len_sum"].keys()) == sorted(source_ids)
-    assert sorted(state["runtime"]["avg_len_count"].keys()) == sorted(source_ids)
-    assert sorted(state["runtime"]["dataset_states"].keys()) == sorted(source_ids)
+    def _freeze_model_module(self):
+        pass
 
-    dataset_length = None
-    args.compute_train_steps(dataset_length)
+    def _build_model(self):
+        self.model = FakeModel().to(get_device_type())
+        self.model_config = PretrainedConfig()
 
-    global_batch_size = cast(int, args.train.global_batch_size)
-    dataloader = build_dataloader(
-        dataloader_type="native",
-        dataset=train_dataset,
-        micro_batch_size=args.train.micro_batch_size,
-        global_batch_size=global_batch_size,
-        dataloader_batch_size=args.train.dataloader_batch_size,
-        max_seq_len=args.data.max_seq_len,
-        train_steps=args.train_steps,
-        dyn_bsz=args.train.dyn_bsz,
-        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
-        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_buffer_size=1,
-        num_workers=1,
-        drop_last=args.data.dataloader.drop_last,
-        pin_memory=args.data.dataloader.pin_memory,
-        prefetch_factor=args.data.dataloader.prefetch_factor,
-    )
+    def _build_model_assets(self):
+        self.model_assets = [self.model_config]
 
-    config = PretrainedConfig()
-    environ_meter = helper.EnvironMeter(
-        config=config,
-        global_batch_size=global_batch_size,
-        empty_cache_steps=args.train.empty_cache_steps,
-        enable_multisource=args.data.enable_multisource,
-        dataloader=dataloader,
-        data_path=tmp_yaml_path,
-    )
+    def _build_data_transform(self):
+        pass
 
-    gt_global_batch_list = []
-    epoch_num = 3
-    train_steps = args.train_steps
-    start_epoch, start_step, global_step = 0, 0, 0
-    save_epoch, save_step = 1, args.train_steps - 1
+    def _build_dataset(self):
+        args = self.args
+        iterable_datasets = [
+            ShardedIterableDataset(size=100, shuffle=True, seed=args.train.seed + i)
+            for i in range(len(self.multisource_names))
+        ]
 
-    fake_model = FakeModel().to(get_device_type())
-    for epoch in range(start_epoch, epoch_num):
-        dataloader.set_epoch(epoch)
-        data_iterator = iter(dataloader)
-        start_time = time.time()
-        for local_step in range(start_step, args.train_steps):
-            global_step += 1
-            try:
-                micro_batches = next(data_iterator)
-            except StopIteration:
-                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
-                break
+        args.data.enable_multisource = True
+        args.train.num_train_epochs = 3
+        self.train_dataset = MultiSourceDataset(
+            datasets=iterable_datasets,
+            weights=self.multisource_weights,
+            seed=args.train.seed,
+            level="token",
+            source_names=self.multisource_names,
+            sharded=True,
+            stopping_strategy="all_exhausted",
+        )
 
-            if global_step == 1:
-                helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
-                for micro_batch in micro_batches:
-                    assert "ds_idx" in micro_batch
-                    assert "source_name" in micro_batch
-                    source_name = micro_batch["source_name"]
-                    if isinstance(source_name, list):
-                        assert all(name in multisource_names for name in source_name)
-                    else:
-                        assert source_name in multisource_names
-                    ds_idx = micro_batch["ds_idx"]
-                    if isinstance(ds_idx, torch.Tensor):
-                        assert torch.all((ds_idx >= 0) & (ds_idx < len(multisource_names)))
-                    elif isinstance(ds_idx, list):
-                        assert all(0 <= int(idx) < len(multisource_names) for idx in ds_idx)
-                    else:
-                        assert 0 <= int(ds_idx) < len(multisource_names)
-                    assert micro_batch["attention_mask"].shape[-1] == micro_batch["input_ids"].shape[-1]
-                    assert micro_batch["labels"].shape[-1] == micro_batch["input_ids"].shape[-1]
-                    assert torch.all(micro_batch["attention_mask"] == 1)
-                    assert torch.all(micro_batch["labels"] == micro_batch["input_ids"])
-
-            if epoch > save_epoch or (epoch == save_epoch and local_step > save_step):
-                gt_global_batch_list.append(micro_batches)
-
-            for micro_step, micro_batch in enumerate(micro_batches):
-                if global_step == 1:
-                    logger.info(f"[rank{rank}] micro step: {micro_step}, {type(micro_batch)}")
-
-                environ_meter.add(micro_batch)
-
-            delta_time = time.time() - start_time
-            try:
-                metrics_resume = environ_meter.step(delta_time, global_step=global_step)
-            except AttributeError as e:
-                # Skip metrics on CPU
-                logger.warning(f"[rank{rank}] Skipping metrics: {e}")
-                metrics_resume = {}
-            if epoch == save_epoch and local_step == save_step:
-                state = {
-                    "model": fake_model,
-                    "extra_state": {
-                        "curr_epoch": epoch,
-                        "curr_step": local_step,
-                        "global_step": global_step,
-                        "train_dataloader": dataloader.state_dict(),
-                        "environ_meter": environ_meter.state_dict(),
-                    },
-                }
-                save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
-                Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
-                dist.barrier()
-    state = {"model": fake_model, "extra_state": {}}
-    Checkpointer.load(save_checkpoint_path, state)
-    dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
-    environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
-    start_epoch = state["extra_state"]["curr_epoch"]
-    assert start_epoch == save_epoch
-    start_step = state["extra_state"]["curr_step"] + 1  # resume from the next step
-    assert start_step == save_step + 1
-    global_step = state["extra_state"]["global_step"]
-
-    pred_global_batch_list = []
-
-    for epoch in range(start_epoch, epoch_num):
-        dataloader.set_epoch(epoch)
-        data_iterator = iter(dataloader)
-        for local_step in range(start_step, train_steps):
-            global_step += 1
-            global_batch = next(data_iterator)
-
-            if epoch > save_epoch or (epoch == save_epoch and local_step > save_step):
-                pred_global_batch_list.append(global_batch)
-
-            start_time = time.time()
-            for micro_batch in global_batch:
-                environ_meter.add(micro_batch)
-            delta_time = time.time() - start_time
-            try:
-                metrics = environ_meter.step(delta_time, global_step=global_step)
-            except AttributeError as e:
-                # Skip metrics on CPU (torch.cpu has no attribute 'get_device_name')
-                logger.warning(f"[rank{rank}] Skipping metrics: {e}")
-                metrics = {}
-        start_step = 0
-
-    compare_global_batch(gt_global_batch_list, pred_global_batch_list)
-    if (
-        metrics is not None
-        and metrics_resume is not None
-        and "consume_tokens(M)" in metrics
-        and "consume_tokens(M)" in metrics_resume
-    ):
-        assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]
-
-    logger.info_rank0(
-        f"dataset_a: {metrics.get('multi_source/consumed_chunk_num/dataset_a', 0)} dataset_b: {metrics.get('multi_source/consumed_chunk_num/dataset_b', 0)}"
-    )
-
-    if dist.is_initialized():
+        multisource_config = dict(
+            sources=self.multisource_names,
+            names=self.multisource_names,
+            schedule=[dict(schedule_type="const", weights=self.multisource_weights)],
+        )
+        self.tmp_yaml_path = os.path.join(get_cache_dir("./tmp_simple_ms.yaml"), "tmp_simple_ms.yaml")
+        if dist.get_rank() == 0:
+            with open(self.tmp_yaml_path, "w") as f:
+                yaml.safe_dump(multisource_config, f)
         dist.barrier()
 
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        os.remove(tmp_yaml_path)
+        state = cast(MultiSourceDataset, self.train_dataset).state_dict()
+        assert state["version"] == 0
+        assert state["topology"]["stopping_strategy"] == "all_exhausted"
+        assert state["topology"]["level"] == "token"
+        assert state["topology"]["source_names"] == self.multisource_names
+        source_ids = state["topology"]["source_ids"]
+        assert len(source_ids) == len(self.multisource_names)
+        assert len(set(source_ids)) == len(source_ids)
+        assert sorted(state["runtime"]["avg_len_sum"].keys()) == sorted(source_ids)
+        assert sorted(state["runtime"]["avg_len_count"].keys()) == sorted(source_ids)
+        assert sorted(state["runtime"]["dataset_states"].keys()) == sorted(source_ids)
 
-    if world_size > 1:
-        dist.destroy_process_group()
+        args.compute_train_steps(dataset_length=None)
+        self.train_steps = args.train_steps
+
+    def _build_dataloader(self):
+        args = self.args
+        global_batch_size = cast(int, args.train.global_batch_size)
+        self.train_dataloader = build_dataloader(
+            dataloader_type="native",
+            dataset=self.train_dataset,
+            micro_batch_size=args.train.micro_batch_size,
+            global_batch_size=global_batch_size,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            max_seq_len=args.data.max_seq_len,
+            train_steps=args.train_steps,
+            dyn_bsz=args.train.dyn_bsz,
+            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+            dyn_bsz_buffer_size=1,
+            num_workers=1,
+            drop_last=args.data.dataloader.drop_last,
+            pin_memory=args.data.dataloader.pin_memory,
+            prefetch_factor=args.data.dataloader.prefetch_factor,
+        )
+
+    def _build_parallelized_model(self):
+        self.model.train()
+
+    def _build_optimizer(self):
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.train.optimizer.lr)
+
+    def _build_lr_scheduler(self):
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
+
+    def _build_training_context(self):
+        self.model_fwd_context = nullcontext()
+        self.model_bwd_context = nullcontext()
+
+    def _init_callbacks(self):
+        self.environ_meter_callback = EnvironMeterCallbackTest(self)
+        self.checkpointer_callback = CheckpointerCallbackTest(self)
+        self.check_callback = CheckCallback(self)
+        self.state = TrainerState()
+
+    def on_train_begin(self):
+        self.environ_meter_callback.on_train_begin(self.state)
+        self.checkpointer_callback.on_train_begin(self.state)
+        self.check_callback.on_train_begin(self.state)
+
+    def on_train_end(self):
+        self.environ_meter_callback.on_train_end(self.state)
+        self.checkpointer_callback.on_train_end(self.state)
+        self.check_callback.on_train_end(self.state)
+
+    def on_epoch_begin(self):
+        self.environ_meter_callback.on_epoch_begin(self.state)
+        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.check_callback.on_epoch_begin(self.state)
+
+    def on_epoch_end(self):
+        self.environ_meter_callback.on_epoch_end(self.state)
+        self.checkpointer_callback.on_epoch_end(self.state)
+        self.check_callback.on_epoch_end(self.state)
+
+    def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
+
+    def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
+        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        self.state.global_step += 1
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.on_step_begin(micro_batches=micro_batches)
+        self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
+
+    def resume_train(self):
+        self.is_resume = True
+        self.start_save_data = True
+        super().train()
+
+    def destroy_distributed(self):
+        if self.is_resume:
+            super().destroy_distributed()
+
+
+class EnvironMeterCallbackTest(Callback):
+    trainer: TrainerTest
+
+    def __init__(self, trainer: TrainerTest) -> None:
+        super().__init__(trainer)
+        args = self.trainer.args
+        self.trainer.environ_meter = helper.EnvironMeter(
+            config=trainer.model_config,
+            global_batch_size=args.train.global_batch_size,
+            empty_cache_steps=args.train.empty_cache_steps,
+            enable_multisource=args.data.enable_multisource,
+            dataloader=trainer.train_dataloader,
+            data_path=trainer.tmp_yaml_path,
+            gc_steps=args.train.gc_steps,
+        )
+
+    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+        for micro_batch in micro_batches:
+            self.trainer.environ_meter.add(micro_batch)
+        self.start_time = time.time()
+
+    def on_step_end(
+        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+    ) -> None:
+        delta_time = time.time() - self.start_time
+        try:
+            step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step)
+        except AttributeError as e:
+            logger.warning(f"[rank{self.trainer.args.train.global_rank}] Skipping metrics: {e}")
+            step_env_metrics = {}
+
+        step_train_metrics = {"total_loss": loss}
+        step_train_metrics.update(loss_dict)
+        step_train_metrics["grad_norm"] = grad_norm
+        step_train_metrics = {
+            f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
+            for k, v in step_train_metrics.items()
+        }
+        step_train_metrics["training/lr"] = max(self.trainer.lr_scheduler.get_last_lr())
+
+        step_env_metrics.update(step_train_metrics)
+        self.trainer.step_train_metrics = step_train_metrics
+        self.trainer.step_env_metrics = step_env_metrics
+
+
+class CheckpointerCallbackTest(CheckpointerCallback):
+    trainer: TrainerTest
+
+    def on_step_end(self, state: TrainerState, **kwargs):
+        pass
+
+    def on_epoch_end(self, state: TrainerState, **kwargs):
+        if state.epoch == 1 and not self.trainer.is_resume:
+            self._save_checkpoint(state)
+            self.trainer.resume_dcp_path = os.path.join(
+                self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
+            )
+            self.trainer.args.train.checkpoint.load_path = self.trainer.resume_dcp_path
+            self.trainer.start_save_data = True
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        if self.trainer.is_resume:
+            self._load_checkpoint()
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+
+class CheckCallback(Callback):
+    trainer: TrainerTest
+
+    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+        if state.global_step == 1:
+            helper.print_example(example=micro_batches[0], rank=self.trainer.args.train.local_rank)
+            for micro_batch in micro_batches:
+                assert "ds_idx" in micro_batch
+                assert "source_name" in micro_batch
+                source_name = micro_batch["source_name"]
+                if isinstance(source_name, list):
+                    assert all(name in self.trainer.multisource_names for name in source_name)
+                else:
+                    assert source_name in self.trainer.multisource_names
+                ds_idx = micro_batch["ds_idx"]
+                if isinstance(ds_idx, torch.Tensor):
+                    assert torch.all((ds_idx >= 0) & (ds_idx < len(self.trainer.multisource_names)))
+                elif isinstance(ds_idx, list):
+                    assert all(0 <= int(idx) < len(self.trainer.multisource_names) for idx in ds_idx)
+                else:
+                    assert 0 <= int(ds_idx) < len(self.trainer.multisource_names)
+                assert micro_batch["attention_mask"].shape[-1] == micro_batch["input_ids"].shape[-1]
+                assert micro_batch["labels"].shape[-1] == micro_batch["input_ids"].shape[-1]
+                assert torch.all(micro_batch["attention_mask"] == 1)
+                assert torch.all(micro_batch["labels"] == micro_batch["input_ids"])
+
+        if self.trainer.start_save_data:
+            if not self.trainer.is_resume:
+                self.trainer.gt_data_list.append(micro_batches)
+            else:
+                self.trainer.pred_data_list.append(micro_batches)
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self.trainer.is_resume:
+            compare_global_batch(self.trainer.gt_data_list, self.trainer.pred_data_list)
+
+            metrics = self.trainer.step_env_metrics
+            metrics_resume = self.trainer.golden_env_metrics
+            if (
+                metrics is not None
+                and metrics_resume is not None
+                and "consume_tokens(M)" in metrics
+                and "consume_tokens(M)" in metrics_resume
+            ):
+                assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]
+
+            logger.info_rank0(
+                "dataset_a: "
+                f"{metrics.get('multi_source/consumed_chunk_num/dataset_a', 0)} "
+                f"dataset_b: {metrics.get('multi_source/consumed_chunk_num/dataset_b', 0)}"
+            )
+
+            if dist.is_initialized():
+                dist.barrier()
+
+            if (not dist.is_initialized() or dist.get_rank() == 0) and os.path.exists(self.trainer.tmp_yaml_path):
+                os.remove(self.trainer.tmp_yaml_path)
+        else:
+            self.trainer.golden_env_metrics = copy.deepcopy(self.trainer.step_env_metrics)
+
+
+def run_multisource_dataset_test():
+    args = parse_args(VeOmniArguments)
+    trainer = TrainerTest(args)
+    trainer.train()
+    trainer.resume_train()
 
 
 def _make_simple_dataset(
