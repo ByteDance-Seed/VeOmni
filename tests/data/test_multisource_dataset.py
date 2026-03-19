@@ -313,23 +313,6 @@ class CheckCallback(Callback):
             assert len(self.trainer.gt_data_list) == len(self.trainer.pred_data_list), (
                 f"Batch count mismatch: gt={len(self.trainer.gt_data_list)}, pred={len(self.trainer.pred_data_list)}"
             )
-
-            """
-            gt_data_list_output = [
-                [(list(set(micro_batch["input_ids"].tolist()[0])), micro_batch.get("ds_idx", None))
-                for micro_batch in micro_batches
-                ]
-                for micro_batches in self.trainer.gt_data_list
-            ]
-            pred_data_list_output = [
-                [(list(set(micro_batch["input_ids"].tolist()[0])), micro_batch.get("ds_idx", None))
-                for micro_batch in micro_batches
-                ]
-                for micro_batches in self.trainer.pred_data_list
-            ]
-            logger.error(f"[rank{self.trainer.args.train.global_rank}] gt_data_list_output: {gt_data_list_output}")
-            logger.error(f"[rank{self.trainer.args.train.global_rank}] pred_data_list_output: {pred_data_list_output}")
-            """
             compare_global_batch(self.trainer.gt_data_list, self.trainer.pred_data_list)
 
             metrics = self.trainer.step_env_metrics

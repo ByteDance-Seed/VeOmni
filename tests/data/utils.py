@@ -19,13 +19,12 @@ logger = helper.create_logger(__name__)
 
 TEST_RESUME_STATE_KEY = "test_resume_position"
 
+import math
+import os
+from typing import Any, Dict, List
 
-def mock_empty_cache() -> None:
-    """Patch target for tests that run on CPU but call empty_cache."""
-    pass
+from unittest.mock import patch
 
-
-def setup_test_distributed(args) -> torch.device:
     """Initialize a minimal distributed runtime for data tests."""
     device_type = get_device_type()
     if device_type != "cpu":
@@ -161,6 +160,8 @@ class StepAwareResumeCheckpointerCallback(StepAwareTestCheckpointerCallback):
         pass
 
 
+=======
+>>>>>>> 12156a5 (temp)
 class ShardedIterableDataset(IterableDataset):
     """Deterministic iterable dataset with rank/worker sharding and optional shuffle.
 
