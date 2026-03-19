@@ -45,11 +45,12 @@ class DynBszBuffer:
         Append a sample to the buffer.
         Args:
             item: a sample to append to the buffer.
-                The sample should be a dict with the following keys:
-                    - input_ids: torch.Tensor of shape (seq_len, )
-                    - attention_mask: torch.Tensor of shape (seq_len, )
+                The sample should be a dict containing an ``attention_mask`` tensor
+                whose ``.sum()`` gives the number of valid tokens for batching.
         """
         self._buffer.append(item)
+        if "attention_mask" not in item:
+            raise KeyError("Expected 'attention_mask' in item")
         self._buffer_sample_lens.append(item["attention_mask"].sum())
         self.all_token_cnt += self._buffer_sample_lens[-1]
 
@@ -154,7 +155,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
 
     def put_item(self, item: Dict[str, Any]):
-        if len(item["input_ids"]) == 1:
+        if item["input_ids"].shape[-1] <= 1:
             print("WARNING: EMPTY STRING.")
             return
         self.buffer.append(item)
