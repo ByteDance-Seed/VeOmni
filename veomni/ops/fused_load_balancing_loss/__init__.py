@@ -34,15 +34,23 @@ def load_balancing_loss_func(
     """Compute the load balancing auxiliary loss for Mixture-of-Experts models.
 
     Drop-in replacement for ``transformers.models.qwen3_moe.modeling_qwen3_moe.load_balancing_loss_func``
-    that dispatches to a fused Triton kernel when available.
+    that dispatches to a fused Triton kernel on CUDA or a pure-PyTorch fallback otherwise.
 
-    See Switch Transformer (https://huggingface.co/papers/2101.03961), equations (4)-(6).
+    Computes the auxiliary load balancing loss from the Switch Transformer paper
+    (Fedus et al., 2021; https://arxiv.org/abs/2101.03961), equations (4)-(6)::
+
+        loss = num_experts * sum_e(f_e * P_e)
+
+    where ``f_e`` is the fraction of tokens routed to expert *e* and ``P_e`` is
+    the average router probability assigned to expert *e* across all tokens.
 
     Args:
         gate_logits: Tuple of per-layer gate logits, each ``[tokens, num_experts]``.
         num_experts: Total number of experts.
         top_k: Number of experts selected per token.
         attention_mask: Optional ``[batch_size, seq_len]`` padding mask.
+            Named ``attention_mask`` (rather than ``loss_mask``) for
+            compatibility with the HuggingFace API.
 
     Returns:
         Scalar auxiliary loss tensor, or ``0`` when *gate_logits* is ``None`` / not a tuple.
@@ -64,10 +72,10 @@ def apply_veomni_load_balancing_loss_patch():
     global _load_balancing_loss
 
     if is_torch_npu_available():
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import load_balancing_loss_func as _hf_lb_loss
+        from .torch_native import load_balancing_loss_pytorch
 
-        _load_balancing_loss = _hf_lb_loss
-        logger.info_rank0("Load balancing loss: using eager (NPU) backend.")
+        _load_balancing_loss = load_balancing_loss_pytorch
+        logger.info_rank0("Load balancing loss: using PyTorch eager (NPU) backend.")
     else:
         from .triton_kernel import load_balancing_loss_triton
 

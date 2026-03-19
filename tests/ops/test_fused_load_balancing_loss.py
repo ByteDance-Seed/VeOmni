@@ -20,8 +20,11 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     load_balancing_loss_func as _reference_load_balancing_loss,
 )
 
+from veomni.ops.fused_load_balancing_loss.torch_native import load_balancing_loss_pytorch
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
+
+DEFAULT_ATOL = 1e-4
 
 # (num_experts, top_k, num_layers, batch_size, seq_len)
 _CONFIGS = [
@@ -61,7 +64,12 @@ def _measure_peak_memory(fn):
     return dev.max_memory_allocated()
 
 
-class TestFusedLoadBalancingLoss:
+# ---------------------------------------------------------------------------
+# Triton kernel tests
+# ---------------------------------------------------------------------------
+
+
+class TestTritonLoadBalancingLoss:
     """Test suite comparing fused Triton kernel against HF reference."""
 
     def test_none_input(self):
@@ -76,7 +84,11 @@ class TestFusedLoadBalancingLoss:
         assert triton_fn(logits, 8, 2) == 0
 
     def test_forward_full_mask(self):
-        """All tokens masked out should return 0 in the Triton implementation."""
+        """All tokens masked out should return 0.
+
+        MoE load balancing loss supports masking padded tokens via attention_mask
+        so that padding does not skew expert routing statistics.
+        """
         _skip_no_cuda()
         triton_fn = _get_triton_impl()
         gate_logits = tuple(torch.randn(8, 4, device=_DEVICE) for _ in range(2))
@@ -96,7 +108,7 @@ class TestFusedLoadBalancingLoss:
         ref = _reference_load_balancing_loss(gate_logits, num_experts, top_k)
         out = triton_fn(gate_logits, num_experts, top_k)
 
-        torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(out, ref, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
 
     @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
     def test_forward_with_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
@@ -111,7 +123,7 @@ class TestFusedLoadBalancingLoss:
         ref = _reference_load_balancing_loss(gate_logits, num_experts, top_k, attention_mask)
         out = triton_fn(gate_logits, num_experts, top_k, attention_mask)
 
-        torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(out, ref, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
 
     @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
     def test_backward(self, num_experts, top_k, num_layers, batch_size, seq_len):
@@ -134,9 +146,11 @@ class TestFusedLoadBalancingLoss:
         fused_loss.backward()
         fused_grads = [g.grad.clone() for g in gate_logits_fused]
 
-        torch.testing.assert_close(fused_loss, ref_loss, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(fused_loss, ref_loss, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
         for i, (rg, fg) in enumerate(zip(ref_grads, fused_grads)):
-            torch.testing.assert_close(fg, rg, atol=1e-4, rtol=1e-4, msg=f"Gradient mismatch at layer {i}")
+            torch.testing.assert_close(
+                fg, rg, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL, msg=f"Gradient mismatch at layer {i}"
+            )
 
     @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
     def test_backward_with_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
@@ -162,9 +176,11 @@ class TestFusedLoadBalancingLoss:
         fused_loss.backward()
         fused_grads = [g.grad.clone() for g in gate_logits_fused]
 
-        torch.testing.assert_close(fused_loss, ref_loss, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(fused_loss, ref_loss, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
         for i, (rg, fg) in enumerate(zip(ref_grads, fused_grads)):
-            torch.testing.assert_close(fg, rg, atol=1e-4, rtol=1e-4, msg=f"Gradient mismatch at layer {i}")
+            torch.testing.assert_close(
+                fg, rg, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL, msg=f"Gradient mismatch at layer {i}"
+            )
 
     @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
     def test_memory_saving(self, num_experts, top_k, num_layers, batch_size, seq_len):
@@ -193,3 +209,100 @@ class TestFusedLoadBalancingLoss:
         assert triton_mem < ref_mem, (
             f"Triton kernel should use less memory than HF reference: triton={triton_mb:.1f} MB >= ref={ref_mb:.1f} MB"
         )
+
+    @pytest.mark.parametrize(
+        "num_experts,top_k,num_layers,batch_size,seq_len",
+        [(8, 2, 2, 4, 128), (60, 8, 4, 2, 512)],
+    )
+    def test_determinism(self, num_experts, top_k, num_layers, batch_size, seq_len):
+        """Triton kernel must produce bitwise-identical results across runs."""
+        _skip_no_cuda()
+        triton_fn = _get_triton_impl()
+
+        torch.manual_seed(42)
+        gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
+
+        results = [triton_fn(gate_logits, num_experts, top_k) for _ in range(5)]
+        for r in results[1:]:
+            assert torch.equal(results[0], r), "Triton forward is non-deterministic"
+
+    @pytest.mark.parametrize(
+        "num_experts,top_k,num_layers,batch_size,seq_len",
+        [(8, 2, 2, 4, 128), (60, 8, 4, 2, 512)],
+    )
+    def test_determinism_with_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
+        """Triton kernel must produce bitwise-identical results with mask."""
+        _skip_no_cuda()
+        triton_fn = _get_triton_impl()
+
+        torch.manual_seed(42)
+        gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
+        attention_mask = torch.ones(batch_size, seq_len, device=_DEVICE)
+        attention_mask[:, seq_len // 2 :] = 0
+
+        results = [triton_fn(gate_logits, num_experts, top_k, attention_mask) for _ in range(5)]
+        for r in results[1:]:
+            assert torch.equal(results[0], r), "Triton forward with mask is non-deterministic"
+
+
+# ---------------------------------------------------------------------------
+# PyTorch eager tests
+# ---------------------------------------------------------------------------
+
+
+class TestPytorchLoadBalancingLoss:
+    """Test suite comparing PyTorch for-loop implementation against HF reference."""
+
+    def test_none_input(self):
+        assert load_balancing_loss_pytorch(None, 8, 2) == 0
+
+    def test_non_tuple_input(self):
+        logits = torch.randn(32, 8, device=_DEVICE)
+        assert load_balancing_loss_pytorch(logits, 8, 2) == 0
+
+    def test_forward_full_mask(self):
+        """All tokens masked out should return 0.
+
+        MoE load balancing loss supports masking padded tokens via attention_mask
+        so that padding does not skew expert routing statistics.
+        """
+        gate_logits = tuple(torch.randn(8, 4, device=_DEVICE) for _ in range(2))
+        attention_mask = torch.zeros(2, 4, device=_DEVICE)
+
+        out = load_balancing_loss_pytorch(gate_logits, 4, 2, attention_mask)
+        assert out.item() == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
+    def test_forward_no_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
+        torch.manual_seed(42)
+        gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
+
+        ref = _reference_load_balancing_loss(gate_logits, num_experts, top_k)
+        out = load_balancing_loss_pytorch(gate_logits, num_experts, top_k)
+
+        torch.testing.assert_close(out, ref, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
+
+    @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
+    def test_forward_with_mask(self, num_experts, top_k, num_layers, batch_size, seq_len):
+        torch.manual_seed(123)
+        gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
+        attention_mask = torch.ones(batch_size, seq_len, device=_DEVICE)
+        attention_mask[:, seq_len // 2 :] = 0
+
+        ref = _reference_load_balancing_loss(gate_logits, num_experts, top_k, attention_mask)
+        out = load_balancing_loss_pytorch(gate_logits, num_experts, top_k, attention_mask)
+
+        torch.testing.assert_close(out, ref, atol=DEFAULT_ATOL, rtol=DEFAULT_ATOL)
+
+    @pytest.mark.parametrize(
+        "num_experts,top_k,num_layers,batch_size,seq_len",
+        [(8, 2, 2, 4, 128), (60, 8, 4, 2, 512)],
+    )
+    def test_determinism(self, num_experts, top_k, num_layers, batch_size, seq_len):
+        """PyTorch implementation must produce bitwise-identical results across runs."""
+        torch.manual_seed(42)
+        gate_logits = _make_gate_logits(batch_size, seq_len, num_experts, num_layers)
+
+        results = [load_balancing_loss_pytorch(gate_logits, num_experts, top_k) for _ in range(5)]
+        for r in results[1:]:
+            assert torch.equal(results[0], r), "PyTorch forward is non-deterministic"

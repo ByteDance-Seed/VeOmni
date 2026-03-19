@@ -16,6 +16,9 @@
 
 Fuses softmax + top-k selection + accumulation into a single GPU kernel,
 eliminating the large ``[N, top_k, num_experts]`` one-hot intermediate tensor.
+
+The forward kernel uses a two-pass tiled reduction to avoid ``atomic_add``,
+ensuring deterministic results across runs.
 """
 
 from typing import Optional, Union
@@ -26,7 +29,7 @@ import triton.language as tl
 
 
 # ---------------------------------------------------------------------------
-# Forward kernel
+# Forward kernel — tiled reduction (no atomics)
 # ---------------------------------------------------------------------------
 
 
@@ -34,60 +37,69 @@ import triton.language as tl
 def _lb_loss_fwd_kernel(
     gate_logits_ptr,  # [N, E]
     mask_weights_ptr,  # [N] per-token weight (or unused when HAS_MASK=False)
-    expert_count_ptr,  # [E] output accumulator
-    router_prob_sum_ptr,  # [E] output accumulator
+    expert_count_ptr,  # [num_blocks, E] partial sums output
+    router_prob_sum_ptr,  # [num_blocks, E] partial sums output
     stride_logits_row,  # stride of gate_logits along dim-0
+    stride_count_row,  # stride of expert_count along dim-0
+    stride_prob_row,  # stride of router_prob_sum along dim-0
     N,
     E: tl.constexpr,
     TOP_K: tl.constexpr,
     BLOCK_E: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     HAS_MASK: tl.constexpr,
 ):
-    row_idx = tl.program_id(0)
+    block_idx = tl.program_id(0)
+    row_start = block_idx * BLOCK_N
     expert_offs = tl.arange(0, BLOCK_E)
     emask = expert_offs < E
 
-    # Optional per-token mask weight
-    if HAS_MASK:
-        w = tl.load(mask_weights_ptr + row_idx).to(tl.float32)
-        if w == 0.0:
-            return
-    else:
-        w = 1.0
+    # Local accumulators in registers — no cross-block sharing needed.
+    local_count = tl.zeros([BLOCK_E], dtype=tl.float32)
+    local_prob_sum = tl.zeros([BLOCK_E], dtype=tl.float32)
 
-    # Load gate logits for this token and upcast to float32 for stable softmax.
-    # Input can be float16/bfloat16/float32; all arithmetic is done in float32.
-    row_start = row_idx * stride_logits_row
-    logits = tl.load(gate_logits_ptr + row_start + expert_offs, mask=emask, other=float("-inf")).to(tl.float32)
+    for row_offset in range(BLOCK_N):
+        row_idx = row_start + row_offset
+        if row_idx < N:
+            # Optional per-token mask weight
+            if HAS_MASK:
+                w = tl.load(mask_weights_ptr + row_idx).to(tl.float32)
+            else:
+                w = 1.0
 
-    # ---- Online softmax ----
-    max_val = tl.max(logits, axis=0)
-    logits_shifted = logits - max_val
-    exp_logits = tl.exp(logits_shifted)
-    sum_exp = tl.sum(exp_logits, axis=0)
-    probs = exp_logits / sum_exp
+            if w != 0.0:
+                # Load gate logits for this token and upcast to float32 for stable softmax.
+                row_ptr = row_idx * stride_logits_row
+                logits = tl.load(gate_logits_ptr + row_ptr + expert_offs, mask=emask, other=float("-inf")).to(
+                    tl.float32
+                )
 
-    # Accumulate weighted router probability sums (all experts).
-    # We use atomic_add because all N rows (one per program) reduce into a
-    # shared [E] buffer.  Contention is low in practice: E is small (60–128)
-    # so each atomic targets a different cache-line, and the hardware coalesces
-    # concurrent writes from threads in the same warp.
-    tl.atomic_add(router_prob_sum_ptr + expert_offs, w * probs, mask=emask)
+                # ---- Online softmax ----
+                max_val = tl.max(logits, axis=0)
+                logits_shifted = logits - max_val
+                exp_logits = tl.exp(logits_shifted)
+                sum_exp = tl.sum(exp_logits, axis=0)
+                probs = exp_logits / sum_exp
 
-    # ---- Top-k selection with expert count accumulation ----
-    probs_for_topk = tl.where(emask, probs, float("-inf"))
-    for _k in range(TOP_K):
-        # Find the expert with the highest probability
-        max_prob = tl.max(probs_for_topk, axis=0)
-        is_max = probs_for_topk == max_prob
-        # Tie-break: pick the lowest expert index
-        candidate = tl.where(is_max, expert_offs, BLOCK_E)
-        winner_idx = tl.min(candidate, axis=0)
-        # Accumulate weighted expert count.
-        # Scalar atomic — only TOP_K atomics per row, negligible overhead.
-        tl.atomic_add(expert_count_ptr + winner_idx, w)
-        # Mask out the winner for the next iteration
-        probs_for_topk = tl.where(expert_offs == winner_idx, float("-inf"), probs_for_topk)
+                # Accumulate weighted router probability sums (all experts).
+                local_prob_sum += w * probs
+
+                # ---- Top-k selection with expert count accumulation ----
+                probs_for_topk = tl.where(emask, probs, float("-inf"))
+                for _k in range(TOP_K):
+                    max_prob = tl.max(probs_for_topk, axis=0)
+                    is_max = probs_for_topk == max_prob
+                    candidate = tl.where(is_max, expert_offs, BLOCK_E)
+                    winner_idx = tl.min(candidate, axis=0)
+                    # Accumulate into local register — no atomics needed.
+                    local_count += tl.where(expert_offs == winner_idx, w, 0.0)
+                    probs_for_topk = tl.where(expert_offs == winner_idx, float("-inf"), probs_for_topk)
+
+    # Write partial sums to this block's row — each block writes to its own row.
+    out_offset = block_idx * stride_count_row + expert_offs
+    tl.store(expert_count_ptr + out_offset, local_count, mask=emask)
+    out_offset_prob = block_idx * stride_prob_row + expert_offs
+    tl.store(router_prob_sum_ptr + out_offset_prob, local_prob_sum, mask=emask)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +164,8 @@ def _lb_loss_bwd_kernel(
 # Autograd Function
 # ---------------------------------------------------------------------------
 
+BLOCK_N = 256
+
 
 class _FusedLoadBalancingLoss(torch.autograd.Function):
     """Autograd wrapper for the fused load balancing loss kernels.
@@ -159,7 +173,7 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
     Dtype handling:
         - ``concatenated_gate_logits`` can be any floating-point dtype
           (float16, bfloat16, float32). The Triton kernels cast inputs to
-          float32 internally for numerical stability (softmax, atomics).
+          float32 internally for numerical stability (softmax).
         - ``mask_weights`` must be float32 (pre-cast by the caller).
         - All intermediate accumulators (``expert_count``, ``router_prob_sum``)
           are allocated in float32.
@@ -180,28 +194,36 @@ class _FusedLoadBalancingLoss(torch.autograd.Function):
         N, E = concatenated_gate_logits.shape
         device = concatenated_gate_logits.device
 
-        # Accumulators are always float32 — the kernels use atomic_add which
-        # requires float32, and this avoids precision loss from softmax sums.
-        expert_count = torch.zeros(E, device=device, dtype=torch.float32)
-        router_prob_sum = torch.zeros(E, device=device, dtype=torch.float32)
-
+        num_blocks = triton.cdiv(N, BLOCK_N)
         BLOCK_E = triton.next_power_of_2(E)
         has_mask = mask_weights is not None
-        # Use a dummy pointer when no mask; kernel will not access it.
-        mask_ptr = mask_weights if has_mask else expert_count  # unused
 
-        _lb_loss_fwd_kernel[(N,)](
+        # Partial-sum buffers: each block writes to its own row — no atomics.
+        partial_expert_count = torch.zeros(num_blocks, E, device=device, dtype=torch.float32)
+        partial_router_prob_sum = torch.zeros(num_blocks, E, device=device, dtype=torch.float32)
+
+        # Use a dummy pointer when no mask; kernel will not access it.
+        mask_ptr = mask_weights if has_mask else partial_expert_count  # unused
+
+        _lb_loss_fwd_kernel[(num_blocks,)](
             concatenated_gate_logits,
             mask_ptr,
-            expert_count,
-            router_prob_sum,
+            partial_expert_count,
+            partial_router_prob_sum,
             concatenated_gate_logits.stride(0),
+            partial_expert_count.stride(0),
+            partial_router_prob_sum.stride(0),
             N,
             E=E,
             TOP_K=top_k,
             BLOCK_E=BLOCK_E,
+            BLOCK_N=BLOCK_N,
             HAS_MASK=has_mask,
         )
+
+        # Reduce partial sums across blocks.
+        expert_count = partial_expert_count.sum(0)
+        router_prob_sum = partial_router_prob_sum.sum(0)
 
         # loss = E * dot(expert_count, router_prob_sum) / total_weight^2
         loss = torch.dot(expert_count, router_prob_sum) * (E / (total_weight * total_weight))
@@ -261,16 +283,38 @@ def load_balancing_loss_triton(
     top_k: int = 2,
     attention_mask: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, int]:
-    """Fused Triton load balancing loss.
+    """Fused Triton load balancing loss for Mixture-of-Experts models.
 
-    Fuses softmax + top-k + accumulation into a single kernel, avoiding
-    the ``[N, top_k, num_experts]`` one-hot intermediate tensor.
+    Computes the auxiliary load balancing loss from the Switch Transformer paper
+    (Fedus et al., 2021; https://arxiv.org/abs/2101.03961), equations (4)-(6)::
 
-    Dtype:
-        ``gate_logits`` may be any floating-point dtype (float16, bfloat16,
-        float32). All internal computation is performed in float32 for
-        numerical stability. Gradients are returned in the original input
-        dtype.
+        loss = num_experts * sum_e(f_e * P_e)
+
+    where ``f_e`` is the fraction of tokens routed to expert *e* and ``P_e`` is
+    the average router probability assigned to expert *e* across all tokens.
+
+    This implementation fuses softmax + top-k selection + accumulation into a
+    single GPU kernel, eliminating the large ``[N, top_k, num_experts]`` one-hot
+    intermediate tensor. The forward kernel uses a tiled reduction (no atomics)
+    for deterministic results.
+
+    Args:
+        gate_logits: Tuple of per-layer gate logits, each shaped
+            ``[batch_size * seq_len, num_experts]``. May be float16, bfloat16,
+            or float32; all internal computation is performed in float32 for
+            numerical stability. Returns ``0`` if ``None`` or not a tuple.
+        num_experts: Total number of experts ``E``.
+        top_k: Number of experts selected per token.
+        attention_mask: Optional ``[batch_size, seq_len]`` binary mask where
+            ``1`` indicates a real token and ``0`` indicates padding. When
+            provided, padded tokens are excluded from both the expert count
+            and the router probability sum. Named ``attention_mask`` (rather
+            than ``loss_mask``) for compatibility with the HuggingFace
+            ``load_balancing_loss_func`` API.
+
+    Returns:
+        Scalar float32 loss tensor, or ``0`` when *gate_logits* is ``None``
+        or not a tuple.
     """
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
