@@ -50,11 +50,32 @@ def save_video_bytes_to_file(video_bytes, output_path):
         f.write(video_bytes)
 
 
+def _align_to_factor_remainder_floor(n: float, factor: int, remainder: int) -> int:
+    """Round down n to the nearest value of the form factor * k + remainder.
+
+    Examples (factor=4, remainder=1): 10 -> 9, 9 -> 9, 8 -> 5, 5 -> 5, 4 -> 1
+    Examples (factor=4, remainder=0): 10 -> 8, 9 -> 8, 8 -> 8, 5 -> 4, 3 -> 0
+    """
+    adjusted = n - remainder
+    return int(adjusted // factor) * factor + remainder
+
+
+def _align_to_factor_remainder_ceil(n: float, factor: int, remainder: int) -> int:
+    """Round up n to the nearest value of the form factor * k + remainder.
+
+    Examples (factor=4, remainder=1): 10 -> 13, 9 -> 9, 8 -> 9, 5 -> 5, 2 -> 5
+    Examples (factor=4, remainder=0): 10 -> 12, 9 -> 12, 8 -> 8, 5 -> 8, 1 -> 4
+    """
+    adjusted = n - remainder
+    return math.ceil(adjusted / factor) * factor + remainder
+
+
 def calculate_frame_indices(
     total_frames: int,
     video_fps: Union[int, float],
     fps: float = 2.0,
     frame_factor: int = None,
+    frame_factor_remainder: int = 0,
     min_frames: int = None,
     max_frames: int = None,
     **kwargs,
@@ -65,7 +86,12 @@ def calculate_frame_indices(
         total_frames: Total frames in video
         video_fps: Original video FPS
         fps: Target sampling FPS
-        frame_factor: Align output frame count to multiples of this
+        frame_factor: Align output frame count to multiples of this (when remainder=0)
+            or to factor * k + remainder form
+        frame_factor_remainder: Remainder when aligning to frame_factor. For example,
+            frame_factor=4, frame_factor_remainder=1 produces counts like 1, 5, 9, 13...
+            This is needed by video generation models (e.g., Wan2.1, CogVideoX) whose
+            temporal VAE compresses T frames to (T-1)/factor + 1 latents.
         min_frames: Minimum frames to output
         max_frames: Maximum frames to output
         **kwargs: Extra arguments (ignored)
@@ -73,24 +99,32 @@ def calculate_frame_indices(
     Returns:
         (indices, pad_count): Frame indices to sample and padding count
     """
+    r = frame_factor_remainder
+    if frame_factor is not None:
+        if frame_factor <= 0:
+            raise ValueError(f"frame_factor must be a positive integer, got {frame_factor}")
+        if not 0 <= r < frame_factor:
+            raise ValueError(f"frame_factor_remainder must be in [0, {frame_factor}), got {r}")
+
     # Calculate target frame count
     nframes = total_frames / video_fps * fps
 
     # Apply min/max limits
     if min_frames is not None:
         if frame_factor is not None:
-            min_frames = math.ceil(min_frames / frame_factor) * frame_factor
+            min_frames = _align_to_factor_remainder_ceil(min_frames, frame_factor, r)
         nframes = max(min_frames, nframes)
 
     if max_frames is not None:
         if frame_factor is not None:
-            max_frames = math.floor(max_frames / frame_factor) * frame_factor
+            max_frames = _align_to_factor_remainder_floor(max_frames, frame_factor, r)
         nframes = min(max_frames, nframes)
 
-    # Align to frame_factor
+    # Align to frame_factor (with remainder)
     if frame_factor is not None:
-        nframes = math.floor(nframes / frame_factor) * frame_factor
-        nframes = max(nframes, frame_factor)
+        nframes = _align_to_factor_remainder_floor(nframes, frame_factor, r)
+        min_valid = r if r > 0 else frame_factor
+        nframes = max(nframes, min_valid)
 
     nframes = int(max(1, nframes))
 
