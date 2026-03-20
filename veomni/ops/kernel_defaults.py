@@ -54,7 +54,7 @@ KERNEL_REGISTRY.register(
         op_name="rms_norm",
         variant="standard",
         factory=_liger_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="cuda"),
+        hardware=HardwareRequirement(device_type="gpu"),
         description="LigerKernel fused RMSNorm",
     )
 )
@@ -92,7 +92,7 @@ KERNEL_REGISTRY.register(
         op_name="rms_norm",
         variant="qwen3_5",
         factory=_liger_rms_norm_qwen3_5_factory,
-        hardware=HardwareRequirement(device_type="cuda"),
+        hardware=HardwareRequirement(device_type="gpu"),
         description="LigerKernel fused RMSNorm for Qwen3.5 (1+weight, zeros init, gemma casting)",
     )
 )
@@ -108,7 +108,7 @@ KERNEL_REGISTRY.register(
         factory=lambda: __import__(
             "liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]
         ).liger_rotary_pos_emb,
-        hardware=HardwareRequirement(device_type="cuda"),
+        hardware=HardwareRequirement(device_type="gpu"),
         description="LigerKernel fused RoPE (full head_dim only)",
     )
 )
@@ -137,7 +137,7 @@ KERNEL_REGISTRY.register(
         op_name="swiglu_mlp",
         variant="standard",
         factory=_liger_swiglu_factory,
-        hardware=HardwareRequirement(device_type="cuda"),
+        hardware=HardwareRequirement(device_type="gpu"),
         description="LigerKernel fused SwiGLU MLP",
     )
 )
@@ -180,7 +180,7 @@ KERNEL_REGISTRY.register(
         op_name="moe_experts",
         variant="standard",
         factory=_triton_group_gemm_factory,
-        hardware=HardwareRequirement(device_type="cuda", min_compute_capability=70),
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
         description="Triton group-gemm fused MoE forward",
     )
 )
@@ -201,7 +201,7 @@ KERNEL_REGISTRY.register(
         op_name="moe_experts",
         variant="standard",
         factory=_quack_cutlass_factory,
-        hardware=HardwareRequirement(device_type="cuda", min_compute_capability=90),
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
         description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
     )
 )
@@ -230,7 +230,7 @@ KERNEL_REGISTRY.register(
         op_name="cross_entropy_loss",
         variant="standard",
         factory=_liger_fused_ce_factory,
-        hardware=HardwareRequirement(device_type="cuda"),
+        hardware=HardwareRequirement(device_type="gpu"),
         description="Liger fused linear cross-entropy loss (with label shifting and SP reduction)",
     )
 )

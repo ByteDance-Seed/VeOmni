@@ -110,12 +110,17 @@ def is_hccl_backend() -> bool:
     return get_dist_comm_backend() == "hccl"
 
 
+def get_gpu_compute_capability() -> int:
+    """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU."""
+    if not IS_CUDA_AVAILABLE:
+        return 0
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
 def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
-    if not IS_CUDA_AVAILABLE:
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+    return get_gpu_compute_capability() >= 90
 
 
 def get_compute_units():

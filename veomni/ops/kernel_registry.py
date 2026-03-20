@@ -24,9 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-import torch
-
 from ..utils import logging
+from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
 logger = logging.get_logger(__name__)
@@ -36,17 +35,15 @@ logger = logging.get_logger(__name__)
 class HardwareRequirement:
     """Describes hardware constraints for a kernel."""
 
-    device_type: str  # "cuda" | "npu"
+    device_type: str  # "gpu" | "npu"
     min_compute_capability: int | None = None  # e.g. 70, 80, 90
 
     def is_satisfied(self) -> bool:
-        if self.device_type == "cuda":
-            if not torch.cuda.is_available():
+        if self.device_type == "gpu":
+            if not IS_CUDA_AVAILABLE:
                 return False
             if self.min_compute_capability is not None:
-                major, minor = torch.cuda.get_device_capability()
-                cc = major * 10 + minor
-                if cc < self.min_compute_capability:
+                if get_gpu_compute_capability() < self.min_compute_capability:
                     return False
             return True
         elif self.device_type == "npu":
@@ -79,9 +76,12 @@ class KernelRegistry:
 
     def register(self, spec: KernelSpec) -> None:
         key = (spec.op_name, spec.variant)
-        if key not in self._specs:
-            self._specs[key] = {}
-        self._specs[key][spec.name] = spec
+        bucket = self._specs.setdefault(key, {})
+        if spec.name in bucket:
+            raise ValueError(
+                f"Duplicate kernel registration: op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}'"
+            )
+        bucket[spec.name] = spec
 
     def resolve(self, op_name: str, variant: str, impl_name: str) -> Callable | None:
         """Resolve an implementation by name.
