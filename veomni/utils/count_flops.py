@@ -401,9 +401,9 @@ class VeomniFlopsCounter:
         flops_all_token = dense_N_flops + attn_qkv_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         # vit flops
-        image_seqlens = kargs.get("image_seqlens", None)
-        if image_seqlens is not None:
-            vit_flops = self._estimate_qwen3_vit_flop(image_seqlens, self.config.vision_config)
+        images_seqlens = kargs.get("images_seqlens", None)
+        if images_seqlens is not None:
+            vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, self.config.vision_config)
         else:
             vit_flops = 0
         # all_layer & all_token fwd & bwd flops
