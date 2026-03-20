@@ -584,7 +584,7 @@
 
          outputs = self.model(
              input_ids=input_ids,
-@@ -2156,27 +2291,54 @@
+@@ -2156,27 +2291,50 @@
          )
 
          hidden_states = outputs[0]
@@ -609,13 +609,9 @@
 +                    **kwargs,
 +                )
 +            else:
-+                loss, logits = self.loss_function(
-+                    logits=logits,
-+                    labels=labels,
-+                    vocab_size=self.config.text_config.vocab_size,
-+                    hidden_states=hidden_states,
-+                    weights=self.lm_head.weight,
-+                    **kwargs,
++                logits = self.lm_head(hidden_states)
++                loss = self.loss_function(
++                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
 +                )
 +        else:
 +            logits = self.lm_head(hidden_states)
@@ -651,7 +647,7 @@
 
          return Qwen3_5MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -2413,6 +2575,11 @@
+@@ -2413,6 +2571,11 @@
 
          return input_ids, model_kwargs
 
