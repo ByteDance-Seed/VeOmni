@@ -94,3 +94,66 @@ def apply_veomni_fused_moe_patch(
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
         _fused_moe_forward = None
+
+
+# ── OpSlot kernel registrations ──────────────────────────────────────────────
+
+from ..kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+def _make_moe_experts_adapter(raw_forward):
+    """Adapt the raw fused MoE kernel to the OpSlot call signature.
+
+    OpSlot invokes with ``(self, hidden_states, top_k_index, top_k_weights)``
+    but the raw kernel uses ``(num_experts, routing_weights, ...)``.
+    """
+
+    def adapter(self, hidden_states, top_k_index, top_k_weights):
+        return raw_forward(
+            num_experts=self.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_weight=None,
+            fc1_2_weight=None,
+            fc2_weight=self.down_proj,
+            fc1_1_2_weight=self.gate_up_proj,
+        )
+
+    return adapter
+
+
+def _fused_moe_kernel_factory():
+    from .group_gemm import group_gemm_fused_moe_forward
+
+    return _make_moe_experts_adapter(group_gemm_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="fused",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_fused_moe_kernel_factory,
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
+        description="Triton group-gemm fused MoE forward",
+    )
+)
+
+
+def _fused_quack_kernel_factory():
+    from .quack_gemm import quack_gemm_fused_moe_forward
+
+    return _make_moe_experts_adapter(quack_gemm_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="fused_quack",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_fused_quack_kernel_factory,
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
+        description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
+    )
+)

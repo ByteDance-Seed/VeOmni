@@ -310,3 +310,33 @@ def apply_veomni_loss_patch():
         _cross_entropy = fused_liger_kernel_cross_entropy
     else:
         _cross_entropy = eager_cross_entropy
+
+
+# ── OpSlot kernel registration ───────────────────────────────────────────────
+
+from ..kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+def _liger_fused_ce_factory():
+    """Return ForCausalLMLoss with the Liger fused CE kernel bound via partial.
+
+    This ensures the OpSlot path gets the full preprocessing (label shifting,
+    flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
+    """
+    from functools import partial
+
+    from .liger_kernel import fused_liger_kernel_cross_entropy
+
+    return partial(ForCausalLMLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_fused",
+        op_name="cross_entropy_loss",
+        variant="standard",
+        factory=_liger_fused_ce_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Liger fused linear cross-entropy loss (with label shifting and SP reduction)",
+    )
+)

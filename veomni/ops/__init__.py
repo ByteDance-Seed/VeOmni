@@ -14,7 +14,7 @@
 
 from ..utils import logging
 from ..utils.env import get_env
-from . import flash_attn, fused_cross_entropy, fused_load_balancing_loss, fused_moe, kernel_defaults  # noqa: F401
+from . import flash_attn, fused_cross_entropy, fused_load_balancing_loss, fused_moe, liger  # noqa: F401
 from .dispatch import OpSlot
 from .fused_load_balancing_loss import load_balancing_loss_func
 from .fused_moe import fused_moe_forward

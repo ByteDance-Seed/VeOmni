@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Default OSS kernel registrations.
+LigerKernel-based kernel registrations (RMSNorm, RoPE, SwiGLU).
 
-Imported at ``veomni.ops`` init time so that all registrations are
-available before any model is built.
+Registrations are executed at import time via ``veomni.ops.__init__``.
 """
 
 from __future__ import annotations
 
-from .kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+from ..kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
 # ── Liger RMSNorm ─────────────────────────────────────────────────────────────
@@ -139,98 +138,5 @@ KERNEL_REGISTRY.register(
         factory=_liger_swiglu_factory,
         hardware=HardwareRequirement(device_type="gpu"),
         description="LigerKernel fused SwiGLU MLP",
-    )
-)
-
-
-# ── MoE Experts: Triton group-gemm ────────────────────────────────────────────
-
-
-def _make_moe_experts_adapter(raw_forward):
-    """Adapt the raw fused MoE kernel to the OpSlot call signature.
-
-    OpSlot invokes with ``(self, hidden_states, top_k_index, top_k_weights)``
-    but the raw kernel uses ``(num_experts, routing_weights, ...)``.
-    """
-
-    def adapter(self, hidden_states, top_k_index, top_k_weights):
-        return raw_forward(
-            num_experts=self.num_experts,
-            routing_weights=top_k_weights.to(hidden_states.dtype),
-            selected_experts=top_k_index,
-            hidden_states=hidden_states,
-            fc1_1_weight=None,
-            fc1_2_weight=None,
-            fc2_weight=self.down_proj,
-            fc1_1_2_weight=self.gate_up_proj,
-        )
-
-    return adapter
-
-
-def _fused_moe_factory():
-    from .fused_moe.group_gemm import group_gemm_fused_moe_forward
-
-    return _make_moe_experts_adapter(group_gemm_fused_moe_forward)
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="fused",
-        op_name="moe_experts",
-        variant="standard",
-        factory=_fused_moe_factory,
-        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
-        description="Triton group-gemm fused MoE forward",
-    )
-)
-
-
-# ── MoE Experts: Quack ────────────────────────────────────────────────────────
-
-
-def _fused_quack_factory():
-    from .fused_moe.quack_gemm import quack_gemm_fused_moe_forward
-
-    return _make_moe_experts_adapter(quack_gemm_fused_moe_forward)
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="fused_quack",
-        op_name="moe_experts",
-        variant="standard",
-        factory=_fused_quack_factory,
-        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
-        description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
-    )
-)
-
-
-# ── Cross-entropy loss: Liger fused ──────────────────────────────────────────
-
-
-def _liger_fused_ce_factory():
-    """Return ForCausalLMLoss with the Liger fused CE kernel bound via partial.
-
-    This ensures the OpSlot path gets the full preprocessing (label shifting,
-    flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
-    """
-    from functools import partial
-
-    from veomni.ops.fused_cross_entropy import ForCausalLMLoss
-    from veomni.ops.fused_cross_entropy.liger_kernel import fused_liger_kernel_cross_entropy
-
-    return partial(ForCausalLMLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger_fused",
-        op_name="cross_entropy_loss",
-        variant="standard",
-        factory=_liger_fused_ce_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
-        description="Liger fused linear cross-entropy loss (with label shifting and SP reduction)",
     )
 )
