@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Quack GEMM backend for fused MoE forward/backward (non-EP path only).
+"""Quack GEMM backend for fused MoE forward/backward.
 
 Uses ``quack.gemm_interface.gemm`` (CUTLASS/CuTe DSL, SM90+) for all GEMM
 operations: forward, dgrad, and wgrad.
@@ -20,11 +20,14 @@ operations: forward, dgrad, and wgrad.
 - Forward/dgrad: ``cu_seqlens_m`` mode — batches over the token (M) dimension.
 - Wgrad: ``cu_seqlens_k`` mode — batches over the token (K) dimension,
   computing ``grad.T @ input`` per expert group.
+
+EP (Expert Parallelism) is supported for both split and merged fc1 weights.
 """
 
 import torch
 from quack.gemm_interface import gemm
 
+from ...distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
 from ...distributed.parallel_state import get_parallel_state
 from ..group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
 
@@ -364,6 +367,212 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         )
 
 
+def _cumsum_to_cu_seqlens(cumsum: torch.Tensor) -> torch.Tensor:
+    """Convert [E] cumsum to [E+1] cu_seqlens_m with leading zero (int32)."""
+    zero = torch.zeros(1, dtype=torch.int32, device=cumsum.device)
+    return torch.cat([zero, cumsum.int()])
+
+
+class EPQuackGroupGemm(torch.autograd.Function):
+    """EP autograd function with split fc1 weights using quack GEMM."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        permute_tokens,
+        cumsum,
+        fc1_1_weight,
+        fc1_2_weight,
+        fc2_weight,
+    ):
+        cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
+
+        fc1_1_w_t = fc1_1_weight.transpose(1, 2)
+        fc1_2_w_t = fc1_2_weight.transpose(1, 2)
+        fc2_w_t = fc2_weight.transpose(1, 2)
+
+        fc1_1_output = gemm(permute_tokens, fc1_1_w_t, cu_seqlens_m=cu_seqlens_m)
+        fc1_2_output = gemm(permute_tokens, fc1_2_w_t, cu_seqlens_m=cu_seqlens_m)
+
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_result = fc1_1_activation * fc1_2_output
+
+        fc2_output = gemm(fc1_result, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
+
+        ctx.save_for_backward(
+            permute_tokens,
+            cumsum,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_output,
+            fc1_2_output,
+        )
+
+        return fc2_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            permute_tokens,
+            cumsum,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_output,
+            fc1_2_output,
+        ) = ctx.saved_tensors
+
+        cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
+
+        # recompute
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_result = fc1_1_activation * fc1_2_output
+
+        # dgrad fc2
+        grad_fc1_result = gemm(grad_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
+
+        # wgrad fc2
+        grad_fc2_weight = None
+        if fc2_weight.requires_grad:
+            grad_fc2_weight = gemm(grad_output.T, fc1_result, cu_seqlens_k=cu_seqlens_m)
+        del fc1_result
+
+        # gate gradients
+        grad_fc1_2_output = fc1_1_activation * grad_fc1_result
+        grad_fc1_1_activation = grad_fc1_result * fc1_2_output
+        del fc1_1_activation
+
+        # dgrad fc1_2
+        grad_scatter_output_2 = gemm(grad_fc1_2_output, fc1_2_weight, cu_seqlens_m=cu_seqlens_m)
+
+        # wgrad fc1_2
+        grad_fc1_2_weight = None
+        if fc1_2_weight.requires_grad:
+            grad_fc1_2_weight = gemm(grad_fc1_2_output.T, permute_tokens, cu_seqlens_k=cu_seqlens_m)
+        del grad_fc1_2_output
+
+        # silu backward
+        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+
+        # dgrad fc1_1
+        grad_scatter_output_1 = gemm(grad_fc1_1_output, fc1_1_weight, cu_seqlens_m=cu_seqlens_m)
+
+        # wgrad fc1_1
+        grad_fc1_1_weight = None
+        if fc1_1_weight.requires_grad:
+            grad_fc1_1_weight = gemm(grad_fc1_1_output.T, permute_tokens, cu_seqlens_k=cu_seqlens_m)
+        del grad_fc1_1_output
+
+        grad_permute_tokens = grad_scatter_output_1 + grad_scatter_output_2
+        del grad_scatter_output_1, grad_scatter_output_2
+
+        return (
+            grad_permute_tokens,  # permute_tokens
+            None,  # cumsum
+            grad_fc1_1_weight,  # fc1_1_weight
+            grad_fc1_2_weight,  # fc1_2_weight
+            grad_fc2_weight,  # fc2_weight
+        )
+
+
+class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
+    """EP autograd function with merged fc1_1_2 weight [E, 2I, H] using quack GEMM."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        permute_tokens,
+        cumsum,
+        fc1_1_2_weight,
+        fc2_weight,
+    ):
+        assert fc1_1_2_weight.shape[1] % 2 == 0, (
+            f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
+        )
+        cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
+
+        fc1_1_2_w_t = fc1_1_2_weight.transpose(1, 2)
+        fc2_w_t = fc2_weight.transpose(1, 2)
+
+        # Single fc1 GEMM: output [T, 2I]
+        fc1_output = gemm(permute_tokens, fc1_1_2_w_t, cu_seqlens_m=cu_seqlens_m)
+
+        # chunk is a view, no copy
+        fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
+
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_result = fc1_1_activation * fc1_2_output
+
+        # fc2
+        fc2_output = gemm(fc1_result, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
+
+        ctx.save_for_backward(
+            permute_tokens,
+            cumsum,
+            fc1_1_2_weight,
+            fc2_weight,
+            fc1_1_output,
+            fc1_2_output,
+        )
+
+        return fc2_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            permute_tokens,
+            cumsum,
+            fc1_1_2_weight,
+            fc2_weight,
+            fc1_1_output,
+            fc1_2_output,
+        ) = ctx.saved_tensors
+
+        cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
+
+        # recompute
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_result = fc1_1_activation * fc1_2_output
+
+        # dgrad fc2: fc2_weight [E, H, I] is [K, N] for quack
+        grad_fc1_result = gemm(grad_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
+
+        # wgrad fc2
+        grad_fc2_weight = None
+        if fc2_weight.requires_grad:
+            grad_fc2_weight = gemm(grad_output.T, fc1_result, cu_seqlens_k=cu_seqlens_m)
+        del fc1_result
+
+        # gate gradients
+        grad_fc1_2_output = fc1_1_activation * grad_fc1_result
+        grad_fc1_1_activation = grad_fc1_result * fc1_2_output
+        del fc1_1_activation, fc1_2_output
+
+        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        del fc1_1_output
+
+        # Merge grads back to [T, 2I]
+        grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
+        del grad_fc1_1_output, grad_fc1_2_output
+
+        # single dgrad for merged fc1: fc1_1_2_weight [E, 2I, H] is [K, N] for quack
+        grad_permute_tokens = gemm(grad_fc1_output, fc1_1_2_weight, cu_seqlens_m=cu_seqlens_m)
+
+        # single wgrad for merged fc1
+        grad_fc1_1_2_weight = None
+        if fc1_1_2_weight.requires_grad:
+            grad_fc1_1_2_weight = gemm(grad_fc1_output.T, permute_tokens, cu_seqlens_k=cu_seqlens_m)
+        del grad_fc1_output
+
+        return (
+            grad_permute_tokens,  # permute_tokens
+            None,  # cumsum
+            grad_fc1_1_2_weight,  # fc1_1_2_weight
+            grad_fc2_weight,  # fc2_weight
+        )
+
+
 def quack_gemm_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -374,13 +583,69 @@ def quack_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
 ):
-    """Quack GEMM fused MoE forward pass (non-EP path only).
+    """Quack GEMM fused MoE forward pass.
 
     Same interface as ``group_gemm_fused_moe_forward``. Supports both split
-    and merged fc1 weight layouts.
+    and merged fc1 weight layouts, including EP (Expert Parallelism).
     """
     if get_parallel_state().ep_enabled:
-        raise NotImplementedError("Quack backend does not support EP yet. Set moe_implementation='fused'.")
+        if fc1_1_2_weight is not None:
+            if fc1_1_weight is not None or fc1_2_weight is not None:
+                raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
+        else:
+            if fc1_1_weight is None or fc1_2_weight is None:
+                raise ValueError("EP requires split fc1 weights (fc1_1_weight and fc1_2_weight).")
+
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+        input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
+            preprocess(
+                expert_mask=expert_mask,
+                num_experts=num_experts,
+                ep_group=get_parallel_state().ep_group,
+            )
+        )
+        permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
+            hidden_states=hidden_states,
+            expert_mask=expert_mask,
+            num_experts=num_experts,
+            input_splits=input_splits,
+            output_splits=output_splits,
+            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
+            ep_group=get_parallel_state().ep_group,
+        )
+
+        cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
+
+        if fc1_1_2_weight is not None:
+            final_permute_tokens = EPMergedFc1QuackGroupGemm.apply(
+                permute_tokens,
+                cumsum,
+                fc1_1_2_weight,
+                fc2_weight,
+            )
+        else:
+            final_permute_tokens = EPQuackGroupGemm.apply(
+                permute_tokens,
+                cumsum,
+                fc1_1_weight,
+                fc1_2_weight,
+                fc2_weight,
+            )
+
+        final_hidden_states = tokens_post_all2all(
+            expert_outputs=final_permute_tokens,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            num_experts=num_experts,
+            input_splits=input_splits,
+            output_splits=output_splits,
+            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
+            routing_map=routing_map,
+            local_input_permutation_mapping=local_input_permutation_mapping,
+            org_hidden_states_shape=org_hidden_states_shape,
+            ep_group=get_parallel_state().ep_group,
+        )
+        return final_hidden_states
 
     if fc1_1_2_weight is not None:
         if fc1_1_weight is not None or fc1_2_weight is not None:

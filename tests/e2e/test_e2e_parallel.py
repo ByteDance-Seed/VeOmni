@@ -145,8 +145,7 @@ text_test_cases = [
     pytest.param(
         "qwen3_5_moe",
         "./tests/toy_config/qwen3_5_moe_toy/config.json",
-        # TODO: Test with EP once Merged fc1_1_2_weight is supported with expert parallelism.
-        False,  # is_moe
+        True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
