@@ -18,7 +18,6 @@ from .arguments_types import (
     CheckpointConfig,
     DataArguments,
     DataloaderConfig,
-    DPOConfig,
     FSDPConfig,
     GradientCheckpointingConfig,
     InferArguments,
@@ -29,7 +28,6 @@ from .arguments_types import (
     ProfileConfig,
     TrainingArguments,
     VeOmniArguments,
-    VeOmniDPOArguments,
     WandbConfig,
 )
 from .parser import parse_args, save_args

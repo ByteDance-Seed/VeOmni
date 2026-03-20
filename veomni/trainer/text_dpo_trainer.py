@@ -13,14 +13,15 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
-from ..arguments import VeOmniDPOArguments
+from ..arguments import VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
@@ -38,6 +39,46 @@ from .base import BaseTrainer
 logger = logging.get_logger(__name__)
 
 _NON_MODEL_KEYS = {"labels"}
+
+
+# ================================ DPO Arguments ======================================
+
+
+@dataclass
+class DPOConfig:
+    """dpo.* — Direct Preference Optimization hyperparameters."""
+
+    beta: float = field(
+        default=0.1,
+        metadata={"help": "Temperature parameter for the DPO loss. Controls deviation from the reference model."},
+    )
+    label_smoothing: float = field(
+        default=0.0,
+        metadata={"help": "Label smoothing for DPO loss. Non-zero values assume noisy preference labels."},
+    )
+    reference_free: bool = field(
+        default=False,
+        metadata={"help": "If True, ignore the reference model and use an implicit uniform reference."},
+    )
+    loss_type: Literal["sigmoid", "ipo"] = field(
+        default="sigmoid",
+        metadata={"help": "DPO loss variant: 'sigmoid' for standard DPO, 'ipo' for Identity Preference Optimization."},
+    )
+    average_log_prob: bool = field(
+        default=False,
+        metadata={"help": "If True, average log probs per token instead of summing."},
+    )
+    refer_model_precision: Literal["float32", "bfloat16"] = field(
+        default="bfloat16",
+        metadata={"help": "Precision of the reference model."},
+    )
+
+
+@dataclass
+class VeOmniDPOArguments(VeOmniArguments):
+    """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters."""
+
+    dpo_config: DPOConfig = field(default_factory=DPOConfig)
 
 
 class TextDPOTrainer:
@@ -181,13 +222,20 @@ class TextDPOTrainer:
         seq_lens = [lg.shape[0] for lg in logits_list]
 
         if self.sp_enabled:
-            labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=get_parallel_state().sp_group)
-            labels = labels.view(-1)[: sum(seq_lens)]
+            # Labels already globally shifted by SequenceParallelCollator;
+            # gather back and split by sequence lengths directly.
+            all_labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=get_parallel_state().sp_group)
+            all_labels = all_labels.view(-1)[: sum(seq_lens)]
+            labels_list = list(all_labels.split(seq_lens))
         else:
-            labels = micro_batch["labels"].view(-1)
-            labels = F.pad(labels[1:], (0, 1), value=IGNORE_INDEX)
-
-        labels_list = labels.split(seq_lens)
+            # Shift labels per-sequence
+            all_labels = micro_batch["labels"].view(-1)
+            offset = 0
+            labels_list = []
+            for sl in seq_lens:
+                seq_labels = all_labels[offset : offset + sl]
+                labels_list.append(F.pad(seq_labels[1:], (0, 1), value=IGNORE_INDEX))
+                offset += sl
 
         average_log_prob = getattr(self.base.args, "dpo_config", None) and self.base.args.dpo_config.average_log_prob
         all_logps: List[torch.Tensor] = []

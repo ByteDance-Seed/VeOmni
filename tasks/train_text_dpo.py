@@ -1,5 +1,5 @@
-from veomni.arguments import VeOmniDPOArguments, parse_args
-from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+from veomni.arguments import parse_args
+from veomni.trainer.text_dpo_trainer import TextDPOTrainer, VeOmniDPOArguments
 
 
 if __name__ == "__main__":
