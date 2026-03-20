@@ -617,23 +617,10 @@ class OpsImplementationConfig:
         },
     )
 
-    # Map from user-facing moe_implementation values to kernel registry names.
-    _MOE_IMPL_TO_KERNEL = {
-        "eager": "eager",
-        "fused": "triton_group_gemm",
-        "fused_quack": "quack_cutlass",
-    }
-
     @property
     def moe_experts_implementation(self) -> str:
-        """Resolve moe_implementation to a kernel registry name for the ``moe_experts`` OpSlot."""
-        raw = self.moe_implementation
-        if raw is None:
-            return "eager"
-        mapped = self._MOE_IMPL_TO_KERNEL.get(raw)
-        if mapped is None:
-            raise ValueError(f"Unknown moe_implementation='{raw}'. Valid: {list(self._MOE_IMPL_TO_KERNEL.keys())}")
-        return mapped
+        """Bridge ``moe_implementation`` → ``moe_experts_implementation`` for OpSlot lookup."""
+        return self.moe_implementation or "eager"
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":

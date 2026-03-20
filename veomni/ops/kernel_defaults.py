@@ -168,7 +168,7 @@ def _make_moe_experts_adapter(raw_forward):
     return adapter
 
 
-def _triton_group_gemm_factory():
+def _fused_moe_factory():
     from .fused_moe.group_gemm import group_gemm_fused_moe_forward
 
     return _make_moe_experts_adapter(group_gemm_fused_moe_forward)
@@ -176,20 +176,20 @@ def _triton_group_gemm_factory():
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="triton_group_gemm",
+        name="fused",
         op_name="moe_experts",
         variant="standard",
-        factory=_triton_group_gemm_factory,
+        factory=_fused_moe_factory,
         hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
         description="Triton group-gemm fused MoE forward",
     )
 )
 
 
-# ── MoE Experts: Quack CUTLASS ────────────────────────────────────────────────
+# ── MoE Experts: Quack ────────────────────────────────────────────────────────
 
 
-def _quack_cutlass_factory():
+def _fused_quack_factory():
     from .fused_moe.quack_gemm import quack_gemm_fused_moe_forward
 
     return _make_moe_experts_adapter(quack_gemm_fused_moe_forward)
@@ -197,10 +197,10 @@ def _quack_cutlass_factory():
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="quack_cutlass",
+        name="fused_quack",
         op_name="moe_experts",
         variant="standard",
-        factory=_quack_cutlass_factory,
+        factory=_fused_quack_factory,
         hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
         description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
     )
