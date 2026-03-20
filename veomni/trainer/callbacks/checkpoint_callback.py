@@ -51,6 +51,11 @@ class CheckpointerCallback(Callback):
         if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
             if state.global_step != self._last_saved_step:
                 self._save_checkpoint(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate checkpoint save at epoch_end (global_step {state.global_step} "
+                    f"already saved at step_end)."
+                )
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
@@ -133,6 +138,11 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         if self.save_hf_weights:
             if state.global_step != self._last_saved_step:
                 self._save_checkpoint(state, stage="train_end")
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate HF checkpoint save at train_end (global_step {state.global_step} "
+                    f"already saved)."
+                )
 
     def on_step_end(self, state: TrainerState, **kwargs):
         if self.save_hf_weights and self.every_n_steps and state.global_step % self.every_n_steps == 0:
@@ -142,6 +152,11 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         if self.save_hf_weights and self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
             if state.global_step != self._last_saved_step:
                 self._save_checkpoint(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate HF checkpoint save at epoch_end (global_step {state.global_step} "
+                    f"already saved at step_end)."
+                )
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._save_model_assets()
