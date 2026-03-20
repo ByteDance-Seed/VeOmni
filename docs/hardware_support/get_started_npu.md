@@ -42,6 +42,14 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 * `True`: This configuration instructs the cache allocator to create specific memory blocks with the capability to be extended later. This allows for more efficient handling of scenarios where the required memory size frequently changes during runtime.  
 * `False`: The memory pool extension segment feature is disabled, and the original memory allocation method is used. Default is `False`.
 
+### MULTI_STREAM_MEMORY_REUSE
+
+```bash
+export MULTI_STREAM_MEMORY_REUSE=2
+```
+
+Refer to: https://github.com/ByteDance-Seed/VeOmni/issues/575
+
 ## Declarations
 
 The Ascend support code, Dockerfile and image provided in the documentation are for reference only. If you intend to use them in a production environment, please contact the official channels. Thank you.

@@ -9,13 +9,14 @@ from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
 
 # See
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
+_dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -85,7 +86,6 @@ def main(
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
-
 text_test_cases = [
     pytest.param(
         "llama3.1",
@@ -143,16 +143,6 @@ text_test_cases = [
     ),
     # TODO: we only support text input now. move this to VLM test once vision input is supported.
     pytest.param(
-        "qwen3_5",
-        "./tests/toy_config/qwen3_5_toy/config.json",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v5_only,
-    ),
-    # TODO: we only support text input now. move this to VLM test once vision input is supported.
-    pytest.param(
         "qwen3_5_moe",
         "./tests/toy_config/qwen3_5_moe_toy/config.json",
         # TODO: Test with EP once Merged fc1_1_2_weight is supported with expert parallelism.
@@ -190,6 +180,7 @@ qwen3vl_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
         marks=_v4_only,
     ),
     pytest.param(
@@ -198,7 +189,17 @@ qwen3vl_test_cases = [
         True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
+        None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3_5",
+        "./tests/toy_config/qwen3_5_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
     ),
 ]
 
@@ -221,6 +222,17 @@ qwen3omni_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         marks=_v4_only,
+    ),
+]
+
+wan_dit_test_cases = [
+    pytest.param(
+        "wan_t2v",
+        "./tests/toy_config/wan_t2v_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_dit_only,
     ),
 ]
 
@@ -265,6 +277,14 @@ def dummy_qwen3omni_dataset():
     del dummy_dataset
 
 
+@pytest.fixture(scope="session")
+def dummy_wan_t2v_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="wan_t2v")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", text_test_cases)
 def test_text_parallel_align(
     model_name: str,
@@ -302,9 +322,15 @@ def test_qwen2vl_parallel_align(
     )
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen3vl_test_cases)
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen3vl_test_cases)
 def test_qwen3vl_parallel_align(
-    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen3vl_dataset
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int | None,
+    dummy_qwen3vl_dataset,
 ):
     main(
         task_name="train_vlm_test",
@@ -313,6 +339,7 @@ def test_qwen3vl_parallel_align(
         is_moe=is_moe,
         rtol=rtol,
         atol=atol,
+        max_sp_size=max_sp_size,
         train_path=dummy_qwen3vl_dataset,
     )
 
@@ -344,4 +371,22 @@ def test_qwen3omni_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_qwen3omni_dataset,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
+def test_wan_dit_parallel_align(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_wan_t2v_dataset
+):
+    """Validate that WanTransformer3DModel loss and grad_norm are identical with
+    and without Ulysses sequence-parallelism at equal DP sizes.
+    """
+    main(
+        task_name="train_dit_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_wan_t2v_dataset,
     )

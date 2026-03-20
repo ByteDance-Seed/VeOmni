@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ..utils.import_utils import is_diffusers_available
 from . import seed_omni, transformers
 from .auto import build_foundation_model, build_processor, build_tokenizer
 from .module_utils import (
@@ -33,5 +34,11 @@ __all__ = [
     "save_model_assets",
     "save_model_weights",
     "transformers",
+    "diffusers",
     "seed_omni",
 ]
+
+if is_diffusers_available():
+    from . import diffusers
+
+    __all__ += ["diffusers"]

@@ -17,6 +17,7 @@ import math
 import subprocess
 from typing import ByteString, Dict, List, Union
 
+import av
 import librosa
 import numpy as np
 import PIL
@@ -366,8 +367,7 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
     video_fps = metadata.average_fps
     total_frames = metadata.num_frames
 
-    # Safety margin for inaccurate frame counts
-    effective_total_frames = max(1, total_frames - 1)
+    effective_total_frames = max(1, total_frames)
 
     indices, pad_count = calculate_frame_indices(total_frames=effective_total_frames, video_fps=video_fps, **kwargs)
 
@@ -593,4 +593,85 @@ def load_video(video: VideoInput, **kwargs):
         videos, video_meta, audios, audio_meta = fetch_videos_metadata([video], **kwargs)
         return videos[0], video_meta[0], audios[0], audio_meta[0]
 
-    raise NotImplementedError(f"Unsupported video input type: {type(video)}")
+
+def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
+    """
+    video:
+        torch.Tensor
+        shape:
+            [T, C, H, W]  or
+            [T, H, W, C]
+
+    value range:
+        [-1,1] / [0,1] / [0,255]
+    """
+
+    if isinstance(video, torch.Tensor):
+        video = video.detach().cpu()
+
+    # -----------------------------
+    # format: TCHW -> THWC
+    # -----------------------------
+    if video.ndim != 4:
+        raise ValueError("video must be 4D tensor")
+
+    if video.shape[1] in (1, 3):  # TCHW
+        video = video.permute(0, 2, 3, 1)
+
+    video = video.numpy()
+
+    # -----------------------------
+    # normalize to uint8
+    # -----------------------------
+    if video.dtype != np.uint8:
+        vmin = video.min()
+        vmax = video.max()
+
+        if vmin >= -1 and vmax <= 1:
+            video = (video + 1) / 2
+
+        if vmin >= 0 and vmax <= 1:
+            video = video * 255
+            video = video.astype(np.uint8)
+        elif vmin >= 0 and vmax <= 255:
+            video = video.astype(np.uint8)
+        else:
+            video = np.clip(video, 0, 255)
+            video = video.astype(np.uint8)
+
+    # -----------------------------
+    # ensure even resolution
+    # -----------------------------
+    T, H, W, C = video.shape
+
+    H_even = H // 2 * 2
+    W_even = W // 2 * 2
+
+    video = video[:, :H_even, :W_even, :]
+
+    # -----------------------------
+    # encode video
+    # -----------------------------
+    container = av.open(output_path, mode="w")
+    stream = container.add_stream("libx264", rate=fps)
+
+    stream.width = W_even
+    stream.height = H_even
+    stream.pix_fmt = "yuv420p"
+
+    stream.codec_context.options["crf"] = "22"
+    stream.codec_context.options["preset"] = "ultrafast"
+
+    for frame in video:
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+
+        frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+
+        for packet in stream.encode(frame):
+            container.mux(packet)
+
+    for packet in stream.encode():
+        container.mux(packet)
+
+    container.close()

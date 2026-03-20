@@ -1,36 +1,32 @@
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import wandb
 from tqdm import trange
-from transformers import (
-    AutoConfig,
-    CLIPTokenizer,
-    T5TokenizerFast,
-)
 
-from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
+from veomni.arguments import (
+    DataArguments,
+    ModelArguments,
+    TrainingArguments,
+    parse_args,
+    save_args,
+)
 from veomni.checkpoint import build_checkpointer
 from veomni.data.diffusion.data_loader import build_dit_dataloader
-from veomni.data.diffusion.dataset import build_text_image_dataset
+from veomni.data.diffusion.dataset import build_tensor_dataset
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models import save_model_assets
-from veomni.models.transformers.flux.encode_flux import (
-    encode_prompt,
-    from_diffusers,
-    load_model,
-    load_model_from_huggingface_folder,
-    load_model_from_single_file,
+from veomni.models import (
+    build_foundation_model,
+    save_model_assets,
 )
-from veomni.models.transformers.flux.modeling_flux import FluxModel
-from veomni.models.transformers.flux.utils_flux import FluxTextEncoder2, FluxVAEEncoder, SD3TextEncoder1
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.schedulers.flow_match import FlowMatchScheduler
 from veomni.utils import helper
@@ -52,65 +48,9 @@ logger = helper.create_logger(__name__)
 
 @dataclass
 class MyDataArguments(DataArguments):
-    height: int = field(
-        default=1024,
-        metadata={"help": "Image height."},
-    )
-    width: int = field(
-        default=1024,
-        metadata={"help": "Image width."},
-    )
     datasets_repeat: int = field(
         default=1,
         metadata={"help": "The number of times to repeat the datasets."},
-    )
-
-
-@dataclass
-class MyModelArguments(ModelArguments):
-    tokenizer_1_path: str = field(
-        default=None,
-        metadata={"help": "Path to the tokenizer_1."},
-    )
-    tokenizer_2_path: str = field(
-        default=None,
-        metadata={"help": "Path to the tokenizer_2."},
-    )
-    pretrained_text_encoder_path: str = field(
-        default=None,
-        metadata={"help": "Path to the pretrained text encoder."},
-    )
-    pretrained_text_encoder_2_path: str = field(
-        default=None,
-        metadata={"help": "Path to the pretrained text encoder 2."},
-    )
-    pretrained_vae_path: str = field(
-        default=None,
-        metadata={"help": "Path to the pretrained vae."},
-    )
-    lora_rank: int = field(
-        default=4,
-        metadata={"help": "The dimension of the LoRA update matrices."},
-    )
-    lora_alpha: float = field(
-        default=4.0,
-        metadata={"help": "The weight of the LoRA update matrices."},
-    )
-    lora_target_modules: str = field(
-        default="q,k,v,o,ffn.0,ffn.2",
-        metadata={"help": "Modules to train with LoRA (must be in lora_target_modules_support)."},
-    )
-    lora_target_modules_support: str = field(
-        default="q,k,v,o,ffn.0,ffn.2",
-        metadata={"help": "All modules supported by the model for LoRA training."},
-    )
-    init_lora_weights: Optional[Literal["kaiming", "full"]] = field(
-        default="kaiming",
-        metadata={"help": "Initialization method for LoRA weights."},
-    )
-    pretrained_lora_path: str = field(
-        default=None,
-        metadata={"help": "Pretrained LoRA path. Required if the training is resumed."},
     )
 
 
@@ -124,19 +64,11 @@ class MyTrainingArguments(TrainingArguments):
         default_factory=list,
         metadata={"help": "Ops to save."},
     )
-    vit_lr: float = field(
-        default=1e-6,
-        metadata={"help": "Learning rate for visual encoder parameters."},
-    )
-    train_architecture: Literal["lora", "full"] = field(
-        default="full",
-        metadata={"help": "Model structure to train. LoRA training or full training."},
-    )
 
 
 @dataclass
 class Arguments:
-    model: MyModelArguments = field(default_factory=MyModelArguments)
+    model: ModelArguments = field(default_factory=ModelArguments)
     data: MyDataArguments = field(default_factory=MyDataArguments)
     train: MyTrainingArguments = field(default_factory=MyTrainingArguments)
 
@@ -164,6 +96,7 @@ def main():
     helper.enable_high_precision_for_bf16()
     if args.train.global_rank == 0:
         save_args(args, args.train.checkpoint.output_dir)
+
     # Gradient checkpointing debug
     torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.gradient_checkpointing.debug)
 
@@ -190,16 +123,11 @@ def main():
     )
 
     if args.data.data_type == "diffusion":
-        train_dataset = build_text_image_dataset(
+        train_dataset = build_tensor_dataset(
             base_path=args.data.train_path,
             metadata_path=os.path.join(args.data.train_path, "metadata.csv"),
-            height=args.data.height,
-            width=args.data.width,
-            center_crop=False,
-            random_flip=False,
             datasets_repeat=args.data.datasets_repeat,
         )
-
         args.train.compute_train_steps(
             args.data.max_seq_len,
             args.data.train_size,
@@ -221,58 +149,19 @@ def main():
     else:
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
-    # build foundation model
-    config_kwargs = {}
-    config = AutoConfig.from_pretrained(args.model.config_path, trust_remote_code=True, **config_kwargs)
-    model = FluxModel(config)
-    model_weights = load_model(
-        file_path=args.model.model_path,
-        device=f"{get_device_type()}:{args.train.local_rank}",
-        torch_dtype=torch.bfloat16,
+    model = build_foundation_model(
+        config_path=args.model.config_path,
+        weights_path=args.model.model_path,
+        init_device=args.train.init_device,
+        torch_dtype="bfloat16",
+        attn_implementation=args.model.ops_implementation.attn_implementation,
     )
-    model_weights = load_model_from_single_file(
-        state_dict=model_weights,
-        model_class=model,
-        model_resource="civitai",
-        torch_dtype=torch.bfloat16,
-        device=f"{get_device_type()}:{args.train.local_rank}",
-    )
-    model.load_state_dict(model_weights)
     model.micro_batch_size = args.train.micro_batch_size
-
-    tokenizer_1 = CLIPTokenizer.from_pretrained(args.model.tokenizer_1_path)
-    tokenizer_2 = T5TokenizerFast.from_pretrained(args.model.tokenizer_2_path)
-    text_encoder_1 = SD3TextEncoder1(vocab_size=49408)
-    text_encoder_1_weights = load_model(
-        file_path=args.model.pretrained_text_encoder_path, device=get_device_type(), torch_dtype=torch.bfloat16
-    )
-    converted_text_encoder_1_weights = from_diffusers(text_encoder_1_weights)
-    text_encoder_1.load_state_dict(converted_text_encoder_1_weights)
-    text_encoder_2 = load_model_from_huggingface_folder(
-        file_path=args.model.pretrained_text_encoder_2_path,
-        model_classes=FluxTextEncoder2,
-        torch_dtype=torch.bfloat16,
-        device=get_device_type(),
-    )
-    vae_encoder = FluxVAEEncoder()
-    vae_encoder_weights = load_model(
-        file_path=args.model.pretrained_vae_path, device=get_device_type(), torch_dtype=torch.bfloat16
-    )
-    vae_encoder_weights = load_model_from_single_file(
-        state_dict=vae_encoder_weights,
-        model_class=vae_encoder,
-        model_resource="civitai",
-        torch_dtype=torch.bfloat16,
-        device=get_device_type(),
-    )
-    if hasattr(vae_encoder, "eval"):
-        vae_encoder = vae_encoder.eval()
-    vae_encoder.load_state_dict(vae_encoder_weights)
-    vae_encoder.to(torch.bfloat16)
 
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
+    lora_target_modules_support = ["q", "k", "v", "o", "ffn.0", "ffn.2"]
     if args.train.train_architecture == "lora":
         logger.info_rank0("train_architecture is lora")
         _use_orig_params = True
@@ -284,7 +173,7 @@ def main():
             lora_target_modules=args.model.lora_target_modules,
             init_lora_weights=args.model.init_lora_weights,
             pretrained_lora_path=args.model.pretrained_lora_path,
-            lora_target_modules_support=args.model.lora_target_modules_support.split(","),
+            lora_target_modules_support=lora_target_modules_support,
         )
         model.to(torch.bfloat16)
     else:
@@ -348,10 +237,12 @@ def main():
             record_shapes=args.train.profile.record_shapes,
             profile_memory=args.train.profile.profile_memory,
             with_stack=args.train.profile.with_stack,
+            with_modules=args.train.profile.with_modules,
             global_rank=args.train.global_rank,
         )
         profiler.start()
 
+    # Build diffusion scheduler: FlowMatchScheduler
     flow_scheduler = FlowMatchScheduler(
         shift=5,
         sigma_min=0.0,
@@ -425,7 +316,7 @@ def main():
         data_iterator = iter(train_dataloader)
 
         epoch_loss = 0
-        for _ in range(args.train.train_steps):
+        for _ in range(start_step, args.train.train_steps):
             global_step += 1
             synchronize()
             total_loss = 0
@@ -438,7 +329,7 @@ def main():
 
             num_micro_steps = len(micro_batches)
 
-            for micro_step, batch in enumerate(micro_batches):
+            for micro_step, micro_batch in enumerate(micro_batches):
                 if (
                     args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
                     and not args.train.accelerator.fsdp_config.reshard_after_backward
@@ -448,31 +339,34 @@ def main():
                         model.set_reshard_after_backward(False)
                     elif micro_step == num_micro_steps - 1:
                         model.set_reshard_after_backward(True)
-                # Data
-                text, image = batch["text"], batch["image"]
-                prompt_emb = encode_prompt(
-                    prompt=text,
-                    positive=True,
-                    device=model.device,
-                    text_encoder_1=text_encoder_1.to(model.device),
-                    tokenizer_1=tokenizer_1,
-                    text_encoder_2=text_encoder_2.to(model.device),
-                    tokenizer_2=tokenizer_2,
-                )
-                if "latents" in batch:
-                    latents = batch["latents"].to(dtype=torch.bfloat16, device=model.device)
+                environ_meter.add(micro_batch, model_type="wan")
+                latents = micro_batch["latents"].to(model.device)
+                prompt_emb = micro_batch["prompt_emb"]
+                if args.train.micro_batch_size > 1:
+                    prompt_emb["context"] = prompt_emb["context"].squeeze(1).to(model.device)
+                    image_emb = micro_batch["image_emb"]
+                    if "clip_feature" in image_emb:
+                        image_emb["clip_feature"] = image_emb["clip_feature"].squeeze(1).to(model.device)
+                    if "y" in image_emb:
+                        image_emb["y"] = image_emb["y"].squeeze(1).to(model.device)
                 else:
-                    vae_encoder.to(model.device)
-                    latents = vae_encoder(image.to(dtype=torch.bfloat16, device=model.device))
+                    prompt_emb["context"] = prompt_emb["context"][0].to(model.device)
+                    image_emb = micro_batch["image_emb"]
+                    if "clip_feature" in image_emb:
+                        image_emb["clip_feature"] = image_emb["clip_feature"][0].to(model.device)
+                    if "y" in image_emb:
+                        image_emb["y"] = image_emb["y"][0].to(model.device)
 
-                environ_meter.add(latents, model_type="flux")
                 noise = torch.randn_like(latents)
-                timestep_id = torch.randint(0, flow_scheduler.num_train_timesteps, (1,))
+                timestep_id = torch.randint(0, flow_scheduler.num_train_timesteps, (latents.size(0),))
                 timestep = flow_scheduler.timesteps[timestep_id].to(latents.dtype).to(latents.device)
-                extra_input = model.prepare_extra_input(latents)
                 # noise and target
                 noisy_latents = flow_scheduler.add_noise(
-                    latents, noise, timestep, args.train.micro_batch_size, args.train.enable_mixed_precision
+                    latents,
+                    noise,
+                    timestep,
+                    args.train.micro_batch_size,
+                    args.train.enable_mixed_precision,
                 )
                 training_target = flow_scheduler.training_target(latents, noise, timestep)
                 # predict noise
@@ -481,17 +375,19 @@ def main():
                         noisy_latents,
                         timestep=timestep,
                         **prompt_emb,
-                        **extra_input,
+                        **image_emb,
                     )
                     # MSE loss with weights
-                    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float(), reduction="none")
+                    loss = F.mse_loss(noise_pred.float(), training_target.float(), reduction="none")
                     weight = flow_scheduler.training_weight(timestep, args.train.micro_batch_size)
+                    # shape: [B, ...], weight: [B]
                     loss = (loss.view(latents.size(0), -1).mean(dim=1) * weight).mean() / len(micro_batches)
+
                 with model_bwd_context:
                     loss.backward()
 
                 total_loss += loss.item()
-                del batch
+                del micro_batch
 
             grad_norm = veomni_clip_grad_norm(model, args.train.optimizer.max_grad_norm)
 

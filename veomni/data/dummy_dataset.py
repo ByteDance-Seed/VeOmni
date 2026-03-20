@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import torch
 from torch.utils.data import Dataset
@@ -321,6 +321,59 @@ class DummyUGDataset(Dataset):
         ]
 
 
+class WanT2VDataset(Dataset):
+    """
+    Generates ready-to-use WAN T2V transformer inputs for CI/SP-alignment testing.
+
+    Dimensions are hard-coded to match the toy config
+    (``tests/toy_config/wan_t2v_toy/config.json``):
+
+    * ``in_channels = 16``, ``patch_size = (1, 2, 2)``
+    * ``text_dim = 512``
+    * latent shape ``(1, 4, 1, 16, 16)`` → 64 patches after patchification,
+      which is divisible by SP size 2.
+
+    Each sample is a dict whose values can be fed **directly** to
+    ``WanTransformer3DModel.forward`` (after moving to the target device):
+
+    * ``hidden_states``:        ``(1, IN_CHANNELS, NUM_FRAMES, HEIGHT, WIDTH)``
+    * ``training_target``:      ``(1, IN_CHANNELS, NUM_FRAMES, HEIGHT, WIDTH)``
+    * ``encoder_hidden_states``: ``(1, TEXT_SEQ_LEN, TEXT_DIM)``
+    * ``timestep``:              ``(1,)``  – fixed float value
+    """
+
+    IN_CHANNELS = 16  # matches toy config in_channels * 2 (mean logvar)
+    NUM_FRAMES = 10
+    HEIGHT = 16  # latent spatial size; gives 8 patches with patch_size=2
+    WIDTH = 16
+    TEXT_SEQ_LEN = 10
+    TEXT_DIM = 512  # matches toy config text_dim
+    TIMESTEP = 500.0
+
+    def __init__(self, size: int = 16) -> None:
+        self.size = size
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        gen = torch.Generator().manual_seed(index)
+        hidden_states = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
+        training_target = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
+        encoder_hidden_states = torch.randn(1, self.TEXT_SEQ_LEN, self.TEXT_DIM, generator=gen)
+        latents = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
+        timestep = torch.tensor([self.TIMESTEP])
+        return [
+            {
+                "hidden_states": hidden_states,
+                "training_target": training_target,
+                "encoder_hidden_states": encoder_hidden_states,
+                "timestep": timestep,
+                "latents": latents,
+            }
+        ]
+
+
 def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset":
     if task_type == "text":
         return DummyTextDataset(size=size, seq_length=max_seq_len)
@@ -334,5 +387,7 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset
         return DummyQwen3OmniMoeDataset(size=size, seq_length=max_seq_len, patch_size=16)
     elif task_type == "ug":
         return DummyUGDataset(size=size, seq_length=max_seq_len)
+    elif task_type == "wan_t2v":
+        return WanT2VDataset(size=size)
     else:
         raise ValueError(f"Dummy dataset type ({task_type}) is not supported.")

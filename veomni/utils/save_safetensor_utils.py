@@ -96,6 +96,23 @@ def _save_hf_safetensor_distributed(
 
     apply_dcp_consolidation_patch()
 
+    save_state = get_model_save_state(model, fqn_to_index_mapping)
+
+    # Filter fqn_to_index_mapping to only include keys that exist in save_state.
+    # This is necessary when training excludes certain modules (e.g., MTP) but the original
+    # fqn_to_index_mapping parsed from model.safetensors.index.json still contains those weights.
+    # Without this filtering, HuggingFaceStorageWriter's consolidation phase would create invalid
+    # metadata entries (with default values like empty shape and 0 dtype_size) for non-existent
+    # weights, resulting in corrupted safetensors output.
+    if fqn_to_index_mapping is not None:
+        original_mapping_size = len(fqn_to_index_mapping)
+        fqn_to_index_mapping = {k: v for k, v in fqn_to_index_mapping.items() if k in save_state}
+        if len(fqn_to_index_mapping) < original_mapping_size:
+            logger.info_rank0(
+                f"Filtered fqn_to_index_mapping from {original_mapping_size} to {len(fqn_to_index_mapping)} keys "
+                f"to match actual model weights"
+            )
+
     storage_writer = HuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
@@ -103,8 +120,6 @@ def _save_hf_safetensor_distributed(
         enable_consolidation=True,
         thread_count_consolidation=5,
     )
-
-    save_state = get_model_save_state(model, fqn_to_index_mapping)
 
     logger.info_rank0("Starting distributed HuggingFace safetensors save...")
     if dist.is_initialized():

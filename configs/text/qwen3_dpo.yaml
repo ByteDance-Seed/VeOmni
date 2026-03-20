@@ -1,0 +1,56 @@
+# DPO training with trl-lib/ultrafeedback_binarized (same dataset as HuggingFace TRL's DPO example)
+#
+# Step 1 - Download model:
+#   python scripts/download_hf_model.py --repo_id Qwen/Qwen3-0.6B --local_dir .
+#   # saves to ./Qwen3-0.6B
+#
+# Step 2 - Prepare data:
+#   python scripts/download_hf_data.py --repo_id trl-lib/ultrafeedback_binarized \
+#       --local_dir ./ultrafeedback_binarized --allow_patterns "*.parquet"
+
+model:
+  model_path: ./Qwen3-0.6B
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: ./ultrafeedback_binarized
+  data_type: dpo
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 20000000
+
+train:
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz_buffer_size: 200
+  optimizer:
+    type: adamw
+    lr: 5.0e-7
+    lr_decay_style: cosine
+    lr_warmup_ratio: 0.1
+    max_grad_norm: 1.0
+  num_train_epochs: 1
+  enable_mixed_precision: true
+  init_device: meta
+  checkpoint:
+    output_dir: Qwen3-0.6B-dpo-ultrafeedback
+    manager: dcp
+    save_steps: 200
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: Qwen3-0.6B-dpo-ultrafeedback
+
+dpo_config:
+  beta: 0.1
+  label_smoothing: 0.0
+  loss_type: sigmoid
+  reference_free: false
+  refer_model_precision: bfloat16

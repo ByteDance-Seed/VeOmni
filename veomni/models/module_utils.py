@@ -30,8 +30,6 @@ try:
     from hdfs_io import copy  # for internal use only
 except ImportError:
     from ..utils.hdfs_io import copy
-from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME as DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME
-from diffusers.utils import SAFETENSORS_WEIGHTS_NAME as DIFFUSERS_SAFETENSORS_WEIGHTS_NAME
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import distributed as dist
@@ -44,6 +42,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
+from ..utils.import_utils import is_diffusers_available
 
 
 if TYPE_CHECKING:
@@ -129,15 +128,6 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
         shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
         return [StateDictIterator(shard_file) for shard_file in shard_files]
 
-    resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFETENSORS_WEIGHTS_NAME, **cache_kwargs)
-    if resolved_weight_file:
-        return [StateDictIterator(resolved_weight_file)]
-
-    resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
-    if resolved_weight_file:
-        shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-        return [StateDictIterator(shard_file) for shard_file in shard_files]
-
     resolved_weight_file = cached_file(weights_path, WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
         return [StateDictIterator(resolved_weight_file)]
@@ -146,6 +136,19 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     if resolved_weight_file:
         shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
         return [StateDictIterator(shard_file) for shard_file in shard_files]
+
+    if is_diffusers_available():
+        from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME as DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME
+        from diffusers.utils import SAFETENSORS_WEIGHTS_NAME as DIFFUSERS_SAFETENSORS_WEIGHTS_NAME
+
+        resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFETENSORS_WEIGHTS_NAME, **cache_kwargs)
+        if resolved_weight_file:
+            return [StateDictIterator(resolved_weight_file)]
+
+        resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
+        if resolved_weight_file:
+            shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
+            return [StateDictIterator(shard_file) for shard_file in shard_files]
 
     raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
 

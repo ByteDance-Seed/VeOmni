@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 import torch
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 from veomni.utils.registry import Registry
+
+
+_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
 
 if TYPE_CHECKING:
@@ -103,6 +107,78 @@ def process_conversation_example(
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
+
+
+@DATA_TRANSFORM_REGISTRY.register("dpo")
+def process_dpo_example(
+    example: Dict[str, Any],
+    chat_template: "ChatTemplate" = None,
+    tokenizer: "PreTrainedTokenizer" = None,
+    max_seq_len: int = 2048,
+    **kwargs,
+) -> List[Dict[str, "torch.Tensor"]]:
+    """Process a DPO preference pair into a single flat sample.
+
+    Chosen and rejected sequences are concatenated into one 1-D tensor with
+    ``position_ids`` that reset at the boundary so that flash-attention treats
+    them as two independent sequences.  This format is directly compatible with
+    ``MainCollator`` (packing + SP) — no DPO-specific collator is needed.
+
+    Supported input formats:
+      1. Conversation: {"chosen": [messages...], "rejected": [messages...]}
+      2. Plaintext with prompt: {"prompt": str, "chosen": str, "rejected": str}
+
+    Returns:
+        A list with one dict.  Each value is a 1-D tensor of length
+        ``len_chosen + len_rejected``.  Keys: ``input_ids``, ``attention_mask``,
+        ``labels``, ``position_ids``.
+    """
+    chosen_raw = example["chosen"]
+    rejected_raw = example["rejected"]
+
+    if isinstance(chosen_raw, list):
+        assert chat_template is not None, "chat_template is required for conversation-format DPO data"
+        chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
+        rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
+    else:
+        assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"
+        prompt = example.get("prompt", "")
+        chosen_text = prompt + chosen_raw
+        rejected_text = prompt + rejected_raw
+
+        chosen_ids = tokenizer.encode(chosen_text, add_special_tokens=True)[:max_seq_len]
+        rejected_ids = tokenizer.encode(rejected_text, add_special_tokens=True)[:max_seq_len]
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True) if prompt else []
+        prompt_len = len(prompt_ids)
+
+        chosen_tok = {
+            "input_ids": chosen_ids,
+            "attention_mask": [1] * len(chosen_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + chosen_ids[prompt_len:],
+        }
+        rejected_tok = {
+            "input_ids": rejected_ids,
+            "attention_mask": [1] * len(rejected_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + rejected_ids[prompt_len:],
+        }
+
+    def _to_tensor(v):
+        return v if isinstance(v, torch.Tensor) else torch.tensor(v)
+
+    c_ids = _to_tensor(chosen_tok["input_ids"])
+    r_ids = _to_tensor(rejected_tok["input_ids"])
+    c_len = c_ids.shape[-1]
+    r_len = r_ids.shape[-1]
+
+    result = {
+        "input_ids": torch.cat([c_ids, r_ids]),
+        "attention_mask": torch.cat(
+            [_to_tensor(chosen_tok["attention_mask"]), _to_tensor(rejected_tok["attention_mask"])]
+        ),
+        "labels": torch.cat([_to_tensor(chosen_tok["labels"]), _to_tensor(rejected_tok["labels"])]),
+        "position_ids": torch.cat([torch.arange(c_len, dtype=torch.int64), torch.arange(r_len, dtype=torch.int64)]),
+    }
+    return [result]
 
 
 @DATA_TRANSFORM_REGISTRY.register("classification")
@@ -198,75 +274,12 @@ def process_classification_example(
     return examples
 
 
-@DATA_TRANSFORM_REGISTRY.register("qwen2_vl")
-@DATA_TRANSFORM_REGISTRY.register("qwen2_5_vl")
-def process_sample_qwen2_5_vl(
+def _process_sample_qwen_vl_base(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
     chat_template: "ChatTemplate",
     position_id_func: "Callable",
-    **kwargs,
-):
-    from .multimodal import conv_preprocess
-    from .multimodal.image_utils import fetch_images
-    from .multimodal.video_utils import fetch_videos
-
-    source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
-
-    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
-        conversations = sample["conversations"]
-    else:
-        conversations = sample
-    conversations = conv_preprocess(source, conversations, **kwargs)
-
-    token_num_inputs, image_inputs, video_inputs = {}, {}, {}
-    image_grid_thw, video_grid_thw = None, None
-    if "images" in sample and sample["images"]:
-        images = fetch_images(sample["images"], **kwargs)
-        image_inputs = processor.image_processor(images=images, return_tensors="pt")
-        image_grid_thw = image_inputs["image_grid_thw"]
-        merge_length = processor.image_processor.merge_size**2
-        image_token_num = image_grid_thw.prod(dim=-1) // merge_length
-        token_num_inputs["image"] = image_token_num
-    if "videos" in sample and sample["videos"]:
-        videos, _ = fetch_videos(sample["videos"], **kwargs)
-        video_inputs = processor.video_processor(videos=videos, return_tensors="pt")
-        video_grid_thw = video_inputs["video_grid_thw"]
-        merge_length = processor.video_processor.merge_size**2
-        video_token_num = video_grid_thw.prod(dim=-1) // merge_length
-        token_num_inputs["video"] = video_token_num
-
-    tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
-    tokenized_example = {
-        k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
-    }
-    input_ids = tokenized_example["input_ids"]
-
-    tokenized_example["position_ids"] = position_id_func(
-        input_ids=input_ids.unsqueeze(0),
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=video_grid_thw,
-        attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
-    )["position_ids"]
-    tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
-
-    tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
-    tokenized_example["video_mask"] = tokenized_example["input_ids"] == VIDEO_INPUT_INDEX
-    tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
-    tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
-    tokenized_example.update(image_inputs)
-    tokenized_example.update(video_inputs)
-
-    return [tokenized_example]
-
-
-@DATA_TRANSFORM_REGISTRY.register("qwen3_vl")
-@DATA_TRANSFORM_REGISTRY.register("qwen3_vl_moe")
-def process_sample_qwen3_vl(
-    sample: Dict[str, Any],
-    processor: "ProcessorMixin",
-    chat_template: "ChatTemplate",
-    position_id_func: "Callable",
+    use_mm_token_type_ids: bool = False,
     **kwargs,
 ):
     from .multimodal import conv_preprocess
@@ -279,13 +292,12 @@ def process_sample_qwen3_vl(
         conversations = sample["conversations"]
     else:
         conversations = sample
-
     conversations = conv_preprocess(source, conversations, **kwargs)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
+    video_metadata = None
 
-    tokenized_example = {}
     if "images" in sample and sample["images"]:
         images = fetch_images(sample["images"], **kwargs)
         image_inputs = processor.image_processor(images=images, return_tensors="pt")
@@ -293,48 +305,88 @@ def process_sample_qwen3_vl(
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
-        tokenized_example = chat_template.encode_messages(conversations, token_num_inputs)
+
     if "videos" in sample and sample["videos"]:
         videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
         video_inputs = processor.video_processor(
             videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
         )
         video_grid_thw = video_inputs["video_grid_thw"]
+        video_metadata = video_inputs.pop("video_metadata", None)
+
         merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["video"] = video_token_num
 
-        video_metadata = video_inputs.pop("video_metadata")
+    # Encoding
+    encode_kwargs = {}
+    if video_metadata is not None:
+        encode_kwargs["video_metadata"] = video_metadata
 
-        tokenized_example = chat_template.encode_messages(
-            conversations, token_num_inputs, video_metadata=video_metadata
-        )
-
-    if not tokenized_example:
-        tokenized_example = chat_template.encode_messages(conversations)
+    tokenized_example = chat_template.encode_messages(conversations, token_num_inputs, **encode_kwargs)
 
     tokenized_example = {
         k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in tokenized_example.items()
     }
 
     input_ids = tokenized_example["input_ids"]
-    tokenized_example["position_ids"] = position_id_func(
-        input_ids=input_ids.unsqueeze(0),
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=video_grid_thw,
-        attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
-    )["position_ids"]
+    attention_mask = tokenized_example["attention_mask"]
 
+    # Masks and Token Types
+    tokenized_example["image_mask"] = input_ids == IMAGE_INPUT_INDEX
+    tokenized_example["video_mask"] = input_ids == VIDEO_INPUT_INDEX
+
+    # Position IDs
+    position_id_func_kwargs = {
+        "input_ids": input_ids.unsqueeze(0),
+        "image_grid_thw": image_grid_thw,
+        "video_grid_thw": video_grid_thw,
+        "attention_mask": attention_mask.unsqueeze(0),
+    }
+
+    if use_mm_token_type_ids:
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        mm_token_type_ids[tokenized_example["image_mask"]] = 1
+        mm_token_type_ids[tokenized_example["video_mask"]] = 2
+        tokenized_example["mm_token_type_ids"] = mm_token_type_ids
+        position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
+
+    tokenized_example["position_ids"] = position_id_func(**position_id_func_kwargs)["position_ids"]
     tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
 
-    tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
-    tokenized_example["video_mask"] = tokenized_example["input_ids"] == VIDEO_INPUT_INDEX
+    # Final cleanup
     tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
     tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
 
     return [tokenized_example]
+
+
+@DATA_TRANSFORM_REGISTRY.register("qwen2_vl")
+@DATA_TRANSFORM_REGISTRY.register("qwen2_5_vl")
+@DATA_TRANSFORM_REGISTRY.register("qwen3_vl")
+@DATA_TRANSFORM_REGISTRY.register("qwen3_vl_moe")
+@DATA_TRANSFORM_REGISTRY.register("qwen3_5")
+def process_sample_qwen_vl(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    **kwargs,
+):
+    """
+    Unified processing function for Qwen-VL series models.
+    Automatically determines whether to use mm_token_type_ids based on transformers version.
+    """
+    return _process_sample_qwen_vl_base(
+        sample,
+        processor,
+        chat_template,
+        position_id_func,
+        use_mm_token_type_ids=_is_transformers_v5,
+        **kwargs,
+    )
 
 
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")

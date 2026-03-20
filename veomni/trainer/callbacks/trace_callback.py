@@ -148,6 +148,7 @@ class ProfileTraceCallback(Callback):
                 record_shapes=args.train.profile.record_shapes,
                 profile_memory=args.train.profile.profile_memory,
                 with_stack=args.train.profile.with_stack,
+                with_modules=args.train.profile.with_modules,
                 global_rank=args.train.global_rank,
             )
             self.profiler.start()
@@ -200,8 +201,9 @@ class EnvironMeterCallback(Callback):
             for k, v in step_train_metrics.items()
         }
 
-        lr = max(self.trainer.lr_scheduler.get_last_lr())
-        step_train_metrics["training/lr"] = lr
+        if self.trainer.lr_scheduler is not None:
+            lr = max(self.trainer.lr_scheduler.get_last_lr())
+            step_train_metrics["training/lr"] = lr
 
         step_env_metrics.update(step_train_metrics)
 

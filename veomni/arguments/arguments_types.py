@@ -144,6 +144,10 @@ class ProfileConfig:
         default=True,
         metadata={"help": "Whether or not to record the stack traces."},
     )
+    with_modules: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to record module hierarchy in profiling traces."},
+    )
     rank0_only: bool = field(
         default=True,
         metadata={
@@ -694,6 +698,10 @@ class ModelArguments:
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
+    lora_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for lora."},
+    )
     ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
 
     def __post_init__(self):
@@ -805,7 +813,7 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification"] = field(
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -858,6 +866,8 @@ class DataArguments:
                 self.text_keys = "messages"
             elif self.data_type == "classification":
                 self.text_keys = "text"
+            elif self.data_type == "dpo":
+                self.text_keys = "chosen"
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

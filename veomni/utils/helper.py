@@ -88,11 +88,18 @@ def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
         # packed micro batch
         seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
         return seqlens
-    else:
+    elif "attention_mask" in micro_batch:
         # unpacked sample
         attention_mask = micro_batch["attention_mask"]
         seqlens = attention_mask.sum().item()
         return [seqlens]
+    elif "chosen_attention_mask" in micro_batch:
+        # DPO preference pair — report combined chosen + rejected length
+        chosen_len = micro_batch["chosen_attention_mask"].sum().item()
+        rejected_len = micro_batch["rejected_attention_mask"].sum().item()
+        return [chosen_len + rejected_len]
+    else:
+        return [0]
 
 
 def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
@@ -104,6 +111,23 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
             seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
             image_seqlens.extend(seqlens)
     return image_seqlens
+
+
+def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    dit_latents_seqlens = []
+    for latents in micro_batch["latents"]:
+        latent_shape = latents.shape
+        if len(latent_shape) == 5:
+            B = latent_shape[0]
+        else:
+            B = 1
+        C, T, H, W = latent_shape[-4:]
+        T_out = int((T - 1) / 1 + 1)
+        H_out = int((H - 2) / 2 + 1)
+        W_out = int((W - 2) / 2 + 1)
+        seqlens = B * T_out * H_out * W_out
+        dit_latents_seqlens.append(seqlens)
+    return dit_latents_seqlens
 
 
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
@@ -184,17 +208,20 @@ class EnvironMeter:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
-        if isinstance(micro_batch, List):
-            for sample in micro_batch:
-                self.batch_seqlens.extend(_compute_seqlens(sample))
-                self.images_seqlens.extend(_compute_image_seqlens(sample))
+        if getattr(self.config, "condition_model_type", None) is None:  # hf model
+            if isinstance(micro_batch, List):
+                for sample in micro_batch:
+                    self.batch_seqlens.extend(_compute_seqlens(sample))
+                    self.images_seqlens.extend(_compute_image_seqlens(sample))
+                    if self.enable_multisource:
+                        self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
+            else:
+                self.batch_seqlens.extend(_compute_seqlens(micro_batch))
+                self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
                 if self.enable_multisource:
-                    self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
-        else:
-            self.batch_seqlens.extend(_compute_seqlens(micro_batch))
-            self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
-            if self.enable_multisource:
-                self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+                    self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+        else:  # dit diffusers model
+            self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0:
@@ -603,6 +630,7 @@ def create_profiler(
     record_shapes: bool,
     profile_memory: bool,
     with_stack: bool,
+    with_modules: bool,
     global_rank: int,
 ):
     """
@@ -701,7 +729,7 @@ def create_profiler(
         on_trace_ready=handler_fn,
         record_shapes=record_shapes,
         profile_memory=profile_memory,
-        with_modules=True,
+        with_modules=with_modules,
         with_stack=with_stack,
         experimental_config=experimental_config,
     )

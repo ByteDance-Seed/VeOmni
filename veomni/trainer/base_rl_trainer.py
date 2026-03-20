@@ -22,6 +22,7 @@ RLTrainer:
     2. postforward to gather outputs to get sample-wise logits
 """
 
+from dataclasses import asdict
 from typing import Any, Dict, List
 
 import torch
@@ -50,8 +51,10 @@ class BaseRLTrainer(BaseTrainer):
     def _build_dataloader(self):
         """Do not build collate_fn for RL trainer."""
         args: VeOmniArguments = self.args
+        dataloader_kwargs = asdict(args.data.dataloader)
+        dataloader_type = dataloader_kwargs.pop("type")
         self.train_dataloader = build_dataloader(
-            dataloader_type=args.data.dataloader.type,
+            dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
             global_batch_size=args.train.global_batch_size,
@@ -62,12 +65,9 @@ class BaseRLTrainer(BaseTrainer):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
-            num_workers=args.data.dataloader.num_workers,
-            drop_last=args.data.dataloader.drop_last,
-            pin_memory=args.data.dataloader.pin_memory,
-            prefetch_factor=args.data.dataloader.prefetch_factor,
             seed=args.train.seed,
             build_collate_fn=False,
+            **dataloader_kwargs,
         )
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
