@@ -105,9 +105,9 @@ KERNEL_REGISTRY.register(
         name="liger",
         op_name="apply_rotary_pos_emb",
         variant="full",
-        factory=lambda: __import__(
-            "liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]
-        ).liger_rotary_pos_emb,
+        factory=lambda: (
+            __import__("liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]).liger_rotary_pos_emb
+        ),
         hardware=HardwareRequirement(device_type="gpu"),
         description="LigerKernel fused RoPE (full head_dim only)",
     )
