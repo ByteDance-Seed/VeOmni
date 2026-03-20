@@ -148,6 +148,7 @@ class ProfileTraceCallback(Callback):
                 record_shapes=args.train.profile.record_shapes,
                 profile_memory=args.train.profile.profile_memory,
                 with_stack=args.train.profile.with_stack,
+                with_modules=args.train.profile.with_modules,
                 global_rank=args.train.global_rank,
             )
             self.profiler.start()
