@@ -102,7 +102,6 @@ class CheckpointerCallback(Callback):
     def _save_checkpoint(self, state: TrainerState):
         """Save distributed checkpoint and optimizer state at each save_steps."""
         args: "VeOmniArguments" = self.trainer.args
-        self._last_saved_step = state.global_step
 
         save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
 
@@ -123,6 +122,7 @@ class CheckpointerCallback(Callback):
         helper.empty_cache()
         dist.barrier()
 
+        self._last_saved_step = state.global_step
         logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
 
@@ -169,8 +169,6 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
 
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save model in HuggingFace format."""
-        self._last_saved_step = state.global_step
-
         args: "VeOmniArguments" = self.trainer.args
         save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
         if not os.path.exists(save_checkpoint_path):
@@ -201,13 +199,14 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         helper.empty_cache()
         dist.barrier()
 
+        self._last_saved_step = state.global_step
+
 
 class HFLoraCkptCallback(HuggingfaceCkptCallback):
     """Save LoRA HF weights once at train end."""
 
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
-        self._last_saved_step = state.global_step
         args: "VeOmniArguments" = self.trainer.args
         save_checkpoint_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
         if not os.path.exists(save_checkpoint_path):
@@ -239,3 +238,5 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
 
         helper.empty_cache()
         dist.barrier()
+
+        self._last_saved_step = state.global_step
