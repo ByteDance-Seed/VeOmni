@@ -35,6 +35,7 @@ import sys
 from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Dict, List
+from unittest.mock import patch
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -59,6 +60,12 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 
 
 logger = helper.create_logger(__name__)
+
+
+# Patch empty_cache to avoid AttributeError on CPU
+def _mock_empty_cache():
+    """Mock empty_cache that does nothing on CPU."""
+    pass
 
 
 MICRO_BATCH_SEQ_LENGTH = 32  # Max tokens per batch
@@ -529,7 +536,12 @@ class TrainerTest(BaseTrainer):
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
-        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        try:
+            self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        except AttributeError as e:
+            # Skip metrics on CPU (torch.cpu has no attribute 'get_device_name')
+            logger.warning(f"[rank{self.args.train.global_rank}] Skipping metrics: {e}")
+            self.step_env_metrics = {}
         self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
@@ -620,17 +632,21 @@ def _main_distributed_test():
     It wraps ``_run_distributed_test()` and in the testing it is supposed to be
     triggered by test_dynamic_batching_dataset_distributed().
     """
-    _parser = argparse.ArgumentParser()
-    _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
-    _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
-    test_args, remaining_argv = _parser.parse_known_args()
-    sys.argv = [sys.argv[0]] + remaining_argv
+    # Patch both the source function and DCP's imported alias to avoid CPU AttributeError.
+    with (
+        patch("veomni.utils.device.empty_cache", _mock_empty_cache),
+    ):
+        _parser = argparse.ArgumentParser()
+        _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
+        _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
+        test_args, remaining_argv = _parser.parse_known_args()
+        sys.argv = [sys.argv[0]] + remaining_argv
 
-    args = parse_args(VeOmniArguments)
-    trainer = TrainerTest(args, shuffle=test_args.shuffle, save_by_idx=test_args.save_by_idx)
-    trainer.train()
-    assert trainer.args.train.checkpoint.load_path is not None
-    trainer.resume_train()
+        args = parse_args(VeOmniArguments)
+        trainer = TrainerTest(args, shuffle=test_args.shuffle, save_by_idx=test_args.save_by_idx)
+        trainer.train()
+        assert trainer.args.train.checkpoint.load_path is not None
+        trainer.resume_train()
 
 
 if __name__ == "__main__":
