@@ -14,6 +14,7 @@
 
 
 import os
+import random
 from functools import partial
 from typing import Callable, Dict, List, Literal, Optional
 
@@ -38,6 +39,8 @@ from ..utils.dist_utils import main_process_first
 from ..utils.multisource_utils import parse_multisource_config
 
 
+logger = logging.get_logger(__name__)
+
 DATASET_REGISTRY = Registry("Dataset")
 
 
@@ -45,22 +48,25 @@ def build_dataset(dataset_name: str, **kwargs) -> "Dataset":
     return DATASET_REGISTRY[dataset_name](**kwargs)
 
 
-logger = logging.get_logger(__name__)
-
-
 class MappingDataset(Dataset):
     def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
         self._data = data
         self._transform = transform
+        self.indices = list(range(len(self._data)))
+        self.data_len = len(self.indices)
 
     def __len__(self) -> int:
-        return len(self._data)
+        return self.data_len
 
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
+        if index >= len(self.indices):
+            random.shuffle(self.indices)
+            index = index % len(self.indices)
+        mapped_idx = self.indices[index]
         if self._transform is not None:
-            return self._transform(self._data[index])
+            return self._transform(self._data[mapped_idx])
         else:
-            return self._data[index]
+            return self._data[mapped_idx]
 
 
 class IterativeDataset(IterableDataset):
@@ -108,12 +114,15 @@ class InterleavedIterableDataset(IterativeDataset):
 
 class InterleavedMappingDataset(MappingDataset):
     def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
-        self._data = data
-        self._transform = transform
+        super().__init__(data, transform)
 
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
+        if index >= len(self.indices):
+            random.shuffle(self.indices)
+            index = index % len(self.indices)
+        mapped_idx = self.indices[index]
         if self._transform is not None:
-            sample = self._data[index]
+            sample = self._data[mapped_idx]
             ds_idx = sample["ds_idx"]
             transformed_sample = self._transform(sample)
             if isinstance(transformed_sample, List):
@@ -123,7 +132,7 @@ class InterleavedMappingDataset(MappingDataset):
                 transformed_sample["ds_idx"] = ds_idx
             return transformed_sample
         else:
-            return self._data[index]
+            return self._data[mapped_idx]
 
 
 class EnergonDataset(IterativeDataset):

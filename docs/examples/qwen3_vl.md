@@ -44,25 +44,25 @@ python3 scripts/download_hf_model.py \
 ### Qwen3-VL-8B
 
 ```shell
-bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --model.model_path ./Qwen3-VL-8B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
-    --data.dataloader_type native \
+    --data.dataloader.type native \
     --data.datasets_type iterable \
     --data.source_name sharegpt4v_sft \
-    --data.num_workers 8 \
+    --data.dataloader.num_workers 8 \
     --train.micro_batch_size 3
 ```
 
 ### Qwen3-VL-30B
 
 ```shell
-bash train.sh tasks/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
     --model.model_path ./Qwen3-VL-30B-A3B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
-    --data.dataloader_type native \
+    --data.dataloader.type native \
     --data.datasets_type iterable \
     --data.source_name sharegpt4v_sft \
-    --data.num_workers 8 \
-    --train.micro_batch_size 3
+    --data.dataloader.num_workers 8 \
+    --train.micro_batch_size 2
 ```

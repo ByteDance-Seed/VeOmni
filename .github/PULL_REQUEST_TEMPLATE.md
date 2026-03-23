@@ -1,39 +1,31 @@
 ### What does this PR do?
 
-> Add **concise** overview of what this PR aims to achieve or accomplish. Reference related GitHub issues and PRs that help with the review.
+> Concise overview of the change. Reference related issues/PRs.
 
 ### Checklist Before Starting
 
-- [ ] Search for similar PRs. Paste at least one query link here: ...
-- [ ] Format the PR title as `[{modules}] {type}: {description}` (This will be checked by the CI)
-  - `{modules}` include `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`
-  - If this PR involves multiple modules, separate them with `,` like `[ci, data, model]`
-  - `{type}` is in `feat`, `fix`, `refactor`, `chore`, `test`
-  - If this PR breaks any API (CLI arguments, config, function signature, etc.), add `[BREAKING]` to the beginning of the title.
-  - Example: `[BREAKING][parallel, model] feat: dynamic batching`
+- Search for relative PRs/issues and link here: ...
+- PR title follows `[{modules}] {type}: {description}` format
+  - `{modules}`: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`
+  - `{type}`: `feat`, `fix`, `refactor`, `chore`, `test`
+  - Breaking changes: prepend `[BREAKING]` — e.g. `[BREAKING][parallel, model] feat: dynamic batching`
 
 ### Test
 
-> For changes that can not be tested by CI (e.g., algorithm implementation, new model support), validate by experiment(s) and show results like training curve plots, evaluation results, etc.
+> Validation results (training curves, eval metrics) for changes not covered by CI.
 
 ### API and Usage Example
 
-> Demonstrate how the API changes if any, and provide usage example(s) if possible.
-
-```python
-# Add code snippet or script demonstrating how to use this
-```
+> Show API changes and usage examples if applicable.
 
 ### Design & Code Changes
 
-> Demonstrate the high-level design if this PR is complex, and list the specific changes.
+> High-level design description and specific change list.
 
 ### Checklist Before Submitting
 
-> [!IMPORTANT]
-> Please check all the following items before requesting a review, otherwise the reviewer might deprioritize this PR for review.
-
-- [ ] Read the [Contribute Guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md).
-- [ ] Apply [pre-commit checks](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md?plain=1#L22): `pre-commit install && pre-commit run --all-files --show-diff-on-failure --color=always`
-- [ ] Add / Update [the documentation](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs).
-- [ ] Add unit or end-to-end test(s) to [the CI workflow](https://github.com/ByteDance-Seed/VeOmni/tree/main/.github/workflows) to cover all the code. If not feasible, explain why: ...
+- Read the [Contribute Guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md)
+- Applied pre-commit checks
+- Added/updated documentation
+- If `tasks/` training scripts were moved or renamed: updated `docs/` examples and verified `python3 scripts/ci/check_doc_task_paths.py` passes (also enforced by the **Check doc task paths** CI workflow)
+- Added tests to CI workflow (or explained why not feasible)

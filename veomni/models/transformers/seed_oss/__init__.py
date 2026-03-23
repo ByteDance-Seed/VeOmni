@@ -16,13 +16,17 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("seed_oss")
 def register_seed_oss_modeling(architecture: str):
-    from .modeling_seed_oss import (
+    from transformers import (
         SeedOssForCausalLM,
         SeedOssForQuestionAnswering,
         SeedOssForSequenceClassification,
         SeedOssForTokenClassification,
         SeedOssModel,
     )
+
+    from .modeling_seed_oss import apply_veomni_seed_oss_patch
+
+    apply_veomni_seed_oss_patch()
 
     if "ForCausalLM" in architecture:
         return SeedOssForCausalLM

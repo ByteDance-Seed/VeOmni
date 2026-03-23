@@ -30,24 +30,19 @@ try:
     from hdfs_io import copy  # for internal use only
 except ImportError:
     from ..utils.hdfs_io import copy
-from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME as DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME
-from diffusers.utils import SAFETENSORS_WEIGHTS_NAME as DIFFUSERS_SAFETENSORS_WEIGHTS_NAME
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
 from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
-from transformers.utils.import_utils import is_safetensors_available
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
-
-
-if is_safetensors_available():
-    from safetensors import safe_open
-    from safetensors.torch import save_file
+from ..utils.import_utils import is_diffusers_available
 
 
 if TYPE_CHECKING:
@@ -133,15 +128,6 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
         shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
         return [StateDictIterator(shard_file) for shard_file in shard_files]
 
-    resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFETENSORS_WEIGHTS_NAME, **cache_kwargs)
-    if resolved_weight_file:
-        return [StateDictIterator(resolved_weight_file)]
-
-    resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
-    if resolved_weight_file:
-        shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-        return [StateDictIterator(shard_file) for shard_file in shard_files]
-
     resolved_weight_file = cached_file(weights_path, WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
         return [StateDictIterator(resolved_weight_file)]
@@ -150,6 +136,19 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     if resolved_weight_file:
         shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
         return [StateDictIterator(shard_file) for shard_file in shard_files]
+
+    if is_diffusers_available():
+        from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME as DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME
+        from diffusers.utils import SAFETENSORS_WEIGHTS_NAME as DIFFUSERS_SAFETENSORS_WEIGHTS_NAME
+
+        resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFETENSORS_WEIGHTS_NAME, **cache_kwargs)
+        if resolved_weight_file:
+            return [StateDictIterator(resolved_weight_file)]
+
+        resolved_weight_file = cached_file(weights_path, DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
+        if resolved_weight_file:
+            shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
+            return [StateDictIterator(shard_file) for shard_file in shard_files]
 
     raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
 
@@ -184,7 +183,7 @@ def _dispatch_parameter(
     module, local_name = _find_submodule(module, name)
     orig_tensor = module._parameters[local_name].data
 
-    # Handle parameter slicing according to parallel_plan, now only EP-aware
+    # Handle parameter slicing according to parallel_plan, now only ExtraParallel-aware
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 

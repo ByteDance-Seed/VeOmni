@@ -111,16 +111,18 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
     dist.init_process_group(backend=args.test.backend)
 
     init_parallel_state(
-        dp_size=args.train.data_parallel_size,
-        dp_replicate_size=args.train.data_parallel_replicate_size,
-        dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
-        ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
-        ulysses_size=args.train.ulysses_parallel_size,
-        dp_mode=args.train.data_parallel_mode,
-        ep_outside=args.train.ep_outside,
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.train.accelerator.extra_parallel_names,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        ep_outside=args.train.accelerator.ep_outside,
     )
 
     try:
@@ -212,11 +214,11 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
         "tests/utils/test_rank0_load_and_broadcast_weights.py",
         "--model.config_path=test",
         "--data.train_path=tests",
-        "--train.output_dir=.tests/cache",
-        "--train.data_parallel_mode=fsdp2",
+        "--train.checkpoint.output_dir=.tests/cache",
+        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
         "--train.init_device=meta",
         "--train.enable_mixed_precision=False",
-        "--train.enable_gradient_checkpointing=False",
+        "--train.gradient_checkpointing.enable=False",
         "--train.broadcast_model_weights_from_rank0=True",
         f"--test.weights_path={weights_path}",
         f"--test.device_type={get_device_type()}",

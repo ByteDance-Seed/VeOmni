@@ -12,12 +12,16 @@ on:
     paths:
       - "**/*.py"
       - .github/workflows/npu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
   pull_request:
     branches:
       - main
     paths:
       - "**/*.py"
       - .github/workflows/npu_unit_tests.yml
+      - "pyproject.toml"
+      - "uv.lock"
 
 # Cancel jobs on the same ref if a new one is triggered
 concurrency:
@@ -91,13 +95,16 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
       - name: Run fsdp2/ep+fsdp2 clip grad norm test
         run: |
-          uv run --frozen pytest -s -x tests/utils/test_ep_clip_grad_norm.py
+          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py

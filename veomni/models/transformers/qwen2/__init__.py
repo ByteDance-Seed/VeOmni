@@ -16,10 +16,16 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen2")
 def register_qwen2_modeling(architecture: str):
-    from .modeling_qwen2 import Qwen2ForCausalLM, Qwen2Model
+    from transformers import Qwen2ForCausalLM, Qwen2ForSequenceClassification, Qwen2Model
+
+    from .modeling_qwen2 import apply_veomni_qwen2_patch
+
+    apply_veomni_qwen2_patch()
 
     if "ForCausalLM" in architecture:
         return Qwen2ForCausalLM
+    elif "ForSequenceClassification" in architecture:
+        return Qwen2ForSequenceClassification
     elif "Model" in architecture:
         return Qwen2Model
     else:

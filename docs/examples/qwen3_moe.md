@@ -106,7 +106,6 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
           ...
 
         out = fused_moe_forward(
-            module=self,
             num_experts=self.num_experts,
             routing_weights=routing_weights,
             selected_experts=selected_experts,
@@ -121,5 +120,5 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
 
 3. Train qwen3 moe model
 ```
-bash train.sh tasks/train_torch.py configs/pretrain/qwen3-moe.yaml
+bash train.sh tasks/train_text.py configs/text/qwen3-moe.yaml
 ```

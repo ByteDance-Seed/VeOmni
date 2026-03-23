@@ -11,12 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY
+from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("qwen2_vl")
+def register_qwen2_vl_model_config():
+    from .configuration_qwen2_vl import Qwen2VLConfig, apply_veomni_qwen2vl_patch
+
+    apply_veomni_qwen2vl_patch()
+
+    return Qwen2VLConfig
 
 
 @MODELING_REGISTRY.register("qwen2_vl")
 def register_qwen2_vl_modeling(architecture: str):
-    from .modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel
+    from .modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel, apply_veomni_qwen2vl_patch
+
+    apply_veomni_qwen2vl_patch()
 
     if "ForConditionalGeneration" in architecture:
         return Qwen2VLForConditionalGeneration

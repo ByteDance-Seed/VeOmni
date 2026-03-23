@@ -1,7 +1,23 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import math
 import subprocess
 from typing import ByteString, Dict, List, Union
 
+import av
 import librosa
 import numpy as np
 import PIL
@@ -34,11 +50,32 @@ def save_video_bytes_to_file(video_bytes, output_path):
         f.write(video_bytes)
 
 
+def _align_to_factor_remainder_floor(n: float, factor: int, remainder: int) -> int:
+    """Round down n to the nearest value of the form factor * k + remainder.
+
+    Examples (factor=4, remainder=1): 10 -> 9, 9 -> 9, 8 -> 5, 5 -> 5, 4 -> 1
+    Examples (factor=4, remainder=0): 10 -> 8, 9 -> 8, 8 -> 8, 5 -> 4, 3 -> 0
+    """
+    adjusted = n - remainder
+    return int(adjusted // factor) * factor + remainder
+
+
+def _align_to_factor_remainder_ceil(n: float, factor: int, remainder: int) -> int:
+    """Round up n to the nearest value of the form factor * k + remainder.
+
+    Examples (factor=4, remainder=1): 10 -> 13, 9 -> 9, 8 -> 9, 5 -> 5, 2 -> 5
+    Examples (factor=4, remainder=0): 10 -> 12, 9 -> 12, 8 -> 8, 5 -> 8, 1 -> 4
+    """
+    adjusted = n - remainder
+    return math.ceil(adjusted / factor) * factor + remainder
+
+
 def calculate_frame_indices(
     total_frames: int,
     video_fps: Union[int, float],
     fps: float = 2.0,
     frame_factor: int = None,
+    frame_factor_remainder: int = 0,
     min_frames: int = None,
     max_frames: int = None,
     **kwargs,
@@ -49,7 +86,12 @@ def calculate_frame_indices(
         total_frames: Total frames in video
         video_fps: Original video FPS
         fps: Target sampling FPS
-        frame_factor: Align output frame count to multiples of this
+        frame_factor: Align output frame count to multiples of this (when remainder=0)
+            or to factor * k + remainder form
+        frame_factor_remainder: Remainder when aligning to frame_factor. For example,
+            frame_factor=4, frame_factor_remainder=1 produces counts like 1, 5, 9, 13...
+            This is needed by video generation models (e.g., Wan2.1, CogVideoX) whose
+            temporal VAE compresses T frames to (T-1)/factor + 1 latents.
         min_frames: Minimum frames to output
         max_frames: Maximum frames to output
         **kwargs: Extra arguments (ignored)
@@ -57,24 +99,32 @@ def calculate_frame_indices(
     Returns:
         (indices, pad_count): Frame indices to sample and padding count
     """
+    r = frame_factor_remainder
+    if frame_factor is not None:
+        if frame_factor <= 0:
+            raise ValueError(f"frame_factor must be a positive integer, got {frame_factor}")
+        if not 0 <= r < frame_factor:
+            raise ValueError(f"frame_factor_remainder must be in [0, {frame_factor}), got {r}")
+
     # Calculate target frame count
     nframes = total_frames / video_fps * fps
 
     # Apply min/max limits
     if min_frames is not None:
         if frame_factor is not None:
-            min_frames = math.ceil(min_frames / frame_factor) * frame_factor
+            min_frames = _align_to_factor_remainder_ceil(min_frames, frame_factor, r)
         nframes = max(min_frames, nframes)
 
     if max_frames is not None:
         if frame_factor is not None:
-            max_frames = math.floor(max_frames / frame_factor) * frame_factor
+            max_frames = _align_to_factor_remainder_floor(max_frames, frame_factor, r)
         nframes = min(max_frames, nframes)
 
-    # Align to frame_factor
+    # Align to frame_factor (with remainder)
     if frame_factor is not None:
-        nframes = math.floor(nframes / frame_factor) * frame_factor
-        nframes = max(nframes, frame_factor)
+        nframes = _align_to_factor_remainder_floor(nframes, frame_factor, r)
+        min_valid = r if r > 0 else frame_factor
+        nframes = max(nframes, min_valid)
 
     nframes = int(max(1, nframes))
 
@@ -351,8 +401,7 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
     video_fps = metadata.average_fps
     total_frames = metadata.num_frames
 
-    # Safety margin for inaccurate frame counts
-    effective_total_frames = max(1, total_frames - 1)
+    effective_total_frames = max(1, total_frames)
 
     indices, pad_count = calculate_frame_indices(total_frames=effective_total_frames, video_fps=video_fps, **kwargs)
 
@@ -578,4 +627,85 @@ def load_video(video: VideoInput, **kwargs):
         videos, video_meta, audios, audio_meta = fetch_videos_metadata([video], **kwargs)
         return videos[0], video_meta[0], audios[0], audio_meta[0]
 
-    raise NotImplementedError(f"Unsupported video input type: {type(video)}")
+
+def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
+    """
+    video:
+        torch.Tensor
+        shape:
+            [T, C, H, W]  or
+            [T, H, W, C]
+
+    value range:
+        [-1,1] / [0,1] / [0,255]
+    """
+
+    if isinstance(video, torch.Tensor):
+        video = video.detach().cpu()
+
+    # -----------------------------
+    # format: TCHW -> THWC
+    # -----------------------------
+    if video.ndim != 4:
+        raise ValueError("video must be 4D tensor")
+
+    if video.shape[1] in (1, 3):  # TCHW
+        video = video.permute(0, 2, 3, 1)
+
+    video = video.numpy()
+
+    # -----------------------------
+    # normalize to uint8
+    # -----------------------------
+    if video.dtype != np.uint8:
+        vmin = video.min()
+        vmax = video.max()
+
+        if vmin >= -1 and vmax <= 1:
+            video = (video + 1) / 2
+
+        if vmin >= 0 and vmax <= 1:
+            video = video * 255
+            video = video.astype(np.uint8)
+        elif vmin >= 0 and vmax <= 255:
+            video = video.astype(np.uint8)
+        else:
+            video = np.clip(video, 0, 255)
+            video = video.astype(np.uint8)
+
+    # -----------------------------
+    # ensure even resolution
+    # -----------------------------
+    T, H, W, C = video.shape
+
+    H_even = H // 2 * 2
+    W_even = W // 2 * 2
+
+    video = video[:, :H_even, :W_even, :]
+
+    # -----------------------------
+    # encode video
+    # -----------------------------
+    container = av.open(output_path, mode="w")
+    stream = container.add_stream("libx264", rate=fps)
+
+    stream.width = W_even
+    stream.height = H_even
+    stream.pix_fmt = "yuv420p"
+
+    stream.codec_context.options["crf"] = "22"
+    stream.codec_context.options["preset"] = "ultrafast"
+
+    for frame in video:
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+
+        frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+
+        for packet in stream.encode(frame):
+            container.mux(packet)
+
+    for packet in stream.encode():
+        container.mux(packet)
+
+    container.close()

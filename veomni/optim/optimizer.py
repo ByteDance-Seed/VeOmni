@@ -143,19 +143,19 @@ class AnyPrecisionAdamW(Optimizer):
 
 class MultiOptimizer(Optimizer, Stateful):
     """
-    A container that handles multiple optimizers (for ep and non-ep parameters when ep+fsdp2 is enabled)
+    A container that handles multiple optimizers (for extra_parallel and non-extra_parallel parameters when extra_parallel+fsdp2 is enabled)
 
     Mapping of name -> torch.optim.Optimizer with convenience methods.
     Compatible with torch.distributed.checkpoint optimizer APIs that accept a Mapping.
 
-    This class is needed for EP+FSDP2 case because EP and non-EP param have different FSDP sharding dimension (dim-0 vs. dim-1)
-    For comparison, EP+FSDP1 also shards EP parameters along dim-0 for FSDP, so it can use the default optimizer class.
+    This class is needed for ExtraParallel+FSDP2 case because ExtraParallel and non-ExtraParallel param have different FSDP sharding dimension (dim-0 vs. dim-1)
+    For comparison, ExtraParallel+FSDP1 also shards ExtraParallel parameters along dim-0 for FSDP, so it can use the default optimizer class.
     """
 
     def __init__(
         self,
         root_model: nn.Module,
-        optimizers: dict,  # {"ep": opt1, "non_ep": opt2}
+        optimizers: dict,  # {"para_1": opt_1, "para_2": opt_2, ..., "parak": opt_k, "non_extra_parallel": opt_{k+1}}
         key_names: list[str],
     ):
         self.model = root_model
@@ -210,9 +210,9 @@ class MultiOptimizer(Optimizer, Stateful):
         return len(self.optimizers_dict)
 
 
-def _should_build_ep_aware(model: "nn.Module") -> bool:
+def _should_build_extra_parallel_aware(model: "nn.Module") -> bool:
     ps = get_parallel_state()
-    if ps.dp_mode == "fsdp2" and ps.ep_enabled:
+    if ps.dp_mode == "fsdp2" and ps.any_extra_parallel_enabled:
         return True
 
     return False
@@ -270,10 +270,9 @@ def build_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
 ) -> "torch.optim.Optimizer":
-    # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
-    if _should_build_ep_aware(model):
-        logger.info_rank0("Building EP+FSDP2 optimizer")
-        return build_ep_fsdp2_optimizer(
+    # ExtraParallel-aware routing: for FSDP2+ExtraParallel, split params into ExtraParallel and non-ExtraParallel groups and build two optimizers.
+    if _should_build_extra_parallel_aware(model):
+        return build_extra_parallel_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
     # Other cases remain the same
@@ -307,7 +306,7 @@ def build_optimizer(
     return optim
 
 
-def build_ep_fsdp2_optimizer(
+def build_extra_parallel_fsdp2_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
     betas: Tuple[float, float] = (0.9, 0.95),
@@ -320,18 +319,23 @@ def build_ep_fsdp2_optimizer(
     no_decay_params: Optional[List[str]] = None,
 ):
     """
-    Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
+    Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
 
     If param_groups provided, it can be a list of dicts with arbitrary parameter groups:
     - Example: [{"params": params1, "lr": lr1},
                 {"params": params2, "lr": lr2},
                 {"params": params3, "lr": lr3}]
-    - Each group's params are automatically split into EP and non-EP based on DTensor mesh
+    - Each group's params are automatically split into ExtraParallel1, ExtraParallel2, ... and non-ExtraParallel based on DTensor mesh
     - Custom learning rates and other optimizer settings are preserved per group
     """
-    # Collect all EP and non-EP parameters across all groups
-    ep_groups: List[Dict[str, Any]] = []
-    non_ep_groups: List[Dict[str, Any]] = []
+    parallel_state = get_parallel_state()
+
+    # Collect all ExtraParallel and non-ExtraParallel parameters across all groups
+    extra_parallel_groups = {
+        para: []  # List[Dict[str, Any]]
+        for para in parallel_state.extra_parallel_names
+    }
+    non_extra_parallel_groups: List[Dict[str, Any]] = []
 
     # Process custom param_groups if provided
     if param_groups is not None:
@@ -348,68 +352,95 @@ def build_ep_fsdp2_optimizer(
             group_lr = group_config.get("lr", lr)
             group_params = group_config["params"]
 
-            # Split this group's params into EP and non-EP
-            group_ep_params: List[torch.nn.Parameter] = []
-            group_non_ep_params: List[torch.nn.Parameter] = []
+            # Split this group's params into ExtraParallel and non-ExtraParallel
+            group_extra_parallel_params = {
+                para: []  # List[torch.nn.Parameter]
+                for para in parallel_state.extra_parallel_names
+            }
+            group_non_extra_parallel_params: List[torch.nn.Parameter] = []
 
             for p in group_params:
                 if not p.requires_grad:
                     continue
+
+                # Check if this parameter is part of ExtraParallel
+                is_extra_parallel_params = False
                 if DTensor is not None and isinstance(p, DTensor):
                     mesh = getattr(p, "device_mesh", None)
                     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-                    if "ep_fsdp" in names:
-                        group_ep_params.append(p)
-                        continue
-                group_non_ep_params.append(p)
+                    for para in parallel_state.extra_parallel_names:
+                        if f"{para}_fsdp" in names:
+                            group_extra_parallel_params[para].append(p)
+                            is_extra_parallel_params = True
+                            break
+
+                if not is_extra_parallel_params:
+                    group_non_extra_parallel_params.append(p)
 
             # Create subgroups with weight decay handling
-            if group_ep_params:
-                group_ep_subgroups = _make_param_groups_for_subset(
-                    model, group_ep_params, weight_decay, no_decay_modules, no_decay_params
-                )
-                for subgroup in group_ep_subgroups:
-                    subgroup["lr"] = group_lr
-                    # Preserve other custom settings from original group
-                    for key, value in group_config.items():
-                        if key not in ["params", "lr", "weight_decay"]:
-                            subgroup[key] = value
-                ep_groups.extend(group_ep_subgroups)
+            for para in parallel_state.extra_parallel_names:
+                if group_extra_parallel_params[para]:
+                    group_para_subgroups = _make_param_groups_for_subset(
+                        model, group_extra_parallel_params[para], weight_decay, no_decay_modules, no_decay_params
+                    )
+                    for subgroup in group_para_subgroups:
+                        subgroup["lr"] = group_lr
+                        # Preserve other custom settings from original group
+                        for key, value in group_config.items():
+                            if key not in ["params", "lr", "weight_decay"]:
+                                subgroup[key] = value
+                    extra_parallel_groups[para].extend(group_para_subgroups)
 
-            if group_non_ep_params:
-                group_non_ep_subgroups = _make_param_groups_for_subset(
-                    model, group_non_ep_params, weight_decay, no_decay_modules, no_decay_params
+            if group_non_extra_parallel_params:
+                group_non_extra_parallel_subgroups = _make_param_groups_for_subset(
+                    model, group_non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
                 )
-                for subgroup in group_non_ep_subgroups:
+                for subgroup in group_non_extra_parallel_subgroups:
                     subgroup["lr"] = group_lr
                     # Preserve other custom settings from original group
                     for key, value in group_config.items():
                         if key not in ["params", "lr", "weight_decay"]:
                             subgroup[key] = value
-                non_ep_groups.extend(group_non_ep_subgroups)
+                non_extra_parallel_groups.extend(group_non_extra_parallel_subgroups)
     else:
         # Default case (param_groups is None): all model parameters with uniform settings(lr)
-        ep_params: List[torch.nn.Parameter] = []
-        non_ep_params: List[torch.nn.Parameter] = []
+        extra_parallel_params = {
+            para: []  # List[torch.nn.Parameter]
+            for para in parallel_state.extra_parallel_names
+        }
+        non_extra_parallel_params: List[torch.nn.Parameter] = []
 
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
+
+            # Check if this parameter is part of ExtraParallel
+            is_extra_parallel_params = False
             if DTensor is not None and isinstance(p, DTensor):
                 mesh = getattr(p, "device_mesh", None)
                 names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
                 logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
-                if "ep_fsdp" in names:
-                    logger.debug_rank0(f"Adding {name} to ep_params in ep+fsdp2 optimizer")
-                    ep_params.append(p)
-                    continue
-            logger.debug_rank0(f"Adding {name} to non_ep_params in ep+fsdp2 optimizer")
-            non_ep_params.append(p)
+
+                for para in parallel_state.extra_parallel_names:
+                    if f"{para}_fsdp" in names:
+                        logger.debug_rank0(f"Adding {name} to {para}_params in extra_parallel+fsdp2 optimizer")
+                        extra_parallel_params[para].append(p)
+                        is_extra_parallel_params = True
+                        break
+
+            if not is_extra_parallel_params:
+                logger.debug_rank0(f"Adding {name} to non_extra_parallel_params in extra_parallel+fsdp2 optimizer")
+                non_extra_parallel_params.append(p)
 
         # Build param groups with weight decay handling
-        ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
-        non_ep_groups = _make_param_groups_for_subset(
-            model, non_ep_params, weight_decay, no_decay_modules, no_decay_params
+        extra_parallel_groups = {
+            para: _make_param_groups_for_subset(
+                model, extra_parallel_params[para], weight_decay, no_decay_modules, no_decay_params
+            )
+            for para in parallel_state.extra_parallel_names
+        }
+        non_extra_parallel_groups = _make_param_groups_for_subset(
+            model, non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
         )
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
@@ -424,16 +455,22 @@ def build_ep_fsdp2_optimizer(
             raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
-    if ep_groups:
-        optimizer_dict["ep"] = _build(ep_groups)
-    if non_ep_groups:
-        optimizer_dict["non_ep"] = _build(non_ep_groups)
+    for para in parallel_state.extra_parallel_names:
+        if extra_parallel_groups[para]:
+            optimizer_dict[para] = _build(extra_parallel_groups[para])
+    if non_extra_parallel_groups:
+        optimizer_dict["non_extra_parallel"] = _build(non_extra_parallel_groups)
 
-    # cache for EP-aware grad clipping helpers
-    model._ep_param_groups = {
-        "ep": [p for g in ep_groups for p in g.get("params", [])] if ep_groups else [],
-        "non_ep": [p for g in non_ep_groups for p in g.get("params", [])] if non_ep_groups else [],
+    # cache for ExtraParallel-aware grad clipping helpers
+    model._extra_parallel_param_groups = {
+        para: [p for g in extra_parallel_groups[para] for p in g.get("params", [])]
+        if extra_parallel_groups[para]
+        else []
+        for para in parallel_state.extra_parallel_names
     }
+    model._extra_parallel_param_groups["non_extra_parallel"] = (
+        [p for g in non_extra_parallel_groups for p in g.get("params", [])] if non_extra_parallel_groups else []
+    )
 
     key_names = list(optimizer_dict.keys())
 

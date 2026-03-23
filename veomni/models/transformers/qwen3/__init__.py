@@ -11,16 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("qwen3")
 def register_qwen3_modeling(architecture: str):
-    from transformers import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        from .generated.patched_modeling_qwen3_gpu import (
+            Qwen3ForCausalLM,
+            Qwen3ForSequenceClassification,
+            Qwen3Model,
+        )
+    else:
+        from transformers import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
 
-    from .modeling_qwen3 import apply_veomni_qwen3_patch
+        from .modeling_qwen3 import apply_veomni_qwen3_patch
 
-    apply_veomni_qwen3_patch()
+        apply_veomni_qwen3_patch()
 
     if "ForCausalLM" in architecture:
         return Qwen3ForCausalLM

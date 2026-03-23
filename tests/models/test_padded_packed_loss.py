@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from veomni.data.data_collator import DataCollatorWithPositionIDs, DataCollatorWithPositionIDsAndPadding
+from veomni.data.data_collator import MainCollator
 from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -27,7 +27,7 @@ def test_qwen3_loss_match_with_padded_packed_input(monkeypatch, pad_to_length):
     torch.manual_seed(0)
 
     model = build_foundation_model(
-        config_path="./tests/models/toy_config/qwen3_toy.json",
+        config_path="./tests/toy_config/qwen3_toy",
         weights_path=None,
         torch_dtype="float16",
         attn_implementation="veomni_flash_attention_2_with_sp",
@@ -39,20 +39,18 @@ def test_qwen3_loss_match_with_padded_packed_input(monkeypatch, pad_to_length):
         {
             "input_ids": torch.tensor([11, 12, 13], dtype=torch.long),
             "attention_mask": torch.tensor([1, 1, 1], dtype=torch.long),
-            "labels": torch.tensor([2], dtype=torch.long),
+            "labels": torch.tensor([11, 12, 13], dtype=torch.long),
         },
         {
             "input_ids": torch.tensor([21, 22], dtype=torch.long),
             "attention_mask": torch.tensor([1, 1], dtype=torch.long),
-            "labels": torch.tensor([1], dtype=torch.long),
+            "labels": torch.tensor([21, 22], dtype=torch.long),
         },
     ]
 
-    base_collator = DataCollatorWithPositionIDs(mask_boundary_labels=False)
-    padded_collator = DataCollatorWithPositionIDsAndPadding(
+    base_collator = MainCollator()
+    padded_collator = MainCollator(
         pad_to_length=pad_to_length,
-        position_id_pad_value=0,
-        attention_mask_pad_value=1,
     )
 
     batch_unpadded = base_collator(features)

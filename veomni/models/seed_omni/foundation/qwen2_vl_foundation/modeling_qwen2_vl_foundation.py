@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from .....data.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from .....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....transformers.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLCausalLMOutputWithPast,
     Qwen2VLForConditionalGeneration,

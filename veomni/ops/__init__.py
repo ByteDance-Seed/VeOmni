@@ -14,12 +14,14 @@
 
 from ..utils import logging
 from ..utils.env import get_env
-from . import flash_attn, fused_cross_entropy, fused_moe
+from . import flash_attn, fused_cross_entropy, fused_load_balancing_loss, fused_moe
+from .fused_load_balancing_loss import load_balancing_loss_func
 from .fused_moe import fused_moe_forward
 
 
 __all__ = [
     "fused_moe_forward",
+    "load_balancing_loss_func",
 ]
 
 logger = logging.get_logger(__name__)
@@ -30,6 +32,7 @@ def build_ALL_OPS():
         ("_fused_moe_forward", fused_moe._fused_moe_forward),
         ("_flash_attention_forward", flash_attn._flash_attention_forward),
         ("_cross_entropy", fused_cross_entropy._cross_entropy),
+        ("_load_balancing_loss", fused_load_balancing_loss._load_balancing_loss),
     ]
 
 
@@ -42,11 +45,13 @@ def apply_ops_patch():
     else:
         from .flash_attn import apply_veomni_attention_patch
         from .fused_cross_entropy import apply_veomni_loss_patch
-        from .fused_moe import apply_veomni_fused_moe_patch
+        from .fused_load_balancing_loss import apply_veomni_load_balancing_loss_patch
 
         apply_veomni_attention_patch()
         apply_veomni_loss_patch()
-        apply_veomni_fused_moe_patch()
+        apply_veomni_load_balancing_loss_patch()
+        # NOTE: fused MoE patch is applied in build_foundation_model() based on
+        # the moe_implementation parameter, not at import time.
         logger.info_rank0("✅ VeOmni ops patch applied.")
 
 

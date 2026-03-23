@@ -1,4 +1,4 @@
-# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,23 +16,31 @@ from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_
 
 @MODEL_CONFIG_REGISTRY.register("qwen3_omni_moe")
 def register_qwen3_omni_moe_config():
-    from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
+    from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, apply_veomni_qwen3_omni_moe_patch
+
+    apply_veomni_qwen3_omni_moe_patch()
 
     return Qwen3OmniMoeConfig
 
 
 @MODELING_REGISTRY.register("qwen3_omni_moe")
 def register_qwen3_omni_moe_modeling(architecture: str):
-    from .modeling_qwen3_omni_moe import (
-        Qwen3OmniMoeForConditionalGeneration,
+    # Talker classes are not subclassed locally; import them from transformers directly.
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeTalkerForConditionalGeneration,
         Qwen3OmniMoeTalkerModel,
-        Qwen3OmniMoeThinkerForConditionalGeneration,
-        Qwen3OmniMoeThinkerTextModel,
     )
 
-    if "ForConditionalGeneration" in architecture:
-        return Qwen3OmniMoeForConditionalGeneration
+    # Import our VeOmni subclasses directly so the registry gets the overridden
+    # forward methods (SP, FSDP, DeepStack) rather than the unpatched base classes.
+    from .modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerTextModel,
+        apply_veomni_qwen3_omni_moe_patch,
+    )
+
+    apply_veomni_qwen3_omni_moe_patch()
     if "ThinkerTextModel" in architecture:
         return Qwen3OmniMoeThinkerTextModel
     if "ThinkerForConditionalGeneration" in architecture:
@@ -41,11 +49,15 @@ def register_qwen3_omni_moe_modeling(architecture: str):
         return Qwen3OmniMoeTalkerModel
     if "TalkerForConditionalGeneration" in architecture:
         return Qwen3OmniMoeTalkerForConditionalGeneration
+    if "ForConditionalGeneration" in architecture:
+        return Qwen3OmniMoeForConditionalGeneration
     return Qwen3OmniMoeForConditionalGeneration
 
 
 @MODEL_PROCESSOR_REGISTRY.register("Qwen3OmniMoeProcessor")
 def register_qwen3_omni_moe_processor():
-    from .processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
+    from .processing_qwen3_omni_moe import Qwen3OmniMoeProcessor, apply_veomni_qwen3_omni_moe_patch
+
+    apply_veomni_qwen3_omni_moe_patch()
 
     return Qwen3OmniMoeProcessor

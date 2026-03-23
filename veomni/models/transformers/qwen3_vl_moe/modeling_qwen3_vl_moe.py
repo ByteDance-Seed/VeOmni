@@ -14,7 +14,7 @@
 
 # Patch https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl_moe/modeling_qwen3_vl_moe.py
 
-
+import copy
 from collections.abc import Callable
 from functools import partial
 from types import SimpleNamespace
@@ -58,6 +58,8 @@ from ....distributed.sequence_parallel import (
 )
 from ....ops import fused_moe_forward
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from ....utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from ....utils.device import is_torch_npu_available
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -100,7 +102,6 @@ class Qwen3VLMoeTextExperts(_Qwen3VLMoeTextExperts):
         down_proj_t = self.down_proj.transpose(1, 2).contiguous()  # (num_experts, hidden_size, expert_dim)
 
         next_states = fused_moe_forward(
-            module=self,
             num_experts=self.num_experts,
             routing_weights=routing_weights,  # Use compact top-k weights
             selected_experts=router_indices,
@@ -247,7 +248,10 @@ def Qwen3VLMoeVisionAttention_forward(
 # get None pixel_values while others get valid pixel_values
 # ================================================================
 # --- Patch.1 ---
-def Qwen3VLMoeVisionModel_dummy_forward(self: Qwen3VLMoeVisionModel):
+def Qwen3VLMoeVisionModel_dummy_forward(
+    self: Qwen3VLMoeVisionModel,
+    encoder_data_balance: Qwen3VLEncoderDataBalance = None,
+):
     if get_parallel_state().sp_enabled:
         sp_size = get_parallel_state().sp_size
         pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
@@ -257,6 +261,16 @@ def Qwen3VLMoeVisionModel_dummy_forward(self: Qwen3VLMoeVisionModel):
     else:
         pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
         grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
+
+        if encoder_data_balance is not None:
+            # add dummy data to avoid encoder data balance communication hang
+            pixel_values, grid_thw = encoder_data_balance.balance_data(pixel_values, grid_thw)
+            dummy_image_embeds, dummy_deepstack_image_embeds = self(hidden_states=pixel_values, grid_thw=grid_thw)
+            dummy_image_embeds, dummy_deepstack_image_embeds = encoder_data_balance.data_bridge(
+                dummy_image_embeds, dummy_deepstack_image_embeds
+            )
+            return dummy_image_embeds, dummy_deepstack_image_embeds
+
         dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
     return self(**dummy_data)
 
@@ -403,6 +417,14 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
         # --- Patch.1 ---
         super().__init__(config)
 
+        if config.encoder_data_balance:
+            self.encoder_data_balance = Qwen3VLEncoderDataBalance(
+                sorting_algo_name=config.encoder_data_balance_sorting_algo,
+                spatial_merge_unit=self.visual.spatial_merge_unit,
+            )
+        else:
+            self.encoder_data_balance = None
+
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
@@ -414,7 +436,15 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
+        if self.encoder_data_balance is not None:
+            # balance encoder's data
+            pixel_values, image_grid_thw = self.encoder_data_balance.balance_data(pixel_values, image_grid_thw)
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if self.encoder_data_balance is not None:
+            # recover the data distribution to fit subsequent process
+            image_embeds, deepstack_image_embeds = self.encoder_data_balance.data_bridge(
+                image_embeds, deepstack_image_embeds
+            )
         # --- Patch.2 ---
         # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         # image_embeds = torch.split(image_embeds, split_sizes)
@@ -535,11 +565,11 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                 ]
             # --- Patch.4 ---
 
-        elif get_parallel_state().fsdp_enabled:
+        elif get_parallel_state().fsdp_enabled or self.encoder_data_balance is not None:
             # --- Patch.5 ---
-            # add dummy ViT forward to avoid FSDP reduce-scatter hang
+            # add dummy ViT forward to avoid FSDP reduce-scatter hang and encoder data balance communication hang
             # when some ranks get None pixel_values while others get valid pixel_values
-            fake_embeds, fake_deepstack = self.visual.dummy_forward()
+            fake_embeds, fake_deepstack = self.visual.dummy_forward(encoder_data_balance=self.encoder_data_balance)
             fake_embeds = fake_embeds.mean() * 0.0
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
@@ -585,11 +615,11 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                     embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
                 ]
             # --- Patch.4 ---
-        elif get_parallel_state().fsdp_enabled:
+        elif get_parallel_state().fsdp_enabled or self.encoder_data_balance is not None:
             # --- Patch.5 ---
             # add dummy ViT forward to avoid FSDP reduce-scatter hang
             # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
-            fake_embeds, fake_deepstack = self.visual.dummy_forward()
+            fake_embeds, fake_deepstack = self.visual.dummy_forward(encoder_data_balance=self.encoder_data_balance)
             fake_embeds = fake_embeds.mean() * 0.0
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
@@ -686,9 +716,6 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
                 position_ids = position_ids.transpose(0, 1).contiguous()
             # --- Patch.6 ---
 
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-
         # --- Patch.7 ---
         kwargs.update(text_flash_attn_kwargs)
         # --- Patch.7 ---
@@ -715,6 +742,7 @@ class Qwen3VLMoeModel(_Qwen3VLMoeModel):
 # Patch: Qwen3VLMoeForConditionalGeneration
 # 1. wrapped Qwen3VLMoeModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 # 2. use the unified loss function to handle Ulysses internally to reduce redudnecy code
+# 3. overwrite token ids with veomni constants
 # ================================================================
 
 
@@ -731,7 +759,12 @@ def get_position_id(main_func, self, **kwargs):
 class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
     # --- Patch.1 ---
     def get_position_id_func(self):
-        fake_model = SimpleNamespace(config=self.config)
+        fake_config = copy.copy(self.config)
+        # --- Patch.3 ---
+        fake_config.image_token_id = IMAGE_INPUT_INDEX
+        fake_config.video_token_id = VIDEO_INPUT_INDEX
+        # --- Patch.3 ---
+        fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
 
     # --- Patch.1 ---

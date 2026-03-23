@@ -24,17 +24,32 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
-    AutoModelForVision2Seq,
+    AutoModelForTextToWaveform,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedModel,
 )
-from transformers.modeling_utils import no_init_weights
+
+
+# transformers v5 deleted the AutoModelForVision2Seq class, so we use AutoModelForImageTextToText as a fallback
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = AutoModelForImageTextToText
 
 from ..utils import logging
 from ..utils.env import get_env
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from ..utils.registry import Registry
 from .module_utils import init_empty_weights, load_model_weights
+
+
+# `no_init_weights` was moved to `transformers.initialization` in:
+# https://github.com/huggingface/transformers/pull/42957
+if is_transformers_version_greater_or_equal_to("5.0.0"):
+    from transformers.initialization import no_init_weights
+else:
+    from transformers.modeling_utils import no_init_weights
 
 
 MODELING_REGISTRY = Registry("Modeling")
@@ -67,7 +82,9 @@ def get_model_config(config_path: str, **kwargs):
                 return config
         except Exception:  # load from veomni
             config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
-            model_type = config_dict["model_type"]
+            model_type = (
+                config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
+            )  # diffusers use _class_name
             logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
             kwargs.pop("trust_remote_code", None)
             return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
@@ -122,6 +139,8 @@ def get_model_class(model_config: PretrainedConfig):
         load_class = AutoModelForImageTextToText
     elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
         load_class = AutoModelForVision2Seq
+    elif type(model_config) in AutoModelForTextToWaveform._model_mapping.keys():  # assume built-in models
+        load_class = AutoModelForTextToWaveform
     elif (
         arch_name is not None
         and "ForCausalLM" in arch_name

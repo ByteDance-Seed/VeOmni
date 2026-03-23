@@ -14,7 +14,7 @@
 
 # Patch https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py
 
-
+import copy
 from collections.abc import Callable
 from functools import lru_cache, partial
 from types import SimpleNamespace
@@ -65,6 +65,7 @@ from ....distributed.sequence_parallel.async_ulysses import (
     async_ulysses_qkv_projection,
 )
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -198,6 +199,11 @@ class Qwen3VLTextAttention(_Qwen3VLTextAttention):
         v = v.transpose(1, 2)
 
         cos, sin = position_embeddings
+
+        # TODO: check this, wehther we need to unpad sp padding?
+        cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
+        sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
+
         query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -615,11 +621,13 @@ class Qwen3VLModel(_Qwen3VLModel):
         image_mask = kwargs.get("image_mask", None)
         video_mask = kwargs.get("video_mask", None)
 
-        # if None, all gather sp group input_ids and calculate mask
+        # if None, calculate mask
         if video_mask is None and image_mask is None:
-            input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
-            dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-            image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=0))
+            if get_parallel_state().sp_enabled:
+                input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+                dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+                input_ids = torch.cat(input_ids_list, dim=0)
+            image_mask, video_mask = self.get_placeholder_mask(input_ids)
         # --- Patch.3 ---
 
         # --- Patch.6 ---
@@ -833,9 +841,6 @@ class Qwen3VLModel(_Qwen3VLModel):
                 position_ids = position_ids.transpose(0, 1).contiguous()
             # --- Patch.5 ---
 
-        if get_parallel_state().sp_enabled and not get_parallel_state().async_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-
         # --- Patch.6 ---
         kwargs.update(flash_attn_kwargs)
         # --- Patch.6 ---
@@ -863,6 +868,7 @@ class Qwen3VLModel(_Qwen3VLModel):
 # Patch: Qwen3VLForConditionalGeneration
 # 1. wrapped Qwen3VLModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 # 2. use the unified loss function to handle Ulysses internally to reduce redudnecy code
+# 3. overwrite token ids with veomni constants
 # ================================================================
 
 
@@ -879,7 +885,12 @@ def get_position_id(main_func, self, **kwargs):
 class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
     # --- Patch.1 ---
     def get_position_id_func(self):
-        fake_model = SimpleNamespace(config=self.config)
+        fake_config = copy.copy(self.config)
+        # --- Patch.3 ---
+        fake_config.image_token_id = IMAGE_INPUT_INDEX
+        fake_config.video_token_id = VIDEO_INPUT_INDEX
+        # --- Patch.3 ---
+        fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)
 
     # --- Patch.1 ---

@@ -11,19 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
-
-
-@MODEL_CONFIG_REGISTRY.register("deepseek_v3")
-def register_deepseek_v3_config():
-    from .configuration_deepseek import DeepseekV3Config
-
-    return DeepseekV3Config
+from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("deepseek_v3")
 def register_deepseek_v3_modeling(architecture: str):
-    from .modeling_deepseek import DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification, DeepseekV3Model
+    from transformers import (
+        DeepseekV3ForCausalLM,
+        DeepseekV3ForSequenceClassification,
+        DeepseekV3Model,
+    )
+
+    from .modeling_deepseek_v3 import apply_veomni_deepseek_v3_patch
+
+    apply_veomni_deepseek_v3_patch()
 
     if "ForCausalLM" in architecture:
         return DeepseekV3ForCausalLM
@@ -31,5 +32,5 @@ def register_deepseek_v3_modeling(architecture: str):
         return DeepseekV3ForSequenceClassification
     elif "Model" in architecture:
         return DeepseekV3Model
-    else:  # None
+    else:
         return DeepseekV3ForCausalLM

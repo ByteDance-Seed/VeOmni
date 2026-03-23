@@ -1,0 +1,49 @@
+model:
+  model_path: Qwen3-30B-A3B-merge
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp1
+      full_shard: true
+      offload: false
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  num_train_epochs: 3
+  enable_mixed_precision: true
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: Qwen3-30B-A3B-sft-tulu
+    manager: dcp
+    save_steps: 100
+    save_epochs: 1
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: Qwen3-30B-A3B-sft-tulu

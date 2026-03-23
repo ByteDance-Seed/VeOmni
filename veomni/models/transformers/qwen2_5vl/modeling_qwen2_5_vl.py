@@ -16,7 +16,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import copy
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, Optional, Union
@@ -56,6 +56,7 @@ from ....distributed.sequence_parallel import (
     unpad_tensor,
 )
 from ....utils import logging
+from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
@@ -509,11 +510,6 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
                 position_ids = position_ids.transpose(0, 1).contiguous()  # bs, dim, l -> dim, bs, l
             # --- Patch.5 ---
 
-        # --- Patch.3 ---
-        if get_parallel_state().sp_enabled:
-            position_ids = sp_pad_and_slice(position_ids, dim=-1)
-        # --- Patch.3 ---
-
         # --- Patch.6 ---
         kwargs.update(flash_attn_kwargs)
         # --- Patch.6 ---
@@ -546,6 +542,7 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
 # Patch: Qwen2_5_VLForConditionalGeneration
 # 1. wrapped Qwen2_5_VLModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 # 2. use the unified loss function to handle Ulysses internally to reduce redudnecy code
+# 3. overwrite token ids with veomni constants
 # ================================================================
 
 
@@ -562,7 +559,12 @@ def get_position_id(main_func, self, **kwargs):
 class Qwen2_5_VLForConditionalGeneration(_Qwen2_5_VLForConditionalGeneration):
     # --- Patch.1 ---
     def get_position_id_func(self):
-        fake_model = SimpleNamespace(config=self.config)
+        fake_config = copy.copy(self.config)
+        # --- Patch.3 ---
+        fake_config.image_token_id = IMAGE_INPUT_INDEX
+        fake_config.video_token_id = VIDEO_INPUT_INDEX
+        # --- Patch.3 ---
+        fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen2_5_VLModel.get_rope_index, fake_model)
 
     # --- Patch.1 ---

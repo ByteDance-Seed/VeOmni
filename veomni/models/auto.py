@@ -26,6 +26,7 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
 
 
@@ -42,18 +43,19 @@ def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
 
 
-def build_processor(processor_path: str) -> "ProcessorMixin":
+def build_processor(processor_path: str, **kwargs) -> "ProcessorMixin":
     """
     Builds the processor.
     """
-    return get_model_processor(processor_path, padding_side="right", trust_remote_code=True)
+    return get_model_processor(processor_path, padding_side="right", trust_remote_code=True, **kwargs)
 
 
 def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     """
     Builds the model config.
     """
-    return get_model_config(config_path, trust_remote_code=True, **config_kwargs)
+    trust_remote_code = config_kwargs.pop("trust_remote_code", True)
+    return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
 def build_foundation_model(
@@ -66,14 +68,18 @@ def build_foundation_model(
             "sdpa",
             "flash_attention_2",
             "flash_attention_3",
+            "flash_attention_4",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
-    moe_implementation: Optional[Literal["eager", "fused"]] = None,
+    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
+    encoder_data_balance: Optional[bool] = False,
+    encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -89,12 +95,39 @@ def build_foundation_model(
         config = build_config(config_path, **config_kwargs)
 
     if moe_implementation is not None:
-        if moe_implementation not in ["eager", "fused"]:
+        if moe_implementation not in ["eager", "fused", "fused_quack"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
-        config._moe_implementation = moe_implementation
-        logger.info_rank0(f"Moe implementation: {moe_implementation}")
+        logger.info_rank0(f"MoE implementation: {moe_implementation}")
+
         if moe_implementation == "eager":
             logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
+            config._moe_implementation = "eager"
+        else:
+            config._moe_implementation = "fused"
+            from ..ops.fused_moe import apply_veomni_fused_moe_patch
+
+            apply_veomni_fused_moe_patch(moe_implementation=moe_implementation)
+
+    if encoder_data_balance:
+        if config.model_type == "qwen3_vl_moe":
+            if get_parallel_state().sp_enabled:
+                logger.warning_rank0(
+                    "Warning: Qwen3VLEncoderDataBalance currently does not support sequence parallelism. "
+                    "The configuration of 'encoder_data_balance' is reset to False. "
+                    "This issue will be addressed in a future release."
+                )
+                config.encoder_data_balance = False
+            else:
+                config.encoder_data_balance = encoder_data_balance
+                config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
+        else:
+            logger.warning_rank0(
+                f"Encoder data balance currently supported only for Qwen3-VL MoE, "
+                f"current model type: {config.model_type}, reset encoder_data_balance = False"
+            )
+            config.encoder_data_balance = False
+    else:
+        config.encoder_data_balance = False
 
     loader: Optional[BaseModelLoader] = get_loader(config)
 
@@ -105,7 +138,17 @@ def build_foundation_model(
         "trust_remote_code": True,
     }
 
-    if attn_implementation not in ("veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"):
+    if attn_implementation == "flash_attention_4" and not is_transformers_version_greater_or_equal_to("5.0.0"):
+        raise RuntimeError(
+            f"attn_implementation '{attn_implementation}' bare name requires Transformers>=5.0.0. "
+            'For Transformers v4, please use attn_implementation="veomni_flash_attention_4_with_sp".'
+        )
+
+    if attn_implementation not in (
+        "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_4_with_sp",
+    ):
         logger.warning_rank0(
             f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use veomni_flash_attention_2_with_sp or veomni_flash_attention_3_with_sp for SP."
         )
@@ -139,5 +182,14 @@ def build_foundation_model(
             return original_forward(*args, **kwargs)
 
         model.forward = wrapped_forward
+
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        assert not getattr(model, "use_kernels", False), (
+            "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "
+            "to avoid unexpected kernel loading side effects."
+        )
+
+    model_class_path = f"{model.__class__.__module__}.{model.__class__.__name__}"
+    logger.info_rank0(f"Built foundation model class: {model_class_path}")
 
     return model
