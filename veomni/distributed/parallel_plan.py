@@ -29,7 +29,7 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class SpecInfo:
-    para_name: str
+    para_name: str  # name of the ExtraParallel this fqn belongs to
     placement: Union[Shard, Replicate]
     fqn: str
     para_fsdp_mesh: DeviceMesh

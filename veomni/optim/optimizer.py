@@ -325,7 +325,7 @@ def build_extra_parallel_fsdp2_optimizer(
     - Example: [{"params": params1, "lr": lr1},
                 {"params": params2, "lr": lr2},
                 {"params": params3, "lr": lr3}]
-    - Each group's params are automatically split into EP and non-EP based on DTensor mesh
+    - Each group's params are automatically split into ExtraParallel1, ExtraParallel2, ... and non-ExtraParallel based on DTensor mesh
     - Custom learning rates and other optimizer settings are preserved per group
     """
     parallel_state = get_parallel_state()
@@ -363,6 +363,7 @@ def build_extra_parallel_fsdp2_optimizer(
                 if not p.requires_grad:
                     continue
 
+                # Check if this parameter is part of ExtraParallel
                 is_extra_parallel_params = False
                 if DTensor is not None and isinstance(p, DTensor):
                     mesh = getattr(p, "device_mesh", None)
@@ -412,6 +413,8 @@ def build_extra_parallel_fsdp2_optimizer(
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
+
+            # Check if this parameter is part of ExtraParallel
             is_extra_parallel_params = False
             if DTensor is not None and isinstance(p, DTensor):
                 mesh = getattr(p, "device_mesh", None)

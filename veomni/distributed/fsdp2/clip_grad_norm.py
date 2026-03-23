@@ -54,7 +54,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
     - Compute local norms for non-ExtraParallel and ExtraParallel parameter groups separately.
     - For finite p: sum p-th powers across the appropriate groups, then take 1/p.
       • non-ExtraParallel: all-reduce over FSDP group.
-      • ExtraParallel: all-reduce over Para-FSDP group, then over Para group, e.g. EP-FSDP.
+      • ExtraParallel: all-reduce over Para-FSDP (e.g. ep_fsdp, emb_fsdp) group, then over Para (e.g. ep, emb) group.
     - For inf-norm: take elementwise MAX with the same reduction groups (MAX).
     - Use a single global clip coefficient for both groups.
     """
@@ -64,7 +64,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
         para: ps.extra_parallel_group(para) if ps.extra_parallel_enabled(para) else None
         for para in ps.extra_parallel_names
     }
-    # For Para (e.g. EP) params sharded by FSDP2 along hidden dimension
+    # For Para (e.g. ep, emb) params sharded by FSDP2 along hidden dimension
     extra_parallel_fsdp_group = {
         para: ps.extra_parallel_fsdp_device_mesh[para][f"{para}_fsdp"].get_group()
         if ps.extra_parallel_enabled(para) and ps.extra_parallel_fsdp_device_mesh[para] is not None
@@ -72,7 +72,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
         for para in ps.extra_parallel_names
     }
 
-    # Build param groups (filter out params without grads)
+    # Build param groups for ExtraParallel params and non-ExtraParallel params (filter out params without grads)
     extra_parallel_params = {
         para: [p for p in model._extra_parallel_param_groups.get(para, []) if p.grad is not None]
         for para in ps.extra_parallel_names
@@ -94,7 +94,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
             f"{para}_params reduces groups: {extra_parallel_fsdp_group[para]=}, {extra_parallel_group[para]=}"
         )
 
-    # Compute and reduce ExtraParallel: first across para_fsdp (e.g. ep_fsdp), then across para (e.g. ep)
+    # Compute and reduce ExtraParallel: first across para_fsdp (e.g. ep_fsdp, emb_fsdp), then across para (e.g. ep, emb)
     extra_parallel_total = {
         para: torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
         for para in ps.extra_parallel_names

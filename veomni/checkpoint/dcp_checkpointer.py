@@ -74,8 +74,10 @@ class ModelState(Stateful):
         model_state_dict = get_model_state_dict(model=self.model)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
-                "Getting model state_dict from ModelState wrapper, would restore Paralit dim for Paralit (e.g. Experts/Embeds) module"
+                "Getting model state_dict from ModelState wrapper, would restore ExtraParallel dim for ExtraParallel (e.g. Experts/Embeds) module"
             )
+            # As fsdp+extra parallel and pure extra parallel have different placements, e.g. [Shard(0), Shard(1)] and [Shard(0)],
+            # restoring state dict should be extra parallel aware.
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "restore")
 
         return model_state_dict

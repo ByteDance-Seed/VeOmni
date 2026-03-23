@@ -38,7 +38,7 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
     extra_parallel_fsdp_process_group = dict.fromkeys(extra_parallel_group.keys())
 
     for handle in fsdp_model._all_handles:
-        # assert handle.uses_sharded_strategy  # params init in CPU have no uses_sharded_strategy
+        assert handle.uses_sharded_strategy  # note: params init in CPU have no uses_sharded_strategy
         assert handle._use_orig_params, "tensor parallelism can only work with FSDP using `use_orig_params=True`"
         for param in handle.flat_param._params:
             assert hasattr(param, "spec_info")
@@ -46,7 +46,7 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
             fsdp_managed_params.add(param)
             if param.grad is not None:
                 grads_for_clip.append(param.grad)
-            # ep param
+            # extra_parallel param
             if isinstance(spec_info.placement, Shard):
                 if spec_info.para_mesh:
                     if extra_parallel_fsdp_process_group[spec_info.para_name] is None:
