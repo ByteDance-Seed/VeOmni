@@ -27,6 +27,12 @@ make style && make quality
 # make test
 ```
 
+When you **move or rename** scripts under `tasks/`, search the repo for old paths (e.g. `grep -r tasks/` in `docs/`) and update examples. CI runs a lightweight check; validate locally with:
+
+```bash
+python3 scripts/ci/check_doc_task_paths.py
+```
+
 5. Submit changes
 
 ```bash
