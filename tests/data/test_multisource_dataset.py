@@ -165,7 +165,7 @@ def run_multisource_dataset_test():
     epoch_num = 3
     train_steps = args.train.train_steps
     start_epoch, start_step, global_step = 0, 0, 0
-    save_epoch, save_step = 1, args.train.train_steps - 1
+    save_epoch, save_step = 1, args.train.train_steps - 2
 
     fake_model = FakeModel().to(get_device_type())
     for epoch in range(start_epoch, epoch_num):
@@ -738,7 +738,8 @@ def build_command():
         "--train.ulysses_parallel_size=1",
         "--train.bsz_warmup_ratio=0",
         "--train.output_dir=.tests/cache",
-        "--train.rmpad=True",
+        "--train.rmpad=false",
+        "--train.rmpad_with_pos_ids=true",
         "--train.dyn_bsz=True",
         "--train.max_steps=6",
     ]

@@ -409,6 +409,7 @@ class DynamicBatchSizeDataLoader:
             self.step = 0
             self._data_iter = iter(self._dataloader)
             self._batch_data_iter = self.batch_data_generator()
+            self.batching_strategy.drop_buffer()
         self._resume = False
         return self
 

@@ -22,11 +22,7 @@ class DynBszBuffer:
     """
 
     def __init__(self):
-        self._buffer = []
-        self._buffer_sample_lens = []
-        self.del_idxs = []
-        self.cur_idx = 0
-        self.all_token_cnt = 0
+        self.clear()
 
     def append(self, item: Dict[str, Any]):
         """
@@ -79,6 +75,13 @@ class DynBszBuffer:
             self._buffer_sample_lens[idx] for idx in range(buffer_len) if idx not in self.del_idxs
         ]
         self.del_idxs = []
+
+    def clear(self):
+        self._buffer = []
+        self._buffer_sample_lens = []
+        self.del_idxs = []
+        self.cur_idx = 0
+        self.all_token_cnt = 0
 
     def merge(self, buffer_to_merge: "DynBszBuffer"):
         """ "
@@ -212,3 +215,6 @@ class TextBatchingStrategy(BaseBatchingStrategy):
 
     def empty(self) -> bool:
         return len(self.buffer) == 0
+
+    def drop_buffer(self):
+        self.buffer.clear()
