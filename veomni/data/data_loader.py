@@ -83,13 +83,18 @@ def build_native_dataloader(
     seed: int = 0,
     collate_fn: Optional[Callable] = None,
     build_collate_fn: bool = True,
-    collate_fn_kwargs: Optional[Dict[str, Any]] = {},
+    collate_fn_kwargs: Optional[Dict[str, Any]] = None,
+    track_source_boundaries: bool = False,
     multiprocessing_context=None,
 ) -> "DistributedDataloader":
     parallel_state = get_parallel_state()
 
+    if collate_fn_kwargs is None:
+        collate_fn_kwargs = {}
+
     if collate_fn is None:
         if build_collate_fn:
+            collate_fn_kwargs["track_source_boundaries"] = track_source_boundaries
             collate_fn = MainCollator(**collate_fn_kwargs)
         else:
             collate_fn = NoopDataCollator()

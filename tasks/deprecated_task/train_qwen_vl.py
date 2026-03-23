@@ -18,6 +18,7 @@ from veomni.data import (
     build_dataset,
     build_multimodal_chat_template,
 )
+from veomni.data.batch_metadata import pop_batch_metadata
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -353,10 +354,7 @@ def main():
                         model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch)
                 micro_batch_token_len = count_loss_token(micro_batch)
-                if args.data.enable_multisource:
-                    micro_batch.pop("ds_idx", None)
-                    micro_batch.pop("cur_token_num", None)
-                    micro_batch.pop("source_name", None)
+                pop_batch_metadata(micro_batch)
 
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v

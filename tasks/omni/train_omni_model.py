@@ -18,6 +18,7 @@ from veomni.data import (
     build_dataset,
     build_multimodal_chat_template,
 )
+from veomni.data.batch_metadata import pop_batch_metadata
 from veomni.data.multimodal.multimodal_transform import encode_multimodal_sample
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
@@ -195,6 +196,7 @@ def main():
     collate_fn_kwargs = {
         "pad_to_length": args.train.pad_to_length,
         "data_collate_info": data_collate_info,
+        "track_source_boundaries": args.data.enable_multisource,
     }
 
     train_dataloader = build_dataloader(
@@ -315,6 +317,8 @@ def main():
         enable_multisource=args.data.enable_multisource,
         dataloader=train_dataloader,
         data_path=args.data.train_path,
+        track_seqlen_distribution=args.train.track_seqlen_distribution,
+        seqlen_distribution_log_interval=args.train.seqlen_distribution_log_interval,
     )
 
     if args.train.checkpoint.load_path:
@@ -386,10 +390,7 @@ def main():
                     elif micro_step == num_micro_steps - 1:
                         model.set_reshard_after_backward(True)
                 environ_meter.add(micro_batch)
-                if args.data.enable_multisource:
-                    micro_batch.pop("ds_idx", None)
-                    micro_batch.pop("cur_token_num", None)
-                    micro_batch.pop("source_name", None)
+                pop_batch_metadata(micro_batch)
 
                 micro_batch = {
                     k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v

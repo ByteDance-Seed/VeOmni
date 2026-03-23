@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .batch_metadata import (
+    BATCH_METADATA_KEY,
+    attach_batch_metadata,
+    get_batch_metadata,
+    pop_batch_metadata,
+)
 from .chat_template import build_chat_template
 from .data_collator import (
     MainCollator,
@@ -26,6 +32,10 @@ from .multimodal.multimodal_chat_template import build_multimodal_chat_template
 
 
 __all__ = [
+    "BATCH_METADATA_KEY",
+    "attach_batch_metadata",
+    "get_batch_metadata",
+    "pop_batch_metadata",
     "build_chat_template",
     "build_dataloader",
     "build_data_transform",

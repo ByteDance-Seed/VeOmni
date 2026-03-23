@@ -19,12 +19,13 @@ logger = helper.create_logger(__name__)
 
 TEST_RESUME_STATE_KEY = "test_resume_position"
 
-import math
-import os
-from typing import Any, Dict, List
 
-from unittest.mock import patch
+def mock_empty_cache():
+    """Mock empty_cache that does nothing on CPU."""
+    pass
 
+
+def setup_test_distributed(args):
     """Initialize a minimal distributed runtime for data tests."""
     device_type = get_device_type()
     if device_type != "cpu":
@@ -160,8 +161,6 @@ class StepAwareResumeCheckpointerCallback(StepAwareTestCheckpointerCallback):
         pass
 
 
-=======
->>>>>>> 12156a5 (temp)
 class ShardedIterableDataset(IterableDataset):
     """Deterministic iterable dataset with rank/worker sharding and optional shuffle.
 

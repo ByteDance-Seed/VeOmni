@@ -286,6 +286,7 @@ class BaseTrainer(Stateful, ABC):
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
+            track_source_boundaries=self.args.data.enable_multisource,
         )
 
     def _build_dataloader(self):

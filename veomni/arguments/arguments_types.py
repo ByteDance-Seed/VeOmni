@@ -421,6 +421,28 @@ class TrainingArguments:
         metadata={"help": "Log MoE expert load heatmap every N steps. 0 = disabled. Requires wandb.enable=True."},
     )
 
+    # Sequence length distribution tracking
+    track_seqlen_distribution: bool = field(
+        default=True,
+        metadata={"help": "Track sequence length distribution statistics (max/min/mean/median/p95/p99)."},
+    )
+    seqlen_distribution_log_interval: int = field(
+        default=10,
+        metadata={"help": "Log sequence length distribution every N steps."},
+    )
+    # Per-source loss tracking
+    track_per_source_loss: bool = field(
+        default=False,
+        metadata={"help": "Enable per-source loss tracking via sampling."},
+    )
+    per_source_loss_sample_interval: int = field(
+        default=100,
+        metadata={"help": "Compute per-source loss every N steps."},
+    )
+    per_source_loss_log_rank: int = field(
+        default=0,
+        metadata={"help": "Which rank should log per-source loss. Default 0. Set to -1 for all ranks."},
+    )
     # sub-argument groups
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)

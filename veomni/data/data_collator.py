@@ -27,6 +27,7 @@ from ..distributed.sequence_parallel import gather_outputs
 from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+from .batch_metadata import attach_batch_metadata
 
 
 logger = logging.get_logger(__name__)
@@ -183,6 +184,7 @@ class PackingCollator(DataCollator):
     seq_classification: bool = (
         False  # whether the training task is sequence classification, if true, do not mask boundary labels
     )
+    track_source_boundaries: bool = False
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
@@ -218,7 +220,56 @@ class PackingCollator(DataCollator):
                 )
         return batch
 
+    # Metadata keys that should be stripped from individual features before
+    # collation and collected into ``_batch_metadata``.  These are pipeline-
+    # internal fields injected by ``MultiSourceDataset``, transforms, or
+    # external dataset wrappers.  They must NOT reach ``default_collate``
+    # (which would incorrectly stack them as tensors or crash on type
+    # mismatch across multi-source samples).
+    _SAMPLE_METADATA_KEYS = frozenset({"ds_idx", "source_name", "cur_token_num"})
+
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        # ------------------------------------------------------------------
+        # 1. Collect per-sample metadata & track source boundaries
+        # ------------------------------------------------------------------
+        source_boundaries: list = []
+        ds_idx_list: list = []
+        source_name_list: list = []
+        current_pos = 0
+
+        for feature in features:
+            # Pop metadata keys so they never enter the collation loop.
+            ds_idx = feature.pop("ds_idx", None)
+            source_name = feature.pop("source_name", None)
+            feature.pop("cur_token_num", None)
+
+            ds_idx_list.append(ds_idx)
+            source_name_list.append(source_name)
+
+            # Build source boundaries (needs ds_idx before collation).
+            if self.track_source_boundaries and ds_idx is not None:
+                seq_len = len(feature["input_ids"])
+                if isinstance(ds_idx, torch.Tensor):
+                    ds_idx = ds_idx.item()
+                sn = source_name if source_name is not None else f"source_{ds_idx}"
+                if isinstance(sn, torch.Tensor):
+                    sn = sn.item() if sn.numel() == 1 else str(sn.tolist())
+                source_boundaries.append(
+                    {
+                        "ds_idx": int(ds_idx),
+                        "source_name": str(sn),
+                        "start_pos": current_pos,
+                        "end_pos": current_pos + seq_len,
+                    }
+                )
+                current_pos += seq_len
+            elif self.track_source_boundaries:
+                seq_len = len(feature["input_ids"])
+                current_pos += seq_len
+
+        # ------------------------------------------------------------------
+        # 2. Normal collation — only model-input keys remain in features
+        # ------------------------------------------------------------------
         batch = defaultdict(list)
         for feature in features:
             for key in feature.keys():
@@ -252,6 +303,25 @@ class PackingCollator(DataCollator):
 
         if not self.sp_enabled:
             add_flash_attention_kwargs_from_position_ids(batch)
+
+        # ------------------------------------------------------------------
+        # 3. Attach collected metadata under _batch_metadata
+        # ------------------------------------------------------------------
+        batch_meta: dict = {}
+        valid_ds_idx = [x for x in ds_idx_list if x is not None]
+        if valid_ds_idx:
+            # Normalise to plain ints for downstream consumers.
+            batch_meta["ds_idx"] = [int(x.item()) if isinstance(x, torch.Tensor) else int(x) for x in valid_ds_idx]
+        valid_source_names = [x for x in source_name_list if x is not None]
+        if valid_source_names:
+            batch_meta["source_name"] = [
+                str(x.item() if isinstance(x, torch.Tensor) and x.numel() == 1 else x) for x in valid_source_names
+            ]
+        if source_boundaries:
+            batch_meta["source_boundaries"] = source_boundaries
+        if batch_meta:
+            attach_batch_metadata(batch, **batch_meta)
+
         return batch
 
 
@@ -350,6 +420,7 @@ class MainCollator(DataCollator):
     data_collate_info: Dict[str, Union[DataCollateInfo, tuple, Dict]] = field(default_factory=lambda: {})
     pad_to_length: bool = False
     seq_classification: bool = False
+    track_source_boundaries: bool = False
 
     """
     Data collator pipeline with a unified collate info.
@@ -392,6 +463,7 @@ class MainCollator(DataCollator):
                 collate_infos=self.collate_infos,
                 pad_to_length=self.pad_to_length,
                 seq_classification=self.seq_classification,
+                track_source_boundaries=self.track_source_boundaries,
             )
         )
         if get_parallel_state().sp_enabled:

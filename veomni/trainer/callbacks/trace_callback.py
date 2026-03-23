@@ -175,6 +175,8 @@ class EnvironMeterCallback(Callback):
             dataloader=trainer.train_dataloader,
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
+            track_seqlen_distribution=args.train.track_seqlen_distribution,
+            seqlen_distribution_log_interval=args.train.seqlen_distribution_log_interval,
         )
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
