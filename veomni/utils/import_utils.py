@@ -107,12 +107,6 @@ def is_linux_aarch64_platform() -> bool:
     return platform.system() == "Linux" and platform.machine().lower() == "aarch64"
 
 
-def is_linux_aarch64_platform() -> bool:
-    import platform
-
-    return platform.system() == "Linux" and platform.machine().lower() == "aarch64"
-
-
 _FFMPEG_AVAILABLE = None
 
 
