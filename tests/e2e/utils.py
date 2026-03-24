@@ -12,6 +12,7 @@ import torch.distributed as dist
 from datasets import Dataset
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.utils.helper import get_cache_dir
@@ -229,7 +230,7 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
 
     for task_name, output in output_dict.items():
         row_cells = []
-        row_cells.append(task_name)
+        row_cells.append(Text(task_name))
 
         val_list = output.get(value_key)
         row_cells.append(", ".join([f"{v:.8f}" for v in val_list]))
