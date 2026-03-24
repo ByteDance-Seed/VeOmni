@@ -585,7 +585,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 class CheckCallback(Callback):
     trainer: TrainerTest
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         # micro_batch_output = [list(set(d['input_ids'].tolist()[0])) for d in micro_batches]
         # logger.error(f"[BEGIN][rank{self.trainer.args.train.global_rank}][epoch{state.epoch}][step{state.curr_step}][global_step{state.global_step}] metrics {  getattr(getattr(self.trainer, 'step_env_metrics', None), 'consume_tokens(M)', None)} micro_batches: {micro_batch_output}")
         if state.global_step == 1:

@@ -178,7 +178,7 @@ class EnvironMeterCallback(Callback):
             gc_steps=args.train.gc_steps,
         )
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)
         self.start_time = time.time()

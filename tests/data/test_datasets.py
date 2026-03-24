@@ -133,7 +133,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 class CheckCallback(Callback):
     trainer: TrainerTest
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         if state.global_step == 1 and get_parallel_state().sp_enabled:
             assert (
                 micro_batches[0]["input_ids"].shape[-1] * get_parallel_state().sp_size
