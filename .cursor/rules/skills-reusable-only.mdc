@@ -1,0 +1,14 @@
+---
+description: Only add reusable, maintainable scripts and workflows to .agents/skills/
+globs: .agents/skills/**/*
+alwaysApply: true
+---
+
+# Skills Directory: Reusable Workflows Only
+
+Only put reusable, maintainable skill definitions under **.agents/skills/**.
+
+- Add: Well-structured SKILL.md or .md files that define repeatable workflows (feature, debug, review, test, new-model, etc.)
+- Do not add: One-off scripts, temporary debug helpers, or experiment-specific files.
+
+Put temporary or one-off scripts in `scripts/`, `tests/`, or task-specific directories -- not in skills.
