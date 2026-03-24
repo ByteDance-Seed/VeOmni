@@ -71,8 +71,8 @@ class CheckpointerCallback(Callback):
         self.trainer.checkpointer.load(args.train.checkpoint.load_path, state)
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
-        self.trainer.start_epoch = state["extra_state"]["epoch"]
-        self.trainer.start_step = state["extra_state"]["curr_step"] + 1
+        self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
+        self.trainer.start_step = self.trainer.state.global_step % args.train_steps
 
         self.trainer.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
 
@@ -103,8 +103,6 @@ class CheckpointerCallback(Callback):
             "optimizer": self.trainer.optimizer,
             "extra_state": {
                 "global_step": state.global_step,
-                "epoch": state.epoch,
-                "curr_step": state.curr_step,
                 "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
                 "train_dataloader": self.trainer.train_dataloader.state_dict(),
                 "environ_meter": self.trainer.environ_meter.state_dict(),

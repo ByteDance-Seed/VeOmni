@@ -15,29 +15,31 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
-from utils import FakeModel, ShardedIterableDataset, compare_global_batch
+from utils import (
+    FakeModel,
+    ShardedIterableDataset,
+    StepAwareResumeCheckpointerCallback,
+    compare_global_batch,
+    compare_metrics,
+    mock_empty_cache,
+    setup_test_distributed,
+)
 
 from tests.tools.launch_utils import find_free_port
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.dataset import MultiSourceDataset
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer
-from veomni.trainer.callbacks import Callback, CheckpointerCallback, TrainerState
+from veomni.trainer.callbacks import Callback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import get_device_type
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
 
 
 logger = helper.create_logger(__name__)
-
-
-# Patch empty_cache to avoid AttributeError on CPU
-def _mock_empty_cache():
-    """Mock empty_cache that does nothing on CPU."""
-    pass
 
 
 def _torch_shm_manager_executable() -> bool:
@@ -77,36 +79,7 @@ class TrainerTest(BaseTrainer):
     multisource_weights = [0.5, 0.5]
 
     def _setup(self):
-        args = self.args
-        device_type = get_device_type()
-        if device_type != "cpu":
-            device_str = f"{device_type}:{args.train.local_rank}"
-            get_torch_device().set_device(device_str)
-            self.device = torch.device(device_str)
-        else:
-            self.device = torch.device("cpu")
-        backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend=backend,
-                world_size=int(os.environ["WORLD_SIZE"]),
-                rank=int(os.environ["RANK"]),
-            )
-
-        init_parallel_state(
-            dp_size=args.train.accelerator.dp_size,
-            dp_replicate_size=args.train.accelerator.dp_replicate_size,
-            dp_shard_size=args.train.accelerator.dp_shard_size,
-            tp_size=args.train.accelerator.tp_size,
-            pp_size=args.train.accelerator.pp_size,
-            cp_size=args.train.accelerator.cp_size,
-            ulysses_size=args.train.accelerator.ulysses_size,
-            extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-            extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-            extra_parallel_names=args.train.accelerator.extra_parallel_names,
-            dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
-        )
-        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+        self.device = setup_test_distributed(self.args)
 
     def _freeze_model_module(self):
         pass
@@ -204,7 +177,7 @@ class TrainerTest(BaseTrainer):
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
-        self.checkpointer_callback = CheckpointerCallbackTest(self)
+        self.checkpointer_callback = StepAwareResumeCheckpointerCallback(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
@@ -301,32 +274,6 @@ class EnvironMeterCallbackTest(Callback):
         self.trainer.step_env_metrics = step_env_metrics
 
 
-class CheckpointerCallbackTest(CheckpointerCallback):
-    trainer: TrainerTest
-
-    def on_step_end(self, state: TrainerState, **kwargs):
-        if (
-            not self.trainer.is_resume_train
-            and state.epoch == self.trainer.save_epoch
-            and state.curr_step == self.trainer.save_step
-        ):
-            self._save_checkpoint(state)
-            self.trainer.resume_dcp_path = os.path.join(
-                self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
-            )
-            self.trainer.args.train.checkpoint.load_path = self.trainer.resume_dcp_path
-
-    def on_epoch_end(self, state: TrainerState, **kwargs):
-        pass
-
-    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        if self.trainer.is_resume_train:
-            self._load_checkpoint()
-
-    def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        pass
-
-
 class CheckCallback(Callback):
     trainer: TrainerTest
 
@@ -387,13 +334,7 @@ class CheckCallback(Callback):
 
             metrics = self.trainer.step_env_metrics
             metrics_resume = self.trainer.golden_env_metrics
-            if (
-                metrics is not None
-                and metrics_resume is not None
-                and "consume_tokens(M)" in metrics
-                and "consume_tokens(M)" in metrics_resume
-            ):
-                assert metrics["consume_tokens(M)"] == metrics_resume["consume_tokens(M)"]
+            compare_metrics(metrics, metrics_resume)
 
             logger.info_rank0(
                 "dataset_a: "
@@ -416,7 +357,8 @@ def _main_distributed_test():
     _, remaining_argv = _parser.parse_known_args()
     sys.argv = [sys.argv[0]] + remaining_argv
 
-    with patch("veomni.utils.device.empty_cache", _mock_empty_cache):
+    # Patch empty_cache to avoid AttributeError on CPU.
+    with patch("veomni.utils.device.empty_cache", mock_empty_cache):
         args = parse_args(VeOmniArguments)
         trainer = TrainerTest(args)
         trainer.train()
