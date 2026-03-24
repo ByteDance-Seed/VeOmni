@@ -31,7 +31,7 @@ class Callback(ABC):
     def __init__(self, trainer: "BaseTrainer") -> None:
         self.trainer = trainer
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         pass
 
     def on_step_end(

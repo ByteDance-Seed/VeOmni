@@ -52,7 +52,8 @@ class ShardedIterableDataset(IterableDataset):
         self.shuffle = shuffle
         self.seed = seed
         self.output_refetch_idx = False  # Will be set by DynamicBatchingSizeDataset if needed
-        self._current_idx = 0  # Track current position in iteration
+        self._current_idx = -1  # Track current position in iteration
+        self._just_resumed = False
 
         # Generate index permutation at initialization if shuffle is enabled
         if self.shuffle:
@@ -110,9 +111,12 @@ class ShardedIterableDataset(IterableDataset):
             num_workers = 1
             worker_id = 0
         total_workers = world_size * num_workers
-        start_idx = self._current_idx if self._current_idx > 0 else rank * num_workers + worker_id
+        if not self._just_resumed or self._current_idx < 0:
+            self._current_idx = rank * num_workers + worker_id
+        else:
+            self._just_resumed = False
 
-        for i in range(start_idx, len(self.indices), total_workers):
+        for i in range(self._current_idx, len(self.indices), total_workers):
             idx = self.indices[i]
             self._current_idx = i + total_workers
             if self.output_refetch_idx:
@@ -144,6 +148,7 @@ class ShardedIterableDataset(IterableDataset):
     def load_state_dict(self, state_dict):
         """Restore the iteration state."""
         self._current_idx = state_dict["current_idx"]
+        self._just_resumed = True
 
 
 class DummyDataset:

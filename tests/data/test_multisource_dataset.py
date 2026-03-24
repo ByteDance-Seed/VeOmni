@@ -1,6 +1,6 @@
+import argparse
 import copy
 import os
-import random
 import subprocess
 import sys
 import time
@@ -17,13 +17,15 @@ from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
 from utils import FakeModel, ShardedIterableDataset, compare_global_batch
 
+from tests.tools.launch_utils import find_free_port
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
-from veomni.data.multisource_dataset import MultiSourceDataset
+from veomni.data.dataset import MultiSourceDataset
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, CheckpointerCallback, TrainerState
 from veomni.utils import helper
+from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
@@ -69,8 +71,8 @@ class TrainerTest(BaseTrainer):
     resume_dcp_path: str
     tmp_yaml_path: str
 
-    is_resume: bool = False
-    start_save_data: bool = False
+    save_epoch, save_step = 1, None
+    is_resume_train: bool = False
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
 
@@ -83,7 +85,6 @@ class TrainerTest(BaseTrainer):
             self.device = torch.device(device_str)
         else:
             self.device = torch.device("cpu")
-
         backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
         if not dist.is_initialized():
             dist.init_process_group(
@@ -165,6 +166,8 @@ class TrainerTest(BaseTrainer):
         args.compute_train_steps(dataset_length=None)
         self.train_steps = args.train_steps
 
+        self.save_step = self.train_steps - 2
+
     def _build_dataloader(self):
         args = self.args
         global_batch_size = cast(int, args.train.global_batch_size)
@@ -216,6 +219,7 @@ class TrainerTest(BaseTrainer):
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
+        self.state.curr_step = self.start_step - 1
         self.environ_meter_callback.on_epoch_begin(self.state)
         self.checkpointer_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
@@ -226,9 +230,10 @@ class TrainerTest(BaseTrainer):
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        # we need to put the check callback before environ meter callback because the later one will remove 'ds_idx' and 'source_name' from it
+        self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
@@ -237,17 +242,17 @@ class TrainerTest(BaseTrainer):
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         self.state.global_step += 1
+        self.state.curr_step += 1
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.on_step_begin(micro_batches=micro_batches)
         self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
 
     def resume_train(self):
-        self.is_resume = True
-        self.start_save_data = True
+        self.is_resume_train = True
         super().train()
 
     def destroy_distributed(self):
-        if self.is_resume:
+        if self.is_resume_train:
             super().destroy_distributed()
 
 
@@ -267,7 +272,7 @@ class EnvironMeterCallbackTest(Callback):
             gc_steps=args.train.gc_steps,
         )
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)
         self.start_time = time.time()
@@ -300,19 +305,22 @@ class CheckpointerCallbackTest(CheckpointerCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
-        pass
-
-    def on_epoch_end(self, state: TrainerState, **kwargs):
-        if state.epoch == 1 and not self.trainer.is_resume:
+        if (
+            not self.trainer.is_resume_train
+            and state.epoch == self.trainer.save_epoch
+            and state.curr_step == self.trainer.save_step
+        ):
             self._save_checkpoint(state)
             self.trainer.resume_dcp_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
             self.trainer.args.train.checkpoint.load_path = self.trainer.resume_dcp_path
-            self.trainer.start_save_data = True
+
+    def on_epoch_end(self, state: TrainerState, **kwargs):
+        pass
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        if self.trainer.is_resume:
+        if self.trainer.is_resume_train:
             self._load_checkpoint()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
@@ -322,7 +330,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 class CheckCallback(Callback):
     trainer: TrainerTest
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         if state.global_step == 1:
             helper.print_example(example=micro_batches[0], rank=self.trainer.args.train.local_rank)
             for micro_batch in micro_batches:
@@ -343,16 +351,38 @@ class CheckCallback(Callback):
                 assert micro_batch["attention_mask"].shape[-1] == micro_batch["input_ids"].shape[-1]
                 assert micro_batch["labels"].shape[-1] == micro_batch["input_ids"].shape[-1]
                 assert torch.all(micro_batch["attention_mask"] == 1)
-                assert torch.all(micro_batch["labels"] == micro_batch["input_ids"])
+                assert torch.all(
+                    (micro_batch["labels"] == IGNORE_INDEX) | (micro_batch["labels"] == micro_batch["input_ids"])
+                )
 
-        if self.trainer.start_save_data:
-            if not self.trainer.is_resume:
+        if state.epoch == self.trainer.save_epoch and state.curr_step > self.trainer.save_step:
+            if not self.trainer.is_resume_train:
                 self.trainer.gt_data_list.append(micro_batches)
             else:
                 self.trainer.pred_data_list.append(micro_batches)
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        if self.trainer.is_resume:
+        if self.trainer.is_resume_train:
+            assert len(self.trainer.gt_data_list) == len(self.trainer.pred_data_list), (
+                f"Batch count mismatch: gt={len(self.trainer.gt_data_list)}, pred={len(self.trainer.pred_data_list)}"
+            )
+
+            """
+            gt_data_list_output = [
+                [(list(set(micro_batch["input_ids"].tolist()[0])), micro_batch.get("ds_idx", None))
+                for micro_batch in micro_batches
+                ]
+                for micro_batches in self.trainer.gt_data_list
+            ]
+            pred_data_list_output = [
+                [(list(set(micro_batch["input_ids"].tolist()[0])), micro_batch.get("ds_idx", None))
+                for micro_batch in micro_batches
+                ]
+                for micro_batches in self.trainer.pred_data_list
+            ]
+            logger.error(f"[rank{self.trainer.args.train.global_rank}] gt_data_list_output: {gt_data_list_output}")
+            logger.error(f"[rank{self.trainer.args.train.global_rank}] pred_data_list_output: {pred_data_list_output}")
+            """
             compare_global_batch(self.trainer.gt_data_list, self.trainer.pred_data_list)
 
             metrics = self.trainer.step_env_metrics
@@ -380,11 +410,18 @@ class CheckCallback(Callback):
             self.trainer.golden_env_metrics = copy.deepcopy(self.trainer.step_env_metrics)
 
 
-def run_multisource_dataset_test():
-    args = parse_args(VeOmniArguments)
-    trainer = TrainerTest(args)
-    trainer.train()
-    trainer.resume_train()
+def _main_distributed_test():
+    """Entry point for the distributed test launched by ``torchrun``."""
+    _parser = argparse.ArgumentParser()
+    _, remaining_argv = _parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + remaining_argv
+
+    with patch("veomni.utils.device.empty_cache", _mock_empty_cache):
+        args = parse_args(VeOmniArguments)
+        trainer = TrainerTest(args)
+        trainer.train()
+        assert trainer.args.train.checkpoint.load_path is not None
+        trainer.resume_train()
 
 
 def _make_simple_dataset(
@@ -816,7 +853,7 @@ class TestLoadStateDictBoundary:
 
 
 def build_command():
-    port = 12345 + random.randint(0, 100)
+    port = find_free_port()
     command = [
         "torchrun",
         "--nnodes=1",
@@ -826,7 +863,7 @@ def build_command():
         "--model.config_path=test",
         "--data.train_path=None",
         "--data.train_size=1000",
-        "--data.max_seq_len=8",
+        "--data.max_seq_len=32",
         "--data.datasets_type=iterable",
         "--train.global_batch_size=8",
         "--train.micro_batch_size=2",
@@ -845,10 +882,9 @@ def test_multisource_dataset_chain():
     if sys.platform == "darwin":
         pytest.skip(f"torch_shm_manager not supported on macOS: executable={_torch_shm_manager_executable()}")
     command = build_command()
-    result = subprocess.run(command, check=True)
+    result = subprocess.run(command, check=True, env=os.environ.copy())
     assert result.returncode == 0
 
 
 if __name__ == "__main__":
-    with patch("veomni.utils.device.empty_cache", _mock_empty_cache):
-        run_multisource_dataset_test()
+    _main_distributed_test()
