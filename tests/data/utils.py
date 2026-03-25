@@ -174,7 +174,7 @@ class ShardedIterableDataset(IterableDataset):
     * **Shuffle** – when ``shuffle=True``, a fixed ``torch.randperm`` generated from
       ``seed`` at construction time is used so that the shuffled order is reproducible
       and consistent across checkpoint / resume cycles.
-    * **Index output** – when ``output_refetch_idx`` is set to ``True`` (by
+    * **Index output** – when ``output_index_for_resume`` is set to ``True`` (by
       ``DynamicBatchingSizeDataset`` when ``save_by_idx=True``), each ``__iter__``
       yield is a ``(sample_dict, original_index)`` tuple instead of a bare dict,
       allowing the consumer to store the indices instead of the full samples when saving checkpoints,
@@ -196,7 +196,7 @@ class ShardedIterableDataset(IterableDataset):
         self.size = size
         self.shuffle = shuffle
         self.seed = seed
-        self.output_refetch_idx = False  # Will be set by DynamicBatchingSizeDataset if needed
+        self.output_index_for_resume = False  # Will be set by DynamicBatchingSizeDataset if needed
         self._current_idx = -1  # Track current position in iteration
         self._just_resumed = False
 
@@ -264,7 +264,7 @@ class ShardedIterableDataset(IterableDataset):
         for i in range(self._current_idx, len(self.indices), total_workers):
             idx = self.indices[i]
             self._current_idx = i + total_workers
-            if self.output_refetch_idx:
+            if self.output_index_for_resume:
                 yield (self[idx], idx)
             else:
                 yield self[idx]

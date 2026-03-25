@@ -395,7 +395,7 @@ def build_command(shuffle=True, save_by_idx=True):
         "--train.checkpoint.manager=dcp",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
-        "--train.dyn_bsz_runtime=worker",
+        "--train.dyn_bsz_run_in=worker",
         f"--save_by_idx={str(save_by_idx).lower()}",
         "--train.seed=42",
     ]
@@ -454,7 +454,7 @@ class TrainerTest(BaseTrainer):
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
-            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_run_in=args.train.dyn_bsz_run_in,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             dyn_bsz_dataset_save_by_idx=self.save_by_idx,
             seed=args.train.seed,

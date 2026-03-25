@@ -113,7 +113,7 @@ class TrainerTest(BaseTrainer):
             seed=args.train.seed,
             level="token",
             source_names=self.multisource_names,
-            sharded=True,
+            upstream_sharded=True,
             stopping_strategy="all_exhausted",
         )
 
@@ -157,7 +157,7 @@ class TrainerTest(BaseTrainer):
             max_seq_len=args.data.max_seq_len,
             train_steps=args.train_steps,
             dyn_bsz=args.train.dyn_bsz,
-            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_run_in=args.train.dyn_bsz_run_in,
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             dyn_bsz_buffer_size=1,
             num_workers=1,
@@ -386,7 +386,7 @@ def _make_simple_dataset(
         sample_token_len_fn=None,
         source_names=source_names,
         source_ids=source_ids,
-        sharded=False,
+        upstream_sharded=False,
         stopping_strategy=stopping_strategy,
     )
 
@@ -817,7 +817,7 @@ def build_command():
         "--train.checkpoint.manager=dcp",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
-        "--train.dyn_bsz_runtime=worker",
+        "--train.dyn_bsz_run_in=worker",
         "--train.bsz_warmup_ratio=0",
         "--train.max_steps=6",
     ]

@@ -252,7 +252,16 @@ class EnergonDataset(IterativeDataset):
 
 
 def get_length_by_attention_mask_fn(sample):
+    """Return token length from ``attention_mask``.
+
+    Defined as a top-level helper instead of an inline lambda because ``spawn``
+    worker mode requires the callable to be pickleable.
+    """
     return int(sample["attention_mask"].sum())
+
+
+def _supports_output_index_for_resume(dataset: Any) -> bool:
+    return callable(getattr(dataset, "get_item", None)) and hasattr(dataset, "output_index_for_resume")
 
 
 class MultiSourceDataset(IterableDataset):
@@ -263,9 +272,9 @@ class MultiSourceDataset(IterableDataset):
 
     It supports:
     - Per-epoch deterministic randomness (seeded by epoch, dp rank, and worker id).
-    - Optional distributed sharding behavior controlled by ``sharded``.
+    - Optional distributed sharding behavior controlled by ``upstream_sharded``.
     - Stopping strategies for how to behave when an upstream source is exhausted.
-    - Optional refetch-index passthrough for checkpointing buffers by index.
+    - Optional resume-index passthrough for checkpointing buffers by index.
     """
 
     def __init__(
@@ -273,13 +282,13 @@ class MultiSourceDataset(IterableDataset):
         datasets: Sequence[IterableDataset],
         weights: Sequence[float],
         seed: int = 42,
-        level: str = "sample",
+        level: Literal["sample", "token"] = "sample",
         sample_token_len_fn: Optional[Callable[[Any], float]] = None,
         source_names: Optional[Sequence[str]] = None,
         source_ids: Optional[Sequence[str]] = None,
-        sharded: bool = False,
+        upstream_sharded: bool = False,
         stopping_strategy: Literal["first_exhausted", "all_exhausted", "never_exhausted"] = "first_exhausted",
-        output_refetch_idx: bool = False,
+        output_index_for_resume: bool = False,
     ) -> None:
         """Initialize a MultiSourceDataset.
 
@@ -293,15 +302,15 @@ class MultiSourceDataset(IterableDataset):
                 If not provided, a default heuristic is used.
             source_names: Optional display names for each source (for meta fields).
             source_ids: Optional stable IDs for each source (used in checkpoint state).
-            sharded: If False, performs deterministic modulo-based sharding by dp rank on
-                the produced samples. If True, assumes upstream datasets already handle
-                sharding/splitting.
+            upstream_sharded: If False, performs deterministic modulo-based sharding by
+                dp rank on the produced samples. If True, assumes upstream datasets
+                already handle sharding/splitting.
             stopping_strategy:
                 - ``first_exhausted``: Stop the whole dataset once any source is exhausted.
                 - ``all_exhausted``: Restart an exhausted source until all sources are exhausted.
                 - ``never_exhausted``: Always restart exhausted sources and never terminate.
-            output_refetch_idx: If True, yields ``(sample, (source_id, refetch_idx))`` so that
-                downstream components can checkpoint buffers by indices and reconstruct them.
+            output_index_for_resume: If True, yields ``(sample, (source_id, resume_index))``
+                so downstream components can checkpoint buffers by indices and reconstruct them.
 
         Raises:
             ValueError: If input arguments are invalid.
@@ -313,7 +322,7 @@ class MultiSourceDataset(IterableDataset):
         self._sample_token_len_fn = sample_token_len_fn or self._default_sample_token_len
         self._source_names = list(source_names) if source_names is not None else None
         self._source_ids = list(source_ids) if source_ids is not None else []
-        self._sharded = sharded
+        self._upstream_sharded = upstream_sharded
         self._stopping_strategy = stopping_strategy
         self._ds_num = len(self._datasets)
 
@@ -356,22 +365,22 @@ class MultiSourceDataset(IterableDataset):
         self.dp_rank = max(0, int(getattr(parallel_state, "dp_rank", 0)))
         self.dp_size = max(1, int(getattr(parallel_state, "dp_size", 1)))
 
-        self.output_refetch_idx = output_refetch_idx
+        self.output_index_for_resume = output_index_for_resume
 
         self._just_resumed = False
 
     @property
-    def output_refetch_idx(self) -> bool:
-        """Whether to yield refetch indices alongside samples."""
-        return self._output_refetch_idx
+    def output_index_for_resume(self) -> bool:
+        """Whether to yield resume indices alongside samples."""
+        return self._output_index_for_resume
 
-    @output_refetch_idx.setter
-    def output_refetch_idx(self, value: bool) -> None:
-        """Enable or disable refetch-index output.
+    @output_index_for_resume.setter
+    def output_index_for_resume(self, value: bool) -> None:
+        """Enable or disable resume-index output.
 
         When enabled, each upstream dataset must provide:
         - ``get_item(idx)`` to fetch a sample by index
-        - ``output_refetch_idx`` attribute to switch yielding ``(sample, idx)``
+        - ``output_index_for_resume`` attribute to switch yielding ``(sample, idx)``
 
         Args:
             value: True to enable refetch indices, False to disable.
@@ -381,25 +390,25 @@ class MultiSourceDataset(IterableDataset):
         """
         if value:
             for source_id, (dataset, _ds_idx) in self._id2dataset.items():
-                if not (callable(getattr(dataset, "get_item", None)) and hasattr(dataset, "output_refetch_idx")):
+                if not _supports_output_index_for_resume(dataset):
                     raise ValueError(
-                        f"output_refetch_idx is True, but dataset '{source_id}' {self._id2dataset.items()} does not have "
-                        f"get_item method or output_refetch_idx attribute to resume samples "
+                        f"output_index_for_resume is True, but dataset '{source_id}' does not have "
+                        f"get_item method or output_index_for_resume attribute to resume samples "
                         f"in buffers based on idx"
                     )
-        self._output_refetch_idx = value
+        self._output_index_for_resume = value
         for dataset in self._datasets:
-            if hasattr(dataset, "output_refetch_idx"):
-                setattr(dataset, "output_refetch_idx", value)
+            if hasattr(dataset, "output_index_for_resume"):
+                dataset.output_index_for_resume = value
 
-    def get_item(self, refetch_idx):
+    def get_item(self, resume_index):
         """Fetch a single sample by its source ID and index within that source.
 
         This is used by downstream checkpoint/resume logic that stores buffer
         contents as ``(source_id, idx)`` pairs instead of full samples.
 
         Args:
-            refetch_idx: A ``(source_id, idx)`` tuple. ``source_id`` identifies the
+            resume_index: A ``(source_id, idx)`` tuple. ``source_id`` identifies the
                 sub-dataset, and ``idx`` is the 0-based index within that sub-dataset.
 
         Returns:
@@ -408,7 +417,7 @@ class MultiSourceDataset(IterableDataset):
         Raises:
             AttributeError: If the underlying sub-dataset does not provide an index-based fetch API.
         """
-        source_id, idx = refetch_idx
+        source_id, idx = resume_index
         dataset, ds_idx = self._id2dataset[source_id]
         get_item_fn = getattr(dataset, "get_item", None)
         if callable(get_item_fn):
@@ -433,8 +442,8 @@ class MultiSourceDataset(IterableDataset):
         """Iterate and yield samples from multiple sources.
 
         Yields:
-            If ``output_refetch_idx`` is False, yields a sample (typically a dict).
-            If ``output_refetch_idx`` is True, yields ``(sample, (source_id, refetch_idx))``.
+            If ``output_index_for_resume`` is False, yields a sample (typically a dict).
+            If ``output_index_for_resume`` is True, yields ``(sample, (source_id, resume_index))``.
         """
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
@@ -459,8 +468,8 @@ class MultiSourceDataset(IterableDataset):
             if sample is None:
                 continue
 
-            if self._output_refetch_idx:
-                sample, refetch_idx = sample[0], sample[1]
+            if self._output_index_for_resume:
+                sample, resume_index = sample[0], sample[1]
 
             token_len = self._sample_token_len_fn(sample)
             if token_len <= 0:
@@ -469,13 +478,13 @@ class MultiSourceDataset(IterableDataset):
                 self._avg_len_sum[ds_idx] += token_len
                 self._avg_len_count[ds_idx] += 1
             self._global_sample_idx += 1
-            if not self._sharded and self._global_sample_idx % self.dp_size != self.dp_rank:
+            if not self._upstream_sharded and self._global_sample_idx % self.dp_size != self.dp_rank:
                 continue
 
             sample = self._attach_meta(sample, ds_idx)
 
-            if self._output_refetch_idx:
-                yield sample, (self._source_ids[ds_idx], refetch_idx)
+            if self._output_index_for_resume:
+                yield sample, (self._source_ids[ds_idx], resume_index)
             else:
                 yield sample
 
@@ -616,7 +625,6 @@ class MultiSourceDataset(IterableDataset):
                 "weights": self._weights.tolist(),
                 "level": self._level,
                 "stopping_strategy": self._stopping_strategy,
-                "sharded": self._sharded,
             },
             "runtime": {
                 "random_state": self._random_state.get_state(),
@@ -752,16 +760,42 @@ class DynamicBatchingSizeDataset(IterableDataset):
             ready_for_micro_batch_threshold: Minimum number of samples required in
                 buffer before attempting to create a batch.
             save_by_idx: If True, saves sample indices for checkpoint resumption.
-                Requires dataset to have get_item method and output_refetch_idx attribute.
+                Requires dataset to have get_item method and output_index_for_resume attribute.
             get_length_fn: Function to compute the length (token count) of a sample.
                 Defaults to len.
             force_generate_long_sequence: If True, a sample whose length alone exceeds
                 ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
                 being silently discarded. This is not supported yet.
 
+        Resume flow when ``save_by_idx=True``::
+
+            Runtime path
+            ------------
+            DynamicBatchingSizeDataset
+            +- sets dataset.output_index_for_resume = True
+            +- reads from dataset.__iter__()
+            |  `- MultiSourceDataset.__iter__()
+            |     +- reads from source dataset 'zh'.__iter__()
+            |     +- gets inner_index = 17 from source dataset 'zh'
+            |     +- sample comes from source_dataset['zh'].get_item(17)
+            |     |  `- {'input_ids': [11, 22, 33], 'attention_mask': [1, 1, 1]}
+            |     `- yields ({'input_ids': [11, 22, 33], 'attention_mask': [1, 1, 1]}, ('zh', 17))
+            `- keeps
+               +- runtime buffer: {'input_ids': [11, 22, 33], 'attention_mask': [1, 1, 1]}
+               `- checkpoint buffer: ('zh', 17)
+
+            Resume path
+            -----------
+            checkpoint['buffer']
+            `- [('zh', 17), ('en', 5), ...]
+               `- load_state_dict()
+                  `- MultiSourceDataset.get_item(('zh', 17))
+                     +- 'zh' -> select source dataset 'zh'
+                     `- 17 -> source_dataset['zh'].get_item(17)
+
         Raises:
             ValueError: If ``save_by_idx`` is True but ``dataset`` does not expose the
-                ``get_item()`` method and ``output_refetch_idx`` attribute required to
+                ``get_item()`` method and ``output_index_for_resume`` attribute required to
                 reconstruct the buffer from indices on resume.
         """
         self.dataset = dataset
@@ -788,13 +822,13 @@ class DynamicBatchingSizeDataset(IterableDataset):
 
     @save_by_idx.setter
     def save_by_idx(self, value: bool) -> None:
-        if value and not (hasattr(self.dataset, "get_item") and hasattr(self.dataset, "output_refetch_idx")):
+        if value and not _supports_output_index_for_resume(self.dataset):
             raise ValueError(
-                "save_by_idx is True, but dataset does not have get_item method or output_refetch_idx attribute to resume samples in buffers based on idx"
+                "save_by_idx is True, but dataset does not have get_item method or output_index_for_resume attribute to resume samples in buffers based on idx"
             )
         self._save_by_idx = value
-        if hasattr(self.dataset, "output_refetch_idx"):
-            self.dataset.output_refetch_idx = value
+        if hasattr(self.dataset, "output_index_for_resume"):
+            self.dataset.output_index_for_resume = value
 
     def __iter__(self):
         """Iterate over the dataset and yield dynamically batched micro batches.

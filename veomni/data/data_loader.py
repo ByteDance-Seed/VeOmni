@@ -71,8 +71,8 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
-    dyn_bsz_runtime: Literal["main", "worker"] = "main",
-    dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_in_dataloader is False.
+    dyn_bsz_run_in: Literal["main", "worker"] = "worker",
+    dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
     worker_num_threads: Optional[int] = None,
@@ -86,6 +86,18 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
 ) -> "DistributedDataloader":
+    """Build the native training dataloader.
+
+    Args:
+        dyn_bsz_run_in: Which process dynamic batching runs in. ``"main"`` keeps the
+            legacy main-process ``DynamicBatchSizeDataLoader`` path, while ``"worker"``
+            batches inside each DataLoader worker via ``DynamicBatchingSizeDataset`` so
+            worker state can participate in ``StatefulDataLoader`` checkpoint/resume.
+        multiprocessing_context: Optional worker start method override.
+            Use ``"spawn"`` when worker-side code must be pickle-safe and should not
+            inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
+            Example: ``multiprocessing_context="spawn"``.
+    """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
@@ -115,7 +127,7 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        if dyn_bsz_runtime == "main":
+        if dyn_bsz_run_in == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,
                 buffer_size=dyn_bsz_buffer_size,
@@ -155,24 +167,22 @@ def build_native_dataloader(
             seed=seed,
         )
 
-    dataloader_kwargs = {
-        "batch_size": dataloader_batch_size,
-        "sampler": sampler,
-        "num_workers": num_workers,
-        "collate_fn": collate_fn,
-        "pin_memory": pin_memory,
-        "pin_memory_device": get_device_type(),
-        "drop_last": drop_last,
-        "prefetch_factor": prefetch_factor,
-    }
-    if multiprocessing_context is not None:
-        dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
-    if worker_num_threads is not None:
-        dataloader_kwargs["worker_init_fn"] = _build_worker_init_fn(worker_num_threads)
+    worker_init_fn = _build_worker_init_fn(worker_num_threads) if worker_num_threads is not None else None
+    dataloader = DistributedDataloader(
+        dataset,
+        batch_size=dataloader_batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        pin_memory_device=get_device_type(),
+        drop_last=drop_last,
+        prefetch_factor=prefetch_factor,
+        worker_init_fn=worker_init_fn,
+        multiprocessing_context=multiprocessing_context,
+    )
 
-    dataloader = DistributedDataloader(dataset, **dataloader_kwargs)
-
-    if dyn_bsz and dyn_bsz_runtime == "main":
+    if dyn_bsz and dyn_bsz_run_in == "main":
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
             batching_strategy=batching_strategy,
