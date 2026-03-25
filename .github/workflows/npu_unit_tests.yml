@@ -117,7 +117,7 @@ jobs:
           uv run --frozen pytest -s -x tests/ops/test_comp.py
       - name: Sync dependencies [transformers-v5]
         run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
+          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
       - name: Run models tests [transformers-v5]
         run: |
           uv run  --frozen pytest -s -x tests/models/test_model_registry.py
