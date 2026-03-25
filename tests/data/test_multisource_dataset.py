@@ -8,11 +8,16 @@ from contextlib import nullcontext
 from typing import Any, Dict, List, Literal, cast
 from unittest.mock import patch
 
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
 import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import yaml
+from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
 from utils import (
@@ -25,7 +30,6 @@ from utils import (
     setup_test_distributed,
 )
 
-from tests.tools.launch_utils import find_free_port
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.dataset import MultiSourceDataset
