@@ -319,3 +319,79 @@ def all_to_all_images(image_embeds, in_splits, out_splits):
     image_embeds = image_embeds[: sum(in_splits)]
     group = get_ulysses_sequence_parallel_group()
     return _AlltoAllRegion.apply(group, image_embeds, in_splits, out_splits)
+
+
+class _Roll(torch.autograd.Function):
+    """
+    Distributed implementation of `torch.roll` using batched isend / irecv
+    """
+
+    @staticmethod
+    def _impl(input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup):
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        dimlen = input.size(dims)
+        assert abs(shifts) <= dimlen
+        if shifts > 0:  # roll afterwards
+            splits = [dimlen - shifts, shifts]
+            body, chunk = torch.split(input, splits, dims)
+            dst = (rank + 1 + world_size) % world_size
+            src = (rank - 1 + world_size) % world_size
+        else:
+            splits = [-shifts, dimlen + shifts]
+            chunk, body = torch.split(input, splits, dims)
+            dst = (rank - 1 + world_size) % world_size
+            src = (rank + 1 + world_size) % world_size
+        chunk = chunk.contiguous()
+        recv_chunk = torch.empty_like(chunk)
+        ops = [
+            dist.P2POp(dist.irecv, recv_chunk, dist.get_global_rank(group, src), group),
+            dist.P2POp(dist.isend, chunk, dist.get_global_rank(group, dst), group),
+        ]
+        works = dist.batch_isend_irecv(ops)
+        for work in works:
+            work.wait()
+        if shifts > 0:
+            output = torch.cat([recv_chunk, body], dims)
+        else:
+            output = torch.cat([body, recv_chunk], dims)
+        return output.contiguous()
+
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup):
+        ctx.group = group
+        ctx.shifts = shifts
+        ctx.dims = dims
+        assert isinstance(shifts, int), "shifts must be an integer"
+        assert isinstance(dims, int), "dims must be an integer"
+        if group is None or shifts == 0:
+            return torch.roll(input, shifts, dims)
+        return _Roll._impl(input, shifts, dims, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        shifts = ctx.shifts
+        dims = ctx.dims
+        if group is None or shifts == 0:
+            return torch.roll(grad_output, -shifts, dims), None, None, None
+        return _Roll._impl(grad_output, -shifts, dims, group), None, None, None
+
+
+def roll_with_sequence_parallel(
+    input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup = None
+) -> torch.Tensor:
+    """
+    Roll the tensor within sequence parallel region. This is the
+    distributed implementation version of `torch.roll`
+
+    args:
+        input: input tensor of shape (sliced_tokens, num_head, head_dim)
+        shifts: number of positions to shift
+        dims: dimension to shift
+    returns:
+        rolled_tensor: rolled tensor of shape (sliced_tokens, num_head, head_dim)
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+
+    return _Roll.apply(input, shifts, dims, group)

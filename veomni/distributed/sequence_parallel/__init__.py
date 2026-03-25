@@ -48,6 +48,7 @@ from .ulysses import (
     all_to_all_images,
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
+    roll_with_sequence_parallel,
 )
 from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
 
