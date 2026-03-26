@@ -221,9 +221,9 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
                     rtol=rtol,
                     atol=atol,
                 )
-            except AssertionError:
+            except AssertionError as e:
                 print_all_values(outputs_dict, key)
-                raise AssertionError(f"{key} not match")
+                raise AssertionError(f"{key} not match") from e
 
 
 def apply_veomni_loss_unpatch():

@@ -99,7 +99,7 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
         )
         dist.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=fsdp_model.process_group)
         # allreduce across tp group
-        for para, para_group in extra_parallel_group.items():
+        for _para, para_group in extra_parallel_group.items():
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=para_group)
     else:
         total_norm = local_sharded_norm**norm_type
@@ -135,7 +135,8 @@ def clip_grad_norm_(fsdp_model: FSDP, max_norm, norm_type=2.0) -> torch.Tensor:
         warnings.warn(
             f"Called FSDP.clip_grad_norm_() on rank {fsdp_model.rank} with no "
             "gradients -- returning the total norm in the default dtype "
-            f"{total_norm.dtype}"
+            f"{total_norm.dtype}",
+            stacklevel=2,
         )  # warn since this is generally unexpected
         return total_norm
     total_norm_dtype = functools.reduce(

@@ -106,7 +106,7 @@ class ParallelPlan:
 
         fsdp_no_shard_states_fqn_to_module = {}
         fsdp_no_shard_states_fqn_to_para = {}
-        for fqn, param in model.named_modules():
+        for fqn, _param in model.named_modules():
             for para, no_shard_patterns in self.extra_parallel_fsdp_no_shard_module.items():
                 for no_shard_pattern in no_shard_patterns:
                     if check_fqn_match(no_shard_pattern, fqn):
@@ -123,7 +123,7 @@ class ParallelPlan:
             return None
 
         fsdp_no_shard_states_fqn_to_module = {}
-        for fqn, param in model.named_modules():
+        for fqn, _param in model.named_modules():
             for no_shard_pattern in self.extra_parallel_fsdp_no_shard_module[para_name]:
                 if check_fqn_match(no_shard_pattern, fqn):
                     fsdp_no_shard_states_fqn_to_module[fqn] = get_module_from_path(model, fqn)
