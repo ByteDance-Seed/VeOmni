@@ -160,6 +160,7 @@ class TrainerTest(BaseTrainer):
             dyn_bsz_run_in=args.train.dyn_bsz_run_in,
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             dyn_bsz_buffer_size=1,
+            dyn_bsz_dataset_save_by_idx=True,
             num_workers=1,
             drop_last=args.data.dataloader.drop_last,
             pin_memory=args.data.dataloader.pin_memory,

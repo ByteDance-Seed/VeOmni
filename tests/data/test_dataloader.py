@@ -1,5 +1,6 @@
 import types
 from functools import partial
+from typing import Literal
 
 import pytest
 from utils import DummyDataset, process_dummy_example
@@ -28,8 +29,14 @@ def dummy_dataset_ci():
 @pytest.mark.parametrize("dataset_name", ["iterable", "mapping"])
 @pytest.mark.parametrize("dyn_bsz", [True, False])
 @pytest.mark.parametrize("sp_size", [1, 2])
+@pytest.mark.parametrize("dyn_bsz_run_in", ["main", "worker"])
 def test_build_dataloader_dyn_bsz_sp_filling(
-    monkeypatch, dummy_dataset_ci, dataset_name: str, dyn_bsz: bool, sp_size: int
+    monkeypatch,
+    dummy_dataset_ci,
+    dataset_name: str,
+    dyn_bsz: bool,
+    sp_size: int,
+    dyn_bsz_run_in: Literal["main", "worker"],
 ):
     import veomni.data.data_collator as m_col
     import veomni.data.data_loader as m_dl
@@ -45,7 +52,10 @@ def test_build_dataloader_dyn_bsz_sp_filling(
     max_seq_len = 100
 
     if dyn_bsz:
-        dataloader_batch_size = 1
+        if dyn_bsz_run_in == "main":
+            dataloader_batch_size = 1
+        else:
+            dataloader_batch_size = global_batch_size // micro_batch_size
     else:
         dataloader_batch_size = global_batch_size
 
@@ -67,6 +77,7 @@ def test_build_dataloader_dyn_bsz_sp_filling(
         train_steps=1,
         num_workers=0,
         dyn_bsz=dyn_bsz,
+        dyn_bsz_run_in=dyn_bsz_run_in,
         dyn_bsz_buffer_size=1,
         drop_last=True,
         prefetch_factor=None,
