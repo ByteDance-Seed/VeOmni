@@ -36,15 +36,13 @@ def get_module_from_path(model: nn.Module, path: str):
         return get_module_from_path(next_obj, ".".join(attrs[1:]))
 
 
-def is_parent_module_from_path(model: nn.Module, module_name: str, path: str):
+def is_same_module_from_path(model: nn.Module, module_name: str, path: str):
     attrs = path.split(".")
     if len(attrs) == 1:
         return getattr(model, attrs[0]).__class__.__name__ == module_name
     else:
         next_obj = getattr(model, attrs[0])
-        if next_obj.__class__.__name__ == module_name:
-            return True
-        return is_parent_module_from_path(next_obj, module_name, ".".join(attrs[1:]))
+        return is_same_module_from_path(next_obj, module_name, ".".join(attrs[1:]))
 
 
 def check_all_fqn_match(path_patterns: List[str], path_keys: List[str]):

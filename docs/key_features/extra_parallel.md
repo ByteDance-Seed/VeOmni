@@ -17,7 +17,7 @@ As EP+FSDP1/FSDP2 is well supported in VeOmni, similar parallelism is also neede
 
 The overall design of extra parallelism is similar to EP+FSDP1/FSDP2, except that it is applied on different parallel modules. Before reading this document, please read [ep_fsdp2.md](./key_features/ep_fsdp2.md). There are several main changes as follow:
 
-* For FSDP1, determine which modules in basic_modules are siblings or parent nodes of fsdp_no_shard_states_fqn; if so, exclude these modules from the FSDP sharding of the entire model's root node at the initial stage to prevent them from being sharded twice later.
+* For FSDP1, determine which modules in basic_modules, typically no split modules, are siblings nodes of fsdp_no_shard_states_fqn; if so, exclude these modules from the FSDP sharding of the entire model's root node at the initial stage to prevent them from being sharded twice later.
 
 * For FSDP2, the sharded modules need to be sorted in reverse order from submodules to parent modules to avoid sharding twice, as full_shard is applied from bottom to top.
 
@@ -40,11 +40,6 @@ When using train script (e.g. [tasks/train_vlm.py](../../tasks/train_vlm.py)), a
 --train.accelerator.extra_parallel_sizes size1 size2
 --train.accelerator.extra_parallel_placement_innermost bool1 bool2
 --train.accelerator.extra_parallel_names name1 name2
-```
-
-In the modeling script (e.g. [patched_modeling_qwen3_moe_gpu.py](../../veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py)), add _no_split_modules to cover the extra parallelism modules, as DecoderLayer covers expert parallel modules by default:
-```python
-_no_split_modules = ["Qwen3MoeDecoderLayer", "ExtraParallelModule1", "ExtraParallelModule2", ...]
 ```
 
 In the parallel plan config (e.g. [qwen3_moe/parallel_plan.py](../../veomni/models/transformers/qwen3_moe/parallel_plan.py)), add

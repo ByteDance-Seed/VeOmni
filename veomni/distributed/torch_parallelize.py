@@ -41,7 +41,7 @@ from .fsdp import (
     register_checkpoint_extension,
 )
 from .parallel_state import get_parallel_state
-from .utils import get_module_from_path, is_parent_module_from_path, set_module_from_path, sort_fqn_by_submodule_first
+from .utils import get_module_from_path, is_same_module_from_path, set_module_from_path, sort_fqn_by_submodule_first
 
 
 if is_torch_version_greater_than("2.4"):
@@ -118,12 +118,12 @@ def parallelize_model_fsdp1(
         ]
         root_model_wrap_module_names = []
         for module_name in basic_modules:
-            is_parent_module = False
+            is_same_module = False
             for fqn in fsdp_no_shard_states_fqn:
-                if is_parent_module_from_path(model, module_name, fqn):
-                    is_parent_module = True
+                if is_same_module_from_path(model, module_name, fqn):
+                    is_same_module = True
                     break
-            if not is_parent_module:
+            if not is_same_module:
                 root_model_wrap_module_names.append(module_name)
 
         logger.info_rank0(
