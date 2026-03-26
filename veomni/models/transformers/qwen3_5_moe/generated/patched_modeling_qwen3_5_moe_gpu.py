@@ -15,6 +15,20 @@
 #      Propagate _moe_implementation from top-level config to text_config
 #    - method_override: Qwen3_5MoeSparseMoeBlock.forward
 #      Avoid in-place += on custom autograd Function output
+#    - method_override: Qwen3_5MoeModel.get_image_features
+#      Remove unnecessary split operation to maintain contiguous memory layout.
+#    - method_override: Qwen3_5MoeModel.get_placeholder_mask
+#      Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.
+#    - method_override: Qwen3_5MoeVisionModel.fast_pos_embed_interpolate
+#      Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.
+#    - method_override: Qwen3_5MoeVisionModel.forward
+#      Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens.
+#    - method_override: Qwen3_5MoeVisionModel.dummy_forward
+#      Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.
+#    - method_override: Qwen3_5MoeModel.forward
+#      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-GPU sync avoidance via pre-computed metadata.
+#    - method_override: Qwen3_5MoeForConditionalGeneration.get_position_id_func
+#      Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.
 #    - class_replacement: Qwen3_5MoeExperts
 #      Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 #    - method_override: Qwen3_5MoeGatedDeltaNet.__init__
@@ -62,7 +76,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeVisionConfig,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
@@ -85,10 +99,25 @@ except ImportError:
         "This case can't support dynamic batching packing!"
     )
 
+
+def get_position_id(main_func, self, **kwargs):
+    # Must be a module-level function for multiprocessing pickle
+    position_ids, rope_deltas = main_func(self, **kwargs)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
 # Additional imports for patches
+from copy import copy
+from functools import partial
+from types import SimpleNamespace
+
+import torch.distributed as dist
+
 from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.ops import fused_moe_forward
+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 
 
@@ -1338,6 +1367,12 @@ class Qwen3_5MoeVisionBlock(GradientCheckpointingLayer):
         return hidden_states
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5MoeVisionModel
+# Methods patched: fast_pos_embed_interpolate, forward, dummy_forward
+# ======================================================================
+
+
 class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
     config: Qwen3_5MoeVisionConfig
     _no_split_modules = ["Qwen3_5MoeVisionBlock"]
@@ -1413,67 +1448,71 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         return embeddings
 
     def fast_pos_embed_interpolate(self, grid_thw):
-        grid_thw_list = grid_thw.tolist()
-        grid_ts = [row[0] for row in grid_thw_list]
-        grid_hs = [row[1] for row in grid_thw_list]
-        grid_ws = [row[2] for row in grid_thw_list]
-        device = self.pos_embed.weight.device
+        """
+        Efficient implementation adapted from vLLM's Qwen-VL optimization.
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+        Key optimizations over standard Transformers implementation:
+        1. Computational Efficiency: Reduces bilinear interpolation multiplications from 4 to 1
+           per patch using algebraic simplification (w11=dh*dw; w10=dh-w11; w01=dw-w11; w00=1-dh-w01).
+        2. Vectorization: Uses torch.meshgrid to compute indices and weights for the entire
+           grid at once, avoiding expensive Python loops.
 
-        for t, h, w in grid_thw_list:
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+        Original source: https://github.com/vllm-project/vllm/blob/95c0f92/vllm/model_executor/models/qwen3_vl.py#L470
+        """
 
-            h_idxs_floor = h_idxs.int()
-            w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
 
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
+        outputs = []
+        dtype = self.pos_embed.weight.dtype
+        for t, h, w in grid_thw:
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
 
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+            h_floor = h_idxs.to(torch.long)
+            w_floor = w_idxs.to(torch.long)
+            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
 
-            indices = [
-                (base_h[None].T + w_idxs_floor[None]).flatten(),
-                (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
-            ]
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
 
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
+            # Create meshgrid view for all h, w vars
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
 
-            for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
+            # original computation of weights
+            # w00 = (1 - dh_grid) * (1 - dw_grid)
+            # w01 = (1 - dh_grid) * dw_grid
+            # w10 = dh_grid * (1 - dw_grid)
+            # w11 = dh_grid * dw_grid
+            # we reuse w11 here to avoid duplicate
+            # dh_grid * dw_grid computation
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
 
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
-        pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
 
-        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=dtype)
 
-        patch_pos_embeds_permute = []
-        merge_size = self.config.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
-            pos_embed = (
-                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
-            patch_pos_embeds_permute.append(pos_embed)
-        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
-        return patch_pos_embeds
+            embeds = self.pos_embed(indices) * weights
+            combined = embeds[0] + embeds[1] + embeds[2] + embeds[3]
+            combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+
+            outputs.append(repeated)
+
+        return torch.cat(outputs, dim=0)
 
     @merge_with_config_defaults
     @capture_outputs
@@ -1491,15 +1530,20 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+        # --- Patch.1: Sequence parallel padding and slicing for position embeddings ---
+        if get_parallel_state().sp_enabled:
+            # Note: grid_thw records the original, unpadded visual shapes. However, the data collator
+            # pads the visual sequence (hidden_states) to a multiple of (sp_size * pad_scale)
+            # to support Sequence Parallelism and subsequent spatial merging.
+            #
+            # pad_scale=4 matches the 4-to-1 spatial merge (2x2 pooling) ratio in the Qwen-VL Vision Tower.
+            # We must manually pad and slice the generated position embeddings to ensure they
+            # correctly align with the padded and sharded hidden states.
+            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
+        # --- Patch.1 ---
+
         hidden_states = hidden_states + pos_embeds
-
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -1510,6 +1554,50 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        # --- Patch.2: Flatten full-sequence rotary embeddings using the actual total sequence length ---
+        # In Sequence Parallelism, hidden_states.size(0) only represents the local shard length.
+        # We must use cu_seqlens[-1] (derived from unpadded grid_thw) to flatten the global
+        # rotary_pos_emb. This ensures the embeddings cover the entire original sequence
+        # before they are padded and sliced in Patch 3 to match the sharded hidden_states.
+        total_seq_len = cu_seqlens[-1]
+        rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
+        # --- Patch.2 ---
+
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        if get_parallel_state().sp_enabled:
+            # --- Patch.3: Sequence parallel padding and slicing for sin/cos rotary embeddings ---
+            cos, sin = position_embeddings
+            # Similar to Patch.1, we pad and slice the rotary embeddings to align with the
+            # padded hidden states, using pad_scale=4 to match the 4-to-1 spatial merge ratio.
+            cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
+            sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
+            position_embeddings = (cos, sin)
+            # --- Patch.3 ---
+
+            # --- Patch.4: Pad cu_seqlens to align with the padded hidden_states buffer under SP ---
+            # The Data Collator pads hidden_states to a multiple of (sp_size * pad_scale),
+            # but cu_seqlens (derived from grid_thw) only covers the original unpadded sequence.
+            # We must extend cu_seqlens to cover the entire padded buffer by treating the
+            # padding region as an additional "virtual sample". This ensures that varlen
+            # kernels (like FlashAttention) process the full buffer, preventing shape
+            # mismatches or collective communication hangs during subsequent Sequence
+            # Parallel operations (e.g., All-to-All).
+            sp_size = get_parallel_state().sp_size
+            # Calculate global padding: (local_seq_len * num_ranks) - original_total_len
+            pad_seq_len = seq_len * sp_size - total_seq_len.item()
+            if pad_seq_len > 0:
+                # Append a new entry to cu_seqlens to include the padding tokens as a final segment
+                new_cumsum = cu_seqlens[-1] + pad_seq_len
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+            # --- Patch.4 ---
 
         for blk in self.blocks:
             hidden_states = blk(
@@ -1525,6 +1613,34 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
             last_hidden_state=hidden_states,
             pooler_output=merged_hidden_states,
         )
+
+    def dummy_forward(self):
+        """
+        # Run a fake ViT forward so every FSDP rank touches the vision tower.
+        # This prevents reduce-scatter hangs when some ranks have no real images/videos.
+        """
+        if get_parallel_state().sp_enabled:
+            sp_size = get_parallel_state().sp_size
+
+            # Fake patch sequence for one local rank:
+            # 16 patch tokens, each token flattened from:
+            #   3 channels * 2 temporal patches * 16 * 16 spatial patch
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            # grid_thw describes the *global* pre-sharded vision grid, not the local shard.
+            # Here:
+            #   T = 1
+            #   H = 4 * sp_size
+            #   W = 4
+            # so total global patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
+            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        else:
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            # Non-SP case: a minimal valid 4x4 patch grid.
+            # Total patch tokens = 1 * 4 * 4 = 16.
+            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        return self(**dummy_data)
 
 
 @dataclass
@@ -1686,7 +1802,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeModel
-# Methods patched: __init__
+# Methods patched: __init__, get_image_features, get_placeholder_mask, forward
 # ======================================================================
 
 
@@ -1826,68 +1942,35 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
 
     @can_return_tuple
     @auto_docstring
-    def get_image_features(
-        self,
-        pixel_values: torch.FloatTensor,
-        image_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | BaseModelOutputWithPooling:
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None):
         r"""
-        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
-            The tensors corresponding to the input images.
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The temporal, height and width of feature shape of each image in LLM.
+        Processes images through the vision tower and returns features as a single contiguous tensor.
+
+        Optimization Note:
+        We removed the original implementation's 'split' operation that breaks vision
+        features into a list of tensors. In VeOmni, we maintain a single flattened tensor
+        to support Sequence Parallelism (SP) and FSDP2 efficiently. Keeping features
+        contiguous avoids Python list-overhead and enables direct execution of
+        vectorized kernels in the main forward pass.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         vision_output: BaseModelOutputWithPooling = self.visual(
-            pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
+            pixel_values, grid_thw=image_grid_thw, return_dict=True
         )
-        image_embeds = vision_output.pooler_output
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
-        vision_output.pooler_output = image_embeds
-
         return vision_output
 
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: torch.FloatTensor | None = None,
-        video_features: torch.FloatTensor | None = None,
-    ):
+    def get_placeholder_mask(self, input_ids: torch.LongTensor, **kwargs):
         """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        Identifies positions of multimodal placeholder tokens (images and videos) in input_ids.
+
+        Optimization Note:
+        We simplified this method by removing 'inputs_embeds' from the argument list.
+        In VeOmni, we primarily rely on 'input_ids' and self-defined placeholder IDs
+        (e.g., IMAGE_INPUT_INDEX) instead of original Qwen token IDs. This decoupling
+        ensures that the data pipeline remains model-agnostic.
         """
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_image_mask = special_image_mask.all(-1)
-            special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_video_mask = special_video_mask.all(-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
-
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if image_features is not None:
-            torch_compilable_check(
-                inputs_embeds[special_image_mask].numel() == image_features.numel(),
-                f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}",
-            )
-
-        n_video_tokens = special_video_mask.sum()
-        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if video_features is not None:
-            torch_compilable_check(
-                inputs_embeds[special_video_mask].numel() == video_features.numel(),
-                f"Video features and video tokens do not match, tokens: {n_video_tokens}, features: {video_features.shape[0]}",
-            )
+        special_image_mask = input_ids == self.config.image_token_id
+        special_video_mask = input_ids == self.config.video_token_id
         return special_image_mask, special_video_mask
 
     def compute_3d_position_ids(
@@ -1940,6 +2023,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5MoeModelOutputWithPast:
@@ -1948,6 +2032,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Token type IDs for multimodal inputs.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1955,27 +2041,136 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
+        # --- Patch.1: Support Ulysses SP by using pre-computed image and video masks ---
+        # We use pre-computed masks to ensure all ranks have a consistent view of multimodal
+        # placeholder positions. If masks are not provided, we reconstruct the full sequence
+        # via all_gather to compute them locally.
+        image_mask = kwargs.get("image_mask", None)
+        video_mask = kwargs.get("video_mask", None)
+
+        # if None, calculate mask
+        if video_mask is None and image_mask is None:
+            if get_parallel_state().sp_enabled:
+                input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+                dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+                input_ids = torch.cat(input_ids_list, dim=0)
+            image_mask, video_mask = self.get_placeholder_mask(input_ids)
+        # --- Patch.1 ---
+
+        # --- Patch.4: Pop pre-computed Flash Attention kwargs to avoid ViT forward re-computation ---
+        # The LM-level flash-attention kwargs (`cu_seq_lens_q`, `cu_seq_lens_k`, `max_length_q`, `max_length_k`) are injected for packed-sequence attention. They must not reach the ViT, which computes its own `cu_seqlens`
+        flash_attn_kwargs = {}
+        flash_attn_kwargs = {}
+        for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+            if key in kwargs:
+                flash_attn_kwargs[key] = kwargs.pop(key)
+        # --- Patch.4 ---
+
+        # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
+        if get_parallel_state().sp_enabled:
+            # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
+            # This gives each rank visibility over the ENTIRE sequence length, which is
+            # necessary to scatter vision features into their correct global positions
+            # as defined by the global pre-computed masks.
+            inputs_embeds = gather_seq_scatter_heads(
+                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
+            )
+        # --- Patch.1 ---
+
         if pixel_values is not None:
             image_outputs: BaseModelOutputWithPooling = self.get_image_features(
                 pixel_values, image_grid_thw, return_dict=True
             )
             image_embeds = image_outputs.pooler_output
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+
+            # --- Patch.1: Shard image_embeds for sequence parallel scatter ---
+            if get_parallel_state().sp_enabled:
+                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+                image_embeds = gather_seq_scatter_heads(
+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
+            n_image_tokens = image_mask.sum().long().item()
+            embeds_image_mask = (
+                image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            # Slice tensor to drop any padded image tokens
+            image_embeds = image_embeds[:n_image_tokens]
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+
+            # sequence parallel patch for image_mask
+            if get_parallel_state().sp_enabled:
+                seq_len = image_mask.shape[1]
+
+                seq_per_rank = seq_len // get_parallel_state().sp_size
+                rank_start = get_parallel_state().sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
+
+                image_mask = image_mask[:, rank_start:rank_end]
+            # --- Patch.1 ---
+        elif get_parallel_state().fsdp_enabled:
+            # --- Patch.2: Dummy forward to prevent FSDP reduce-scatter hang on uneven multimodal batches ---
+            # add dummy ViT forward to avoid FSDP reduce-scatter hang
+            # when some ranks get None pixel_values while others get valid pixel_values
+            vision_output = self.visual.dummy_forward()
+            fake_embeds = vision_output.pooler_output
+            fake_embeds = fake_embeds.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
+            # --- Patch.2 ---
 
         if pixel_values_videos is not None:
             video_outputs: BaseModelOutputWithPooling = self.get_video_features(
                 pixel_values_videos, video_grid_thw, return_dict=True
             )
             video_embeds = video_outputs.pooler_output
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+
+            # --- Patch.1: Shard video_embeds for sequence parallel scatter ---
+            # sequence parallel patch for video embeds
+            if get_parallel_state().sp_enabled:
+                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+                video_embeds = gather_seq_scatter_heads(
+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                )
+            n_video_tokens = video_mask.sum().long().item()
+            embeds_video_mask = (
+                video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            # Slice tensor to drop any padded video tokens
+            video_embeds = video_embeds[:n_video_tokens]
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+
+            # sequence parallel patch for video_mask
+            if get_parallel_state().sp_enabled:
+                seq_len = video_mask.shape[1]
+
+                seq_per_rank = seq_len // get_parallel_state().sp_size
+                rank_start = get_parallel_state().sp_rank * seq_per_rank
+                rank_end = rank_start + seq_per_rank
+
+                video_mask = video_mask[:, rank_start:rank_end]
+            # --- Patch.1 ---
+        elif get_parallel_state().fsdp_enabled:
+            # --- Patch.2: Dummy forward for video encoder to avoid FSDP hang ---
+            # add dummy ViT forward to avoid FSDP reduce-scatter hang
+            # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
+            vision_output = self.visual.dummy_forward()
+            fake_embeds = vision_output.pooler_output
+            fake_embeds = fake_embeds.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
+            # --- Patch.2 ---
+
+        # --- Patch.1: Final transpose back to standard sequence-sharded layout ---
+        if get_parallel_state().sp_enabled:
+            # Restore the layout to (batch, local_seq, full_hidden) for subsequent
+            # transformer layers, which expect standard Sequence Parallel sharding.
+            inputs_embeds = gather_heads_scatter_seq(
+                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+            )
+        # --- Patch.1 ---
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(
@@ -1985,7 +2180,19 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
             )
+        else:
+            # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
+            # When position_ids are pre-computed during data preprocessing (for varlen/packed data),
+            # they are typically collated into (batch_size, 3, seq_len) shape. We transpose them
+            if position_ids.dim() == 3 and position_ids.shape[1] == 3:
+                position_ids = position_ids.transpose(0, 1).contiguous()
+            # --- Patch.3 ---
+
+        # --- Patch.4: Restore pre-computed Flash Attention kwargs for language model ---
+        kwargs.update(flash_attn_kwargs)
+        # --- Patch.4 ---
 
         outputs = self.language_model(
             input_ids=None,
@@ -2194,7 +2401,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeForConditionalGeneration
-# Methods patched: forward, get_parallel_plan
+# Methods patched: get_position_id_func, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -2267,13 +2474,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
-        # Modification: VeOmni currently supports text-only Qwen3_5Moe.
-        if pixel_values is not None or pixel_values_videos is not None:
-            raise ValueError(
-                "Qwen3_5MoeForConditionalGeneration currently supports text-only inputs in VeOmni; "
-                "`pixel_values` and `pixel_values_videos` are not supported yet."
-            )
-
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -2552,6 +2752,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
             model_kwargs["encoder_outputs"] = _expand_dict_for_generation(model_kwargs["encoder_outputs"])
 
         return input_ids, model_kwargs
+
+    def get_position_id_func(self):
+        fake_config = copy(self.config)
+        fake_config.image_token_id = IMAGE_INPUT_INDEX
+        fake_config.video_token_id = VIDEO_INPUT_INDEX
+        fake_model = SimpleNamespace(config=fake_config)
+        return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
 
     def get_parallel_plan(self):
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan
