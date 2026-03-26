@@ -67,11 +67,15 @@ class PatchDeepseekV3TopkRouter(nn.Module):
         self.n_routed_experts = config.n_routed_experts
 
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
-        self.register_buffer("e_score_correction_bias", torch.zeros(self.n_routed_experts))
+        self.e_score_correction_bias = nn.Parameter(torch.zeros(self.n_routed_experts), requires_grad=False)
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        # Disable autocast to ensure fp32 computation — autocast overrides
+        # explicit .type(torch.float32) in F.linear, causing precision mismatch
+        # between actor (autocast bf16) and rollout (no autocast, native fp32).
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
         return router_logits
 
 
