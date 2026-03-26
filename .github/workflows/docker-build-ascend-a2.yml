@@ -3,7 +3,7 @@ name: docker-build-ascend-a2
 on:
   workflow_dispatch:
   push:
-    branches: [ "dev/docker_workflow" ]
+    branches: [ "main" ]
     paths:
       - "docker/ascend/Dockerfile.ascend_8.3.rc2_a2"
       - ".github/workflows/docker-build-ascend-a2.yml"
@@ -12,7 +12,7 @@ on:
 
 jobs:
   build-ascend-image-a2:
-    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'phdddd' }}
+    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'ByteDance-Seed' }}
     runs-on: ubuntu-latest
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-build-ascend-image-a2
