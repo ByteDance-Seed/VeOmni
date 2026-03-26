@@ -59,7 +59,7 @@ def parallel_load_safetensors(
             elif ignore_param_name is not None:
                 if param_name in ignore_param_name:
                     continue
-            elif cpu_load_param_name is not None:
+            if cpu_load_param_name is not None:
                 if param_name in cpu_load_param_name:
                     cpu_load_param_files[param_name] = filename
                     continue
