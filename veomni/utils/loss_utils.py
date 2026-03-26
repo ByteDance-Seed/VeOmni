@@ -34,6 +34,11 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
         if isinstance(obj, dict) and not obj.get("padding_flag", False):
             token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
 
+            for key in obj.keys():
+                if key.endswith("_labels"):
+                    token_name = key.split("_labels")[0]
+                    token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
+
             if "image_output_mask" in obj:
                 token_len["image_decoder_tokens"] += torch.sum(obj["image_output_mask"])  # image generation tokens
         elif isinstance(obj, (list, tuple)):
