@@ -14,7 +14,7 @@ Choose one of the following methods to use CANN:
 
 ## Install with uv or pip
 
-**UV**
+### UV
 
 > Recommend to use [uv](https://docs.astral.sh/uv/) for faster and easier installation.
 
@@ -45,12 +45,13 @@ uv sync --locked  --extra npu --extra audio
 > sudo yum install ffmpeg
 > ```
 
-**Pip**
+### Pip
 
 ```bash
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
+# Choose one of the following installation options based on your needs:
 # Option 1: Stable version (transformers < 5.0)
 pip install -e .[npu,transformers-stable]
 
@@ -60,13 +61,36 @@ pip install -e .[npu,transformers-stable]
 # pip install -e .[npu,transformers5-exp]
 ```
 
-## Ascend relevant Environment variables
-
+### Set up CANN environment before installing torchcodec
+Make sure CANN_path is set to your CANN installation directory, e.g., export CANN_path=/usr/local/Ascend
 ```bash
-# Make sure CANN_path is set to your CANN installation directory, e.g., export CANN_path=/usr/local/Ascend
 source $CANN_path/ascend-toolkit/set_env.sh
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 # Add chunkloss feature
 export VEOMNI_ENABLE_CHUNK_LOSS=1
+```
+
+### Video/Audio Processing Dependencies (Optional)
+
+For video/audio processing capabilities, you need to install torchcodec separately. Follow these steps:
+
+```bash
+# Clone the torchcodec repository
+cd ..
+git clone https://github.com/meta-pytorch/torchcodec.git
+cd torchcodec
+
+# Checkout to a specific version for compatibility
+git checkout v0.5.0
+
+# Run the installation script (replace with your actual CANN path)
+bash install_ascend.sh $CANN_path/ascend-toolkit/set_env.sh
+
+# Verify installation
+pip show torchcodec
+
+# Test torchcodec import
+python -c "from torchcodec.decoders import VideoDecoder; print('Success')"
+# If the terminal outputs'Success', it indicates that the torchcodec installation was successful. If an error message is output, it indicates that the installation was not successful
 ```
