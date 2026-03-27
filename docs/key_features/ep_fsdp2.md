@@ -37,7 +37,7 @@ This is to enable more flexible parallelism setup. Otherwise, if we also choose 
 
 Let's take Qwen3-MoE-30B-A3B model for example, which has 128 experts, hidden dim size of 2048, and intermediate size of 768. So, we can view expert weights as
 
-* Gate projection: [128, 768, 768]
+* Gate projection: [128, 768, 2048]
 * Up projection: [128, 768, 2048]
 * Down projection: [128, 2048, 768]
 
