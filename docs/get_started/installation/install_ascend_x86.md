@@ -65,7 +65,6 @@ pip install -e .[npu,transformers-stable]
 Make sure CANN_path is set to your CANN installation directory, e.g., export CANN_path=/usr/local/Ascend
 ```bash
 source $CANN_path/ascend-toolkit/set_env.sh
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 # Add chunkloss feature
 export VEOMNI_ENABLE_CHUNK_LOSS=1
@@ -84,11 +83,14 @@ cd torchcodec
 # Checkout to a specific version for compatibility
 git checkout v0.5.0
 
+# Copy the installation script to the torchcodec source directory
+cp ../VeOmni/docs/get_started/installation/install_torchcodec_Ascend.sh .
+
 # Note: Ensure Python is installed as a shared library (required for compiling C++ extensions)
 # The installation script will automatically verify this requirement
 
 # Run the installation script (replace with your actual CANN path)
-bash install_ascend.sh $CANN_path/ascend-toolkit/set_env.sh
+bash install_torchcodec_Ascend.sh $CANN_path/ascend-toolkit/set_env.sh
 
 # Verify installation
 pip show torchcodec
