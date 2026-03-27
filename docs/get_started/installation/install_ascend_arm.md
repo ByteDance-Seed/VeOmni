@@ -53,6 +53,9 @@ cd torchcodec
 # Checkout to a specific version for compatibility
 git checkout v0.5.0
 
+# Note: Ensure Python is installed as a shared library (required for compiling C++ extensions)
+# The installation script will automatically verify this requirement
+
 # Run the installation script (replace with your actual CANN path)
 bash install_ascend.sh $CANN_path/ascend-toolkit/set_env.sh
 
