@@ -90,9 +90,9 @@ def parallel_load_safetensors(
                     states = load_file(safetensors_file, device=device)
                     valid_states = {k: v for k, v in states.items() if k in safetensors2param[file]}
                 else:
-                    # load all params in the file containing cpu_load_param_name to cpu
+                    # load all params in the file containing large params (cpu_load_param_name) to cpu
                     states = load_file(safetensors_file, device="cpu")
-                    # move the params except cpu_load_param_name to device (e.g. CUDA)
+                    # move the params except large params (cpu_load_param_name) to device (e.g. cuda)
                     valid_states = {k: v.to(device) for k, v in states.items() if k in safetensors2param[file]}
                 shard_states.update(valid_states)
                 del states
@@ -101,13 +101,17 @@ def parallel_load_safetensors(
                 for param_name in safetensors2param[file]:
                     shard_states[param_name] = rank
 
-    # load cpu_load_param_name to shard_states
-    for param_name, filename in cpu_load_param_files.items():
-        safetensors_file = os.path.join(filepath, filename)
-        states = load_file(safetensors_file, device="cpu")
-        valid_states = {k: v for k, v in states.items() if k == param_name}
-        shard_states.update(valid_states)
-        del states
+        for param_name, filename in cpu_load_param_files.items():
+            if dist.get_rank() == 0:
+                # rank0: load large params to shard_states
+                safetensors_file = os.path.join(filepath, filename)
+                states = load_file(safetensors_file, device="cpu")
+                valid_states = {k: v for k, v in states.items() if k == param_name}
+                shard_states.update(valid_states)
+                del states
+            else:
+                # other ranks: receive chunk of large params from rank0
+                shard_states[param_name] = 0
 
     return shard_states
 
@@ -272,15 +276,6 @@ def parallel_init_fsdp_fn(
             else:
                 shard_states[param_name] = 0
         loaded = shard_states[param_name]
-
-        # params loaded by cpu is a special case, in which each rank loads params individually
-        if isinstance(loaded, (torch.nn.Parameter, torch.Tensor)) and loaded.device.type == "cpu":
-            if hasattr(state, "spec_info"):
-                copy_to_local(param, loaded.data, state.spec_info)
-
-            shard_states.pop(param_name)
-            del loaded
-            return param
 
         if isinstance(loaded, (torch.nn.Parameter, torch.Tensor)):
             if not _is_large_shard_param(param, state):
