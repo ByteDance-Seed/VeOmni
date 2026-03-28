@@ -14,7 +14,6 @@ Choose one of the following methods to use CANN:
 
 ## Install with pip
 
-
 ```bash
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
@@ -33,6 +32,9 @@ pip install -e .[npu_aarch64,transformers-stable]
 Make sure CANN_path is set to your CANN installation directory, e.g., export CANN_path=/usr/local/Ascend
 ```bash
 source $CANN_path/ascend-toolkit/set_env.sh
+
+# Add chunkloss feature
+export VEOMNI_ENABLE_CHUNK_LOSS=1
 ```
 
 ### Video/Audio Processing Dependencies (Optional)
@@ -48,29 +50,19 @@ cd torchcodec
 # Checkout to a specific version for compatibility
 git checkout v0.5.0
 
-# Install required dependencies
-# Note: We use conda to install ffmpeg here to ensure version compatibility (4.2.2)
-# This installs ffmpeg in the current conda environment, not system-wide
-# No need to run system-level installation (apt-get/yum) before this step
-conda install pybind11 ffmpeg=4.2.2
+# Copy the installation script to the torchcodec source directory
+cp ../VeOmni/docs/get_started/installation/install_torchcodec_Ascend.sh .
 
-# Set environment variables to ensure compilation finds the correct libraries from conda environment
-export PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH
-export C_INCLUDE_PATH=$CONDA_PREFIX/include:$C_INCLUDE_PATH
-export CPLUS_INCLUDE_PATH=$CONDA_PREFIX/include:$CPLUS_INCLUDE_PATH
-export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+# Note: Ensure Python is installed as a shared library (required for compiling C++ extensions)
+# The installation script will automatically verify this requirement
 
-# Install torchcodec in development mode without build isolation
-pip install -e . --no-build-isolation
-```
+# Run the installation script (replace with your actual CANN path)
+bash install_torchcodec_Ascend.sh $CANN_path/ascend-toolkit/set_env.sh
 
-## Ascend relevant Environment variables
+# Verify installation
+pip show torchcodec
 
-```bash
-# Set additional Ascend environment variables
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-
-# Add chunkloss feature
-export VEOMNI_ENABLE_CHUNK_LOSS=1
+# Test torchcodec import
+python -c "from torchcodec.decoders import VideoDecoder; print('Success')"
+# If the terminal outputs'Success', it indicates that the torchcodec installation was successful. If an error message is output, it indicates that the installation was not successful
 ```
