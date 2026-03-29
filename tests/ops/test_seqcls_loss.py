@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 
@@ -245,3 +247,44 @@ def test_seqcls_loss_assertions(monkeypatch):
     # logits and hidden_states both None -> assert
     with pytest.raises(ValueError, match="Either hidden_states or logits must be provided"):
         m.ForSequenceClassificationLoss(logits=None, labels=labels, num_labels=3)
+
+
+# ---------------------------------------------------------------------------
+# ReduceLoss zero-division guard (SP group all-padding scenario)
+# ---------------------------------------------------------------------------
+# When Ulysses SP splits a sequence and ALL ranks in a group receive only
+# padding (n_valid=0), ReduceLoss previously computed 0/0 = NaN.  The NaN
+# propagated through Liger element_mul_kernel and FSDP all-reduce, permanently
+# corrupting the model.  The fix returns zero loss / grad instead.
+# ---------------------------------------------------------------------------
+
+
+_RL_PREFIX = "veomni.distributed.sequence_parallel.loss"
+
+
+def _noop_all_reduce(tensor, group=None, **kwargs):
+    """Mock all_reduce as no-op (partner also has zero)."""
+    pass
+
+
+def test_reduce_loss_no_nan_when_sp_group_all_padding():
+    """ReduceLoss.forward+backward must return 0 (not NaN) when global tokens = 0."""
+    from veomni.distributed.sequence_parallel.loss import ReduceLoss
+
+    with (
+        patch(f"{_RL_PREFIX}.get_unified_sequence_parallel_group", return_value=MagicMock()),
+        patch(f"{_RL_PREFIX}.get_unified_sequence_parallel_world_size", return_value=2),
+        patch(f"{_RL_PREFIX}.dist.all_reduce", side_effect=_noop_all_reduce),
+    ):
+        x = torch.tensor(0.5, requires_grad=True)
+        loss = x * 1.0  # non-leaf, simulating CE output
+        n_valid = torch.tensor(0.0)
+
+        result = ReduceLoss.apply(loss, n_valid)
+        assert not torch.isnan(result), "forward returned NaN on global_num_tokens=0"
+        assert result.item() == 0.0
+
+        result.backward()
+        assert x.grad is not None
+        assert not torch.isnan(x.grad), "backward produced NaN grad on global_num_tokens=0"
+        assert x.grad.item() == 0.0
