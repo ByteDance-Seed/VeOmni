@@ -45,8 +45,10 @@ def build_dit_dataloader(
     prefetch_factor: int = 2,
     seed: int = 0,
     build_collate_fn: bool = True,
-    collate_fn_kwargs: Optional[Dict[str, Any]] = {},
+    collate_fn_kwargs: Optional[Dict[str, Any]] = None,
 ) -> "DistributedDataloader":
+    if collate_fn_kwargs is None:
+        collate_fn_kwargs = {}
     # TODO: also need dyn_bsz here?
     parallel_state = get_parallel_state()
     num_micro_batch = global_batch_size // (

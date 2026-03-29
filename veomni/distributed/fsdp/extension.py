@@ -40,9 +40,7 @@ orig_optim_state_dict = FSDP.optim_state_dict
 orig_optim_state_dict_to_load = FSDP.optim_state_dict_to_load
 
 
-def _shard_tensor(
-    orgin_tensor: torch.Tensor, para_mesh: DeviceMesh, para_fsdp_mesh: DeviceMesh, shard: Shard = Shard(0)
-):
+def _shard_tensor(orgin_tensor: torch.Tensor, para_mesh: DeviceMesh, para_fsdp_mesh: DeviceMesh, shard: Shard = None):
     """
     Shard Tensor to DTensor.
 
@@ -53,6 +51,8 @@ def _shard_tensor(
 
     """
     assert para_fsdp_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {para_fsdp_mesh.ndim}"
+    if shard is None:
+        shard = Shard(0)
 
     if orgin_tensor.__class__.__name__ == "DTensor":
         placements = (shard,) + orgin_tensor.placements
@@ -63,7 +63,7 @@ def _shard_tensor(
     return dtensor
 
 
-def _shard_dtensor(orgin_dtensor: DTensor, device_mesh: DeviceMesh, shard: Shard = Shard(0)):
+def _shard_dtensor(orgin_dtensor: DTensor, device_mesh: DeviceMesh, shard: Shard = None):
     """
     Convert DTensor to local Tensor
 
@@ -73,6 +73,9 @@ def _shard_dtensor(orgin_dtensor: DTensor, device_mesh: DeviceMesh, shard: Shard
         shard (Shard): The shard info, default Shard(0).
 
     """
+    if shard is None:
+        shard = Shard(0)
+
     assert isinstance(orgin_dtensor, DTensor), (
         f"Only support DTensor, got {type(orgin_dtensor)}, for torch.Tensor, use _shard_dtensor instead."
     )

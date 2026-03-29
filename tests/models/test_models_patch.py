@@ -362,7 +362,7 @@ def test_models_patch_fwd_bwd(
     res = {}
     log_keys = []
     # Train HF backend models
-    for idx, mode in enumerate(hf_model_modes):
+    for _idx, mode in enumerate(hf_model_modes):
         result_metrics = trainer.forward_backward_step(state_dict, mode, dummy_data_loader)
         if not log_keys:
             log_keys = set(result_metrics.keys())
@@ -370,7 +370,7 @@ def test_models_patch_fwd_bwd(
             assert set(result_metrics.keys()) == set(log_keys)
         res[mode] = result_metrics
     # Train VeOmni backend models
-    for idx, mode in enumerate(veomni_model_modes):
+    for _idx, mode in enumerate(veomni_model_modes):
         result_metrics = trainer.forward_backward_step(state_dict, mode, dummy_data_loader)
         assert set(result_metrics.keys()) == set(log_keys)
         res[mode] = result_metrics

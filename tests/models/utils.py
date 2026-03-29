@@ -108,6 +108,7 @@ def prepare_model_modes(
 MODEL_TO_DATASET = {
     "qwen3_vl": "qwen3vl",
     "qwen3_5": "qwen3vl",
+    "qwen3_5_moe": "qwen3vl",
     "qwen3_vl_moe": "qwen3vl",
     "qwen2_vl": "qwen2vl",
     "qwen2_5_vl": "qwen2vl",
@@ -221,9 +222,9 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
                     rtol=rtol,
                     atol=atol,
                 )
-            except AssertionError:
+            except AssertionError as e:
                 print_all_values(outputs_dict, key)
-                raise AssertionError(f"{key} not match")
+                raise AssertionError(f"{key} not match") from e
 
 
 def apply_veomni_loss_unpatch():

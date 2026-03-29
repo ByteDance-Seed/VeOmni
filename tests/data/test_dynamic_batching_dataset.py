@@ -229,8 +229,8 @@ def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
                 total_tokens = batch["attention_mask"].sum()
                 if total_tokens > 0:
                     found_last_batch_scenario = True
-            except StopIteration:
-                assert False, "Expected to get a batch from remaining buffer, but got StopIteration"
+            except StopIteration as e:
+                raise AssertionError("Expected to get a batch from remaining buffer, but got StopIteration") from e
         else:
             # Normal batch retrieval
             try:

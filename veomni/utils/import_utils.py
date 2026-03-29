@@ -53,6 +53,10 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
 }
 
 
+def is_package_available(name: str) -> bool:
+    return _is_package_available(name)
+
+
 def is_flash_attn_2_available() -> bool:
     return _PACKAGE_FLAGS["flash_attn"]
 

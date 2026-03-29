@@ -104,12 +104,12 @@ def all2all_splits(image_lens: List, image_lens_per_rank: List, sp_size: int, sp
     cu_seqlens = [0] + [sum(image_lens_per_rank[: i + 1]) for i in range(sp_size)]
     rank = 0
     num_tokens = 0
-    for image_idx, image_lens in enumerate(image_lens):
+    for image_idx, image_len in enumerate(image_lens):
         src_rank = image_idx // sp_step
         tokens_split = []
         for rank in range(sp_size):
             overlap, overlap_len = has_overlap(
-                num_tokens, num_tokens + image_lens, cu_seqlens[rank], cu_seqlens[rank + 1]
+                num_tokens, num_tokens + image_len, cu_seqlens[rank], cu_seqlens[rank + 1]
             )
             if overlap:
                 tokens_split.append(overlap_len)
@@ -117,9 +117,9 @@ def all2all_splits(image_lens: List, image_lens_per_rank: List, sp_size: int, sp
                     out_splits[src_rank] += overlap_len
                 if src_rank == sp_rank:
                     in_splits[rank] += overlap_len
-        assert sum(tokens_split) == image_lens
+        assert sum(tokens_split) == image_len
 
-        num_tokens += image_lens
+        num_tokens += image_len
 
     return in_splits, out_splits
 

@@ -41,7 +41,7 @@ from .fsdp import (
     register_checkpoint_extension,
 )
 from .parallel_state import get_parallel_state
-from .utils import get_module_from_path, is_parent_module_from_path, set_module_from_path, sort_fqn_by_submodule_first
+from .utils import get_module_from_path, is_same_module_from_path, set_module_from_path, sort_fqn_by_submodule_first
 
 
 if is_torch_version_greater_than("2.4"):
@@ -95,7 +95,7 @@ def parallelize_model_fsdp1(
     **kwargs,
 ) -> "nn.Module":
     """
-    Applies ExtraParallel (when enabled) + FSDP1 parallel strategy to the model.
+    Apply ExtraParallel (e.g. Expert Parallel + Embed Parallel + ...) + FSDP1 parallel strategy to the model.
     """
     parallel_state = get_parallel_state()
 
@@ -118,12 +118,12 @@ def parallelize_model_fsdp1(
         ]
         root_model_wrap_module_names = []
         for module_name in basic_modules:
-            is_parent_module = False
+            is_same_module = False
             for fqn in fsdp_no_shard_states_fqn:
-                if is_parent_module_from_path(model, module_name, fqn):
-                    is_parent_module = True
+                if is_same_module_from_path(model, module_name, fqn):
+                    is_same_module = True
                     break
-            if not is_parent_module:
+            if not is_same_module:
                 root_model_wrap_module_names.append(module_name)
 
         logger.info_rank0(
@@ -287,13 +287,27 @@ def parallelize_model_fsdp2(
     **kwargs,
 ) -> "nn.Module":
     """
-    Applies Para (e.g. EP or Embed Parallel) + FSDP2 parallel strategy to the model.
-    Take EP as an example:
-        Flow:
+    Apply ExtraParallel (e.g. Expert Parallel or Embed Parallel) + FSDP2 parallel strategy to the model.
+
+    For Expert Parallel, the flow is as follows:
         1. Apply EP: Expert tensors [128,H,I] -> [32,H,I] local tensors per EP rank
         2. Apply FSDP2 to expert modules: Shard expert tensors along dim-1 (hidden dim)
         3. Apply FSDP2 to regular modules: Standard dim-0 sharding
         4. Result: Expert params [32,H/fsdp_size,I], regular params use standard FSDP2
+
+    For ExtraParallel, see test_clip_grad_norm_fsdp2_ep2_emb4 with Expert Parallel + Embed Parallel, where
+        ToyMoeAndEmbedModel(
+            (embed_tokens): ToyEmbed()
+            (decoder): ToyMoeAndEmbedDecoderLayer(
+                (embed_tokens): ToyEmbed()
+                (moe): ToyMoeExperts()
+            )
+        )
+        ToyMoeAndEmbedModel._no_split_modules = ["ToyMoeAndEmbedDecoderLayer", "ToyEmbed"]
+        ep_plan = {"decoder.moe.experts": Shard(0)}
+        emb_plan = {"embed_tokens.weight": Shard(0), "decoder.embed_tokens.weight": Shard(0)}
+        ep_size, emb_size = 2, 4
+    We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
 
@@ -301,25 +315,39 @@ def parallelize_model_fsdp2(
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
 
-    # Make a list of tuples that contains layer's name and module
+    # Make a list of tuples that contains target classes' name and module
+    # Note that all target classes should include all ExtraParallel modules.
+    #   e.g. `ToyEmbed` and `ToyMoeAndEmbedDecoderLayer` include `embed_tokens.weight` and `decoder.embed_tokens.weight`
+    # Note that target class A is allowed to include target class B:
+    #   e.g. `ToyMoeAndEmbedDecoderLayer` includes target class `ToyEmbed`
+    # Thus, target module A could include target module B.
+    #   e.g. `decoder` includes `decoder.embed_tokens`
     target_modules: List[Tuple[str, nn.Module]] = [
         (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
 
-    # Step 1: Apply extra_parallel parallelism
-    # e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
+    # Step 1: Apply ExtraParallel
+    #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
+    #        Apply embed parallelism (slice embed tensors [64,H] -> [16,H])
     if parallel_state.any_extra_parallel_enabled:
         parallel_plan = model.get_parallel_plan()
         assert parallel_plan is not None, (
-            "ExtraParallel needs parallel plan defined in the model! Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism."
+            "ExtraParallel needs parallel plan defined in the model! \
+            Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
+            Please see tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4 \
+            for example of expert parallelism + embed parallelism."
         )
+        # Add SpecInfo to extra_parallel modules,
+        #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
-        # Attach spec mapping for checkpoint load-time reconstruction
-        setattr(model, "_fqn2spec_info", fqn2spec_info)
-        # ep_mesh does not really exist in EP parameters' device mesh.
-        # EP parameters are loaded as local tensors to be later sharded by fully_shard
 
+        # Attach spec mapping for checkpoint load-time reconstruction
+        model._fqn2spec_info = fqn2spec_info
+        # ExtraParallel mesh does not really exist in ExtraParallel parameters' device mesh.
+        # ExtraParallel parameters are loaded as local tensors to be later sharded by fully_shard.
+        # We store each extra_parallel's fqn to module mapping in _extra_parallel_map.
+        #  e.g. {'emb': {'embed_tokens': ToyEmbed, 'decoder.embed_tokens': ToyEmbed}, 'ep': {'decoder.moe': ToyMoeExperts}}
         _extra_parallel_mesh = {}
         _extra_parallel_map = {}
         for para in parallel_state.extra_parallel_names:
@@ -340,7 +368,15 @@ def parallelize_model_fsdp2(
         _extra_parallel_mesh = None
         _extra_parallel_map = None
 
-    # Extract extra_parallel module from the layer if any, then pair them
+    # Extract ExtraParallel modules from the target classes if any, then pair them.
+    # Regard each target module as a layer.
+    # Note that all target modules should include ExtraParallel modules.
+    #     If we have ToyMoeAndEmbedModel like the above, then,
+    #         layer_pairs_list = [
+    #            ('decoder.embed_tokens', (ToyEmbed, {'emb': ToyEmbed, 'ep': None})),
+    #            ('embed_tokens', (ToyEmbed, {'emb': ToyEmbed, 'ep': None})),
+    #            ('decoder', (ToyMoeAndEmbedDecoderLayer, {'emb': ToyEmbed, 'ep': ToyMoeExperts}))
+    #         ]
     layer_pairs = {}
     for layer_fqn, layer_mod in target_modules:
         layer_pair = [layer_mod]
@@ -367,7 +403,7 @@ def parallelize_model_fsdp2(
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
-    # mp_policy kwargs
+    # prepare mp_policy kwargs
     if enable_mixed_precision:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
@@ -401,13 +437,21 @@ def parallelize_model_fsdp2(
             para_fsdp_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para][f"{para}_fsdp"]
             para_fsdp_kwargs = dict(fsdp_kwargs)
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
+            # Prefer dim-1 sharding for expert/embed weights when composing with expert/embed shard on dim-0
             para_fsdp_kwargs["shard_placement_fn"] = lambda param: Shard(1)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
         else:
             extra_parallel_fsdp_kwargs[para] = None
 
-    # Here we have a basic assumption for the decoder layer hierarchy
-    # Decoder Layer
+    # Here we have a basic assumption for target module (e.g. embed_tokens, decoder) hierarchy:
+    # | -- target module A (e.g. decoder)
+    #   | -- target module B (e.g. decoder.embed_tokens)
+    #   | -- extra parallel module C (e.g. decoder.moe)
+    #     | -- no more target module or extra parallel module
+    #   | -- mp modules
+    #     | -- no more target module or extra parallel module
+    #   | -- other module (e.g. attention, if provided)
+    # e.g. Decoder Layer
     # | -- layers that are sharded by fully_shard(decode_layer) (e.g., Attention)
     # | -- experts layer (apply fully_shard separately in order to shard across EP groups on the same EP rank instead of sharding globally)
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
@@ -420,6 +464,8 @@ def parallelize_model_fsdp2(
 
         apply_hccl_premul_sum_patch()
 
+    # Sort layer_pairs by fqn by submodule order, as fully_shard should starts from bottom modules to top modules
+    #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
 
@@ -428,13 +474,13 @@ def parallelize_model_fsdp2(
         layer_mod._fsdp_modules = []
 
         for para in parallel_state.extra_parallel_names:
-            # para (e.g. ep) enabled and this layer contains the para (e.g. expert) module
+            # para (e.g. ep, emb) enabled and this layer contains the para (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens) module
             if (
                 parallel_state.extra_parallel_enabled(para)
                 and extra_parallel_mod[para] is not None
                 and not isinstance(extra_parallel_mod[para], FSDPModule)
             ):
-                # shard para module (e.g. expert)
+                # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
                 fully_shard(extra_parallel_mod[para], **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
@@ -457,26 +503,12 @@ def parallelize_model_fsdp2(
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     layer_mod._fsdp_modules.append(sub_mod)
 
-        # shard everything else in the module:
-        #   for example:
-        #      if we have a model like the following:
-        #          ToyMoeAndEmbedModel(
-        #           (embed_tokens): ToyEmbed()
-        #           (decoder): ToyMoeAndEmbedDecoderLayer(
-        #             (embed_tokens): ToyEmbed()
-        #             (moe): ToyMoeExperts()
-        #            )
-        #          )
-        #       then, layer_pairs_list = [
-        #           ('decoder.embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})),
-        #           ('embed_tokens', (ToyEmbed(), {'emb': ToyEmbed(), 'ep': None})),
-        #           ('decoder', (ToyMoeAndEmbedDecoderLayer(
-        #               (embed_tokens): ToyEmbed()
-        #               (moe): ToyMoeExperts()
-        #           ), {'emb': ToyEmbed(), 'ep': ToyMoeExperts()}))
-        #       ]
-        #   if layer_mod (e.g. decoder.embed_tokens) is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed())
-        #   no need to shard layer_mod again
+        # Shard everything else in the module:
+        #   Note:
+        #      if we have a model and layer_pairs_list like the above,
+        #      when layer_mod (also called as target module, e.g. decoder.embed_tokens),
+        #      is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed),
+        #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
             layer_mod._fsdp_modules.append(layer_mod)
@@ -488,7 +520,7 @@ def parallelize_model_fsdp2(
     # configure manual prefetching when needed
     need_manual_prefetch = parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
     if need_manual_prefetch:
-        blocks = [pair[1][0] for pair in layer_pairs_list]
+        blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]
         for current_block, next_block in zip(blocks, next_blocks):
             if next_block is not None:

@@ -213,7 +213,9 @@ class TileWorker:
 
 
 @contextmanager
-def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = False):
+def init_weights_on_device(device=None, include_buffers: bool = False):
+    if device is None:
+        device = torch.device("meta")
     old_register_parameter = torch.nn.Module.register_parameter
     if include_buffers:
         old_register_buffer = torch.nn.Module.register_buffer
@@ -533,7 +535,7 @@ class SD3VAEEncoder(torch.nn.Module):
         res_stack = None
 
         # 2. blocks
-        for i, block in enumerate(self.blocks):
+        for _i, block in enumerate(self.blocks):
             hidden_states, time_emb, text_emb, res_stack = block(hidden_states, time_emb, text_emb, res_stack)
 
         # 3. output

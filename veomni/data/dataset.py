@@ -100,7 +100,8 @@ class InterleavedIterableDataset(IterativeDataset):
         for sample in self._data:
             if self._transform is not None:
                 ds_idx = sample["ds_idx"]
-                transformed_sample = self._transform(sample)
+                source_name = sample.get("source_name", None)
+                transformed_sample = self._transform(sample, source_name=source_name)
                 if isinstance(transformed_sample, List):
                     for idx in range(len(transformed_sample)):
                         transformed_sample[idx]["ds_idx"] = ds_idx
@@ -124,7 +125,8 @@ class InterleavedMappingDataset(MappingDataset):
         if self._transform is not None:
             sample = self._data[mapped_idx]
             ds_idx = sample["ds_idx"]
-            transformed_sample = self._transform(sample)
+            source_name = sample.get("source_name", None)
+            transformed_sample = self._transform(sample, source_name=source_name)
             if isinstance(transformed_sample, List):
                 for idx in range(len(transformed_sample)):
                     transformed_sample[idx]["ds_idx"] = ds_idx
@@ -449,8 +451,10 @@ def build_energon_dataset(
     """
     try:
         from megatron.energon import WorkerConfig, get_train_dataset
-    except ImportError:
-        raise ImportError("Megatron-Energon is not installed. Please install it with: pip install megatron-energon")
+    except ImportError as e:
+        raise ImportError(
+            "Megatron-Energon is not installed. Please install it with: pip install megatron-energon"
+        ) from e
 
     logger.info_rank0(f"Start building Megatron-Energon native dataset from {train_path}")
     # Get parallel state for distributed training

@@ -56,11 +56,11 @@ def requires_mesh(fn: Callable) -> Callable:
 
 def init_para_mesh_matrix(para_size: int, para_fsdp_size: int, para_outside: bool = False) -> "DeviceMesh":
     """
-    Initialize the device mesh matrix for the XXX_Parallel.
+    Initialize the device mesh matrix for the ExtraParallel.
     Args:
-        para_size (int): The size of the XXX_Parallel.
-        para_fsdp_size (int): The size of the XXX_Parallel-FSDP.
-        para_outside (bool): Whether the XXX_Parallel is outside in para-fsdp group.
+        para_size (int): The size of the ExtraParallel.
+        para_fsdp_size (int): The size of the ExtraParallel-FSDP.
+        para_outside (bool): Whether the ExtraParallel is outside in para-fsdp group.
     """
     if para_outside:
         with torch.device("cpu"):
@@ -494,7 +494,7 @@ def init_parallel_state(
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
-    extra_parallel_placement_innermost: Tuple[bool] = (1,),
+    extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
 ) -> None:
@@ -513,7 +513,10 @@ def init_parallel_state(
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
         dp_shard_size = dp_size
 
-    assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names)
+    # Note that Expert Parallel is included into Extra Parallel
+    assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names), (
+        "each extra parallel should correspond to a size, a placement and a name"
+    )
 
     logger.info_rank0(
         f"Initializing parallel state: dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, "

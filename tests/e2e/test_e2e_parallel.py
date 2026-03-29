@@ -141,17 +141,6 @@ text_test_cases = [
         None,  # max_sp_size
         marks=_v4_only,
     ),
-    # TODO: we only support text input now. move this to VLM test once vision input is supported.
-    pytest.param(
-        "qwen3_5_moe",
-        "./tests/toy_config/qwen3_5_moe_toy/config.json",
-        # TODO: Test with EP once Merged fc1_1_2_weight is supported with expert parallelism.
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v5_only,
-    ),
 ]
 
 qwen2vl_test_cases = [
@@ -191,6 +180,15 @@ qwen3vl_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3_5_moe",
+        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
     ),
     pytest.param(
         "qwen3_5",

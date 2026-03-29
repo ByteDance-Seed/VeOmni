@@ -374,7 +374,7 @@ For a complete working example of how preprocessors integrate into the training 
 ```
 Config (qwen2_vl.yaml)
   └─> source_name: sharegpt4v_pretrain
-       └─> Training Script (train_qwen2_vl.py)
+       └─> Training Script (train_vlm.py)
             └─> process_sample() calls conv_preprocess("sharegpt4v_pretrain", ...)
                  └─> Registry looks up sharegpt4v_pretrain_preprocess()
                       └─> Preprocessor (preprocess.py) transforms raw data

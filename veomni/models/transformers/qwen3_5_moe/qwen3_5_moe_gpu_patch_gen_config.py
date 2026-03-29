@@ -24,25 +24,42 @@ Patches applied:
 4. Fused loss + aux_loss in ForConditionalGeneration.
 """
 
+from copy import copy
+from functools import partial
+from types import SimpleNamespace
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
+    Qwen3_5MoeModel,
+    Qwen3_5MoeModelOutputWithPast,
+    Qwen3_5MoeTextModel,
+    Qwen3_5MoeVisionModel,
     load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
+    qwen3_5_model_get_image_features,
+    qwen3_5_model_get_placeholder_mask,
+    qwen3_5_vision_model_dummy_forward,
+    qwen3_5_vision_model_fast_pos_embed_interpolate,
+    qwen3_5_vision_model_forward,
 )
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
 
 logger = logging.get_logger(__name__)
@@ -54,12 +71,19 @@ config = PatchConfig(
     description="Qwen3_5Moe with LigerKernel GPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
 
+config.add_import("copy", names=["copy"])
+config.add_import("functools", names=["partial"])
+config.add_import("types", names=["SimpleNamespace"])
+config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
+config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -99,6 +123,11 @@ config.add_post_import_block(
     """
 )
 
+# Dummy definitions for names that exist in the generated file's scope but not here.
+# The patchgen only extracts the function body; these are resolved at codegen time.
+gather_seq_scatter_heads = None
+gather_heads_scatter_seq = None
+
 
 # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
 
@@ -125,6 +154,27 @@ def qwen3_5_moe_rmsnorm_forward_patched(self, x):
 # results and NaN in attention output.
 
 
+# ── Propagate _moe_implementation from top-level config to text_config ────────
+
+
+@config.override_method(
+    "Qwen3_5MoeModel.__init__",
+    description="Propagate _moe_implementation from top-level config to text_config",
+)
+def qwen3_5_moe_model_init_patched(self, config):
+    # Propagate _moe_implementation so SparseMoeBlock picks up the correct mode.
+    moe_implementation = getattr(config, "_moe_implementation", "eager")
+    config.text_config._moe_implementation = moe_implementation
+
+    super().__init__(config)
+    self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
+    self.rope_deltas = None  # cache rope_deltas here
+
+    # Initialize weights and apply final processing
+    self.post_init()
+
+
 # ── SparseMoeBlock forward (avoid in-place op on autograd Function output) ────
 
 
@@ -149,6 +199,265 @@ def qwen3_5_moe_sparse_moe_block_forward_patched(
     expert_output = expert_output + shared_expert_output
     expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
     return expert_output
+
+
+# ── ViT patches ───────────────────────────────────────────────────────────────
+
+config.override_method(
+    "Qwen3_5MoeModel.get_image_features",
+    replacement=qwen3_5_model_get_image_features,
+    description="Remove unnecessary split operation to maintain contiguous memory layout.",
+)
+
+config.override_method(
+    "Qwen3_5MoeModel.get_placeholder_mask",
+    replacement=qwen3_5_model_get_placeholder_mask,
+    description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.fast_pos_embed_interpolate",
+    replacement=qwen3_5_vision_model_fast_pos_embed_interpolate,
+    description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.forward",
+    replacement=qwen3_5_vision_model_forward,
+    description="Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.dummy_forward",
+    replacement=qwen3_5_vision_model_dummy_forward,
+    description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
+)
+
+
+@config.override_method(
+    "Qwen3_5MoeModel.forward",
+    description=(
+        "Optimized multimodal forward supporting Ulysses SP (multimodal scattering), "
+        "FSDP-safe dummy vision processing, position_ids shape alignment, and "
+        "CPU-GPU sync avoidance via pre-computed metadata."
+    ),
+)
+def qwen3_5_moe_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.FloatTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    mm_token_type_ids: torch.IntTensor | None = None,
+    cache_position: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | Qwen3_5MoeModelOutputWithPast:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        Token type IDs for multimodal inputs.
+    """
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+    # --- Patch.1: Support Ulysses SP by using pre-computed image and video masks ---
+    # We use pre-computed masks to ensure all ranks have a consistent view of multimodal
+    # placeholder positions. If masks are not provided, we reconstruct the full sequence
+    # via all_gather to compute them locally.
+    image_mask = kwargs.get("image_mask", None)
+    video_mask = kwargs.get("video_mask", None)
+
+    # if None, calculate mask
+    if video_mask is None and image_mask is None:
+        if get_parallel_state().sp_enabled:
+            input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+            dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+            input_ids = torch.cat(input_ids_list, dim=0)
+        image_mask, video_mask = self.get_placeholder_mask(input_ids)
+    # --- Patch.1 ---
+
+    # --- Patch.4: Pop pre-computed Flash Attention kwargs to avoid ViT forward re-computation ---
+    # The LM-level flash-attention kwargs (`cu_seq_lens_q`, `cu_seq_lens_k`, `max_length_q`, `max_length_k`) are injected for packed-sequence attention. They must not reach the ViT, which computes its own `cu_seqlens`
+    flash_attn_kwargs = {}
+    flash_attn_kwargs = {}
+    for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+        if key in kwargs:
+            flash_attn_kwargs[key] = kwargs.pop(key)
+    # --- Patch.4 ---
+
+    # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
+    if get_parallel_state().sp_enabled:
+        # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
+        # This gives each rank visibility over the ENTIRE sequence length, which is
+        # necessary to scatter vision features into their correct global positions
+        # as defined by the global pre-computed masks.
+        inputs_embeds = gather_seq_scatter_heads(
+            inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
+        )
+    # --- Patch.1 ---
+
+    if pixel_values is not None:
+        image_outputs: BaseModelOutputWithPooling = self.get_image_features(
+            pixel_values, image_grid_thw, return_dict=True
+        )
+        image_embeds = image_outputs.pooler_output
+
+        # --- Patch.1: Shard image_embeds for sequence parallel scatter ---
+        if get_parallel_state().sp_enabled:
+            # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+            image_embeds = gather_seq_scatter_heads(
+                image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+            )
+        n_image_tokens = image_mask.sum().long().item()
+        embeds_image_mask = (
+            image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        )
+        # Slice tensor to drop any padded image tokens
+        image_embeds = image_embeds[:n_image_tokens]
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+
+        # sequence parallel patch for image_mask
+        if get_parallel_state().sp_enabled:
+            seq_len = image_mask.shape[1]
+
+            seq_per_rank = seq_len // get_parallel_state().sp_size
+            rank_start = get_parallel_state().sp_rank * seq_per_rank
+            rank_end = rank_start + seq_per_rank
+
+            image_mask = image_mask[:, rank_start:rank_end]
+        # --- Patch.1 ---
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.2: Dummy forward to prevent FSDP reduce-scatter hang on uneven multimodal batches ---
+        # add dummy ViT forward to avoid FSDP reduce-scatter hang
+        # when some ranks get None pixel_values while others get valid pixel_values
+        vision_output = self.visual.dummy_forward()
+        fake_embeds = vision_output.pooler_output
+        fake_embeds = fake_embeds.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        # --- Patch.2 ---
+
+    if pixel_values_videos is not None:
+        video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+            pixel_values_videos, video_grid_thw, return_dict=True
+        )
+        video_embeds = video_outputs.pooler_output
+
+        # --- Patch.1: Shard video_embeds for sequence parallel scatter ---
+        # sequence parallel patch for video embeds
+        if get_parallel_state().sp_enabled:
+            # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
+            video_embeds = gather_seq_scatter_heads(
+                video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+            )
+        n_video_tokens = video_mask.sum().long().item()
+        embeds_video_mask = (
+            video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        )
+
+        # Slice tensor to drop any padded video tokens
+        video_embeds = video_embeds[:n_video_tokens]
+        video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+
+        # sequence parallel patch for video_mask
+        if get_parallel_state().sp_enabled:
+            seq_len = video_mask.shape[1]
+
+            seq_per_rank = seq_len // get_parallel_state().sp_size
+            rank_start = get_parallel_state().sp_rank * seq_per_rank
+            rank_end = rank_start + seq_per_rank
+
+            video_mask = video_mask[:, rank_start:rank_end]
+        # --- Patch.1 ---
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.2: Dummy forward for video encoder to avoid FSDP hang ---
+        # add dummy ViT forward to avoid FSDP reduce-scatter hang
+        # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
+        vision_output = self.visual.dummy_forward()
+        fake_embeds = vision_output.pooler_output
+        fake_embeds = fake_embeds.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        # --- Patch.2 ---
+
+    # --- Patch.1: Final transpose back to standard sequence-sharded layout ---
+    if get_parallel_state().sp_enabled:
+        # Restore the layout to (batch, local_seq, full_hidden) for subsequent
+        # transformer layers, which expect standard Sequence Parallel sharding.
+        inputs_embeds = gather_heads_scatter_seq(
+            inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+        )
+    # --- Patch.1 ---
+
+    if position_ids is None:
+        position_ids = self.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+    else:
+        # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
+        # When position_ids are pre-computed during data preprocessing (for varlen/packed data),
+        # they are typically collated into (batch_size, 3, seq_len) shape. We transpose them
+        if position_ids.dim() == 3 and position_ids.shape[1] == 3:
+            position_ids = position_ids.transpose(0, 1).contiguous()
+        # --- Patch.3 ---
+
+    # --- Patch.4: Restore pre-computed Flash Attention kwargs for language model ---
+    kwargs.update(flash_attn_kwargs)
+    # --- Patch.4 ---
+
+    outputs = self.language_model(
+        input_ids=None,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    return Qwen3_5MoeModelOutputWithPast(
+        **outputs,
+        rope_deltas=self.rope_deltas,
+    )
+
+
+config.add_post_import_block("""
+def get_position_id(main_func, self, **kwargs):
+    # Must be a module-level function for multiprocessing pickle
+    position_ids, rope_deltas = main_func(self, **kwargs)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+""")
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_position_id_func",
+    description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
+)
+def qwen3_5_moe_forconditional_generation_get_position_id_func(self):
+    fake_config = copy(self.config)
+    fake_config.image_token_id = IMAGE_INPUT_INDEX
+    fake_config.video_token_id = VIDEO_INPUT_INDEX
+    fake_model = SimpleNamespace(config=fake_config)
+    return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
 
 
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
@@ -297,7 +606,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     return hidden_states
 
 
-# ── ForConditionalGeneration forward (fused loss + aux_loss, no vision) ──────────
+# ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
 
 
 @config.override_method(
@@ -320,13 +629,6 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
-    # Modification: VeOmni currently supports text-only Qwen3_5Moe.
-    if pixel_values is not None or pixel_values_videos is not None:
-        raise ValueError(
-            "Qwen3_5MoeForConditionalGeneration currently supports text-only inputs in VeOmni; "
-            "`pixel_values` and `pixel_values_videos` are not supported yet."
-        )
-
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,

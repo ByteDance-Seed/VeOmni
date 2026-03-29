@@ -302,3 +302,140 @@ class EPGroupGemm(torch.autograd.Function):
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
         )
+
+
+class EPMergedFc1GroupGemm(torch.autograd.Function):
+    """EP autograd function that accepts a merged fc1_1_2 weight [E, 2I, H].
+
+    Uses a single group_gemm_same_nk call for fc1 instead of two separate calls.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        permute_tokens,
+        cumsum,
+        fc1_1_2_weight,
+        fc2_weight,
+    ):
+        # permute_tokens: [tokens, hidden_dim]
+        # cumsum: [local_experts]
+        assert fc1_1_2_weight.shape[1] % 2 == 0, (
+            f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
+        )
+
+        # Single fc1 gemm: output shape [T, 2I]
+        fc1_output = group_gemm_same_nk(
+            a=permute_tokens,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum,
+            max_M=permute_tokens.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+
+        # chunk is a view, no copy
+        fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
+
+        # compute the activation of linear layer fc1-1
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+
+        # compute final result of linear layer fc1
+        fc1_result = fc1_1_activation * fc1_2_output
+
+        # compute linear layer fc2
+        fc2_output = group_gemm_same_nk(
+            a=fc1_result,
+            b=fc2_weight,
+            cumsum_M=cumsum,
+            max_M=permute_tokens.shape[0],
+            transpose_a=False,
+            transpose_b=True,
+        )
+
+        ctx.save_for_backward(
+            permute_tokens,
+            cumsum,
+            fc1_1_2_weight,
+            fc2_weight,
+            fc1_1_output,
+            fc1_2_output,
+        )
+
+        return fc2_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            permute_tokens,
+            cumsum,
+            fc1_1_2_weight,
+            fc2_weight,
+            fc1_1_output,
+            fc1_2_output,
+        ) = ctx.saved_tensors
+
+        # recompute
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_result = fc1_1_activation * fc1_2_output
+
+        # dgrad fc2
+        grad_fc1_result = group_gemm_same_nk(
+            a=grad_output,
+            b=fc2_weight,
+            cumsum_M=cumsum,
+            max_M=grad_output.shape[0],
+            transpose_b=False,
+        )
+
+        # wgrad fc2
+        grad_fc2_weight = None
+        if fc2_weight.requires_grad:
+            grad_fc2_weight = torch.empty_like(fc2_weight)
+            group_gemm_same_mn(
+                a=grad_output,
+                b=fc1_result,
+                c=grad_fc2_weight,
+                cumsum_K=cumsum,
+                max_K=grad_output.shape[0],
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        # gate gradients
+        grad_fc1_2_output = fc1_1_activation * grad_fc1_result
+        grad_fc1_1_activation = grad_fc1_result * fc1_2_output
+        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+
+        # Merge grads back to [T, 2I]
+        grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
+
+        # single dgrad for merged fc1
+        grad_permute_tokens = group_gemm_same_nk(
+            a=grad_fc1_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum,
+            max_M=grad_output.shape[0],
+            transpose_b=False,
+        )
+
+        # single wgrad for merged fc1
+        grad_fc1_1_2_weight = None
+        if fc1_1_2_weight.requires_grad:
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+            group_gemm_same_mn(
+                a=grad_fc1_output,
+                b=permute_tokens,
+                c=grad_fc1_1_2_weight,
+                cumsum_K=cumsum,
+                max_K=grad_output.shape[0],
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        return (
+            grad_permute_tokens,  # permute_tokens
+            None,  # cumsum
+            grad_fc1_1_2_weight,  # fc1_1_2_weight
+            grad_fc2_weight,  # fc2_weight
+        )

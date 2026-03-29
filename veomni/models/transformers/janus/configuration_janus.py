@@ -84,12 +84,16 @@ class JanusGenVisionConfig(PretrainedConfig):
         codebook_show_usage: bool = True,
         commit_loss_beta: float = 0.25,
         entropy_loss_ratio: float = 0.0,
-        encoder_ch_mult: List[int] = [1, 1, 2, 2, 4],
-        decoder_ch_mult: List[int] = [1, 1, 2, 2, 4],
+        encoder_ch_mult: List[int] = None,
+        decoder_ch_mult: List[int] = None,
         z_channels: int = 256,
         dropout_p: float = 0.0,
         **kwargs,
     ):
+        if decoder_ch_mult is None:
+            decoder_ch_mult = [1, 1, 2, 2, 4]
+        if encoder_ch_mult is None:
+            encoder_ch_mult = [1, 1, 2, 2, 4]
         self.codebook_size = codebook_size
         self.codebook_embed_dim = codebook_embed_dim
         self.codebook_l2_norm = codebook_l2_norm

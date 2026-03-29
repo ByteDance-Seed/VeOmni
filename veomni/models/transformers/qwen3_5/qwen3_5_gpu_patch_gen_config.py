@@ -808,7 +808,7 @@ def qwen3_5_model_forward(
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
-        # sequence parallel patch for image_mask & deepstack_image_embeds
+        # sequence parallel patch for image_mask
         if get_parallel_state().sp_enabled:
             seq_len = image_mask.shape[1]
 
@@ -852,7 +852,7 @@ def qwen3_5_model_forward(
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-        # sequence parallel patch for video_mask & deepstack_video_embeds
+        # sequence parallel patch for video_mask
         if get_parallel_state().sp_enabled:
             seq_len = video_mask.shape[1]
 

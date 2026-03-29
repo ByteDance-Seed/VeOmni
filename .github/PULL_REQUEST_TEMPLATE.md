@@ -27,4 +27,5 @@
 - Read the [Contribute Guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md)
 - Applied pre-commit checks
 - Added/updated documentation
+- If `tasks/` training scripts were moved or renamed: updated `docs/` examples and verified `python3 scripts/ci/check_doc_task_paths.py` passes (also enforced by the **Check doc task paths** CI workflow)
 - Added tests to CI workflow (or explained why not feasible)

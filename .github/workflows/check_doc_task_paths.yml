@@ -1,0 +1,19 @@
+name: Check doc task paths
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check_doc_task_paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tasks/*.py paths in docs
+        run: python3 scripts/ci/check_doc_task_paths.py

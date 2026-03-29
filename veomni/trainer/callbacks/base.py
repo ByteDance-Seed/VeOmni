@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import ABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -27,7 +26,7 @@ class TrainerState:
     epoch: int = 0
 
 
-class Callback(ABC):
+class Callback:
     def __init__(self, trainer: "BaseTrainer") -> None:
         self.trainer = trainer
 
