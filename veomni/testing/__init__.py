@@ -13,9 +13,11 @@ from .comparison_utils import (
     compare_metrics,
     print_comparison_table,
 )
+from .data_generators import DummyDataset
 
 
 __all__ = [
+    "DummyDataset",
     "TensorComparator",
     "assert_close",
     "assert_exact",

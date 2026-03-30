@@ -59,7 +59,7 @@ def build_torchrun_cmd(
     model_path: str,
     train_path: str,
     output_dir: str,
-    parallel_config: ParallelConfig,
+    parallel_config: Optional[ParallelConfig] = None,
     extra_args: Optional[List[str]] = None,
     nproc: Optional[int] = None,
     init_device: str = "meta",
@@ -67,11 +67,19 @@ def build_torchrun_cmd(
     """Build a torchrun command for distributed test execution.
 
     Args:
+        parallel_config: Parallelism configuration. When None, no parallel
+            args (fsdp_mode, ulysses_size, ep_size) are passed — suitable
+            for plain single-GPU training.
         init_device: Device for model initialization. Use "meta" for FSDP
             (multi-GPU), device type for single-GPU (no FSDP wrapping).
     """
     port = find_free_port()
-    n = nproc or parallel_config.world_size
+    if nproc is not None:
+        n = nproc
+    elif parallel_config is not None:
+        n = parallel_config.world_size
+    else:
+        n = 1
 
     cmd = [
         "torchrun",
@@ -84,12 +92,9 @@ def build_torchrun_cmd(
         "--data.dyn_bsz_buffer_size=1",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=1",
-        f"--train.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
         "--model.ops_implementation.attn_implementation=flash_attention_2",
         "--model.ops_implementation.moe_implementation=fused",
         f"--train.init_device={init_device}",
-        f"--train.accelerator.ulysses_size={parallel_config.sp_size}",
-        f"--train.accelerator.ep_size={parallel_config.ep_size}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",
         "--train.checkpoint.save_epochs=0",
@@ -101,6 +106,15 @@ def build_torchrun_cmd(
         f"--train.checkpoint.output_dir={output_dir}",
         f"--model.model_path={model_path}",
     ]
+
+    if parallel_config is not None:
+        cmd.extend(
+            [
+                f"--train.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
+                f"--train.accelerator.ulysses_size={parallel_config.sp_size}",
+                f"--train.accelerator.ep_size={parallel_config.ep_size}",
+            ]
+        )
 
     if extra_args:
         cmd.extend(extra_args)
@@ -138,8 +152,8 @@ def run_training_config(
     model_path: str,
     train_path: str,
     output_dir: str,
-    parallel_config: ParallelConfig,
     task_name: str,
+    parallel_config: Optional[ParallelConfig] = None,
     nproc: Optional[int] = None,
     extra_args: Optional[List[str]] = None,
     init_device: str = "meta",

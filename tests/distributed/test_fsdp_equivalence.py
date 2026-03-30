@@ -46,7 +46,7 @@ _TEXT_TRAIN_SCRIPT = "tests/e2e/train_text_test.py"
 
 def _setup_model_and_data(model_name, config_path, dataset_type="text"):
     """Materialize model weights and create dummy dataset."""
-    from tests.e2e.e2e_fixtures import DummyDataset
+    from veomni.testing import DummyDataset
 
     from .distributed_test_helpers import materialize_weights
 
@@ -63,23 +63,21 @@ def _setup_model_and_data(model_name, config_path, dataset_type="text"):
 
 
 def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
-    """Run single-GPU training via VeOmni trainer (nproc=1, no FSDP).
+    """Run plain single-GPU training (nproc=1, no parallelism).
 
-    Uses the same trainer script as the FSDP run, but with nproc=1 and
-    init_device=cuda (since FSDP meta-init is not available without FSDP).
-    The trainer detects world_size=1 and skips FSDP wrapping, but the full
-    data pipeline, loss normalization, and batch invariant mode remain active.
+    Uses the same trainer script as the FSDP run, but with nproc=1 and no
+    parallel config. This mimics a HuggingFace-style single-GPU training
+    baseline with no FSDP wrapping, no sequence parallelism, and no expert
+    parallelism.
     """
     from .distributed_test_helpers import run_training_config
 
-    config = ParallelConfig(sp_size=1, ep_size=1, fsdp_mode="fsdp2")
     return run_training_config(
         script=_TEXT_TRAIN_SCRIPT,
         config_path=config_path,
         model_path=model_path,
         train_path=train_path,
         output_dir=output_dir,
-        parallel_config=config,
         task_name="single_gpu",
         nproc=1,
         init_device=get_device_type(),
