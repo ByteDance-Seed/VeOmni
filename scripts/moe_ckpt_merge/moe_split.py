@@ -19,7 +19,7 @@ Output format (original HF per-expert):
     model.layers.{i}.mlp.experts.{j}.up_proj.weight    [I, H]
     model.layers.{i}.mlp.experts.{j}.down_proj.weight  [H, I]
 
-Usage: python moe_spilt.py --merge_hf_path <merged_checkpoint> --split_hf_path <output_dir>
+Usage: python moe_split.py --merge_hf_path <merged_checkpoint> --split_hf_path <output_dir>
 """
 
 import os

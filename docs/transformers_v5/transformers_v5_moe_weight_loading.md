@@ -142,7 +142,7 @@ compatible with v4 VeOmni, standard HF `from_pretrained()`, or inference engines
 To convert a v5-format checkpoint back to the standard HF per-expert format:
 
 ```bash
-python scripts/moe_ckpt_merge/moe_spilt.py \
+python scripts/moe_ckpt_merge/moe_split.py \
     --merge_hf_path <v5_checkpoint> \
     --split_hf_path <output_dir>
 ```
@@ -188,5 +188,5 @@ Expected tensor interface:
 | Checkpoint Format | v4 VeOmni Load | v5 VeOmni Load | HF `from_pretrained()` | vLLM/SGLang |
 |---|---|---|---|---|
 | HF per-expert (original) | needs `moe_merge.py` | runtime converter | direct | direct |
-| v4 merged (gate/up/down separate) | direct | needs re-merge with v5 format | needs `moe_spilt.py` | needs `moe_spilt.py` |
-| v5 fused (gate_up_proj) | incompatible | direct | needs `moe_spilt.py` | needs `moe_spilt.py` |
+| v4 merged (gate/up/down separate) | direct | needs re-merge with v5 format | needs `moe_split.py` | needs `moe_split.py` |
+| v5 fused (gate_up_proj) | incompatible | direct | needs `moe_split.py` | needs `moe_split.py` |
