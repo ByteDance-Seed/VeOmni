@@ -372,6 +372,8 @@ def build_command(shuffle=True, save_by_idx=True):
     Returns:
         list: Command arguments for subprocess.run().
     """
+    from veomni.testing import find_free_port
+
     port = find_free_port()
 
     command = [

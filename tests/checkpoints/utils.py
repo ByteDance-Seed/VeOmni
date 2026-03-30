@@ -3,8 +3,12 @@
 
 import os
 
-from ..tools.launch_utils import find_free_port
+from veomni.testing import find_free_port
 
+
+# ---------------------------------------------------------------------------
+# Model configs for checkpoint tests
+# ---------------------------------------------------------------------------
 
 MODEL_CONFIGS = {
     "qwen3_moe": {

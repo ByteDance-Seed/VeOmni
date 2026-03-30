@@ -1,19 +1,12 @@
 # tests/utils.py
 import os
-import socket
 
 import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from veomni.testing import find_free_port
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
-
-
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
 
 
 def _dist_worker_entry(rank, world_size, port, func, args, kwargs):

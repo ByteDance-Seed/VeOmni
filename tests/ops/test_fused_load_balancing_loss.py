@@ -23,6 +23,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
+pytestmark = [pytest.mark.L1]
+
 DEFAULT_ATOL = 1e-4
 
 # (num_experts, top_k, num_layers, batch_size, seq_len)

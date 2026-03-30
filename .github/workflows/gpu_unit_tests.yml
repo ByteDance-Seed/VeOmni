@@ -99,7 +99,7 @@ jobs:
           uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
       - name: Run checkpoint callback unit tests
         run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py
+          uv run --frozen pytest -s -x tests/distributed/test_checkpoint_callback.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
