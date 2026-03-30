@@ -134,7 +134,9 @@ def _copy_non_weight_files(src_dir: str, dst_dir: str):
     skip_files = {"model.safetensors.index.json", "pytorch_model.bin.index.json"}
     for filename in os.listdir(src_dir):
         src_path = os.path.join(src_dir, filename)
-        if not os.path.isfile(src_path):
+        if os.path.isdir(src_path):
+            if not filename.startswith("."):
+                shutil.copytree(src_path, os.path.join(dst_dir, filename), dirs_exist_ok=True)
             continue
         if os.path.splitext(filename)[1] in weight_extensions:
             continue
