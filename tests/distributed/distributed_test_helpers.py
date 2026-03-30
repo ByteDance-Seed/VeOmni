@@ -12,7 +12,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from veomni.testing import compare_metrics, find_free_port, get_toy_config_path, print_comparison_table
+from veomni.testing import compare_metrics, find_free_port, print_comparison_table
 
 
 # Re-export for consumers that previously imported from utils.py / _training_core.py
@@ -21,7 +21,6 @@ __all__ = [
     "build_torchrun_cmd",
     "compare_metrics",
     "find_free_port",
-    "get_toy_config_path",
     "materialize_weights",
     "print_comparison_table",
     "release_device_memory",
