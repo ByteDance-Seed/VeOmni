@@ -112,6 +112,9 @@ jobs:
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
+      - name: Run distributed tests (dummy_forward)
+        run: |
+          uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data

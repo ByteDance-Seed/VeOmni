@@ -96,9 +96,15 @@ jobs:
       - name: Run e2e training test
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+      - name: Run FSDP equivalence tests
+        run: |
+          uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
       - name: Sync dependencies [transformers-v5]
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
-      - name: Run models tests [transformers-v5]
+      - name: Run e2e tests [transformers-v5]
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+      - name: Run FSDP equivalence tests [transformers-v5]
+        run: |
+          uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py

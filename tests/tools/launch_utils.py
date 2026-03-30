@@ -39,7 +39,7 @@ def _dist_worker_entry(rank, world_size, port, func, args, kwargs):
 
 
 def torchrun(func, world_size: int = 4, *args, **kwargs):
-    if get_torch_device().is_available() and get_torch_device().is_available().device_count() < world_size:
+    if get_torch_device().is_available() and get_torch_device().device_count() < world_size:
         pytest.skip(f"Requires {world_size} {get_device_type()} devices")
 
     port = find_free_port()
