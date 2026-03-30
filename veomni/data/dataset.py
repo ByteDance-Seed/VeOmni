@@ -264,7 +264,7 @@ def _supports_output_index_for_resume(dataset: Any) -> bool:
     return callable(getattr(dataset, "get_item", None)) and hasattr(dataset, "output_index_for_resume")
 
 
-class MultiSourceDataset(IterableDataset):
+class WeightedMultiSourceDataset(IterableDataset):
     """Multi-source dataset with weighted sampling.
 
     This dataset samples from multiple upstream iterable datasets according to a
@@ -290,7 +290,7 @@ class MultiSourceDataset(IterableDataset):
         stopping_strategy: Literal["first_exhausted", "all_exhausted", "never_exhausted"] = "first_exhausted",
         output_index_for_resume: bool = False,
     ) -> None:
-        """Initialize a MultiSourceDataset.
+        """Initialize a WeightedMultiSourceDataset.
 
         Args:
             datasets: Upstream iterable datasets (one per source).
@@ -309,8 +309,9 @@ class MultiSourceDataset(IterableDataset):
                 - ``first_exhausted``: Stop the whole dataset once any source is exhausted.
                 - ``all_exhausted``: Restart an exhausted source until all sources are exhausted.
                 - ``never_exhausted``: Always restart exhausted sources and never terminate.
-            output_index_for_resume: If True, yields ``(sample, (source_id, resume_index))``
-                so downstream components can checkpoint buffers by indices and reconstruct them.
+            output_index_for_resume: If True, yields ``(sample, (source_id, output_index))``
+                so downstream components can checkpoint buffers by output indices
+                and reconstruct them later.
 
         Raises:
             ValueError: If input arguments are invalid.
@@ -371,22 +372,22 @@ class MultiSourceDataset(IterableDataset):
 
     @property
     def output_index_for_resume(self) -> bool:
-        """Whether to yield resume indices alongside samples."""
+        """Whether to yield output indices alongside samples for resume."""
         return self._output_index_for_resume
 
     @output_index_for_resume.setter
     def output_index_for_resume(self, value: bool) -> None:
-        """Enable or disable resume-index output.
+        """Enable or disable output-index emission for resume.
 
         When enabled, each upstream dataset must provide:
         - ``get_item(idx)`` to fetch a sample by index
         - ``output_index_for_resume`` attribute to switch yielding ``(sample, idx)``
 
         Args:
-            value: True to enable refetch indices, False to disable.
+            value: True to emit output indices for resume, False to disable.
 
         Raises:
-            ValueError: If any upstream dataset cannot support refetch-by-index.
+            ValueError: If any upstream dataset cannot emit output indices for resume.
         """
         if value:
             for source_id, (dataset, _ds_idx) in self._id2dataset.items():
@@ -442,8 +443,9 @@ class MultiSourceDataset(IterableDataset):
         """Iterate and yield samples from multiple sources.
 
         Yields:
-            If ``output_index_for_resume`` is False, yields a sample (typically a dict).
-            If ``output_index_for_resume`` is True, yields ``(sample, (source_id, resume_index))``.
+            If ``output_index_for_resume`` is False, yields a sample.
+            If ``output_index_for_resume`` is True, yields
+            ``(sample, (source_id, output_index))``.
         """
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
@@ -469,7 +471,7 @@ class MultiSourceDataset(IterableDataset):
                 continue
 
             if self._output_index_for_resume:
-                sample, resume_index = sample[0], sample[1]
+                sample, output_index = sample[0], sample[1]
 
             token_len = self._sample_token_len_fn(sample)
             if token_len <= 0:
@@ -484,7 +486,7 @@ class MultiSourceDataset(IterableDataset):
             sample = self._attach_meta(sample, ds_idx)
 
             if self._output_index_for_resume:
-                yield sample, (self._source_ids[ds_idx], resume_index)
+                yield sample, (self._source_ids[ds_idx], output_index)
             else:
                 yield sample
 
@@ -774,24 +776,31 @@ class DynamicBatchingSizeDataset(IterableDataset):
             DynamicBatchingSizeDataset
             +- sets dataset.output_index_for_resume = True
             +- reads from dataset.__iter__()
-            |  `- MultiSourceDataset.__iter__()
+            |  `- WeightedMultiSourceDataset.__iter__()
             |     +- reads from source dataset 'zh'.__iter__()
             |     +- gets inner_index = 17 from source dataset 'zh'
             |     +- sample comes from source_dataset['zh'].get_item(17)
-            |     |  `- {'input_ids': [11, 22, 33], 'attention_mask': [1, 1, 1]}
-            |     `- yields ({'input_ids': [11, 22, 33], 'attention_mask': [1, 1, 1]}, ('zh', 17))
+            |     |  `- [
+            |     |      {'input_ids': [11, 22], 'attention_mask': [1, 1]},
+            |     |      {'input_ids': [33], 'attention_mask': [1]},
+            |     |     ]
+            |     `- yields ([...], ('zh', 17))
             `- keeps
-               +- runtime buffer: {'input_ids': [11, 22, 33], 'attention_mask': [1, 1, 1]}
-               `- checkpoint buffer: ('zh', 17)
+               +- runtime buffer: [
+               |     ({'input_ids': [11, 22], 'attention_mask': [1, 1]}, 2),
+               |     ({'input_ids': [33], 'attention_mask': [1]}, 1),
+               |  ]
+               `- checkpoint buffer: [(('zh', 17), 0), (('zh', 17), 1)]
 
             Resume path
             -----------
             checkpoint['buffer']
-            `- [('zh', 17), ('en', 5), ...]
+            `- [(('zh', 17), 0), (('zh', 17), 1)]
                `- load_state_dict()
-                  `- MultiSourceDataset.get_item(('zh', 17))
-                     +- 'zh' -> select source dataset 'zh'
-                     `- 17 -> source_dataset['zh'].get_item(17)
+                  +- WeightedMultiSourceDataset.get_item(('zh', 17))
+                  |  +- 'zh' -> select source dataset 'zh'
+                  |  `- 17 -> source_dataset['zh'].get_item(17)
+                  `- select sample_idx=1 from the returned list
 
         Raises:
             ValueError: If ``save_by_idx`` is True but ``dataset`` does not expose the
@@ -811,7 +820,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self.force_generate_long_sequence = force_generate_long_sequence
 
         self._buffer = []
-        self._buffer_of_refetch_idx = []
+        self._buffer_of_output_index = []
         self._buffer_token_count = 0
 
         self._just_resumed = False  # Flag to indicate if the dataset has just been resumed from a checkpoint, used to skip buffer checks on the first iteration after resume.
@@ -850,7 +859,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
             # Clear buffer state on new iteration unless we just resumed from a checkpoint,
             # in which case we want to keep the buffer contents.
             self._buffer = []
-            self._buffer_of_refetch_idx = []
+            self._buffer_of_output_index = []
             self._buffer_token_count = 0
         else:
             self._just_resumed = False
@@ -870,15 +879,13 @@ class DynamicBatchingSizeDataset(IterableDataset):
 
                 item = next(self._data_iter)
                 if self.save_by_idx:
-                    item, refetch_idx = item[0], item[1]
-
-                samples_to_add = []
-                if type(item) is list:
-                    samples_to_add = item
+                    item, output_index = item
                 else:
-                    samples_to_add = [item]
-                for item in samples_to_add:
-                    length = self.get_length_fn(item)
+                    output_index = None
+
+                samples_to_add = item if isinstance(item, list) else [item]
+                for sample_idx, sample in enumerate(samples_to_add):
+                    length = self.get_length_fn(sample)
                     if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
                         # TODO: record the count of discarded long examples for monitoring
                         logger.warning(
@@ -886,11 +893,14 @@ class DynamicBatchingSizeDataset(IterableDataset):
                         )
                         continue
 
-                    self._buffer.append((item, length))
+                    self._buffer.append((sample, length))
                     if self.save_by_idx:
-                        self._buffer_of_refetch_idx.append(refetch_idx)
-
-                    self._buffer_token_count += self._buffer[-1][1]
+                        # Save one output-index entry per buffered sample.
+                        # An upstream dataset may yield ``list[dict]`` in one
+                        # iteration, and ``sample_idx`` selects the buffered
+                        # sample within that list during resume.
+                        self._buffer_of_output_index.append((output_index, sample_idx))
+                    self._buffer_token_count += length
 
             except Exception as e:
                 if isinstance(e, StopIteration):
@@ -951,7 +961,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         for idx in reversed(indices_to_remove_from_buffer):
             del self._buffer[idx]
             if self.save_by_idx:
-                del self._buffer_of_refetch_idx[idx]
+                del self._buffer_of_output_index[idx]
 
         assert len(micro_batch) > 0
         return micro_batch
@@ -979,7 +989,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         # the state_dict might be called frequently with StatefulDataloaders(see more details of snapshot_every_n_steps)
         # so we try to not include extra calculations here.
         if self.save_by_idx:
-            state["buffer"] = copy.deepcopy(self._buffer_of_refetch_idx)
+            state["buffer"] = copy.deepcopy(self._buffer_of_output_index)
         else:
             # deepcopy buffer so that it can be transfered through multiple processes
             state["buffer"] = copy.deepcopy(self._buffer)
@@ -1014,18 +1024,29 @@ class DynamicBatchingSizeDataset(IterableDataset):
         prev_save_by_idx = state_dict["save_by_idx"]
         if prev_save_by_idx:
             self._buffer = []
-            self._buffer_of_refetch_idx = []
-            for idx in state_dict["buffer"]:
-                item = self.dataset.get_item(idx)
-                length = self.get_length_fn(item)
-                self._buffer.append((item, length))
+            self._buffer_of_output_index = []
+            cached_output_index = None
+            cached_restored_samples = None
+            for output_index_entry in state_dict["buffer"]:
+                # Each checkpoint entry points to exactly one buffered sample:
+                # ``output_index`` identifies the upstream item and ``sample_idx``
+                # selects one sample after flattening a possible ``list[dict]``.
+                output_index, sample_idx = output_index_entry
+                if output_index != cached_output_index:
+                    restored_item = self.dataset.get_item(output_index)
+                    cached_restored_samples = restored_item if isinstance(restored_item, list) else [restored_item]
+                    cached_output_index = output_index
+                restored_sample = cached_restored_samples[sample_idx]
+                length = self.get_length_fn(restored_sample)
+                self._buffer.append((restored_sample, length))
                 if self.save_by_idx:
-                    self._buffer_of_refetch_idx.append(idx)
+                    self._buffer_of_output_index.append(output_index_entry)
+                self._buffer_token_count += length
         else:
             self._buffer = state_dict["buffer"]
             if self.save_by_idx and len(self._buffer) > 0:
                 raise ValueError("save_by_idx is True, but previous buffer contains valid samples instead of indices")
-            self._buffer_of_refetch_idx = []
+            self._buffer_of_output_index = []
 
         self._buffer_token_count = state_dict["buffer_token_count"]
         # Verify buffer_token_count matches the sum of token lengths
@@ -1318,3 +1339,52 @@ def build_energon_dataset(
 
     # Wrap in our EnergonDataset for Megatron-Energon specific functionality
     return EnergonDataset(dataset, transform)
+
+
+@DATASET_REGISTRY.register("veomni_weighted_multisource")
+def build_weighted_multisource_dataset(
+    train_path: str,
+    transform: Optional[Callable] = None,
+    seed: int = 42,
+    level: str = "sample",
+    sample_token_len_fn: Optional[Callable[[Any], float]] = None,
+    stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted",
+    overlong_strategy: Literal["drop", "truncate"] = "drop",
+    namespace: Literal["train", "test"] = "train",
+    split_by_node: bool = True,
+    **kwargs: Any,
+) -> IterableDataset:
+    multisource_config = parse_multisource_config(train_path)
+    schedule = multisource_config["schedule"]
+    if len(schedule) != 1 or schedule[0].get("schedule_type") != "const":
+        raise ValueError("simple_multisource only supports a single const schedule now")
+    weights = schedule[0]["weights"]
+
+    sources = multisource_config["sources"]
+    source_names = multisource_config.get("names")
+    source_ids = multisource_config.get(
+        "source_names", source_names
+    )  # if source_ids is not provided, use source_names as source_ids
+
+    datasets = [
+        build_iterable_dataset(
+            train_path=source,
+            namespace=namespace,
+            seed=seed,
+            transform=transform,
+            split_by_node=split_by_node,
+        )
+        for source in sources
+    ]
+
+    return WeightedMultiSourceDataset(
+        datasets=datasets,
+        weights=weights,
+        seed=seed,
+        level=level,
+        sample_token_len_fn=sample_token_len_fn,
+        source_names=source_names,
+        source_ids=source_ids,
+        upstream_sharded=split_by_node,
+        stopping_strategy=stopping_strategy,
+    )

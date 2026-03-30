@@ -1,6 +1,6 @@
 import math
 import os
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -184,7 +184,13 @@ class ShardedIterableDataset(IterableDataset):
       exact position of the iterator.
     """
 
-    def __init__(self, size: int = 100, shuffle: bool = False, seed: int = 42):
+    def __init__(
+        self,
+        size: int = 100,
+        shuffle: bool = False,
+        seed: int = 42,
+        transform: Optional[Callable[[Dict[str, torch.Tensor]], Any]] = None,
+    ):
         """
         Args:
             size: Total number of samples in the dataset.
@@ -192,10 +198,13 @@ class ShardedIterableDataset(IterableDataset):
                 once at construction time using ``seed`` so that it is stable across
                 distributed workers.
             seed: Random seed used to generate the permutation when ``shuffle=True``.
+            transform: Optional transform applied in ``__getitem__`` / ``get_item``.
+                It may return either one sample dict or ``list[dict]``.
         """
         self.size = size
         self.shuffle = shuffle
         self.seed = seed
+        self.transform = transform
         self.output_index_for_resume = False  # Will be set by DynamicBatchingSizeDataset if needed
         self._current_idx = -1  # Track current position in iteration
         self._just_resumed = False
@@ -212,13 +221,14 @@ class ShardedIterableDataset(IterableDataset):
         return self.size
 
     def __getitem__(self, idx):
-        """Return the dummy sample at position *idx*."""
+        """Return the transformed dummy sample at position *idx*."""
         if idx < 0 or idx >= self.size:
             raise IndexError(f"Index {idx} out of range [0, {self.size})")
 
         index = idx + 1
         input_ids = torch.tensor([index] * index, dtype=torch.long)
-        return {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "labels": input_ids.clone()}
+        sample = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "labels": input_ids.clone()}
+        return self.transform(sample) if self.transform is not None else sample
 
     def __iter__(self):
         """Iterate through the dataset in order or shuffled order with rank and worker sharding.
@@ -280,7 +290,7 @@ class ShardedIterableDataset(IterableDataset):
             idx: 0-based integer index into the dataset.
 
         Returns:
-            Sample as returned by ``ShardedIterableDataset.__getitem__``.
+            Sample or ``list[dict]`` as returned by ``ShardedIterableDataset.__getitem__``.
         """
         return self[idx]
 

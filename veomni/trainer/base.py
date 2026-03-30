@@ -580,10 +580,7 @@ class BaseTrainer(Stateful, ABC):
 
             self.start_step = 0
 
-            if get_device_type() == "cpu":
-                helper.print_cpu_memory_info()
-            else:
-                helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
         self.on_train_end()
 

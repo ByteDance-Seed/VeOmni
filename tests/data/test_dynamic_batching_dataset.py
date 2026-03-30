@@ -23,7 +23,7 @@ The test suite includes:
 
     End-to-end distributed tests (require ``torchrun`` with 2 processes):
         - ``test_dynamic_batching_dataset_distributed`` – parametrised over
-          ``shuffle × save_by_idx`` (4 combinations), verifying that resumed
+          ``shuffle × save_by_idx × multi_sample_per_iteration`` (5 combinations), verifying that resumed
           batches are byte-for-byte identical to the original run.
 """
 
@@ -77,6 +77,17 @@ DATASET_SIZE = 50
 
 def get_length_fn(item):
     return item["attention_mask"].sum()
+
+
+def single_sample_transform(sample: Dict[str, torch.Tensor]):
+    return [sample]
+
+
+def multi_sample_transform(sample: Dict[str, torch.Tensor]):
+    secondary_sample = copy.deepcopy(sample)
+    secondary_sample["input_ids"] = secondary_sample["input_ids"] + 1000
+    secondary_sample["labels"] = secondary_sample["labels"] + 1000
+    return [sample, secondary_sample]
 
 
 # Fixtures
@@ -333,15 +344,16 @@ def test_save_load_state_dict(save_by_idx):
 
 
 @pytest.mark.parametrize(
-    "shuffle,save_by_idx",
+    "shuffle,save_by_idx,multi_sample_per_iteration",
     [
-        (False, False),
-        (False, True),
-        (True, False),
-        (True, True),
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
     ],
 )
-def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx):
+def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample_per_iteration):
     """Test DynamicBatchingSizeDataset in distributed setting.
 
     Runs _main_distributed_test() by torchrun with or without data shuffling
@@ -350,17 +362,22 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx):
     Args:
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
+        multi_sample_per_iteration: Whether one dataset iteration emits two samples.
 
     Raises:
         subprocess.CalledProcessError: If the distributed test fails.
     """
-    command = build_command(shuffle=shuffle, save_by_idx=save_by_idx)
+    command = build_command(
+        shuffle=shuffle,
+        save_by_idx=save_by_idx,
+        multi_sample_per_iteration=multi_sample_per_iteration,
+    )
     # Pass current environment to subprocess to inherit virtual environment
     result = subprocess.run(command, check=True, env=os.environ.copy())
     assert result.returncode == 0
 
 
-def build_command(shuffle=True, save_by_idx=True):
+def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
     """Build torchrun command for distributed testing.
 
     Constructs a command to launch the test script with torchrun for
@@ -369,6 +386,7 @@ def build_command(shuffle=True, save_by_idx=True):
     Args:
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
+        multi_sample_per_iteration: Whether one dataset iteration emits two samples.
 
     Returns:
         list: Command arguments for subprocess.run().
@@ -397,6 +415,7 @@ def build_command(shuffle=True, save_by_idx=True):
         "--train.dyn_bsz=true",
         "--train.dyn_bsz_run_in=worker",
         f"--save_by_idx={str(save_by_idx).lower()}",
+        f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
         "--train.seed=42",
     ]
     return command
@@ -411,9 +430,16 @@ class TrainerTest(BaseTrainer):
     save_epoch, save_step = 1, 0
     is_resume_train: bool = False
 
-    def __init__(self, args: VeOmniArguments, shuffle: bool, save_by_idx: bool):
+    def __init__(
+        self,
+        args: VeOmniArguments,
+        shuffle: bool,
+        save_by_idx: bool,
+        multi_sample_per_iteration: bool,
+    ):
         self.shuffle = shuffle
         self.save_by_idx = save_by_idx
+        self.multi_sample_per_iteration = multi_sample_per_iteration
         super().__init__(args)
 
     def _setup(self):
@@ -434,8 +460,15 @@ class TrainerTest(BaseTrainer):
 
     def _build_dataset(self):
         args = self.args
-        self.train_dataset = ShardedIterableDataset(size=DATASET_SIZE, shuffle=self.shuffle, seed=args.train.seed)
-        args.compute_train_steps(len(self.train_dataset))
+        transform = multi_sample_transform if self.multi_sample_per_iteration else single_sample_transform
+        self.train_dataset = ShardedIterableDataset(
+            size=DATASET_SIZE,
+            shuffle=self.shuffle,
+            seed=args.train.seed,
+            transform=transform,
+        )
+        effective_dataset_size = DATASET_SIZE * (2 if self.multi_sample_per_iteration else 1)
+        args.compute_train_steps(effective_dataset_size)
         args.train.num_train_epochs = 2
         self.train_steps = args.train_steps
 
@@ -590,11 +623,17 @@ def _main_distributed_test():
         _parser = argparse.ArgumentParser()
         _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
+        _parser.add_argument("--multi_sample_per_iteration", type=lambda x: x.lower() == "true", default=False)
         test_args, remaining_argv = _parser.parse_known_args()
         sys.argv = [sys.argv[0]] + remaining_argv
 
         args = parse_args(VeOmniArguments)
-        trainer = TrainerTest(args, shuffle=test_args.shuffle, save_by_idx=test_args.save_by_idx)
+        trainer = TrainerTest(
+            args,
+            shuffle=test_args.shuffle,
+            save_by_idx=test_args.save_by_idx,
+            multi_sample_per_iteration=test_args.multi_sample_per_iteration,
+        )
         trainer.train()
         assert trainer.args.train.checkpoint.load_path is not None
         trainer.resume_train()

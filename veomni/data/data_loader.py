@@ -93,6 +93,43 @@ def build_native_dataloader(
             legacy main-process ``DynamicBatchSizeDataLoader`` path, while ``"worker"``
             batches inside each DataLoader worker via ``DynamicBatchingSizeDataset`` so
             worker state can participate in ``StatefulDataLoader`` checkpoint/resume.
+
+            Data format by stage when ``dyn_bsz=True``:
+
+            ``dyn_bsz_run_in="main"``
+
+                dataset
+                  │  yields: ``list[dict]``
+                  ▼
+                DataLoader(batch_size=1, collate_fn=UnpackDataCollator)
+                  │  yields: ``list[dict]``
+                  ▼
+                DynamicBatchSizeDataLoader / TextBatchingStrategy
+                  │  flatten each upstream item: ``list[dict]`` -> ``dict``
+                  │  internal buffer entry: ``dict``
+                  │  micro batch from strategy: ``list[dict]``
+                  ▼
+                trainer step input
+                     ``list[list[dict]]``
+                     (outer list = micro batches in one optimizer step,
+                      inner list = samples in one micro batch)
+
+            ``dyn_bsz_run_in="worker"``
+
+                dataset
+                  │  yields: ``list[dict]``
+                  ▼
+                DynamicBatchingSizeDataset (inside each worker)
+                  │  flatten each upstream item: ``list[dict]`` -> ``dict``
+                  │  internal buffer entry: ``dict``
+                  │  micro batch before collate: ``list[dict]``
+                  ▼
+                StatefulDataLoader(batch_size=num_micro_batch, collate_fn=NoopDataCollator)
+                  │ ``list[list[dict]]``
+                  ▼
+                trainer step input
+                  │ ``list[list[dict]]``
+
         multiprocessing_context: Optional worker start method override.
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.

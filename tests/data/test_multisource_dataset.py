@@ -21,8 +21,8 @@ from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
 from utils import (
+    DummyDataset,
     FakeModel,
-    ShardedIterableDataset,
     StepAwareResumeCheckpointerCallback,
     compare_global_batch,
     compare_metrics,
@@ -32,7 +32,7 @@ from utils import (
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
-from veomni.data.dataset import MultiSourceDataset
+from veomni.data.dataset import WeightedMultiSourceDataset
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, TrainerState
@@ -85,6 +85,28 @@ class TrainerTest(BaseTrainer):
     def _setup(self):
         self.device = setup_test_distributed(self.args)
 
+        self.multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in self.multisource_names]
+        self.multisource_paths = [dataset.save_path for dataset in self.multisource_datasets]
+
+        multisource_config = dict(
+            sources=self.multisource_paths,
+            names=self.multisource_names,
+            schedule=[dict(schedule_type="const", weights=self.multisource_weights)],
+        )
+        self.tmp_train_path = os.path.join(get_cache_dir("./tmp_train_path.yaml"), "tmp_train_path.yaml")
+        if dist.get_rank() == 0:
+            with open(self.tmp_train_path, "w") as f:
+                yaml.safe_dump(multisource_config, f)
+
+        self.args.data.train_path = self.tmp_train_path
+        self.args.data.enable_multisource = True
+        self.args.data.level = "token"
+        self.args.data.split_by_node = False
+        self.args.data.stopping_strategy = "all_exhausted"
+        self.args.data.dataset_name = "veomni_weighted_multisource"
+
+        self.args.train.num_train_epochs = 3
+
     def _freeze_model_module(self):
         pass
 
@@ -96,39 +118,14 @@ class TrainerTest(BaseTrainer):
         self.model_assets = [self.model_config]
 
     def _build_data_transform(self):
-        pass
+        self.data_transform = None
 
     def _build_dataset(self):
-        args = self.args
-        iterable_datasets = [
-            ShardedIterableDataset(size=100, shuffle=True, seed=args.train.seed + i)
-            for i in range(len(self.multisource_names))
-        ]
+        super()._build_dataset()
 
-        args.data.enable_multisource = True
-        args.train.num_train_epochs = 3
-        self.train_dataset = MultiSourceDataset(
-            datasets=iterable_datasets,
-            weights=self.multisource_weights,
-            seed=args.train.seed,
-            level="token",
-            source_names=self.multisource_names,
-            upstream_sharded=True,
-            stopping_strategy="all_exhausted",
-        )
-
-        multisource_config = dict(
-            sources=self.multisource_names,
-            names=self.multisource_names,
-            schedule=[dict(schedule_type="const", weights=self.multisource_weights)],
-        )
-        self.tmp_yaml_path = os.path.join(get_cache_dir("./tmp_simple_ms.yaml"), "tmp_simple_ms.yaml")
-        if dist.get_rank() == 0:
-            with open(self.tmp_yaml_path, "w") as f:
-                yaml.safe_dump(multisource_config, f)
         dist.barrier()
 
-        state = cast(MultiSourceDataset, self.train_dataset).state_dict()
+        state = cast(WeightedMultiSourceDataset, self.train_dataset).state_dict()
         assert state["version"] == 0
         assert state["topology"]["stopping_strategy"] == "all_exhausted"
         assert state["topology"]["level"] == "token"
@@ -140,9 +137,8 @@ class TrainerTest(BaseTrainer):
         assert sorted(state["runtime"]["avg_len_count"].keys()) == sorted(source_ids)
         assert sorted(state["runtime"]["dataset_states"].keys()) == sorted(source_ids)
 
-        args.compute_train_steps(dataset_length=None)
-        self.train_steps = args.train_steps
-
+        self.args.compute_train_steps(dataset_length=None)
+        self.train_steps = self.args.train_steps
         self.save_step = self.train_steps - 2
 
     def _build_dataloader(self):
@@ -379,7 +375,7 @@ def _make_simple_dataset(
     source_names=None,
     source_ids=None,
 ):
-    return MultiSourceDataset(
+    return WeightedMultiSourceDataset(
         datasets=datasets,
         weights=weights,
         seed=123,
@@ -693,7 +689,7 @@ def test_level_token_weighting():
 )
 def test_init_validation(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        MultiSourceDataset(**kwargs, seed=42)
+        WeightedMultiSourceDataset(**kwargs, seed=42)
 
 
 @pytest.mark.parametrize(

@@ -306,7 +306,7 @@ class MultiSourceCounterItem:
 
 class MultiSourceInfoTracker:
     """
-    Tracks the statistics about the MultiSourceDataset.
+    Tracks the statistics about the weighted multi-source dataset.
     """
 
     def __init__(self, dataloader: Optional["DataLoader"], data_path: str) -> None:
@@ -326,7 +326,7 @@ class MultiSourceInfoTracker:
 
     def step(self, batch_ds_idx: List[int], batch_seqlens: List[int]) -> Dict[str, Any]:
         """
-        Computes the statistics about the MultiSourceDataset. It should be called at every rank to update dataloader.
+        Computes the statistics about the weighted multi-source dataset. It should be called at every rank to update dataloader.
         """
         counter = defaultdict(MultiSourceCounterItem)
         for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens):
@@ -482,9 +482,12 @@ def print_device_mem_info(prompt: str = "VRAM usage") -> None:
     """
     Logs VRAM info.
     """
-    memory_allocated = get_torch_device().memory_allocated() / (1024**3)
-    max_memory_allocated = get_torch_device().max_memory_allocated() / (1024**3)
-    logger.info_rank0(f"{prompt}: cur {memory_allocated:.2f}GB, max {max_memory_allocated:.2f}GB.")
+    if get_device_type() == "cpu":
+        print_cpu_memory_info()
+    else:
+        memory_allocated = get_torch_device().memory_allocated() / (1024**3)
+        max_memory_allocated = get_torch_device().max_memory_allocated() / (1024**3)
+        logger.info_rank0(f"{prompt}: cur {memory_allocated:.2f}GB, max {max_memory_allocated:.2f}GB.")
 
 
 def print_cpu_memory_info():
