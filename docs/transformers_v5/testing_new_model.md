@@ -7,6 +7,10 @@ When adding a new model with `transformers>=5.0.0` support, two test suites need
 
 Both files gate v5-only cases so they are skipped on v4 environments.
 
+For VLM models, there is also a lightweight trainer-level smoke test for `freeze_vit`:
+
+3. **`tests/models/test_vlm_trainer.py`** — builds a real toy VLM model on CPU and checks that vision parameters stay trainable when `freeze_vit=False` and are frozen when `freeze_vit=True`
+
 ## 1. `tests/models/test_models_patch.py`
 
 ### What it tests
@@ -134,6 +138,30 @@ pytest.param(
 
 For vision-language or multimodal models, add to the appropriate test case list (`qwen2vl_test_cases`, `qwen3vl_test_cases`, etc.) and pair with the matching fixture and test function. The same `max_sp_size` field is available.
 
+## 3. `tests/models/test_vlm_trainer.py`
+
+### What it tests
+
+Builds a real toy VLM model and calls `VLMTrainer._freeze_model_module()` directly. The test only checks one behavior:
+
+- `freeze_vit=False` -> the vision tower parameters remain trainable
+- `freeze_vit=True` -> the vision tower parameters are frozen
+
+This is intentionally simpler than an e2e training test. It is meant to catch model wrapper path changes such as `model.visual` vs `model.model.visual`.
+
+### How to add a case
+
+Add your toy config to the matching case list:
+
+```python
+_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5 = [
+    pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
+    pytest.param("./tests/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),
+]
+```
+
+For transformers v4 VLMs, add to `_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4` instead.
+
 ## Checklist
 
 When adding a new v5 model, verify:
@@ -142,6 +170,8 @@ When adding a new v5 model, verify:
 - [ ] Entry added to `_TEST_CASES_TRANSFORMERS_V5` in `test_models_patch.py`
 - [ ] Unsupported attention/MoE modes filtered in `test_models_patch_fwd_bwd` if needed
 - [ ] Entry added to `text_test_cases` (or VLM equivalent) in `test_e2e_parallel.py` with `marks=_v5_only`
+- [ ] For VLM models, toy config added to `_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5` in `tests/models/test_vlm_trainer.py`
 - [ ] `max_sp_size` set appropriately (use `1` if SP not supported, `None` otherwise)
 - [ ] `pytest --collect-only -k <model>` shows expected test cases
 - [ ] Tests pass: `pytest tests/models/test_models_patch.py -k <model>` and `pytest tests/e2e/test_e2e_parallel.py -k <model>`
+- [ ] For VLM models, `pytest tests/models/test_vlm_trainer.py -k <model>` passes
