@@ -34,6 +34,15 @@ When restructuring code (same behavior, better structure):
 - `MainCollator` has **strict SP ordering** (pad → slice → FA kwargs → slice position_ids) — reordering breaks SP correctness.
 - `position_ids == 0` marks segment boundaries for FA varlen — any transform that produces position_ids must preserve this convention.
 
+## Documentation
+
+Before committing, check if the change requires documentation updates:
+
+- **New/changed API** → update or create docs in `docs/`.
+- **New/changed config fields** → update config examples in `configs/` and relevant docs.
+- **Architecture change** → update `.agents/knowledge/architecture.md`.
+- **New constraint discovered** → add to `.agents/knowledge/constraints.md`.
+
 ## When to Use Other Skills
 
 - **New model** → `/veomni-new-model`

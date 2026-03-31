@@ -72,11 +72,12 @@ Title: `[{modules}] {type}: {description}`
 ## Commit Flow
 
 1. Complete and verify the change.
-2. Run `/veomni-review` skill (subagent code review).
-3. **safe** -> commit. **risky** -> report to user, wait for approval.
-4. Each fix -> immediate commit. Do not batch unrelated changes.
-5. Run `make quality` before every commit.
-6. **Commit messages must NOT mention Claude/AI/Co-Authored-By.**
+2. Update related documentation: `docs/`, `README.md`, `.agents/knowledge/`, config examples — if the change introduces, modifies, or removes any API, config field, or workflow.
+3. Run `/veomni-review` skill (subagent code review).
+4. **safe** -> commit. **risky** -> report to user, wait for approval.
+5. Each fix -> immediate commit. Do not batch unrelated changes.
+6. Run `make quality` before every commit.
+7. **Commit messages must NOT mention Claude/AI/Co-Authored-By.**
 
 ---
 

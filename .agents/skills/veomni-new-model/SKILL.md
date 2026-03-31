@@ -101,6 +101,11 @@ Phase 6: Test                          -> pending
 
 4. Run `make quality` and `pytest tests/models/`.
 
+5. **Update documentation**:
+   - Add usage example to `docs/` (training command, config reference).
+   - Update `.agents/knowledge/architecture.md` if the model adds a new module or trainer path.
+   - Update supported models table in project `README.md` if applicable.
+
 ## Common Pitfalls
 
 - **Model registry**: Registration must happen at import time in `__init__.py`. If the model's `AutoConfig` type is not registered, `build_foundation_model()` will fail.
