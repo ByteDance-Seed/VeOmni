@@ -23,6 +23,10 @@ except ImportError:
 
 def parse_multisource_config(multisource_config_path: str):
     multisource_config = None
+    import logging
+
+    logger = logging.getLogger(__name__)
+    logger.error(f"Failed to parse multisource config from {multisource_config_path}.")
     with open(multisource_config_path) as f:
         multisource_config = yaml.safe_load(f)
     assert multisource_config is not None, "expect multisource_config is not None."

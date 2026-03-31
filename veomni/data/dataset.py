@@ -544,6 +544,13 @@ class WeightedMultiSourceDataset(IterableDataset):
                     f"Data source #{ds_idx} (source_name: {self._source_names[ds_idx]}) is exhausted, reset and continue"
                 )
                 self._iters[ds_idx] = iter(self._datasets[ds_idx])
+                try:
+                    return next(self._iters[ds_idx])
+                except StopIteration as e:
+                    raise RuntimeError(
+                        f"Data source #{ds_idx} (source_name: {self._source_names[ds_idx]}) remains exhausted "
+                        "immediately after reset"
+                    ) from e
 
     def _attach_meta(self, sample: Any, ds_idx: int) -> Any:
         """Attach per-source metadata fields onto a sample.
@@ -1139,6 +1146,7 @@ def build_iterable_dataset(
     seed: int = 42,
     source_name: Optional[str] = None,
     split_by_node: bool = True,
+    shuffle: bool = True,
     **kwargs,
 ) -> "IterableDataset":
     """
@@ -1155,7 +1163,8 @@ def build_iterable_dataset(
     logger.info_rank0("Start building iterative dataset")
     data_files, file_extenstion = get_data_files(train_path)
     dataset = load_dataset(file_extenstion, data_files=data_files, split=namespace, streaming=True)
-    dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
+    if shuffle:
+        dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
 
     if split_by_node:
         parallel_state = get_parallel_state()
@@ -1346,12 +1355,7 @@ def build_weighted_multisource_dataset(
     train_path: str,
     transform: Optional[Callable] = None,
     seed: int = 42,
-    level: str = "sample",
-    sample_token_len_fn: Optional[Callable[[Any], float]] = None,
-    stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted",
-    overlong_strategy: Literal["drop", "truncate"] = "drop",
-    namespace: Literal["train", "test"] = "train",
-    split_by_node: bool = True,
+    shuffle: bool = True,
     **kwargs: Any,
 ) -> IterableDataset:
     multisource_config = parse_multisource_config(train_path)
@@ -1366,13 +1370,17 @@ def build_weighted_multisource_dataset(
         "source_names", source_names
     )  # if source_ids is not provided, use source_names as source_ids
 
+    level = multisource_config.get("level", "sample")
+    stopping_strategy = multisource_config.get("stopping_strategy", "first_exhausted")
+    split_by_node = multisource_config.get("upstream_sharded", True)
+
     datasets = [
         build_iterable_dataset(
             train_path=source,
-            namespace=namespace,
             seed=seed,
             transform=transform,
             split_by_node=split_by_node,
+            shuffle=shuffle,
         )
         for source in sources
     ]
@@ -1382,7 +1390,6 @@ def build_weighted_multisource_dataset(
         weights=weights,
         seed=seed,
         level=level,
-        sample_token_len_fn=sample_token_len_fn,
         source_names=source_names,
         source_ids=source_ids,
         upstream_sharded=split_by_node,

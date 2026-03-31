@@ -1,10 +1,13 @@
 import argparse
 import copy
+import dataclasses
 import os
 import subprocess
 import sys
 import time
 from contextlib import nullcontext
+from dataclasses import field
+from functools import partial
 from typing import Any, Dict, List, Literal, cast
 from unittest.mock import patch
 
@@ -70,6 +73,17 @@ class MockIterableDataset(IterableDataset):
         self._state = dict(state)
 
 
+def _convert_list_to_tensor_fn(sample: Dict[str, Any], max_seq_len: int, **kwargs) -> Dict[str, Any]:
+    """Convert list fields in the sample to truncated tensors."""
+    converted = {}
+    for k, v in sample.items():
+        if isinstance(v, list):
+            converted[k] = torch.tensor(v[:max_seq_len], dtype=torch.long)
+        else:
+            converted[k] = v
+    return converted
+
+
 class TrainerTest(BaseTrainer):
     gt_data_list: List[List[Dict[str, Any]]] = []
     pred_data_list: List[List[Dict[str, Any]]] = []
@@ -92,20 +106,34 @@ class TrainerTest(BaseTrainer):
             sources=self.multisource_paths,
             names=self.multisource_names,
             schedule=[dict(schedule_type="const", weights=self.multisource_weights)],
+            level="token",
+            stopping_strategy="all_exhausted",
+            upstream_sharded=False,
         )
         self.tmp_train_path = os.path.join(get_cache_dir("./tmp_train_path.yaml"), "tmp_train_path.yaml")
         if dist.get_rank() == 0:
             with open(self.tmp_train_path, "w") as f:
                 yaml.safe_dump(multisource_config, f)
+        if dist.is_initialized():
+            dist.barrier()
 
         self.args.data.train_path = self.tmp_train_path
         self.args.data.enable_multisource = True
-        self.args.data.level = "token"
-        self.args.data.split_by_node = False
-        self.args.data.stopping_strategy = "all_exhausted"
         self.args.data.dataset_name = "veomni_weighted_multisource"
 
         self.args.train.num_train_epochs = 3
+
+        # we have to add a shuffle field to the args because it does not have one,
+        # and we need it to control the behavior of HF datasets,
+        # because it is shuffled it will store samples in a buffer,
+        # and such a buffer will be en  which will be discarded during resuming,
+        # thus causing the resumed training to see different samples from the original training
+        shuffle_field = field(default=True)
+        shuffle_field.name = "shuffle"
+        shuffle_field.type = bool
+        shuffle_field._field_type = dataclasses._FIELD
+        self.args.data.__dataclass_fields__["shuffle"] = shuffle_field
+        self.args.data.shuffle = False
 
     def _freeze_model_module(self):
         pass
@@ -118,7 +146,7 @@ class TrainerTest(BaseTrainer):
         self.model_assets = [self.model_config]
 
     def _build_data_transform(self):
-        self.data_transform = None
+        self.data_transform = partial(_convert_list_to_tensor_fn, max_seq_len=self.args.data.max_seq_len)
 
     def _build_dataset(self):
         super()._build_dataset()
@@ -156,7 +184,7 @@ class TrainerTest(BaseTrainer):
             dyn_bsz_run_in=args.train.dyn_bsz_run_in,
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             dyn_bsz_buffer_size=1,
-            dyn_bsz_dataset_save_by_idx=True,
+            dyn_bsz_dataset_save_by_idx=False,
             num_workers=1,
             drop_last=args.data.dataloader.drop_last,
             pin_memory=args.data.dataloader.pin_memory,
@@ -242,7 +270,7 @@ class EnvironMeterCallbackTest(Callback):
             empty_cache_steps=args.train.empty_cache_steps,
             enable_multisource=args.data.enable_multisource,
             dataloader=trainer.train_dataloader,
-            data_path=trainer.tmp_yaml_path,
+            data_path=trainer.tmp_train_path,
             gc_steps=args.train.gc_steps,
         )
 
@@ -346,8 +374,8 @@ class CheckCallback(Callback):
             if dist.is_initialized():
                 dist.barrier()
 
-            if (not dist.is_initialized() or dist.get_rank() == 0) and os.path.exists(self.trainer.tmp_yaml_path):
-                os.remove(self.trainer.tmp_yaml_path)
+            if (not dist.is_initialized() or dist.get_rank() == 0) and os.path.exists(self.trainer.tmp_train_path):
+                os.remove(self.trainer.tmp_train_path)
         else:
             self.trainer.golden_env_metrics = copy.deepcopy(self.trainer.step_env_metrics)
 
