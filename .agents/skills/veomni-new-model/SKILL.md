@@ -106,4 +106,4 @@ Phase 6: Test                          -> pending
 - **Model registry**: Registration must happen at import time in `__init__.py`. If the model's `AutoConfig` type is not registered, `build_foundation_model()` will fail.
 - **Generated files**: Never edit files in `generated/` directories — they are overwritten by patchgen. Edit the patch spec or the `modeling_*_patch.py` instead.
 - **Tokenizer compatibility**: Some models require specific tokenizer versions or custom chat templates — verify in `veomni/data/chat_template.py`.
-- **Transformers version**: VeOmni requires `transformers>=5.2.0`. Some v4-era APIs (e.g., `AutoModelForVision2Seq`) no longer exist — use v5 equivalents.
+- **Transformers version**: New code must target v5. Use `is_transformers_version_greater_or_equal_to()` for v4 compat guards. v4-era APIs (e.g., `AutoModelForVision2Seq`) no longer exist in v5 — use v5 equivalents.

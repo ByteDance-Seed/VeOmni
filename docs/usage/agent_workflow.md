@@ -36,9 +36,9 @@ If you are using Cursor or another AI coding tool on this project, the workflow 
 | What you say | Agent uses |
 |---|---|
 | "Add support for Llama 4" | `/veomni-new-model` |
-| "Fix the OOM error in VLM training" | `/veomni-bugfix` or `/veomni-debug` |
+| "Fix the OOM error in VLM training" | `/veomni-debug` |
 | "Add a fused RoPE kernel" | `/veomni-new-op` |
-| "Refactor the data collator" | `/veomni-refactor` |
+| "Refactor the data collator" | `/veomni-develop` |
 | "Update torch to 2.10" | `/veomni-uv-update` |
 
 ## Directory Structure
@@ -49,17 +49,12 @@ Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name
 
 ```
 .agents/skills/
-├── veomni-feature/SKILL.md      # New feature development
-├── veomni-bugfix/SKILL.md       # Clear bug with obvious fix
-├── veomni-refactor/SKILL.md     # Restructuring without behavior change
-├── veomni-debug/SKILL.md        # Complex debugging (unclear root cause)
-├── veomni-review/SKILL.md       # Pre-commit code review (mandatory)
-├── veomni-verify/SKILL.md       # Validate conclusions after investigation
-├── veomni-new-model/SKILL.md    # Add a new model to VeOmni
-├── veomni-new-op/SKILL.md       # Add a new kernel/operator
-├── veomni-run-test/SKILL.md     # Execute and record test results
-├── veomni-uv-update/SKILL.md    # Dependency management with uv
-└── veomni-housekeeping/SKILL.md # Recover state after context loss
+├── veomni-develop/SKILL.md    # Feature development and refactoring
+├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
+├── veomni-review/SKILL.md     # Pre-commit code review (mandatory)
+├── veomni-new-model/SKILL.md  # Add a new model to VeOmni
+├── veomni-new-op/SKILL.md     # Add a new kernel/operator
+└── veomni-uv-update/SKILL.md  # Dependency management with uv
 ```
 
 The `description` field in frontmatter tells the agent when to apply the skill. Agents that support auto-discovery (Cursor, Claude Code) will offer the relevant skill automatically based on the task description.
@@ -70,8 +65,8 @@ Domain knowledge that agents should read before making changes:
 
 | File | Content |
 |------|---------|
-| `constraints.md` | 20 hard constraints — violating any one causes bugs or crashes |
-| `architecture.md` | Module map, trainer hierarchy, data flow, model loading flow |
+| `constraints.md` | 22 hard constraints — violating any one causes bugs or crashes |
+| `architecture.md` | Module map, trainer hierarchy, data flow, model loading flow, test mapping |
 | `uv.md` | Dependency management architecture (uv, extras, lockfile, torch sources) |
 
 ### `.cursor/rules/`
@@ -80,12 +75,6 @@ Cursor IDE rules (auto-applied when editing matching files):
 
 - `no-section-divider-comments.mdc` — no decorative `# ----` banners in Python
 - `skills-reusable-only.mdc` — enforce Agent Skills standard format in `.agents/skills/`
-
-## Subagent Skills
-
-`/veomni-review` and `/veomni-verify` launch a **separate AI subagent** for independent evaluation:
-- **Review**: receives only the diff + constraints (not the developer's reasoning) to avoid confirmation bias
-- **Verify**: acts as an adversary trying to disprove a conclusion
 
 ## Adding a New Skill
 

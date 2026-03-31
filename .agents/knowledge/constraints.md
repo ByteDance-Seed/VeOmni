@@ -147,9 +147,8 @@ Core files:
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
 20. **PR title must follow format: `[{modules}] {type}: {description}`**
-    - Modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`, `agent`
-    - Types: `feat`, `fix`, `refactor`, `chore`, `test`
-    - CI checks PR titles automatically (`check_pr_title.yml`).
+    - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (single source of truth).
+    - CI checks PR titles automatically on every PR.
 
 ## Hardware
 

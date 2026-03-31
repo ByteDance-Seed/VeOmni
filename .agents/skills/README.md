@@ -8,7 +8,7 @@ Each skill is a folder containing a `SKILL.md` with YAML frontmatter:
 
 ```
 .agents/skills/
-├── veomni-feature/
+├── veomni-develop/
 │   └── SKILL.md          # name + description frontmatter, then instructions
 ├── veomni-debug/
 │   └── SKILL.md
@@ -24,7 +24,7 @@ Agents use the `description` field to decide when a skill is relevant. Users can
    - `description` should explain what the skill does and when to use it.
 2. Add the skill to the dispatch table in `AGENTS.md`.
 3. If the skill requires domain knowledge, add it to `.agents/knowledge/`.
-4. Optional: add `scripts/`, `references/`, or `assets/` subdirectories for supporting files.
+4. Optional: add `scripts/`, `references/`, or `assets/` subdirectories.
 
 See the [Agent Skills specification](https://agentskills.io/specification) for the full format.
 
@@ -32,14 +32,9 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 
 | Skill | Description |
 |-------|-------------|
-| `veomni-feature` | New feature development workflow |
-| `veomni-bugfix` | Lightweight bugfix for straightforward bugs |
-| `veomni-refactor` | Safe refactoring with baseline verification |
-| `veomni-debug` | Four-phase debugging protocol for complex issues |
-| `veomni-review` | Pre-commit code review via subagent |
-| `veomni-verify` | Adversarial verification of conclusions |
-| `veomni-new-model` | Adding a new model to VeOmni |
+| `veomni-develop` | Feature development and refactoring — VeOmni-specific impact analysis and safety checklist |
+| `veomni-debug` | Bug fix and debugging — quick path for simple fixes, full protocol for complex issues |
+| `veomni-review` | Pre-commit code review via subagent (mandatory gate) |
+| `veomni-new-model` | Adding a new model to VeOmni (patchgen, parallel plan, registry) |
 | `veomni-new-op` | Adding a new optimized kernel/operator to veomni/ops/ |
-| `veomni-run-test` | Orchestrated test execution and result recording |
 | `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
-| `veomni-housekeeping` | Post-compaction state verification |

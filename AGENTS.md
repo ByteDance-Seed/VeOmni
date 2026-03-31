@@ -25,7 +25,7 @@ On session start, read the following:
 - **Explain, Don't Assume**: Explain **why** (motivation, tradeoffs), not just what. Cite files and line numbers.
 - **Ask When Stuck**: 3+ approaches fail? Stop, summarize, ask user. No hacks.
 - **Search Before You Act**: On unexpected behavior, search codebase + check constraints + review `git log` before attempting fixes.
-- **Planning Discipline**: Complex tasks (multi-file, >30 min) -> TodoWrite. Simple tasks -> just do them.
+- **Planning Discipline**: Complex tasks (multi-file, >30 min) -> TodoWrite. Plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
 - **Cross-modality Awareness**: Changes in shared code (`BaseTrainer`, `data_collator`, `distributed/`) affect all modalities.
 - **No Patchgen Edits**: Never edit files under `veomni/models/transformers/*/generated/`.
 
@@ -64,8 +64,7 @@ pytest tests/<mod>/ # specific module
 
 Title: `[{modules}] {type}: {description}`
 
-- `{modules}`: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`, `agent`
-- `{type}`: `feat`, `fix`, `refactor`, `chore`, `test`
+- Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (the CI source of truth).
 - Breaking: prepend `[BREAKING]`
 
 ---
@@ -87,25 +86,17 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 
 | Task | Skill |
 |------|-------|
-| New feature | `/veomni-feature` |
-| Simple bug fix | `/veomni-bugfix` |
-| Complex debugging | `/veomni-debug` |
-| Refactoring | `/veomni-refactor` |
+| Feature / refactoring | `/veomni-develop` |
+| Bug fix / debugging | `/veomni-debug` |
 | Code review (pre-commit) | `/veomni-review` |
-| Verify conclusions | `/veomni-verify` |
 | Add new model | `/veomni-new-model` |
 | Add new op/kernel | `/veomni-new-op` |
-| Run tests | `/veomni-run-test` |
 | Update dependencies (uv) | `/veomni-uv-update` |
-| Post-compaction recovery | `/veomni-housekeeping` |
 
 ### Quick Decision Guide
 
-- **"Add support for model X"** -> `/veomni-new-model`
-- **"Add a new kernel / fused op"** -> `/veomni-new-op`
-- **"Fix this error"** (clear cause) -> `/veomni-bugfix`
-- **"Training is hanging / wrong results"** (unclear cause) -> `/veomni-debug`
-- **"Add a new capability"** -> `/veomni-feature`
-- **"Clean up / reorganize"** -> `/veomni-refactor`
-- **"Update package X" / "bump uv" / "upgrade torch"** -> `/veomni-uv-update`
-- **"Is this conclusion correct?"** -> `/veomni-verify`
+- **"Add support for model X"** → `/veomni-new-model`
+- **"Add a new kernel / fused op"** → `/veomni-new-op`
+- **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`
+- **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
+- **"Update package X" / "bump uv" / "upgrade torch"** → `/veomni-uv-update`

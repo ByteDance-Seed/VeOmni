@@ -130,7 +130,7 @@ configs/
         └── <Model>.json    (HuggingFace-compatible config.json)
 ```
 
-## Testing Structure
+## Testing
 
 ```
 tests/
@@ -140,10 +140,25 @@ tests/
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
 ├── checkpoints/    Checkpoint save/load tests
 ├── utils/          Utility function tests
-├── e2e/            End-to-end training tests
+├── e2e/            End-to-end training tests (require GPU)
 ├── toy_config/     Minimal model configs for fast testing
 └── tools/          Test utilities (launch_utils, common_utils)
 ```
+
+### Test Commands by Change Area
+
+| Change in | Test command |
+|-----------|-------------|
+| `veomni/models/` | `pytest tests/models/` |
+| `veomni/data/` | `pytest tests/data/` |
+| `veomni/ops/` | `pytest tests/ops/` |
+| `veomni/distributed/` | `pytest tests/parallel/` |
+| `veomni/checkpoint/` | `pytest tests/checkpoints/` |
+| `veomni/utils/` | `pytest tests/utils/` |
+| `veomni/trainer/` | `pytest tests/e2e/` |
+| Full regression | `pytest tests/` |
+
+Distributed tests (`tests/parallel/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
 
 ## Key Entry Points
 
