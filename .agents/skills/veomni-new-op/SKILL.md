@@ -120,7 +120,7 @@ Patch functions are called from:
 
 ## Phase 5: Finalize
 
-1. Run `veomni-review` skill.
+1. Run `/veomni-review` skill.
 2. Run `make quality`.
 3. Verify `build_ALL_OPS()` and `format_kernel_functions()` include the new op.
 

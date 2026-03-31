@@ -1,4 +1,7 @@
-Structured workflow for developing a new feature in VeOmni. For non-model work: new trainer capabilities, data pipeline changes, distributed strategy improvements, new ops/kernels, config enhancements.
+---
+name: veomni-feature
+description: "Structured workflow for developing a new feature in VeOmni. For non-model work: new trainer capabilities, data pipeline changes, distributed strategy improvements, new ops/kernels, config enhancements. Trigger: 'add feature', 'implement', 'new capability', 'support for', 'enhance'."
+---
 
 ## Phase 1: Understand & Scope
 
@@ -25,18 +28,19 @@ Structured workflow for developing a new feature in VeOmni. For non-model work: 
 
 ## Phase 4: Validate
 
-1. Run the relevant test suite (see `veomni-run-test` skill).
+1. Run the relevant test suite (see `/veomni-run-test` skill).
 2. If the feature affects distributed training, verify with multi-GPU e2e tests.
 3. Check side effects on other trainers/modalities.
 
 ## Phase 5: Finalize
 
-1. Run `veomni-review` skill (pre-commit code review).
+1. Run `/veomni-review` skill (pre-commit code review).
 2. Run `make quality` to ensure ruff passes.
 3. Update documentation in `docs/` if the feature introduces new APIs.
 
 ## When to Use Other Skills
 
-- **New model** -> `veomni-new-model`
-- **Bug fix** -> `veomni-bugfix` or `veomni-debug`
-- **Refactoring** -> `veomni-refactor`
+- **New model** -> `/veomni-new-model`
+- **Bug fix** -> `/veomni-bugfix` or `/veomni-debug`
+- **Refactoring** -> `/veomni-refactor`
+- **New op/kernel** -> `/veomni-new-op`

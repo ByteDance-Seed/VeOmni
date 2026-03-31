@@ -60,7 +60,7 @@ Mark each phase as you progress. Do NOT mark Phase 5 complete until knowledge is
 2. Implement a SINGLE targeted fix addressing the root cause.
 3. Verify: test passes, training runs correctly, no regressions.
 4. Check for collateral — did the fix break other modalities or trainers?
-5. Before committing: run `veomni-review` skill.
+5. Before committing: run `/veomni-review` skill.
 
 ## Phase 5: Knowledge Capture (mandatory — do it NOW, not later)
 

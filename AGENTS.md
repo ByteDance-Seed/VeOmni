@@ -8,7 +8,7 @@
 - Python: `>=3.11, <3.12`
 - Package: `veomni`
 
-**Language**: Match user's language (Chinese or English).
+**Language**: Match user's language (English).
 
 ## Context Loading
 
@@ -69,7 +69,7 @@ Title: `[{modules}] {type}: {description}`
 ## Commit Flow
 
 1. Complete and verify the change.
-2. Run `veomni-review` skill (subagent code review).
+2. Run `/veomni-review` skill (subagent code review).
 3. **safe** -> commit. **risky** -> report to user, wait for approval.
 4. Each fix -> immediate commit. Do not batch unrelated changes.
 5. Run `make quality` before every commit.
@@ -77,31 +77,31 @@ Title: `[{modules}] {type}: {description}`
 
 ---
 
-## Skill Dispatch
+## Skills
 
-Read the skill file before starting.
+Skills follow the [Agent Skills](https://agentskills.io) open standard. Each skill is a folder in `.agents/skills/<name>/` containing a `SKILL.md` with YAML frontmatter (`name`, `description`). Skills are auto-discovered by compatible agents (Cursor, Claude Code, Codex, etc.) and can also be invoked manually with `/skill-name` in chat.
 
-| Task | Skill | Path |
-|------|-------|------|
-| New feature | `veomni-feature` | `.agents/skills/veomni-feature.md` |
-| Simple bug fix | `veomni-bugfix` | `.agents/skills/veomni-bugfix.md` |
-| Complex debugging | `veomni-debug` | `.agents/skills/veomni-debug/SKILL.md` |
-| Refactoring | `veomni-refactor` | `.agents/skills/veomni-refactor.md` |
-| Code review (pre-commit) | `veomni-review` | `.agents/skills/veomni-review/SKILL.md` |
-| Verify conclusions | `veomni-verify` | `.agents/skills/veomni-verify/SKILL.md` |
-| Add new model | `veomni-new-model` | `.agents/skills/veomni-new-model/SKILL.md` |
-| Add new op/kernel | `veomni-new-op` | `.agents/skills/veomni-new-op/SKILL.md` |
-| Run tests | `veomni-run-test` | `.agents/skills/veomni-run-test/SKILL.md` |
-| Update dependencies (uv) | `veomni-uv-update` | `.agents/skills/veomni-uv-update/SKILL.md` |
-| Post-compaction recovery | `veomni-housekeeping` | `.agents/skills/veomni-housekeeping/SKILL.md` |
+| Task | Skill |
+|------|-------|
+| New feature | `/veomni-feature` |
+| Simple bug fix | `/veomni-bugfix` |
+| Complex debugging | `/veomni-debug` |
+| Refactoring | `/veomni-refactor` |
+| Code review (pre-commit) | `/veomni-review` |
+| Verify conclusions | `/veomni-verify` |
+| Add new model | `/veomni-new-model` |
+| Add new op/kernel | `/veomni-new-op` |
+| Run tests | `/veomni-run-test` |
+| Update dependencies (uv) | `/veomni-uv-update` |
+| Post-compaction recovery | `/veomni-housekeeping` |
 
 ### Quick Decision Guide
 
-- **"Add support for model X"** -> `veomni-new-model`
-- **"Add a new kernel / fused op"** -> `veomni-new-op`
-- **"Fix this error"** (clear cause) -> `veomni-bugfix`
-- **"Training is hanging / wrong results"** (unclear cause) -> `veomni-debug`
-- **"Add a new capability"** -> `veomni-feature`
-- **"Clean up / reorganize"** -> `veomni-refactor`
-- **"Update package X" / "bump uv" / "upgrade torch"** -> `veomni-uv-update`
-- **"Is this conclusion correct?"** -> `veomni-verify`
+- **"Add support for model X"** -> `/veomni-new-model`
+- **"Add a new kernel / fused op"** -> `/veomni-new-op`
+- **"Fix this error"** (clear cause) -> `/veomni-bugfix`
+- **"Training is hanging / wrong results"** (unclear cause) -> `/veomni-debug`
+- **"Add a new capability"** -> `/veomni-feature`
+- **"Clean up / reorganize"** -> `/veomni-refactor`
+- **"Update package X" / "bump uv" / "upgrade torch"** -> `/veomni-uv-update`
+- **"Is this conclusion correct?"** -> `/veomni-verify`

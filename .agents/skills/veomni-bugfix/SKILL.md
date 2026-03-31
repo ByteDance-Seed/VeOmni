@@ -1,24 +1,27 @@
-Lightweight bugfix for straightforward bugs. For complex/unclear bugs, use `veomni-debug`.
+---
+name: veomni-bugfix
+description: "Lightweight bugfix for straightforward bugs with clear root cause. For complex or unclear bugs, use veomni-debug instead. Trigger: 'fix bug', 'fix error', 'fix crash', 'broken', 'doesn't work', 'fails with'."
+---
 
 | Situation | Use |
 |-----------|-----|
-| Clear error, obvious fix | `veomni-bugfix` |
-| Fix in <30 min | `veomni-bugfix` |
-| Root cause unclear | `veomni-debug` |
-| Multiple failed attempts | `veomni-debug` |
-| Distributed training issues | `veomni-debug` |
-| Numerical accuracy / loss divergence | `veomni-debug` |
+| Clear error, obvious fix | `/veomni-bugfix` |
+| Fix in <30 min | `/veomni-bugfix` |
+| Root cause unclear | `/veomni-debug` |
+| Multiple failed attempts | `/veomni-debug` |
+| Distributed training issues | `/veomni-debug` |
+| Numerical accuracy / loss divergence | `/veomni-debug` |
 
 ## Steps
 
 ### 1. Reproduce
-Get exact command and config. Confirm the error is consistent. Can't reproduce -> `veomni-debug`.
+Get exact command and config. Confirm the error is consistent. Can't reproduce -> `/veomni-debug`.
 
 ### 2. Identify Root Cause
 - Read error/traceback carefully.
 - Check `.agents/knowledge/constraints.md` for known pitfalls.
 - Search for similar patterns in existing tests under `tests/`.
-- Not clear in 15 min -> `veomni-debug`.
+- Not clear in 15 min -> `/veomni-debug`.
 
 ### 3. Fix
 - Write a reproducer test if feasible (add to `tests/`).
@@ -31,6 +34,6 @@ Get exact command and config. Confirm the error is consistent. Can't reproduce -
 - Fix addresses root cause, not symptoms.
 
 ### 5. Commit
-- Run `veomni-review` skill.
+- Run `/veomni-review` skill.
 - Run `make quality` to ensure ruff compliance.
 - PR title format: `[{module}] fix: {description}`.

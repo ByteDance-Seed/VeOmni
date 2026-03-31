@@ -59,7 +59,7 @@ After tests complete:
 
 1. **Note the results**: total passed, failed, skipped, errors.
 2. **If any failures**: record the failing test names and error messages.
-3. **Regressions**: If a previously passing test now fails, **STOP** and investigate before proceeding. Use `veomni-debug` if the cause is not obvious.
+3. **Regressions**: If a previously passing test now fails, **STOP** and investigate before proceeding. Use `/veomni-debug` if the cause is not obvious.
 
 ## Step 5: Quality Gate
 

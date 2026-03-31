@@ -1,4 +1,7 @@
-Safe refactoring: same behavior, better structure. If behavior changes, use `veomni-feature` or `veomni-bugfix`.
+---
+name: veomni-refactor
+description: "Safe refactoring: same behavior, better structure. If behavior changes, use veomni-feature or veomni-bugfix instead. Trigger: 'refactor', 'reorganize', 'clean up', 'restructure', 'move code', 'rename'."
+---
 
 ## Phase 1: Baseline
 
@@ -24,7 +27,7 @@ For each step:
 ## Phase 3: Verify
 
 1. Run same tests as Phase 1 — results must be identical.
-2. Run `veomni-review` skill on full diff.
+2. Run `/veomni-review` skill on full diff.
 3. Run `make quality` to ensure ruff passes.
 
 ## Common Traps
