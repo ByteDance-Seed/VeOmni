@@ -27,8 +27,7 @@ from .comm import (
 class ReduceLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx: torch.autograd.Function, loss: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
-        if num_valid_tokens == 0:
-            loss = torch.nan_to_num(loss)
+        loss = torch.where(num_valid_tokens > 0, loss, torch.zeros_like(loss))
 
         local_num_tokens = num_valid_tokens.detach().clone()
         loss *= num_valid_tokens
@@ -42,10 +41,7 @@ class ReduceLoss(torch.autograd.Function):
         # This NaN propagates through element_mul_kernel in Liger backward,
         # corrupting the entire model via FSDP all-reduce.
         # Return zero loss instead to safely skip this micro-batch.
-        if num_valid_tokens == 0:
-            return torch.zeros_like(loss)
-
-        return loss / num_valid_tokens
+        return loss / num_valid_tokens.clamp_min(1)
 
     @staticmethod
     def backward(
@@ -55,10 +51,12 @@ class ReduceLoss(torch.autograd.Function):
 
         # FIX: Mirror the forward guard — zero grad when global tokens = 0,
         # preventing NaN grad_output from corrupting downstream parameters.
-        if global_num_tokens == 0:
-            return torch.zeros_like(grad_output), None
-
-        grad_output = get_unified_sequence_parallel_world_size() * local_num_tokens * grad_output / global_num_tokens
+        grad_output = (
+            get_unified_sequence_parallel_world_size()
+            * local_num_tokens
+            * grad_output
+            / global_num_tokens.clamp(min=1)
+        )
         return grad_output, None
 
 
