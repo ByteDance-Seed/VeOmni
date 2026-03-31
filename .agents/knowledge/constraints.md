@@ -86,7 +86,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
 18. **PR title must follow format: `[{modules}] {type}: {description}`**
-    - Modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`
+    - Modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`, `agent`
     - Types: `feat`, `fix`, `refactor`, `chore`, `test`
     - CI checks PR titles automatically (`check_pr_title.yml`).
 

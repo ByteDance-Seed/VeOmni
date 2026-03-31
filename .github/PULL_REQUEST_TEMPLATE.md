@@ -6,7 +6,7 @@
 
 - Search for relative PRs/issues and link here: ...
 - PR title follows `[{modules}] {type}: {description}` format
-  - `{modules}`: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`
+  - `{modules}`: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`, `agent`
   - `{type}`: `feat`, `fix`, `refactor`, `chore`, `test`
   - Breaking changes: prepend `[BREAKING]` — e.g. `[BREAKING][parallel, model] feat: dynamic batching`
 

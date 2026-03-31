@@ -60,7 +60,7 @@ pytest tests/<mod>/ # specific module
 
 Title: `[{modules}] {type}: {description}`
 
-- `{modules}`: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`
+- `{modules}`: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`, `agent`
 - `{type}`: `feat`, `fix`, `refactor`, `chore`, `test`
 - Breaking: prepend `[BREAKING]`
 
