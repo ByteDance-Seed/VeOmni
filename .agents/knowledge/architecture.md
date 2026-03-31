@@ -12,10 +12,13 @@ veomni/
 │   ├── multimodal/     Vision, audio, video preprocessing and chat templates
 │   └── diffusion/      Diffusion model data loading
 ├── distributed/        All parallelism strategies
-│   ├── fsdp/           FSDP (v1) wrapping, gradient clipping, extensions
-│   ├── fsdp2/          FSDP2 (composable) wrapping, gradient clipping
-│   ├── moe/            MoE expert parallelism: routing, communication, layer wrapping
-│   └── sequence_parallel/  Ulysses sequence parallelism: split/gather, async variants
+│   ├── parallel_state.py   init_parallel_state(), ParallelState, device mesh setup
+│   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
+│   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
+│   ├── fsdp/           FSDP (v1) — LEGACY, will be removed
+│   ├── fsdp2/          FSDP2 (composable fully_shard) — PRIMARY, gradient clipping
+│   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
+│   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
@@ -79,7 +82,7 @@ YAML Config -> VeOmniArguments -> Trainer
                     │               │               │
                     v               v               v
               Parallelize     Dynamic Batch     Grad Clip
-              (FSDP/FSDP2)    + Data Transform  (veomni_clip_grad_norm)
+              (FSDP2)         + Data Transform  (fsdp2/clip_grad_norm)
                     │               │               │
                     └───────────────┼───────────────┘
                                     v
@@ -99,13 +102,17 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Parallelization Flow
 
-1. `init_parallel_state()` -> set up device meshes for FSDP, SP, EP
-2. Model-specific `parallel_plan.py` -> define wrapping policy and sharding spec
-3. `build_parallelize_model()`:
-   - FSDP (v1): `FullyShardedDataParallel` wrapping with auto-wrap policy
-   - FSDP2: `fully_shard()` composable API on each transformer block
-   - Sequence Parallel: `parallelize_module()` with Ulysses attention
-   - Expert Parallel: shard MoE experts across EP group
+FSDP1 is legacy and will be removed. All new development uses FSDP2.
+
+1. `init_parallel_state()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
+2. Model-specific `parallel_plan.py` -> define EP/embedding weight sharding via `ParallelPlan`
+3. `build_parallelize_model()` -> `parallelize_model_fsdp2()`:
+   - `ParallelPlan.apply()` wraps EP/embedding params as DTensors on para mesh
+   - `fully_shard()` on EP modules with `ep_fsdp` submesh (Shard(1) for hidden dim)
+   - `fully_shard()` on each transformer block with `fsdp_mesh`
+   - `fully_shard()` on root model
+4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
+5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
 
 ## Config Structure
 

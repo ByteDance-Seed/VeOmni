@@ -34,11 +34,15 @@ On session start, read the following:
 ## Setup
 
 ```bash
+# Default (transformers 4.57.3)
 uv sync --extra gpu --extra audio --dev
 source .venv/bin/activate
+
+# For new development targeting transformers v5:
+uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --dev
 ```
 
-Always activate `.venv/` before running any commands.
+Always activate `.venv/` before running any commands. New code must target transformers v5 and FSDP2. See `.agents/knowledge/constraints.md` for details.
 
 ---
 

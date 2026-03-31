@@ -18,84 +18,145 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 
-4. **Transformers version >= 5.2.0**
-   - VeOmni is based on HuggingFace transformers v5. Some internal APIs changed between v4 and v5 (e.g., `AutoModelForVision2Seq` removed, `no_init_weights` moved to `transformers.initialization`).
-   - Model patches in `veomni/models/transformers/` must be compatible with transformers v5 APIs.
+4. **Transformers version: dual-track (v4.57.3 / v5.2.0), new development targets v5**
+   - VeOmni currently supports two transformers versions via uv conflicts:
+     - **Default**: `transformers==4.57.3` (dependency group `transformers-stable`, active by default)
+     - **Experimental**: `transformers==5.2.0` (optional extra `transformers5-exp`)
+   - Switch: `uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev`
+   - **All new code must target v5 APIs.** v4 compatibility code exists but will be removed.
+   - Version branching uses `is_transformers_version_greater_or_equal_to()` from `veomni/utils/import_utils.py`.
+   - Key v4→v5 API changes:
+     - `AutoModelForVision2Seq` removed → use `AutoModelForImageTextToText`
+     - `no_init_weights` moved from `transformers.modeling_utils` to `transformers.initialization`
+     - Model `__init__.py` files select `generated.patched_modeling_*` (v5) vs upstream + `apply_*_patch()` (v4)
+   - Patchgen regeneration must be done with the target transformers version installed.
 
 ## Distributed Training
 
-5. **FSDP2 `fully_shard()` requires torch >= 2.4**
-   - The `fully_shard` composable API is conditionally imported. Code that unconditionally calls it will crash on older PyTorch versions.
-   - Always check: `is_torch_version_greater_than("2.4")` before using FSDP2 APIs.
+VeOmni supports FSDP1 and FSDP2, but **FSDP1 is legacy and will be removed**. All new development must use FSDP2.
 
-6. **FSDP wrap policy must match model structure**
-   - The wrap policy in `build_parallelize_model()` determines which modules become FSDP units.
-   - Wrong granularity causes: too coarse -> OOM, too fine -> excessive communication overhead.
-   - Each model's `parallel_plan.py` defines the correct wrapping boundaries.
+Core entry points:
+- `veomni/distributed/parallel_state.py` — `init_parallel_state()`, `ParallelState` dataclass
+- `veomni/distributed/torch_parallelize.py` — `build_parallelize_model()`, `parallelize_model_fsdp2()`
+- `veomni/distributed/parallel_plan.py` — `ParallelPlan`, `SpecInfo`
 
-7. **Gradient clipping must use `veomni_clip_grad_norm`**
-   - Standard `torch.nn.utils.clip_grad_norm_` does not handle FSDP sharded parameters correctly.
-   - VeOmni provides `veomni.distributed.clip_grad_norm.veomni_clip_grad_norm` which handles both FSDP and FSDP2.
+### FSDP2
 
-8. **Sequence parallel requires consistent attention splitting**
-   - `veomni/distributed/sequence_parallel/ulysses.py` splits input sequences across ranks.
-   - Attention masks, position IDs, and KV caches must be split/gathered consistently.
-   - Gathering outputs before loss computation is mandatory — partial outputs produce incorrect loss.
-   - Use `gather_outputs()` from `veomni.distributed.sequence_parallel`.
+5. **FSDP2 uses PyTorch composable `fully_shard()` API**
+   - `parallelize_model_fsdp2()` in `torch_parallelize.py` calls `fully_shard()` on each transformer block, then on the root model.
+   - The FSDP mesh comes from `ParallelState.fsdp_mesh`, which is a view of the global device mesh (can be `dp_shard`, `dp_shard_sp`, or include `dp_replicate` for HSDP).
+   - When SP is enabled, the FSDP shard mesh fuses with the SP mesh (`dp_shard_sp`) so sequence-parallel ranks co-shard via FSDP.
+   - Gradient clipping: `veomni/distributed/fsdp2/clip_grad_norm.py` — handles DTensor grads and ExtraParallel param groups.
 
-9. **MoE expert parallel requires matching device mesh**
-   - Expert parallel device mesh must be compatible with the FSDP device mesh.
-   - `veomni/distributed/moe/` handles expert assignment — changing mesh topology without updating MoE configuration causes routing failures.
+6. **Device mesh initialization (`init_parallel_state()`)**
+   - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `ulysses`, `cp`, `tp` (each included only if size > 1).
+   - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
+   - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
+
+### Sequence Parallel (Ulysses)
+
+7. **SP uses all-to-all head/sequence exchange, not all-gather**
+   - Implementation: `veomni/distributed/sequence_parallel/ulysses.py`
+   - `gather_seq_scatter_heads(qkv)` — before attention: each rank sends sequence chunks, receives head chunks → **full sequence, subset of heads** per rank.
+   - `gather_heads_scatter_seq(output)` — after attention: inverse exchange → **full heads, subset of sequence** per rank.
+   - Underlying primitive: `_SeqAllToAll` (autograd-aware `all_to_all_tensor`).
+   - Async variants in `async_ulysses*.py` for DiT and pipelined QKV/output projections.
+   - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
+   - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks.
+   - Process groups: `comm.py` sets `ulysses_sequence_parallel_group`, `context_parallel_group`, `unified_sequence_parallel_group` from the device mesh.
+
+### Expert Parallel (MoE)
+
+8. **EP shards expert weights and exchanges tokens via all-to-all**
+   - Weight sharding: `ParallelPlan` in `parallel_plan.py` defines which expert parameters get `Shard(0)` on the EP mesh. `ParallelPlan.apply()` wraps matching params as DTensors and redistributes to local shards.
+   - Token routing: `veomni/distributed/moe/moe_layer.py` — `preprocess()` computes dispatch counts, `token_pre_all2all()` / `tokens_post_all2all()` exchange tokens between EP ranks via `all_to_all` / `all_to_all_async` in `moe/comm.py`.
+   - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
+   - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
+   - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
 
 ## Data Pipeline
 
-10. **Data collator must match model modality**
-    - `MainCollator` in `veomni/data/data_collator.py` dispatches to modality-specific collation.
-    - Using a text-only collator on multimodal data (or vice versa) causes silent shape mismatches or crashes.
+Core files:
+- `veomni/data/data_collator.py` — `MainCollator` (3-stage pipeline)
+- `veomni/data/dynamic_batching.py` — sample packing with token budgets
+- `veomni/data/data_transform.py` — dataset transform registry
+- `veomni/data/chat_template.py` — chat template with label masking
+- `veomni/utils/seqlen_pos_transform_utils.py` — FA kwargs computation
 
-11. **`IGNORE_INDEX` (-100) for loss masking**
+### MainCollator Pipeline
+
+9. **MainCollator is a 3-stage pipeline, not a single function**
+   - Stage 1: `PrecomputePositionIDsCollator` — fills `position_ids = torch.arange(seq_len)` if absent.
+   - Stage 2: `PackingCollator` — concatenates micro-batch samples along sequence dim using `DataCollateInfo` rules from `DEFAULT_DATA_COLLATE_INFO`. Sets `labels[0]` of each non-first sample to `IGNORE_INDEX` at pack boundaries.
+   - Stage 3: `SequenceParallelCollator` (only when SP enabled) — label shift, SP padding/slicing, FA kwargs, then position_ids slicing.
+
+### Conventions
+
+10. **`position_ids == 0` marks segment boundaries for FlashAttention varlen**
+    - `add_flash_attention_kwargs_from_position_ids()` finds indices where `position_ids == 0` → builds `cu_seq_lens_q/k` for `flash_attn_varlen`.
+    - These must be in the batch dict **before** the model forward pass. Recomputing per-layer causes host-device sync.
+    - Multimodal models may have 3D position_ids `(B, dim, L)` — FA uses the first row `[:, 0, :]`.
+
+11. **`attention_mask` sum = token count for dynamic batching**
+    - Dynamic batching (`DynamicBatchingSizeDataset`, `DynBszBuffer`) uses `attention_mask.sum()` as the length function.
+    - With FA varlen, `attention_mask` is expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
+    - When SP is enabled, `attention_mask` must use `sp_pad_value=1` (asserted in `MainCollator.__post_init__`).
+
+12. **`IGNORE_INDEX` (-100) for loss masking**
     - Labels set to `IGNORE_INDEX` are excluded from loss computation.
-    - Custom data transforms must preserve this convention. Using a different ignore value silently corrupts training.
+    - Chat templates set `IGNORE_INDEX` on non-target turns (prompts, system messages).
+    - `PackingCollator` sets `IGNORE_INDEX` on the first token of each packed sample (after the first) to prevent cross-sample supervision.
+    - Custom data transforms must preserve this convention.
 
-12. **Flash attention kwargs must be precomputed**
-    - `add_flash_attention_kwargs_from_position_ids()` computes `cu_seq_lens` and `max_length` from `position_ids`.
-    - These must be added to the batch dict before the model forward pass. Recomputing inside each attention layer causes host-device sync, hurting performance.
+13. **SP collation ordering is load-bearing**
+    - `SequenceParallelCollator` executes in strict order: pad → slice batch tensors → compute FA kwargs on **full** `position_ids` → slice `position_ids` last.
+    - Reordering causes incorrect `cu_seq_lens` or misaligned position/label tensors.
 
-13. **Dynamic batching preserves per-sample boundaries**
-    - `veomni/data/dynamic_batching.py` packs multiple samples into a single sequence.
-    - Position IDs and attention masks must correctly reflect sample boundaries. Breaking boundaries causes cross-contamination between samples.
+14. **Dynamic batching packs samples by token budget**
+    - `DynamicBatchingSizeDataset` (preferred) / `DynBszBuffer` (legacy): per-worker buffer, yields when token sum ≥ `micro_batch_seq_length`.
+    - `_get_micro_batch` greedily adds samples that fit. Supports `state_dict` / `load_state_dict` for checkpoint resumption.
+    - Position IDs in packed sequences must encode segment boundaries (see constraint 10).
+
+### Multimodal Data
+
+15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/`)**
+    - `encode_multimodal_sample()` in `multimodal_transform.py` orchestrates: `conv_preprocess()` → `fetch_images/videos/audios` → `process_mm_data()` → processor tokenization.
+    - Images: load → RGB PIL → `smart_resize` (pixel min/max, scale_factor for grid alignment, max aspect ratio).
+    - Videos: `torchcodec` decode → `calculate_frame_indices` (FPS, min/max frames, `frame_factor`/`frame_factor_remainder` for VAE-friendly counts); optional paired audio.
+    - Audio: `librosa` at configurable `sample_rate` (default 16kHz).
+    - Placeholder IDs: `TYPE2INDEX` maps modality tokens (e.g. image input → `-200`, output → `-201`). `mask_input_ids()` replaces these with `0` for text embedding and exposes `{modality}_{input|output}_mask`.
 
 ## Checkpoint
 
-14. **DCP checkpoint keys must match model state dict**
+16. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
     - Extra state is saved per-rank via `_EXTRA_STATE_FORMAT` — changing rank count requires checkpoint resharding.
 
-15. **Checkpoint save/load requires all ranks to participate**
+17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
 
 ## Code Quality
 
-16. **Ruff must pass before commit**
+18. **Ruff must pass before commit**
     - `make quality` runs `ruff check` and `ruff format --check`.
     - Pre-commit hooks enforce this automatically (`pre-commit run --all-files`).
 
-17. **All comments and docstrings must be in English**
+19. **All comments and docstrings must be in English**
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
-18. **PR title must follow format: `[{modules}] {type}: {description}`**
+20. **PR title must follow format: `[{modules}] {type}: {description}`**
     - Modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `trainer`, `agent`
     - Types: `feat`, `fix`, `refactor`, `chore`, `test`
     - CI checks PR titles automatically (`check_pr_title.yml`).
 
 ## Hardware
 
-19. **NPU (Ascend) code paths require guards**
+21. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
     - NPU patches live in `veomni/ops/npu_patch/` — they must not be imported on GPU-only environments.
 
-20. **Device-agnostic code must use `veomni.utils.device` helpers**
+22. **Device-agnostic code must use `veomni.utils.device` helpers**
     - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
     - Direct CUDA calls break NPU compatibility.

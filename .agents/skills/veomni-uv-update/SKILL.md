@@ -71,21 +71,29 @@ uv sync --extra gpu --dev
 
 ## Scenario 4: Update transformers Version
 
-transformers is a core dependency (`>=5.2.0`) in `[project.dependencies]`.
+transformers uses a **dual-track** setup: default `4.57.3` (group `transformers-stable`) and experimental `5.2.0` (extra `transformers5-exp`), declared as conflicts in `[tool.uv.conflicts]`.
 
-1. Edit the version constraint in `pyproject.toml` -> `[project.dependencies]`.
+**Bump within a track** (e.g. 4.57.3 → 4.58.0, or 5.2.0 → 5.3.0):
+1. Edit the pinned version in the relevant section of `pyproject.toml`:
+   - Stable: `[dependency-groups]` -> `transformers-stable`
+   - Experimental: `[project.optional-dependencies]` -> `transformers5-exp`
 2. Regenerate lockfile and sync:
 
 ```bash
 uv lock
+# Stable:
 uv sync --extra gpu --dev
+# Or v5:
+uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev
 ```
 
-3. Check for API breakage — transformers v5 moved/renamed some internals:
+3. Check for API breakage — key v4→v5 differences:
    - `AutoModelForVision2Seq` removed (use `AutoModelForImageTextToText`)
    - `no_init_weights` moved from `transformers.modeling_utils` to `transformers.initialization`
-   - Review `veomni/models/loader.py` compatibility guards
+   - Model `__init__.py` version gates: `is_transformers_version_greater_or_equal_to("5.0.0")` chooses `generated/` (v5) vs upstream + `apply_*_patch()` (v4)
+   - Some models (e.g. `qwen3_5`, `glm_moe_dsa`) only register on `>= 5.2.0`
 4. Run tests: `pytest tests/models/ tests/e2e/`
+5. Regenerate model patches if needed: `make patchgen` (with the target transformers installed)
 
 ## Scenario 5: Regenerate Lockfile Only
 
