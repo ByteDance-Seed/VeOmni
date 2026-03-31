@@ -78,6 +78,7 @@ Title: `[{modules}] {type}: {description}`
 5. Each fix -> immediate commit. Do not batch unrelated changes.
 6. Run `make quality` before every commit.
 7. **Commit messages must NOT mention Claude/AI/Co-Authored-By.**
+8. **Skill gap check**: If the task didn't match any existing skill, briefly assess after completion: Was this a one-off, or a repeatable pattern? If repeatable, suggest creating a new skill to the user.
 
 ---
 
