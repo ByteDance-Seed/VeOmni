@@ -27,8 +27,7 @@ from .comm import (
 class ReduceLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx: torch.autograd.Function, loss: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
-        if num_valid_tokens == 0:
-            loss = torch.nan_to_num(loss)
+        loss = torch.where(num_valid_tokens > 0, loss, torch.zeros_like(loss))
 
         local_num_tokens = num_valid_tokens.detach().clone()
         loss *= num_valid_tokens
@@ -36,14 +35,28 @@ class ReduceLoss(torch.autograd.Function):
         dist.all_reduce(loss, group=group)
         dist.all_reduce(num_valid_tokens, group=group)
         ctx.save_for_backward(local_num_tokens, num_valid_tokens)
-        return loss / num_valid_tokens
+
+        # FIX: When ALL ranks in the SP group have zero valid tokens,
+        # global num_valid_tokens = 0 after all_reduce, causing 0/0 = NaN.
+        # This NaN propagates through element_mul_kernel in Liger backward,
+        # corrupting the entire model via FSDP all-reduce.
+        # Return zero loss instead to safely skip this micro-batch.
+        return loss / num_valid_tokens.clamp_min(1)
 
     @staticmethod
     def backward(
         ctx: torch.autograd.Function, grad_output: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         local_num_tokens, global_num_tokens = ctx.saved_tensors
-        grad_output = get_unified_sequence_parallel_world_size() * local_num_tokens * grad_output / global_num_tokens
+
+        # FIX: Mirror the forward guard — zero grad when global tokens = 0,
+        # preventing NaN grad_output from corrupting downstream parameters.
+        grad_output = (
+            get_unified_sequence_parallel_world_size()
+            * local_num_tokens
+            * grad_output
+            / global_num_tokens.clamp(min=1)
+        )
         return grad_output, None
 
 

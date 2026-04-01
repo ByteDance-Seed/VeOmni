@@ -278,7 +278,7 @@ def apply_veomni_qwen3_moe_patch():
     hf_qwen3_moe.Qwen3MoeSparseMoeBlock = PatchQwen3MoeSparseMoeBlock
     from .parallel_plan import get_parallel_plan
 
-    hf_qwen3_moe.Qwen3MoeForCausalLM.get_parallel_plan = lambda self: get_parallel_plan()
+    hf_qwen3_moe.Qwen3MoeForCausalLM.get_parallel_plan = lambda self: get_parallel_plan(use_gate_up_proj=False)
 
     hf_qwen3_moe.Qwen3MoeForCausalLM.forward = qwen3_moe_forcausal_lm_forward
     hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = qwen3_moe_pretrained_model_init_weights

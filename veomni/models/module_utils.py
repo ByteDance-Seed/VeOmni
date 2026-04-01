@@ -43,6 +43,7 @@ from ..utils import logging
 from ..utils.device import synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.import_utils import is_diffusers_available
+from .checkpoint_tensor_loading import get_checkpoint_tensor_converter, maybe_convert_checkpoint_tensor
 
 
 if TYPE_CHECKING:
@@ -288,25 +289,34 @@ def load_model_weights(
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
 
+    converter = get_checkpoint_tensor_converter(model)
     state_dict_iterators = _load_state_dict(weights_path)
+
+    def _dispatch_kv(name: str, tensor: "torch.Tensor") -> None:
+        if name in buffer_dict.keys():  # persistent buffers
+            buffer_dict[name] = tensor.clone()
+        elif name in parameter_names_to_load:
+            parameter_names_to_load.remove(name)
+            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+        else:
+            logger.info_rank0(f"Unexpected key in state dict: {name}.")
+
     for state_dict_iterator in tqdm(
         state_dict_iterators, desc="Loading checkpoint shards", disable=int(os.getenv("LOCAL_RANK", "-1")) > 0
     ):
         for name, tensor in state_dict_iterator:
-            # IMPORTANT: Call this function to adapt to transformers 4.52 breaking change
-            # on model structure. See the comment for details.
             name = _convert_weight_key(name, model)
-
-            if name in buffer_dict.keys():  # persistent buffers
-                buffer_dict[name] = tensor.clone()
-            elif name in parameter_names_to_load:
-                parameter_names_to_load.remove(name)
-                _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
-            else:
-                logger.info_rank0(f"Unexpected key in state dict: {name}.")
+            converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
+            if converted is None:
+                continue
+            _dispatch_kv(converted.name, converted.tensor)
 
         del state_dict_iterator
         empty_cache()
+
+    if converter is not None:
+        for result in converter.finalize():
+            _dispatch_kv(result.name, result.tensor)
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
@@ -336,10 +346,35 @@ def rank0_load_and_broadcast_weights(
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
 
+    converter = get_checkpoint_tensor_converter(model)
     global_rank = get_parallel_state().global_rank
     torch_device = torch.device(init_device)
 
-    # get the safetensor file iterator
+    def _broadcast_and_dispatch(name, shape, dtype, tensor):
+        """Broadcast a single (name, tensor) from rank0 and dispatch it."""
+        logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
+        if global_rank != 0:
+            tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+        else:
+            tensor = tensor.to(torch_device, non_blocking=True)
+
+        start_time = time.perf_counter()
+        dist.broadcast(tensor, src=0)
+        logger.info_rank0(
+            f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
+        )
+
+        if name in buffer_dict:
+            buffer_dict[name] = tensor.detach().clone()
+        elif name in parameter_names_to_load:
+            parameter_names_to_load.discard(name)
+            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+        else:
+            if global_rank == 0:
+                logger.info_rank0(f"Unexpected key in state dict: {name}.")
+        del tensor
+
+    # --- Broadcast shard count ---
     state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
     shard_count = len(state_dict_iterators) if global_rank == 0 else 0
     logger.info_rank0(f"rank0_load_and_broadcast_weights: {shard_count=} ")
@@ -352,12 +387,10 @@ def rank0_load_and_broadcast_weights(
     shard_count = int(shard_count_tensor.item())
 
     if global_rank == 0:
-        # only rank0 would actual read weights from safetensor state_dict iterators
         shard_iterable = enumerate(
             tqdm(
                 state_dict_iterators,
                 desc="Loading checkpoint shards",
-                # only rank0 displays tqdm pbar
                 disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
             )
         )
@@ -370,19 +403,31 @@ def rank0_load_and_broadcast_weights(
         iterator = iter(state_dict_iterator) if global_rank == 0 else None
 
         while True:
-            # read tensors from safetensor
             tensor: Optional["torch.Tensor"] = None
 
             if global_rank == 0:
-                try:
-                    key, tensor = next(iterator)  # type: ignore[arg-type]
-                    key = _convert_weight_key(key, model)
-                    logger.info_rank0(f"loading {key=}")
-                    if torch.count_nonzero(tensor) == 0:
-                        logger.warning_rank0(f"Detected tensor with all-zero values when reading safetensor: {key=}")
-                    metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
-                except StopIteration:
-                    metadata = BroadcastMetadata(True, None, None, None)
+                while True:
+                    # Inner loop: rank0 keeps reading tensors until the converter
+                    # produces a result or the shard is exhausted. The converter may
+                    # return None to indicate "still accumulating" (e.g. collecting
+                    # per-expert MoE tensors), so we continue without broadcasting.
+                    try:
+                        key, tensor = next(iterator)  # type: ignore[arg-type]
+                        key = _convert_weight_key(key, model)
+                        converted = maybe_convert_checkpoint_tensor(key, tensor, converter)
+                        if converted is None:
+                            continue
+                        key, tensor = converted.name, converted.tensor
+                        logger.info_rank0(f"loading {key=}")
+                        if torch.count_nonzero(tensor) == 0:
+                            logger.warning_rank0(
+                                f"Detected tensor with all-zero values when reading safetensor: {key=}"
+                            )
+                        metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
+                        break
+                    except StopIteration:
+                        metadata = BroadcastMetadata(True, None, None, None)
+                        break
             else:
                 metadata = BroadcastMetadata(False, None, None, None)
 
@@ -398,33 +443,43 @@ def rank0_load_and_broadcast_weights(
             dtype = metadata.dtype
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata.")
-            logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
-            if global_rank != 0:
-                tensor = torch.empty(shape, dtype=dtype, device=torch_device)
-            else:
-                tensor = tensor.to(torch_device, non_blocking=True)  # type: ignore[assignment]
-
-            start_time = time.perf_counter()
-            dist.broadcast(tensor, src=0)
-            logger.info_rank0(
-                f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
-            )
-
-            if name in buffer_dict:
-                buffer_dict[name] = tensor.detach().clone()
-            elif name in parameter_names_to_load:
-                parameter_names_to_load.discard(name)
-                _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
-            else:
-                if global_rank == 0:
-                    logger.info_rank0(f"Unexpected key in state dict: {name}.")
-
-            del tensor
+            _broadcast_and_dispatch(name, shape, dtype, tensor)
 
         if global_rank == 0:
             del state_dict_iterator
 
         empty_cache()
+
+    # --- Flush converter (broadcast any finalized tensors) ---
+    if converter is not None:
+        finalized = converter.finalize() if global_rank == 0 else []
+        fin_count_tensor = torch.tensor(
+            [len(finalized)],
+            dtype=torch.int64,
+            device=torch_device if torch_device.type != "cpu" else torch.device("cpu"),
+        )
+        dist.broadcast(fin_count_tensor, src=0)
+        fin_count = int(fin_count_tensor.item())
+
+        for i in range(fin_count):
+            if global_rank == 0:
+                result = finalized[i]
+                metadata = BroadcastMetadata(False, result.name, result.tensor.shape, result.tensor.dtype)
+                tensor = result.tensor
+            else:
+                metadata = BroadcastMetadata(False, None, None, None)
+                tensor = None
+
+            metadata_list = [metadata]
+            dist.broadcast_object_list(metadata_list, src=0)
+            metadata = metadata_list[0]
+
+            name = metadata.name
+            shape = metadata.shape
+            dtype = metadata.dtype
+            if name is None or shape is None or dtype is None:
+                raise RuntimeError("Received incomplete broadcast metadata from finalize.")
+            _broadcast_and_dispatch(name, shape, dtype, tensor)
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 

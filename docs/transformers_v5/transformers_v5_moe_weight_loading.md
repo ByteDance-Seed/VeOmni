@@ -85,10 +85,12 @@ Handling summary:
 
 ## Qwen3Moe Handling in VeOmni
 
-For qwen3_moe, VeOmni keeps split expert tensors in patched modeling:
-- `gate_proj`
-- `up_proj`
-- `down_proj`
+### Transformers v4 (stable, `transformers==4.57.3`)
+
+VeOmni keeps split expert tensors in patched modeling:
+- `gate_proj` `[E, I, H]`
+- `up_proj` `[E, I, H]`
+- `down_proj` `[E, H, I]`
 
 This differs from native Transformers v5 `gate_up_proj` layout.
 
@@ -99,23 +101,76 @@ Checkpoint loading behavior:
 To avoid loading/mapping issues, merge weights offline before training:
 - `scripts/moe_ckpt_merge/moe_merge.py`
 
+### Transformers v5 (`transformers>=5.0.0`)
+
+VeOmni v5 patchgen modeling uses the native v5 fused expert layout:
+- `gate_up_proj` `[E, 2*I, H]`
+- `down_proj` `[E, H, I]`
+
+See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the patchgen config.
+
+#### Loading (HF safetensors -> v5 modeling)
+
+A runtime `CheckpointTensorConverter` (`veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`)
+is registered on model classes when `transformers>=5.0.0`. It converts per-expert HF keys at load time:
+
+```
+HF per-expert:                             v5 fused:
+  experts.{j}.gate_proj.weight [I, H]   ->   experts.gate_up_proj [E, 2*I, H]
+  experts.{j}.up_proj.weight   [I, H]   ->     (merged via torch.cat)
+  experts.{j}.down_proj.weight [H, I]   ->   experts.down_proj    [E, H, I]
+```
+
+This eliminates the need for offline `moe_merge.py` preprocessing.
+
+#### Saving (v5 modeling -> checkpoint)
+
+Training saves the model state dict as-is, producing v5 fused format:
+
+```
+model.layers.{i}.mlp.experts.gate_up_proj  [E, 2*I, H]
+model.layers.{i}.mlp.experts.down_proj     [E, H, I]
+```
+
+This format can be loaded directly by v5 VeOmni (the converter's regex does not match
+`gate_up_proj` keys so they pass through without conversion). However, it is **not**
+compatible with v4 VeOmni, standard HF `from_pretrained()`, or inference engines
+(vLLM/SGLang) which expect per-expert keys.
+
+#### Offline reverse conversion (v5 fused -> per-expert HF)
+
+To convert a v5-format checkpoint back to the standard HF per-expert format:
+
+```bash
+python scripts/moe_ckpt_merge/moe_split.py \
+    --merge_hf_path <v5_checkpoint> \
+    --split_hf_path <output_dir>
+```
+
+The script auto-detects the input format (v5 `gate_up_proj` or v4 separate `gate_proj`/`up_proj`)
+and splits back to per-expert keys. The output is compatible with:
+- v4 VeOmni (after running `moe_merge.py` if needed)
+- v5 VeOmni (runtime converter handles per-expert keys)
+- HuggingFace `from_pretrained()`
+- Inference engines (vLLM, SGLang)
+
 ## VeOmni Fused MoE Op Interface
 
 VeOmni fused MoE entrypoint:
 - `veomni.ops.fused_moe.fused_moe_forward(...)`
 
-Current signature:
+Current signature supports both split and fused gate/up weights:
 
 ```python
 fused_moe_forward(
-    module: torch.nn.Module,
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
-    fc2_weight: torch.Tensor,
+    fc1_1_weight: torch.Tensor,       # gate [E, I, H], or None if fc1_1_2_weight is provided
+    fc1_2_weight: torch.Tensor,       # up   [E, I, H], or None if fc1_1_2_weight is provided
+    fc2_weight: torch.Tensor,         # down [E, H, I]
+    fc1_1_2_weight: torch.Tensor,     # fused gate_up [E, 2*I, H], optional
 )
 ```
 
@@ -125,23 +180,13 @@ Expected tensor interface:
 - `selected_experts`: router top-k expert indices, shape `[num_tokens, top_k]`;
 - `fc1_1_weight` (gate): shape `[num_experts, intermediate_dim, hidden_dim]`;
 - `fc1_2_weight` (up): shape `[num_experts, intermediate_dim, hidden_dim]`;
-- `fc2_weight` (down): shape `[num_experts, hidden_dim, intermediate_dim]`.
+- `fc2_weight` (down): shape `[num_experts, hidden_dim, intermediate_dim]`;
+- `fc1_1_2_weight` (fused gate_up): shape `[num_experts, 2 * intermediate_dim, hidden_dim]`, used by v5 path.
 
-Important constraints:
-- op expects split gate/up tensors (`fc1_1_weight` and `fc1_2_weight`), not a merged `gate_up_proj` tensor;
-- needs to be `.contiguous()`.
+## Weight Format Compatibility Matrix
 
-## Future Work: Align with Transformers v5 Weight Formatting
-
-To reduce integration friction and runtime overhead, we should converge toward v5-native MoE weight handling.
-
-- For models whose safetensor layout is already close to Transformers v5 (for example, `qwen3_5_moe`), add fused-op support for v5-native MoE tensors directly.
-  This avoids extra offline remapping and avoids runtime reshape/copy steps such as `.contiguous()` in expert forward paths.
-
-- For models with layout mismatch (for example, `qwen3_moe`), we still need to choose one stable strategy:
-  1. Offline remap to v5 format before training.
-  2. Runtime remap during model loading.
-
-  - Tradeoffs:
-    1. Offline remap: lower runtime complexity and more predictable execution, but adds preprocessing burden and user error risk.
-    2. Runtime remap: less user preprocessing and easier onboarding, but adds loader complexity and may introduce runtime variability.
+| Checkpoint Format | v4 VeOmni Load | v5 VeOmni Load | HF `from_pretrained()` | vLLM/SGLang |
+|---|---|---|---|---|
+| HF per-expert (original) | needs `moe_merge.py` | runtime converter | direct | direct |
+| v4 merged (gate/up/down separate) | direct | needs re-merge with v5 format | needs `moe_split.py` | needs `moe_split.py` |
+| v5 fused (gate_up_proj) | incompatible | direct | needs `moe_split.py` | needs `moe_split.py` |

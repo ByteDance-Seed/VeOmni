@@ -1,14 +1,23 @@
 """
 Reverse process of moe_merge.py - splits merged MoE expert weights back to individual experts.
 
-This script takes a HF checkpoint that has been processed by moe_merge.py (where expert weights
-are stacked into single tensors) and splits them back to the original format with individual
-expert weights.
+This script takes a HF checkpoint with stacked/fused expert weights and splits them back to
+the original per-expert format expected by HuggingFace safetensors.
 
-The process reverses the merging by:
-1. Loading stacked tensors like model.layers.{i}.mlp.experts.gate_proj
-2. Unstacking them back to individual experts model.layers.{i}.mlp.experts.{j}.gate_proj.weight
-3. Handling all three projection types: gate_proj, up_proj, down_proj
+Supported input formats:
+  - v4 veomni format (from moe_merge.py):
+      model.layers.{i}.mlp.experts.gate_proj  [E, I, H]
+      model.layers.{i}.mlp.experts.up_proj    [E, I, H]
+      model.layers.{i}.mlp.experts.down_proj  [E, H, I]
+
+  - v5 fused format (from training with transformers v5 patchgen modeling):
+      model.layers.{i}.mlp.experts.gate_up_proj  [E, 2*I, H]
+      model.layers.{i}.mlp.experts.down_proj     [E, H, I]
+
+Output format (original HF per-expert):
+    model.layers.{i}.mlp.experts.{j}.gate_proj.weight  [I, H]
+    model.layers.{i}.mlp.experts.{j}.up_proj.weight    [I, H]
+    model.layers.{i}.mlp.experts.{j}.down_proj.weight  [H, I]
 
 Usage: python moe_split.py --merge_hf_path <merged_checkpoint> --split_hf_path <output_dir>
 """
@@ -62,13 +71,32 @@ def main(merge_hf_path, split_hf_path):
     num_hidden_layers = config.num_hidden_layers
     for i in range(num_hidden_layers):
         print(f"Converting layer {i}")
-        for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+
+        # Handle v5 fused gate_up_proj [E, 2*I, H] -> gate_proj + up_proj per expert
+        gate_up_key = f"model.layers.{i}.mlp.experts.gate_up_proj"
+        if gate_up_key in new_state_dict:
+            gate_up_tensor = new_state_dict.pop(gate_up_key)  # [E, 2*I, H]
+            for j in range(num_experts):
+                gate, up = gate_up_tensor[j].chunk(2, dim=0)  # each [I, H]
+                new_state_dict[f"model.layers.{i}.mlp.experts.{j}.gate_proj.weight"] = gate
+                new_state_dict[f"model.layers.{i}.mlp.experts.{j}.up_proj.weight"] = up
+
+        # Handle v4 separate gate_proj [E, I, H] and up_proj [E, I, H] per expert
+        for proj_name in ["gate_proj", "up_proj"]:
             stacked_key = f"model.layers.{i}.mlp.experts.{proj_name}"
             if stacked_key in new_state_dict:
                 stacked_tensor = new_state_dict.pop(stacked_key)
                 for j in range(num_experts):
                     expert_key = f"model.layers.{i}.mlp.experts.{j}.{proj_name}.weight"
                     new_state_dict[expert_key] = stacked_tensor[j]
+
+        # Handle down_proj [E, H, I] (same key name in both v4 and v5)
+        down_key = f"model.layers.{i}.mlp.experts.down_proj"
+        if down_key in new_state_dict:
+            stacked_tensor = new_state_dict.pop(down_key)
+            for j in range(num_experts):
+                expert_key = f"model.layers.{i}.mlp.experts.{j}.down_proj.weight"
+                new_state_dict[expert_key] = stacked_tensor[j]
 
     model_assets = [config, tokenizer]
 
