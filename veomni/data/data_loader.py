@@ -71,7 +71,7 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
-    dyn_bsz_run_in: Literal["main", "worker"] = "worker",
+    dyn_bsz_runtime: Literal["main", "worker"] = "worker",
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
@@ -89,14 +89,14 @@ def build_native_dataloader(
     """Build the native training dataloader.
 
     Args:
-        dyn_bsz_run_in: Which process dynamic batching runs in. ``"main"`` keeps the
+        dyn_bsz_runtime: Which process dynamic batching runs in. ``"main"`` keeps the
             legacy main-process ``DynamicBatchSizeDataLoader`` path, while ``"worker"``
             batches inside each DataLoader worker via ``DynamicBatchingSizeDataset`` so
             worker state can participate in ``StatefulDataLoader`` checkpoint/resume.
 
             Data format by stage when ``dyn_bsz=True``:
 
-            ``dyn_bsz_run_in="main"``
+            ``dyn_bsz_runtime="main"``
 
                 dataset
                   │  yields: ``list[dict]``
@@ -114,7 +114,7 @@ def build_native_dataloader(
                      (outer list = micro batches in one optimizer step,
                       inner list = samples in one micro batch)
 
-            ``dyn_bsz_run_in="worker"``
+            ``dyn_bsz_runtime="worker"``
 
                 dataset
                   │  yields: ``list[dict]``
@@ -164,7 +164,7 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        if dyn_bsz_run_in == "main":
+        if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,
                 buffer_size=dyn_bsz_buffer_size,
@@ -219,7 +219,7 @@ def build_native_dataloader(
         multiprocessing_context=multiprocessing_context,
     )
 
-    if dyn_bsz and dyn_bsz_run_in == "main":
+    if dyn_bsz and dyn_bsz_runtime == "main":
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
             batching_strategy=batching_strategy,

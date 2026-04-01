@@ -365,7 +365,7 @@ class TrainingArguments:
         default=200,
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
     )
-    dyn_bsz_run_in: Literal["main", "worker"] = field(
+    dyn_bsz_runtime: Literal["main", "worker"] = field(
         default="worker",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
@@ -521,7 +521,7 @@ class TrainingArguments:
 
         # dataloader batch size
         if self.dyn_bsz:
-            if self.dyn_bsz_run_in == "main":
+            if self.dyn_bsz_runtime == "main":
                 self.dataloader_batch_size = 1
             else:
                 self.dataloader_batch_size = self.global_batch_size // acc.dp_size // self.micro_batch_size

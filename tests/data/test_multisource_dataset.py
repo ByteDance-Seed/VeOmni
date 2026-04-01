@@ -181,7 +181,7 @@ class TrainerTest(BaseTrainer):
             max_seq_len=args.data.max_seq_len,
             train_steps=args.train_steps,
             dyn_bsz=args.train.dyn_bsz,
-            dyn_bsz_run_in=args.train.dyn_bsz_run_in,
+            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             dyn_bsz_buffer_size=1,
             dyn_bsz_dataset_save_by_idx=False,
@@ -842,7 +842,7 @@ def build_command():
         "--train.checkpoint.manager=dcp",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
-        "--train.dyn_bsz_run_in=worker",
+        "--train.dyn_bsz_runtime=worker",
         "--train.bsz_warmup_ratio=0",
         "--train.max_steps=6",
     ]
