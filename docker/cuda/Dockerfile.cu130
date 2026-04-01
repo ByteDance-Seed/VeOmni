@@ -57,6 +57,6 @@ ENV UV_CACHE_DIR=/home/tiger/.cache/uv
 # uv sync
 WORKDIR /app
 COPY . ./
-RUN uv sync --locked --all-packages --extra gpu --dev
+# RUN uv sync --locked --all-packages --extra gpu --dev
 
 USER root
