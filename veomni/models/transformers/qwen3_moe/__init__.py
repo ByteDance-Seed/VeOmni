@@ -18,11 +18,18 @@ from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 @MODELING_REGISTRY.register("qwen3_moe")
 def register_qwen3_moe_modeling(architecture: str):
     if is_transformers_version_greater_or_equal_to("5.0.0"):
+        # Register runtime checkpoint tensor converter for v5+ only.
+        # For transformers < v5, users should continue using the offline
+        # merge script to produce pre-fused expert weights.
+        from .checkpoint_tensor_converter import create_qwen3_moe_checkpoint_tensor_converter
         from .generated.patched_modeling_qwen3_moe_gpu import (
             Qwen3MoeForCausalLM,
             Qwen3MoeForQuestionAnswering,
             Qwen3MoeModel,
         )
+
+        for model_cls in (Qwen3MoeForCausalLM, Qwen3MoeForQuestionAnswering, Qwen3MoeModel):
+            model_cls._create_checkpoint_tensor_converter = staticmethod(create_qwen3_moe_checkpoint_tensor_converter)
     else:
         from transformers import (
             Qwen3MoeForCausalLM,
