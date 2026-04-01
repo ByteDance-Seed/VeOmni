@@ -261,6 +261,8 @@ _TEST_CASES_TRANSFORMERS_V5 = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen2_vl",
+    ),
+    pytest.param(
         "./tests/toy_config/qwen2_toy/config.json",
         False,
         _DEFAULT_RTOL,
