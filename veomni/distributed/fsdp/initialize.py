@@ -39,6 +39,7 @@ def parallel_load_safetensors(
     filepath: str,
     specific_param_name: list[str] = None,
     ignore_param_name: list[str] = None,
+    cpu_load_param_name: list[str] = None,
 ):
     assert not (specific_param_name is not None and ignore_param_name is not None)
 
@@ -47,6 +48,7 @@ def parallel_load_safetensors(
     dist.barrier()
 
     safetensors2param = {}
+    cpu_load_param_files = {}
     index_file = os.path.join(filepath, "model.safetensors.index.json")
     if os.path.exists(index_file):
         index = json.load(open(index_file, "rb"))
@@ -56,6 +58,10 @@ def parallel_load_safetensors(
                     continue
             elif ignore_param_name is not None:
                 if param_name in ignore_param_name:
+                    continue
+            if cpu_load_param_name is not None:
+                if param_name in cpu_load_param_name:
+                    cpu_load_param_files[param_name] = filename
                     continue
 
             safetensors2param.setdefault(filename, []).append(param_name)
@@ -80,14 +86,32 @@ def parallel_load_safetensors(
         if rank == dist.get_rank():
             for file in files:
                 safetensors_file = os.path.join(filepath, file)
-                states = load_file(safetensors_file, device=device)
-                valid_states = {k: v for k, v in states.items() if k in safetensors2param[file]}
+                if file not in cpu_load_param_files.values():
+                    states = load_file(safetensors_file, device=device)
+                    valid_states = {k: v for k, v in states.items() if k in safetensors2param[file]}
+                else:
+                    # load all params in the file containing large params (cpu_load_param_name) to cpu
+                    states = load_file(safetensors_file, device="cpu")
+                    # move the params except large params (cpu_load_param_name) to device (e.g. cuda)
+                    valid_states = {k: v.to(device) for k, v in states.items() if k in safetensors2param[file]}
                 shard_states.update(valid_states)
                 del states
         else:
             for file in files:
                 for param_name in safetensors2param[file]:
                     shard_states[param_name] = rank
+
+        for param_name, filename in cpu_load_param_files.items():
+            if dist.get_rank() == 0:
+                # rank0: load large params to shard_states
+                safetensors_file = os.path.join(filepath, filename)
+                states = load_file(safetensors_file, device="cpu")
+                valid_states = {k: v for k, v in states.items() if k == param_name}
+                shard_states.update(valid_states)
+                del states
+            else:
+                # other ranks: receive chunk of large params from rank0
+                shard_states[param_name] = 0
 
     return shard_states
 

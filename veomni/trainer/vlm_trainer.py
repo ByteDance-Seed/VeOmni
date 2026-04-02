@@ -34,6 +34,21 @@ logger = helper.create_logger(__name__)
 MAX_PIXELS = 768 * 28 * 28
 
 
+def _get_vlm_visual_module(model):
+    # Qwen-VL wrappers are not consistent across transformers versions:
+    # older releases may expose `visual` directly on the conditional model
+    # for backward compatibility, while newer ones only keep `model.visual`.
+    visual = getattr(model, "visual", None)
+    if visual is not None:
+        return visual
+
+    inner_model = getattr(model, "model", None)
+    if inner_model is not None:
+        return getattr(inner_model, "visual", None)
+
+    return None
+
+
 @dataclass
 class VLMTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(
@@ -142,7 +157,12 @@ class VLMTrainer:
                 self.base.model.thinker.visual.requires_grad_(False)
                 self.base.model.thinker.visual.merger.requires_grad_(True)
             else:
-                self.base.model.visual.requires_grad_(False)
+                # Resolve both paths so freeze_vit works for the transformers v4-style Back Compatible alias
+                # and the nested layout used by the v5-style Qwen3.5 models.
+                visual = _get_vlm_visual_module(self.base.model)
+                if visual is None:
+                    raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")
+                visual.requires_grad_(False)
 
         if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.model.thinker.audio_tower.requires_grad_(False)

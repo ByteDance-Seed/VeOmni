@@ -118,10 +118,14 @@ jobs:
         run: |
           uv run  --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
+      - name: Run e2e dcp save and load test [transformers-v5]
+        run: |
+          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run utils tests [transformers-v5]
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |

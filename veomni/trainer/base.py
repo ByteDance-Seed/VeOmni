@@ -310,6 +310,16 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
+    def _get_basic_modules(self, model, arg_basic_modules):
+        if hasattr(model, "vision_encoder") and hasattr(model, "language_model"):
+            return list(
+                set(getattr(model.vision_encoder, "_no_split_modules", None) or [])
+                | set(getattr(model.language_model, "_no_split_modules", None) or [])
+                | set(arg_basic_modules)
+            )
+        else:
+            return list(set(getattr(model, "_no_split_modules", None) or []) | set(arg_basic_modules))
+
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
 
@@ -323,9 +333,7 @@ class BaseTrainer(Stateful, ABC):
             enable_mixed_precision=args.train.enable_mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
-            basic_modules=list(
-                set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
-            ),
+            basic_modules=self._get_basic_modules(self.model, args.model.basic_modules),
             enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,

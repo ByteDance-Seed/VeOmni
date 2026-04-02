@@ -34,6 +34,7 @@ usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
 usage/checkpoint_conversion.md
 usage/trainer.md
+usage/agent_workflow.md
 ```
 
 ```{toctree}

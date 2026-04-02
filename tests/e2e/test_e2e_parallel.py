@@ -44,11 +44,15 @@ def main(
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
-    # Qwen3_5Moe uses stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I])
-    # which is also the native HF safetensor format for this model. HF's save_pretrained() with
-    # save_original_format=True calls revert_weight_conversion() that splits them into per-expert
-    # keys (experts.*.gate_proj.weight, etc.), but VeOmni's load_model_weights doesn't apply the
-    # reverse merge. Disable save_original_format for qwen3_5_moe to save in native stacked format.
+    # Models with stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I]):
+    #
+    # - qwen3_5_moe: native HF safetensor format is already stacked. HF's save_pretrained() with
+    #   save_original_format=True calls revert_weight_conversion() that splits them into per-expert
+    #   keys (experts.*.gate_proj.weight, etc.), but VeOmni has no runtime converter for this model.
+    #   Disable save_original_format to save in native stacked format.
+    #
+    # - qwen3_moe (v5): VeOmni registers a runtime CheckpointTensorConverter that merges per-expert
+    #   HF keys back to fused format at load time, so save_original_format=True works correctly.
     save_original_format = model_name != "qwen3_5_moe"
     _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
 
@@ -97,6 +101,15 @@ text_test_cases = [
         marks=_v4_only,
     ),
     pytest.param(
+        "qwen2",
+        "./tests/toy_config/qwen2_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
+    ),
+    pytest.param(
         "qwen2.5",
         "./tests/toy_config/qwen25_toy",
         False,  # is_moe
@@ -122,6 +135,16 @@ text_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3_moe",
+        "./tests/toy_config/qwen3_moe_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
+        id="qwen3_moe_v5",
     ),
     pytest.param(
         "seed_oss",
@@ -151,6 +174,14 @@ qwen2vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen2vl",
+        "./tests/toy_config/qwen2vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v5_only,
     ),
     pytest.param(
         "qwen25vl",
