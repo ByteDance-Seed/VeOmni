@@ -9,8 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: Qwen3_5RMSNorm
-#      Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
+#    - method_override: Qwen3_5MoeRMSNorm.forward
+#      Use eager Qwen3Next-style RMSNorm (1+weight centered formulation) for NPU patchgen
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
 #      Use device-agnostic get_device_id() for FusedRMSNormGated init
 #    - method_override: Qwen3_5GatedDeltaNet._get_local_conv1d_weight
@@ -30,7 +30,7 @@
 #    - method_override: Qwen3_5VisionModel.dummy_forward
 #      Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.
 #    - method_override: Qwen3_5Model.forward
-#      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-GPU sync avoidance via pre-computed metadata.
+#      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-NPU sync avoidance via pre-computed metadata.
 #    - method_override: Qwen3_5ForConditionalGeneration.get_position_id_func
 #      Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.
 #    - method_override: Qwen3_5ForConditionalGeneration.forward
@@ -63,22 +63,18 @@ from transformers.utils.output_capturing import capture_outputs
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 
 # Additional import blocks for patches
-# Modification: We are not using https://github.com/Dao-AILab/causal-conv1d now
-# we are using the triton impl of causal_conv1d from fla.
-# TODO: Evaluate Tridao's impl in the future.
-try:
-    from fla.modules import FusedRMSNormGated
-    from fla.modules.convolution import causal_conv1d as causal_conv1d_fn
-    from fla.modules.convolution import causal_conv1d_update
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-except ImportError:
-    chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
-    FusedRMSNormGated = None
-    causal_conv1d_update, causal_conv1d_fn = None, None
-    logging.get_logger(__name__).warning(
-        "Failed to import FLA modules: fallback to eager implementation."
-        "This case can't support dynamic batching packing!"
-    )
+# ── OpSlot declarations ──────────────────────────────────────────────────
+# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+from veomni.ops.dispatch import OpSlot
+veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
+veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+
+FusedRMSNormGated = None
+fused_recurrent_gated_delta_rule = None
+causal_conv1d_update = None
+causal_conv1d_fn = None
+chunk_gated_delta_rule = None
 
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
@@ -543,9 +539,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-        self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:
@@ -642,7 +636,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv_t = mixed_qkv.transpose(1, 2)
                 conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
                 cache_params.conv_states[self.layer_idx] = conv_state
-            if self.causal_conv1d_fn is not None:
+            if veomni_causal_conv1d.has_kernel:
                 # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
                 if ulysses_enabled:
                     conv_weight = self._get_local_conv1d_weight(
@@ -653,14 +647,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 else:
                     conv_weight = self.conv1d.weight.squeeze(1)
                 # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
-                mixed_qkv = self.causal_conv1d_fn(
+                mixed_qkv = veomni_causal_conv1d(
                     x=mixed_qkv,
                     weight=conv_weight,
                     bias=self.conv1d.bias,
                     activation=self.activation,
                     seq_idx=None,
                     backend="triton",
-                    cu_seqlens=cu_seq_lens_q,
+                    cu_seqlens=cu_seq_lens_q.npu(),
                 )[0]
             else:
                 raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
@@ -694,14 +688,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
-                raise RuntimeError(
-                    "Varlen training requires FLA. Install flash-linear-attention so "
-                    "chunk_gated_delta_rule supports cu_seqlens."
-                )
-            else:
+            if veomni_chunk_gated_delta_rule.has_kernel:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                core_attn_out, last_recurrent_state = veomni_chunk_gated_delta_rule(
                     query,
                     key,
                     value,
@@ -710,7 +699,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     initial_state=None,
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=cu_seq_lens_q,
+                    cu_seqlens=cu_seq_lens_q.npu(),
+                )
+            else:
+                raise RuntimeError(
+                    "Varlen training requires FLA. Install flash-linear-attention so "
+                    "chunk_gated_delta_rule supports cu_seqlens."
                 )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
@@ -944,14 +938,25 @@ class Qwen3_5MLP(nn.Module):
         return down_proj
 
 
-# ======================================================================
-# [PATCHED CLASS] Qwen3_5RMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
-# Source: liger_kernel.transformers.rms_norm
-# ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNormForQwen3Next
-from liger_kernel.transformers.rms_norm import LigerRMSNormForQwen3Next as Qwen3_5RMSNorm
+
+class Qwen3_5RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float())
+        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
 # ======================================================================
@@ -991,7 +996,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
         assert cu_seq_lens_q is not None, (
             "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
-            "and to remove the full Flash Attention CPU-GPU sync."
+            "and to remove the full Flash Attention CPU-NPU sync."
         )
 
         # Token Mixer
@@ -1931,7 +1936,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
-            # sequence parallel patch for image_mask
+            # sequence parallel patch for image_mask & deepstack_image_embeds
             if get_parallel_state().sp_enabled:
                 seq_len = image_mask.shape[1]
 
@@ -1975,7 +1980,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-            # sequence parallel patch for video_mask
+            # sequence parallel patch for video_mask & deepstack_video_embeds
             if get_parallel_state().sp_enabled:
                 seq_len = video_mask.shape[1]
 
