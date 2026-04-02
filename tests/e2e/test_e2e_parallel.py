@@ -5,11 +5,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
+
+from .utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 
 
 # See
