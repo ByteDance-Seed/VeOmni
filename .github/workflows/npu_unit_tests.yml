@@ -87,7 +87,7 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra npu --extra audio --group dev
+          uv sync --python 3.11 --frozen --extra npu --extra audio --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -123,10 +123,10 @@ jobs:
           uv run --frozen pytest -s -x tests/ops/test_comp.py
       - name: Sync dependencies [transformers-v5]
         run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
+          uv sync --python 3.11 --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
       - name: Run models tests [transformers-v5]
         run: |
-          uv run  --frozen pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
