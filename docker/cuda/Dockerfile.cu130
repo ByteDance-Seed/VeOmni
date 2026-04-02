@@ -54,14 +54,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /bin/
 ENV PATH="/bin/:$PATH"
 ENV UV_CACHE_DIR=/home/tiger/.cache/uv
 
-WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/home/tiger/.cache/uv,uid=1000,gid=1000 \
-    uv sync --locked --no-install-project --extra gpu --extra audio --dev
-
-# Copy full source and install the project itself
-COPY . ./
-RUN --mount=type=cache,target=/home/tiger/.cache/uv,uid=1000,gid=1000 \
-    uv sync --locked --extra gpu --extra audio --dev
+# Pre-populate uv download cache so that subsequent `uv sync` in any directory
+# can reuse it without re-downloading packages.
+COPY pyproject.toml uv.lock /tmp/uv-warmup/
+RUN cd /tmp/uv-warmup && \
+    uv sync --locked --no-install-project --extra gpu --extra audio --dev && \
+    rm -rf /tmp/uv-warmup
 
 USER root
