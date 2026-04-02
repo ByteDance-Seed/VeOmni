@@ -1,8 +1,7 @@
-"""Distributed test utilities for VeOmni.
+"""Shared training utilities for distributed and e2e tests.
 
-Provides helpers for setting up distributed training environments,
-building models with toy configs, running torchrun training, and
-comparing training metrics across different parallelism configurations.
+Provides helpers for building torchrun commands, materializing model weights,
+running training configurations, and comparing results.
 """
 
 import gc
@@ -12,20 +11,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from ..tools import compare_metrics, find_free_port, print_comparison_table
-
-
-# Re-export for consumers
-__all__ = [
-    "ParallelConfig",
-    "build_torchrun_cmd",
-    "compare_metrics",
-    "find_free_port",
-    "materialize_weights",
-    "print_comparison_table",
-    "release_device_memory",
-    "run_training_config",
-]
+from .launch_utils import find_free_port
 
 
 def release_device_memory():

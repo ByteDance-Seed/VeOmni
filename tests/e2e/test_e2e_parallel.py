@@ -10,7 +10,8 @@ from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
-from .utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
+from ..tools import DummyDataset, compare_metrics, print_comparison_table
+from .utils import prepare_exec_cmd
 
 
 # See
@@ -82,8 +83,8 @@ def main(
         res[task_name] = output
 
     for key in log_keys:
-        print_all_values(res, key, model_type=model_name)
-    compare_multi_items(model_name, res, rtol=rtol, atol=atol)
+        print_comparison_table(res, key, title=model_name)
+    compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
 

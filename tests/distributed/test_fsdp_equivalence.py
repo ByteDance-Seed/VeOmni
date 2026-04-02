@@ -31,7 +31,7 @@ import pytest
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-from .distributed_test_helpers import ParallelConfig
+from ..tools import ParallelConfig
 
 
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
@@ -41,13 +41,12 @@ _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transfor
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
-_TEXT_TRAIN_SCRIPT = "tests/e2e/train_text_test.py"
+_TEXT_TRAIN_SCRIPT = "tests/train_scripts/train_text_test.py"
 
 
 def _setup_model_and_data(model_name, config_path, dataset_type="text"):
     """Materialize model weights and create dummy dataset."""
-    from ..tools import DummyDataset
-    from .distributed_test_helpers import materialize_weights
+    from ..tools import DummyDataset, materialize_weights
 
     test_dir = f"./_test_fsdp_equiv_{model_name}"
     os.makedirs(test_dir, exist_ok=True)
@@ -69,7 +68,7 @@ def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
     baseline with no FSDP wrapping, no sequence parallelism, and no expert
     parallelism.
     """
-    from .distributed_test_helpers import run_training_config
+    from ..tools import run_training_config
 
     return run_training_config(
         script=_TEXT_TRAIN_SCRIPT,
@@ -97,7 +96,7 @@ def _get_nproc():
 
 def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=None):
     """Run FSDP2 distributed training and return metrics."""
-    from .distributed_test_helpers import run_training_config
+    from ..tools import run_training_config
 
     if nproc is None:
         nproc = _get_nproc()
@@ -135,7 +134,7 @@ def _run_fsdp_equivalence(
     covers that rank's micro-batches (with fsdp_size scaling), while the
     single-GPU run covers all micro-batches (with fsdp_size=1).
     """
-    from .distributed_test_helpers import compare_metrics, print_comparison_table
+    from ..tools import compare_metrics, print_comparison_table
 
     test_dir, train_path, dummy_dataset = _setup_model_and_data(model_name, config_path, dataset_type)
 
