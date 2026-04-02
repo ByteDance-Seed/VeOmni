@@ -158,7 +158,8 @@ transformers-stable = [
 # NOTE 1: Update this at least once per month as uv releases new version every week.
 # NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
 #         version and release new docker images.
-required-version = "==0.11.2"
+
+# required-version = "==0.11.2"
 no-build-isolation-package = [
     "flash-attn",
     "flash-attn-3",
