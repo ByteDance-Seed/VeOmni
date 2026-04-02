@@ -45,21 +45,21 @@ dev = [
 ]
 audio = [
   "torchcodec",
-  "av>=14.3.0",
+  "av>=15.0.0,<17.0.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 # Alias for audio extra - includes both video and audio processing dependencies
 video = [
   "torchcodec",
-  "av>=14.3.0",
+  "av>=15.0.0,<17.0.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
   "diffusers==0.36.0",
   "torchcodec",
-  "av>=14.3.0",
+  "av>=15.0.0,<17.0.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
   "ftfy",
@@ -245,11 +245,6 @@ flash-attn-3 = [
 # Pinned to 03/18/2026 latest main commit.
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 
-# Download av wheel directly to avoid FFmpeg build dependency issues in CI.
-# Pinned to cp311 wheel for Python 3.11; other Python versions resolve from PyPI (newer av has wheels).
-av = [
-  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" },
-]
 
 [[tool.uv.index]]
 name = "pytorch"
