@@ -42,6 +42,9 @@ def test_build_dataloader_dyn_bsz_sp_filling(
     import veomni.data.data_loader as m_dl
     import veomni.data.dataset as m_ds
 
+    if dyn_bsz and dyn_bsz_runtime == "worker" and dataset_name == "mapping":
+        pytest.skip("dyn_bsz_runtime='worker' requires an IterableDataset; mapping-style datasets are not supported")
+
     ps = _fake_ps(sp_size=sp_size)
     monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
     monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)

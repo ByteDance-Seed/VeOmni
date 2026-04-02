@@ -814,6 +814,10 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 ``get_item()`` method and ``output_index_for_resume`` attribute required to
                 reconstruct the buffer from indices on resume.
         """
+        if not isinstance(dataset, IterableDataset):
+            raise TypeError(
+                f"DynamicBatchingSizeDataset does not support Mapping style datasets now, the dataset's type must be IterableDataset, got {type(dataset).__name__}"
+            )
         self.dataset = dataset
         self.dynamic_batching_collate_fn = dynamic_batching_collate_fn
         self.ready_for_micro_batch_threshold = ready_for_micro_batch_threshold

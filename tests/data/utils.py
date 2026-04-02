@@ -394,7 +394,9 @@ def compare_global_batch(global_batch_list, global_batch_resume_list):
         for micro_batch, micro_batch_resume in zip(global_batch, global_batch_resume, strict=True):
             for key in micro_batch.keys():
                 if torch.is_tensor(micro_batch[key]):
-                    assert torch.all(micro_batch[key] == micro_batch_resume[key])
+                    assert torch.all(micro_batch[key] == micro_batch_resume[key]), (
+                        f"rank {dist.get_rank()} key {key} is not equal in micro_batch and micro_batch_resume"
+                    )
 
 
 def compare_metrics(metrics, metrics_resume):

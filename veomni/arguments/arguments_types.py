@@ -366,7 +366,7 @@ class TrainingArguments:
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
     )
     dyn_bsz_runtime: Literal["main", "worker"] = field(
-        default="worker",
+        default="main",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
     enable_mixed_precision: bool = field(

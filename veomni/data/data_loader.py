@@ -71,7 +71,7 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
-    dyn_bsz_runtime: Literal["main", "worker"] = "worker",
+    dyn_bsz_runtime: Literal["main", "worker"] = "main",
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
