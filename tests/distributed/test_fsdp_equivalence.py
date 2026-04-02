@@ -27,7 +27,6 @@ import os
 import shutil
 
 import pytest
-import torch
 
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -87,9 +86,12 @@ def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
 
 def _get_nproc():
     """Return the number of available GPUs/NPUs, requiring at least 2."""
-    count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    from veomni.utils.device import get_torch_device
+
+    torch_device = get_torch_device()
+    count = torch_device.device_count() if torch_device.is_available() else 0
     if count < 2:
-        pytest.skip(f"Requires at least 2 GPUs, found {count}")
+        pytest.skip(f"Requires at least 2 devices, found {count}")
     return count
 
 
