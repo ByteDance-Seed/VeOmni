@@ -1,25 +1,15 @@
-"""Asymmetric multimodal forward tests for VLM/omni models under FSDP2.
+"""Asymmetric multimodal forward tests under FSDP2.
 
 Validates that forward + backward complete without NCCL hangs when some ranks
 have multimodal data (images/audio/video) while other ranks have text-only data.
-
-This is a critical production scenario: in distributed training with data
-parallelism, some ranks may receive text-only batches while others receive
-multimodal batches. The model's internal dummy_forward() must fire on
-text-only ranks so that all ranks participate in FSDP reduce-scatter
-collectives and no rank is left waiting.
-
-Each test:
-1. Builds a toy VLM/omni model from config
-2. Wraps encoder modules (those with dummy_forward) and root model with FSDP2
-3. Rank 0 receives a multimodal batch; rank 1 receives a text-only batch
-4. Runs forward + backward
-5. Asserts no hang, loss is finite, and gradients are finite
+The model's dummy_forward() must fire on text-only ranks so that all ranks
+participate in FSDP collectives.
 
 Requires: 2+ GPUs.
 """
 
 import gc
+import os
 from functools import partial
 
 import pytest
@@ -43,12 +33,7 @@ _VOCAB_SIZE = 1024
 
 
 def _vlm_batch(*, rank, device, dtype, patch_size):
-    """Build VLM batch: rank 0 gets images + video, other ranks get text-only.
-
-    All batches include image_mask / video_mask (all-False for text-only) so
-    that models relying on pre-computed masks (e.g. Qwen3-VL) don't need to
-    fall back to computing them from input_ids.
-    """
+    """Build VLM batch: rank 0 gets images + video, other ranks get text-only."""
     h, w = 4, 4
     image_t, video_t = 2, 10
     merge_size, temporal_patch_size = 2, 2
@@ -88,11 +73,7 @@ def _vlm_batch(*, rank, device, dtype, patch_size):
 
 
 def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
-    """Build omni batch: rank 0 gets images + audio + video, others get text-only.
-
-    Always includes image_mask / video_mask / audio_mask since Qwen3-Omni-MoE
-    asserts their presence in kwargs unconditionally.
-    """
+    """Build omni batch: rank 0 gets images + audio + video, others get text-only."""
     h, w = 4, 4
     image_t, video_t = 2, 10
     merge_size, temporal_patch_size = 2, 2
@@ -155,20 +136,17 @@ def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
 
 
 def _asymmetric_forward_worker(model_type, config_path, batch_fn):
-    """Test forward + backward with asymmetric multimodal data under FSDP2.
-
-    Rank 0 receives a multimodal batch (images, audio, video), while rank 1
-    receives a text-only batch.  The model's internal logic should call
-    dummy_forward() on rank 1, keeping FSDP collectives in sync.
-    """
-    from torch.distributed._composable.fsdp import fully_shard
-
+    """Rank 0 gets multimodal data, other ranks get text-only. Verifies no NCCL hang."""
     from veomni import _apply_patches
-    from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import init_parallel_state
+    from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.auto import build_foundation_model
     from veomni.utils.device import get_device_type
 
     _apply_patches()
+
+    # Tight NCCL timeout so a missing dummy_forward fails fast instead of hanging
+    os.environ["NCCL_TIMEOUT"] = "120"
 
     world_size = dist.get_world_size()
     init_parallel_state(dp_size=world_size, dp_shard_size=world_size, dp_mode="fsdp2")
@@ -176,52 +154,40 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     rank = dist.get_rank()
     device = torch.device(f"{get_device_type()}:{rank}")
 
-    # Build model on real device
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
         attn_implementation="eager",
         moe_implementation="eager",
-        init_device=get_device_type(),
+        init_device="meta",
     )
-    model = model.to(device=device, dtype=torch.float32)
     model.train()
 
-    # Wrap encoder modules (those with dummy_forward) as separate FSDP units
-    # so their reduce-scatter happens independently -- this is the scenario
-    # where a missing dummy_forward would cause a hang.
-    fsdp_mesh = get_parallel_state().fsdp_mesh
-    seen_ids = set()
-    for _name, module in model.named_modules():
-        if hasattr(module, "dummy_forward") and id(module) not in seen_ids:
-            fully_shard(module, mesh=fsdp_mesh)
-            seen_ids.add(id(module))
+    model = build_parallelize_model(
+        model,
+        weights_path=None,
+        init_device="meta",
+        enable_mixed_precision=True,
+        enable_gradient_checkpointing=False,
+        basic_modules=[],
+    )
 
-    # Wrap root model
-    fully_shard(model, mesh=fsdp_mesh)
+    batch = batch_fn(rank=rank, device=device, dtype=torch.bfloat16)
 
-    # Construct rank-specific batch
-    batch = batch_fn(rank=rank, device=device, dtype=torch.float32)
-
-    # Forward
     output = model(**batch)
     loss = output.loss
     assert loss is not None, f"[Rank {rank}] Loss is None for {model_type}"
     assert torch.isfinite(loss), f"[Rank {rank}] Loss is not finite: {loss.item()}"
 
-    # Backward -- triggers reduce-scatter on all FSDP units
     loss.backward()
 
-    # Verify gradients are finite (no NaN/Inf from dummy_forward interaction)
     for name, param in model.named_parameters():
         if param.grad is not None:
             assert torch.isfinite(param.grad).all(), f"[Rank {rank}] Non-finite gradient in {name}"
 
-    # Barrier confirms no rank is stuck
     dist.barrier()
 
-    # Clean up
     del model
     gc.collect()
     empty_cache()

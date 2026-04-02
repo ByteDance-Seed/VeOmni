@@ -27,6 +27,7 @@ import os
 import shutil
 
 import pytest
+import torch
 
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -84,9 +85,20 @@ def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
     )
 
 
-def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=2):
+def _get_nproc():
+    """Return the number of available GPUs/NPUs, requiring at least 2."""
+    count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if count < 2:
+        pytest.skip(f"Requires at least 2 GPUs, found {count}")
+    return count
+
+
+def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=None):
     """Run FSDP2 distributed training and return metrics."""
     from .distributed_test_helpers import run_training_config
+
+    if nproc is None:
+        nproc = _get_nproc()
 
     config = ParallelConfig(sp_size=1, ep_size=1, fsdp_mode="fsdp2")
     return run_training_config(
@@ -134,13 +146,12 @@ def _run_fsdp_equivalence(
             output_dir=test_dir,
         )
 
-        # 2. Run FSDP2 with 2 GPUs
+        # 2. Run FSDP2 with all available GPUs
         fsdp2_results = _run_fsdp2_training(
             config_path=config_path,
             model_path=test_dir,
             train_path=train_path,
             output_dir=test_dir,
-            nproc=2,
         )
 
         # 3. Compare grad_norm (primary correctness signal)
