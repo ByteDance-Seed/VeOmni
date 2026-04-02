@@ -374,6 +374,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Enable mixed precision training."},
     )
+    mixed_precision_cast_forward_inputs: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision cast forward inputs."},
+    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
         metadata={

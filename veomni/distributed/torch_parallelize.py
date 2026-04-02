@@ -285,6 +285,7 @@ def parallelize_model_fsdp2(
     weights_path: Optional[str] = None,
     enable_reshard_after_forward: bool = True,
     enable_mixed_precision: bool = True,
+    mixed_precision_cast_forward_inputs: bool = True,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
 ) -> "nn.Module":
@@ -410,6 +411,7 @@ def parallelize_model_fsdp2(
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
+            cast_forward_inputs=mixed_precision_cast_forward_inputs,
         )
         fsdp_kwargs["mp_policy"] = mp_policy
 
@@ -572,6 +574,7 @@ def build_parallelize_model(
     use_orig_params: bool = True,
     enable_reshard_after_forward: bool = True,
     enable_mixed_precision: bool = True,
+    mixed_precision_cast_forward_inputs: bool = True,
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
@@ -620,6 +623,7 @@ def build_parallelize_model(
                 enable_reshard_after_forward=enable_reshard_after_forward,
                 enable_mixed_precision=enable_mixed_precision,
                 basic_modules=basic_modules,
+                mixed_precision_cast_forward_inputs=mixed_precision_cast_forward_inputs,
                 **kwargs,
             )
         elif parallel_state.dp_mode == "fsdp1":
