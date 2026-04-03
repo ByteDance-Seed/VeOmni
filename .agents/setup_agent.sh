@@ -9,7 +9,34 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_DIR="${REPO_ROOT}/.${AGENT_NAME}"
 
 if [[ -d "$TARGET_DIR" ]]; then
-    echo "Directory .${AGENT_NAME}/ already exists — skipping."
+    ERRORS=()
+    for resource in skills knowledge; do
+        link="$TARGET_DIR/$resource"
+        expected="../.agents/$resource"
+        if [[ ! -e "$link" && ! -L "$link" ]]; then
+            ERRORS+=("  - $resource: missing. Expected symlink to $expected")
+        elif [[ ! -L "$link" ]]; then
+            ERRORS+=("  - $resource: is a regular file/directory, not a symlink. Expected symlink to $expected")
+        elif [[ "$(readlink "$link")" != "$expected" ]]; then
+            ERRORS+=("  - $resource: symlink points to '$(readlink "$link")' instead of '$expected'")
+        elif [[ ! -e "$link" ]]; then
+            ERRORS+=("  - $resource: dangling symlink (target $expected does not exist)")
+        fi
+    done
+
+    if [[ ${#ERRORS[@]} -gt 0 ]]; then
+        echo "ERROR: .${AGENT_NAME}/ exists but has broken resource links:" >&2
+        printf '%s\n' "${ERRORS[@]}" >&2
+        echo "" >&2
+        echo "To fix, try one of:" >&2
+        echo "  1. Remove the directory and re-run:  rm -rf .${AGENT_NAME} && bash .agents/setup_agent.sh ${AGENT_NAME}" >&2
+        echo "  2. Manually recreate the symlinks:" >&2
+        echo "       ln -sf ../.agents/skills    .${AGENT_NAME}/skills" >&2
+        echo "       ln -sf ../.agents/knowledge .${AGENT_NAME}/knowledge" >&2
+        exit 1
+    fi
+
+    echo "Directory .${AGENT_NAME}/ already exists and looks healthy — skipping."
     exit 0
 fi
 
