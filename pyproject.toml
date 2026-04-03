@@ -83,16 +83,16 @@ npu = [
   "torchcodec>=0.4.0,<0.6.0"
 ]
 gpu = [
-  "torch==2.11.0+cu130",
-  "torchvision==0.26.0+cu130",
-  "torchaudio==2.11.0+cu130",
+  "torch==2.10.0+cu130",
+  "torchvision==0.25.0+cu130",
+  "torchaudio==2.10.0+cu130",
   "nvidia-cusparselt-cu13",
   "nvidia-nccl-cu13",
   "liger-kernel",
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
-  "torchcodec==0.11.0", # 0.11.0 is compatible with torch 2.11
+  "torchcodec==0.10.0", # 0.10.0 is compatible with torch 2.10
   "cuda-python==13.0.1",
   "torch-c-dlpack-ext",
   # For models with linear attention like Qwen 3.5
@@ -176,10 +176,10 @@ override-dependencies = [
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
     # PyPI without using the cu130 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
-    "torch==2.11.0+cu130; (extra == 'gpu')",
-    "torchaudio==2.11.0+cu130; (extra == 'gpu')",
-    "torchvision==0.26.0+cu130; (extra == 'gpu')",
-    "torchcodec==0.11.0; (extra == 'gpu')",
+    "torch==2.10.0+cu130; (extra == 'gpu')",
+    "torchaudio==2.10.0+cu130; (extra == 'gpu')",
+    "torchvision==0.25.0+cu130; (extra == 'gpu')",
+    "torchcodec==0.10.0; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
@@ -226,21 +226,21 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THESE TO THE CORRESPONDING WHEEL URLS.
-  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "python_version == '3.11'" },
-  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "python_version == '3.12'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.10.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.10.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "python_version == '3.12'" },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Download fa2 and fa3 wheels directly to avoid build issues.
 flash-attn = [
-  # torch 2.11+cu130
-  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.11+.
-  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3%2Bcu130torch2.11-cp311-cp311-linux_x86_64.whl", extra = "gpu", marker = "python_version == '3.11'"},
-  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3%2Bcu130torch2.11-cp312-cp312-linux_x86_64.whl", extra = "gpu", marker = "python_version == '3.12'"},
+  # torch 2.10+cu130
+  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.10+.
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp311-cp311-linux_x86_64.whl", extra = "gpu", marker = "python_version == '3.11'"},
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl", extra = "gpu", marker = "python_version == '3.12'"},
 ]
 flash-attn-3 = [
-  # torch 2.11+cu130
-  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0%2Bcu130torch2.11gite2743ab-cp39-abi3-linux_x86_64.whl", extra = "gpu"},
+  # torch 2.10+cu130
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.8.2/flash_attn_3-3.0.0%2Bcu130torch2.10gite2743ab-cp39-abi3-linux_x86_64.whl", extra = "gpu"},
 ]
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
 # Pinned to 03/18/2026 latest main commit.

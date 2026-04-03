@@ -30,7 +30,7 @@ import types
 _dcp_consolidation_patch_applied = False
 
 # Minimum torch version for this patch - update when upgrading torch
-_SUPPORTED_TORCH_VERSIONS = ("2.9", "2.10", "2.11")
+_SUPPORTED_TORCH_VERSIONS = ("2.9", "2.10")
 
 
 def apply_dcp_consolidation_patch():
@@ -78,7 +78,7 @@ def apply_dcp_consolidation_patch():
 
     # Define the replacement function logic
     # This is a modified version of torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
-    # Original: https://github.com/pytorch/pytorch/blob/v2.11.0/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
+    # Original: https://github.com/pytorch/pytorch/blob/v2.10.0/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
     # Key change: Use append mode ("ab") instead of read-write mode ("r+b") for HDFS FUSE compatibility
     def _process_output_file_impl(output_file, output_data, input_files_data):
         sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
