@@ -38,3 +38,4 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 | `veomni-new-model` | Adding a new model to VeOmni (patchgen, parallel plan, registry) |
 | `veomni-new-op` | Adding a new optimized kernel/operator to veomni/ops/ |
 | `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
+| `create-pr` | Create a pull request — handles uncommitted changes, generates CI-compliant title and description |
