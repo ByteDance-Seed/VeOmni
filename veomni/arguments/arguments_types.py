@@ -366,6 +366,10 @@ class TrainingArguments:
         default=200,
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
     )
+    dyn_bsz_runtime: Literal["main", "worker"] = field(
+        default="main",
+        metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
+    )
     enable_mixed_precision: bool = field(
         default=True,
         metadata={"help": "Enable mixed precision training."},
@@ -517,7 +521,13 @@ class TrainingArguments:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # dataloader batch size
-        self.dataloader_batch_size = 1 if self.dyn_bsz else self.global_batch_size // acc.dp_size
+        if self.dyn_bsz:
+            if self.dyn_bsz_runtime == "main":
+                self.dataloader_batch_size = 1
+            else:
+                self.dataloader_batch_size = self.global_batch_size // acc.dp_size // self.micro_batch_size
+        else:
+            self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
 
     def _resolve_checkpoint_paths(self):
         ckpt = self.checkpoint
@@ -738,6 +748,10 @@ class DataloaderConfig:
     num_workers: int = field(
         default=2,
         metadata={"help": "Number of workers to load data."},
+    )
+    worker_num_threads: Optional[int] = field(
+        default=None,
+        metadata={"help": "Per-worker torch thread count for dataloader subprocesses."},
     )
     prefetch_factor: int = field(
         default=2,
