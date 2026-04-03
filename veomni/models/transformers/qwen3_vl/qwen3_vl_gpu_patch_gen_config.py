@@ -398,7 +398,7 @@ def qwen3vl_vision_rot_pos_emb_patched(self, grid_thw: torch.Tensor) -> torch.Te
     cache = getattr(self, "_veomni_rot_pos_ids_cache", None)
     if cache is None:
         cache = {}
-        setattr(self, "_veomni_rot_pos_ids_cache", cache)
+        self._veomni_rot_pos_ids_cache = cache
 
     max_hw = int(grid_thw[:, 1:].max().item())
     freq_table = self.rotary_pos_emb(max_hw)
@@ -826,8 +826,8 @@ def qwen3vl_model_forward_patched(
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
 
-    # if None, calculate mask
-    if video_mask is None and image_mask is None:
+    # If masks are not provided, infer them. SP-enabled path gathers full seq first.
+    if image_mask is None and video_mask is None:
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
             dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
@@ -1010,6 +1010,9 @@ def qwen3vl_model_forward_patched(
         # handle (bs, 3, seq) precomputed position_ids
         if position_ids.dim() == 3 and position_ids.shape[1] == 3:
             position_ids = position_ids.transpose(0, 1).contiguous()
+
+    # if get_parallel_state().sp_enabled and not get_parallel_state().async_enabled and position_ids is not None:
+    #     position_ids = sp_pad_and_slice(position_ids, dim=-1)
 
     # Restore flash-attn kwargs to LM
     kwargs.update(flash_attn_kwargs)
