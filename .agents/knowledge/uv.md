@@ -9,7 +9,7 @@ Pinned to a specific version for reproducibility. **Three locations must stay in
 | Location | Format |
 |----------|--------|
 | `pyproject.toml` -> `[tool.uv]` -> `required-version` | `"==X.Y.Z"` |
-| `docker/cuda/Dockerfile.cu129` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
+| `docker/cuda/Dockerfile.cu130` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
 | `docker/ascend/Dockerfile.*` | same pattern |
 
 ## Dependency Layout
