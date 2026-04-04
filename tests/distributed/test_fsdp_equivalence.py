@@ -80,7 +80,7 @@ def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
         task_name="single_gpu",
         nproc=1,
         init_device=get_device_type(),
-        extra_args=["--train.enable_mixed_precision=False"],
+        extra_args=["--train.accelerator.fsdp_config.mixed_precision.enable=False"],
     )
 
 
@@ -115,7 +115,7 @@ def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=N
         extra_args=[
             "--train.accelerator.ulysses_size=1",
             "--train.accelerator.ep_size=1",
-            "--train.enable_mixed_precision=False",
+            "--train.accelerator.fsdp_config.mixed_precision.enable=False",
         ],
     )
 
