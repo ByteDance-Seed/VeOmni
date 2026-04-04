@@ -104,6 +104,9 @@ def parallelize_model_fsdp1(
     """
     Apply ExtraParallel (e.g. Expert Parallel + Embed Parallel + ...) + FSDP1 parallel strategy to the model.
     """
+    if mixed_precision is None:
+        mixed_precision = MixedPrecisionConfig(enable=True)
+
     parallel_state = get_parallel_state()
 
     if parallel_state.any_extra_parallel_enabled:
@@ -318,6 +321,9 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
+    if mixed_precision is None:
+        mixed_precision = MixedPrecisionConfig(enable=True)
+
     parallel_state = get_parallel_state()
 
     # Step 0: Get target classes to shard later
@@ -588,6 +594,9 @@ def build_parallelize_model(
     """
     Applies parallel strategies to the model.
     """
+    if mixed_precision is None:
+        mixed_precision = MixedPrecisionConfig(enable=True)
+
     parallel_state = get_parallel_state()
 
     if not parallel_state.fsdp_enabled:
