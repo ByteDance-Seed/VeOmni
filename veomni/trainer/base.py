@@ -240,7 +240,7 @@ class BaseTrainer(Stateful, ABC):
         self.model = build_foundation_model(
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
-            torch_dtype="float32" if self.args.train.enable_mixed_precision else "bfloat16",
+            torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
             attn_implementation=self.args.model.ops_implementation.attn_implementation,
             moe_implementation=self.args.model.ops_implementation.moe_implementation,
             init_device=self.args.train.init_device,
@@ -330,7 +330,7 @@ class BaseTrainer(Stateful, ABC):
             weights_path=args.model.model_path,
             enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-            enable_mixed_precision=args.train.enable_mixed_precision,
+            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=self._get_basic_modules(self.model, args.model.basic_modules),

@@ -27,6 +27,7 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
+from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..models.module_utils import _convert_weight_key as convert_weight_key
 from ..utils import logging
@@ -41,7 +42,13 @@ from .fsdp import (
     register_checkpoint_extension,
 )
 from .parallel_state import get_parallel_state
-from .utils import get_module_from_path, is_same_module_from_path, set_module_from_path, sort_fqn_by_submodule_first
+from .utils import (
+    get_module_from_path,
+    is_same_module_from_path,
+    set_module_from_path,
+    sort_fqn_by_submodule_first,
+    str2dtype,
+)
 
 
 if is_torch_version_greater_than("2.4"):
@@ -86,7 +93,7 @@ def parallelize_model_fsdp1(
     weights_path: Optional[str] = None,
     enable_full_shard: bool = True,
     enable_shard_grad_op: bool = False,
-    enable_mixed_precision: bool = True,
+    mixed_precision: Optional[MixedPrecisionConfig] = None,
     use_orig_params: bool = True,
     basic_modules: Optional[List[str]] = None,
     fsdp_no_shard_states=None,
@@ -156,17 +163,17 @@ def parallelize_model_fsdp1(
 
     fsdp_kwargs.update(kwargs.pop("fsdp_kwargs", {}))
 
-    if enable_mixed_precision:
+    if mixed_precision.enable:
         logger.info_rank0("Enable mixed precision training.")
-        mixed_precision = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.float32,
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=str2dtype(mixed_precision.param_dtype),
+            reduce_dtype=str2dtype(mixed_precision.reduce_dtype),
+            buffer_dtype=str2dtype(mixed_precision.buffer_dtype) or torch.float32,
         )
         if hasattr(model, "get_ignore_modules_in_mixed_precision"):
-            mixed_precision._module_classes_to_ignore += model.get_ignore_modules_in_mixed_precision()
+            mixed_precision_policy._module_classes_to_ignore += model.get_ignore_modules_in_mixed_precision()
 
-        fsdp_kwargs["mixed_precision"] = mixed_precision
+        fsdp_kwargs["mixed_precision"] = mixed_precision_policy
 
     if kwargs.get("init_device") == "cpu":
         logger.info_rank0("Enable rank0-only initialization.")
@@ -284,8 +291,7 @@ def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     enable_reshard_after_forward: bool = True,
-    enable_mixed_precision: bool = True,
-    mixed_precision_cast_forward_inputs: bool = True,
+    mixed_precision: Optional[MixedPrecisionConfig] = None,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
 ) -> "nn.Module":
@@ -407,11 +413,12 @@ def parallelize_model_fsdp2(
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
     # prepare mp_policy kwargs
-    if enable_mixed_precision:
+    if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            cast_forward_inputs=mixed_precision_cast_forward_inputs,
+            param_dtype=str2dtype(mixed_precision.param_dtype),
+            reduce_dtype=str2dtype(mixed_precision.reduce_dtype),
+            output_dtype=str2dtype(mixed_precision.output_dtype),
+            cast_forward_inputs=mixed_precision.cast_forward_inputs,
         )
         fsdp_kwargs["mp_policy"] = mp_policy
 
@@ -573,8 +580,7 @@ def build_parallelize_model(
     enable_shard_grad_op: bool = False,
     use_orig_params: bool = True,
     enable_reshard_after_forward: bool = True,
-    enable_mixed_precision: bool = True,
-    mixed_precision_cast_forward_inputs: bool = True,
+    mixed_precision: Optional[MixedPrecisionConfig] = None,
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
@@ -590,7 +596,7 @@ def build_parallelize_model(
         if kwargs.pop("enable_fsdp_offload", False):
             raise ValueError("Only FSDP training supports `enable_fsdp_offload`.")
 
-    if enable_mixed_precision:  # upcast to float32 before feed it to optimizer
+    if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
 
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
@@ -621,9 +627,8 @@ def build_parallelize_model(
                 weights_path=weights_path,
                 enable_full_shard=enable_full_shard,
                 enable_reshard_after_forward=enable_reshard_after_forward,
-                enable_mixed_precision=enable_mixed_precision,
+                mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
-                mixed_precision_cast_forward_inputs=mixed_precision_cast_forward_inputs,
                 **kwargs,
             )
         elif parallel_state.dp_mode == "fsdp1":
@@ -633,18 +638,18 @@ def build_parallelize_model(
                 enable_full_shard=enable_full_shard,
                 enable_shard_grad_op=enable_shard_grad_op,
                 use_orig_params=use_orig_params,
-                enable_mixed_precision=enable_mixed_precision,
+                mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 **kwargs,
             )
         else:
             ddp_kwargs = {"device_ids": [parallel_state.local_rank]}
-            if enable_mixed_precision:
+            if mixed_precision.enable:
                 logger.info_rank0("Enable mixed precision training.")
                 mixed_precision = MixedPrecision(
-                    param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
-                    buffer_dtype=torch.bfloat16,
+                    param_dtype=str2dtype(mixed_precision.param_dtype),
+                    reduce_dtype=str2dtype(mixed_precision.reduce_dtype),
+                    buffer_dtype=str2dtype(mixed_precision.buffer_dtype) or torch.bfloat16,
                 )
                 ddp_kwargs["mixed_precision"] = mixed_precision
 

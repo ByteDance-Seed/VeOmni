@@ -36,6 +36,7 @@ logger = logging.get_logger(__name__)
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
+#   │   |   └── mixed_precision.* → MixedPrecisionConfig
 #   │   └── offload_config.* → OffloadConfig
 #   └── checkpoint.*         → CheckpointConfig
 #
@@ -178,6 +179,36 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
+class MixedPrecisionConfig:
+    """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
+
+    enable: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision training."},
+    )
+    param_dtype: str = field(
+        default="bfloat16",
+        metadata={"help": "Dtype for the unsharded parameter (DDP, FSDP1)."},
+    )
+    reduce_dtype: str = field(
+        default="float32",
+        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1)."},
+    )
+    buffer_dtype: str = field(
+        default=None,
+        metadata={"help": "Dtype for the buffer (DDP, FSDP1)."},
+    )
+    output_dtype: str = field(
+        default=None,
+        metadata={"help": "Dtype for casting floating-point forward outputs (DDP, FSDP1)."},
+    )
+    cast_forward_inputs: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
+    )
+
+
+@dataclass
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
@@ -205,6 +236,7 @@ class FSDPConfig:
         default=False,
         metadata={"help": "Enable CPU offload for FSDP1."},
     )
+    mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
 
 @dataclass
@@ -365,18 +397,6 @@ class TrainingArguments:
     bsz_warmup_init_mbtoken: int = field(
         default=200,
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
-    )
-    dyn_bsz_runtime: Literal["main", "worker"] = field(
-        default="main",
-        metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
-    )
-    enable_mixed_precision: bool = field(
-        default=True,
-        metadata={"help": "Enable mixed precision training."},
-    )
-    mixed_precision_cast_forward_inputs: bool = field(
-        default=True,
-        metadata={"help": "Enable mixed precision cast forward inputs."},
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",

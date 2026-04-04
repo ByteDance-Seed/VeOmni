@@ -21,6 +21,7 @@ from .arguments_types import (
     FSDPConfig,
     GradientCheckpointingConfig,
     InferArguments,
+    MixedPrecisionConfig,
     ModelArguments,
     OffloadConfig,
     OpsImplementationConfig,

@@ -15,6 +15,7 @@
 import re
 from typing import List
 
+import torch
 import torch.nn as nn
 
 
@@ -139,3 +140,19 @@ def sort_fqn_by_submodule_first(fqn_list: list[str]) -> list[str]:
 
     sorted_list = sorted(fqn_list, key=cmp_to_key(_fqn_nesting_compare))
     return sorted_list
+
+
+def str2dtype(dtype_str: str) -> torch.dtype:
+    if dtype_str is None:
+        return None
+
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float16": torch.float16,
+    }
+
+    if dtype_str.lower() in dtype_map:
+        return dtype_map[dtype_str.lower()]
+    else:
+        raise ValueError(f"Invalid dtype string: {dtype_str}")
