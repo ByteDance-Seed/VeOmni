@@ -64,7 +64,7 @@
 +#      Register Qwen3_5Moe expert parallel plan for v5 generated modeling
 +#
 +# ==============================================================================
- 
+
  from collections.abc import Callable
  from dataclasses import dataclass
  from typing import Any, Optional
@@ -166,81 +166,81 @@
 +from veomni.distributed.sequence_parallel import sp_pad_and_slice
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +
- 
+
  logger = logging.get_logger(__name__)
 +
- 
- 
+
+
  class Qwen3_5MoeVisionRotaryEmbedding(nn.Module):
 @@ -80,6 +132,7 @@
          seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
          freqs = torch.outer(seq, self.inv_freq)
          return freqs
 +
- 
- 
+
+
  class Qwen3_5MoeTextRotaryEmbedding(nn.Module):
 @@ -172,6 +225,7 @@
          return freqs_t
- 
- 
+
+
 +
  class Qwen3_5MoeDynamicCache:
      """
      A dynamic cache that can handle both the attention cache (which has a seq_len dimension) and the linear attention
 @@ -262,6 +316,7 @@
          return self.conv_states[self.last_linear_layer] is not None
- 
- 
+
+
 +
  class Qwen3_5MoeRMSNormGated(nn.Module):
      def __init__(self, hidden_size, eps=1e-6, **kwargs):
          super().__init__()
 @@ -280,6 +335,7 @@
          return hidden_states.to(input_dtype)
- 
- 
+
+
 +
  def apply_mask_to_padding_states(hidden_states, attention_mask):
      """
      Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
 @@ -292,9 +348,11 @@
      return hidden_states
- 
- 
+
+
 +
  is_fast_path_available = all(
      (causal_conv1d_fn, causal_conv1d_update, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule)
  )
 +
- 
- 
+
+
  def torch_causal_conv1d_update(
 @@ -315,10 +373,12 @@
      return out
- 
- 
+
+
 +
  def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
      """This function is intended to align with the l2norm implementation in the FLA library."""
      inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
      return x * inv_norm
 +
- 
- 
+
+
  def torch_chunk_gated_delta_rule(
 @@ -401,6 +461,7 @@
      return core_attn_out, last_recurrent_state
- 
- 
+
+
 +
  def torch_recurrent_gated_delta_rule(
      query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
  ):
 @@ -443,6 +504,12 @@
      return core_attn_out, last_recurrent_state
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3_5MoeGatedDeltaNet
 +# Methods patched: __init__, _get_local_conv1d_weight, forward
@@ -268,10 +268,10 @@
 +        cu_seq_lens_q: torch.Tensor | None = None,
      ):
          hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
- 
+
 @@ -522,10 +592,7 @@
          batch_size, seq_len, _ = hidden_states.shape
- 
+
          use_precomputed_states = (
 -            cache_params is not None
 -            and cache_params.has_previous_state
@@ -279,20 +279,20 @@
 -            and cache_position is not None
 +            cache_params is not None and cache_params.has_previous_state and seq_len == 1 and cache_position is not None
          )
- 
+
          # getting projected states from cache if it exists
 @@ -534,7 +601,6 @@
              recurrent_state = cache_params.recurrent_states[self.layer_idx]
- 
+
          mixed_qkv = self.in_proj_qkv(hidden_states)
 -        mixed_qkv = mixed_qkv.transpose(1, 2)
- 
+
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
 @@ -542,65 +608,127 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
- 
+
 +        # Modification: Ulysses SP all-to-all for linear attention heads.
 +        ulysses_enabled = get_parallel_state().ulysses_enabled
 +        if ulysses_enabled:
@@ -394,14 +394,14 @@
              ],
              dim=-1,
          )
- 
+
 -        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
 -        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
 -        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 +        query = query.reshape(query.shape[0], query.shape[1], local_num_k_heads, self.head_k_dim)
 +        key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
 +        value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
- 
+
          beta = b.sigmoid()
          # If the model is loaded in fp16, without the .float() here, A might be -inf
 -        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
@@ -416,7 +416,7 @@
          if self.num_v_heads // self.num_k_heads > 1:
              query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
              key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
- 
+
          if not use_precomputed_states:
 -            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
 -                query,
@@ -453,7 +453,7 @@
 @@ -617,6 +745,12 @@
          if cache_params is not None:
              cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
- 
+
 +        # Modification: gather attention output back to sequence-sharded layout before gated norm.
 +        if ulysses_enabled:
 +            core_attn_out = gather_heads_scatter_seq(
@@ -466,7 +466,7 @@
 @@ -626,12 +760,30 @@
          output = self.out_proj(core_attn_out)
          return output
- 
+
 +    def _get_local_conv1d_weight(
 +        self, ulysses_rank: int, local_key_dim: int, local_value_dim: int
 +    ) -> torch.Tensor:
@@ -484,20 +484,20 @@
 +        return torch.cat([w_q, w_k, w_v], dim=0)
 +
 +
- 
+
  def rotate_half(x):
      """Rotates half the hidden dims of the input."""
      x1 = x[..., : x.shape[-1] // 2]
      x2 = x[..., x.shape[-1] // 2 :]
      return torch.cat((-x2, x1), dim=-1)
 +
- 
- 
+
+
  # Adapted from transformers.models.glm.modular_glm.apply_rotary_pos_emb
 @@ -673,6 +825,7 @@
      return q_embed, k_embed
- 
- 
+
+
 +
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
      """
@@ -507,29 +507,29 @@
      hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
      return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 +
- 
- 
+
+
  def eager_attention_forward(
 @@ -710,6 +864,7 @@
      return attn_output, attn_weights
- 
- 
+
+
 +
  @use_kernelized_func(apply_rotary_pos_emb)
  class Qwen3_5MoeAttention(nn.Module):
      """Multi-headed attention from 'Attention Is All You Need' paper"""
 @@ -791,6 +946,7 @@
          return attn_output, attn_weights
- 
- 
+
+
 +
  class Qwen3_5MoeMLP(nn.Module):
      def __init__(self, config: Qwen3_5MoeConfig, intermediate_size: int):
          super().__init__()
 @@ -807,12 +963,23 @@
          return down_proj
- 
- 
+
+
 -@use_experts_implementation
 +# ======================================================================
 +# [PATCHED CLASS] Qwen3_5MoeExperts
@@ -545,7 +545,7 @@
 +    (which routes to grouped_mm and bypasses our fused MoE path) and to add
 +    VeOmni fused MoE dispatch via OpSlot.
 +    """
- 
+
      def __init__(self, config):
          super().__init__()
 +        self.config = config
@@ -566,16 +566,16 @@
              expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
 @@ -847,6 +1019,7 @@
          return final_hidden_states
- 
- 
+
+
 +
  class Qwen3_5MoeTopKRouter(nn.Module):
      def __init__(self, config):
          super().__init__()
 @@ -866,6 +1039,12 @@
          return router_logits, router_scores, router_indices
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3_5MoeSparseMoeBlock
 +# Methods patched: forward
@@ -588,7 +588,7 @@
 @@ -874,7 +1053,9 @@
          self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
          self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
- 
+
 -    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 +    def forward(
 +        self, hidden_states: torch.Tensor
@@ -597,9 +597,9 @@
          hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
          shared_expert_output = self.shared_expert(hidden_states_reshaped)
 @@ -883,9 +1064,18 @@
- 
+
          shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
- 
+
 -        expert_output += shared_expert_output
 +        # Modification: use out-of-place add instead of `expert_output += shared_expert_output`
 +        # to avoid "Output of MergedFc1TritonFusedMoeExpertFunctionBackward is a view and is
@@ -613,12 +613,12 @@
 +# [MODIFIED CLASS] Qwen3_5MoeRMSNorm
 +# Methods patched: forward
 +# ======================================================================
- 
- 
+
+
  class Qwen3_5MoeRMSNorm(nn.Module):
 @@ -898,14 +1088,22 @@
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
- 
+
      def forward(self, x):
 +        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
 +        if veomni_rms_norm.has_kernel:
@@ -629,7 +629,7 @@
 -        # See https://github.com/huggingface/transformers/pull/29402
          output = output * (1.0 + self.weight.float())
          return output.type_as(x)
- 
+
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.eps}"
 +
@@ -638,13 +638,13 @@
 +# [MODIFIED CLASS] Qwen3_5MoeDecoderLayer
 +# Methods patched: forward
 +# ======================================================================
- 
- 
+
+
  class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
 @@ -935,13 +1133,22 @@
- 
+
          hidden_states = self.input_layernorm(hidden_states)
- 
+
 +        # Modification: read varlen metadata from kwargs and enforce it for linear-attention varlen kernels.
 +        cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
 +        assert cu_seq_lens_q is not None, (
@@ -671,21 +671,21 @@
 -
          return hidden_states
 +
- 
- 
+
+
  class Qwen3_5MoePreTrainedModel(PreTrainedModel):
 @@ -1004,6 +1211,7 @@
              init.copy_(module.inv_freq, inv_freq)
- 
- 
+
+
 +
  class Qwen3_5MoeVisionMLP(nn.Module):
      def __init__(self, config):
          super().__init__()
 @@ -1017,6 +1225,7 @@
          return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
- 
- 
+
+
 +
  class Qwen3_5MoeVisionPatchEmbed(nn.Module):
      def __init__(self, config) -> None:
@@ -695,37 +695,37 @@
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
 +
- 
- 
+
+
  class Qwen3_5MoeVisionPatchMerger(nn.Module):
 @@ -1051,6 +1261,7 @@
          x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
          x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
          return x
 +
- 
- 
+
+
  def apply_rotary_pos_emb_vision(
 @@ -1065,6 +1276,7 @@
      q_embed = q_embed.to(orig_q_dtype)
      k_embed = k_embed.to(orig_k_dtype)
      return q_embed, k_embed
 +
- 
- 
+
+
  class Qwen3_5MoeVisionAttention(nn.Module):
 @@ -1150,6 +1362,7 @@
          return attn_output
- 
- 
+
+
 +
  class Qwen3_5MoeVisionBlock(GradientCheckpointingLayer):
      def __init__(self, config, attn_implementation: str = "sdpa") -> None:
          super().__init__()
 @@ -1177,6 +1390,12 @@
          return hidden_states
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3_5MoeVisionModel
 +# Methods patched: fast_pos_embed_interpolate, forward, dummy_forward
@@ -737,7 +737,7 @@
      _no_split_modules = ["Qwen3_5MoeVisionBlock"]
 @@ -1252,67 +1471,71 @@
          return embeddings
- 
+
      def fast_pos_embed_interpolate(self, grid_thw):
 -        grid_thw_list = grid_thw.tolist()
 -        grid_ts = [row[0] for row in grid_thw_list]
@@ -865,12 +865,12 @@
 +            outputs.append(repeated)
 +
 +        return torch.cat(outputs, dim=0)
- 
+
      @merge_with_config_defaults
      @capture_outputs
 @@ -1330,15 +1553,20 @@
          hidden_states = self.patch_embed(hidden_states)
- 
+
          pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 +
 +        # --- Patch.1: Sequence parallel padding and slicing for position embeddings ---
@@ -894,13 +894,13 @@
 -        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
 -        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
 -        position_embeddings = (emb.cos(), emb.sin())
- 
+
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
 @@ -1350,6 +1578,50 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
- 
+
 +        rotary_pos_emb = self.rot_pos_emb(grid_thw)
 +
 +        seq_len, _ = hidden_states.size()
@@ -981,29 +981,29 @@
 +            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
 +        return self(**dummy_data)
 +
- 
- 
+
+
  @dataclass
 @@ -1389,6 +1690,7 @@
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
 +
- 
- 
+
+
  @dataclass
 @@ -1420,6 +1722,7 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
 +
- 
- 
+
+
  class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 @@ -1523,6 +1826,12 @@
          return linear_attn_mask
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3_5MoeModel
 +# Methods patched: __init__, get_image_features, get_placeholder_mask, forward
@@ -1015,7 +1015,7 @@
      base_model_prefix = "model"
 @@ -1533,6 +1842,10 @@
      _no_split_modules = ["Qwen3_5MoeTextDecoderLayer", "Qwen3_5MoeVisionBlock"]
- 
+
      def __init__(self, config):
 +        # Propagate _moe_implementation so SparseMoeBlock picks up the correct mode.
 +        moe_implementation = getattr(config, "_moe_implementation", "eager")
@@ -1060,7 +1060,7 @@
 -
 +        vision_output: BaseModelOutputWithPooling = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True)
          return vision_output
- 
+
 -    def get_placeholder_mask(
 -        self,
 -        input_ids: torch.LongTensor,
@@ -1111,7 +1111,7 @@
 +        special_image_mask = input_ids == self.config.image_token_id
 +        special_video_mask = input_ids == self.config.video_token_id
          return special_image_mask, special_video_mask
- 
+
      def compute_3d_position_ids(
 @@ -1769,6 +2049,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
@@ -1130,7 +1130,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
- 
+
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 +
@@ -1169,7 +1169,7 @@
 +                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
 +            )
 +        # --- Patch.1 ---
- 
+
          if pixel_values is not None:
              image_outputs: BaseModelOutputWithPooling = self.get_image_features(
                  pixel_values, image_grid_thw, return_dict=True
@@ -1215,7 +1215,7 @@
 +            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 +            inputs_embeds = inputs_embeds + fake_embeds
 +            # --- Patch.2 ---
- 
+
          if pixel_values_videos is not None:
              video_outputs: BaseModelOutputWithPooling = self.get_video_features(
                  pixel_values_videos, video_grid_thw, return_dict=True
@@ -1272,7 +1272,7 @@
 +                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
 +            )
 +        # --- Patch.1 ---
- 
+
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
 @@ -1814,7 +2206,19 @@
@@ -1292,7 +1292,7 @@
 +        # --- Patch.4: Restore pre-computed Flash Attention kwargs for language model ---
 +        kwargs.update(flash_attn_kwargs)
 +        # --- Patch.4 ---
- 
+
          outputs = self.language_model(
              input_ids=None,
 @@ -1830,6 +2234,7 @@
@@ -1300,21 +1300,21 @@
              rope_deltas=self.rope_deltas,
          )
 +
- 
- 
+
+
  def load_balancing_loss_func(
 @@ -1912,6 +2317,7 @@
- 
+
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
 +
- 
- 
+
+
  @auto_docstring
 @@ -2021,6 +2427,12 @@
          )
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3_5MoeForConditionalGeneration
 +# Methods patched: get_position_id_func, forward, get_parallel_plan
@@ -1384,14 +1384,14 @@
              pixel_values=pixel_values,
 @@ -2156,27 +2517,50 @@
          )
- 
+
          hidden_states = outputs[0]
 -
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 -        logits = self.lm_head(hidden_states[:, slice_indices, :])
 +        hidden_states = hidden_states[:, slice_indices, :]
- 
+
          loss = None
 +        logits = None
          if labels is not None:
@@ -1413,7 +1413,7 @@
 +                )
 +        else:
 +            logits = self.lm_head(hidden_states)
- 
+
          aux_loss = None
          if kwargs.get("output_router_logits", False):
 -            aux_loss = load_balancing_loss_func(
@@ -1442,13 +1442,13 @@
 -                    loss.device
 -                )  # make sure to reside in the same device
 +                loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
- 
+
          return Qwen3_5MoeCausalLMOutputWithPast(
              loss=loss,
 @@ -2413,6 +2797,19 @@
- 
+
          return input_ids, model_kwargs
- 
+
 +    def get_position_id_func(self):
 +        fake_config = copy(self.config)
 +        fake_config.image_token_id = IMAGE_INPUT_INDEX
@@ -1462,6 +1462,6 @@
 +        return _get_parallel_plan()
 +
 +
- 
+
  __all__ = [
      "Qwen3_5MoeVisionModel",

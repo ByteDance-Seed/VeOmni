@@ -49,12 +49,12 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
-    qwen3_5_moe_rmsnorm_forward_patched,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_moe_rmsnorm_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
@@ -102,6 +102,7 @@ config.add_post_import_block(
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
+    veomni_load_balancing_loss = OpSlot("moe_load_balancing_loss", "standard")
 
     FusedRMSNormGated = None
     fused_recurrent_gated_delta_rule = None
@@ -488,11 +489,9 @@ class PatchedQwen3_5MoeExperts(nn.Module):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            intermediate_dim = self.intermediate_dim
-            gate_w = self.gate_up_proj[expert_idx, :intermediate_dim, :]
-            up_w = self.gate_up_proj[expert_idx, intermediate_dim:, :]
-            gate = nn.functional.linear(current_state, gate_w)
-            up = nn.functional.linear(current_state, up_w)
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).split(
+                [self.intermediate_dim, self.gate_up_proj.shape[1] - self.intermediate_dim], dim=1
+            )
             current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
@@ -659,12 +658,21 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
 
     aux_loss = None
     if kwargs.get("output_router_logits", False):
-        aux_loss = load_balancing_loss_func(
-            outputs.router_logits,
-            self.config.text_config.num_experts,
-            self.config.text_config.num_experts_per_tok,
-            attention_mask,
-        )
+        # Modification: OpSlot guard for load-balancing loss.
+        if veomni_load_balancing_loss.has_kernel:
+            aux_loss = veomni_load_balancing_loss(
+                outputs.router_logits,
+                self.config.text_config.num_experts,
+                self.config.text_config.num_experts_per_tok,
+                attention_mask,
+            )
+        else:
+            aux_loss = load_balancing_loss_func(
+                outputs.router_logits,
+                self.config.text_config.num_experts,
+                self.config.text_config.num_experts_per_tok,
+                attention_mask,
+            )
         if labels is not None:
             loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
 

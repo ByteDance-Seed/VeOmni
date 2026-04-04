@@ -607,14 +607,14 @@ class OpsImplementationConfig:
         default="eager",
         metadata={
             "help": "causal_conv1d kernel implementation. "
-            "'eager' for standard PyTorch, 'liger' for LigerKernel fused RMSNorm."
+            "'eager' for standard PyTorch, 'liger' for LigerKernel causal_conv1d."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
         default="eager",
         metadata={
             "help": "chunk_gated_delta_rule kernel implementation. "
-            "'eager' for standard PyTorch, 'liger' for LigerKernel fused RMSNorm."
+            "'eager' for standard PyTorch, 'liger' for LigerKernel chunk_gated_delta_rule."
         },
     )
     swiglu_mlp_implementation: str = field(

@@ -342,6 +342,7 @@ KERNEL_REGISTRY.register(
     )
 )
 
+
 def register_npu_kernel_cross_entropy(cross_entropy):
     def _npu_fused_ce_factory():
         """Return ForCausalLMLoss with the NPU fused CE kernel bound via partial.
@@ -350,8 +351,9 @@ def register_npu_kernel_cross_entropy(cross_entropy):
         flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
         """
         from functools import partial
+
         return partial(ForCausalLMLoss, cross_entropy_fn=cross_entropy)
-    
+
     KERNEL_REGISTRY.register(
         KernelSpec(
             name="npu_fused",

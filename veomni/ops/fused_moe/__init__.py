@@ -159,6 +159,7 @@ KERNEL_REGISTRY.register(
 )
 
 if is_torch_npu_available():
+
     def _make_npu_moe_experts_adapter(raw_forward):
         """Adapt the raw NPU fused MoE kernel to the OpSlot call signature.
 
@@ -172,16 +173,17 @@ if is_torch_npu_available():
                 routing_weights=top_k_weights.to(hidden_states.dtype),
                 selected_experts=top_k_index.to(torch.int64),
                 hidden_states=hidden_states,
-                fc1_1_weight=self.gate_up_proj[:, :self.intermediate_dim, :].contiguous(),
-                fc1_2_weight=self.gate_up_proj[:, self.intermediate_dim:, :].contiguous(),
+                fc1_1_weight=self.gate_up_proj[:, : self.intermediate_dim, :].contiguous(),
+                fc1_2_weight=self.gate_up_proj[:, self.intermediate_dim :, :].contiguous(),
                 fc2_weight=self.down_proj,
                 fc1_1_2_weight=None,
             )
 
         return adapter
-    
+
     def _npu_fused_moe_kernel_factory():
         from .npu_group_gemm import npu_fused_moe_forward
+
         return _make_npu_moe_experts_adapter(npu_fused_moe_forward)
 
     KERNEL_REGISTRY.register(

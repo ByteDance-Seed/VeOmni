@@ -41,6 +41,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -52,15 +53,20 @@ from transformers.integrations import use_kernelized_func
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast, ModelOutput
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPooling,
+    CausalLMOutputWithPast,
+    ModelOutput,
+)
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
-from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
-from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
-from transformers.utils.output_capturing import capture_outputs
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
+
 
 # Additional import blocks for patches
 # Modification: We are not using https://github.com/Dao-AILab/causal-conv1d now
@@ -80,25 +86,28 @@ except ImportError:
         "This case can't support dynamic batching packing!"
     )
 
+
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
+
 # Additional imports for patches
 from copy import copy
 from functools import partial
 from types import SimpleNamespace
+
 import torch.distributed as dist
+
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.utils.device import get_device_id
-from veomni.distributed.sequence_parallel.ulysses import gather_seq_scatter_heads, gather_heads_scatter_seq
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
+from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.device import get_device_id
 
 
 logger = logging.get_logger(__name__)
-
 
 
 class Qwen3_5DynamicCache:
@@ -191,7 +200,6 @@ class Qwen3_5DynamicCache:
         return self.conv_states[self.last_linear_layer] is not None
 
 
-
 class Qwen3_5VisionRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
@@ -206,7 +214,6 @@ class Qwen3_5VisionRotaryEmbedding(nn.Module):
         seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(seq, self.inv_freq)
         return freqs
-
 
 
 class Qwen3_5TextRotaryEmbedding(nn.Module):
@@ -299,7 +306,6 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         return freqs_t
 
 
-
 class Qwen3_5RMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
@@ -318,7 +324,6 @@ class Qwen3_5RMSNormGated(nn.Module):
         return hidden_states.to(input_dtype)
 
 
-
 def apply_mask_to_padding_states(hidden_states, attention_mask):
     """
     Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
@@ -331,11 +336,9 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     return hidden_states
 
 
-
 is_fast_path_available = all(
     (causal_conv1d_fn, causal_conv1d_update, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule)
 )
-
 
 
 def torch_causal_conv1d_update(
@@ -356,12 +359,10 @@ def torch_causal_conv1d_update(
     return out
 
 
-
 def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
     """This function is intended to align with the l2norm implementation in the FLA library."""
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
-
 
 
 def torch_chunk_gated_delta_rule(
@@ -442,7 +443,6 @@ def torch_chunk_gated_delta_rule(
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
-
 
 
 def torch_recurrent_gated_delta_rule(
@@ -575,7 +575,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         use_precomputed_states = (
-            cache_params is not None and cache_params.has_previous_state and seq_len == 1 and cache_position is not None
+            cache_params is not None
+            and cache_params.has_previous_state
+            and seq_len == 1
+            and cache_position is not None
         )
 
         # getting projected states from cache if it exists
@@ -743,9 +746,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output = self.out_proj(core_attn_out)
         return output
 
-    def _get_local_conv1d_weight(
-        self, ulysses_rank: int, local_key_dim: int, local_value_dim: int
-    ) -> torch.Tensor:
+    def _get_local_conv1d_weight(self, ulysses_rank: int, local_key_dim: int, local_value_dim: int) -> torch.Tensor:
         # Modification: shard depthwise conv1d weights to match head-sharded mixed_qkv channels.
         w_full = self.conv1d.weight.squeeze(1)
         assert w_full.shape[0] == self.key_dim * 2 + self.value_dim, (
@@ -760,13 +761,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return torch.cat([w_q, w_k, w_v], dim=0)
 
 
-
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
 
 
 # Adapted from transformers.models.glm.modular_glm.apply_rotary_pos_emb
@@ -808,7 +807,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -819,7 +817,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
 
 
 def eager_attention_forward(
@@ -845,7 +842,6 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
-
 
 
 @use_kernelized_func(apply_rotary_pos_emb)
@@ -925,7 +921,6 @@ class Qwen3_5Attention(nn.Module):
 
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
-
 
 
 class Qwen3_5MLP(nn.Module):
@@ -1026,7 +1021,6 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-
 class Qwen3_5PreTrainedModel(PreTrainedModel):
     config: Qwen3_5Config
     base_model_prefix = "model"
@@ -1056,7 +1050,6 @@ class Qwen3_5PreTrainedModel(PreTrainedModel):
             init.copy_(module.inv_freq, inv_freq)
 
 
-
 class Qwen3_5VisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1068,7 +1061,6 @@ class Qwen3_5VisionMLP(nn.Module):
 
     def forward(self, hidden_state):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
-
 
 
 class Qwen3_5VisionPatchEmbed(nn.Module):
@@ -1091,7 +1083,6 @@ class Qwen3_5VisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-
 class Qwen3_5VisionPatchMerger(nn.Module):
     def __init__(self, config: Qwen3_5VisionConfig, use_postshuffle_norm=False) -> None:
         super().__init__()
@@ -1108,7 +1099,6 @@ class Qwen3_5VisionPatchMerger(nn.Module):
         return x
 
 
-
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1121,7 +1111,6 @@ def apply_rotary_pos_emb_vision(
     q_embed = q_embed.to(orig_q_dtype)
     k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
-
 
 
 class Qwen3_5VisionAttention(nn.Module):
@@ -1205,7 +1194,6 @@ class Qwen3_5VisionAttention(nn.Module):
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
         return attn_output
-
 
 
 class Qwen3_5VisionBlock(GradientCheckpointingLayer):
@@ -1511,7 +1499,6 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         return self(**dummy_data)
 
 
-
 @dataclass
 @auto_docstring(
     custom_intro="""
@@ -1534,7 +1521,6 @@ class Qwen3_5ModelOutputWithPast(ModelOutput):
     hidden_states: tuple[torch.FloatTensor] | None = None
     attentions: tuple[torch.FloatTensor] | None = None
     rope_deltas: torch.LongTensor | None = None
-
 
 
 class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
@@ -1776,9 +1762,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
     @can_return_tuple
     @auto_docstring
-    def get_image_features(
-        self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None
-    ):
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None):
         r"""
         Processes images through the vision tower and returns features as a single contiguous tensor.
 
@@ -1790,7 +1774,9 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         vectorized kernels in the main forward pass.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        vision_output: BaseModelOutputWithPooling = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True)
+        vision_output: BaseModelOutputWithPooling = self.visual(
+            pixel_values, grid_thw=image_grid_thw, return_dict=True
+        )
         return vision_output
 
     def get_placeholder_mask(self, input_ids: torch.LongTensor, **kwargs):
@@ -2044,7 +2030,6 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         )
 
 
-
 @auto_docstring
 class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -2126,7 +2111,6 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
 
 
 @dataclass
@@ -2505,7 +2489,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         fake_config.video_token_id = VIDEO_INPUT_INDEX
         fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3_5Model.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
-
 
 
 __all__ = [
