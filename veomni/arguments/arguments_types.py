@@ -188,11 +188,11 @@ class MixedPrecisionConfig:
     )
     param_dtype: str = field(
         default="bfloat16",
-        metadata={"help": "Dtype for the unsharded parameter (DDP, FSDP1)."},
+        metadata={"help": "Dtype for the unsharded parameter (DDP, FSDP1, FSDP2)."},
     )
     reduce_dtype: str = field(
         default="float32",
-        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1)."},
+        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1, FSDP2)."},
     )
     buffer_dtype: str = field(
         default=None,
@@ -200,7 +200,7 @@ class MixedPrecisionConfig:
     )
     output_dtype: str = field(
         default=None,
-        metadata={"help": "Dtype for casting floating-point forward outputs (DDP, FSDP1)."},
+        metadata={"help": "Dtype for casting floating-point forward outputs (FSDP2)."},
     )
     cast_forward_inputs: bool = field(
         default=True,
@@ -397,6 +397,10 @@ class TrainingArguments:
     bsz_warmup_init_mbtoken: int = field(
         default=200,
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
+    )
+    dyn_bsz_runtime: Literal["main", "worker"] = field(
+        default="main",
+        metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
