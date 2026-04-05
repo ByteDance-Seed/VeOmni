@@ -51,7 +51,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py",
     "veomni/arguments/arguments_types.py",
     "veomni/ops/group_gemm/utils/device.py",
-    "tests/special_senity/check_device_api_usage.py",
+    "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
 ]
 

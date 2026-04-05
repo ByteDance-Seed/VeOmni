@@ -1,14 +1,12 @@
 import os
-import random
 import re
 from dataclasses import dataclass
-from typing import Dict
 
 import numpy as np
 import pandas as pd
 
 from ..tools import DummyDataset as DummyDataset
-from ..tools import compare_metrics, print_comparison_table
+from ..tools import ParallelConfig, build_torchrun_cmd
 
 
 def parse_training_log(log_content) -> pd.DataFrame:
@@ -68,11 +66,8 @@ def compare_log(base_log_df: pd.DataFrame, compare_log_df: pd.DataFrame):
     check_metric(base_log_df["grad_norm"], compare_log_df["grad_norm"], name="grad_norm")
 
 
-# DummyDataset is imported from tests.tools and re-exported for backward compatibility.
-
-
 @dataclass(frozen=True)
-class ModelMode:
+class ParallelMode:
     sp_size: int
     ep_size: int
 
@@ -87,7 +82,7 @@ _EP_SIZE = [1, 2]
 def _base_model_modes():
     modes = []
     for sp_size in _SP_SIZE:
-        modes.append(ModelMode(sp_size, 1))
+        modes.append(ParallelMode(sp_size, 1))
     return modes
 
 
@@ -95,7 +90,7 @@ def _moe_model_modes():
     modes = []
     for sp_size in _SP_SIZE:
         for ep_size in _EP_SIZE:
-            modes.append(ModelMode(sp_size, ep_size))
+            modes.append(ParallelMode(sp_size, ep_size))
     return modes
 
 
@@ -108,11 +103,11 @@ def prepare_exec_cmd(
     output_dir: str,
     is_moe: bool,
     max_sp_size: int | None = None,
-) -> str:
+) -> list[tuple[str, list[str]]]:
     """Build torchrun commands for every (task, parallel-mode) combination.
 
     Args:
-        test_tasks: Script basenames under tests/e2e/ to run (e.g. ["train_text_test"]).
+        test_tasks: Script basenames under tests/train_scripts/ to run (e.g. ["train_text_test"]).
         model_name: Short name used for directory naming and log output.
         config_path: Path to the model's toy config directory or config.json.
         model_path: Path to materialized model weights.
@@ -126,56 +121,24 @@ def prepare_exec_cmd(
         List of (task_name, command) tuples, where command is a list of strings
         suitable for subprocess.run.
     """
-    model_modes: ModelMode = _base_model_modes() if not is_moe else _moe_model_modes()
+    model_modes: list[ParallelMode] = _base_model_modes() if not is_moe else _moe_model_modes()
     if max_sp_size is not None:
         model_modes = [m for m in model_modes if m.sp_size <= max_sp_size]
 
     command_list = []
     for task in test_tasks:
         for mode in model_modes:
-            port = 12345 + random.randint(0, 100)
-            command = [
-                "torchrun",
-                "--nnodes=1",
-                f"--nproc_per_node={mode.sp_size * 4}",
-                f"--master_port={port}",
-                f"tests/e2e/{task}.py",
-                f"--model.config_path={config_path}",
-                f"--data.train_path={train_path}",
-                "--data.dyn_bsz_buffer_size=1",
-                "--train.global_batch_size=16",
-                "--train.micro_batch_size=1",
-                "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-                "--model.ops_implementation.attn_implementation=flash_attention_2",
-                "--model.ops_implementation.moe_implementation=fused",
-                "--train.init_device=meta",
-                f"--train.accelerator.ulysses_size={mode.sp_size}",
-                f"--train.accelerator.ep_size={mode.ep_size}",
-                "--train.bsz_warmup_ratio=0",
-                "--train.num_train_epochs=1",
-                "--train.checkpoint.save_epochs=0",
-                "--train.checkpoint.save_steps=0",
-                "--train.checkpoint.save_hf_weights=False",
-                "--train.enable_full_determinism=True",
-                "--train.enable_batch_invariant_mode=True",
-                "--train.max_steps=2",
-                f"--train.checkpoint.output_dir={os.path.join(output_dir, f'{model_name}_{task}_{mode}')}",
-                f"--model.model_path={model_path}",
-            ]
             task_name = f"{model_name}_{task}_{mode}"
+            parallel_config = ParallelConfig(sp_size=mode.sp_size, ep_size=mode.ep_size, fsdp_mode="fsdp2")
+            command = build_torchrun_cmd(
+                script=f"tests/train_scripts/{task}.py",
+                config_path=config_path,
+                model_path=model_path,
+                train_path=train_path,
+                output_dir=os.path.join(output_dir, task_name),
+                parallel_config=parallel_config,
+                nproc=mode.sp_size * 4,
+            )
             command_list.append((task_name, command))
 
     return command_list
-
-
-def print_all_values(output_dict, value_key: str, model_type: str = ""):
-    """Thin wrapper around tests.tools.print_comparison_table for backward compatibility."""
-    print_comparison_table(output_dict, value_key, title=model_type)
-
-
-def compare_multi_items(model_name: str, outputs_dict: Dict, rtol=0.01, atol=0.01):
-    """Thin wrapper around tests.tools.compare_metrics for backward compatibility."""
-    try:
-        compare_metrics(outputs_dict, rtol=rtol, atol=atol)
-    except AssertionError as e:
-        raise AssertionError(f"[{model_name}] {e}") from e
