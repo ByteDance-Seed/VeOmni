@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from veomni.arguments import MixedPrecisionConifg
+from veomni.arguments import MixedPrecisionConfig
 from veomni.utils.device import empty_cache
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
@@ -169,7 +169,7 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
         model,
         weights_path=None,
         init_device="meta",
-        mixed_precision=MixedPrecisionConifg(enable=True),
+        mixed_precision=MixedPrecisionConfig(enable=True),
         enable_gradient_checkpointing=False,
         basic_modules=[],
     )
