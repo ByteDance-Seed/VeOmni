@@ -207,6 +207,16 @@ class MixedPrecisionConfig:
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
 
+    def __post_init__(self):
+        def _check_dtype(dtype: str):
+            if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
+                raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")
+
+        _check_dtype(self.param_dtype)
+        _check_dtype(self.reduce_dtype)
+        _check_dtype(self.buffer_dtype)
+        _check_dtype(self.output_dtype)
+
 
 @dataclass
 class FSDPConfig:
