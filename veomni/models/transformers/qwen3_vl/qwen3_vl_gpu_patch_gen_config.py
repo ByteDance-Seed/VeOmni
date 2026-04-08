@@ -34,10 +34,24 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    BaseModelOutputWithDeepstackFeatures,
+    Qwen3VLCausalLMOutputWithPast,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLModel,
+    Qwen3VLModelOutputWithPast,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_vision,
+    eager_attention_forward,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
+from transformers.utils.generic import is_flash_attention_requested
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
