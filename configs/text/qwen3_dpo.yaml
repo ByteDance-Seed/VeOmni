@@ -25,6 +25,8 @@ train:
     fsdp_config:
       fsdp_mode: fsdp2
       full_shard: true
+      mixed_precision:
+        enable: true
   gradient_checkpointing:
     enable: true
   global_batch_size: 8
@@ -37,7 +39,6 @@ train:
     lr_warmup_ratio: 0.1
     max_grad_norm: 1.0
   num_train_epochs: 1
-  enable_mixed_precision: true
   init_device: meta
   checkpoint:
     output_dir: Qwen3-0.6B-dpo-ultrafeedback

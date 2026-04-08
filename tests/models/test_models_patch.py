@@ -7,7 +7,15 @@ import pytest
 import torch
 
 from veomni import _apply_patches
-from veomni.arguments import CheckpointConfig, DataArguments, ModelArguments, TrainingArguments
+from veomni.arguments import (
+    AcceleratorConfig,
+    CheckpointConfig,
+    DataArguments,
+    FSDPConfig,
+    MixedPrecisionConfig,
+    ModelArguments,
+    TrainingArguments,
+)
 from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -318,7 +326,11 @@ def test_models_patch_fwd_bwd(
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
-        enable_mixed_precision=False,
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(
+                mixed_precision=MixedPrecisionConfig(enable=False),
+            ),
+        ),
         enable_full_determinism=True,
         init_device=get_device_type(),
     )

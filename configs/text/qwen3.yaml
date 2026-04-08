@@ -19,6 +19,8 @@ train:
       fsdp_mode: fsdp1
       full_shard: true
       offload: false
+      mixed_precision:
+        enable: true
     offload:
       enable_activation: false
   gradient_checkpointing:
@@ -32,7 +34,6 @@ train:
     lr_decay_style: cosine
     max_grad_norm: 1.0
   num_train_epochs: 3
-  enable_mixed_precision: true
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500

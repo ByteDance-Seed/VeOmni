@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
-from ..arguments import VeOmniArguments
+from ..arguments import MixedPrecisionConfig, VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
@@ -152,7 +152,7 @@ class TextDPOTrainer:
             weights_path=args.model.model_path,
             enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-            enable_mixed_precision=False,  # In reference model, we will not use mixed precision
+            mixed_precision=MixedPrecisionConfig(enable=False),  # In reference model, we will not use mixed precision
             enable_gradient_checkpointing=False,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=list(

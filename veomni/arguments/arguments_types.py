@@ -36,6 +36,7 @@ logger = logging.get_logger(__name__)
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
+#   │   |   └── mixed_precision.* → MixedPrecisionConfig
 #   │   └── offload_config.* → OffloadConfig
 #   └── checkpoint.*         → CheckpointConfig
 #
@@ -178,6 +179,46 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
+class MixedPrecisionConfig:
+    """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
+
+    enable: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision training."},
+    )
+    param_dtype: str = field(
+        default="bfloat16",
+        metadata={"help": "Dtype for the unsharded parameter (DDP, FSDP1, FSDP2)."},
+    )
+    reduce_dtype: str = field(
+        default="float32",
+        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1, FSDP2)."},
+    )
+    buffer_dtype: str = field(
+        default=None,
+        metadata={"help": "Dtype for the buffer (DDP, FSDP1)."},
+    )
+    output_dtype: str = field(
+        default=None,
+        metadata={"help": "Dtype for casting floating-point forward outputs (FSDP2)."},
+    )
+    cast_forward_inputs: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
+    )
+
+    def __post_init__(self):
+        def _check_dtype(dtype: str):
+            if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
+                raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")
+
+        _check_dtype(self.param_dtype)
+        _check_dtype(self.reduce_dtype)
+        _check_dtype(self.buffer_dtype)
+        _check_dtype(self.output_dtype)
+
+
+@dataclass
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
@@ -205,6 +246,7 @@ class FSDPConfig:
         default=False,
         metadata={"help": "Enable CPU offload for FSDP1."},
     )
+    mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
 
 @dataclass
@@ -369,10 +411,6 @@ class TrainingArguments:
     dyn_bsz_runtime: Literal["main", "worker"] = field(
         default="main",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
-    )
-    enable_mixed_precision: bool = field(
-        default=True,
-        metadata={"help": "Enable mixed precision training."},
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
