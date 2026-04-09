@@ -123,10 +123,23 @@ def _patch_transformers_hub_kernel_loader_for_veomni():
         return
 
     def _veomni_load_and_register_attn_kernel(
-        attn_implementation: str, attention_wrapper: Callable | None = None
+        attn_implementation: str,
+        attention_wrapper: Callable | None = None,
+        allow_all_kernels: bool = False,
     ) -> SimpleNamespace | object:
+        """
+        Monkey-patch for Transformers' hub-kernel loader.
+
+        - v5.3.0+ adds `allow_all_kernels`.
+        - Older versions only accept `attn_implementation` and `attention_wrapper`.
+        """
         if _is_veomni_custom_flash_attention(attn_implementation):
             return _load_veomni_local_flash_kernel(attn_implementation)
+
+        if is_transformers_version_greater_or_equal_to("5.3.0"):
+            return _original_load_and_register_attn_kernel(
+                attn_implementation, attention_wrapper, allow_all_kernels=allow_all_kernels
+            )
         return _original_load_and_register_attn_kernel(attn_implementation, attention_wrapper)
 
     hub_kernels.load_and_register_attn_kernel = _veomni_load_and_register_attn_kernel
