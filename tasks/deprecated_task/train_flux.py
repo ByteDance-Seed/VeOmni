@@ -46,7 +46,6 @@ from veomni.utils.lora_utils import add_lora_to_model, freeze_parameters
 from veomni.utils.recompute_utils import convert_ops_to_objects
 from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
-
 logger = helper.create_logger(__name__)
 
 
@@ -308,7 +307,7 @@ def main():
         weights_path=args.model.model_path,
         enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-        enable_mixed_precision=args.train.enable_mixed_precision,
+        enable_mixed_precision=args.train.accelerator.fsdp_config.mixed_precision.enable,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         init_device=args.train.init_device,
         enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
@@ -473,7 +472,7 @@ def main():
                 extra_input = model.prepare_extra_input(latents)
                 # noise and target
                 noisy_latents = flow_scheduler.add_noise(
-                    latents, noise, timestep, args.train.micro_batch_size, args.train.enable_mixed_precision
+                    latents, noise, timestep, args.train.micro_batch_size, args.train.accelerator.fsdp_config.mixed_precision.enable
                 )
                 training_target = flow_scheduler.training_target(latents, noise, timestep)
                 # predict noise

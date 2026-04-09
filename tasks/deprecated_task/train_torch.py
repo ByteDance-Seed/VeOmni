@@ -37,7 +37,6 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
 from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
-
 logger = helper.create_logger(__name__)
 
 
@@ -136,7 +135,7 @@ def main():
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
         attn_implementation=args.model.ops_implementation.attn_implementation,
         moe_implementation=args.model.ops_implementation.moe_implementation,
         init_device=args.train.init_device,
@@ -151,7 +150,7 @@ def main():
         weights_path=args.model.model_path,
         enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-        enable_mixed_precision=args.train.enable_mixed_precision,
+        enable_mixed_precision=args.train.accelerator.fsdp_config.mixed_precision.enable,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
         basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)),
