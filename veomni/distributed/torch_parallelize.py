@@ -566,7 +566,14 @@ def parallelize_model_fsdp2(
             rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            import functools
+            # B7 fix: every rank already has the full checkpoint (see log above), so
+            # the default src_data_rank=0 triggers a redundant dist.scatter() that
+            # wastes bandwidth on CUDA and causes a driver D-state hang on XPU PCIe
+            # (Level Zero IPC not supported). src_data_rank=None → local split only,
+            # zero collective. Bit-identical losses verified on A100 across 5 models.
+            _dt_no_scatter = functools.partial(distribute_tensor, src_data_rank=None)
+            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=_dt_no_scatter)
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
@@ -595,7 +602,7 @@ def build_parallelize_model(
     parallel_state = get_parallel_state()
 
     if not parallel_state.fsdp_enabled:
-        if kwargs.get("init_device") not in ["cuda", "npu"]:
+        if kwargs.get("init_device") not in ["cuda", "npu", "xpu"]:
             raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
         if kwargs.pop("enable_fsdp_offload", False):
             raise ValueError("Only FSDP training supports `enable_fsdp_offload`.")

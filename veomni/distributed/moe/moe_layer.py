@@ -23,7 +23,7 @@ from .comm import all_to_all
 from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
 
 
-if not is_torch_npu_available():
+if not is_torch_npu_available() and torch.cuda.is_available():
     from ...ops.group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
 

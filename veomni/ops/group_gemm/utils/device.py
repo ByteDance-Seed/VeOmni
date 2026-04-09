@@ -21,6 +21,9 @@ from ....utils.device import get_device_name
 def get_device_key() -> str:
     import torch
 
+    if not torch.cuda.is_available():
+        return "unknown"
+
     if torch.cuda.get_device_capability() == (8, 0):
         return "A100"  # A30 is treated the same way as A100 for the moment.
 
