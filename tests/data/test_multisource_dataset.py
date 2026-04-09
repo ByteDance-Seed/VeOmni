@@ -1,7 +1,6 @@
 import argparse
 import copy
 import dataclasses
-import gc
 import os
 import subprocess
 import sys
@@ -188,7 +187,11 @@ class TrainerTest(BaseTrainer):
             dyn_bsz_dataset_save_by_idx=False,
             num_workers=1,
             drop_last=args.data.dataloader.drop_last,
-            pin_memory=args.data.dataloader.pin_memory,
+            # Force pin_memory=False: on NPU the pin_memory background thread
+            # races with HCCL teardown (triggered inside destroy_distributed)
+            # and aborts the process with SIGABRT. The test uses DummyDataset
+            # so pin_memory provides no benefit anyway.
+            pin_memory=False,
             prefetch_factor=args.data.dataloader.prefetch_factor,
         )
 
@@ -394,13 +397,6 @@ def _main_distributed_test():
         trainer.train()
         assert trainer.args.train.checkpoint.load_path is not None
         trainer.resume_train()
-        # Drop trainer and force GC so DataLoader workers / pin_memory thread
-        # exit before we tear down the process group. NPU/HCCL aborts if the
-        # ProcessGroup is destroyed while those threads are still alive.
-        del trainer
-        gc.collect()
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
 
 def _make_simple_dataset(
