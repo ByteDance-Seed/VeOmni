@@ -1,6 +1,7 @@
 import argparse
 import copy
 import dataclasses
+import gc
 import os
 import subprocess
 import sys
@@ -393,6 +394,13 @@ def _main_distributed_test():
         trainer.train()
         assert trainer.args.train.checkpoint.load_path is not None
         trainer.resume_train()
+        # Drop trainer and force GC so DataLoader workers / pin_memory thread
+        # exit before we tear down the process group. NPU/HCCL aborts if the
+        # ProcessGroup is destroyed while those threads are still alive.
+        del trainer
+        gc.collect()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def _make_simple_dataset(
