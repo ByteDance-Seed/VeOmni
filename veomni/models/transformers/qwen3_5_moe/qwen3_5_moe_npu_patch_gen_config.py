@@ -49,6 +49,7 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
+    apply_rotary_pos_emb_npu,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
@@ -101,6 +102,7 @@ config.add_post_import_block(
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "partial")
     veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
     veomni_load_balancing_loss = OpSlot("moe_load_balancing_loss", "standard")
 
@@ -525,6 +527,9 @@ config.override_method(
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
 )
 
+config.replace_function(
+    "apply_rotary_pos_emb", replacement=apply_rotary_pos_emb_npu, description="Use fused rotary embedding kernel"
+)
 
 # ── DecoderLayer forward ────────────────────────────────────────────────────────
 

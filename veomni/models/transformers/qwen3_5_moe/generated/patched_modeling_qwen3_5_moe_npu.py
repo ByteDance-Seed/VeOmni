@@ -37,6 +37,8 @@
 #      Shard depthwise conv1d weights for local heads under Ulysses SP
 #    - method_override: Qwen3_5MoeGatedDeltaNet.forward
 #      Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward
+#    - function_replacement: apply_rotary_pos_emb
+#      Use fused rotary embedding kernel
 #    - method_override: Qwen3_5MoeDecoderLayer.forward
 #      Extract and pass cu_seq_lens_q for varlen linear attention in Qwen3_5MoeDecoderLayer.forward
 #    - method_override: Qwen3_5MoeForConditionalGeneration.forward
@@ -90,6 +92,7 @@ veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
 veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "partial")
 veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
 veomni_load_balancing_loss = OpSlot("moe_load_balancing_loss", "standard")
 
@@ -779,7 +782,11 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# Adapted from transformers.models.glm.modular_glm.apply_rotary_pos_emb
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb
+# Reason: Use fused rotary embedding kernel
+# Source: veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
+# ======================================================================
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -800,6 +807,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    if veomni_apply_rotary_pos_emb.has_kernel:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
