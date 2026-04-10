@@ -645,6 +645,28 @@ class OpsImplementationConfig:
     )
 
     def __post_init__(self):
+        import torch
+
+        _on_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+
+        if _on_xpu:
+            # flash_attn / FA2/FA3/FA4 are CUDA-only; fall back to sdpa on XPU.
+            _fa_impls = {"flash_attention_2", "flash_attention_3", "flash_attention_4"}
+            if self.attn_implementation in _fa_impls:
+                logger.info_rank0(
+                    f"XPU detected: replacing attn_implementation '{self.attn_implementation}' with 'sdpa' "
+                    "(flash_attn is CUDA-only)."
+                )
+                self.attn_implementation = "sdpa"
+            # fused / fused_quack MoE kernels are CUDA-only; fall back to eager on XPU.
+            if self.moe_implementation in ("fused", "fused_quack"):
+                logger.info_rank0(
+                    f"XPU detected: replacing moe_implementation '{self.moe_implementation}' with 'eager' "
+                    "(fused MoE kernels are CUDA-only)."
+                )
+                self.moe_implementation = "eager"
+            return
+
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
