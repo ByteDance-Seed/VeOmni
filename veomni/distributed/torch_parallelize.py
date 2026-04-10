@@ -566,13 +566,12 @@ def parallelize_model_fsdp2(
             rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-            import functools
             # B7 fix: every rank already has the full checkpoint (see log above), so
             # the default src_data_rank=0 triggers a redundant dist.scatter() that
             # wastes bandwidth on CUDA and causes a driver D-state hang on XPU PCIe
             # (Level Zero IPC not supported). src_data_rank=None → local split only,
             # zero collective. Bit-identical losses verified on A100 across 5 models.
-            _dt_no_scatter = functools.partial(distribute_tensor, src_data_rank=None)
+            _dt_no_scatter = partial(distribute_tensor, src_data_rank=None)
             load_model_weights(model, weights_path, get_device_type(), dtensor_factory=_dt_no_scatter)
 
     # Register grad norm clipping method for FSDP2
