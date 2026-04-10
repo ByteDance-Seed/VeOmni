@@ -188,16 +188,44 @@ def _dispatch_parameter(
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
-    tensor = tensor.to(orig_tensor)
     if hasattr(orig_tensor, "device_mesh"):  # dtensor
         if orig_tensor.device.type == "cpu":
             raise ValueError("Cannot load dtensor on CPU.")
 
         device_mesh = orig_tensor.device_mesh
         placements = orig_tensor.placements
-        module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+        apply_npu_patch = False
+
+        if orig_tensor.device.type == "npu":
+            if parallel_plan is not None:
+                apply_npu_patch = True
+        
+        if apply_npu_patch:
+            local_device = orig_tensor.device
+            tensor = tensor.to(device=local_device, dtype=orig_tensor.dtype)
+            target_local = orig_tensor.to_local()
+            
+            for mesh_dim, p in enumerate(placements):
+                if p.__class__.__name__ == "Shard":
+                    shard_dim = p.dim
+                    my_mesh_rank = device_mesh.get_coordinate()[mesh_dim]
+                    world_size = device_mesh.size(mesh_dim)
+                    
+                    shards = tensor.chunk(world_size, dim=shard_dim)
+                    tensor = shards[my_mesh_rank].contiguous()
+
+            if target_local.shape == tensor.shape:
+                target_local.copy_(tensor)
+            else:
+                target_local.copy_(tensor.reshape(target_local.shape))
+                
+        else:
+            tensor = tensor.to(orig_tensor)
+            module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+            
     else:  # not dtensor
-        module._parameters[local_name].data.copy_(tensor)
+        tensor = tensor.to(device=orig_tensor.device, dtype=orig_tensor.dtype)
+        module._parameters[local_name].data.copy_(tensor.contiguous())
 
 
 def _dispatch_buffer(
