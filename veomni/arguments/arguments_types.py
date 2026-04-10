@@ -412,10 +412,10 @@ class TrainingArguments:
         default="main",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
+    init_device: Literal["cpu", "cuda", "meta", "npu", "xpu"] = field(
         default="cuda",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU. 5. `xpu`: Init parameters on Intel XPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
