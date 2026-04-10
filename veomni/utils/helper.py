@@ -248,7 +248,7 @@ class EnvironMeter:
         # cuda memory
         allocated_memory = get_torch_device().max_memory_allocated()
         reserved_memory = get_torch_device().max_memory_reserved()
-        num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
+        num_alloc_retries = get_torch_device().memory_stats().get("num_alloc_retries", 0)
         allocated_memory, reserved_memory, num_alloc_retries = all_reduce(
             (allocated_memory, reserved_memory, num_alloc_retries), op="max"
         )
