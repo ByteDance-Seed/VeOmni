@@ -117,9 +117,10 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
     """Build a model from toy config and save random weights to disk.
 
     This avoids downloading real model weights for CI tests.
+    Uses CPU for weight materialization regardless of device type — we only
+    need random weights on disk, no GPU computation required here.
     """
     from veomni.models.auto import build_foundation_model
-    from veomni.utils.device import get_device_type
 
     model = build_foundation_model(
         config_path=config_path,
@@ -127,7 +128,7 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
         torch_dtype="float32",
         attn_implementation="eager",
         moe_implementation="eager",
-        init_device=get_device_type(),
+        init_device="cpu",
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
 

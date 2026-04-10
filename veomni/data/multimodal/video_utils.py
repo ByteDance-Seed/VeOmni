@@ -22,7 +22,10 @@ import librosa
 import numpy as np
 import PIL
 import torch
-from torchcodec.decoders import VideoDecoder
+try:
+    from torchcodec.decoders import VideoDecoder
+except (ImportError, OSError, RuntimeError):
+    VideoDecoder = None
 from torchvision.transforms import InterpolationMode, functional
 
 from ...utils import logging
