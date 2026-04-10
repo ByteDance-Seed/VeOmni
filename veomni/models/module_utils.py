@@ -194,25 +194,33 @@ def _dispatch_parameter(
 
         device_mesh = orig_tensor.device_mesh
         placements = orig_tensor.placements
+        
+        # Workaround for Ascend NPU: Implicit DTensor redistribute collective sync 
+        # triggers critical HCCL deadlocks during FSDP initialization.
         apply_npu_patch = False
-
-        if orig_tensor.device.type == "npu":
-            if parallel_plan is not None:
-                apply_npu_patch = True
+        if orig_tensor.device.type == "npu" and parallel_plan is not None:
+            apply_npu_patch = True
         
         if apply_npu_patch:
-            local_device = orig_tensor.device
-            tensor = tensor.to(device=local_device, dtype=orig_tensor.dtype)
-            target_local = orig_tensor.to_local()
-            
+            # Step 1: Perform manual mathematical chunking on CPU first.
+            # This prevents NPU Out-Of-Memory (OOM) errors when dealing with large MoE parameters.
             for mesh_dim, p in enumerate(placements):
                 if p.__class__.__name__ == "Shard":
                     shard_dim = p.dim
                     my_mesh_rank = device_mesh.get_coordinate()[mesh_dim]
                     world_size = device_mesh.size(mesh_dim)
                     
+                    # Defensive check: ensure tensor size is sufficient for the requested world_size
+                    if tensor.size(shard_dim) < world_size:
+                        raise ValueError(f"Tensor size {tensor.size(shard_dim)} on dim {shard_dim} is too small for world_size {world_size} on mesh dimension {mesh_dim} for parameter {full_param_name}")
+                    
                     shards = tensor.chunk(world_size, dim=shard_dim)
-                    tensor = shards[my_mesh_rank].contiguous()
+                    tensor = shards[my_mesh_rank]
+
+            # Step 2: Safely move the sharded local chunk to the NPU physical device
+            # and perform a pure local copy to bypass dtensor_factory.
+            tensor = tensor.to(device=orig_tensor.device, dtype=orig_tensor.dtype).contiguous()
+            target_local = orig_tensor.to_local()
 
             if target_local.shape == tensor.shape:
                 target_local.copy_(tensor)
@@ -220,12 +228,8 @@ def _dispatch_parameter(
                 target_local.copy_(tensor.reshape(target_local.shape))
                 
         else:
-            tensor = tensor.to(orig_tensor)
-            module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
-            
-    else:  # not dtensor
-        tensor = tensor.to(device=orig_tensor.device, dtype=orig_tensor.dtype)
-        module._parameters[local_name].data.copy_(tensor.contiguous())
+            # Default execution path for GPUs or non-EP scenarios
+            tensor =
 
 
 def _dispatch_buffer(
