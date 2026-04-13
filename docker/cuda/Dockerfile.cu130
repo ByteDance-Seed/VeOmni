@@ -56,9 +56,16 @@ ENV UV_CACHE_DIR=/home/tiger/.cache/uv
 
 # Pre-populate uv download cache so that subsequent `uv sync` in any directory
 # can reuse it without re-downloading packages.
+# Both transformers forks (stable & v5-exp) are warmed to avoid re-downloads
 COPY pyproject.toml uv.lock /tmp/uv-warmup/
 RUN cd /tmp/uv-warmup && \
-    uv sync --locked --no-install-project --extra gpu --extra audio --dev && \
+    uv sync --locked --no-install-project \
+        --extra gpu --extra audio --extra dit --extra fa4 \
+        --extra megatron --extra trl --dev && \
+    uv sync --locked --no-install-project \
+        --no-group transformers-stable --extra transformers5-exp \
+        --extra gpu --extra audio --extra dit --extra fa4 \
+        --extra megatron --extra trl --dev && \
     rm -rf /tmp/uv-warmup
 
 USER root
