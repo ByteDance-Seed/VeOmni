@@ -94,6 +94,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Add new model | `/veomni-new-model` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
+| Performance profiling | `/veomni-profile` |
 
 ### Quick Decision Guide
 
@@ -102,3 +103,4 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
 - **"Update package X" / "bump uv" / "upgrade torch"** → `/veomni-uv-update`
+- **"Analyze this trace" / "why is training slow" / "profile" / "MFU"** → `/veomni-profile`
