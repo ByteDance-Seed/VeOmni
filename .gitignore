@@ -81,6 +81,9 @@ profile_default/
 ipython_config.py
 
 
+# pyenv / uv — each developer sets their own Python version locally
+.python-version
+
 # celery beat schedule file
 celerybeat-schedule
 
