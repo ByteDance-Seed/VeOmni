@@ -64,7 +64,7 @@ def apply_dcp_consolidation_patch():
 
     if not any(torch.__version__.startswith(v) for v in _SUPPORTED_TORCH_VERSIONS):
         raise RuntimeError(
-            f"DCP consolidation patch requires torch {'/'.join(v + '.x' for v in _SUPPORTED_TORCH_VERSIONS)}, "
+            f"DCP consolidation patch requires torch {', '.join(f'{v}.x' for v in _SUPPORTED_TORCH_VERSIONS)}, "
             f"but got {torch.__version__}. Please update the patch or verify compatibility."
         )
 
