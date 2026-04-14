@@ -21,6 +21,7 @@ from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
+from ..utils.import_utils import is_liger_kernel_available, is_torch_npu_available
 
 
 logger = logging.get_logger(__name__)
@@ -620,7 +621,15 @@ class TrainingArguments:
 
 @dataclass
 class OpsImplementationConfig:
-    """model.ops_implementation.* — Attention / MoE kernel implementation."""
+    """model.ops_implementation.* — Attention, MoE, and fused kernel implementation.
+
+    Each ``*_implementation`` field selects the kernel backend for that operation:
+    - ``"auto"`` (default): pick the best available backend (liger_kernel on GPU
+      if installed, triton on GPU, eager on NPU, etc.).
+    - ``"eager"``: PyTorch reference implementation.
+    - ``"liger_kernel"``: LigerKernel fused implementation (requires ``liger-kernel``).
+    - ``"triton"``: Triton fused implementation (GPU only).
+    """
 
     attn_implementation: Optional[
         Literal[
@@ -643,6 +652,51 @@ class OpsImplementationConfig:
             "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
         },
     )
+    cross_entropy_loss_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+        default="auto",
+        metadata={
+            "help": "Cross-entropy loss implementation. "
+            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
+            "'eager' uses PyTorch F.cross_entropy."
+        },
+    )
+    rms_norm_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+        default="auto",
+        metadata={
+            "help": "RMSNorm implementation. "
+            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'liger_kernel' uses LigerRMSNorm. "
+            "'eager' uses the HuggingFace default."
+        },
+    )
+    swiglu_mlp_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+        default="auto",
+        metadata={
+            "help": "SwiGLU MLP implementation. "
+            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'liger_kernel' uses LigerSwiGLUMLP. "
+            "'eager' uses the HuggingFace default."
+        },
+    )
+    rotary_pos_emb_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+        default="auto",
+        metadata={
+            "help": "Rotary positional embedding implementation. "
+            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'liger_kernel' uses liger_rotary_pos_emb. "
+            "'eager' uses the HuggingFace default."
+        },
+    )
+    load_balancing_loss_implementation: Literal["auto", "eager", "triton"] = field(
+        default="auto",
+        metadata={
+            "help": "MoE load-balancing loss implementation. "
+            "'auto' uses triton on GPU, eager on NPU. "
+            "'triton' uses a fused Triton kernel. "
+            "'eager' uses PyTorch reference."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
@@ -655,6 +709,37 @@ class OpsImplementationConfig:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
+
+        self._resolve_auto_implementations()
+
+    def _resolve_auto_implementations(self):
+        """Resolve ``"auto"`` to concrete backend names based on hardware and availability."""
+        npu = is_torch_npu_available()
+        liger = is_liger_kernel_available()
+
+        if self.cross_entropy_loss_implementation == "auto":
+            self.cross_entropy_loss_implementation = "liger_kernel" if (liger and not npu) else "eager"
+
+        if self.rms_norm_implementation == "auto":
+            self.rms_norm_implementation = "liger_kernel" if (liger and not npu) else "eager"
+
+        if self.swiglu_mlp_implementation == "auto":
+            self.swiglu_mlp_implementation = "liger_kernel" if (liger and not npu) else "eager"
+
+        if self.rotary_pos_emb_implementation == "auto":
+            self.rotary_pos_emb_implementation = "liger_kernel" if (liger and not npu) else "eager"
+
+        if self.load_balancing_loss_implementation == "auto":
+            self.load_balancing_loss_implementation = "eager" if npu else "triton"
+
+        if self.cross_entropy_loss_implementation == "liger_kernel" and not liger:
+            raise ValueError("cross_entropy_loss_implementation='liger_kernel' requires liger-kernel to be installed.")
+        if self.rms_norm_implementation == "liger_kernel" and not liger:
+            raise ValueError("rms_norm_implementation='liger_kernel' requires liger-kernel to be installed.")
+        if self.swiglu_mlp_implementation == "liger_kernel" and not liger:
+            raise ValueError("swiglu_mlp_implementation='liger_kernel' requires liger-kernel to be installed.")
+        if self.rotary_pos_emb_implementation == "liger_kernel" and not liger:
+            raise ValueError("rotary_pos_emb_implementation='liger_kernel' requires liger-kernel to be installed.")
 
 
 @dataclass

@@ -67,15 +67,21 @@ def load_balancing_loss_func(
     return _load_balancing_loss(gate_logits, num_experts, top_k, attention_mask)
 
 
-def apply_veomni_load_balancing_loss_patch():
-    """Select and bind the load balancing loss implementation."""
+def apply_veomni_load_balancing_loss_patch(load_balancing_loss_implementation: str = "triton"):
+    """Select and bind the load balancing loss implementation.
+
+    Args:
+        load_balancing_loss_implementation: ``"triton"`` or ``"eager"``.
+            Should already be resolved from ``"auto"`` by
+            ``OpsImplementationConfig._resolve_auto_implementations``.
+    """
     global _load_balancing_loss
 
-    if is_torch_npu_available():
+    if load_balancing_loss_implementation == "eager" or is_torch_npu_available():
         from .torch_native import load_balancing_loss_pytorch
 
         _load_balancing_loss = load_balancing_loss_pytorch
-        logger.info_rank0("Load balancing loss: using PyTorch eager (NPU) backend.")
+        logger.info_rank0("Load balancing loss: using PyTorch eager backend.")
     else:
         from .triton_kernel import load_balancing_loss_triton
 

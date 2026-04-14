@@ -1,25 +1,36 @@
 import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
 
+from ....ops.ops_config import get_ops_config
 from ....utils import logging
-from ....utils.env import get_env
-from ....utils.import_utils import is_liger_kernel_available
 
 
 logger = logging.get_logger(__name__)
 
 
 def apply_veomni_qwen3_gpu_patch():
-    # ================================================================
-    # PATCH: apply_rotary_pos_emb, Qwen3RMSNorm, Qwen3MLP
-    # 1. Patch with Liger Kernel
-    # ================================================================
-    if is_liger_kernel_available() and get_env("VEOMNI_USE_LIGER_KERNEL") == "1":
-        from liger_kernel.transformers.rms_norm import LigerRMSNorm
+    ops_config = get_ops_config()
+    if ops_config is None:
+        return
+
+    applied = []
+
+    if ops_config.rotary_pos_emb_implementation == "liger_kernel":
         from liger_kernel.transformers.rope import liger_rotary_pos_emb
-        from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
 
         hf_qwen3.apply_rotary_pos_emb = liger_rotary_pos_emb
-        hf_qwen3.Qwen3RMSNorm = LigerRMSNorm
-        hf_qwen3.Qwen3MLP = LigerSwiGLUMLP
+        applied.append("RoPE")
 
-        logger.info_rank0("Apply liger kernel to Qwen3.")
+    if ops_config.rms_norm_implementation == "liger_kernel":
+        from liger_kernel.transformers.rms_norm import LigerRMSNorm
+
+        hf_qwen3.Qwen3RMSNorm = LigerRMSNorm
+        applied.append("RMSNorm")
+
+    if ops_config.swiglu_mlp_implementation == "liger_kernel":
+        from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+
+        hf_qwen3.Qwen3MLP = LigerSwiGLUMLP
+        applied.append("SwiGLU")
+
+    if applied:
+        logger.info_rank0(f"Apply liger kernel to Qwen3: {', '.join(applied)}.")

@@ -12,12 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from ..utils import logging
 from ..utils.env import get_env
 from . import flash_attn, fused_cross_entropy, fused_load_balancing_loss, fused_moe
 from .fused_load_balancing_loss import load_balancing_loss_func
 from .fused_moe import fused_moe_forward
+from .ops_config import set_ops_config
 
+
+if TYPE_CHECKING:
+    from ..arguments.arguments_types import OpsImplementationConfig
 
 __all__ = [
     "fused_moe_forward",
@@ -37,22 +45,46 @@ def build_ALL_OPS():
 
 
 def apply_ops_patch():
-    import os
+    """Import-time ops patch: only registers attention implementations.
 
+    Loss, load-balancing, and MoE patches are deferred to
+    ``apply_ops_config()`` which is called after the YAML config is parsed
+    and ``OpsImplementationConfig`` is available.
+    """
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
     else:
         from .flash_attn import apply_veomni_attention_patch
-        from .fused_cross_entropy import apply_veomni_loss_patch
-        from .fused_load_balancing_loss import apply_veomni_load_balancing_loss_patch
 
         apply_veomni_attention_patch()
-        apply_veomni_loss_patch()
-        apply_veomni_load_balancing_loss_patch()
-        # NOTE: fused MoE patch is applied in build_foundation_model() based on
-        # the moe_implementation parameter, not at import time.
-        logger.info_rank0("✅ VeOmni ops patch applied.")
+        logger.info_rank0("✅ VeOmni attention patch applied.")
+
+
+def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
+    """Apply loss / load-balancing / model patches based on resolved config.
+
+    This must be called after ``OpsImplementationConfig`` is constructed
+    (i.e. after YAML parsing) and before ``build_foundation_model()``.
+    """
+    set_ops_config(ops_config)
+
+    modeling_backend = get_env("MODELING_BACKEND")
+    if modeling_backend == "hf":
+        return
+
+    from .fused_cross_entropy import apply_veomni_loss_patch
+    from .fused_load_balancing_loss import apply_veomni_load_balancing_loss_patch
+
+    apply_veomni_loss_patch(
+        cross_entropy_loss_implementation=ops_config.cross_entropy_loss_implementation,
+    )
+    apply_veomni_load_balancing_loss_patch(
+        load_balancing_loss_implementation=ops_config.load_balancing_loss_implementation,
+    )
+    # NOTE: fused MoE patch is applied in build_foundation_model() based on
+    # the moe_implementation parameter.
+    logger.info_rank0("✅ VeOmni ops config applied.")
 
 
 def format_kernel_functions() -> str:

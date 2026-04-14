@@ -16,9 +16,8 @@ import torch
 import transformers.models.deepseek_v3.modeling_deepseek_v3 as hf_deepseek_v3
 
 from ....ops.batch_invariant_ops import batch_invariant_rms_norm, triton_bmm
+from ....ops.ops_config import get_ops_config
 from ....utils import logging
-from ....utils.env import get_env
-from ....utils.import_utils import is_liger_kernel_available
 
 
 logger = logging.get_logger(__name__)
@@ -68,22 +67,34 @@ def _patch_rms_norm():
 
 
 def apply_veomni_deepseek_v3_gpu_patch():
-    if get_env("VEOMNI_USE_FUSED_KERNELS") == "0":
-        logger.info_rank0("Skip GPU kernel patch for deepseek_v3 (VEOMNI_USE_FUSED_KERNELS=0).")
-        return
-    if is_liger_kernel_available() and get_env("VEOMNI_USE_LIGER_KERNEL") == "1":
-        from liger_kernel.transformers.rms_norm import LigerRMSNorm
-        from liger_kernel.transformers.rope import liger_rotary_pos_emb
-        from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+    ops_config = get_ops_config()
 
-        hf_deepseek_v3.apply_rotary_pos_emb = liger_rotary_pos_emb
-        hf_deepseek_v3.DeepseekV3RMSNorm = LigerRMSNorm
-        hf_deepseek_v3.DeepseekV3MLP = LigerSwiGLUMLP
-        logger.info_rank0("Apply liger kernel to deepseek_v3.")
+    use_liger_rope = ops_config is not None and ops_config.rotary_pos_emb_implementation == "liger_kernel"
+    use_liger_rms = ops_config is not None and ops_config.rms_norm_implementation == "liger_kernel"
+    use_liger_swiglu = ops_config is not None and ops_config.swiglu_mlp_implementation == "liger_kernel"
+
+    if use_liger_rope or use_liger_rms or use_liger_swiglu:
+        applied = []
+        if use_liger_rope:
+            from liger_kernel.transformers.rope import liger_rotary_pos_emb
+
+            hf_deepseek_v3.apply_rotary_pos_emb = liger_rotary_pos_emb
+            applied.append("RoPE")
+        if use_liger_rms:
+            from liger_kernel.transformers.rms_norm import LigerRMSNorm
+
+            hf_deepseek_v3.DeepseekV3RMSNorm = LigerRMSNorm
+            applied.append("RMSNorm")
+        if use_liger_swiglu:
+            from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+
+            hf_deepseek_v3.DeepseekV3MLP = LigerSwiGLUMLP
+            applied.append("SwiGLU")
+        logger.info_rank0(f"Apply liger kernel to DeepSeek-V3: {', '.join(applied)}.")
     else:
         # Fused Triton kernels: deterministic RoPE bmm + batch-invariant RMSNorm.
         # Faster than native PyTorch and ensures numerical reproducibility
         # across different batch compositions (required for VeRL rollout matching).
         hf_deepseek_v3.DeepseekV3RotaryEmbedding.forward = _make_deterministic_rope_forward()
         _patch_rms_norm()
-        logger.info_rank0("Apply Triton RoPE and RMSNorm to deepseek_v3.")
+        logger.info_rank0("Apply Triton RoPE and RMSNorm to DeepSeek-V3.")

@@ -22,6 +22,7 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..models import build_foundation_model, build_processor
+from ..ops import apply_ops_config
 from ..optim import build_optimizer
 from ..utils import helper
 from ..utils.device import synchronize
@@ -133,6 +134,7 @@ class VLMTrainer:
     def _build_model(self):
         args: VeOmniVLMArguments = self.base.args
         logger.info_rank0("Build model")
+        apply_ops_config(args.model.ops_implementation)
         self.base.model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,

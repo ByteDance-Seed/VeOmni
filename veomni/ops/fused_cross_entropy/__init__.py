@@ -23,8 +23,7 @@ from transformers.loss.loss_utils import LOSS_MAPPING
 from ...distributed.parallel_state import get_parallel_state
 from ...distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ...utils import logging
-from ...utils.env import get_env
-from ...utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from ...utils.import_utils import is_torch_npu_available
 from .eager import eager_cross_entropy
 
 
@@ -294,7 +293,14 @@ def chunk_loss_function(
     return chunk_loss, None
 
 
-def apply_veomni_loss_patch():
+def apply_veomni_loss_patch(cross_entropy_loss_implementation: str = "eager"):
+    """Bind the cross-entropy loss implementation.
+
+    Args:
+        cross_entropy_loss_implementation: ``"liger_kernel"`` or ``"eager"``.
+            Should already be resolved from ``"auto"`` by
+            ``OpsImplementationConfig._resolve_auto_implementations``.
+    """
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
     LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
@@ -303,7 +309,7 @@ def apply_veomni_loss_patch():
         if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1":
             LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
         _cross_entropy = eager_cross_entropy
-    elif is_liger_kernel_available() and get_env("VEOMNI_USE_LIGER_KERNEL") == "1":
+    elif cross_entropy_loss_implementation == "liger_kernel":
         from .liger_kernel import fused_liger_kernel_cross_entropy
 
         _cross_entropy = fused_liger_kernel_cross_entropy

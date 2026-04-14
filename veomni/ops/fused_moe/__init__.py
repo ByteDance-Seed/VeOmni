@@ -17,7 +17,6 @@ from typing import Literal
 import torch
 
 from ...utils import logging
-from ...utils.env import get_env
 from ...utils.import_utils import (
     is_fused_moe_available,
     is_quack_gemm_available,
@@ -88,7 +87,7 @@ def apply_veomni_fused_moe_patch(
         from .quack_gemm import quack_gemm_fused_moe_forward
 
         _fused_moe_forward = quack_gemm_fused_moe_forward
-    elif moe_implementation == "fused" and is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
+    elif moe_implementation == "fused" and is_fused_moe_available():
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward

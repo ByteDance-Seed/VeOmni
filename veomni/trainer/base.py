@@ -57,6 +57,7 @@ from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import init_parallel_state
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
+from ..ops import apply_ops_config
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
@@ -237,6 +238,7 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_model(self):
         logger.info_rank0("Build model")
+        apply_ops_config(self.args.model.ops_implementation)
         self.model = build_foundation_model(
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,

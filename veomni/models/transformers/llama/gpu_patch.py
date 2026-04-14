@@ -14,26 +14,37 @@
 
 import transformers.models.llama.modeling_llama as hf_llama
 
+from ....ops.ops_config import get_ops_config
 from ....utils import logging
-from ....utils.env import get_env
-from ....utils.import_utils import is_liger_kernel_available
 
 
 logger = logging.get_logger(__name__)
 
 
 def apply_veomni_llama_gpu_patch():
-    # ================================================================
-    # PATCH: apply_rotary_pos_emb, LlamaRMSNorm, LlamaMLP
-    # 1. Patch with Liger Kernel
-    # ================================================================
-    if is_liger_kernel_available() and get_env("VEOMNI_USE_LIGER_KERNEL") == "1":
-        from liger_kernel.transformers.rms_norm import LigerRMSNorm
+    ops_config = get_ops_config()
+    if ops_config is None:
+        return
+
+    applied = []
+
+    if ops_config.rotary_pos_emb_implementation == "liger_kernel":
         from liger_kernel.transformers.rope import liger_rotary_pos_emb
-        from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
 
         hf_llama.apply_rotary_pos_emb = liger_rotary_pos_emb
-        hf_llama.LlamaRMSNorm = LigerRMSNorm
-        hf_llama.LlamaMLP = LigerSwiGLUMLP
+        applied.append("RoPE")
 
-        logger.info_rank0("Apply liger kernel to Llama.")
+    if ops_config.rms_norm_implementation == "liger_kernel":
+        from liger_kernel.transformers.rms_norm import LigerRMSNorm
+
+        hf_llama.LlamaRMSNorm = LigerRMSNorm
+        applied.append("RMSNorm")
+
+    if ops_config.swiglu_mlp_implementation == "liger_kernel":
+        from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+
+        hf_llama.LlamaMLP = LigerSwiGLUMLP
+        applied.append("SwiGLU")
+
+    if applied:
+        logger.info_rank0(f"Apply liger kernel to Llama: {', '.join(applied)}.")

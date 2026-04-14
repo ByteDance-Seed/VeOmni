@@ -127,12 +127,21 @@ Root config — assembles `model`, `data`, and `train`.
 
 ### OpsImplementationConfig
 
-`model.ops_implementation.*` — Attention and MoE kernel implementation.
+`model.ops_implementation.*` — Attention, MoE, and fused kernel implementation.
+
+Each `*_implementation` field selects the kernel backend for that operation.
+`"auto"` (default) picks the best available backend: `liger_kernel` on GPU
+if installed, `triton` on GPU, `eager` on NPU, etc.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]]` | `"flash_attention_2"` | Attention implementation to use. |
 | moe_implementation | `Optional[Literal["eager", "fused", "fused_quack"]]` | `None` | MoE implementation: `eager` (reference loop), `fused` (Triton), `fused_quack` (Quack CUTLASS, SM90+). |
+| cross_entropy_loss_implementation | `Literal["auto", "eager", "liger_kernel"]` | `"auto"` | Cross-entropy loss: `liger_kernel` for fused linear CE, `eager` for PyTorch. |
+| rms_norm_implementation | `Literal["auto", "eager", "liger_kernel"]` | `"auto"` | RMSNorm: `liger_kernel` for LigerRMSNorm, `eager` for HF default. |
+| swiglu_mlp_implementation | `Literal["auto", "eager", "liger_kernel"]` | `"auto"` | SwiGLU MLP: `liger_kernel` for LigerSwiGLUMLP, `eager` for HF default. |
+| rotary_pos_emb_implementation | `Literal["auto", "eager", "liger_kernel"]` | `"auto"` | Rotary pos emb: `liger_kernel` for liger_rotary_pos_emb, `eager` for HF default. |
+| load_balancing_loss_implementation | `Literal["auto", "eager", "triton"]` | `"auto"` | MoE load-balancing loss: `triton` for fused kernel, `eager` for PyTorch. |
 
 ### DataArguments
 
