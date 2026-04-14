@@ -11,24 +11,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_vl")
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_vl_text")
 def register_qwen2_5_vl_config():
-    from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, apply_veomni_qwen25_vl_patch
+    if is_transformers_version_greater_or_equal_to("5.2.0"):
+        from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 
-    apply_veomni_qwen25_vl_patch()
+        return Qwen2_5_VLConfig
+    else:
+        from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, apply_veomni_qwen25_vl_patch
 
-    return Qwen2_5_VLConfig
+        apply_veomni_qwen25_vl_patch()
+
+        return Qwen2_5_VLConfig
 
 
 @MODELING_REGISTRY.register("qwen2_5_vl")
 def register_qwen2_5_vl_modeling(architecture: str):
-    from .modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel, apply_veomni_qwen25_vl_patch
+    if is_transformers_version_greater_or_equal_to("5.2.0"):
+        from .generated.patched_modeling_qwen2_5_vl_gpu import (
+            Qwen2_5_VLForConditionalGeneration,
+            Qwen2_5_VLModel,
+        )
+    else:
+        from .modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
+            Qwen2_5_VLModel,
+            apply_veomni_qwen25_vl_patch,
+        )
 
-    apply_veomni_qwen25_vl_patch()
+        apply_veomni_qwen25_vl_patch()
 
     if "ForConditionalGeneration" in architecture:
         return Qwen2_5_VLForConditionalGeneration

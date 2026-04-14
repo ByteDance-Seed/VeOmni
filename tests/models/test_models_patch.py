@@ -277,6 +277,13 @@ _TEST_CASES_TRANSFORMERS_V5 = [
         _DEFAULT_ATOL,
         id="qwen2",
     ),
+    pytest.param(
+        "./tests/toy_config/qwen25vl_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2_5_vl",
+    ),
 ]
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
