@@ -1,13 +1,9 @@
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+b[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+.post[0-9]+"
+  release:
+    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,6 +27,7 @@ jobs:
 
   version-check:
     name: Verify tag matches package version
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +83,11 @@ jobs:
   build:
     name: Build distribution
     needs: [lint, version-check, sanity-check]
+    if: |
+      always()
+      && needs.lint.result == 'success'
+      && (needs.version-check.result == 'success' || needs.version-check.result == 'skipped')
+      && needs.sanity-check.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
