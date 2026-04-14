@@ -34,6 +34,7 @@ class BroadcastTestArguments:
     weights_path: str = ""
     device_type: str = get_device_type()
     backend: str = get_dist_comm_backend()
+    mode: str = "broadcast"  # "broadcast" | "load_weights"
 
 
 @dataclass
@@ -122,7 +123,6 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
         extra_parallel_names=args.train.accelerator.extra_parallel_names,
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
-        ep_outside=args.train.accelerator.ep_outside,
     )
 
     try:
@@ -229,6 +229,140 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
     assert result.returncode == 0
 
 
+def run_load_weights_test(args: Arguments) -> None:
+    """
+    Worker entrypoint for test_load_weights_no_scatter.
+
+    Verifies that load_model_weights (which now passes src_data_rank=None to
+    distribute_tensor) produces bit-for-bit identical parameters to a reference
+    single-rank load. This is the code path fixed in:
+    https://github.com/ByteDance-Seed/VeOmni/issues/637
+    """
+    weights_path = Path(args.test.weights_path)
+    if not weights_path.exists():
+        raise ValueError("`--test.weights_path` must point to an existing directory.")
+
+    get_torch_device().set_device(args.train.local_rank)
+    dist.init_process_group(backend=args.test.backend)
+
+    init_parallel_state(
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.train.accelerator.extra_parallel_names,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+    )
+
+    try:
+        # build_parallelize_model with weights_path triggers load_model_weights
+        # (the every-rank-reads-from-disk path, fixed in issue #637).
+        fsdp_model = build_parallelize_model(
+            TinyModel(),
+            weights_path=str(weights_path),
+            init_device=args.train.init_device,
+            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+            enable_gradient_checkpointing=False,
+            basic_modules=[],
+        )
+
+        reference_model = TinyModel().to(get_device_type())
+        load_model_weights(reference_model, str(weights_path), init_device=get_device_type())
+        reference_model = reference_model.cpu()
+
+        torch.testing.assert_close(
+            _clone_to_cpu(fsdp_model.get_input_embeddings().weight),
+            reference_model.get_input_embeddings().weight.detach().cpu(),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            _clone_to_cpu(fsdp_model.get_output_embeddings().weight),
+            reference_model.get_output_embeddings().weight.detach().cpu(),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            _clone_to_cpu(fsdp_model.linear1.weight),
+            reference_model.linear1.weight.detach().cpu(),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            _clone_to_cpu(fsdp_model.linear1.bias),
+            reference_model.linear1.bias.detach().cpu(),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            _clone_to_cpu(fsdp_model.linear2.weight),
+            reference_model.linear2.weight.detach().cpu(),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+        torch.testing.assert_close(
+            _clone_to_cpu(fsdp_model.buffer),
+            reference_model.buffer.detach().cpu(),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+        assert fsdp_model.get_input_embeddings().weight is fsdp_model.get_output_embeddings().weight
+
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+        from veomni.distributed import parallel_state as _ps
+
+        _ps._PARALLEL_STATE = None
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
+def test_load_weights_no_scatter(tmp_path: Path) -> None:
+    """
+    Regression test for https://github.com/ByteDance-Seed/VeOmni/issues/637.
+
+    Ensures load_model_weights with src_data_rank=None (all-ranks-read path)
+    loads bit-for-bit correct parameters into an FSDP2 model.
+    The rank0_load_and_broadcast_weights path is tested separately in
+    test_load_dist_model_weights_matches_standard.
+    """
+    checkpoint_dir = tmp_path / "ckpt"
+    weights_path = _write_checkpoint(checkpoint_dir)
+
+    world_size = 2
+    port = 12345 + random.randint(0, 100)
+    command = [
+        "torchrun",
+        f"--nproc_per_node={world_size}",
+        f"--master_port={port}",
+        "tests/utils/test_rank0_load_and_broadcast_weights.py",
+        "--model.config_path=test",
+        "--data.train_path=tests",
+        "--train.checkpoint.output_dir=.tests/cache",
+        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
+        "--train.init_device=meta",
+        "--train.accelerator.fsdp_config.mixed_precision.enable=False",
+        "--train.gradient_checkpointing.enable=False",
+        f"--test.weights_path={weights_path}",
+        f"--test.device_type={get_device_type()}",
+        f"--test.backend={get_dist_comm_backend()}",
+        "--test.mode=load_weights",
+    ]
+
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
 if __name__ == "__main__":
     args = parse_args(Arguments)
-    run_rank0_broadcast_test(args)
+    if getattr(args.test, "mode", "broadcast") == "load_weights":
+        run_load_weights_test(args)
+    else:
+        run_rank0_broadcast_test(args)

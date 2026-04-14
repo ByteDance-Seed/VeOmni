@@ -344,12 +344,10 @@ def parallelize_model_fsdp2(
     #        Apply embed parallelism (slice embed tensors [64,H] -> [16,H])
     if parallel_state.any_extra_parallel_enabled:
         parallel_plan = model.get_parallel_plan()
-        assert parallel_plan is not None, (
-            "ExtraParallel needs parallel plan defined in the model! \
+        assert parallel_plan is not None, "ExtraParallel needs parallel plan defined in the model! \
             Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
             Please see tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4 \
             for example of expert parallelism + embed parallelism."
-        )
         # Add SpecInfo to extra_parallel modules,
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
@@ -431,9 +429,9 @@ def parallelize_model_fsdp2(
         modules_to_ignore_in_mixed_precision = None
 
     if modules_to_ignore_in_mixed_precision:
-        assert isinstance(modules_to_ignore_in_mixed_precision, tuple), (
-            "modules_to_ignore_in_mixed_precision needs to be a tuple!"
-        )
+        assert isinstance(
+            modules_to_ignore_in_mixed_precision, tuple
+        ), "modules_to_ignore_in_mixed_precision needs to be a tuple!"
         mp_ignored_classes = modules_to_ignore_in_mixed_precision
         fsdp_kwargs_without_mp = dict(fsdp_kwargs)
         fsdp_kwargs_without_mp.pop("mp_policy", None)
@@ -566,7 +564,11 @@ def parallelize_model_fsdp2(
             rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            # Every rank independently reads the full checkpoint from disk, so dist.scatter() from
+            # rank 0 is redundant. src_data_rank=None performs a local tensor split with zero
+            # collective communication. See: https://github.com/ByteDance-Seed/VeOmni/issues/637
+            _dt_local_split = partial(distribute_tensor, src_data_rank=None)
+            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=_dt_local_split)
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
