@@ -1,0 +1,125 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+b[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+.post[0-9]+"
+
+permissions:
+  contents: read
+  id-token: write # Required for OIDC trusted publishing
+
+jobs:
+  # ── Pre-publish checks ─────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: Ruff check & format
+        run: |
+          ruff check tasks tests veomni docs
+          ruff format --check tasks tests veomni docs
+
+  version-check:
+    name: Verify tag matches package version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare git tag with __version__
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_VERSION="${TAG#v}"
+          PKG_VERSION=$(python -c "
+          import re, pathlib
+          text = pathlib.Path('veomni/_version.py').read_text()
+          m = re.search(r'__version__\s*=\s*[\"'']([^\"'']+)[\"'']', text)
+          print(m.group(1))
+          ")
+          echo "Git tag     : $TAG"
+          echo "Tag version : $TAG_VERSION"
+          echo "Package ver : $PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $TAG (version $TAG_VERSION) does not match __version__ ($PKG_VERSION) in veomni/_version.py"
+            exit 1
+          fi
+      - name: Reject dev versions
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          if echo "$TAG_VERSION" | grep -qE '\.dev[0-9]+'; then
+            echo "::error::Dev versions (e.g. $TAG_VERSION) must not be published to PyPI."
+            exit 1
+          fi
+
+  sanity-check:
+    name: Import sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify _version.py imports without side effects
+        run: python -c "from veomni._version import __version__; print('version:', __version__)"
+      - name: Verify PEP 440 compliance
+        run: |
+          pip install packaging
+          python -c "
+          from packaging.version import Version
+          from veomni._version import __version__
+          v = Version(__version__)
+          print(f'Normalized: {v}')
+          "
+
+  # ── Build ───────────────────────────────────────────────────────────
+  build:
+    name: Build distribution
+    needs: [lint, version-check, sanity-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: pip install build setuptools wheel
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Sanity-check built artifacts
+        run: |
+          pip install twine
+          twine check dist/*
+          echo "--- Built artifacts ---"
+          ls -lh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # ── Publish ─────────────────────────────────────────────────────────
+  publish:
+    name: Publish to PyPI
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/veomni/
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

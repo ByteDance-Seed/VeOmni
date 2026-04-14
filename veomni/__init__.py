@@ -28,4 +28,4 @@ def _apply_patches():
 
 _apply_patches()
 
-__version__ = "v0.1.0"
+from ._version import __version__
