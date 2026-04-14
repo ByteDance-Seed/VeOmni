@@ -11,6 +11,10 @@ For VLM models, there is also a lightweight trainer-level smoke test for `freeze
 
 3. **`tests/models/test_vlm_trainer.py`** — builds a real toy VLM model on CPU and checks that vision parameters stay trainable when `freeze_vit=False` and are frozen when `freeze_vit=True`
 
+For VLM / Omni models, an additional multi-GPU test covers the FSDP2 asymmetric-forward path:
+
+4. **`tests/distributed/test_dummy_forward.py`** — verifies rank-asymmetric multimodal batches (rank 0 has images/video/audio, others text-only) do not hang NCCL under FSDP2, exercising the model's `dummy_forward()` hook.
+
 ## 1. `tests/models/test_models_patch.py`
 
 ### What it tests
@@ -162,6 +166,42 @@ _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5 = [
 
 For transformers v4 VLMs, add to `_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4` instead.
 
+## 4. `tests/distributed/test_dummy_forward.py` (VLM / Omni only)
+
+### What it tests
+
+Launches a 2-GPU `torchrun` job under FSDP2. Rank 0 receives a multimodal
+batch (images + video, and audio for Omni); other ranks receive text-only.
+Both ranks must complete forward + backward without an NCCL timeout, which
+proves that the model's `dummy_forward()` hook (or equivalent) fires on
+text-only ranks so every rank participates in FSDP collectives.
+
+Any v5 migration that overrides `<M>VisionTransformerPretrainedModel.dummy_forward`
+(or similar) must add a v5 case here — this suite is the only coverage for
+that override on multi-GPU.
+
+### How to add a case
+
+Append a sibling entry to `_vlm_cases` (VLM) or `_omni_cases` (Omni) marked
+`_v5_only`, using a distinct `id` so pytest `-k` can disambiguate v4 vs v5:
+
+```python
+_vlm_cases = [
+    # ... existing v4 cases ...
+    pytest.param(
+        "<new_vlm_model>",
+        "./tests/toy_config/<new_vlm_model>_toy",
+        partial(_vlm_batch, patch_size=<P>),
+        id="<new_vlm_model>_v5",
+        marks=_v5_only,
+    ),
+]
+```
+
+`patch_size` must match the model's vision patch size (e.g. 14 for Qwen2.5-VL,
+16 for Qwen3-VL). Run with `pytest tests/distributed/test_dummy_forward.py -k <new_vlm_model>_v5`
+on a 2-GPU host.
+
 ## Checklist
 
 When adding a new v5 model, verify:
@@ -175,3 +215,5 @@ When adding a new v5 model, verify:
 - [ ] `pytest --collect-only -k <model>` shows expected test cases
 - [ ] Tests pass: `pytest tests/models/test_models_patch.py -k <model>` and `pytest tests/e2e/test_e2e_parallel.py -k <model>`
 - [ ] For VLM models, `pytest tests/models/test_vlm_trainer.py -k <model>` passes
+- [ ] For VLM / Omni models, a `_v5_only` sibling added to `_vlm_cases` / `_omni_cases` in `tests/distributed/test_dummy_forward.py` (required on any model that overrides `dummy_forward`)
+- [ ] `pytest tests/distributed/test_dummy_forward.py -k <model>_v5` passes on 2 GPUs
