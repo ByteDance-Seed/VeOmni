@@ -187,7 +187,11 @@ class TrainerTest(BaseTrainer):
             dyn_bsz_dataset_save_by_idx=False,
             num_workers=1,
             drop_last=args.data.dataloader.drop_last,
-            pin_memory=args.data.dataloader.pin_memory,
+            # Force pin_memory=False: on NPU the pin_memory background thread
+            # races with HCCL teardown (triggered inside destroy_distributed)
+            # and aborts the process with SIGABRT. The test uses DummyDataset
+            # so pin_memory provides no benefit anyway.
+            pin_memory=False,
             prefetch_factor=args.data.dataloader.prefetch_factor,
         )
 
