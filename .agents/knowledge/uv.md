@@ -9,7 +9,7 @@ Pinned to a specific version for reproducibility. **Three locations must stay in
 | Location | Format |
 |----------|--------|
 | `pyproject.toml` -> `[tool.uv]` -> `required-version` | `"==X.Y.Z"` |
-| `docker/cuda/Dockerfile.cu129` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
+| `docker/cuda/Dockerfile.cu130` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
 | `docker/ascend/Dockerfile.*` | same pattern |
 
 ## Dependency Layout
@@ -18,7 +18,7 @@ Pinned to a specific version for reproducibility. **Three locations must stay in
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
 ├── [project.optional-dependencies]     Hardware & feature extras
-│   ├── gpu          torch 2.9.1+cu129, flash-attn, liger-kernel, etc.
+│   ├── gpu          torch 2.10.0+cu130, flash-attn, liger-kernel, etc.
 │   ├── npu          torch 2.7.1+cpu, torch-npu
 │   ├── npu_aarch64  torch 2.7.1 (native)
 │   ├── audio/video  torchcodec, av, librosa, soundfile

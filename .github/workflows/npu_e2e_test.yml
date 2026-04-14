@@ -87,9 +87,13 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/0.11.2/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra npu --extra audio --group dev
+          uv sync --python 3.11 --frozen --extra npu --extra audio --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -101,8 +105,8 @@ jobs:
           uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
       - name: Sync dependencies [transformers-v5]
         run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
-      - name: Run e2e tests [transformers-v5]
+          uv sync --python 3.11 --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
+      - name: Run models tests [transformers-v5]
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
       - name: Run FSDP equivalence tests [transformers-v5]

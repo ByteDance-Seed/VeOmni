@@ -16,7 +16,7 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
 uv is pinned to a specific version. Update **all three locations** together:
 
 1. `pyproject.toml` -> `[tool.uv]` -> `required-version = "==X.Y.Z"`
-2. `docker/cuda/Dockerfile.cu129` -> `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z`
+2. `docker/cuda/Dockerfile.cu130` -> `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z`
 3. `docker/ascend/Dockerfile.ascend_*` -> same pattern (if present)
 
 Then regenerate the lockfile:

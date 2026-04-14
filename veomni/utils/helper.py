@@ -419,10 +419,13 @@ def enable_full_determinism(seed: int):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
-    # Enable CUDNN deterministic mode
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.enabled = False
+    # torch.use_deterministic_algorithms(True) already ensures deterministic cudnn algorithm
+    # refer: https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
+    #       & https://pytorch.org/docs/stable/notes/randomness.html
+    if not torch.backends.flags_frozen():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.enabled = False
 
     if IS_NPU_AVAILABLE:
         torch.npu.manual_seed(seed)

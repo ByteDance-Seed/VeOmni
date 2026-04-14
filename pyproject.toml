@@ -11,7 +11,7 @@ name = "veomni"
 dynamic = ["version"]
 description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
 readme = "README.md"
-requires-python = ">=3.11, <3.12"
+requires-python = ">=3.11, <3.13"
 license = { file = "LICENSE" }
 authors = [
   { name="ByteDance-Seed", email="doubao-llm@bytedance.com" },
@@ -45,21 +45,21 @@ dev = [
 ]
 audio = [
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=15.0.0,<17.0.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 # Alias for audio extra - includes both video and audio processing dependencies
 video = [
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=15.0.0,<17.0.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
   "diffusers==0.36.0",
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=15.0.0,<17.0.0",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
   "ftfy",
@@ -83,17 +83,17 @@ npu = [
   "torchcodec>=0.4.0,<0.6.0"
 ]
 gpu = [
-  "torch==2.9.1+cu129",
-  "torchvision==0.24.1+cu129",
-  "torchaudio==2.9.1+cu129",
-  "nvidia-cusparselt-cu12",
-  "nvidia-nccl-cu12",
+  "torch==2.10.0+cu130",
+  "torchvision==0.25.0+cu130",
+  "torchaudio==2.10.0+cu130",
+  "nvidia-cusparselt-cu13",
+  "nvidia-nccl-cu13",
   "liger-kernel",
   "flash-attn",
   "flash-attn-3",
   "hf_transfer",
-  "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
-  "cuda-python==12.9.1",
+  "torchcodec==0.10.0", # 0.10.0 is compatible with torch 2.10
+  "cuda-python==13.0.1",
   "torch-c-dlpack-ext",
   # For models with linear attention like Qwen 3.5
   "flash-linear-attention",
@@ -158,7 +158,7 @@ transformers-stable = [
 # NOTE 1: Update this at least once per month as uv releases new version every week.
 # NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
 #         version and release new docker images.
-required-version = "==0.9.8"
+required-version = "==0.11.2"
 no-build-isolation-package = [
     "flash-attn",
     "flash-attn-3",
@@ -173,12 +173,12 @@ default-groups = ["transformers-stable"]
 override-dependencies = [
     # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
-    # PyPI without using the cu128 versions.
+    # PyPI without using the cu130 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
-    "torch==2.9.1+cu129; (extra == 'gpu')",
-    "torchaudio==2.9.1+cu129; (extra == 'gpu')",
-    "torchvision==0.24.1+cu129; (extra == 'gpu')",
-    "torchcodec==0.8.1; (extra == 'gpu')",
+    "torch==2.10.0+cu130; (extra == 'gpu')",
+    "torchaudio==2.10.0+cu130; (extra == 'gpu')",
+    "torchvision==0.25.0+cu130; (extra == 'gpu')",
+    "torchcodec==0.10.0; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
@@ -196,10 +196,6 @@ override-dependencies = [
     # from the dependency tree. The version pinning is now handled by the
     # "transformers-stable" default dependency group + conflicts declaration.
 
-    # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
-    # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
-    # TODO: remove this override after we upgrade to torch 2.10.
-    "nvidia-cudnn-cu12==9.15.1.9",
 ]
 
 conflicts = [
@@ -221,34 +217,34 @@ conflicts = [
 # To support override-dependencies for multiple extras, one package can only have one index.
 # Using pytorch index for all variants since it has both regular and +cpu versions
 torch = [
-  { index = "pytorch", marker = "(extra == 'npu' or extra == 'npu_aarch64')" },
+  { index = "pytorch", marker = "extra == 'npu' or extra == 'npu_aarch64'" },
   # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
   # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
   # those nvidia packages.
   #
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
-  # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
+  # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THESE TO THE CORRESPONDING WHEEL URLS.
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.10.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.10.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "python_version == '3.12'" },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Download fa2 and fa3 wheels directly to avoid build issues.
 flash-attn = [
-  # torch 2.9+cu129
-  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.9+.
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"},
+  # torch 2.10+cu130
+  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.10+.
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp311-cp311-linux_x86_64.whl", extra = "gpu", marker = "python_version == '3.11'"},
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl", extra = "gpu", marker = "python_version == '3.12'"},
 ]
 flash-attn-3 = [
-  # torch 2.9+cu129
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
+  # torch 2.10+cu130
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.8.2/flash_attn_3-3.0.0%2Bcu130torch2.10gite2743ab-cp39-abi3-linux_x86_64.whl", extra = "gpu"},
 ]
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
 # Pinned to 03/18/2026 latest main commit.
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 
-# Download av wheel directly to avoid FFmpeg build dependency issues in CI.
-av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video' or extra == 'dit'" }
 
 [[tool.uv.index]]
 name = "pytorch"

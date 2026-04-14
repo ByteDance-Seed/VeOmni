@@ -29,8 +29,8 @@ import types
 
 _dcp_consolidation_patch_applied = False
 
-# Fixed torch version for this patch - update when upgrading torch
-_REQUIRED_TORCH_VERSION = "2.9"
+# Minimum torch version for this patch - update when upgrading torch
+_SUPPORTED_TORCH_VERSIONS = ("2.9", "2.10")
 
 
 def apply_dcp_consolidation_patch():
@@ -59,12 +59,12 @@ def apply_dcp_consolidation_patch():
     if _dcp_consolidation_patch_applied:
         return
 
-    # Verify torch version matches exactly
+    # Verify torch version is supported
     import torch
 
-    if not torch.__version__.startswith(_REQUIRED_TORCH_VERSION):
+    if not any(torch.__version__.startswith(v) for v in _SUPPORTED_TORCH_VERSIONS):
         raise RuntimeError(
-            f"DCP consolidation patch requires torch {_REQUIRED_TORCH_VERSION}.x, "
+            f"DCP consolidation patch requires torch {', '.join(f'{v}.x' for v in _SUPPORTED_TORCH_VERSIONS)}, "
             f"but got {torch.__version__}. Please update the patch or verify compatibility."
         )
 
@@ -72,13 +72,13 @@ def apply_dcp_consolidation_patch():
 
     if not hasattr(hf_module, "_process_output_file"):
         raise RuntimeError(
-            f"torch.distributed.checkpoint._consolidate_hf_safetensors does not have "
-            f"_process_output_file attribute. Please verify torch {_REQUIRED_TORCH_VERSION}.x compatibility."
+            "torch.distributed.checkpoint._consolidate_hf_safetensors does not have "
+            "_process_output_file attribute. Please verify torch compatibility."
         )
 
     # Define the replacement function logic
     # This is a modified version of torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
-    # Original: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
+    # Original: https://github.com/pytorch/pytorch/blob/v2.10.0/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
     # Key change: Use append mode ("ab") instead of read-write mode ("r+b") for HDFS FUSE compatibility
     def _process_output_file_impl(output_file, output_data, input_files_data):
         sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
