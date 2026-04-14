@@ -77,6 +77,54 @@ def get_object_source(obj: Any) -> str:
         return ""
 
 
+def get_object_source_with_leading_comments(obj: Any) -> str:
+    """Get object source including contiguous leading ``#`` comment lines.
+
+    ``inspect.getsource`` starts at the first decorator and drops any comment
+    block sitting directly above it. Patch config files use those blocks to
+    document *why* a patch exists (e.g. the numbered ``Patch.N`` headers), so
+    we rewind through preceding comment/blank lines and prepend them.
+    """
+    try:
+        src_lines, start_lineno = inspect.getsourcelines(obj)
+        source_file = inspect.getsourcefile(obj)
+    except (OSError, TypeError):
+        return ""
+
+    if not source_file:
+        return "".join(src_lines)
+
+    try:
+        with open(source_file) as f:
+            all_lines = f.readlines()
+    except OSError:
+        return "".join(src_lines)
+
+    # start_lineno is 1-indexed; walk backwards collecting contiguous
+    # comment and blank lines (stop at any code line).
+    idx = start_lineno - 1
+    actual_start = idx
+    while actual_start > 0:
+        raw = all_lines[actual_start - 1].rstrip("\n")
+        stripped = raw.strip()
+        if stripped == "":
+            actual_start -= 1
+            continue
+        # Only absorb comments that sit at column 0 — otherwise we'd cross
+        # into the previous function's indented trailing comments.
+        if raw.startswith("#"):
+            actual_start -= 1
+            continue
+        break
+
+    leading = all_lines[actual_start:idx]
+    # Trim leading pure-blank lines so the block hugs the definition.
+    while leading and leading[0].strip() == "":
+        leading.pop(0)
+
+    return "".join(leading) + "".join(src_lines)
+
+
 def extract_source_segment(source_lines: list[str], start_line: int, end_line: int) -> str:
     """
     Extract a segment of source code from source lines, preserving comments and blank lines.
@@ -275,6 +323,41 @@ def strip_patch_decorators(source: str) -> str:
     return "\n".join(filtered_lines)
 
 
+def _split_leading_comments(source: str) -> tuple[list[str], str]:
+    """Split ``source`` into (leading comment lines, rest starting at def/decorator).
+
+    Used to relocate the patch-header comment block *above* the HF decorators
+    when injecting a replacement method into a class.
+    """
+    lines = source.splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(("def ", "async def ", "@", "class ")):
+            break
+        i += 1
+    leading = lines[:i]
+    while leading and leading[-1].strip() == "":
+        leading.pop()
+    return leading, "\n".join(lines[i:])
+
+
+def _collapse_blank_lines(source: str, max_consecutive: int = 2) -> str:
+    """Collapse runs of more than ``max_consecutive`` blank lines."""
+    lines = source.splitlines()
+    out: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run <= max_consecutive:
+                out.append(line)
+        else:
+            blank_run = 0
+            out.append(line)
+    return "\n".join(out)
+
+
 def _apply_name_map(source: str, name_map: dict[str, str] | None) -> str:
     """Apply text substitutions from *name_map* to *source*.
 
@@ -471,7 +554,7 @@ class ModelingCodeGenerator:
 
         if patch.replacement:
             # Get source of replacement class (preserves comments)
-            replacement_source = get_object_source(patch.replacement)
+            replacement_source = get_object_source_with_leading_comments(patch.replacement)
             if replacement_source:
                 # Rename the class to match original using simple text replacement
                 replacement_source = textwrap.dedent(replacement_source)
@@ -522,8 +605,8 @@ class ModelingCodeGenerator:
         if not patch.replacement:
             return class_node, "", False
 
-        # Get source of replacement method (preserves comments)
-        replacement_source = get_object_source(patch.replacement)
+        # Get source of replacement method (preserves leading comment block too)
+        replacement_source = get_object_source_with_leading_comments(patch.replacement)
         if not replacement_source:
             return class_node, "", False
 
@@ -600,7 +683,7 @@ class ModelingCodeGenerator:
         lines.append(f"# {'=' * 70}")
 
         if patch.replacement:
-            replacement_source = get_object_source(patch.replacement)
+            replacement_source = get_object_source_with_leading_comments(patch.replacement)
             if replacement_source:
                 replacement_source = textwrap.dedent(replacement_source)
                 replacement_source = _apply_name_map(replacement_source, patch.name_map)
@@ -702,7 +785,7 @@ class ModelingCodeGenerator:
 
         if method_node:
             # Replace existing method body while preserving untouched class formatting.
-            method_start = method_node.lineno - 1  # 0-indexed
+            method_start = method_node.lineno - 1  # 0-indexed; `def` line
             method_end = (
                 method_node.end_lineno
                 if hasattr(method_node, "end_lineno") and method_node.end_lineno
@@ -714,8 +797,27 @@ class ModelingCodeGenerator:
             else:
                 method_indent = class_indent + 4
 
-            indented_preserved_lines = self._indent_preserved_source(preserved_source, method_indent)
-            new_source_lines = source_lines[:method_start] + indented_preserved_lines + source_lines[method_end:]
+            # Place patch-header comments *above* the decorators rather than
+            # between `@decorator` lines and `def`. Decorators from the HF
+            # source (e.g. `@capture_outputs`) stay in place.
+            leading_lines, def_source = _split_leading_comments(preserved_source)
+            indented_leading = (
+                self._indent_preserved_source("\n".join(leading_lines), method_indent) if leading_lines else []
+            )
+            indented_def = self._indent_preserved_source(def_source, method_indent)
+
+            if method_node.decorator_list:
+                decorator_start = min(d.lineno for d in method_node.decorator_list) - 1
+            else:
+                decorator_start = method_start
+
+            new_source_lines = (
+                source_lines[:decorator_start]
+                + indented_leading
+                + source_lines[decorator_start:method_start]
+                + indented_def
+                + source_lines[method_end:]
+            )
             return "\n".join(new_source_lines)
 
         # If the method does not exist, inject it while preserving class formatting.
@@ -859,6 +961,7 @@ class ModelingCodeGenerator:
 
         # 4. Join and format output
         output = "\n".join(output_parts)
+        output = _collapse_blank_lines(output, max_consecutive=2)
 
         # 5. Write to file if path provided
         if output_path:
