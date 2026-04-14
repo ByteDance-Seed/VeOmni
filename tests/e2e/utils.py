@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from ..tools import DummyDataset as DummyDataset
-from ..tools import ParallelConfig, build_torchrun_cmd
+from ..tools import ParallelConfig
 
 
 def parse_training_log(log_content) -> pd.DataFrame:
@@ -103,8 +103,12 @@ def prepare_exec_cmd(
     output_dir: str,
     is_moe: bool,
     max_sp_size: int | None = None,
-) -> list[tuple[str, list[str]]]:
-    """Build torchrun commands for every (task, parallel-mode) combination.
+) -> list[tuple[str, dict]]:
+    """Prepare torchrun command kwargs for every (task, parallel-mode) combination.
+
+    Port allocation is deferred to execution time to avoid TOCTOU races —
+    the caller must pass each dict to ``build_torchrun_cmd(**kwargs)`` right
+    before ``subprocess.run()``.
 
     Args:
         test_tasks: Script basenames under tests/train_scripts/ to run (e.g. ["train_text_test"]).
@@ -118,8 +122,8 @@ def prepare_exec_cmd(
             Use 1 to skip sp=2 when the model does not support sequence parallelism yet.
 
     Returns:
-        List of (task_name, command) tuples, where command is a list of strings
-        suitable for subprocess.run.
+        List of (task_name, cmd_kwargs) tuples, where cmd_kwargs is a dict of
+        keyword arguments for :func:`build_torchrun_cmd`.
     """
     model_modes: list[ParallelMode] = _base_model_modes() if not is_moe else _moe_model_modes()
     if max_sp_size is not None:
@@ -129,16 +133,15 @@ def prepare_exec_cmd(
     for task in test_tasks:
         for mode in model_modes:
             task_name = f"{model_name}_{task}_{mode}"
-            parallel_config = ParallelConfig(sp_size=mode.sp_size, ep_size=mode.ep_size, fsdp_mode="fsdp2")
-            command = build_torchrun_cmd(
+            cmd_kwargs = dict(
                 script=f"tests/train_scripts/{task}.py",
                 config_path=config_path,
                 model_path=model_path,
                 train_path=train_path,
                 output_dir=os.path.join(output_dir, task_name),
-                parallel_config=parallel_config,
+                parallel_config=ParallelConfig(sp_size=mode.sp_size, ep_size=mode.ep_size, fsdp_mode="fsdp2"),
                 nproc=mode.sp_size * 4,
             )
-            command_list.append((task_name, command))
+            command_list.append((task_name, cmd_kwargs))
 
     return command_list
