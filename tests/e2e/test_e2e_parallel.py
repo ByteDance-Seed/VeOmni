@@ -10,7 +10,7 @@ from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
-from ..tools import DummyDataset, compare_metrics, print_comparison_table
+from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
 from .utils import prepare_exec_cmd
 
 
@@ -71,8 +71,9 @@ def main(
     )
     res = {}
     log_keys = []
-    for task_name, cmd in command_list:
+    for task_name, cmd_kwargs in command_list:
         print(f"{'-' * 10} {task_name} {'-' * 10}")
+        cmd = build_torchrun_cmd(**cmd_kwargs)
         subprocess.run(cmd, check=True)
         with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
             output = json.load(f)
