@@ -5,9 +5,13 @@ on:
   push:
     branches:
       - main
+  workflow_call:
 
 permissions:
   contents: read
+
+env:
+  RUFF_VERSION: "0.13.2"
 
 jobs:
   check_pr_lint:
@@ -16,16 +20,26 @@ jobs:
       matrix:
         python-version: ["3.12"]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           path: .
-      - uses: actions/setup-python@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==${{ env.RUFF_VERSION }}
 
-      - name: Run ruff format and check
+      - name: Run ruff lint and format check
         run: |
-          pwd && ls -la
-          ruff check tasks tests veomni docs
-          ruff format --check tasks tests veomni docs
+          failed=0
+          ruff check tasks tests veomni docs || failed=1
+          ruff format --check tasks tests veomni docs || failed=1
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "=========================================="
+            echo "  Fix: run 'make style && make quality'"
+            echo "  Ruff version: ${{ env.RUFF_VERSION }}"
+            echo "=========================================="
+            exit 1
+          fi

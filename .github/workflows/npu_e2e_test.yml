@@ -33,7 +33,11 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    uses: ./.github/workflows/check_pr_lint.yml
+
   npu_e2e_tests:
+    needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
     runs-on: [self-hosted, npu-0]
