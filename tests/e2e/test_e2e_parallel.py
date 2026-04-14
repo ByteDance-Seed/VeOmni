@@ -194,6 +194,14 @@ qwen2vl_test_cases = [
         _DEFAULT_ATOL,
         marks=_v4_only,
     ),
+    pytest.param(
+        "qwen25vl",
+        "./tests/toy_config/qwen25vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v5_only,
+    ),
 ]
 
 qwen3vl_test_cases = [
