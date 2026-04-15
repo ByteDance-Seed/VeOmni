@@ -67,15 +67,13 @@ jobs:
       CI_DATASET_DIR: "/github/home/dataset"
 
     steps:
-      - name: Configure NPU device visibility
+      - name: Set NPU visible devices
         run: |
-          if echo "$RUNNER_NAME" | grep -qi "npu-1"; then
-            DEVICES="8,9,10,11,12,13,14,15"
-          else
-            DEVICES="0,1,2,3,4,5,6,7"
+          if [[ "$RUNNER_NAME" == *npu0* ]]; then
+            echo "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" >> $GITHUB_ENV
+          elif [[ "$RUNNER_NAME" == *npu1* ]]; then
+            echo "ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15" >> $GITHUB_ENV
           fi
-          echo "ASCEND_RT_VISIBLE_DEVICES=$DEVICES" >> $GITHUB_ENV
-          echo "Configured ASCEND_RT_VISIBLE_DEVICES=$DEVICES for runner $RUNNER_NAME"
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
