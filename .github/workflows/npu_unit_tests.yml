@@ -65,6 +65,15 @@ jobs:
       CI_SAMPLES_DIR: "/data00/assets/samples"
 
     steps:
+      - name: Configure NPU device visibility
+        run: |
+          if echo "$RUNNER_NAME" | grep -qi "npu-1"; then
+            DEVICES="8,9,10,11,12,13,14,15"
+          else
+            DEVICES="0,1,2,3,4,5,6,7"
+          fi
+          echo "ASCEND_RT_VISIBLE_DEVICES=$DEVICES" >> $GITHUB_ENV
+          echo "Configured ASCEND_RT_VISIBLE_DEVICES=$DEVICES for runner $RUNNER_NAME"
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
