@@ -256,6 +256,11 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
 
+    # ================================================================
+    # Patch: Qwen2_5_VLVisionAttention.forward
+    # 1. accept precomputed max_seqlen from outer forward to avoid
+    #    per-layer `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -341,6 +346,11 @@ class Qwen2_5_VLVisionBlock(GradientCheckpointingLayer):
         self.attn = Qwen2_5_VLVisionAttention(config=config)
         self.mlp = Qwen2_5_VLMLP(config, bias=True)
 
+    # ================================================================
+    # Patch: Qwen2_5_VLVisionBlock.forward
+    # 1. thread the precomputed max_seqlen down into the attention call
+    #    (paired with the Qwen2_5_VLVisionAttention.forward patch above)
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -501,6 +511,18 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
         return window_index, cu_window_seqlens
 
+    # ================================================================
+    # Patch: Qwen2_5_VisionTransformerPretrainedModel.forward
+    # 1. SP all-to-all to get full-seq hidden_states for window attention
+    #    (gather_seq_scatter_heads / gather_heads_scatter_seq around the
+    #    window-index permutation + merger fill-back)
+    # 2. SP-pad cu_seqlens / cu_window_seqlens / position embeddings so the
+    #    padded tokens participate in a valid attention window
+    # 3. precompute max_seqlen / win_max_seqlen here (once) to avoid
+    #    per-layer CPU-GPU sync inside Qwen2_5_VLVisionAttention.forward
+    # 4. return BaseModelOutputWithPooling (v5 contract: last_hidden_state =
+    #    pre-merger tokens, pooler_output = post-merger tokens)
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     def forward(
@@ -619,6 +641,14 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         )
         # --- Patch.4 ---
 
+    # ================================================================
+    # Patch: Qwen2_5_VisionTransformerPretrainedModel.dummy_forward (new)
+    # 1. add dummy_forward so ranks without pixel_values can still run the
+    #    visual encoder under FSDP — otherwise reduce-scatter hangs when
+    #    some ranks get None pixel_values while others have real images.
+    # 2. SP-aware shape: grid_thw width is scaled by sp_size so the cached
+    #    dummy batch stays a clean multiple after sequence slicing.
+    # ================================================================
     def dummy_forward(self):
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
@@ -1348,6 +1378,14 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         return vision_outputs
 
+    # ================================================================
+    # Patch: Qwen2_5_VLModel.get_placeholder_mask
+    # 1. return raw (image_mask, video_mask) bool tensors without the
+    #    HF v5 `inputs_embeds` / `*_features` shape-validation branch —
+    #    VeOmni needs the masks on the *full* all-gathered input_ids,
+    #    which have a different seq-len than the SP-sliced inputs_embeds.
+    # Signature keeps the v5 kwargs so any HF-internal caller still works.
+    # ================================================================
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
@@ -1400,6 +1438,25 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             position_ids = None
         return position_ids
 
+    # ================================================================
+    # Patch: Qwen2_5_VLModel.forward
+    # 1. Ulysses SP scatter/gather around the visual-embed masked_scatter
+    #    (gather_seq_scatter_heads on inputs_embeds + image/video embeds,
+    #    gather_heads_scatter_seq after fill-back)
+    # 2. precomputed image/video masks: use kwargs["image_mask"/"video_mask"]
+    #    when provided by the VeOmni data pipeline; otherwise all-gather
+    #    input_ids across SP group and recompute masks on the full sequence
+    # 3. pop ViT-incompatible flash-attn kwargs (cu_seq_lens_q/k,
+    #    max_length_q/k) before calling ViT/visual; restore onto the
+    #    language-model kwargs afterwards
+    # 4. FSDP dummy_forward branch when pixel_values / pixel_values_videos
+    #    are None on this rank — keeps visual params on the FSDP all-reduce
+    #    graph via fake_embeds * 0
+    # 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
+    # 6. v5 visual return contract: get_image_features / get_video_features
+    #    now return BaseModelOutputWithPooling whose pooler_output is a
+    #    tuple[per-image tensor] — concat into a single tensor
+    # ================================================================
     @auto_docstring
     def forward(
         self,
@@ -1644,6 +1701,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         """
         return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
+    # ================================================================
+    # Patch: Qwen2_5_VLForConditionalGeneration.forward
+    # 1. use the unified VeOmni fused loss_function (handles Ulysses
+    #    internally, takes hidden_states + lm_head weights instead of
+    #    pre-computed logits) — avoids materializing full-vocab logits
+    #    when labels are provided
+    # 2. drop the HF v5 logits-first path — only compute logits when
+    #    labels is None (inference); otherwise let loss_function fuse
+    #    matmul + cross-entropy
+    # ================================================================
     @can_return_tuple
     @auto_docstring
     def forward(
