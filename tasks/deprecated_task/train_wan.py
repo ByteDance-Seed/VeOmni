@@ -197,7 +197,7 @@ def main():
         weights_path=args.model.model_path,
         enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-        enable_mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+        enable_mixed_precision=args.train.accelerator.fsdp_config.mixed_precision.enable,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         init_device=args.train.init_device,
         enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
