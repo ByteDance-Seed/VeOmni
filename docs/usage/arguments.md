@@ -281,7 +281,7 @@ Root config — assembles `model`, `data`, and `train`.
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | full_shard | `bool` | `True` | Enable full sharding — equivalent to ZeRO-3. |
-| forward_prefetch | `bool` | `True` | Enable forward prefetch (FSDP1). |
+| forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload (FSDP1 only). |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 

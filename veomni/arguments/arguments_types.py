@@ -240,7 +240,7 @@ class FSDPConfig:
     )
     forward_prefetch: bool = field(
         default=True,
-        metadata={"help": "Enable forward prefetch for FSDP1."},
+        metadata={"help": "Enable forward prefetch."},
     )
     offload: bool = field(
         default=False,
