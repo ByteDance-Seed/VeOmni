@@ -52,7 +52,6 @@ jobs:
         # Use self-host cache speed up pip and model download
         # - /home/action/actions-runner/_work/cache:/github/home/.cache/
       options: >-
-        --device /dev/davinci0
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
