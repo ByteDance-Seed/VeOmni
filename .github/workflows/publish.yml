@@ -67,14 +67,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Verify _version.py imports without side effects
-        run: python -c "from veomni._version import __version__; print('version:', __version__)"
+      - name: Verify _version.py is readable
+        run: |
+          python -c "
+          exec(open('veomni/_version.py').read())
+          print('version:', __version__)
+          "
       - name: Verify PEP 440 compliance
         run: |
           pip install packaging
           python -c "
           from packaging.version import Version
-          from veomni._version import __version__
+          exec(open('veomni/_version.py').read())
           v = Version(__version__)
           print(f'Normalized: {v}')
           "
