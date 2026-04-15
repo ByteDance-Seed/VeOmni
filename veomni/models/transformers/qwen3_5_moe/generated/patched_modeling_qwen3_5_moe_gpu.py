@@ -961,6 +961,7 @@ class Qwen3_5MoeMLP(nn.Module):
 # Reason: Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 # Source: veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config
 # ======================================================================
+# ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
 class Qwen3_5MoeExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors.
 
@@ -1057,6 +1058,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
+    # ── SparseMoeBlock forward (avoid in-place op on autograd Function output) ────
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
@@ -1103,6 +1105,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    # ── DecoderLayer forward ────────────────────────────────────────────────────────
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1815,6 +1818,14 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
     config: Qwen3_5MoeConfig
     _no_split_modules = ["Qwen3_5MoeTextDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
+    # NOTE: apply_rotary_pos_emb is NOT replaced with LigerKernel rotary because
+    # Qwen3_5Moe uses partial_rotary_factor=0.25 with mrope_interleaved=True.
+    # The HF implementation correctly handles partial rotary (applying RoPE only
+    # to the first `rotary_dim` dims and passing through the rest), while
+    # liger_rotary_pos_emb applies RoPE to the full head_dim, producing incorrect
+    # results and NaN in attention output.
+
+    # ── Propagate _moe_implementation from top-level config to text_config ────────
     def __init__(self, config):
         # Propagate _moe_implementation so SparseMoeBlock picks up the correct mode.
         moe_implementation = getattr(config, "_moe_implementation", "eager")
@@ -2457,6 +2468,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         """
         return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
+    # ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
     @can_return_tuple
     def forward(
         self,
@@ -2760,6 +2772,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
 
+    # ── Expert parallel plan ─────────────────────────────────────────────────────
     def get_parallel_plan(self):
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
