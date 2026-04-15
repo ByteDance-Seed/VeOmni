@@ -1781,6 +1781,9 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
 
         return input_ids, model_kwargs
 
+    # ================================================================
+    # Patch: Qwen2VLForConditionalGeneration.get_position_id_func
+    # ================================================================
     def get_position_id_func(self):
         def get_position_id(main_func, self, **kwargs):
             position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, 1, l), rope_deltas (1, 1)
