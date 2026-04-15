@@ -297,19 +297,19 @@ def apply_veomni_loss_patch(cross_entropy_loss_implementation: str = "eager"):
     """Bind the cross-entropy loss implementation.
 
     Args:
-        cross_entropy_loss_implementation: ``"liger_kernel"`` or ``"eager"``.
-            Should already be resolved from ``"auto"`` by
+        cross_entropy_loss_implementation: ``"liger_kernel"``, ``"eager"``, or
+            a custom string.  Should already be resolved from ``"auto"`` by
             ``OpsImplementationConfig._resolve_auto_implementations``.
     """
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
     LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
     global _cross_entropy
-    if is_torch_npu_available():
-        if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1":
-            LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
-        _cross_entropy = eager_cross_entropy
-    elif cross_entropy_loss_implementation == "liger_kernel":
+
+    if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1" and is_torch_npu_available():
+        LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
+
+    if cross_entropy_loss_implementation == "liger_kernel":
         from .liger_kernel import fused_liger_kernel_cross_entropy
 
         _cross_entropy = fused_liger_kernel_cross_entropy

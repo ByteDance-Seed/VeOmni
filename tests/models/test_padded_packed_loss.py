@@ -1,8 +1,10 @@
 import pytest
 import torch
 
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.data_collator import MainCollator
 from veomni.models import build_foundation_model
+from veomni.ops import apply_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -18,6 +20,7 @@ def _skip_if_no_flash_attn():
 @pytest.mark.parametrize("pad_to_length", [16])
 def test_qwen3_loss_match_with_padded_packed_input(monkeypatch, pad_to_length):
     _skip_if_no_flash_attn()
+    apply_ops_config(OpsImplementationConfig())
     monkeypatch.setattr(
         "veomni.data.data_collator.get_parallel_state",
         lambda: type("PS", (), {"sp_enabled": False, "sp_size": 1, "sp_rank": 0})(),

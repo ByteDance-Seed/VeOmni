@@ -85,6 +85,7 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     # NOTE: fused MoE patch is applied in build_foundation_model() based on
     # the moe_implementation parameter.
     logger.info_rank0("✅ VeOmni ops config applied.")
+    logger.info_rank0(format_kernel_functions())
 
 
 def format_kernel_functions() -> str:

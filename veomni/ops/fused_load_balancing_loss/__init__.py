@@ -17,7 +17,6 @@ from typing import Optional, Union
 import torch
 
 from ...utils import logging
-from ...utils.import_utils import is_torch_npu_available
 
 
 logger = logging.get_logger(__name__)
@@ -77,13 +76,13 @@ def apply_veomni_load_balancing_loss_patch(load_balancing_loss_implementation: s
     """
     global _load_balancing_loss
 
-    if load_balancing_loss_implementation == "eager" or is_torch_npu_available():
-        from .torch_native import load_balancing_loss_pytorch
-
-        _load_balancing_loss = load_balancing_loss_pytorch
-        logger.info_rank0("Load balancing loss: using PyTorch eager backend.")
-    else:
+    if load_balancing_loss_implementation == "triton":
         from .triton_kernel import load_balancing_loss_triton
 
         _load_balancing_loss = load_balancing_loss_triton
         logger.info_rank0("Load balancing loss: using fused Triton backend.")
+    else:
+        from .torch_native import load_balancing_loss_pytorch
+
+        _load_balancing_loss = load_balancing_loss_pytorch
+        logger.info_rank0("Load balancing loss: using PyTorch eager backend.")

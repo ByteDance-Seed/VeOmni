@@ -21,7 +21,7 @@ from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
-from ..utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from ..utils.import_utils import is_liger_kernel_available
 
 
 logger = logging.get_logger(__name__)
@@ -623,12 +623,19 @@ class TrainingArguments:
 class OpsImplementationConfig:
     """model.ops_implementation.* — Attention, MoE, and fused kernel implementation.
 
-    Each ``*_implementation`` field selects the kernel backend for that operation:
-    - ``"auto"`` (default): pick the best available backend (liger_kernel on GPU
-      if installed, triton on GPU, eager on NPU, etc.).
+    Each ``*_implementation`` field selects the kernel backend for that operation.
+    The type is ``str`` (not ``Literal``) so that third-party backends can be
+    registered without modifying this class.
+
+    Well-known values:
+
+    - ``"auto"`` (default): pick the best available backend (liger_kernel when
+      the ``liger-kernel`` package is installed, triton on GPU, eager as fallback).
     - ``"eager"``: PyTorch reference implementation.
-    - ``"liger_kernel"``: LigerKernel fused implementation (requires ``liger-kernel``).
-    - ``"triton"``: Triton fused implementation (GPU only).
+    - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
+      ``liger-kernel``).
+    - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
+      NPU with ``triton-ascend``).
     """
 
     attn_implementation: Optional[
@@ -652,48 +659,48 @@ class OpsImplementationConfig:
             "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
         },
     )
-    cross_entropy_loss_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+    cross_entropy_loss_implementation: str = field(
         default="auto",
         metadata={
             "help": "Cross-entropy loss implementation. "
-            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
             "'eager' uses PyTorch F.cross_entropy."
         },
     )
-    rms_norm_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+    rms_norm_implementation: str = field(
         default="auto",
         metadata={
             "help": "RMSNorm implementation. "
-            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses LigerRMSNorm. "
             "'eager' uses the HuggingFace default."
         },
     )
-    swiglu_mlp_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+    swiglu_mlp_implementation: str = field(
         default="auto",
         metadata={
             "help": "SwiGLU MLP implementation. "
-            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses LigerSwiGLUMLP. "
             "'eager' uses the HuggingFace default."
         },
     )
-    rotary_pos_emb_implementation: Literal["auto", "eager", "liger_kernel"] = field(
+    rotary_pos_emb_implementation: str = field(
         default="auto",
         metadata={
             "help": "Rotary positional embedding implementation. "
-            "'auto' uses liger_kernel when available on GPU, eager otherwise. "
+            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses liger_rotary_pos_emb. "
             "'eager' uses the HuggingFace default."
         },
     )
-    load_balancing_loss_implementation: Literal["auto", "eager", "triton"] = field(
+    load_balancing_loss_implementation: str = field(
         default="auto",
         metadata={
             "help": "MoE load-balancing loss implementation. "
-            "'auto' uses triton on GPU, eager on NPU. "
-            "'triton' uses a fused Triton kernel. "
+            "'auto' uses triton when available, eager otherwise. "
+            "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
             "'eager' uses PyTorch reference."
         },
     )
@@ -714,32 +721,26 @@ class OpsImplementationConfig:
 
     def _resolve_auto_implementations(self):
         """Resolve ``"auto"`` to concrete backend names based on hardware and availability."""
-        npu = is_torch_npu_available()
+        from ..utils.import_utils import is_fused_moe_available
+
         liger = is_liger_kernel_available()
 
-        if self.cross_entropy_loss_implementation == "auto":
-            self.cross_entropy_loss_implementation = "liger_kernel" if (liger and not npu) else "eager"
-
-        if self.rms_norm_implementation == "auto":
-            self.rms_norm_implementation = "liger_kernel" if (liger and not npu) else "eager"
-
-        if self.swiglu_mlp_implementation == "auto":
-            self.swiglu_mlp_implementation = "liger_kernel" if (liger and not npu) else "eager"
-
-        if self.rotary_pos_emb_implementation == "auto":
-            self.rotary_pos_emb_implementation = "liger_kernel" if (liger and not npu) else "eager"
+        liger_fields = (
+            "cross_entropy_loss_implementation",
+            "rms_norm_implementation",
+            "swiglu_mlp_implementation",
+            "rotary_pos_emb_implementation",
+        )
+        for field_name in liger_fields:
+            if getattr(self, field_name) == "auto":
+                setattr(self, field_name, "liger_kernel" if liger else "eager")
 
         if self.load_balancing_loss_implementation == "auto":
-            self.load_balancing_loss_implementation = "eager" if npu else "triton"
+            self.load_balancing_loss_implementation = "triton" if is_fused_moe_available() else "eager"
 
-        if self.cross_entropy_loss_implementation == "liger_kernel" and not liger:
-            raise ValueError("cross_entropy_loss_implementation='liger_kernel' requires liger-kernel to be installed.")
-        if self.rms_norm_implementation == "liger_kernel" and not liger:
-            raise ValueError("rms_norm_implementation='liger_kernel' requires liger-kernel to be installed.")
-        if self.swiglu_mlp_implementation == "liger_kernel" and not liger:
-            raise ValueError("swiglu_mlp_implementation='liger_kernel' requires liger-kernel to be installed.")
-        if self.rotary_pos_emb_implementation == "liger_kernel" and not liger:
-            raise ValueError("rotary_pos_emb_implementation='liger_kernel' requires liger-kernel to be installed.")
+        for field_name in liger_fields:
+            if getattr(self, field_name) == "liger_kernel" and not liger:
+                raise ValueError(f"{field_name}='liger_kernel' requires liger-kernel to be installed.")
 
 
 @dataclass

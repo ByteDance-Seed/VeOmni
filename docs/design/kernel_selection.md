@@ -26,13 +26,17 @@ accessible via `model.ops_implementation.*` in YAML.
 When a field is set to `"auto"` (the default), `OpsImplementationConfig.__post_init__`
 resolves it based on hardware and package availability:
 
-| Field | GPU + liger installed | GPU, no liger | NPU |
-|-------|----------------------|---------------|-----|
-| `cross_entropy_loss_implementation` | `"liger_kernel"` | `"eager"` | `"eager"` |
-| `rms_norm_implementation` | `"liger_kernel"` | `"eager"` | `"eager"` |
-| `swiglu_mlp_implementation` | `"liger_kernel"` | `"eager"` | `"eager"` |
-| `rotary_pos_emb_implementation` | `"liger_kernel"` | `"eager"` | `"eager"` |
-| `load_balancing_loss_implementation` | `"triton"` | `"triton"` | `"eager"` |
+| Field | liger installed | no liger | triton / triton-ascend available | no triton |
+|-------|----------------|----------|---------------------------------|-----------|
+| `cross_entropy_loss_implementation` | `"liger_kernel"` | `"eager"` | — | — |
+| `rms_norm_implementation` | `"liger_kernel"` | `"eager"` | — | — |
+| `swiglu_mlp_implementation` | `"liger_kernel"` | `"eager"` | — | — |
+| `rotary_pos_emb_implementation` | `"liger_kernel"` | `"eager"` | — | — |
+| `load_balancing_loss_implementation` | — | — | `"triton"` | `"eager"` |
+
+> **Note:** `liger_kernel` works on both GPU and NPU when `liger-kernel` (with
+> NPU support via `triton-ascend`) is installed. The `auto` resolution no
+> longer special-cases NPU — it simply checks package availability.
 
 ---
 
@@ -107,7 +111,7 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 ```yaml
 model:
   ops_implementation:
-    cross_entropy_loss_implementation: auto   # or "eager" / "liger_kernel"
+    cross_entropy_loss_implementation: auto   # or "eager", "liger_kernel", or custom str
 ```
 
 **Field:** `OpsImplementationConfig.cross_entropy_loss_implementation`
@@ -134,9 +138,9 @@ model:
 ```yaml
 model:
   ops_implementation:
-    rms_norm_implementation: auto             # or "eager" / "liger_kernel"
-    swiglu_mlp_implementation: auto           # or "eager" / "liger_kernel"
-    rotary_pos_emb_implementation: auto       # or "eager" / "liger_kernel"
+    rms_norm_implementation: auto             # or "eager", "liger_kernel", or custom str
+    swiglu_mlp_implementation: auto           # or "eager", "liger_kernel", or custom str
+    rotary_pos_emb_implementation: auto       # or "eager", "liger_kernel", or custom str
 ```
 
 Each operation can be independently controlled.
@@ -170,7 +174,7 @@ Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
 ```yaml
 model:
   ops_implementation:
-    load_balancing_loss_implementation: auto   # or "eager" / "triton"
+    load_balancing_loss_implementation: auto   # or "eager", "triton", or custom str
 ```
 
 **Field:** `OpsImplementationConfig.load_balancing_loss_implementation`
