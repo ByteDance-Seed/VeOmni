@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.env import get_env
-from ....utils.import_utils import is_liger_kernel_available, is_transformers_version_greater_or_equal_to
+from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
@@ -35,29 +34,20 @@ def register_deepseek_v3_modeling(architecture: str):
                 DeepseekV3Model,
             )
 
-            # Liger kernels and the deterministic Triton RoPE + batch-invariant
-            # RMSNorm fallback are not baked into the generated file; apply them
-            # here at runtime so behavior matches the v4 path. ``VEOMNI_USE_LIGER_KERNEL
-            # == "1"`` selects Liger; otherwise use the deterministic/batch-invariant
-            # path required for VeRL actor/rollout parity.
+            # Apply deterministic Triton RoPE + batch-invariant RMSNorm at
+            # runtime (required for VeRL actor/rollout numerical parity).
+            # Not baked into the generated file so kernel choice stays a
+            # runtime concern.
             if IS_CUDA_AVAILABLE:
+                from ....ops.batch_invariant_ops import batch_invariant_rms_norm
                 from .generated import patched_modeling_deepseek_v3_gpu as gen
+                from .gpu_patch import _make_deterministic_rope_forward
 
-                if is_liger_kernel_available() and get_env("VEOMNI_USE_LIGER_KERNEL") == "1":
-                    from liger_kernel.transformers.rms_norm import LigerRMSNorm
-                    from liger_kernel.transformers.rope import liger_rotary_pos_emb
+                def _fused_rms_norm_forward(self, hidden_states):
+                    return batch_invariant_rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
-                    gen.apply_rotary_pos_emb = liger_rotary_pos_emb
-                    gen.DeepseekV3RMSNorm = LigerRMSNorm
-                else:
-                    from ....ops.batch_invariant_ops import batch_invariant_rms_norm
-                    from .gpu_patch import _make_deterministic_rope_forward
-
-                    def _fused_rms_norm_forward(self, hidden_states):
-                        return batch_invariant_rms_norm(hidden_states, self.weight, self.variance_epsilon)
-
-                    gen.DeepseekV3RotaryEmbedding.forward = _make_deterministic_rope_forward()
-                    gen.DeepseekV3RMSNorm.forward = _fused_rms_norm_forward
+                gen.DeepseekV3RotaryEmbedding.forward = _make_deterministic_rope_forward()
+                gen.DeepseekV3RMSNorm.forward = _fused_rms_norm_forward
 
         for model_cls in (DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification, DeepseekV3Model):
             model_cls._create_checkpoint_tensor_converter = staticmethod(
