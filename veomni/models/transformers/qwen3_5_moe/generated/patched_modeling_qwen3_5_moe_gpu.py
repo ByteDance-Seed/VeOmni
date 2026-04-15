@@ -962,8 +962,6 @@ class Qwen3_5MoeMLP(nn.Module):
 # Source: veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config
 # ======================================================================
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
-
-
 class Qwen3_5MoeExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors.
 
@@ -2775,7 +2773,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
 
     # ── Expert parallel plan ─────────────────────────────────────────────────────
-
     def get_parallel_plan(self):
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 

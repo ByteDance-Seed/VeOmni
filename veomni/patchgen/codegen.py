@@ -118,9 +118,13 @@ def get_object_source_with_leading_comments(obj: Any) -> str:
         break
 
     leading = all_lines[actual_start:idx]
-    # Trim leading pure-blank lines so the block hugs the definition.
+    # Trim pure-blank lines on both sides so the comment hugs the
+    # definition — otherwise blanks between the comment and the
+    # decorator/def survive into the generated file and bloat the diff.
     while leading and leading[0].strip() == "":
         leading.pop(0)
+    while leading and leading[-1].strip() == "":
+        leading.pop()
 
     return "".join(leading) + "".join(src_lines)
 
