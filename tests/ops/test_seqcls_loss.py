@@ -129,7 +129,7 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
     from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.ops import apply_ops_config
 
-    apply_ops_config(OpsImplementationConfig())
+    apply_ops_config(OpsImplementationConfig(cross_entropy_loss_implementation="liger_kernel"))
 
     dev_api = get_torch_device()
     local_rank = 0

@@ -629,9 +629,7 @@ class OpsImplementationConfig:
 
     Well-known values:
 
-    - ``"auto"`` (default): pick the best available backend (liger_kernel when
-      the ``liger-kernel`` package is installed, triton on GPU, eager as fallback).
-    - ``"eager"``: PyTorch reference implementation.
+    - ``"eager"`` (default): PyTorch reference implementation.
     - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
       ``liger-kernel``).
     - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
@@ -660,48 +658,43 @@ class OpsImplementationConfig:
         },
     )
     cross_entropy_loss_implementation: str = field(
-        default="auto",
+        default="eager",
         metadata={
             "help": "Cross-entropy loss implementation. "
-            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
-            "'eager' uses PyTorch F.cross_entropy."
+            "'eager' (default) uses PyTorch F.cross_entropy."
         },
     )
     rms_norm_implementation: str = field(
-        default="auto",
+        default="eager",
         metadata={
             "help": "RMSNorm implementation. "
-            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses LigerRMSNorm. "
-            "'eager' uses the HuggingFace default."
+            "'eager' (default) uses the HuggingFace default."
         },
     )
     swiglu_mlp_implementation: str = field(
-        default="auto",
+        default="eager",
         metadata={
             "help": "SwiGLU MLP implementation. "
-            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses LigerSwiGLUMLP. "
-            "'eager' uses the HuggingFace default."
+            "'eager' (default) uses the HuggingFace default."
         },
     )
     rotary_pos_emb_implementation: str = field(
-        default="auto",
+        default="eager",
         metadata={
             "help": "Rotary positional embedding implementation. "
-            "'auto' uses liger_kernel when available, eager otherwise. "
             "'liger_kernel' uses liger_rotary_pos_emb. "
-            "'eager' uses the HuggingFace default."
+            "'eager' (default) uses the HuggingFace default."
         },
     )
     load_balancing_loss_implementation: str = field(
-        default="auto",
+        default="eager",
         metadata={
             "help": "MoE load-balancing loss implementation. "
-            "'auto' uses triton when available, eager otherwise. "
             "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
-            "'eager' uses PyTorch reference."
+            "'eager' (default) uses PyTorch reference."
         },
     )
 
@@ -717,28 +710,18 @@ class OpsImplementationConfig:
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
-        self._resolve_auto_implementations()
+        self._validate_implementations()
 
-    def _resolve_auto_implementations(self):
-        """Resolve ``"auto"`` to concrete backend names based on hardware and availability."""
-        from ..utils.import_utils import is_fused_moe_available
-
+    def _validate_implementations(self):
+        """Validate that requested backends are actually available."""
         liger = is_liger_kernel_available()
 
-        liger_fields = (
+        for field_name in (
             "cross_entropy_loss_implementation",
             "rms_norm_implementation",
             "swiglu_mlp_implementation",
             "rotary_pos_emb_implementation",
-        )
-        for field_name in liger_fields:
-            if getattr(self, field_name) == "auto":
-                setattr(self, field_name, "liger_kernel" if liger else "eager")
-
-        if self.load_balancing_loss_implementation == "auto":
-            self.load_balancing_loss_implementation = "triton" if is_fused_moe_available() else "eager"
-
-        for field_name in liger_fields:
+        ):
             if getattr(self, field_name) == "liger_kernel" and not liger:
                 raise ValueError(f"{field_name}='liger_kernel' requires liger-kernel to be installed.")
 

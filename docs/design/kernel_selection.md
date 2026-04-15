@@ -9,34 +9,15 @@ All selections are driven by config fields in `OpsImplementationConfig`.
 | Kernel | Config field | Default | Selection time |
 |--------|-------------|---------|----------------|
 | Attention | `attn_implementation` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `"auto"` | `apply_ops_config()` (before model build) |
-| RMSNorm | `rms_norm_implementation` | `"auto"` | Model registration via ops config singleton |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `"auto"` | Model registration via ops config singleton |
-| Rotary embedding | `rotary_pos_emb_implementation` | `"auto"` | Model registration via ops config singleton |
-| Load-balancing loss | `load_balancing_loss_implementation` | `"auto"` | `apply_ops_config()` (before model build) |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `"eager"` | `apply_ops_config()` (before model build) |
+| RMSNorm | `rms_norm_implementation` | `"eager"` | Model registration via ops config singleton |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `"eager"` | Model registration via ops config singleton |
+| Rotary embedding | `rotary_pos_emb_implementation` | `"eager"` | Model registration via ops config singleton |
+| Load-balancing loss | `load_balancing_loss_implementation` | `"eager"` | `apply_ops_config()` (before model build) |
 | MoE implementation | `moe_implementation` | `None` | `build_foundation_model` |
 
 All config fields live in `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`),
 accessible via `model.ops_implementation.*` in YAML.
-
----
-
-## `"auto"` Resolution
-
-When a field is set to `"auto"` (the default), `OpsImplementationConfig.__post_init__`
-resolves it based on hardware and package availability:
-
-| Field | liger installed | no liger | triton / triton-ascend available | no triton |
-|-------|----------------|----------|---------------------------------|-----------|
-| `cross_entropy_loss_implementation` | `"liger_kernel"` | `"eager"` | — | — |
-| `rms_norm_implementation` | `"liger_kernel"` | `"eager"` | — | — |
-| `swiglu_mlp_implementation` | `"liger_kernel"` | `"eager"` | — | — |
-| `rotary_pos_emb_implementation` | `"liger_kernel"` | `"eager"` | — | — |
-| `load_balancing_loss_implementation` | — | — | `"triton"` | `"eager"` |
-
-> **Note:** `liger_kernel` works on both GPU and NPU when `liger-kernel` (with
-> NPU support via `triton-ascend`) is installed. The `auto` resolution no
-> longer special-cases NPU — it simply checks package availability.
 
 ---
 
@@ -48,7 +29,7 @@ import veomni                                 # (1) import time
        └─ apply_veomni_attention_patch()      # register FA2/3/4 with SP
 
 OpsImplementationConfig.__post_init__()       # (2) config parse time
-  ├─ resolve "auto" → concrete values
+  ├─ validate requested backends are available
   ├─ rewrite attn_implementation for SP
   └─ set_ops_config(self)                     # populate singleton
 
@@ -111,7 +92,7 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 ```yaml
 model:
   ops_implementation:
-    cross_entropy_loss_implementation: auto   # or "eager", "liger_kernel", or custom str
+    cross_entropy_loss_implementation: eager   # or "liger_kernel", or custom str
 ```
 
 **Field:** `OpsImplementationConfig.cross_entropy_loss_implementation`
@@ -138,9 +119,9 @@ model:
 ```yaml
 model:
   ops_implementation:
-    rms_norm_implementation: auto             # or "eager", "liger_kernel", or custom str
-    swiglu_mlp_implementation: auto           # or "eager", "liger_kernel", or custom str
-    rotary_pos_emb_implementation: auto       # or "eager", "liger_kernel", or custom str
+    rms_norm_implementation: eager             # or "liger_kernel", or custom str
+    swiglu_mlp_implementation: eager           # or "liger_kernel", or custom str
+    rotary_pos_emb_implementation: eager       # or "liger_kernel", or custom str
 ```
 
 Each operation can be independently controlled.
@@ -174,7 +155,7 @@ Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
 ```yaml
 model:
   ops_implementation:
-    load_balancing_loss_implementation: auto   # or "eager", "triton", or custom str
+    load_balancing_loss_implementation: eager   # or "triton", or custom str
 ```
 
 **Field:** `OpsImplementationConfig.load_balancing_loss_implementation`

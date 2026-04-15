@@ -298,8 +298,7 @@ def apply_veomni_loss_patch(cross_entropy_loss_implementation: str = "eager"):
 
     Args:
         cross_entropy_loss_implementation: ``"liger_kernel"``, ``"eager"``, or
-            a custom string.  Should already be resolved from ``"auto"`` by
-            ``OpsImplementationConfig._resolve_auto_implementations``.
+            a custom string.
     """
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss

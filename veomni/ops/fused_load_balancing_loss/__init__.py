@@ -70,9 +70,8 @@ def apply_veomni_load_balancing_loss_patch(load_balancing_loss_implementation: s
     """Select and bind the load balancing loss implementation.
 
     Args:
-        load_balancing_loss_implementation: ``"triton"`` or ``"eager"``.
-            Should already be resolved from ``"auto"`` by
-            ``OpsImplementationConfig._resolve_auto_implementations``.
+        load_balancing_loss_implementation: ``"triton"``, ``"eager"``, or
+            a custom string.
     """
     global _load_balancing_loss
 

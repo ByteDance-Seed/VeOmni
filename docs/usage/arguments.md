@@ -130,21 +130,18 @@ Root config — assembles `model`, `data`, and `train`.
 `model.ops_implementation.*` — Attention, MoE, and fused kernel implementation.
 
 Each `*_implementation` field selects the kernel backend for that operation.
-`"auto"` (default) picks the best available backend: `liger_kernel` when the
-`liger-kernel` package is installed (GPU or NPU), `triton` when `triton` /
-`triton-ascend` is available, `eager` otherwise. The type is `str` (not
-`Literal`) so third-party backends can be registered without modifying the
-config class.
+The type is `str` (not `Literal`) so third-party backends can be registered
+without modifying the config class.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
 | moe_implementation | `Optional[Literal["eager", "fused", "fused_quack"]]` | `None` | MoE implementation: `eager` (reference loop), `fused` (Triton), `fused_quack` (Quack CUTLASS, SM90+). |
-| cross_entropy_loss_implementation | `str` | `"auto"` | Cross-entropy loss. `auto` → `liger_kernel` if available, else `eager`. Known values: `eager`, `liger_kernel`. |
-| rms_norm_implementation | `str` | `"auto"` | RMSNorm. `auto` → `liger_kernel` if available, else `eager`. Known values: `eager`, `liger_kernel`. |
-| swiglu_mlp_implementation | `str` | `"auto"` | SwiGLU MLP. `auto` → `liger_kernel` if available, else `eager`. Known values: `eager`, `liger_kernel`. |
-| rotary_pos_emb_implementation | `str` | `"auto"` | Rotary pos emb. `auto` → `liger_kernel` if available, else `eager`. Known values: `eager`, `liger_kernel`. |
-| load_balancing_loss_implementation | `str` | `"auto"` | MoE load-balancing loss. `auto` → `triton` if triton available, else `eager`. Known values: `eager`, `triton`. |
+| cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`. |
+| rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`. |
+| swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
+| rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`. |
+| load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton`. |
 
 ### DataArguments
 
