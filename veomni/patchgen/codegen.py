@@ -95,7 +95,7 @@ def get_object_source_with_leading_comments(obj: Any) -> str:
         return "".join(src_lines)
 
     try:
-        with open(source_file) as f:
+        with open(source_file, encoding="utf-8") as f:
             all_lines = f.readlines()
     except OSError:
         return "".join(src_lines)
