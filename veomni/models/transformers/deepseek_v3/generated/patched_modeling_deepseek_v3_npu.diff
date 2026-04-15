@@ -123,7 +123,7 @@
  class DeepseekV3TopkRouter(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -145,13 +181,39 @@
+@@ -145,13 +181,46 @@
          self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
          self.register_buffer("e_score_correction_bias", torch.zeros(self.n_routed_experts))
 
@@ -153,6 +153,13 @@
 +# Reason: Use v5 gate_up_proj expert layout with explicit VeOmni fused-MoE path
 +# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
 +# ======================================================================
++# NOTE: Liger replacements (RMSNorm / SwiGLU MLP / apply_rotary_pos_emb) are
++# intentionally NOT applied to the v5 generated file. DeepseekV3 runs on the
++# deterministic Triton RoPE + batch-invariant RMSNorm kernels wired at runtime
++# from ``__init__.py`` so actor/rollout numerics stay aligned; LigerSwiGLUMLP
++# additionally rejects the ``intermediate_size`` kwarg used by shared_experts.
++
++
 +# ================================================================
 +# Patch: DeepseekV3NaiveMoe
 +# 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
@@ -165,7 +172,7 @@
  class DeepseekV3NaiveMoe(nn.Module):
      """Collection of expert weights stored as 3D tensors."""
 
-@@ -163,6 +225,7 @@
+@@ -163,6 +232,7 @@
          self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
@@ -173,7 +180,7 @@
 
      def forward(
          self,
-@@ -171,22 +234,38 @@
+@@ -171,22 +241,38 @@
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
          final_hidden_states = torch.zeros_like(hidden_states)
@@ -228,7 +235,7 @@
 
          return final_hidden_states
 
-@@ -254,30 +333,19 @@
+@@ -254,30 +340,19 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -272,7 +279,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -644,6 +712,12 @@
+@@ -644,6 +719,12 @@
          )
 
 
@@ -285,7 +292,7 @@
  @auto_docstring
  class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -659,6 +733,11 @@
+@@ -659,6 +740,11 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -297,7 +304,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -674,23 +753,6 @@
+@@ -674,23 +760,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> CausalLMOutputWithPast:
@@ -321,7 +328,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -703,13 +765,23 @@
+@@ -703,13 +772,23 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -349,7 +356,7 @@
 
          return CausalLMOutputWithPast(
              loss=loss,
-@@ -718,6 +790,15 @@
+@@ -718,6 +797,15 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
          )

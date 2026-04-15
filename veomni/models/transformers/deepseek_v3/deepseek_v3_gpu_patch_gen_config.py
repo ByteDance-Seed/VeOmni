@@ -18,23 +18,20 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
 v5 patches:
-1. Liger replacements for RMSNorm and apply_rotary_pos_emb (MLP intentionally
-   skipped — shared_experts passes intermediate_size kwarg that LigerSwiGLUMLP
-   doesn't accept).
-2. DeepseekV3NaiveMoe fused expert forward (eager + fused branches) — drops
+1. DeepseekV3NaiveMoe fused expert forward (eager + fused branches) — drops
    upstream ``@use_experts_implementation`` which otherwise routes around our
    fused MoE kernel.
-3. DeepseekV3TopkRouter.forward restores ``torch.autocast(enabled=False)``
+2. DeepseekV3TopkRouter.forward restores ``torch.autocast(enabled=False)``
    around the fp32 router F.linear, required for VeRL actor/rollout parity.
-4. DeepseekV3ForCausalLM.forward fused cross-entropy path.
-5. Register get_parallel_plan on DeepseekV3ForCausalLM.
+3. DeepseekV3ForCausalLM.forward fused cross-entropy path.
+4. Register get_parallel_plan on DeepseekV3ForCausalLM.
 
-Batch-invariant RMSNorm + deterministic Triton RoPE (used when
-``VEOMNI_USE_LIGER_KERNEL != "1"``) are applied at runtime from ``__init__.py``
-and therefore not baked into the generated file.
+Liger kernels (RMSNorm / SwiGLU MLP / rotary) and batch-invariant RMSNorm +
+deterministic Triton RoPE are applied at runtime from ``__init__.py`` based on
+``VEOMNI_USE_LIGER_KERNEL`` — not baked into the generated file.
 """
 
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -46,7 +43,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.ops import fused_moe_forward
-from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
 
 
 config = PatchConfig(
@@ -58,43 +55,11 @@ config = PatchConfig(
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 
 
-# ================================================================
-# Patch: DeepseekV3RMSNorm / DeepseekV3MLP / apply_rotary_pos_emb
-# 1. Liger kernels for RMSNorm, SwiGLU MLP, and rotary embedding.
-# ================================================================
-config.patches.append(
-    create_patch_from_external(
-        target="DeepseekV3RMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNorm",
-        description="Use LigerKernel RMSNorm",
-    )
-)
-
-# NOTE: DeepseekV3MLP is NOT replaced with LigerSwiGLUMLP. The shared-experts
-# path constructs ``DeepseekV3MLP(config=config, intermediate_size=...)`` with a
-# custom intermediate_size, which LigerSwiGLUMLP's __init__ does not accept.
-
-
-@config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
-def apply_rotary_pos_emb_liger(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+# NOTE: Liger replacements (RMSNorm / SwiGLU MLP / apply_rotary_pos_emb) are
+# intentionally NOT applied to the v5 generated file. DeepseekV3 runs on the
+# deterministic Triton RoPE + batch-invariant RMSNorm kernels wired at runtime
+# from ``__init__.py`` so actor/rollout numerics stay aligned; LigerSwiGLUMLP
+# additionally rejects the ``intermediate_size`` kwarg used by shared_experts.
 
 
 # ================================================================

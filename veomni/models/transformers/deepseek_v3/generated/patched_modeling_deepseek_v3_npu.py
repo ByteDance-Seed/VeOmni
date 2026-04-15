@@ -205,6 +205,13 @@ class DeepseekV3TopkRouter(nn.Module):
 # Reason: Use v5 gate_up_proj expert layout with explicit VeOmni fused-MoE path
 # Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
 # ======================================================================
+# NOTE: Liger replacements (RMSNorm / SwiGLU MLP / apply_rotary_pos_emb) are
+# intentionally NOT applied to the v5 generated file. DeepseekV3 runs on the
+# deterministic Triton RoPE + batch-invariant RMSNorm kernels wired at runtime
+# from ``__init__.py`` so actor/rollout numerics stay aligned; LigerSwiGLUMLP
+# additionally rejects the ``intermediate_size`` kwarg used by shared_experts.
+
+
 # ================================================================
 # Patch: DeepseekV3NaiveMoe
 # 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches

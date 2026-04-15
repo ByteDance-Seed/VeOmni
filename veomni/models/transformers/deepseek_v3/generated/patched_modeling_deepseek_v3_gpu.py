@@ -9,10 +9,6 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: DeepseekV3RMSNorm
-#      Use LigerKernel RMSNorm
-#    - function_replacement: apply_rotary_pos_emb
-#      Use LigerKernel rotary embedding
 #    - class_replacement: DeepseekV3NaiveMoe
 #      Use v5 gate_up_proj expert layout with explicit VeOmni fused-MoE path
 #    - method_override: DeepseekV3TopkRouter.forward
@@ -30,20 +26,12 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-
-# ======================================================================
-# [PATCHED CLASS] DeepseekV3RMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm
-# Source: liger_kernel.transformers.rms_norm
-# ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNorm
-from liger_kernel.transformers.rms_norm import LigerRMSNorm as DeepseekV3RMSNorm
 from torch import nn
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
@@ -62,6 +50,27 @@ from transformers.utils.output_capturing import capture_outputs
 
 # Additional imports for patches
 from veomni.ops import fused_moe_forward
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class DeepseekV3RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        DeepseekV3RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class DeepseekV3RotaryEmbedding(nn.Module):
@@ -184,6 +193,13 @@ class DeepseekV3TopkRouter(nn.Module):
 # Reason: Use v5 gate_up_proj expert layout with explicit VeOmni fused-MoE path
 # Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
 # ======================================================================
+# NOTE: Liger replacements (RMSNorm / SwiGLU MLP / apply_rotary_pos_emb) are
+# intentionally NOT applied to the v5 generated file. DeepseekV3 runs on the
+# deterministic Triton RoPE + batch-invariant RMSNorm kernels wired at runtime
+# from ``__init__.py`` so actor/rollout numerics stay aligned; LigerSwiGLUMLP
+# additionally rejects the ``intermediate_size`` kwarg used by shared_experts.
+
+
 # ================================================================
 # Patch: DeepseekV3NaiveMoe
 # 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
@@ -312,32 +328,30 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Use LigerKernel rotary embedding
-# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
-# ======================================================================
-# NOTE: DeepseekV3MLP is NOT replaced with LigerSwiGLUMLP. The shared-experts
-# path constructs ``DeepseekV3MLP(config=config, intermediate_size=...)`` with a
-# custom intermediate_size, which LigerSwiGLUMLP's __init__ does not accept.
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
+@use_kernel_func_from_hub("rotary_pos_emb")
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
 
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
