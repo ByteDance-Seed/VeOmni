@@ -73,18 +73,28 @@ def sync_weight_deepseek_v3(config, state_dict_source, veomni_model):
         if i in veomni_model_state_dict.keys():
             veomni_model_state_dict[i] = hf_model_state_dict[i]
 
-    # Align experts between HF and VeOmni:
-    # VeOmni: experts.{module_name} stacked [num_experts, ...]
-    # HF: experts.{expert_id}.{module_name} per expert
-    for layer_id in range(first_k_dense_replace, layer_num):
-        for module_name in ["gate_proj", "up_proj", "down_proj"]:
-            expert_weights = []
-            for expert_id in range(expert_num):
-                key = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{module_name}.weight"
-                expert_weights.append(hf_model_state_dict[key])
+    # Under transformers v5 the HF experts already use the fused
+    # ``gate_up_proj``/``down_proj`` layout that matches VeOmni, so the
+    # straight copy above is sufficient. Only v4's per-expert layout needs
+    # the stacking step below.
+    hf_uses_fused_experts = any(
+        k.endswith(".mlp.experts.gate_up_proj") or k.endswith(".mlp.experts.down_proj")
+        for k in hf_model_state_dict.keys()
+    )
 
-            veomni_module_name = f"model.layers.{layer_id}.mlp.experts.{module_name}"
-            veomni_model_state_dict[veomni_module_name] = torch.stack(expert_weights, dim=0)
+    if not hf_uses_fused_experts:
+        # Align experts between HF and VeOmni:
+        # VeOmni: experts.{module_name} stacked [num_experts, ...]
+        # HF: experts.{expert_id}.{module_name} per expert
+        for layer_id in range(first_k_dense_replace, layer_num):
+            for module_name in ["gate_proj", "up_proj", "down_proj"]:
+                expert_weights = []
+                for expert_id in range(expert_num):
+                    key = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{module_name}.weight"
+                    expert_weights.append(hf_model_state_dict[key])
+
+                veomni_module_name = f"model.layers.{layer_id}.mlp.experts.{module_name}"
+                veomni_model_state_dict[veomni_module_name] = torch.stack(expert_weights, dim=0)
 
     veomni_model.load_state_dict(veomni_model_state_dict)
 
