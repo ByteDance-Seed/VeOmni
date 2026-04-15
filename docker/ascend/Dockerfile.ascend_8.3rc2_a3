@@ -1,0 +1,58 @@
+# FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-a3-openeuler24.03-py3.11
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+
+# Define environments
+ENV MAX_JOBS=16
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV OMP_NUM_THREADS=4
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+
+RUN echo "Setting timezone to CST (China Standard Time)..." && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone
+
+RUN apt-get update -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates ffmpeg pkg-config && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
+    pip install --upgrade pip setuptools packaging && \
+    pip cache purge
+
+RUN chmod +x /usr/bin/make /usr/bin/gmake /usr/bin/cc /usr/bin/c++
+
+RUN pip install --upgrade pip setuptools packaging --no-cache-dir --progress-bar off && \
+    pip cache purge
+
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.extra-index-url "${PIP_INDEX}" && \
+    pip config set global.no-cache-dir "true" && \
+    pip config --user set global.progress_bar off && \
+    python -m pip install --upgrade pip
+
+RUN pip3 install --no-cache-dir -U pip setuptools requests
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install -e .[npu_aarch64,transformers-stable]
+
+RUN git clone https://github.com/meta-pytorch/torchcodec.git
+
+WORKDIR /app/torchcodec
+
+RUN git checkout v0.5.0
+
+ENV CANN_PATH=/usr/local/Ascend
+
+RUN cp ../docs/get_started/installation/install_torchcodec_Ascend.sh .
+
+RUN chmod +x install_torchcodec_Ascend.sh
+
+RUN bash install_torchcodec_Ascend.sh ${CANN_PATH}/ascend-toolkit/set_env.sh
+
+WORKDIR /app
+
+CMD ["/bin/bash"]

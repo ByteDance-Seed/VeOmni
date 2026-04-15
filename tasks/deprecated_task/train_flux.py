@@ -308,7 +308,7 @@ def main():
         weights_path=args.model.model_path,
         enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-        enable_mixed_precision=args.train.enable_mixed_precision,
+        enable_mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         init_device=args.train.init_device,
         enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
@@ -473,7 +473,11 @@ def main():
                 extra_input = model.prepare_extra_input(latents)
                 # noise and target
                 noisy_latents = flow_scheduler.add_noise(
-                    latents, noise, timestep, args.train.micro_batch_size, args.train.enable_mixed_precision
+                    latents,
+                    noise,
+                    timestep,
+                    args.train.micro_batch_size,
+                    args.train.accelerator.fsdp_config.mixed_precision,
                 )
                 training_target = flow_scheduler.training_target(latents, noise, timestep)
                 # predict noise
