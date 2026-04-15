@@ -36,6 +36,7 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 | `veomni-debug` | Bug fix and debugging — quick path for simple fixes, full protocol for complex issues |
 | `veomni-review` | Pre-commit code review via subagent (mandatory gate) |
 | `veomni-new-model` | Adding a new model to VeOmni (patchgen, parallel plan, registry) |
+| `veomni-migrate-transformers-v5` | Migrate an existing `veomni/models/transformers/<model>/` from v4 monkey-patches to v5 patchgen + generated modeling (text + MoE) |
 | `veomni-new-op` | Adding a new optimized kernel/operator to veomni/ops/ |
 | `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
 | `create-pr` | Create a pull request — handles uncommitted changes, generates CI-compliant title and description |
