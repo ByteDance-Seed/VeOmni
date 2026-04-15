@@ -371,7 +371,7 @@ def apply_veomni_deepseek_v3_patch():
     hf_deepseek_v3.DeepseekV3MoE = PatchDeepseekV3MoE
     from .parallel_plan import get_parallel_plan
 
-    hf_deepseek_v3.DeepseekV3ForCausalLM.get_parallel_plan = lambda self: get_parallel_plan()
+    hf_deepseek_v3.DeepseekV3ForCausalLM.get_parallel_plan = lambda self: get_parallel_plan(use_gate_up_proj=False)
 
     hf_deepseek_v3.DeepseekV3Attention.forward = deepseek_v3_attention_forward
     hf_deepseek_v3.DeepseekV3ForCausalLM.forward = deepseek_v3_forcausal_lm_forward
