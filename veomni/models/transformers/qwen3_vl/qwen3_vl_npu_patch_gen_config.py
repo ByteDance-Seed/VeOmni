@@ -55,6 +55,7 @@ config = PatchConfig(
 # async ulysses / get_position_id helpers).
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
+config.helpers.extend(gpu_config.helpers)
 config.add_import("torch_npu", is_from_import=False)
 
 

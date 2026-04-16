@@ -48,10 +48,11 @@
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -81,10 +82,141 @@ from veomni.distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_outputs,
     gather_seq_scatter_heads,
+    get_ulysses_sequence_parallel_world_size,
     sp_pad_and_slice,
+)
+from veomni.distributed.sequence_parallel.async_ulysses import (
+    async_ulysses_output_projection,
+    async_ulysses_qkv_projection,
 )
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+# ======================================================================
+# [HELPERS] Module-level helpers injected via config.add_helper
+# ======================================================================
+
+# ================================================================
+# Module-level helpers injected after the import block
+# 1. `rot_pos_ids` — vllm-adapted lru_cached pos-id builder used by
+#    the patched `Qwen3VLVisionModel.rot_pos_emb` below
+# 2. `_qwen3_vl_async_ulysses_attention_forward` — async Ulysses
+#    attention path used by the patched `Qwen3VLTextAttention.forward`
+# 3. `get_position_id` — picklable wrapper that the patched
+#    `Qwen3VLForConditionalGeneration.get_position_id_func` returns via
+#    `partial(...)` so the VeOmni data pipeline can precompute
+#    multimodal position_ids on CPU worker processes
+# ================================================================
+
+
+# Copied and adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L431
+@lru_cache(maxsize=1024)
+def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+    if isinstance(h, torch.Tensor):
+        h = int(h.item())
+    if isinstance(w, torch.Tensor):
+        w = int(w.item())
+    if isinstance(spatial_merge_size, torch.Tensor):
+        spatial_merge_size = int(spatial_merge_size.item())
+    hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+    h_div = h // spatial_merge_size
+    w_div = w // spatial_merge_size
+    hpos_ids = hpos_ids.reshape(h_div, spatial_merge_size, w_div, spatial_merge_size)
+    hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+    wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+    wpos_ids = wpos_ids.reshape(h_div, spatial_merge_size, w_div, spatial_merge_size)
+    wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+    return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+
+def _qwen3_vl_async_ulysses_attention_forward(
+    self,
+    hidden_states,
+    attention_mask,
+    position_embeddings,
+    **kwargs,
+):
+    """Async Ulysses attention forward path for Qwen3VLTextAttention.
+
+    Fuses QKV projection + q_norm/k_norm + RoPE + ulysses all-to-all, and
+    the output projection + reverse all-to-all. Requires a flash-attention
+    implementation because of the packed-varlen contract.
+    """
+    if not is_flash_attention_requested(self.config):
+        raise ValueError(
+            "Async Ulysses attention only supports flash attention implementations. "
+            f"Current implementation: '{self.config._attn_implementation}'. "
+            "Please set attn_implementation to a flash attention variant or disable async Ulysses."
+        )
+
+    unpadded_seq_len = hidden_states.size(1)
+
+    q, k, v = async_ulysses_qkv_projection(
+        hidden_states=hidden_states,
+        seq_dimension=1,
+        head_dimension=2,
+        q_weight=self.q_proj.weight,
+        q_bias=self.q_proj.bias,
+        k_weight=self.k_proj.weight,
+        k_bias=self.k_proj.bias,
+        v_weight=self.v_proj.weight,
+        v_bias=self.v_proj.bias,
+        norm_type="rmsnorm",
+        norm_q_weight=self.q_norm.weight,
+        norm_q_bias=None,
+        norm_k_weight=self.k_norm.weight,
+        norm_k_bias=None,
+        normalized_shape=self.head_dim,
+        eps=self.config.rms_norm_eps,
+        unpadded_dim_size=unpadded_seq_len * get_ulysses_sequence_parallel_world_size(),
+        head_dim=self.head_dim,
+    )
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    cos, sin = position_embeddings
+    # cos/sin are per-rank sharded along the sequence dim; async path operates on
+    # full-seq QKV, so gather them back across the SP group.
+    cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
+    sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
+
+    query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
+
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        v,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        skip_ulysses=True,
+        **kwargs,
+    )
+
+    attn_output = async_ulysses_output_projection(
+        hidden_states=attn_output,
+        seq_dimension=1,
+        head_dimension=2,
+        proj_weight=self.o_proj.weight,
+        proj_bias=self.o_proj.bias,
+        unpadded_dim_size=attn_output.shape[1],
+    )
+    return attn_output, attn_weights
+
+
+def get_position_id(main_func, self, **kwargs):
+    # Must be a module-level function for multiprocessing pickle
+    position_ids, rope_deltas = main_func(self, **kwargs)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
 @dataclass

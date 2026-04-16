@@ -58,6 +58,7 @@
 +from functools import partial
 +from types import SimpleNamespace
  from typing import Any, Optional
+
  import torch
 +import torch.distributed as dist
  import torch.nn as nn
@@ -90,13 +91,24 @@
 +from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 +from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
++from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
++    Qwen2_5_VLConfig,
++    Qwen2_5_VLTextConfig,
++    Qwen2_5_VLVisionConfig,
++)
 +from transformers.processing_utils import Unpack
-+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
++from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 +from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.distributed.parallel_state import get_parallel_state
-+from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads, pad_tensor, sp_pad_and_slice, unpad_tensor
++from veomni.distributed.sequence_parallel import (
++    gather_heads_scatter_seq,
++    gather_seq_scatter_heads,
++    pad_tensor,
++    sp_pad_and_slice,
++    unpad_tensor,
++)
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +
 +
@@ -162,11 +174,10 @@
          else:
 -            # Other implementations: Process each chunk separately
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
--            splits = [
--                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
--            ]
+             splits = [
+                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+             ]
 -
-+            splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
              attn_outputs = [
                  attention_interface(
                      self,
@@ -788,5 +799,5 @@
 +        return partial(get_position_id, Qwen2_5_VLModel.get_rope_index, fake_model)  # noqa: F821
 +        # --- Patch.1 ---
 +
-+
-+__all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
+
+ __all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
