@@ -238,6 +238,13 @@ _vlm_cases = [
         id="qwen3_vl_v5",
         marks=_v5_only,
     ),
+    pytest.param(
+        "qwen3_vl_moe",
+        "./tests/toy_config/qwen3vlmoe_toy",
+        partial(_vlm_batch, patch_size=16),
+        id="qwen3_vl_moe_v5",
+        marks=_v5_only,
+    ),
 ]
 
 
