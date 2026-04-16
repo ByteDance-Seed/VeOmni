@@ -69,10 +69,22 @@ def get_module_source(module_name: str) -> str:
     return source
 
 
+def _unwrap_to_inspectable(obj: Any) -> Any:
+    """Follow ``__wrapped__`` links so ``inspect`` can find source.
+
+    Decorators like ``functools.lru_cache`` return wrapper objects that
+    ``inspect.getsourcelines`` cannot resolve. The original function is
+    reachable via ``__wrapped__`` (set by ``functools.wraps``).
+    """
+    while hasattr(obj, "__wrapped__"):
+        obj = obj.__wrapped__
+    return obj
+
+
 def get_object_source(obj: Any) -> str:
     """Get the source code of a class or function, preserving comments."""
     try:
-        return inspect.getsource(obj)
+        return inspect.getsource(_unwrap_to_inspectable(obj))
     except (OSError, TypeError):
         return ""
 
@@ -85,6 +97,7 @@ def get_object_source_with_leading_comments(obj: Any) -> str:
     document *why* a patch exists (e.g. the numbered ``Patch.N`` headers), so
     we rewind through preceding comment/blank lines and prepend them.
     """
+    obj = _unwrap_to_inspectable(obj)
     try:
         src_lines, start_lineno = inspect.getsourcelines(obj)
         source_file = inspect.getsourcefile(obj)
@@ -305,7 +318,9 @@ def strip_patch_decorators(source: str) -> str:
 
     by tracking parenthesis depth until the decorator is fully closed.
     """
-    _PATCH_DECORATOR_RE = re.compile(r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init)\b")
+    _PATCH_DECORATOR_RE = re.compile(
+        r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init|add_helper)\b"
+    )
     source_lines = source.splitlines()
     filtered_lines: list[str] = []
     in_patch_decorator = False
@@ -502,19 +517,9 @@ class ModelingCodeGenerator:
                 filtered_node = ast.Import(names=filtered_names)
                 output_lines.append(ast_to_source(filtered_node))
 
-        # Add custom post-import blocks from config
-        if self.config.post_import_blocks:
-            output_lines.append("")
-            output_lines.append("# Additional import blocks for patches")
-            for block in self.config.post_import_blocks:
-                block = textwrap.dedent(block).strip()
-                if block:
-                    output_lines.append(block)
-                    output_lines.append("")
-            if output_lines and output_lines[-1] == "":
-                output_lines.pop()
-
-        # Add additional imports from config
+        # Add additional imports from config first — keep these before the
+        # post-import blocks (and before helpers) so helper bodies can rely
+        # on any names declared via ``add_import``.
         if self.config.additional_imports:
             output_lines.append("")
             output_lines.append("# Additional imports for patches")
@@ -531,7 +536,45 @@ class ModelingCodeGenerator:
                     else:
                         output_lines.append(f"import {imp.module}")
 
+        # Add custom post-import blocks from config
+        if self.config.post_import_blocks:
+            output_lines.append("")
+            output_lines.append("# Additional import blocks for patches")
+            for block in self.config.post_import_blocks:
+                block = textwrap.dedent(block).strip()
+                if block:
+                    output_lines.append(block)
+                    output_lines.append("")
+            if output_lines and output_lines[-1] == "":
+                output_lines.pop()
+
         return "\n".join(output_lines)
+
+    def _generate_helpers(self) -> str:
+        """Emit module-level helpers registered via ``config.add_helper``.
+
+        Each helper's source (including any leading ``#`` comment block) is
+        copied verbatim, with the ``@config.add_helper`` decorator stripped
+        so the generated file stays self-contained.
+        """
+        if not self.config.helpers:
+            return ""
+
+        lines: list[str] = [
+            "",
+            f"# {'=' * 70}",
+            "# [HELPERS] Module-level helpers injected via config.add_helper",
+            f"# {'=' * 70}",
+        ]
+        for helper in self.config.helpers:
+            src = get_object_source_with_leading_comments(helper)
+            if not src:
+                continue
+            src = textwrap.dedent(src)
+            src = strip_patch_decorators(src)
+            lines.append("")
+            lines.append(src.rstrip())
+        return "\n".join(lines)
 
     def _apply_class_replacement(
         self,
@@ -934,7 +977,14 @@ class ModelingCodeGenerator:
         output_parts.append(self._transform_imports(import_nodes))
         output_parts.append("")
 
-        # 3. Process ALL module-level nodes in their original order
+        # 3. Emit module-level helpers (config.add_helper) after the import
+        # block so subsequent classes / functions can reference them.
+        helpers_block = self._generate_helpers()
+        if helpers_block:
+            output_parts.append(helpers_block)
+            output_parts.append("")
+
+        # 4. Process ALL module-level nodes in their original order
         # This preserves the exact structure of the original file
         for node in self.source_ast.body:
             # Skip import statements (already handled above)
