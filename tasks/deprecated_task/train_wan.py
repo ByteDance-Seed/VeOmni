@@ -366,7 +366,7 @@ def main():
                     noise,
                     timestep,
                     args.train.micro_batch_size,
-                    args.train.accelerator.fsdp_config.mixed_precision,
+                    args.train.accelerator.fsdp_config.mixed_precision.enable,
                 )
                 training_target = flow_scheduler.training_target(latents, noise, timestep)
                 # predict noise
