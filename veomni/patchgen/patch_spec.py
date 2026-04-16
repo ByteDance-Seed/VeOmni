@@ -111,6 +111,7 @@ class PatchConfig:
     patches: list[Patch] = field(default_factory=list)
     additional_imports: list[ImportSpec] = field(default_factory=list)
     post_import_blocks: list[str] = field(default_factory=list)
+    helpers: list[Callable] = field(default_factory=list)
     drop_imported_names: set[str] = field(default_factory=set)
 
     # Classes/functions to exclude from the output
@@ -293,6 +294,34 @@ class PatchConfig:
             is_from_import=is_from_import,
         )
         self.additional_imports.append(import_spec)
+
+    def add_helper(self, func: Optional[Callable] = None):
+        """
+        Register a module-level helper (function or class) to be emitted into
+        the generated file verbatim, just after the import block.
+
+        Unlike ``add_post_import_block`` (which takes a raw string), the helper
+        stays a real Python object in the config file: type-checked, linted,
+        navigable in the IDE. Leading ``#`` comment blocks attached to the
+        function are preserved in the generated output.
+
+        Imports that the helper depends on should be declared via
+        ``add_import`` (or re-used from the HF source module imports).
+
+        Decorator usage::
+
+            @config.add_helper
+            @lru_cache(maxsize=1024)
+            def rot_pos_ids(h, w, merge_size): ...
+
+        Direct usage::
+
+            config.add_helper(rot_pos_ids)
+        """
+        if func is None:
+            return self.add_helper  # support bare ``@config.add_helper()``
+        self.helpers.append(func)
+        return func
 
     def add_post_import_block(self, block: str):
         """
