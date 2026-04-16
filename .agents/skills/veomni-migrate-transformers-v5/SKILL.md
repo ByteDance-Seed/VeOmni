@@ -34,7 +34,7 @@ Scenarios differ by *v4-coexistence* vs *v5-only* — pick the closest example:
   - `qwen3_vl_npu_patch_gen_config.py` — demonstrates the **NPU-inherits-GPU** pattern: a thin NPU config that extends `gpu_config.helpers` / `gpu_config.post_import_blocks` / `gpu_config.additional_imports` and only overrides RMSNorm / rotary with `torch_npu.npu_rms_norm` / `torch_npu.npu_rotary_mul`. Avoids duplicating ~1K lines of shared VLM SP/deepstack patches.
 - **v4↔v5 coexist, VLM + MoE + GPU+NPU** — `veomni/models/transformers/qwen3_vl_moe/`
   - `__init__.py` — Pattern B with three classes: `_create_checkpoint_tensor_converter` attached as `staticmethod` on `Qwen3VLMoeForConditionalGeneration`, `Qwen3VLMoeModel`, **and** `Qwen3VLMoeTextModel` (the inner text submodel is also loadable standalone and must carry the converter).
-  - `qwen3_vl_moe_gpu_patch_gen_config.py` — minimal config that imports *all* VLM SP / deepstack / async-Ulysses / dummy_forward patches from `qwen3_vl` via `name_map={"Qwen3VL": "Qwen3VLMoe"}`, and only writes MoE-specific deltas: `replace_class("Qwen3VLMoeExperts")` with fused layout, `override_method("Qwen3VLMoeModel.__init__")` to propagate `_moe_implementation` into `config.text_config`, and `get_parallel_plan`. This is the canonical template for any new VLM+MoE migration.
+  - `qwen3_vl_moe_gpu_patch_gen_config.py` — minimal config that imports *most* VLM SP / deepstack / async-Ulysses / dummy_forward patches from `qwen3_vl` via `name_map={"Qwen3VL": "Qwen3VLMoe"}`, and only writes MoE-specific deltas: `replace_class("Qwen3VLMoeExperts")` with fused layout, `override_method("Qwen3VLMoeModel.__init__")` to propagate `_moe_implementation` into `config.text_config`, a hand-cloned `Qwen3VLMoeModel.forward` (see below), `Qwen3VLMoeForConditionalGeneration.forward` with fused loss + aux_loss, and `get_parallel_plan`. This is the canonical template for any new VLM+MoE migration. **Exception — do NOT reuse `Model.forward` via name_map**: `Qwen3VLMoeModelOutputWithPast` carries an extra `router_logits` field absent from the dense `Qwen3VLModelOutputWithPast`; rewriting class names at the AST level keeps the dense constructor's argument list, silently dropping `router_logits` and collapsing MoE routing. Clone the forward body and hand-author the return.
   - `checkpoint_tensor_converter.py` — HF ships *fused* expert tensors under the *same key names* as v5 but in transposed layout (`[E, H, 2*I]` vs `[E, 2*I, H]`). Uses dim-1 shape dispatch to recognize HF vs v5 layout, passes v5-native tensors through untouched, and hard-errors on unrecognized shapes — see Phase 3 "round-trip safety".
 - **v5-only, text/VLM+MoE** — `veomni/models/transformers/qwen3_5/`, `qwen3_5_moe/`
   - `__init__.py` — module-level `if is_transformers_version_greater_or_equal_to("5.2.0"):` gate wraps the whole `@MODELING_REGISTRY.register(...)`; there is **no v4 branch, no `modeling_<m>.py`, no `gpu_patch.py`/`npu_patch.py`**.
@@ -215,7 +215,7 @@ config = PatchConfig(
 | Replace module-level function (rotary, loss)  | `@config.replace_function("<name>")`                   |
 | Override a single method (Attention.forward, Model.forward, ForCausalLM.forward) | `@config.override_method("<Class>.<method>")`         |
 | Add attribute / extra `super().__init__()` wiring | `@config.modify_init("<Class>")`                   |
-| Reuse patch from a sibling config (name-prefix difference) | `config.override_method("<NewClass>.<m>", replacement=<imported_fn>, name_map={"OldPrefix": "NewPrefix"})` — non-decorator form |
+| Reuse patch from a sibling config (name-prefix difference) | `config.override_method("<NewClass>.<m>", replacement=<imported_fn>, name_map={"OldPrefix": "NewPrefix"})` — non-decorator form. **Caveat**: name_map only rewrites symbol *names* at the AST level; it does NOT align field sets between sibling output dataclasses (e.g. dense `ModelOutputWithPast` vs MoE `ModelOutputWithPast` with extra `router_logits`). Any `<OldClass>Output(...)` constructor call in the body gets its name rewritten but keeps the original arg list, silently dropping MoE-only fields. Clone the body when return dataclasses differ. |
 | Supporting import needed in generated file    | `config.add_import("<module>", names=[...])` (or `alias=..., is_from_import=False`) |
 | Remove an upstream import the generated file should NOT keep | `config.drop_import_names("<symbol>", ...)`     |
 | Inject raw code (try/except import fallback, helper fn used by patched code) near top of generated file | `config.add_post_import_block("""...""")` |
@@ -729,6 +729,26 @@ Extra e2e gotchas:
 - **Duplicating patches across sibling models** — if qwen3_5 and qwen3_5_moe share
   a GatedDeltaNet / ViT, import the replacement functions from the sibling
   patchgen config and use `name_map={"OldPrefix": "NewPrefix"}` — don't copy.
+- **Reusing a dense `Model.forward` on an MoE sibling via `name_map`** — name_map
+  rewrites `<DensePrefix>*` → `<MoePrefix>*` at the AST level, but the
+  constructed `<DensePrefix>ModelOutputWithPast(...)` return call is rewritten
+  to `<MoePrefix>ModelOutputWithPast(...)` **with the same argument list as the
+  dense version**, silently dropping MoE-only fields (`router_logits`).
+  Downstream `ForConditionalGeneration.forward` then sees
+  `outputs.router_logits = None`; `load_balancing_loss_func(None, ...)` returns
+  int `0`, and either (a) aux_loss stays at 0 → router collapse, or
+  (b) `0.to(loss.device)` crashes with `AttributeError`. Clone the forward body
+  and hand-author the return whenever the sibling output dataclass has extra
+  fields. `qwen3_vl_moe` hit this — see `qwen3_vl_moe_gpu_patch_gen_config.py`
+  for the clone pattern.
+- **`load_balancing_loss_func` can return a Python `int`, not a tensor** — when
+  `router_logits` is `None` or an empty tuple, `load_balancing_loss_func(...)`
+  returns scalar `0` (int), not `torch.tensor(0.0)`. Any later
+  `loss += coef * aux_loss.to(loss.device)` will then raise
+  `AttributeError: 'int' object has no attribute 'to'`. Guard with
+  `isinstance(aux_loss, torch.Tensor)` before composing into `loss`, and
+  prefer out-of-place `loss = loss + ...` over `+=` to avoid mutating a tensor
+  that may be used elsewhere.
 - **Non-picklable helpers inside override bodies** — VLM `get_position_id_func`
   returns a `partial` over a helper; that helper must be at module scope in the
   generated file (injected via `add_post_import_block`), not a local closure,
