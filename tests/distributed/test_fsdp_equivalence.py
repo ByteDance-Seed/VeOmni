@@ -226,6 +226,15 @@ _text_test_cases_v5 = [
         id="qwen3_5_moe",
         marks=_v5_only,
     ),
+    pytest.param(
+        "deepseek_v3",
+        "./tests/toy_config/deepseek_v3_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v3_v5",
+        marks=_v5_only,
+    ),
 ]
 
 _text_test_cases = _text_test_cases_v4 + _text_test_cases_v5

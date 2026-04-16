@@ -28,6 +28,10 @@ Scenarios differ by *v4-coexistence* vs *v5-only* — pick the closest example:
   - `__init__.py` — additionally attaches `_create_checkpoint_tensor_converter` as a `staticmethod` on every v5 model class.
   - `qwen3_moe_gpu_patch_gen_config.py` — replaces `Qwen3MoeExperts` with fused-MoE layout + overrides `get_parallel_plan`.
   - `checkpoint_tensor_converter.py` — HF per-expert → v5 fused runtime converter.
+- **v4↔v5 coexist, MoE + NPU** — `veomni/models/transformers/deepseek_v3/`
+  - Pattern B with sibling `deepseek_v3_npu_patch_gen_config.py`; both GPU and NPU generated files committed.
+  - `parallel_plan.get_parallel_plan(use_gate_up_proj: bool = True)` — v5 path shards the fused `gate_up_proj` parameter, v4 path (`apply_veomni_<m>_patch`) calls with `use_gate_up_proj=False` to keep the split `gate_proj`/`up_proj` layout.
+  - No Liger kernels in the generated file: runtime kernel choice (deterministic Triton RoPE + batch-invariant RMSNorm) is wired in `__init__.py` for actor/rollout numerical parity.
 - **v5-only, text/VLM+MoE** — `veomni/models/transformers/qwen3_5/`, `qwen3_5_moe/`
   - `__init__.py` — module-level `if is_transformers_version_greater_or_equal_to("5.2.0"):` gate wraps the whole `@MODELING_REGISTRY.register(...)`; there is **no v4 branch, no `modeling_<m>.py`, no `gpu_patch.py`/`npu_patch.py`**.
   - `qwen3_5_moe_gpu_patch_gen_config.py` — demonstrates `config.drop_import_names(...)`, `config.add_post_import_block(...)`, cross-config reuse via `from ...qwen3_5.qwen3_5_gpu_patch_gen_config import <fn>`, and `name_map={"Qwen3_5": "Qwen3_5Moe"}` on `override_method` to share patches between sibling configs.
@@ -659,6 +663,27 @@ Extra e2e gotchas:
 - **Only regenerating GPU when NPU config exists** — if the model has a sibling
   `<m>_npu_patch_gen_config.py`, run codegen for **both** (or use `--all`) before
   committing. CI checks both generated files for drift.
+- **`LigerSwiGLUMLP` incompatible with MLPs that accept `intermediate_size` kwarg** —
+  e.g. DeepseekV3 reuses `DeepseekV3MLP` for `shared_experts` passing an explicit
+  `intermediate_size`; `LigerSwiGLUMLP.__init__` rejects that kwarg and raises
+  `TypeError`. Don't blindly copy the qwen3 Liger MLP swap — if the model uses the
+  same MLP class for routed + shared experts with different `intermediate_size`,
+  skip the Liger replacement.
+- **Parallel plan keys must track v5 fused expert layout** — after migrating MoE
+  to `gate_up_proj [E, 2I, H]`, `parallel_plan.py` must shard
+  `model.layers.*.mlp.experts.gate_up_proj` (Shard(0)), NOT the legacy
+  `gate_proj` / `up_proj` keys. Stale v4 keys leave `gate_up_proj` un-sharded and
+  EP training hits `AssertionError: len(cumsum_M) == b.shape[0]` inside
+  `group_gemm_same_nk` (cumsum length = `E_local`, but the weight has all `E`
+  experts). For coexist patterns, expose a `use_gate_up_proj: bool` flag so the
+  v4 `apply_veomni_<m>_patch` path can opt back to the split-key plan. See
+  `veomni/models/transformers/deepseek_v3/parallel_plan.py`.
+- **Sync-weight adapters must detect v5 fused layout** — HF v5 checkpoints may
+  already ship `experts.gate_up_proj` / `experts.down_proj`. Test adapters in
+  `tests/models/weight_sync_adapters.py::sync_weight_<m>` that unconditionally
+  stack per-expert `gate_proj`/`up_proj`/`down_proj` will raise
+  `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check
+  and skip stacking when the fused keys are already present.
 
 ---
 

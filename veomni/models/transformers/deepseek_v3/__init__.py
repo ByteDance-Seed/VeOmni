@@ -11,20 +11,58 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("deepseek_v3")
 def register_deepseek_v3_modeling(architecture: str):
-    from transformers import (
-        DeepseekV3ForCausalLM,
-        DeepseekV3ForSequenceClassification,
-        DeepseekV3Model,
-    )
+    if is_transformers_version_greater_or_equal_to("5.2.0"):
+        from .checkpoint_tensor_converter import create_deepseek_v3_checkpoint_tensor_converter
 
-    from .modeling_deepseek_v3 import apply_veomni_deepseek_v3_patch
+        if IS_NPU_AVAILABLE:
+            from .generated.patched_modeling_deepseek_v3_npu import (
+                DeepseekV3ForCausalLM,
+                DeepseekV3ForSequenceClassification,
+                DeepseekV3Model,
+            )
+        else:
+            from .generated.patched_modeling_deepseek_v3_gpu import (
+                DeepseekV3ForCausalLM,
+                DeepseekV3ForSequenceClassification,
+                DeepseekV3Model,
+            )
 
-    apply_veomni_deepseek_v3_patch()
+            # Apply deterministic Triton RoPE + batch-invariant RMSNorm at
+            # runtime (required for VeRL actor/rollout numerical parity).
+            # Not baked into the generated file so kernel choice stays a
+            # runtime concern.
+            if IS_CUDA_AVAILABLE:
+                from ....ops.batch_invariant_ops import batch_invariant_rms_norm
+                from .generated import patched_modeling_deepseek_v3_gpu as gen
+                from .gpu_patch import _make_deterministic_rope_forward
+
+                def _fused_rms_norm_forward(self, hidden_states):
+                    return batch_invariant_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+                gen.DeepseekV3RotaryEmbedding.forward = _make_deterministic_rope_forward()
+                gen.DeepseekV3RMSNorm.forward = _fused_rms_norm_forward
+
+        for model_cls in (DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification, DeepseekV3Model):
+            model_cls._create_checkpoint_tensor_converter = staticmethod(
+                create_deepseek_v3_checkpoint_tensor_converter
+            )
+    else:
+        from transformers import (
+            DeepseekV3ForCausalLM,
+            DeepseekV3ForSequenceClassification,
+            DeepseekV3Model,
+        )
+
+        from .modeling_deepseek_v3 import apply_veomni_deepseek_v3_patch
+
+        apply_veomni_deepseek_v3_patch()
 
     if "ForCausalLM" in architecture:
         return DeepseekV3ForCausalLM
