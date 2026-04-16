@@ -532,7 +532,9 @@ def parallelize_model_fsdp2(
     fully_shard(model, **fsdp_kwargs)
 
     # configure manual prefetching when needed
-    need_manual_prefetch = parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+    need_manual_prefetch = (
+        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+    ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]
