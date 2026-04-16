@@ -184,10 +184,11 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
     cos, sin = position_embeddings
     # cos/sin are per-rank sharded along the sequence dim; async path operates on
-    # full-seq QKV, so gather them back across the SP group. Shape is
-    # (3, bs, seq_len, head_dim) for qwen3_vl mrope, so the seq dim is 2.
-    cos = gather_outputs(cos, gather_dim=2, group=get_parallel_state().sp_group)
-    sin = gather_outputs(sin, gather_dim=2, group=get_parallel_state().sp_group)
+    # full-seq QKV, so gather them back across the SP group. In v5,
+    # `apply_interleaved_mrope` collapses the leading 3-axis from mrope, so the
+    # incoming shape here is (bs, seq_len, head_dim) and the seq dim is 1.
+    cos = gather_outputs(cos, gather_dim=1, group=get_parallel_state().sp_group)
+    sin = gather_outputs(sin, gather_dim=1, group=get_parallel_state().sp_group)
 
     query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -226,12 +227,13 @@ def get_position_id(main_func, self, **kwargs):
 
 # ================================================================
 # Patch: Qwen3VLVisionAttention.forward
-# 1. accept precomputed max_seqlen from outer forward to avoid
-#    per-layer `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync
+# 1. accept precomputed max_seqlen from outer forward so the
+#    `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync happens once
+#    (hoisted to the outer visual forward) instead of once per layer
 # ================================================================
 @config.override_method(
     "Qwen3VLVisionAttention.forward",
-    description="Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync",
+    description="Use precomputed max_seqlen passed from outer forward to hoist CPU-GPU sync out of the layer loop",
 )
 def qwen3_vl_vision_attention_forward_patched(
     self,
@@ -442,8 +444,8 @@ def qwen3_vl_vision_fast_pos_embed_interpolate_patched(self, grid_thw):
 # 2. use pre-padding cu_seqlens[-1] as the un-sliced total seq length
 # 3. when SP is enabled, extend cu_seqlens with the SP-padded sentinel
 #    so the padded tokens belong to a valid attention window
-# 4. precompute max_seqlen once from cu_seqlens to avoid per-layer
-#    CPU-GPU sync inside the attention call
+# 4. precompute max_seqlen once here (single CPU-GPU sync hoisted out
+#    of the attention layer loop) and thread it into each block
 # 5. on NPU, move cu_seqlens to CPU — NPU FA2 varlen path requires it
 # 6. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
 #    path returned `(merged, deepstack_list)` as a bare tuple)
@@ -547,8 +549,10 @@ def qwen3_vl_vision_forward_patched(
 # 1. add dummy_forward so ranks without pixel_values can still run the
 #    visual encoder under FSDP — otherwise reduce-scatter hangs when
 #    some ranks get None pixel_values while others have real images
-# 2. SP-aware shape: grid_thw width is scaled by sp_size so the dummy
-#    batch stays a clean multiple after sequence slicing
+# 2. SP-aware shape: grid_thw height is scaled by sp_size so the dummy
+#    batch stays a clean multiple after sequence slicing. Shapes are
+#    derived from the vision config (patch_size / temporal_patch_size /
+#    in_channels / spatial_merge_size) so model variants don't break
 # ================================================================
 @config.override_method(
     "Qwen3VLVisionModel.dummy_forward",
@@ -556,18 +560,33 @@ def qwen3_vl_vision_forward_patched(
 )
 def qwen3_vl_vision_dummy_forward_patched(self):
     # --- Patch.1 ---
+    # Derive dummy shape from config so variants with different patch sizes /
+    # channel counts work without silent breakage:
+    #   - pixel row:  in_channels * temporal_patch_size * patch_size**2
+    #   - grid_thw:   one (t=1) frame with a (h x w) grid of patches where
+    #                 h and w are multiples of spatial_merge_size (required
+    #                 by the ViT merger) — we use 2*merge_size for both.
+    patch_size = self.config.patch_size
+    temporal_patch_size = self.config.temporal_patch_size
+    in_channels = self.config.in_channels
+    merge_size = self.spatial_merge_size
+
+    t = 1
+    h_base = 2 * merge_size
+    w = 2 * merge_size
+
+    # --- Patch.2 ---
     if get_parallel_state().sp_enabled:
-        # --- Patch.2 ---
-        sp_size = get_parallel_state().sp_size
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-        grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
-        # --- Patch.2 ---
-        dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        h = h_base * get_parallel_state().sp_size
     else:
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-        grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
-        dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
-    return self(**dummy_data)
+        h = h_base
+    # --- Patch.2 ---
+
+    num_patches = t * h * w
+    pixel_row_size = in_channels * temporal_patch_size * patch_size * patch_size
+    pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=self.dtype, device=self.device)
+    grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
+    return self(hidden_states=pixel_values, grid_thw=grid_thw)
     # --- Patch.1 ---
 
 
@@ -929,14 +948,32 @@ def qwen3_vl_model_forward_patched(
         # --- Patch.4 ---
 
     if position_ids is None:
+        # --- Patch.5 ---
+        # HF v5 may pass attention_mask as a dict (keyed by attention type); the
+        # rope-index helpers below still expect a plain tensor, so unwrap it.
+        if isinstance(attention_mask, dict):
+            attention_mask_tensor = attention_mask.get("full_attention", None)
+        else:
+            attention_mask_tensor = attention_mask
+        # Under Ulysses SP, input_ids/inputs_embeds here are per-rank slices, so
+        # computing mrope positions on the fly would drift. The training path is
+        # expected to go through the VeOmni `get_position_id_func` precompute
+        # (via data pipeline); raise loudly if we somehow land here with SP on.
+        if get_parallel_state().sp_enabled:
+            raise RuntimeError(
+                "Qwen3VLModel.forward: position_ids is None while sequence parallel "
+                "is enabled; multimodal position_ids must be precomputed via "
+                "`get_position_id_func` in the VeOmni data pipeline."
+            )
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask_tensor,
             past_key_values=past_key_values,
         )
+        # --- Patch.5 ---
     else:
         # --- Patch.5 ---
         if position_ids.dim() == 3 and position_ids.shape[1] == 3:
