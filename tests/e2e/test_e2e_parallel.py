@@ -215,6 +215,15 @@ qwen3vl_test_cases = [
         marks=_v4_only,
     ),
     pytest.param(
+        "qwen3vl",
+        "./tests/toy_config/qwen3vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
+    ),
+    pytest.param(
         "qwen3vlmoe",
         "./tests/toy_config/qwen3vlmoe_toy",
         True,
