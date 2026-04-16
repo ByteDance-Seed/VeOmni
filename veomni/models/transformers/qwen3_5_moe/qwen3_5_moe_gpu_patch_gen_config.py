@@ -423,12 +423,11 @@ def qwen3_5_moe_model_forward_patched(
     )
 
 
-config.add_post_import_block("""
+@config.add_helper
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-""")
 
 
 @config.override_method(
@@ -440,7 +439,7 @@ def qwen3_5_moe_forconditional_generation_get_position_id_func(self):
     fake_config.image_token_id = IMAGE_INPUT_INDEX
     fake_config.video_token_id = VIDEO_INPUT_INDEX
     fake_model = SimpleNamespace(config=fake_config)
-    return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
+    return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821
 
 
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────

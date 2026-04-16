@@ -554,10 +554,7 @@ class ModelingCodeGenerator:
             f"# {'=' * 70}",
         ]
         for helper in self.config.helpers:
-            # Unwrap functools decorators (e.g. ``@lru_cache``) so ``inspect``
-            # can locate the original source file/lines.
-            unwrapped = inspect.unwrap(helper) if callable(helper) else helper
-            src = get_object_source_with_leading_comments(unwrapped)
+            src = get_object_source_with_leading_comments(helper)
             if not src:
                 continue
             src = textwrap.dedent(src)

@@ -39,10 +39,16 @@
 # ==============================================================================
 
 from collections.abc import Callable
+
+# Additional imports for patches
+from copy import copy
 from dataclasses import dataclass
+from functools import partial
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers import initialization as init
@@ -67,6 +73,12 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import sp_pad_and_slice
+from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.device import get_device_id
+
 
 # Additional import blocks for patches
 # Modification: We are not using https://github.com/Dao-AILab/causal-conv1d now
@@ -87,24 +99,15 @@ except ImportError:
     )
 
 
+# ======================================================================
+# [HELPERS] Module-level helpers injected via config.add_helper
+# ======================================================================
+
+
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-
-
-# Additional imports for patches
-from copy import copy
-from functools import partial
-from types import SimpleNamespace
-
-import torch.distributed as dist
-
-from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import sp_pad_and_slice
-from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.device import get_device_id
 
 
 logger = logging.get_logger(__name__)
@@ -2488,7 +2491,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         fake_config.image_token_id = IMAGE_INPUT_INDEX
         fake_config.video_token_id = VIDEO_INPUT_INDEX
         fake_model = SimpleNamespace(config=fake_config)
-        return partial(get_position_id, Qwen3_5Model.get_rope_index, fake_model)  # noqa: F821 already defined via above `add_post_import_block`
+        return partial(get_position_id, Qwen3_5Model.get_rope_index, fake_model)  # noqa: F821
 
 
 __all__ = [

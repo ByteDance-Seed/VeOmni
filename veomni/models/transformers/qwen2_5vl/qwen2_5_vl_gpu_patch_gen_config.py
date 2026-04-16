@@ -553,6 +553,13 @@ def qwen2_5_vl_model_forward_patched(
     return output if return_dict else output.to_tuple()
 
 
+@config.add_helper
+def get_position_id(main_func, self, **kwargs):
+    # Module-level function so `partial(...)` is picklable for multiprocessing.
+    position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, bs, l)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
 # ================================================================
 # Patch: Qwen2_5_VLForConditionalGeneration.get_position_id_func (new)
 # 1. wrap Qwen2_5_VLModel.get_rope_index so VeOmni's data pipeline can
@@ -562,14 +569,6 @@ def qwen2_5_vl_model_forward_patched(
 # 2. overwrite token ids with VeOmni constants (IMAGE_INPUT_INDEX /
 #    VIDEO_INPUT_INDEX) so input_ids produced by our data pipeline match
 # ================================================================
-config.add_post_import_block("""
-def get_position_id(main_func, self, **kwargs):
-    # Must be a module-level function for multiprocessing pickle
-    position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, bs, l)
-    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-""")
-
-
 @config.override_method(
     "Qwen2_5_VLForConditionalGeneration.get_position_id_func",
     description="Use VeOmni precomputed position-id function and unified multimodal token ids",
@@ -582,7 +581,7 @@ def qwen2_5_vl_get_position_id_func_patched(self):
     fake_config.video_token_id = VIDEO_INPUT_INDEX
     # --- Patch.2 ---
     fake_model = SimpleNamespace(config=fake_config)
-    return partial(get_position_id, Qwen2_5_VLModel.get_rope_index, fake_model)  # noqa: F821 defined via add_post_import_block
+    return partial(get_position_id, Qwen2_5_VLModel.get_rope_index, fake_model)  # noqa: F821
     # --- Patch.1 ---
 
 

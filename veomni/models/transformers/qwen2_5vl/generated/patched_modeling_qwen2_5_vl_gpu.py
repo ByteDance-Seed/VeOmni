@@ -28,11 +28,16 @@
 #
 # ==============================================================================
 
+# Additional imports for patches
+import copy
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import initialization as init
@@ -56,21 +61,6 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-
-# Additional import blocks for patches
-def get_position_id(main_func, self, **kwargs):
-    # Must be a module-level function for multiprocessing pickle
-    position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, bs, l)
-    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-
-
-# Additional imports for patches
-import copy
-from functools import partial
-from types import SimpleNamespace
-
-import torch.distributed as dist
-
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -80,6 +70,17 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+
+
+# ======================================================================
+# [HELPERS] Module-level helpers injected via config.add_helper
+# ======================================================================
+
+
+def get_position_id(main_func, self, **kwargs):
+    # Module-level function so `partial(...)` is picklable for multiprocessing.
+    position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, bs, l)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
 logger = logging.get_logger(__name__)
@@ -2005,6 +2006,15 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
         return input_ids, model_kwargs
 
+    # ================================================================
+    # Patch: Qwen2_5_VLForConditionalGeneration.get_position_id_func (new)
+    # 1. wrap Qwen2_5_VLModel.get_rope_index so VeOmni's data pipeline can
+    #    precompute multimodal position_ids in process_sample (on CPU worker
+    #    processes) — get_position_id is defined as a module-level function
+    #    so `partial(...)` is picklable for multiprocessing
+    # 2. overwrite token ids with VeOmni constants (IMAGE_INPUT_INDEX /
+    #    VIDEO_INPUT_INDEX) so input_ids produced by our data pipeline match
+    # ================================================================
     def get_position_id_func(self):
         # --- Patch.1 ---
         fake_config = copy.copy(self.config)
@@ -2013,7 +2023,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         fake_config.video_token_id = VIDEO_INPUT_INDEX
         # --- Patch.2 ---
         fake_model = SimpleNamespace(config=fake_config)
-        return partial(get_position_id, Qwen2_5_VLModel.get_rope_index, fake_model)  # noqa: F821 defined via add_post_import_block
+        return partial(get_position_id, Qwen2_5_VLModel.get_rope_index, fake_model)  # noqa: F821
         # --- Patch.1 ---
 
 
