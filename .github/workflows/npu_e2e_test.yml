@@ -69,11 +69,10 @@ jobs:
     steps:
       - name: Set NPU visible devices
         run: |
-          if [[ "$RUNNER_NAME" == *npu0* ]]; then
-            echo "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" >> $GITHUB_ENV
-          elif [[ "$RUNNER_NAME" == *npu1* ]]; then
-            echo "ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15" >> $GITHUB_ENV
-          fi
+          case "$RUNNER_NAME" in
+            *npu0*) echo "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" >> $GITHUB_ENV ;;
+            *npu1*) echo "ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15" >> $GITHUB_ENV ;;
+          esac
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
