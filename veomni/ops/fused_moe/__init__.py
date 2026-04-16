@@ -173,10 +173,10 @@ if is_torch_npu_available():
                 routing_weights=top_k_weights.to(hidden_states.dtype),
                 selected_experts=top_k_index.to(torch.int64),
                 hidden_states=hidden_states,
-                fc1_1_weight=self.gate_up_proj[:, : self.intermediate_dim, :].contiguous(),
-                fc1_2_weight=self.gate_up_proj[:, self.intermediate_dim :, :].contiguous(),
+                fc1_1_weight=None,
+                fc1_2_weight=None,
                 fc2_weight=self.down_proj,
-                fc1_1_2_weight=None,
+                fc1_1_2_weight=self.gate_up_proj,
             )
 
         return adapter
