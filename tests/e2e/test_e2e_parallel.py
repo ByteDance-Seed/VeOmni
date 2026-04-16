@@ -159,6 +159,16 @@ text_test_cases = [
         marks=_v4_only,
     ),
     pytest.param(
+        "seed_oss",
+        "./tests/toy_config/seed_oss_toy",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
+        id="seed_oss_v5",
+    ),
+    pytest.param(
         "deepseek_v3",
         "./tests/toy_config/deepseek_v3_toy",
         True,  # is_moe
