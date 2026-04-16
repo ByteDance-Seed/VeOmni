@@ -27,11 +27,14 @@ python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qw
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+    BaseModelOutputWithDeepstackFeatures,
     Qwen3VLMoeCausalLMOutputWithPast,
+    Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextModel,
     Qwen3VLMoeVisionModel,
     load_balancing_loss_func,
@@ -39,12 +42,17 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
+    gather_outputs,
+    gather_seq_scatter_heads,
+)
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     config as qwen3_vl_config,
 )
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_get_position_id_func_patched,
-    qwen3_vl_model_forward_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_text_attention_forward_patched,
@@ -144,12 +152,6 @@ config.override_method(
     replacement=qwen3_vl_model_get_placeholder_mask_patched,
     name_map=_NAME_MAP,
     description="Return raw image/video placeholder bool masks for VeOmni SP-aware masked_scatter",
-)
-config.override_method(
-    "Qwen3VLMoeModel.forward",
-    replacement=qwen3_vl_model_forward_patched,
-    name_map=_NAME_MAP,
-    description="VeOmni SP + precomputed position-id + dummy-forward + deepstack multimodal patches",
 )
 config.override_method(
     "Qwen3VLMoeForConditionalGeneration.get_position_id_func",
@@ -262,6 +264,258 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
 
 
 # ================================================================
+# Patch: Qwen3VLMoeModel.forward
+# MoE-specific clone of the dense qwen3_vl model forward. The shared
+# body (SP + precomputed position-id + dummy-forward + deepstack) is
+# identical, but the return type is `Qwen3VLMoeModelOutputWithPast`
+# which carries an extra `router_logits` field — dropping it on the
+# return statement would silence the MoE load-balancing loss (router
+# collapse) since `Qwen3VLMoeForConditionalGeneration.forward` reads
+# `outputs.router_logits`.
+# ================================================================
+@config.override_method(
+    "Qwen3VLMoeModel.forward",
+    description="VeOmni SP + precomputed position-id + dummy-forward + deepstack; preserve MoE router_logits",
+)
+def qwen3_vl_moe_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.FloatTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    cache_position: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | Qwen3VLMoeModelOutputWithPast:
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+    # --- Patch.2 ---
+    image_mask = kwargs.pop("image_mask", None)
+    video_mask = kwargs.pop("video_mask", None)
+    if video_mask is None and image_mask is None:
+        if get_parallel_state().sp_enabled:
+            input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
+            dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+            input_ids_full = torch.cat(input_ids_list, dim=1)
+        else:
+            input_ids_full = input_ids
+        image_mask, video_mask = self.get_placeholder_mask(input_ids_full)
+    # --- Patch.2 ---
+
+    # --- Patch.3 ---
+    flash_attn_kwargs = {}
+    for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+        if key in kwargs:
+            flash_attn_kwargs[key] = kwargs.pop(key)
+    # --- Patch.3 ---
+
+    # --- Patch.1 ---
+    if get_parallel_state().sp_enabled:
+        inputs_embeds = gather_seq_scatter_heads(
+            inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
+        )
+    # --- Patch.1 ---
+
+    fake_deepstack = None
+
+    if pixel_values is not None:
+        image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
+            pixel_values, image_grid_thw, return_dict=True
+        )
+        image_embeds = image_outputs.pooler_output
+        deepstack_image_embeds = image_outputs.deepstack_features
+
+        # --- Patch.1 ---
+        if get_parallel_state().sp_enabled:
+            image_embeds = gather_seq_scatter_heads(
+                image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+            )
+            deepstack_image_embeds = [
+                gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
+                for embed in deepstack_image_embeds
+            ]
+        # --- Patch.1 ---
+
+        n_image_tokens = image_mask.sum().long().item()
+        embeds_image_mask = (
+            image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        )
+        image_embeds = image_embeds[:n_image_tokens]
+        deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
+
+        # --- Patch.1 ---
+        if get_parallel_state().sp_enabled:
+            seq_len = image_mask.shape[1]
+            seq_per_rank = seq_len // get_parallel_state().sp_size
+            rank_start = get_parallel_state().sp_rank * seq_per_rank
+            rank_end = rank_start + seq_per_rank
+
+            deepstack_offset = image_mask[:, :rank_start].sum().item()
+            image_mask = image_mask[:, rank_start:rank_end]
+            deepstack_len = image_mask.sum().item()
+
+            deepstack_image_embeds = [
+                embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
+            ]
+        # --- Patch.1 ---
+
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.4 ---
+        fake_vision = self.visual.dummy_forward()
+        fake_embeds = fake_vision.pooler_output.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        fake_deepstack = fake_vision.deepstack_features
+        # --- Patch.4 ---
+
+    if pixel_values_videos is not None:
+        video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
+            pixel_values_videos, video_grid_thw, return_dict=True
+        )
+        video_embeds = video_outputs.pooler_output
+        deepstack_video_embeds = video_outputs.deepstack_features
+
+        # --- Patch.1 ---
+        if get_parallel_state().sp_enabled:
+            video_embeds = gather_seq_scatter_heads(
+                video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+            )
+            deepstack_video_embeds = [
+                gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
+                for embed in deepstack_video_embeds
+            ]
+        # --- Patch.1 ---
+
+        n_video_tokens = video_mask.sum().long().item()
+        embeds_video_mask = (
+            video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        )
+        video_embeds = video_embeds[:n_video_tokens]
+        deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
+        video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
+
+        # --- Patch.1 ---
+        if get_parallel_state().sp_enabled:
+            seq_len = video_mask.shape[1]
+            seq_per_rank = seq_len // get_parallel_state().sp_size
+            rank_start = get_parallel_state().sp_rank * seq_per_rank
+            rank_end = rank_start + seq_per_rank
+
+            deepstack_offset = video_mask[:, :rank_start].sum().item()
+            video_mask = video_mask[:, rank_start:rank_end]
+            deepstack_len = video_mask.sum().item()
+
+            deepstack_video_embeds = [
+                embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
+            ]
+        # --- Patch.1 ---
+
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.4 ---
+        fake_vision = self.visual.dummy_forward()
+        fake_embeds = fake_vision.pooler_output.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        fake_deepstack = fake_vision.deepstack_features
+        # --- Patch.4 ---
+
+    # --- Patch.1 ---
+    if get_parallel_state().sp_enabled:
+        inputs_embeds = gather_heads_scatter_seq(
+            inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+        )
+    # --- Patch.1 ---
+
+    visual_pos_masks = None
+    deepstack_visual_embeds = None
+
+    if pixel_values is not None and pixel_values_videos is not None:
+        visual_pos_masks = image_mask | video_mask
+        deepstack_visual_embeds = []
+        image_mask_joint = image_mask[visual_pos_masks]
+        video_mask_joint = video_mask[visual_pos_masks]
+        for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+            embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+            embed_joint[image_mask_joint, :] = img_embed
+            embed_joint[video_mask_joint, :] = vid_embed
+            deepstack_visual_embeds.append(embed_joint)
+    elif pixel_values is not None:
+        visual_pos_masks = image_mask
+        deepstack_visual_embeds = deepstack_image_embeds
+    elif pixel_values_videos is not None:
+        visual_pos_masks = video_mask
+        deepstack_visual_embeds = deepstack_video_embeds
+    else:
+        # --- Patch.4 ---
+        if fake_deepstack is not None:
+            deepstack_visual_embeds = fake_deepstack
+        # --- Patch.4 ---
+
+    if position_ids is None:
+        # --- Patch.5 ---
+        if isinstance(attention_mask, dict):
+            attention_mask_tensor = attention_mask.get("full_attention", None)
+        else:
+            attention_mask_tensor = attention_mask
+        if get_parallel_state().sp_enabled:
+            raise RuntimeError(
+                "Qwen3VLMoeModel.forward: position_ids is None while sequence parallel "
+                "is enabled; multimodal position_ids must be precomputed via "
+                "`get_position_id_func` in the VeOmni data pipeline."
+            )
+        position_ids = self.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask_tensor,
+            past_key_values=past_key_values,
+        )
+        # --- Patch.5 ---
+    else:
+        # --- Patch.5 ---
+        if position_ids.dim() == 3 and position_ids.shape[1] == 3:
+            position_ids = position_ids.transpose(0, 1).contiguous()
+        # --- Patch.5 ---
+
+    # --- Patch.3 ---
+    kwargs.update(flash_attn_kwargs)
+    # --- Patch.3 ---
+
+    outputs = self.language_model(
+        input_ids=None,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        cache_position=cache_position,
+        visual_pos_masks=visual_pos_masks,
+        deepstack_visual_embeds=deepstack_visual_embeds,
+        **kwargs,
+    )
+
+    return Qwen3VLMoeModelOutputWithPast(
+        last_hidden_state=outputs.last_hidden_state,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        router_logits=getattr(outputs, "router_logits", None),
+        rope_deltas=self.rope_deltas,
+    )
+
+
+# ================================================================
 # Patch: Qwen3VLMoeForConditionalGeneration.forward
 # 1. use the unified VeOmni fused loss_function path — avoids
 #    materializing full-vocab logits when labels is provided
@@ -332,8 +586,8 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
             self.config.text_config.num_experts_per_tok,
             attention_mask,
         )
-        if labels is not None:
-            loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+        if labels is not None and isinstance(aux_loss, torch.Tensor):
+            loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
     # --- Patch.2 ---
 
     return Qwen3VLMoeCausalLMOutputWithPast(
@@ -344,6 +598,7 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
+        router_logits=getattr(outputs, "router_logits", None),
     )
 
 

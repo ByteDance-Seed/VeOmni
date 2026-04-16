@@ -29,14 +29,14 @@
 #      Return flat image_embeds tensor (skip per-image torch.split)
 #    - method_override: Qwen3VLMoeModel.get_placeholder_mask
 #      Return raw image/video placeholder bool masks for VeOmni SP-aware masked_scatter
-#    - method_override: Qwen3VLMoeModel.forward
-#      VeOmni SP + precomputed position-id + dummy-forward + deepstack multimodal patches
 #    - method_override: Qwen3VLMoeForConditionalGeneration.get_position_id_func
 #      Use VeOmni precomputed position-id function and unified multimodal token ids
 #    - method_override: Qwen3VLMoeModel.__init__
 #      Propagate _moe_implementation from top-level config to text_config
 #    - class_replacement: Qwen3VLMoeTextExperts
 #      Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
+#    - method_override: Qwen3VLMoeModel.forward
+#      VeOmni SP + precomputed position-id + dummy-forward + deepstack; preserve MoE router_logits
 #    - method_override: Qwen3VLMoeForConditionalGeneration.forward
 #      Use VeOmni fused loss_function and MoE aux_loss path
 #    - method_override: Qwen3VLMoeForConditionalGeneration.get_parallel_plan
@@ -1456,7 +1456,7 @@ class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLMoeModel
-# Methods patched: get_image_features, get_placeholder_mask, forward, __init__
+# Methods patched: get_image_features, get_placeholder_mask, __init__, forward
 # ======================================================================
 
 
@@ -1687,21 +1687,13 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
     # ================================================================
     # Patch: Qwen3VLMoeModel.forward
-    # 1. Ulysses SP scatter/gather around the visual-embed masked_scatter
-    #    (gather_seq_scatter_heads on inputs_embeds + image/video embeds;
-    #    gather_heads_scatter_seq after fill-back); slice image/video mask
-    #    + deepstack embeds to the per-rank range
-    # 2. precomputed image/video masks: use kwargs["image_mask"/"video_mask"]
-    #    from the VeOmni data pipeline; otherwise all-gather input_ids
-    #    across SP group and recompute on the full sequence
-    # 3. pop ViT-incompatible flash-attn kwargs (cu_seq_lens_q/k,
-    #    max_length_q/k) before calling the visual encoder; restore onto
-    #    the language-model kwargs afterwards
-    # 4. FSDP dummy_forward branch when pixel_values / pixel_values_videos
-    #    are None on this rank — keeps visual params on the FSDP all-reduce
-    #    graph via fake_embeds * 0, and threads a fake deepstack tensor
-    #    down into `_deepstack_process` so those params participate too
-    # 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
+    # MoE-specific clone of the dense qwen3_vl model forward. The shared
+    # body (SP + precomputed position-id + dummy-forward + deepstack) is
+    # identical, but the return type is `Qwen3VLMoeModelOutputWithPast`
+    # which carries an extra `router_logits` field — dropping it on the
+    # return statement would silence the MoE load-balancing loss (router
+    # collapse) since `Qwen3VLMoeForConditionalGeneration.forward` reads
+    # `outputs.router_logits`.
     # ================================================================
     @auto_docstring
     @can_return_tuple
@@ -1886,24 +1878,16 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             deepstack_visual_embeds = deepstack_video_embeds
         else:
             # --- Patch.4 ---
-            # Pass fake deepstack so _deepstack_process still touches the
-            # visual params; visual_pos_masks=None triggers the add-0.0 branch
             if fake_deepstack is not None:
                 deepstack_visual_embeds = fake_deepstack
             # --- Patch.4 ---
 
         if position_ids is None:
             # --- Patch.5 ---
-            # HF v5 may pass attention_mask as a dict (keyed by attention type); the
-            # rope-index helpers below still expect a plain tensor, so unwrap it.
             if isinstance(attention_mask, dict):
                 attention_mask_tensor = attention_mask.get("full_attention", None)
             else:
                 attention_mask_tensor = attention_mask
-            # Under Ulysses SP, input_ids/inputs_embeds here are per-rank slices, so
-            # computing mrope positions on the fly would drift. The training path is
-            # expected to go through the VeOmni `get_position_id_func` precompute
-            # (via data pipeline); raise loudly if we somehow land here with SP on.
             if get_parallel_state().sp_enabled:
                 raise RuntimeError(
                     "Qwen3VLMoeModel.forward: position_ids is None while sequence parallel "
@@ -1946,6 +1930,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            router_logits=getattr(outputs, "router_logits", None),
             rope_deltas=self.rope_deltas,
         )
 
@@ -2158,8 +2143,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                 self.config.text_config.num_experts_per_tok,
                 attention_mask,
             )
-            if labels is not None:
-                loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+            if labels is not None and isinstance(aux_loss, torch.Tensor):
+                loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
         # --- Patch.2 ---
 
         return Qwen3VLMoeCausalLMOutputWithPast(
@@ -2170,6 +2155,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
+            router_logits=getattr(outputs, "router_logits", None),
         )
 
     def prepare_inputs_for_generation(

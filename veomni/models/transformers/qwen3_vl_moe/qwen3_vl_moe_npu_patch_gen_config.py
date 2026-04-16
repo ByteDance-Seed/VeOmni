@@ -26,7 +26,6 @@ import torch
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_get_position_id_func_patched,
-    qwen3_vl_model_forward_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_text_attention_forward_patched,
@@ -42,6 +41,7 @@ from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config i
     PatchedQwen3VLMoeTextExperts,
     qwen3_vl_moe_for_conditional_generation_forward_patched,
     qwen3_vl_moe_get_parallel_plan_patched,
+    qwen3_vl_moe_model_forward_patched,
     qwen3_vl_moe_model_init_patched,
 )
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
@@ -132,9 +132,8 @@ config.override_method(
 )
 config.override_method(
     "Qwen3VLMoeModel.forward",
-    replacement=qwen3_vl_model_forward_patched,
-    name_map=_NAME_MAP,
-    description="VeOmni SP + precomputed position-id + dummy-forward + deepstack multimodal patches",
+    replacement=qwen3_vl_moe_model_forward_patched,
+    description="VeOmni SP + precomputed position-id + dummy-forward + deepstack; preserve MoE router_logits",
 )
 config.override_method(
     "Qwen3VLMoeForConditionalGeneration.get_position_id_func",
