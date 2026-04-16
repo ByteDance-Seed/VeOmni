@@ -69,10 +69,22 @@ def get_module_source(module_name: str) -> str:
     return source
 
 
+def _unwrap_to_inspectable(obj: Any) -> Any:
+    """Follow ``__wrapped__`` links so ``inspect`` can find source.
+
+    Decorators like ``functools.lru_cache`` return wrapper objects that
+    ``inspect.getsourcelines`` cannot resolve. The original function is
+    reachable via ``__wrapped__`` (set by ``functools.wraps``).
+    """
+    while hasattr(obj, "__wrapped__"):
+        obj = obj.__wrapped__
+    return obj
+
+
 def get_object_source(obj: Any) -> str:
     """Get the source code of a class or function, preserving comments."""
     try:
-        return inspect.getsource(obj)
+        return inspect.getsource(_unwrap_to_inspectable(obj))
     except (OSError, TypeError):
         return ""
 
@@ -85,6 +97,7 @@ def get_object_source_with_leading_comments(obj: Any) -> str:
     document *why* a patch exists (e.g. the numbered ``Patch.N`` headers), so
     we rewind through preceding comment/blank lines and prepend them.
     """
+    obj = _unwrap_to_inspectable(obj)
     try:
         src_lines, start_lineno = inspect.getsourcelines(obj)
         source_file = inspect.getsourcefile(obj)
