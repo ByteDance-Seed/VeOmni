@@ -286,10 +286,10 @@ _TEST_CASES_TRANSFORMERS_V5 = [
     ),
     pytest.param(
         "./tests/toy_config/qwen3vl_toy/config.json",
-        True,
+        False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        id="qwen3_5_moe",
+        id="qwen3_vl",
     ),
 ]
 

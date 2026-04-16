@@ -10,48 +10,42 @@
 #
 #  Patches applied:
 #    - method_override: Qwen3VLVisionAttention.forward
-#      Support FA3/FA4/VeOmni varlen and pass precomputed max_seqlen.
-#    - method_override: Qwen3VLTextAttention._async_ulysses_attention_forward
-#      Inject async-Ulysses attention forward for VeOmni sequence parallelism.
-#    - method_override: Qwen3VLTextAttention.forward
-#      Enable async-Ulysses attention when VeOmni async is on; otherwise keep HF v5 logic.
-#    - method_override: Qwen3VLTextModel.forward
-#      Restore v4 position-id handling for loss parity: text_position_ids = position_ids[0] for 3D positions.
+#      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
+#    - method_override: Qwen3VLVisionBlock.forward
+#      Propagate precomputed max_seqlen to attention to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen3VLVisionModel.rot_pos_emb
-#      Cache rot_pos_ids(h,w,merge) for performance; numpy-based implementation mirrors VeOmni runtime patch.
+#      Use lru_cached rot_pos_ids helper (vllm-style) to avoid per-image Python loops
 #    - method_override: Qwen3VLVisionModel.fast_pos_embed_interpolate
-#      Efficient fast_pos_embed_interpolate implementation (VeOmni/vLLM-style).
+#      Tensorized meshgrid implementation of fast_pos_embed_interpolate
 #    - method_override: Qwen3VLVisionModel.forward
-#      SP-aware vision forward + precompute max_seqlen; matches VeOmni runtime patch behavior on v5 output type.
+#      VeOmni SP + deepstack + precomputed max_seqlen; return BaseModelOutputWithDeepstackFeatures
 #    - method_override: Qwen3VLVisionModel.dummy_forward
-#      Dummy vision forward to avoid FSDP hang when some ranks have no pixel_values.
+#      Provide dummy vision forward for FSDP path with SP-aware shape
+#    - method_override: Qwen3VLTextAttention.forward
+#      Route through async Ulysses fused QKV/Output projection when async_enabled
 #    - method_override: Qwen3VLTextModel._deepstack_process
-#      If visual_pos_masks is None, still trigger GPU ops but add 0.0 (VeOmni).
+#      Handle visual_pos_masks=None by adding 0.0 so FSDP sees the visual params
 #    - method_override: Qwen3VLModel.get_image_features
-#      Skip torch.split in get_image_features: keep pooler_output as one tensor (VeOmni).
+#      Return flat image_embeds tensor (skip per-image torch.split)
 #    - method_override: Qwen3VLModel.get_placeholder_mask
-#      Relax placeholder mask checks for VeOmni (no strict token/feature length assertion).
-#    - method_override: Qwen3VLModel.get_rope_index
-#      Restore v4.57.3 get_rope_index behavior for loss parity (signature adjusted for v5).
+#      Return raw image/video placeholder bool masks for VeOmni SP-aware masked_scatter
 #    - method_override: Qwen3VLModel.forward
-#      VeOmni SP/async/FSDP-dummy + flash-attn kwargs handling; keep v4 position-id semantics for loss parity.
-#    - method_override: Qwen3VLForConditionalGeneration._get_position_id
-#      Pickle-friendly helper used by get_position_id_func (class function style).
+#      VeOmni SP + precomputed position-id + dummy-forward + deepstack multimodal patches
 #    - method_override: Qwen3VLForConditionalGeneration.get_position_id_func
-#      Expose multiprocessing-safe function to compute position_ids/rope_deltas using VeOmni placeholder token ids.
+#      Use VeOmni precomputed position-id function and unified multimodal token ids
 #    - method_override: Qwen3VLForConditionalGeneration.forward
-#      Use VeOmni fused/unified loss path (pass hidden_states + weights) for loss parity.
+#      Use VeOmni unified fused loss_function path
 #
 # ==============================================================================
 
+# Additional import blocks for patches
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Any, Optional
 
-# Additional imports for patches
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -86,9 +80,134 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
-from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+# ======================================================================
+# [HELPERS] Module-level helpers injected via config.add_helper
+# ======================================================================
+
+# ================================================================
+# Module-level helpers injected after the import block
+# 1. `rot_pos_ids` — vllm-adapted lru_cached pos-id builder used by
+#    the patched `Qwen3VLVisionModel.rot_pos_emb` below
+# 2. `_qwen3_vl_async_ulysses_attention_forward` — async Ulysses
+#    attention path used by the patched `Qwen3VLTextAttention.forward`
+# 3. `get_position_id` — picklable wrapper that the patched
+#    `Qwen3VLForConditionalGeneration.get_position_id_func` returns via
+#    `partial(...)` so the VeOmni data pipeline can precompute
+#    multimodal position_ids on CPU worker processes
+# ================================================================
+
+
+# Copied and adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L431
+@lru_cache(maxsize=1024)
+def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+    if isinstance(h, torch.Tensor):
+        h = int(h.item())
+    if isinstance(w, torch.Tensor):
+        w = int(w.item())
+    if isinstance(spatial_merge_size, torch.Tensor):
+        spatial_merge_size = int(spatial_merge_size.item())
+    hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+    h_div = h // spatial_merge_size
+    w_div = w // spatial_merge_size
+    hpos_ids = hpos_ids.reshape(h_div, spatial_merge_size, w_div, spatial_merge_size)
+    hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+    wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+    wpos_ids = wpos_ids.reshape(h_div, spatial_merge_size, w_div, spatial_merge_size)
+    wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+    return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+
+def _qwen3_vl_async_ulysses_attention_forward(
+    self,
+    hidden_states,
+    attention_mask,
+    position_embeddings,
+    **kwargs,
+):
+    """Async Ulysses attention forward path for Qwen3VLTextAttention.
+
+    Fuses QKV projection + q_norm/k_norm + RoPE + ulysses all-to-all, and
+    the output projection + reverse all-to-all. Requires a flash-attention
+    implementation because of the packed-varlen contract.
+    """
+    if not is_flash_attention_requested(self.config):
+        raise ValueError(
+            "Async Ulysses attention only supports flash attention implementations. "
+            f"Current implementation: '{self.config._attn_implementation}'. "
+            "Please set attn_implementation to a flash attention variant or disable async Ulysses."
+        )
+
+    unpadded_seq_len = hidden_states.size(1)
+
+    q, k, v = async_ulysses_qkv_projection(
+        hidden_states=hidden_states,
+        seq_dimension=1,
+        head_dimension=2,
+        q_weight=self.q_proj.weight,
+        q_bias=self.q_proj.bias,
+        k_weight=self.k_proj.weight,
+        k_bias=self.k_proj.bias,
+        v_weight=self.v_proj.weight,
+        v_bias=self.v_proj.bias,
+        norm_type="rmsnorm",
+        norm_q_weight=self.q_norm.weight,
+        norm_q_bias=None,
+        norm_k_weight=self.k_norm.weight,
+        norm_k_bias=None,
+        normalized_shape=self.head_dim,
+        eps=self.config.rms_norm_eps,
+        unpadded_dim_size=unpadded_seq_len * get_ulysses_sequence_parallel_world_size(),
+        head_dim=self.head_dim,
+    )
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    cos, sin = position_embeddings
+    # cos/sin are per-rank sharded along the sequence dim; async path operates on
+    # full-seq QKV, so gather them back across the SP group.
+    cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
+    sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
+
+    query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
+
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        v,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        skip_ulysses=True,
+        **kwargs,
+    )
+
+    attn_output = async_ulysses_output_projection(
+        hidden_states=attn_output,
+        seq_dimension=1,
+        head_dimension=2,
+        proj_weight=self.o_proj.weight,
+        proj_bias=self.o_proj.bias,
+        unpadded_dim_size=attn_output.shape[1],
+    )
+    return attn_output, attn_weights
+
+
+def get_position_id(main_func, self, **kwargs):
+    # Must be a module-level function for multiprocessing pickle
+    position_ids, rope_deltas = main_func(self, **kwargs)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
 @dataclass
@@ -245,20 +364,26 @@ class Qwen3VLVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
 
+    # ================================================================
+    # Patch: Qwen3VLVisionAttention.forward
+    # 1. accept precomputed max_seqlen from outer forward to avoid
+    #    per-layer `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        # --- Patch.1 ---
+        max_seqlen: int,
+        # --- Patch.1 ---
         rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        max_seqlen: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
-
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
@@ -266,13 +391,14 @@ class Qwen3VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
 
-        if (self.config._attn_implementation in VARLEN_ATTENTION_TYPES) or is_flash_attention_requested(self.config):
-            if max_seqlen is None:
-                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        if is_flash_attention_requested(self.config):
+            # --- Patch.1 ---
+            # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            # --- Patch.1 ---
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -310,7 +436,14 @@ class Qwen3VLVisionAttention(nn.Module):
             attn_output = torch.cat(attn_outputs, dim=1)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        return self.proj(attn_output)
+        attn_output = self.proj(attn_output)
+        return attn_output
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3VLVisionBlock
+# Methods patched: forward
+# ======================================================================
 
 
 class Qwen3VLVisionBlock(GradientCheckpointingLayer):
@@ -321,10 +454,18 @@ class Qwen3VLVisionBlock(GradientCheckpointingLayer):
         self.attn = Qwen3VLVisionAttention(config=config)
         self.mlp = Qwen3VLVisionMLP(config=config)
 
+    # ================================================================
+    # Patch: Qwen3VLVisionBlock.forward
+    # 1. thread the precomputed max_seqlen down into the attention call
+    #    (paired with the Qwen3VLVisionAttention.forward patch above)
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        # --- Patch.1 ---
+        max_seqlen: int,
+        # --- Patch.1 ---
         rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
@@ -332,6 +473,9 @@ class Qwen3VLVisionBlock(GradientCheckpointingLayer):
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
+            # --- Patch.1 ---
+            max_seqlen=max_seqlen,
+            # --- Patch.1 ---
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -478,7 +622,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLTextAttention
-# Methods patched: _async_ulysses_attention_forward, forward
+# Methods patched: forward
 # ======================================================================
 
 
@@ -514,6 +658,13 @@ class Qwen3VLTextAttention(nn.Module):
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
 
+    # ================================================================
+    # Patch: Qwen3VLTextAttention.forward
+    # 1. route through the async Ulysses fused QKV/Output projection path
+    #    (defined via add_post_import_block as a module-level helper) when
+    #    `get_parallel_state().async_enabled` is True; otherwise fall
+    #    through to the upstream logic unchanged
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -523,13 +674,16 @@ class Qwen3VLTextAttention(nn.Module):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # --- Patch.1 ---
         if get_parallel_state().async_enabled:
-            return self._async_ulysses_attention_forward(
+            return _qwen3_vl_async_ulysses_attention_forward(  # noqa: F821 defined via add_post_import_block
+                self,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+        # --- Patch.1 ---
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -545,9 +699,10 @@ class Qwen3VLTextAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
+
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -558,79 +713,9 @@ class Qwen3VLTextAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        return self.o_proj(attn_output), attn_weights
-
-    def _async_ulysses_attention_forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.config._attn_implementation not in VARLEN_ATTENTION_TYPES:
-            raise ValueError(
-                "Async Ulysses attention only supports flash attention implementations. "
-                f"Current implementation: '{self.config._attn_implementation}'."
-            )
-
-        unpadded_seq_len = hidden_states.size(1)
-        q, k, v = async_ulysses_qkv_projection(
-            hidden_states=hidden_states,
-            seq_dimension=1,
-            head_dimension=2,
-            q_weight=self.q_proj.weight,
-            q_bias=self.q_proj.bias,
-            k_weight=self.k_proj.weight,
-            k_bias=self.k_proj.bias,
-            v_weight=self.v_proj.weight,
-            v_bias=self.v_proj.bias,
-            norm_type="rmsnorm",
-            norm_q_weight=self.q_norm.weight,
-            norm_q_bias=None,
-            norm_k_weight=self.k_norm.weight,
-            norm_k_bias=None,
-            normalized_shape=self.head_dim,
-            eps=self.config.rms_norm_eps,
-            unpadded_dim_size=unpadded_seq_len * get_ulysses_sequence_parallel_world_size(),
-            head_dim=self.head_dim,
-        )
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        cos, sin = position_embeddings
-
-        # TODO: check this, wehther we need to unpad sp padding?
-        cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
-        sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
-
-        query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
-
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            skip_ulysses=True,
-            **kwargs,
-        )
-
-        attn_output = async_ulysses_output_projection(
-            hidden_states=attn_output,
-            seq_dimension=1,
-            head_dimension=2,
-            proj_weight=self.o_proj.weight,
-            proj_bias=self.o_proj.bias,
-            unpadded_dim_size=attn_output.shape[1],
-        )
+        attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
 
@@ -795,16 +880,18 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen3VLVisionModel.rot_pos_emb
+    # 1. swap the upstream Python-list-indexed grid builder for a vllm-style
+    #    lru_cached `rot_pos_ids` helper keyed on `(h, w, merge_size)` so
+    #    repeated (h, w) tiles across a batch hit the cache
+    # ================================================================
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        # --- Patch.1 ---
         merge_size = self.spatial_merge_size
 
-        cache = getattr(self, "_veomni_rot_pos_ids_cache", None)
-        if cache is None:
-            cache = {}
-            self._veomni_rot_pos_ids_cache = cache
-
         max_hw = int(grid_thw[:, 1:].max().item())
-        freq_table = self.rotary_pos_emb(max_hw)
+        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
         device = freq_table.device
 
         total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
@@ -812,33 +899,27 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
         offset = 0
         for num_frames, height, width in grid_thw:
-            h = int(height.item())
-            w = int(width.item())
-            key = (h, w, int(merge_size))
-            coords = cache.get(key)
-            if coords is None:
-                hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
-                h_div = h // merge_size
-                w_div = w // merge_size
-                hpos_ids = hpos_ids.reshape(h_div, merge_size, w_div, merge_size).transpose(0, 2, 1, 3).flatten()
-
-                wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
-                wpos_ids = wpos_ids.reshape(h_div, merge_size, w_div, merge_size).transpose(0, 2, 1, 3).flatten()
-
-                coords = torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1)).to(torch.long)
-                cache[key] = coords
-
-            coords = coords.to(device)
+            coords = rot_pos_ids(height, width, merge_size).to(device)  # noqa: F821 defined via add_post_import_block
             if num_frames > 1:
-                coords = coords.repeat(int(num_frames.item()), 1)
-
+                coords = coords.repeat(num_frames, 1)
             num_tokens = coords.shape[0]
             pos_ids[offset : offset + num_tokens] = coords
             offset += num_tokens
 
-        return freq_table[pos_ids].flatten(1)
+        embeddings = freq_table[pos_ids]
+        embeddings = embeddings.flatten(1)
+        return embeddings
+        # --- Patch.1 ---
 
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    # ================================================================
+    # Patch: Qwen3VLVisionModel.fast_pos_embed_interpolate
+    # 1. a fully-tensorized vllm-adapted implementation — replaces the
+    #    upstream per-image Python list extend / tolist path with
+    #    meshgrid-based bilinear weight synthesis so the whole batch stays
+    #    on device (also avoids the final torch.split + per-image permute)
+    # ================================================================
+    def fast_pos_embed_interpolate(self, grid_thw):
+        # --- Patch.1 ---
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
         hidden_dim = self.pos_embed.embedding_dim
@@ -846,10 +927,6 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         outputs = []
         dtype = self.pos_embed.weight.dtype
         for t, h, w in grid_thw:
-            h = int(h.item())
-            w = int(w.item())
-            t_int = int(t.item())
-
             h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
             w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
 
@@ -865,6 +942,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
             h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
 
+            # reuse dh*dw to avoid duplicate multiplies
             w11 = dh_grid * dw_grid
             w10 = dh_grid - w11
             w01 = dw_grid - w11
@@ -875,17 +953,35 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             h_grid_idx = h_grid * num_grid_per_side
 
             indices = (h_grid_idx + w_grid).reshape(4, -1)
-            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1).to(dtype=dtype)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=dtype)
 
             embeds = self.pos_embed(indices) * weights
             combined = embeds[0] + embeds[1] + embeds[2] + embeds[3]
             combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
 
             combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
-            outputs.append(combined.expand(t_int, -1, -1).reshape(-1, hidden_dim))
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+
+            outputs.append(repeated)
 
         return torch.cat(outputs, dim=0)
+        # --- Patch.1 ---
 
+    # ================================================================
+    # Patch: Qwen3VLVisionModel.forward
+    # 1. SP pad pos_embeds / cos / sin so sharded hidden_states get the
+    #    matching pos embedding (pad_scale=4 matches the upstream SP
+    #    sharding scale used for ViT inputs)
+    # 2. use pre-padding cu_seqlens[-1] as the un-sliced total seq length
+    # 3. when SP is enabled, extend cu_seqlens with the SP-padded sentinel
+    #    so the padded tokens belong to a valid attention window
+    # 4. precompute max_seqlen once from cu_seqlens to avoid per-layer
+    #    CPU-GPU sync inside the attention call
+    # 5. on NPU, move cu_seqlens to CPU — NPU FA2 varlen path requires it
+    # 6. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
+    #    path returned `(merged, deepstack_list)` as a bare tuple)
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     def forward(
@@ -893,12 +989,16 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
         **kwargs: Unpack[TransformersKwargs],
-    ):
+    ) -> BaseModelOutputWithDeepstackFeatures:
         hidden_states = self.patch_embed(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
+        # --- Patch.1 ---
+
         hidden_states = hidden_states + pos_embeds
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
@@ -912,62 +1012,95 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
 
-        total_seq_len = int(cu_seqlens[-1].item())
+        # --- Patch.2 ---
+        total_seq_len = cu_seqlens[-1]
         rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
+        # --- Patch.2 ---
 
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
         if get_parallel_state().sp_enabled:
+            # --- Patch.1 ---
             cos, sin = position_embeddings
             cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
             sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
             position_embeddings = (cos, sin)
+            # --- Patch.1 ---
 
+            # --- Patch.3 ---
             sp_size = get_parallel_state().sp_size
-            pad_seq_len = seq_len * sp_size - total_seq_len
+            pad_seq_len = seq_len * sp_size - total_seq_len.item()
             if pad_seq_len > 0:
-                cu_seqlens = torch.cat([cu_seqlens, (cu_seqlens[-1] + pad_seq_len).unsqueeze(0)], dim=0)
-
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
-        if IS_NPU_AVAILABLE:
-            cu_seqlens = cu_seqlens.cpu()
+                new_cumsum = cu_seqlens[-1] + pad_seq_len
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+            # --- Patch.3 ---
 
         deepstack_feature_lists = []
+
+        # --- Patch.4 ---
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        # --- Patch.4 ---
+
+        # --- Patch.5 ---
+        if IS_NPU_AVAILABLE:
+            cu_seqlens = cu_seqlens.cpu()
+        # --- Patch.5 ---
+
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
+                # --- Patch.4 ---
                 max_seqlen=max_seqlen,
+                # --- Patch.4 ---
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature_lists.append(
-                    self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](hidden_states)
+                deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
+                    hidden_states
                 )
+                deepstack_feature_lists.append(deepstack_feature)
 
         merged_hidden_states = self.merger(hidden_states)
+
+        # --- Patch.6 ---
         return BaseModelOutputWithDeepstackFeatures(
             last_hidden_state=hidden_states,
             pooler_output=merged_hidden_states,
             deepstack_features=deepstack_feature_lists,
         )
+        # --- Patch.6 ---
 
+    # ================================================================
+    # Patch: Qwen3VLVisionModel.dummy_forward (new)
+    # 1. add dummy_forward so ranks without pixel_values can still run the
+    #    visual encoder under FSDP — otherwise reduce-scatter hangs when
+    #    some ranks get None pixel_values while others have real images
+    # 2. SP-aware shape: grid_thw width is scaled by sp_size so the dummy
+    #    batch stays a clean multiple after sequence slicing
+    # ================================================================
     def dummy_forward(self):
+        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
+            # --- Patch.2 ---
             sp_size = get_parallel_state().sp_size
             pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
             grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+            # --- Patch.2 ---
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
         else:
             pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
             grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
-        return self(hidden_states=pixel_values, grid_thw=grid_thw, return_dict=True)
+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+        return self(**dummy_data)
+        # --- Patch.1 ---
 
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLTextModel
-# Methods patched: forward, _deepstack_process
+# Methods patched: _deepstack_process
 # ======================================================================
 
 
@@ -1009,13 +1142,23 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
+        # args for deepstack
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ):
+    ) -> tuple | BaseModelOutputWithPast:
+        r"""
+        visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
+            The mask of the visual positions.
+        deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
+            The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
+            The feature is extracted from the different visual encoder layers, and fed to the decoder
+            hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        # torch.jit.trace() doesn't support cache objects in the output
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
             past_key_values = DynamicCache(config=self.config)
 
@@ -1025,11 +1168,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
+        # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
@@ -1051,10 +1193,13 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         )
 
         hidden_states = inputs_embeds
+
+        # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
-            hidden_states = decoder_layer(
+            layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=text_position_ids,
@@ -1063,34 +1208,51 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            hidden_states = layer_outputs
+
+            # add visual features to the hidden states of first several layers
             if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
                 hidden_states = self._deepstack_process(
-                    hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+                    hidden_states,
+                    visual_pos_masks,
+                    deepstack_visual_embeds[layer_idx],
                 )
 
         hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values)
 
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+    # ================================================================
+    # Patch: Qwen3VLTextModel._deepstack_process
+    # 1. handle the case where `visual_pos_masks is None` (both image and
+    #    video pixel_values were None on this rank) — still touch
+    #    visual_embeds so FSDP sees the params; add 0.0 so gradients flow
+    #    without mutating hidden_states
+    # ================================================================
     def _deepstack_process(
-        self,
-        hidden_states: torch.Tensor,
-        visual_pos_masks: torch.Tensor | None,
-        visual_embeds: torch.Tensor,
+        self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
     ):
+        # --- Patch.1 ---
         if visual_pos_masks is None:
             visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-            return hidden_states + visual_embeds.mean() * 0.0
+            hidden_states = hidden_states + visual_embeds.mean() * 0.0
+            return hidden_states
+        # --- Patch.1 ---
 
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-        local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
+        hidden_states = hidden_states.clone()
+        local_this = hidden_states[visual_pos_masks, :] + visual_embeds
         hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
 
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLModel
-# Methods patched: get_image_features, get_placeholder_mask, get_rope_index, forward
+# Methods patched: get_image_features, get_placeholder_mask, forward
 # ======================================================================
 
 
@@ -1124,130 +1286,87 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
+
+        # Since we use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
         if video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
+
+        image_grid_thw_list = image_grid_thw.tolist() if image_grid_thw is not None else None
+        video_grid_thw_list = video_grid_thw.tolist() if video_grid_thw is not None else None
 
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
-
         mrope_position_deltas = []
-        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
-            total_input_ids = input_ids
-            if attention_mask is None:
-                attention_mask = torch.ones_like(total_input_ids)
-
-            position_ids = torch.ones(
-                3,
-                input_ids.shape[0],
-                input_ids.shape[1],
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-
-            image_index, video_index = 0, 0
-            attention_mask = attention_mask.to(total_input_ids.device)
-
-            for i, current_input_ids in enumerate(total_input_ids):
-                current_input_ids = current_input_ids[attention_mask[i] == 1]
-                vision_start_indices = torch.argwhere(current_input_ids == vision_start_token_id).squeeze(1)
-                vision_tokens = current_input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum()
-                video_nums = (vision_tokens == video_token_id).sum()
-
-                input_tokens = current_input_ids.tolist()
-                llm_pos_ids_list: list[torch.Tensor] = []
-                st = 0
-                remain_images, remain_videos = int(image_nums.item()), int(video_nums.item())
-
-                for _ in range(remain_images + remain_videos):
-                    if image_token_id in input_tokens and remain_images > 0:
-                        ed_image = input_tokens.index(image_token_id, st)
-                    else:
-                        ed_image = len(input_tokens) + 1
-                    if video_token_id in input_tokens and remain_videos > 0:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    else:
-                        ed_video = len(input_tokens) + 1
-
-                    if ed_image < ed_video:
-                        t, h, w = image_grid_thw[image_index]
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-                    else:
-                        t, h, w = video_grid_thw[video_index]
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
-
-                    llm_grid_t = t.item()
-                    llm_grid_h = h.item() // spatial_merge_size
-                    llm_grid_w = w.item() // spatial_merge_size
-
-                    text_len = ed - st
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
-                    )
-
-                    t_index = (
-                        torch.arange(llm_grid_t, device=input_ids.device)
-                        .view(-1, 1)
-                        .expand(-1, llm_grid_h * llm_grid_w)
-                        .flatten()
-                    )
-                    h_index = (
-                        torch.arange(llm_grid_h, device=input_ids.device)
-                        .view(1, -1, 1)
-                        .expand(llm_grid_t, -1, llm_grid_w)
-                        .flatten()
-                    )
-                    w_index = (
-                        torch.arange(llm_grid_w, device=input_ids.device)
-                        .view(1, 1, -1)
-                        .expand(llm_grid_t, llm_grid_h, -1)
-                        .flatten()
-                    )
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
-
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-                if st < len(input_tokens):
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
-                    )
-
-                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
-                mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
-
-            mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
-            return position_ids, mrope_position_deltas
-
-        if attention_mask is not None:
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids = position_ids.masked_fill(attention_mask == 0, 1)
-            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-            max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
-            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-        else:
-            position_ids = (
-                torch.arange(input_ids.shape[1], device=input_ids.device)
-                .view(1, 1, -1)
-                .expand(3, input_ids.shape[0], -1)
-            )
-            mrope_position_deltas = torch.zeros(
-                [input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype
-            )
-
+        total_input_ids = input_ids
+        if attention_mask is None:
+            attention_mask = torch.ones_like(total_input_ids)
+        position_ids = torch.zeros(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        image_index, video_index = 0, 0
+        attention_mask = attention_mask.to(total_input_ids.device)
+        for i, input_ids in enumerate(total_input_ids):
+            input_ids = input_ids[attention_mask[i] == 1]
+            image_nums, video_nums = 0, 0
+            vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+            vision_tokens = input_ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum()
+            video_nums = (vision_tokens == video_token_id).sum()
+            input_tokens = input_ids.tolist()
+            llm_pos_ids_list: list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+            for _ in range(image_nums + video_nums):
+                if image_token_id in input_tokens and remain_images > 0:
+                    ed_image = input_tokens.index(image_token_id, st)
+                else:
+                    ed_image = len(input_tokens) + 1
+                if video_token_id in input_tokens and remain_videos > 0:
+                    ed_video = input_tokens.index(video_token_id, st)
+                else:
+                    ed_video = len(input_tokens) + 1
+                if ed_image < ed_video:
+                    t, h, w = image_grid_thw_list[image_index]
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+                else:
+                    t, h, w = video_grid_thw_list[video_index]
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+                llm_grid_t, llm_grid_h, llm_grid_w = (
+                    t,
+                    h // spatial_merge_size,
+                    w // spatial_merge_size,
+                )
+                text_len = ed - st
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                # t_index is always 0 because llm_grid_t is always 1 (we use timestamps to encode the temporal information for videos)
+                t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+        mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
     @can_return_tuple
@@ -1267,6 +1386,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
+    # ================================================================
+    # Patch: Qwen3VLModel.get_image_features
+    # 1. skip the upstream `torch.split(image_embeds, split_sizes)` — VeOmni
+    #    needs the flat tensor for SP all-to-all, and the downstream
+    #    masked_scatter is indexed by a single n_image_tokens slice rather
+    #    than a per-image tuple
+    # ================================================================
     @can_return_tuple
     @auto_docstring
     def get_image_features(
@@ -1274,32 +1400,36 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         pixel_values: torch.FloatTensor,
         image_grid_thw: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ):
+    ) -> BaseModelOutputWithDeepstackFeatures:
         pixel_values = pixel_values.type(self.visual.dtype)
-        return self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
+        vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
+            pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
+        )
+        # --- Patch.1 ---
+        # image_embeds = vision_output.pooler_output
+        # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        # vision_output.pooler_output = torch.split(image_embeds, split_sizes)
+        # --- Patch.1 ---
+        return vision_output
 
+    # ================================================================
+    # Patch: Qwen3VLModel.get_placeholder_mask
+    # 1. return raw (image_mask, video_mask) bool tensors without the
+    #    HF v5 `inputs_embeds` / `*_features` shape-validation branch —
+    #    VeOmni needs the masks on the *full* all-gathered input_ids,
+    #    which have a different seq-len than the SP-sliced inputs_embeds
+    # ================================================================
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
+        inputs_embeds: torch.FloatTensor | None = None,
         image_features: torch.FloatTensor | None = None,
         video_features: torch.FloatTensor | None = None,
     ):
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_image_mask = special_image_mask.all(-1)
-            special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
-            special_video_mask = special_video_mask.all(-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
-
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        # --- Patch.1 ---
+        special_image_mask = input_ids == self.config.image_token_id
+        special_video_mask = input_ids == self.config.video_token_id
+        # --- Patch.1 ---
         return special_image_mask, special_video_mask
 
     def compute_3d_position_ids(
@@ -1339,6 +1469,24 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             position_ids = None
         return position_ids
 
+    # ================================================================
+    # Patch: Qwen3VLModel.forward
+    # 1. Ulysses SP scatter/gather around the visual-embed masked_scatter
+    #    (gather_seq_scatter_heads on inputs_embeds + image/video embeds;
+    #    gather_heads_scatter_seq after fill-back); slice image/video mask
+    #    + deepstack embeds to the per-rank range
+    # 2. precomputed image/video masks: use kwargs["image_mask"/"video_mask"]
+    #    from the VeOmni data pipeline; otherwise all-gather input_ids
+    #    across SP group and recompute on the full sequence
+    # 3. pop ViT-incompatible flash-attn kwargs (cu_seq_lens_q/k,
+    #    max_length_q/k) before calling the visual encoder; restore onto
+    #    the language-model kwargs afterwards
+    # 4. FSDP dummy_forward branch when pixel_values / pixel_values_videos
+    #    are None on this rank — keeps visual params on the FSDP all-reduce
+    #    graph via fake_embeds * 0, and threads a fake deepstack tensor
+    #    down into `_deepstack_process` so those params participate too
+    # 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
+    # ================================================================
     @auto_docstring
     @can_return_tuple
     def forward(
@@ -1352,149 +1500,158 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ):
+    ) -> tuple | Qwen3VLModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # Pop VeOmni-only kwargs early to avoid leaking into HF attention backends.
+        # --- Patch.2 ---
         image_mask = kwargs.pop("image_mask", None)
         video_mask = kwargs.pop("video_mask", None)
-
-        # If masks are not provided, infer them. SP-enabled path gathers full seq first.
-        if image_mask is None and video_mask is None:
+        if video_mask is None and image_mask is None:
             if get_parallel_state().sp_enabled:
-                input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
+                input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
                 dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-                input_ids = torch.cat(input_ids_list, dim=0)
-            image_mask, video_mask = self.get_placeholder_mask(input_ids)
+                input_ids_full = torch.cat(input_ids_list, dim=1)
+            else:
+                input_ids_full = input_ids
+            image_mask, video_mask = self.get_placeholder_mask(input_ids_full)
+        # --- Patch.2 ---
 
-        # Pop flash-attn kwargs for ViT; they should go only to the language model.
+        # --- Patch.3 ---
         flash_attn_kwargs = {}
         for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
             if key in kwargs:
                 flash_attn_kwargs[key] = kwargs.pop(key)
+        # --- Patch.3 ---
 
+        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds,
-                seq_dim=1,
-                head_dim=2,
-                group=get_parallel_state().sp_group,
+                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
+        # --- Patch.1 ---
 
         fake_deepstack = None
 
-        # Image branch
         if pixel_values is not None:
-            image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+            image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True
+            )
             image_embeds = image_outputs.pooler_output
             deepstack_image_embeds = image_outputs.deepstack_features
 
+            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 image_embeds = gather_seq_scatter_heads(
-                    image_embeds,
-                    seq_dim=0,
-                    head_dim=-1,
-                    group=get_parallel_state().sp_group,
+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
                 deepstack_image_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_image_embeds
                 ]
+            # --- Patch.1 ---
 
-            n_image_tokens = int(image_mask.sum().long().item())
+            n_image_tokens = image_mask.sum().long().item()
             embeds_image_mask = (
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-
             image_embeds = image_embeds[:n_image_tokens]
             deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
+            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 seq_len = image_mask.shape[1]
                 seq_per_rank = seq_len // get_parallel_state().sp_size
                 rank_start = get_parallel_state().sp_rank * seq_per_rank
                 rank_end = rank_start + seq_per_rank
 
-                deepstack_offset = int(image_mask[:, :rank_start].sum().item())
+                deepstack_offset = image_mask[:, :rank_start].sum().item()
                 image_mask = image_mask[:, rank_start:rank_end]
-                deepstack_len = int(image_mask.sum().item())
+                deepstack_len = image_mask.sum().item()
+
                 deepstack_image_embeds = [
                     embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
                 ]
+            # --- Patch.1 ---
 
         elif get_parallel_state().fsdp_enabled:
-            fake_out = self.visual.dummy_forward()
-            fake_embeds = fake_out.pooler_output.mean() * 0.0
-            inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            fake_deepstack = fake_out.deepstack_features
+            # --- Patch.4 ---
+            fake_vision = self.visual.dummy_forward()
+            fake_embeds = fake_vision.pooler_output.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
+            fake_deepstack = fake_vision.deepstack_features
+            # --- Patch.4 ---
 
-        # Video branch
         if pixel_values_videos is not None:
-            video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+            video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
+                pixel_values_videos, video_grid_thw, return_dict=True
+            )
             video_embeds = video_outputs.pooler_output
             deepstack_video_embeds = video_outputs.deepstack_features
 
+            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 video_embeds = gather_seq_scatter_heads(
-                    video_embeds,
-                    seq_dim=0,
-                    head_dim=-1,
-                    group=get_parallel_state().sp_group,
+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
                 deepstack_video_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_video_embeds
                 ]
+            # --- Patch.1 ---
 
-            n_video_tokens = int(video_mask.sum().long().item())
+            n_video_tokens = video_mask.sum().long().item()
             embeds_video_mask = (
                 video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-
             video_embeds = video_embeds[:n_video_tokens]
             deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
+            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 seq_len = video_mask.shape[1]
                 seq_per_rank = seq_len // get_parallel_state().sp_size
                 rank_start = get_parallel_state().sp_rank * seq_per_rank
                 rank_end = rank_start + seq_per_rank
 
-                deepstack_offset = int(video_mask[:, :rank_start].sum().item())
+                deepstack_offset = video_mask[:, :rank_start].sum().item()
                 video_mask = video_mask[:, rank_start:rank_end]
-                deepstack_len = int(video_mask.sum().item())
+                deepstack_len = video_mask.sum().item()
+
                 deepstack_video_embeds = [
                     embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
                 ]
+            # --- Patch.1 ---
 
         elif get_parallel_state().fsdp_enabled:
-            fake_out = self.visual.dummy_forward()
-            fake_embeds = fake_out.pooler_output.mean() * 0.0
-            inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            fake_deepstack = fake_out.deepstack_features
+            # --- Patch.4 ---
+            fake_vision = self.visual.dummy_forward()
+            fake_embeds = fake_vision.pooler_output.mean() * 0.0
+            fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + fake_embeds
+            fake_deepstack = fake_vision.deepstack_features
+            # --- Patch.4 ---
 
+        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds,
-                head_dim=2,
-                seq_dim=1,
-                group=get_parallel_state().sp_group,
+                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
             )
+        # --- Patch.1 ---
 
-        # Build deepstack inputs
         visual_pos_masks = None
         deepstack_visual_embeds = None
+
         if pixel_values is not None and pixel_values_videos is not None:
             visual_pos_masks = image_mask | video_mask
             deepstack_visual_embeds = []
@@ -1512,52 +1669,31 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             visual_pos_masks = video_mask
             deepstack_visual_embeds = deepstack_video_embeds
         else:
-            deepstack_visual_embeds = fake_deepstack
+            # --- Patch.4 ---
+            # Pass fake deepstack so _deepstack_process still touches the
+            # visual params; visual_pos_masks=None triggers the add-0.0 branch
+            if fake_deepstack is not None:
+                deepstack_visual_embeds = fake_deepstack
+            # --- Patch.4 ---
 
-        # Position ids (v4 semantics, non-compiled path)
-        if position_ids is None and input_ids is not None:
-            attention_mask_tensor = (
-                attention_mask if not isinstance(attention_mask, dict) else attention_mask.get("full_attention", None)
+        if position_ids is None:
+            position_ids = self.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
             )
-            if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
-                attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
-                if attention_mask_tensor.dtype.is_floating_point:
-                    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
-                    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
-
-            prefill_stage = (cache_position is not None and cache_position[0] == 0) or (
-                past_key_values is None or past_key_values.get_seq_length() == 0
-            )
-            if prefill_stage or self.rope_deltas is None:
-                position_ids, rope_deltas = self.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    attention_mask=attention_mask_tensor,
-                )
-                self.rope_deltas = rope_deltas
-            else:
-                batch_size, seq_length, _ = inputs_embeds.shape
-                delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
-                    if cache_position is not None
-                    else 0
-                )
-                pos_1d = torch.arange(seq_length, device=inputs_embeds.device).view(1, -1).expand(batch_size, -1)
-                if cache_position is not None:
-                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-                pos_1d = pos_1d.add(delta)
-                position_ids = pos_1d.unsqueeze(0).expand(3, -1, -1)
-        elif position_ids is not None:
-            # handle (bs, 3, seq) precomputed position_ids
+        else:
+            # --- Patch.5 ---
             if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()
+            # --- Patch.5 ---
 
-        # if get_parallel_state().sp_enabled and not get_parallel_state().async_enabled and position_ids is not None:
-        #     position_ids = sp_pad_and_slice(position_ids, dim=-1)
-
-        # Restore flash-attn kwargs to LM
+        # --- Patch.3 ---
         kwargs.update(flash_attn_kwargs)
+        # --- Patch.3 ---
 
         outputs = self.language_model(
             input_ids=None,
@@ -1570,6 +1706,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             deepstack_visual_embeds=deepstack_visual_embeds,
             **kwargs,
         )
+
         return Qwen3VLModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
@@ -1608,7 +1745,7 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLForConditionalGeneration
-# Methods patched: _get_position_id, get_position_id_func, forward
+# Methods patched: get_position_id_func, forward
 # ======================================================================
 
 
@@ -1664,6 +1801,16 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         """
         return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
+    # ================================================================
+    # Patch: Qwen3VLForConditionalGeneration.forward
+    # 1. use the unified VeOmni fused loss_function (handles Ulysses
+    #    internally; takes hidden_states + lm_head weights instead of
+    #    pre-computed logits) — avoids materializing full-vocab logits
+    #    when labels are provided
+    # 2. drop the HF v5 logits-first path: only compute logits when
+    #    labels is None (inference), otherwise let loss_function fuse
+    #    matmul + cross-entropy
+    # ================================================================
     @can_return_tuple
     def forward(
         self,
@@ -1677,11 +1824,10 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ):
+    ) -> tuple | Qwen3VLCausalLMOutputWithPast:
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -1693,7 +1839,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
-            mm_token_type_ids=mm_token_type_ids,
             **kwargs,
         )
 
@@ -1701,6 +1846,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         hidden_states = hidden_states[:, slice_indices, :]
 
+        # --- Patch.1 ---
         loss = None
         logits = None
         if labels is not None:
@@ -1714,6 +1860,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             )
         else:
             logits = self.lm_head(hidden_states)
+        # --- Patch.1 ---
 
         return Qwen3VLCausalLMOutputWithPast(
             loss=loss,
@@ -1946,16 +2093,24 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
         return input_ids, model_kwargs
 
-    def _get_position_id(main_func, fake_model, **kwargs):
-        position_ids, rope_deltas = main_func(fake_model, **kwargs)
-        return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-
+    # ================================================================
+    # Patch: Qwen3VLForConditionalGeneration.get_position_id_func (new)
+    # 1. wrap Qwen3VLModel.get_rope_index so the VeOmni data pipeline can
+    #    precompute multimodal position_ids on CPU worker processes
+    # 2. overwrite multimodal token ids with VeOmni constants
+    #    (IMAGE_INPUT_INDEX / VIDEO_INPUT_INDEX) so input_ids produced by
+    #    our data pipeline match the fake config here
+    # ================================================================
     def get_position_id_func(self):
+        # --- Patch.1 ---
         fake_config = copy.copy(self.config)
+        # --- Patch.2 ---
         fake_config.image_token_id = IMAGE_INPUT_INDEX
         fake_config.video_token_id = VIDEO_INPUT_INDEX
+        # --- Patch.2 ---
         fake_model = SimpleNamespace(config=fake_config)
-        return partial(Qwen3VLForConditionalGeneration._get_position_id, Qwen3VLModel.get_rope_index, fake_model)
+        return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)  # noqa: F821 defined via add_post_import_block
+        # --- Patch.1 ---
 
 
 __all__ = [

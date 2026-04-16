@@ -150,15 +150,6 @@ text_test_cases = [
         id="qwen3_moe_v5",
     ),
     pytest.param(
-        "qwen3_vl",
-        "./tests/toy_config/qwen3vl_toy",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v5_only,
-    ),
-    pytest.param(
         "seed_oss",
         "./tests/toy_config/seed_oss_toy",
         False,  # is_moe
@@ -222,6 +213,15 @@ qwen3vl_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3vl",
+        "./tests/toy_config/qwen3vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
     ),
     pytest.param(
         "qwen3vlmoe",
