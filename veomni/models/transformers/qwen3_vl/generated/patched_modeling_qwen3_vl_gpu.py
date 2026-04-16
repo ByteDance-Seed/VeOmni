@@ -172,9 +172,10 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
     cos, sin = position_embeddings
     # cos/sin are per-rank sharded along the sequence dim; async path operates on
-    # full-seq QKV, so gather them back across the SP group.
-    cos = gather_outputs(cos, dim=0, group=get_parallel_state().sp_group)
-    sin = gather_outputs(sin, dim=1, group=get_parallel_state().sp_group)
+    # full-seq QKV, so gather them back across the SP group. Shape is
+    # (3, bs, seq_len, head_dim) for qwen3_vl mrope, so the seq dim is 2.
+    cos = gather_outputs(cos, gather_dim=2, group=get_parallel_state().sp_group)
+    sin = gather_outputs(sin, gather_dim=2, group=get_parallel_state().sp_group)
 
     query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -1710,6 +1711,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         return Qwen3VLModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
 
@@ -1866,6 +1869,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
         )
 
