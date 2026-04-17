@@ -28,6 +28,7 @@ Scenarios differ by *v4-coexistence* vs *v5-only* — pick the closest example:
   - `__init__.py` — additionally attaches `_create_checkpoint_tensor_converter` as a `staticmethod` on every v5 model class.
   - `qwen3_moe_gpu_patch_gen_config.py` — replaces `Qwen3MoeExperts` with fused-MoE layout + overrides `get_parallel_plan`.
   - `checkpoint_tensor_converter.py` — HF per-expert → v5 fused runtime converter.
+  - `parallel_plan.py` — `get_parallel_plan(use_gate_up_proj: bool = True)` switch: v5 (default) shards fused `gate_up_proj`, v4 monkey patch passes `False` to shard split `gate_proj`/`up_proj`. Required whenever v4 experts use a different param layout than v5 (qwen3_moe, qwen3_omni_moe). Not needed when v4 inherits an already-fused HF base (qwen3_vl_moe).
 - **v4↔v5 coexist, VLM (non-MoE) + GPU+NPU** — `veomni/models/transformers/qwen3_vl/`
   - `__init__.py` — registry dispatch on transformers version; v4 branch keeps the monkey patch, v5 branch branches on `IS_NPU_AVAILABLE` between `patched_modeling_qwen3_vl_{gpu,npu}`.
   - `qwen3_vl_gpu_patch_gen_config.py` — full VLM forward with Ulysses SP, async Ulysses text attention, deepstack, precomputed mrope via `get_position_id_func`, and a SP-aware `dummy_forward`.
@@ -301,7 +302,14 @@ duplicating ~hundreds of lines per sibling model.
   `@config.override_method("<M>Model.__init__")` patch (see qwen3_5_moe).
 - **MoE expert parallel plan** — `@config.override_method("<M>ForCausalLM.get_parallel_plan")`
   (or `ForConditionalGeneration.get_parallel_plan`) returning
-  `parallel_plan.get_parallel_plan()`.
+  `parallel_plan.get_parallel_plan()`. **If v4 reimplements `<M>Experts` with
+  split `gate_proj`/`up_proj` while v5 uses fused `gate_up_proj`** (qwen3_moe,
+  qwen3_omni_moe pattern), `parallel_plan.py` must take a
+  `use_gate_up_proj: bool = True` switch — v4 monkey patch calls with `False`
+  (split keys), v5 patchgen calls with default `True` (fused key). See
+  `qwen3_moe/parallel_plan.py` for the canonical template. Models whose v4
+  inherits from an already-fused HF base (qwen3_vl_moe pattern) don't need the
+  switch — a single fused-only plan matches both paths.
 - **VLM/multimodal forward** — replicate qwen3_5_moe's pattern (VLM+MoE) or
   qwen3_vl's (VLM, non-MoE): pop LM-level flash-attn kwargs before ViT call,
   transpose seq↔head layout for Ulysses SP, shard image/video embeds, shard
@@ -751,6 +759,18 @@ Extra e2e gotchas:
 - **MoE expert layout mismatch** → three distinct upstream layouts exist
   (qwen3_moe per-expert, qwen3_vl_moe transposed, qwen3_5_moe direct). Confirm
   which one applies before writing the converter.
+- **`parallel_plan.py` EP keys must match the live param names on both v4 and
+  v5** — when v4 reimplements `<M>Experts` with split `gate_proj`/`up_proj`
+  (qwen3_moe, qwen3_omni_moe pattern) but v5 uses fused `gate_up_proj`, a
+  single fused-only EP plan silently leaves v4's split params unsharded. Group
+  GEMM then sees full-expert tensors and `assert len(cumsum_M) == b.shape[0]`
+  fires inside `group_gemm_same_nk`. Fix: add a
+  `use_gate_up_proj: bool = True` switch in `parallel_plan.py`, pass `False`
+  from the v4 monkey patch, default `True` from patchgen — see
+  `qwen3_moe/parallel_plan.py`. Audit by checking the live param names on the
+  v4 expert class (`grep -n 'self\.\(gate\|up\|down\|gate_up\)_proj' modeling_<m>.py`)
+  vs the EP keys in `parallel_plan.py`. qwen3_vl_moe is exempt because its v4
+  inherits HF's already-fused `_Qwen3VLMoeTextExperts`.
 - **Copy-pasting a sibling converter's docstring** — the `__doc__` on a
   neighboring `checkpoint_tensor_converter.py` is an unreliable source of truth
   for the HF layout; it was written for *that* model, not yours, and survives
