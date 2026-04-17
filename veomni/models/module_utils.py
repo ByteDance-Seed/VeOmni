@@ -229,7 +229,12 @@ def _dispatch_parameter(
                 
         else:
             # Default execution path for GPUs or non-EP scenarios
-            tensor =
+            tensor = tensor.to(orig_tensor)
+            module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+            
+    else:  # not dtensor
+        tensor = tensor.to(device=orig_tensor.device, dtype=orig_tensor.dtype)
+        module._parameters[local_name].data.copy_(tensor.contiguous())
 
 
 def _dispatch_buffer(
