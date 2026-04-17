@@ -94,6 +94,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
+          uv run --frozen pytest -s -x tests/models/test_models_logits_equal.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
