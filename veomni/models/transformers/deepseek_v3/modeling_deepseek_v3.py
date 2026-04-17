@@ -125,9 +125,9 @@ class PatchDeepseekV3NaiveMoe(nn.Module):
                 final_hidden_states.index_add_(0, token_idx, current_hidden_states)
             final_hidden_states = final_hidden_states.to(hidden_states.dtype)
         elif self._moe_implementation == "fused":
-            final_hidden_states = torch.zeros_like(hidden_states)
-            # cast top_k_weights to dtype of final_hidden_states
-            top_k_weights = top_k_weights.to(final_hidden_states.dtype)
+            # cast top_k_weights to dtype of hidden_states to satisfy the
+            # fused MoE kernel's half-precision requirement
+            top_k_weights = top_k_weights.to(hidden_states.dtype)
 
             final_hidden_states = fused_moe_forward(
                 num_experts=self.num_experts,
