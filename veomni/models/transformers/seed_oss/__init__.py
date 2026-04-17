@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY
+from ...loader import MODELING_REGISTRY, raise_if_not_migrated_to_v5
 
 
 @MODELING_REGISTRY.register("seed_oss")
 def register_seed_oss_modeling(architecture: str):
+    raise_if_not_migrated_to_v5("seed_oss")
+
     from transformers import (
         SeedOssForCausalLM,
         SeedOssForQuestionAnswering,

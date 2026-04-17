@@ -59,6 +59,20 @@ MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
 logger = logging.get_logger(__name__)
 
 
+def raise_if_not_migrated_to_v5(model_name: str) -> None:
+    # Gate for models whose VeOmni path is a v4-style monkey-patch and has NOT been ported
+    # to the patchgen/generated flow. `get_model_class` in this module short-circuits when
+    # MODELING_BACKEND=hf, so this function is only reached when the caller wants VeOmni's
+    # patched classes — under transformers>=5.0.0 those patches are almost certainly broken
+    # against v5's rewritten modeling layer, so fail loudly instead of silently corrupting.
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        raise RuntimeError(
+            f"{model_name} has not been migrated to transformers v5 in VeOmni. "
+            f"Set MODELING_BACKEND=hf to bypass VeOmni patches and load upstream "
+            f"HuggingFace classes directly, or pin transformers<5.0.0."
+        )
+
+
 def get_model_config(config_path: str, **kwargs):
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":

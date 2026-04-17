@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY, raise_if_not_migrated_to_v5
 
 
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_omni")
@@ -25,6 +25,8 @@ def register_qwen2_5_omni_config():
 
 @MODELING_REGISTRY.register("qwen2_5_omni")
 def register_qwen2_5_omni_modeling(architecture: str):
+    raise_if_not_migrated_to_v5("qwen2_5_omni")
+
     from .modeling_qwen2_5_omni import (
         Qwen2_5OmniForConditionalGeneration,
         Qwen2_5OmniThinkerForConditionalGeneration,
