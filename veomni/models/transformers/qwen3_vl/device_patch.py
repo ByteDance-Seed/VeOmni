@@ -16,31 +16,31 @@
 
 import transformers.models.qwen3_vl.modeling_qwen3_vl as hf_qwen3vl
 
-from ....ops.device_patch_utils import ImplSpec, apply_device_patches, rms_norm_patch, rope_patch
-
-
-PATCHES = [
-    rope_patch(
-        "apply_rotary_pos_emb",
-        {
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "apply_rotary_pos_emb_npu"),
-        },
-    ),
-    rms_norm_patch(
-        "Qwen3VLTextRMSNorm",
-        {
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "rms_norm_forward_npu", replace_forward=True),
-        },
-    ),
-]
+from ....ops.config.registry import apply_per_model_patches
 
 
 def _custom_qwen3vl(ops_config, applied):
+    # Qwen3-VL additionally patches the vision-tower RoPE when running on NPU.
     if ops_config.rotary_pos_emb_implementation == "npu":
-        from veomni.ops.npu_patch import npu_fused_operator
+        from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_vision_npu
 
-        hf_qwen3vl.apply_rotary_pos_emb_vision = npu_fused_operator.apply_rotary_pos_emb_vision_npu
+        hf_qwen3vl.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision_npu
 
 
 def apply_veomni_qwen3vl_device_patch():
-    apply_device_patches(hf_qwen3vl, PATCHES, "Qwen3-VL", custom_patches=_custom_qwen3vl)
+    apply_per_model_patches(
+        hf_module=hf_qwen3vl,
+        model_name="Qwen3-VL",
+        targets={
+            "rotary_pos_emb": "apply_rotary_pos_emb",
+            "rms_norm": "Qwen3VLTextRMSNorm",
+        },
+        # Historically only the NPU backend was wired up for Qwen3-VL; keep
+        # the liger_kernel backends disabled so configs that enable liger for
+        # other models do not silently alter Qwen3-VL semantics.
+        extra_backends={
+            "rotary_pos_emb": {"liger_kernel": None},
+            "rms_norm": {"liger_kernel": None},
+        },
+        custom_patches=_custom_qwen3vl,
+    )

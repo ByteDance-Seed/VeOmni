@@ -296,7 +296,7 @@ if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[1]
 Replace the model's built-in CE loss with `ForCausalLMLoss` to get Liger/fused kernel selection and correct SP loss reduction:
 
 ```python
-from ....ops.fused_cross_entropy import ForCausalLMLoss
+from ....ops.kernels.cross_entropy import ForCausalLMLoss
 
 if labels is not None:
     loss, logits = ForCausalLMLoss(

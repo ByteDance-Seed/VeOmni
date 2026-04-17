@@ -633,7 +633,8 @@ class OpsImplementationConfig:
     - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
       ``liger-kernel``).
     - ``"npu"``: Ascend NPU fused implementation (requires ``torch_npu``).
-      Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from ``veomni.ops.npu_patch``.
+      Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from
+      ``veomni.ops.kernels.{rms_norm,rotary}.npu``.
     - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
       NPU with ``triton-ascend``).
     """
@@ -664,6 +665,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "Cross-entropy loss implementation. "
             "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
+            "'npu' enables chunked loss computation for CausalLM on NPU "
+            "(requires torch_npu). "
             "'eager' (default) uses PyTorch F.cross_entropy."
         },
     )
@@ -703,13 +706,6 @@ class OpsImplementationConfig:
             "'eager' (default) uses PyTorch reference."
         },
     )
-    chunk_loss: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable chunked loss computation for CausalLM on NPU. "
-            "Replaces the VEOMNI_ENABLE_CHUNK_LOSS environment variable."
-        },
-    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
@@ -726,23 +722,28 @@ class OpsImplementationConfig:
         self._validate_implementations()
 
     def _validate_implementations(self):
-        """Validate that requested backends are actually available."""
-        from ..utils.import_utils import is_torch_npu_available
+        """Validate that requested backends are actually available.
 
-        liger = is_liger_kernel_available()
-        npu = is_torch_npu_available()
+        Walks the kernel registry so new ops/backends are discovered
+        automatically.  Importing ``veomni.ops`` here is what triggers every
+        op module to call ``register_op``.
+        """
+        from ..ops import config as ops_config_pkg  # noqa: F401  import side-effect
+        from ..ops.config.registry import list_ops
 
-        for field_name in (
-            "cross_entropy_loss_implementation",
-            "rms_norm_implementation",
-            "swiglu_mlp_implementation",
-            "rotary_pos_emb_implementation",
-        ):
-            value = getattr(self, field_name)
-            if value == "liger_kernel" and not liger:
-                raise ValueError(f"{field_name}='liger_kernel' requires liger-kernel to be installed.")
-            if value == "npu" and not npu:
-                raise ValueError(f"{field_name}='npu' requires torch_npu to be installed.")
+        for op in list_ops():
+            value = getattr(self, op.config_field)
+            backend = op.backends.get(value)
+            if backend is None:
+                continue
+            for pkg in backend.requires:
+                if pkg == "liger_kernel" and not is_liger_kernel_available():
+                    raise ValueError(f"{op.config_field}='{value}' requires liger-kernel to be installed.")
+                if pkg == "torch_npu":
+                    from ..utils.import_utils import is_torch_npu_available
+
+                    if not is_torch_npu_available():
+                        raise ValueError(f"{op.config_field}='{value}' requires torch_npu to be installed.")
 
 
 @dataclass

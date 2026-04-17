@@ -15,43 +15,20 @@
 import torch
 import transformers.models.deepseek_v3.modeling_deepseek_v3 as hf_deepseek_v3
 
-from ....ops.device_patch_utils import ImplSpec, apply_device_patches, rms_norm_patch, rope_patch, swiglu_patch
-
-
-PATCHES = [
-    rope_patch(
-        "apply_rotary_pos_emb",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rope", "liger_rotary_pos_emb"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "apply_rotary_pos_emb_npu"),
-        },
-    ),
-    rms_norm_patch(
-        "DeepseekV3RMSNorm",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rms_norm", "LigerRMSNorm"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "rms_norm_forward_npu", replace_forward=True),
-        },
-    ),
-    swiglu_patch(
-        "DeepseekV3MLP",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.swiglu", "LigerSwiGLUMLP"),
-        },
-    ),
-]
+from ....ops.config.registry import BackendSpec, apply_per_model_patches
 
 
 def _make_deterministic_rope_forward():
     """Build a RotaryEmbedding.forward that uses a deterministic Triton bmm kernel.
 
     The default ``inv_freq @ position_ids`` dispatches to cuBLAS bmm which is
-    non-deterministic on the first call for certain GPU architectures.  Replacing
-    it with an explicit Triton batched-GEMM kernel eliminates this issue.
+    non-deterministic on the first call for certain GPU architectures.
+    Replacing it with an explicit Triton batched-GEMM kernel eliminates this
+    issue.
     """
     from transformers.models.deepseek_v3.modeling_deepseek_v3 import dynamic_rope_update
 
-    from ....ops.batch_invariant_ops import triton_bmm
+    from ....ops.kernels.rotary.triton_deterministic import triton_bmm
 
     @torch.no_grad()
     @dynamic_rope_update
@@ -74,24 +51,42 @@ def _make_deterministic_rope_forward():
     return _deterministic_rope_forward
 
 
-def _patch_triton_rms_norm():
-    """Replace DeepseekV3RMSNorm.forward with fused Triton kernel."""
-    from ....ops.batch_invariant_ops import batch_invariant_rms_norm
+def _make_batch_invariant_rms_norm_forward():
+    """Build an RMSNorm.forward that uses the batch-invariant Triton kernel."""
+    from ....ops.kernels.rms_norm.triton_batch_invariant import batch_invariant_rms_norm
 
     def _fused_rms_norm_forward(self, hidden_states):
         return batch_invariant_rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
-    hf_deepseek_v3.DeepseekV3RMSNorm.forward = _fused_rms_norm_forward
-
-
-def _custom_deepseek_v3(ops_config, applied):
-    if ops_config.rotary_pos_emb_implementation == "triton":
-        hf_deepseek_v3.DeepseekV3RotaryEmbedding.forward = _make_deterministic_rope_forward()
-        applied.append("RoPE (triton)")
-    if ops_config.rms_norm_implementation == "triton":
-        _patch_triton_rms_norm()
-        applied.append("RMSNorm (triton)")
+    return _fused_rms_norm_forward
 
 
 def apply_veomni_deepseek_v3_device_patch():
-    apply_device_patches(hf_deepseek_v3, PATCHES, "DeepSeek-V3", custom_patches=_custom_deepseek_v3)
+    apply_per_model_patches(
+        hf_module=hf_deepseek_v3,
+        model_name="DeepSeek-V3",
+        targets={
+            "rotary_pos_emb": "apply_rotary_pos_emb",
+            "rms_norm": "DeepseekV3RMSNorm",
+            "swiglu_mlp": "DeepseekV3MLP",
+        },
+        extra_backends={
+            "rotary_pos_emb": {
+                # The Triton backend replaces ``DeepseekV3RotaryEmbedding.forward``
+                # rather than the module-level ``apply_rotary_pos_emb``.
+                "triton": BackendSpec(
+                    entry="veomni.models.transformers.deepseek_v3.device_patch:_make_deterministic_rope_forward",
+                    entry_is_factory=True,
+                    replace_forward=True,
+                    target_override="DeepseekV3RotaryEmbedding",
+                ),
+            },
+            "rms_norm": {
+                "triton": BackendSpec(
+                    entry="veomni.models.transformers.deepseek_v3.device_patch:_make_batch_invariant_rms_norm_forward",
+                    entry_is_factory=True,
+                    replace_forward=True,
+                ),
+            },
+        },
+    )

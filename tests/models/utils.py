@@ -343,18 +343,18 @@ def apply_veomni_hf_unpatch():
 def apply_veomni_loss_unpatch():
     from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
 
-    from veomni.ops import fused_cross_entropy
+    from veomni.ops.kernels import cross_entropy
 
-    fused_cross_entropy._cross_entropy = None
+    cross_entropy._cross_entropy = None
 
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
 
 
 def apply_veomni_moe_unpatch():
-    from veomni.ops import fused_moe
+    from veomni.ops.kernels import moe
 
-    fused_moe._fused_moe_forward = None
+    moe._fused_moe_forward = None
 
 
 def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig:

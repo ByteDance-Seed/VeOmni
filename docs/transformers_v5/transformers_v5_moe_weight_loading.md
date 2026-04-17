@@ -157,7 +157,7 @@ and splits back to per-expert keys. The output is compatible with:
 ## VeOmni Fused MoE Op Interface
 
 VeOmni fused MoE entrypoint:
-- `veomni.ops.fused_moe.fused_moe_forward(...)`
+- `veomni.ops.kernels.moe.fused_moe_forward(...)`
 
 Current signature supports both split and fused gate/up weights:
 

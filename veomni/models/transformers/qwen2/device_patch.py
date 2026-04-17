@@ -14,32 +14,16 @@
 
 import transformers.models.qwen2.modeling_qwen2 as hf_qwen2
 
-from ....ops.device_patch_utils import ImplSpec, apply_device_patches, rms_norm_patch, rope_patch, swiglu_patch
-
-
-PATCHES = [
-    rope_patch(
-        "apply_rotary_pos_emb",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rope", "liger_rotary_pos_emb"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "apply_rotary_pos_emb_npu"),
-        },
-    ),
-    rms_norm_patch(
-        "Qwen2RMSNorm",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rms_norm", "LigerRMSNorm"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "rms_norm_forward_npu", replace_forward=True),
-        },
-    ),
-    swiglu_patch(
-        "Qwen2MLP",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.swiglu", "LigerSwiGLUMLP"),
-        },
-    ),
-]
+from ....ops.config.registry import apply_per_model_patches
 
 
 def apply_veomni_qwen2_device_patch():
-    apply_device_patches(hf_qwen2, PATCHES, "Qwen2")
+    apply_per_model_patches(
+        hf_module=hf_qwen2,
+        model_name="Qwen2",
+        targets={
+            "rotary_pos_emb": "apply_rotary_pos_emb",
+            "rms_norm": "Qwen2RMSNorm",
+            "swiglu_mlp": "Qwen2MLP",
+        },
+    )

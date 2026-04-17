@@ -25,12 +25,21 @@ veomni/
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   ├── diffusers/      Diffusion model definitions (Wan T2V)
 │   └── seed_omni/      Omni-model architecture (encoder-foundation-decoder)
-├── ops/                Optimized kernels
-│   ├── flash_attn/     Flash attention integration
-│   ├── fused_cross_entropy/   Fused loss computation
-│   ├── fused_moe/      Fused MoE kernels
-│   ├── group_gemm/     Group GEMM kernels (triton)
-│   └── npu_patch/      NPU-specific operator patches
+├── ops/                Optimized kernels and dispatch
+│   ├── config/         Unified ops registry + singleton resolved config
+│   │   ├── registry.py OpSpec/BackendSpec/OpScope + register_op/apply_*
+│   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
+│   ├── kernels/        Kernel implementations (one subdir per op)
+│   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
+│   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
+│   │   ├── load_balancing_loss/  eager + triton variants
+│   │   ├── rms_norm/   Liger/NPU/batch-invariant Triton RMSNorm
+│   │   ├── rotary/     Liger/NPU + DeepSeek V3 deterministic + Wan Triton
+│   │   ├── swiglu_mlp/ Liger SwiGLU MLP
+│   │   └── moe/        Fused MoE kernels + group_gemm sub-kernels
+│   ├── platform/       Platform-specific runtime patches
+│   │   └── npu/        HCCL pre-mul sum patch
+│   └── batch_invariant_ops/  Mode switch for deterministic ops
 ├── optim/              Optimizer and LR scheduler construction
 ├── patchgen/           Auto-generate model patches from HuggingFace models
 ├── schedulers/         LR scheduler implementations (flow matching)

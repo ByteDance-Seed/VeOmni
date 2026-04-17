@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-import veomni.ops.fused_cross_entropy as m
+import veomni.ops.kernels.cross_entropy as m
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_torch_device
 

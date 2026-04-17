@@ -14,7 +14,6 @@ All selections are driven by config fields in `OpsImplementationConfig`.
 | SwiGLU MLP | `swiglu_mlp_implementation` | `"eager"` | Model registration via ops config singleton |
 | Rotary embedding | `rotary_pos_emb_implementation` | `"eager"` | Model registration via ops config singleton |
 | Load-balancing loss | `load_balancing_loss_implementation` | `"eager"` | `apply_ops_config()` (before model build) |
-| Chunk loss (NPU) | `chunk_loss` | `False` | `apply_ops_config()` (before model build) |
 | MoE implementation | `moe_implementation` | `None` | `build_foundation_model` |
 
 All config fields live in `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`),
@@ -81,7 +80,7 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
-- Registration: `veomni/ops/flash_attn/__init__.py` — `apply_veomni_attention_patch()`
+- Registration: `veomni/ops/kernels/attention/__init__.py` — `apply_veomni_attention_patch()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(attn_implementation=...)`
 
 ---
@@ -103,13 +102,15 @@ model:
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | `fused_liger_kernel_cross_entropy` | `liger-kernel` package |
+| `npu` | `chunk_loss_function` (chunked loss for `ForCausalLM`) | `torch_npu` |
 | `eager` | `eager_cross_entropy` (PyTorch `F.cross_entropy`) | — |
 
 ### Key files
 
-- Selection: `veomni/ops/fused_cross_entropy/__init__.py` — `apply_veomni_loss_patch()`
-- Eager impl: `veomni/ops/fused_cross_entropy/eager.py`
-- Liger impl: `veomni/ops/fused_cross_entropy/liger_kernel.py`
+- Selection: `veomni/ops/kernels/cross_entropy/__init__.py` — `apply_veomni_loss_patch()`
+- Eager impl: `veomni/ops/kernels/cross_entropy/eager.py`
+- Liger impl: `veomni/ops/kernels/cross_entropy/liger.py`
+- NPU chunk loss: `veomni/ops/kernels/cross_entropy/chunk_loss.py` — `chunk_loss_function`
 
 ---
 
@@ -144,8 +145,9 @@ Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
 
 ### Key files
 
-- Config singleton: `veomni/ops/ops_config.py` — `get_ops_config()`, `set_ops_config()`
-- `veomni/models/transformers/{model}/device_patch.py` (8 model-specific files)
+- Config singleton: `veomni/ops/config/singleton.py` — `get_ops_config()`, `set_ops_config()`
+- Unified registry: `veomni/ops/config/registry.py` — `register_op()`, `apply_per_model_patches()`, `apply_global_ops()`
+- `veomni/models/transformers/{model}/device_patch.py` (9 model-specific files)
 
 ---
 
@@ -170,9 +172,9 @@ model:
 
 ### Key files
 
-- Selection: `veomni/ops/fused_load_balancing_loss/__init__.py`
-- Triton impl: `veomni/ops/fused_load_balancing_loss/triton_kernel.py`
-- Eager impl: `veomni/ops/fused_load_balancing_loss/torch_native.py`
+- Selection: `veomni/ops/kernels/load_balancing_loss/__init__.py`
+- Triton impl: `veomni/ops/kernels/load_balancing_loss/triton.py`
+- Eager impl: `veomni/ops/kernels/load_balancing_loss/eager.py`
 
 ---
 
@@ -201,7 +203,7 @@ model:
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
-- Dispatch: `veomni/ops/fused_moe/__init__.py` — `apply_veomni_fused_moe_patch()`
+- Dispatch: `veomni/ops/kernels/moe/__init__.py` — `apply_veomni_fused_moe_patch()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(moe_implementation=...)`
 
 ---

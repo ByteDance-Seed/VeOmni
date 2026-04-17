@@ -14,32 +14,16 @@
 
 import transformers.models.seed_oss.modeling_seed_oss as hf_seed_oss
 
-from ....ops.device_patch_utils import ImplSpec, apply_device_patches, rms_norm_patch, rope_patch, swiglu_patch
-
-
-PATCHES = [
-    rope_patch(
-        "apply_rotary_pos_emb",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rope", "liger_rotary_pos_emb"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "apply_rotary_pos_emb_npu"),
-        },
-    ),
-    rms_norm_patch(
-        "SeedOssRMSNorm",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rms_norm", "LigerRMSNorm"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "rms_norm_forward_npu", replace_forward=True),
-        },
-    ),
-    swiglu_patch(
-        "SeedOssMLP",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.swiglu", "LigerSwiGLUMLP"),
-        },
-    ),
-]
+from ....ops.config.registry import apply_per_model_patches
 
 
 def apply_veomni_seed_oss_device_patch():
-    apply_device_patches(hf_seed_oss, PATCHES, "SeedOss")
+    apply_per_model_patches(
+        hf_module=hf_seed_oss,
+        model_name="SeedOss",
+        targets={
+            "rotary_pos_emb": "apply_rotary_pos_emb",
+            "rms_norm": "SeedOssRMSNorm",
+            "swiglu_mlp": "SeedOssMLP",
+        },
+    )

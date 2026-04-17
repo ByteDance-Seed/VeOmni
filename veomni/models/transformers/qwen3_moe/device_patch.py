@@ -16,32 +16,16 @@
 
 import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 
-from ....ops.device_patch_utils import ImplSpec, apply_device_patches, rms_norm_patch, rope_patch, swiglu_patch
-
-
-PATCHES = [
-    rope_patch(
-        "apply_rotary_pos_emb",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rope", "liger_rotary_pos_emb"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "apply_rotary_pos_emb_npu"),
-        },
-    ),
-    rms_norm_patch(
-        "Qwen3MoeRMSNorm",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.rms_norm", "LigerRMSNorm"),
-            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "rms_norm_forward_npu", replace_forward=True),
-        },
-    ),
-    swiglu_patch(
-        "Qwen3MoeMLP",
-        {
-            "liger_kernel": ImplSpec("liger_kernel.transformers.swiglu", "LigerSwiGLUMLP"),
-        },
-    ),
-]
+from ....ops.config.registry import apply_per_model_patches
 
 
 def apply_veomni_qwen3_moe_device_patch():
-    apply_device_patches(hf_qwen3_moe, PATCHES, "Qwen3-MoE")
+    apply_per_model_patches(
+        hf_module=hf_qwen3_moe,
+        model_name="Qwen3-MoE",
+        targets={
+            "rotary_pos_emb": "apply_rotary_pos_emb",
+            "rms_norm": "Qwen3MoeRMSNorm",
+            "swiglu_mlp": "Qwen3MoeMLP",
+        },
+    )

@@ -18,10 +18,15 @@ from typing import TYPE_CHECKING
 
 from ..utils import logging
 from ..utils.env import get_env
-from . import flash_attn, fused_cross_entropy, fused_load_balancing_loss, fused_moe
-from .fused_load_balancing_loss import load_balancing_loss_func
-from .fused_moe import fused_moe_forward
-from .ops_config import set_ops_config
+
+# Eagerly import kernel packages so that every op registers itself with the
+# registry.  Order does not matter; each ``register_op`` call is idempotent.
+from . import kernels  # noqa: F401  triggers all register_op() calls
+from .config.registry import apply_global_ops
+from .config.singleton import set_ops_config
+from .kernels import attention, cross_entropy, load_balancing_loss, moe  # noqa: F401
+from .kernels.load_balancing_loss import load_balancing_loss_func
+from .kernels.moe import fused_moe_forward
 
 
 if TYPE_CHECKING:
@@ -37,17 +42,17 @@ logger = logging.get_logger(__name__)
 
 def build_ALL_OPS():
     return [
-        ("_fused_moe_forward", fused_moe._fused_moe_forward),
-        ("_flash_attention_forward", flash_attn._flash_attention_forward),
-        ("_cross_entropy", fused_cross_entropy._cross_entropy),
-        ("_load_balancing_loss", fused_load_balancing_loss._load_balancing_loss),
+        ("_fused_moe_forward", moe._fused_moe_forward),
+        ("_flash_attention_forward", attention._flash_attention_forward),
+        ("_cross_entropy", cross_entropy._cross_entropy),
+        ("_load_balancing_loss", load_balancing_loss._load_balancing_loss),
     ]
 
 
 def apply_ops_patch():
     """Import-time ops patch: only registers attention implementations.
 
-    Loss, load-balancing, and MoE patches are deferred to
+    Loss, load-balancing, and per-model kernel patches are deferred to
     ``apply_ops_config()`` which is called after the YAML config is parsed
     and ``OpsImplementationConfig`` is available.
     """
@@ -55,17 +60,19 @@ def apply_ops_patch():
     if modeling_backend == "hf":
         logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
     else:
-        from .flash_attn import apply_veomni_attention_patch
+        from .kernels.attention import apply_veomni_attention_patch
 
         apply_veomni_attention_patch()
         logger.info_rank0("✅ VeOmni attention patch applied.")
 
 
 def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
-    """Apply loss / load-balancing / model patches based on resolved config.
+    """Apply kernel patches based on resolved ``OpsImplementationConfig``.
 
-    This must be called after ``OpsImplementationConfig`` is constructed
-    (i.e. after YAML parsing) and before ``build_foundation_model()``.
+    Walks all registered GLOBAL ops (cross-entropy loss, load-balancing loss)
+    and binds the selected backend to each op's ``global_slot``.  Per-model
+    patches are applied separately by each model's ``device_patch.py`` via
+    ``apply_per_model_patches``.
     """
     set_ops_config(ops_config)
 
@@ -73,19 +80,18 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     if modeling_backend == "hf":
         return
 
-    from .fused_cross_entropy import apply_veomni_loss_patch
-    from .fused_load_balancing_loss import apply_veomni_load_balancing_loss_patch
+    # Install VeOmni's loss wrappers in HF's LOSS_MAPPING before walking the
+    # registry: the NPU cross-entropy backend's side-effect then overrides
+    # LOSS_MAPPING["ForCausalLM"] to the chunked-loss variant.
+    from .kernels.cross_entropy import install_loss_mapping
 
-    apply_veomni_loss_patch(
-        cross_entropy_loss_implementation=ops_config.cross_entropy_loss_implementation,
-        chunk_loss=ops_config.chunk_loss,
-    )
-    apply_veomni_load_balancing_loss_patch(
-        load_balancing_loss_implementation=ops_config.load_balancing_loss_implementation,
-    )
+    install_loss_mapping()
+
+    applied = apply_global_ops(ops_config)
     # NOTE: fused MoE patch is applied in build_foundation_model() based on
-    # the moe_implementation parameter.
-    logger.info_rank0("✅ VeOmni ops config applied.")
+    # the moe_implementation parameter; per-model kernels are applied by each
+    # model's device_patch.py.
+    logger.info_rank0(f"✅ VeOmni ops config applied: {', '.join(applied) if applied else '(defaults only)'}.")
     logger.info_rank0(format_kernel_functions())
 
 
