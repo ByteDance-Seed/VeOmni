@@ -7,7 +7,6 @@ from rich.console import Console
 from rich.table import Table
 from transformers import set_seed
 
-from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.utils.import_utils import is_torch_npu_available
 
 
@@ -162,6 +161,8 @@ def prepare_data(model_name: str, max_seq_len: int, model_config):
     Build a DummyDataLoader that yields raw features (list of 2 dicts).
     MainCollator packing + cu_seqlens precompute is done in the trainer (TrainerTest).
     """
+    from veomni.data.dummy_dataset import build_dummy_dataset
+
     dataset_name = MODEL_TO_DATASET.get(model_name, "text")
     dataset = build_dummy_dataset(dataset_name, 2, max_seq_len)
 
@@ -225,6 +226,52 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
             except AssertionError as e:
                 print_all_values(outputs_dict, key)
                 raise AssertionError(f"{key} not match") from e
+
+
+# ---------------------------------------------------------------------------
+# Pristine snapshots of HF model classes taken at module import — before any
+# veomni import has a chance to monkey-patch them. `apply_veomni_hf_unpatch`
+# restores them so a second test in the same process can build an HF model
+# that is genuinely un-patched. Keep the module imports inside this block
+# so that util users who never need them are not forced to pay the cost.
+# ---------------------------------------------------------------------------
+import transformers.models.deepseek_v3.modeling_deepseek_v3 as _hf_ds3  # noqa: E402
+import transformers.models.qwen3.modeling_qwen3 as _hf_qwen3  # noqa: E402
+import transformers.models.qwen3_moe.modeling_qwen3_moe as _hf_qwen3_moe  # noqa: E402
+
+
+_PRISTINE_HF_CLASSES = {
+    "qwen3.forward": _hf_qwen3.Qwen3ForCausalLM.forward,
+    "qwen3_moe.forward": _hf_qwen3_moe.Qwen3MoeForCausalLM.forward,
+    "qwen3_moe.MoeBlock": _hf_qwen3_moe.Qwen3MoeSparseMoeBlock,
+    "qwen3_moe.init_weights": _hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights,
+    "ds3.attn_fwd": _hf_ds3.DeepseekV3Attention.forward,
+    "ds3.lm_fwd": _hf_ds3.DeepseekV3ForCausalLM.forward,
+    "ds3.MoE": _hf_ds3.DeepseekV3MoE,
+    "ds3.init_weights": _hf_ds3.DeepseekV3PreTrainedModel._init_weights,
+    "ds3.rope_fwd": _hf_ds3.DeepseekV3RotaryEmbedding.forward,
+    "ds3.rmsnorm_fwd": _hf_ds3.DeepseekV3RMSNorm.forward,
+}
+
+
+def apply_veomni_hf_unpatch():
+    """Undo in-place veomni monkey-patches on HF model modules.
+
+    `apply_veomni_*_patch()` in each of `qwen3/`, `qwen3_moe/`, `deepseek_v3/`
+    mutates the HF model modules directly (e.g. swaps in PatchQwen3MoeSparseMoeBlock).
+    Without this restore, the first parametrize case to build a veomni model
+    leaks its patches into every subsequent HF build in the same test session.
+    """
+    _hf_qwen3.Qwen3ForCausalLM.forward = _PRISTINE_HF_CLASSES["qwen3.forward"]
+    _hf_qwen3_moe.Qwen3MoeForCausalLM.forward = _PRISTINE_HF_CLASSES["qwen3_moe.forward"]
+    _hf_qwen3_moe.Qwen3MoeSparseMoeBlock = _PRISTINE_HF_CLASSES["qwen3_moe.MoeBlock"]
+    _hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = _PRISTINE_HF_CLASSES["qwen3_moe.init_weights"]
+    _hf_ds3.DeepseekV3Attention.forward = _PRISTINE_HF_CLASSES["ds3.attn_fwd"]
+    _hf_ds3.DeepseekV3ForCausalLM.forward = _PRISTINE_HF_CLASSES["ds3.lm_fwd"]
+    _hf_ds3.DeepseekV3MoE = _PRISTINE_HF_CLASSES["ds3.MoE"]
+    _hf_ds3.DeepseekV3PreTrainedModel._init_weights = _PRISTINE_HF_CLASSES["ds3.init_weights"]
+    _hf_ds3.DeepseekV3RotaryEmbedding.forward = _PRISTINE_HF_CLASSES["ds3.rope_fwd"]
+    _hf_ds3.DeepseekV3RMSNorm.forward = _PRISTINE_HF_CLASSES["ds3.rmsnorm_fwd"]
 
 
 def apply_veomni_loss_unpatch():
