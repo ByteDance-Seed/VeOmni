@@ -34,6 +34,10 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
 )
+from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
+    Qwen3OmniMoeCheckpointTensorConverter,
+    create_qwen3_omni_moe_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import (
     Qwen3VLMoeCheckpointTensorConverter,
     create_qwen3_vl_moe_checkpoint_tensor_converter,
@@ -557,4 +561,217 @@ class TestQwen3VLMoeConverterIntegration:
             VLMOE_NUM_EXPERTS,
             VLMOE_HIDDEN,
             VLMOE_INTERMEDIATE,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for Qwen3OmniMoeCheckpointTensorConverter
+# ---------------------------------------------------------------------------
+
+
+OMNIMOE_NUM_EXPERTS = 4
+OMNIMOE_HIDDEN = 8
+OMNIMOE_INTERMEDIATE = 6  # chosen so hidden != 2*intermediate (8 != 12) — layouts are unambiguous
+
+
+def _omnimoe_hf_gate_up(layer: int = 0) -> tuple[str, torch.Tensor]:
+    key = f"thinker.model.layers.{layer}.mlp.experts.gate_up_proj"
+    tensor = torch.arange(
+        OMNIMOE_NUM_EXPERTS * OMNIMOE_HIDDEN * 2 * OMNIMOE_INTERMEDIATE, dtype=torch.float32
+    ).reshape(OMNIMOE_NUM_EXPERTS, OMNIMOE_HIDDEN, 2 * OMNIMOE_INTERMEDIATE)
+    return key, tensor
+
+
+def _omnimoe_hf_down(layer: int = 0) -> tuple[str, torch.Tensor]:
+    key = f"thinker.model.layers.{layer}.mlp.experts.down_proj"
+    tensor = torch.arange(OMNIMOE_NUM_EXPERTS * OMNIMOE_INTERMEDIATE * OMNIMOE_HIDDEN, dtype=torch.float32).reshape(
+        OMNIMOE_NUM_EXPERTS, OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN
+    )
+    return key, tensor
+
+
+class TestQwen3OmniMoeConverterCanHandle:
+    def setup_method(self):
+        self.converter = Qwen3OmniMoeCheckpointTensorConverter(
+            num_experts=OMNIMOE_NUM_EXPERTS,
+            hidden_size=OMNIMOE_HIDDEN,
+            intermediate_size=OMNIMOE_INTERMEDIATE,
+        )
+
+    def test_matches_thinker_fused_keys(self):
+        assert self.converter.can_handle("thinker.model.layers.0.mlp.experts.gate_up_proj")
+        assert self.converter.can_handle("thinker.model.layers.10.mlp.experts.down_proj")
+
+    def test_matches_talker_fused_keys(self):
+        # Talker tower shares the same expert layout convention.
+        assert self.converter.can_handle("talker.model.layers.0.mlp.experts.gate_up_proj")
+        assert self.converter.can_handle("talker.model.layers.3.mlp.experts.down_proj")
+
+    def test_matches_standalone_text_model_keys(self):
+        # When the thinker text submodel is loaded standalone the prefix is just `model.*`.
+        assert self.converter.can_handle("model.layers.3.mlp.experts.gate_up_proj")
+
+    def test_rejects_other_keys(self):
+        assert not self.converter.can_handle("thinker.model.layers.0.self_attn.q_proj.weight")
+        # Per-expert keys (qwen3_moe HF layout) must NOT match here.
+        assert not self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
+        assert not self.converter.can_handle("thinker.model.embed_tokens.weight")
+
+
+class TestQwen3OmniMoeConverterConvert:
+    def setup_method(self):
+        self.converter = Qwen3OmniMoeCheckpointTensorConverter(
+            num_experts=OMNIMOE_NUM_EXPERTS,
+            hidden_size=OMNIMOE_HIDDEN,
+            intermediate_size=OMNIMOE_INTERMEDIATE,
+        )
+
+    def test_hf_gate_up_proj_is_transposed(self):
+        key, tensor = _omnimoe_hf_gate_up()
+        result = self.converter.convert(key, tensor)
+        assert result is not None
+        assert result.name == key
+        assert result.tensor.shape == (OMNIMOE_NUM_EXPERTS, 2 * OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN)
+        # Transposing back should reproduce the HF tensor.
+        assert torch.equal(result.tensor.transpose(1, 2), tensor)
+        assert result.tensor.is_contiguous()
+
+    def test_hf_down_proj_is_transposed(self):
+        key, tensor = _omnimoe_hf_down()
+        result = self.converter.convert(key, tensor)
+        assert result is not None
+        assert result.tensor.shape == (OMNIMOE_NUM_EXPERTS, OMNIMOE_HIDDEN, OMNIMOE_INTERMEDIATE)
+        assert torch.equal(result.tensor.transpose(1, 2), tensor)
+
+    def test_v5_layout_passes_through_unchanged(self):
+        # Simulate a checkpoint previously saved by VeOmni in v5-native layout.
+        gate_up_v5 = torch.randn(OMNIMOE_NUM_EXPERTS, 2 * OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN)
+        down_v5 = torch.randn(OMNIMOE_NUM_EXPERTS, OMNIMOE_HIDDEN, OMNIMOE_INTERMEDIATE)
+
+        gate_up_result = self.converter.convert("thinker.model.layers.0.mlp.experts.gate_up_proj", gate_up_v5)
+        down_result = self.converter.convert("thinker.model.layers.0.mlp.experts.down_proj", down_v5)
+
+        assert gate_up_result is not None and torch.equal(gate_up_result.tensor, gate_up_v5)
+        assert down_result is not None and torch.equal(down_result.tensor, down_v5)
+
+    def test_rejects_non_expert_key(self):
+        result = self.converter.convert("thinker.model.embed_tokens.weight", torch.randn(4, 4))
+        assert result is None
+
+    def test_raises_on_wrong_rank(self):
+        with pytest.raises(RuntimeError, match="expected 3-D"):
+            self.converter.convert(
+                "thinker.model.layers.0.mlp.experts.gate_up_proj",
+                torch.randn(OMNIMOE_NUM_EXPERTS, OMNIMOE_HIDDEN),  # 2-D
+            )
+
+    def test_raises_on_wrong_num_experts(self):
+        with pytest.raises(RuntimeError, match="dim-0 == num_experts"):
+            self.converter.convert(
+                "thinker.model.layers.0.mlp.experts.gate_up_proj",
+                torch.randn(OMNIMOE_NUM_EXPERTS + 1, OMNIMOE_HIDDEN, 2 * OMNIMOE_INTERMEDIATE),
+            )
+
+    def test_raises_on_unrecognized_middle_dim(self):
+        with pytest.raises(RuntimeError, match="unrecognized layout"):
+            self.converter.convert(
+                "thinker.model.layers.0.mlp.experts.gate_up_proj",
+                torch.randn(OMNIMOE_NUM_EXPERTS, 999, OMNIMOE_HIDDEN),
+            )
+
+
+class TestQwen3OmniMoeConverterFinalize:
+    def test_finalize_is_noop(self):
+        converter = Qwen3OmniMoeCheckpointTensorConverter(
+            num_experts=OMNIMOE_NUM_EXPERTS,
+            hidden_size=OMNIMOE_HIDDEN,
+            intermediate_size=OMNIMOE_INTERMEDIATE,
+        )
+        key, tensor = _omnimoe_hf_gate_up()
+        converter.convert(key, tensor)
+        assert converter.finalize() == []
+
+
+class TestQwen3OmniMoeConverterFactory:
+    def test_factory_with_top_level_omni_config(self):
+        # Qwen3OmniMoeConfig — has `thinker_config.text_config`.
+        text_config = SimpleNamespace(
+            num_experts=OMNIMOE_NUM_EXPERTS,
+            hidden_size=OMNIMOE_HIDDEN,
+            moe_intermediate_size=OMNIMOE_INTERMEDIATE,
+        )
+        thinker_config = SimpleNamespace(text_config=text_config)
+        model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config))
+        converter = create_qwen3_omni_moe_checkpoint_tensor_converter(model)
+        assert isinstance(converter, Qwen3OmniMoeCheckpointTensorConverter)
+        assert converter.num_experts == OMNIMOE_NUM_EXPERTS
+        assert converter.hidden_size == OMNIMOE_HIDDEN
+        assert converter.intermediate_size == OMNIMOE_INTERMEDIATE
+
+    def test_factory_with_thinker_config(self):
+        # Qwen3OmniMoeThinkerForConditionalGeneration — `config.text_config`.
+        text_config = SimpleNamespace(
+            num_experts=OMNIMOE_NUM_EXPERTS,
+            hidden_size=OMNIMOE_HIDDEN,
+            moe_intermediate_size=OMNIMOE_INTERMEDIATE,
+        )
+        model = SimpleNamespace(config=SimpleNamespace(text_config=text_config))
+        converter = create_qwen3_omni_moe_checkpoint_tensor_converter(model)
+        assert converter.num_experts == OMNIMOE_NUM_EXPERTS
+        assert converter.hidden_size == OMNIMOE_HIDDEN
+        assert converter.intermediate_size == OMNIMOE_INTERMEDIATE
+
+    def test_factory_with_flat_text_config(self):
+        # Qwen3OmniMoeThinkerTextModel loaded standalone — flat config.
+        flat = SimpleNamespace(
+            num_experts=OMNIMOE_NUM_EXPERTS,
+            hidden_size=OMNIMOE_HIDDEN,
+            moe_intermediate_size=OMNIMOE_INTERMEDIATE,
+        )
+        model = SimpleNamespace(config=flat)
+        converter = create_qwen3_omni_moe_checkpoint_tensor_converter(model)
+        assert converter.num_experts == OMNIMOE_NUM_EXPERTS
+        assert converter.hidden_size == OMNIMOE_HIDDEN
+        assert converter.intermediate_size == OMNIMOE_INTERMEDIATE
+
+
+class TestQwen3OmniMoeConverterIntegration:
+    """End-to-end through `maybe_convert_checkpoint_tensor` using an HF-layout checkpoint."""
+
+    def test_full_layer_conversion(self):
+        converter = Qwen3OmniMoeCheckpointTensorConverter(
+            num_experts=OMNIMOE_NUM_EXPERTS,
+            hidden_size=OMNIMOE_HIDDEN,
+            intermediate_size=OMNIMOE_INTERMEDIATE,
+        )
+
+        non_expert_keys = [
+            "thinker.model.layers.0.self_attn.q_proj.weight",
+            "thinker.model.layers.0.mlp.gate.weight",
+        ]
+        dispatched = {}
+        for key in non_expert_keys:
+            t = torch.randn(4, 4)
+            result = maybe_convert_checkpoint_tensor(key, t, converter)
+            assert result is not None and result.name == key
+            dispatched[result.name] = result.tensor
+
+        for load_fn in (_omnimoe_hf_gate_up, _omnimoe_hf_down):
+            key, t = load_fn()
+            result = maybe_convert_checkpoint_tensor(key, t, converter)
+            assert result is not None
+            dispatched[result.name] = result.tensor
+
+        assert converter.finalize() == []
+
+        # Fused expert tensors are now in v5 modeling layout.
+        assert dispatched["thinker.model.layers.0.mlp.experts.gate_up_proj"].shape == (
+            OMNIMOE_NUM_EXPERTS,
+            2 * OMNIMOE_INTERMEDIATE,
+            OMNIMOE_HIDDEN,
+        )
+        assert dispatched["thinker.model.layers.0.mlp.experts.down_proj"].shape == (
+            OMNIMOE_NUM_EXPERTS,
+            OMNIMOE_HIDDEN,
+            OMNIMOE_INTERMEDIATE,
         )

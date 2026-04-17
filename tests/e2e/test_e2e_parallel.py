@@ -281,6 +281,14 @@ qwen3omni_test_cases = [
         _DEFAULT_ATOL,
         marks=_v4_only,
     ),
+    pytest.param(
+        "qwen3_omni_moe",
+        "./tests/toy_config/qwen3omni_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v5_only,
+    ),
 ]
 
 wan_dit_test_cases = [
