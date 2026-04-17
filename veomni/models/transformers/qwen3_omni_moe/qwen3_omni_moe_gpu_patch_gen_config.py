@@ -118,6 +118,70 @@ config.add_import(
 
 
 # ================================================================
+# Drop talker + code2wav from generated output.
+#
+# The patched `Qwen3OmniMoeForConditionalGeneration.__init__` forces
+# `has_talker=False` and never calls `enable_talker()`, so the talker /
+# code2wav modules are never instantiated on the training path. But HF's
+# `PreTrainedModel.post_init` aggregates `_no_split_modules` by walking the
+# class hierarchy, so leaving `Qwen3OmniMoeTalkerDecoderLayer`,
+# `Qwen3OmniMoeCode2WavTransformerLayer`, etc. in the generated module
+# still lets them contribute to the aggregation and can pull dead layer
+# names into the FSDP no-split set. Excluding them here also trims the
+# generated file (~1500 lines) and removes an import-time footprint that
+# isn't exercised.
+#
+# The top-level package `__init__.py` imports `Qwen3OmniMoeTalkerModel` /
+# `Qwen3OmniMoeTalkerForConditionalGeneration` directly from upstream
+# transformers (not from the generated file), so excluding them here is
+# safe for the registry.
+#
+# The remaining methods on `Qwen3OmniMoeForConditionalGeneration`
+# (`enable_talker`, `_get_talker_*`, `generate`, `token2wav`) reference
+# these classes by name but only at call time (Python late binding) — the
+# training forward never reaches them.
+# ================================================================
+config.exclude_from_output(
+    # Talker
+    "Qwen3OmniMoeTalkerResizeMLP",
+    "Qwen3OmniMoeTalkerCodePredictorOutputWithPast",
+    "Qwen3OmniMoeTalkerCodePredictorAttention",
+    "Qwen3OmniMoeTalkerCodePredictorDecoderLayer",
+    "Qwen3OmniMoeTalkerCodePredictorModel",
+    "Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration",
+    "Qwen3OmniMoeTalkerOutputWithPast",
+    "Qwen3OmniMoeTalkerRotaryEmbedding",
+    "Qwen3OmniMoeTalkerTextMLP",
+    "Qwen3OmniMoeTalkerTextTopKRouter",
+    "Qwen3OmniMoeTalkerTextExperts",
+    "Qwen3OmniMoeTalkerTextSparseMoeBlock",
+    "Qwen3OmniMoeTalkerDecoderLayer",
+    "Qwen3OmniMoeTalkerModel",
+    "Qwen3OmniMoeTalkerForConditionalGeneration",
+    # Shared by talker + code2wav (not referenced by thinker)
+    "Qwen3OmniMoeRMSNorm",
+    "Qwen3OmniMoeMLP",
+    "Qwen3OmniMoeRotaryEmbedding",
+    # Code2Wav
+    "Qwen3OmniMoeCausalConvNet",
+    "Qwen3OmniMoeCausalTransConvNet",
+    "Qwen3OmniMoeConvNeXtBlock",
+    "Qwen3OmniMoeCode2WavAttention",
+    "Qwen3OmniMoeCode2WavMlp",
+    "Qwen3OmniMoeCode2WavRMSNorm",
+    "Qwen3OmniMoeCode2WavLayerScale",
+    "Qwen3OmniMoeCode2WavTransformerLayer",
+    "Qwen3OmniMoeCode2WavTransformerModel",
+    "Qwen3OmniMoeCode2WavDecoderResidualUnit",
+    "Qwen3OmniMoeCode2WavDecoderBlock",
+    "Qwen3OmniMoeCode2Wav",
+    # SnakeBeta activation is only referenced inside the excluded Code2Wav
+    # residual blocks, so exclude it too to avoid generating dead code.
+    "SnakeBeta",
+)
+
+
+# ================================================================
 # Module-level helper emitted into the generated file so multiprocessing
 # dataloaders can pickle the per-sample position-id closure.
 # ================================================================
@@ -136,6 +200,40 @@ def get_position_id(main_func, self, **kwargs):
     return {"position_ids": position_ids.squeeze(1), "rope_deltas": rope_deltas.squeeze(0)}
 '''
 )
+
+
+# ================================================================
+# Patch: Qwen3OmniMoePreTrainedModel._init_weights
+# Upstream branches on `isinstance(module, Qwen3OmniMoeCode2Wav)`; that
+# class is excluded from the generated file (training never instantiates
+# code2wav), so the name lookup fails at runtime during `post_init`. Drop
+# the Code2Wav branch — everything else matches upstream verbatim.
+# ================================================================
+# These names (`init`, `np`, `SinusoidsPositionEmbedding`,
+# `Qwen3OmniMoeThinkerTextSparseMoeBlock`, `Qwen3OmniMoeVisionRotaryEmbedding`)
+# are resolved from the generated file's module namespace at import time,
+# not from this patch config — patchgen lifts the function body verbatim
+# into the generated class.
+@config.override_method(
+    "Qwen3OmniMoePreTrainedModel._init_weights",
+    description="Drop Qwen3OmniMoeCode2Wav branch since the class is excluded from the generated file",
+)
+@torch.no_grad()
+def qwen3_omni_moe_pretrained_init_weights_patched(self, module):
+    super()._init_weights(module)
+    std = self.config.initializer_range
+    if isinstance(module, Qwen3OmniMoeThinkerTextSparseMoeBlock):  # noqa: F821
+        init.normal_(module.experts.gate_up_proj, mean=0.0, std=std)  # noqa: F821
+        init.normal_(module.experts.down_proj, mean=0.0, std=std)  # noqa: F821
+        init.normal_(module.gate.weight, mean=0.0, std=std)  # noqa: F821
+    elif isinstance(module, SinusoidsPositionEmbedding):  # noqa: F821
+        log_timescale_increment = np.log(module.max_timescale) / (module.channels // 2 - 1)  # noqa: F821
+        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(module.channels // 2).float())
+        scaled_time = torch.arange(module.length)[:, np.newaxis] * inv_timescales[np.newaxis, :]  # noqa: F821
+        init.copy_(module.positional_embedding, torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1))  # noqa: F821
+    elif isinstance(module, Qwen3OmniMoeVisionRotaryEmbedding):  # noqa: F821
+        inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
+        init.copy_(module.inv_freq, inv_freq)  # noqa: F821
 
 
 # ================================================================
@@ -532,15 +630,19 @@ def qwen3_omni_moe_vision_forward_patched(
 # ================================================================
 @config.override_method(
     "Qwen3OmniMoeVisionEncoder.dummy_forward",
-    description="FSDP dummy forward to keep reduce-scatter in sync when some ranks lack visual data",
+    description="FSDP dummy forward with patch-embed dtype lookup to stay bf16-safe under MixedPrecision",
 )
 def qwen3_omni_moe_vision_dummy_forward_patched(self):
+    # Pull dtype from a live parameter rather than `self.dtype`: under FSDP2 +
+    # MixedPrecision the module's reported dtype may lag the per-call compute
+    # cast, causing float/bf16 mismatches when the real-data rank runs in bf16.
+    dtype = self.patch_embed.proj.weight.dtype
     if get_parallel_state().sp_enabled:
         sp_size = get_parallel_state().sp_size
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
         grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
     else:
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
         grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
     return self(hidden_states=pixel_values, grid_thw=grid_thw)
 
@@ -644,21 +746,25 @@ def qwen3_omni_moe_audio_forward_patched(
 # Patch: Qwen3OmniMoeAudioEncoder.dummy_forward (NEW method)
 # [FSDP] Synthetic forward so reduce-scatter stays in sync on ranks with
 # no audio data. Minimum valid shape is one chunk of length n_window*2.
+# Dtype is looked up from `self.conv2d1.weight.dtype` at call time — under
+# FSDP2 + MixedPrecision, `self.dtype` (via `next(self.parameters()).dtype`)
+# may still report the sharded full precision (fp32) while the per-module
+# compute dtype has already been cast to bf16; using the conv weight's
+# live dtype keeps the dummy inputs matched to whatever the conv actually
+# runs in. We do NOT cache (`_dummy_data`) because the cached tensor
+# would stay at first-call dtype and break on subsequent calls that
+# enter a different mixed-precision context.
 # ================================================================
 @config.override_method(
     "Qwen3OmniMoeAudioEncoder.dummy_forward",
-    description="FSDP dummy forward to keep reduce-scatter in sync when some ranks lack audio",
+    description="FSDP dummy forward with conv-weight dtype lookup (no caching) to stay bf16-safe",
 )
 def qwen3_omni_moe_audio_dummy_forward_patched(self):
-    if getattr(self, "_dummy_data", None) is None:
-        min_len = self.n_window * 2
-        input_features = torch.zeros((min_len, self.num_mel_bins), dtype=self.dtype, device=self.device)
-        feature_lens = torch.tensor([min_len], dtype=torch.long, device=self.device)
-        self._dummy_data = {
-            "input_features": input_features,
-            "feature_lens": feature_lens,
-        }
-    return self(**self._dummy_data)
+    min_len = self.n_window * 2
+    dtype = self.conv2d1.weight.dtype
+    input_features = torch.zeros((min_len, self.num_mel_bins), dtype=dtype, device=self.device)
+    feature_lens = torch.tensor([min_len], dtype=torch.long, device=self.device)
+    return self(input_features=input_features, feature_lens=feature_lens)
 
 
 # ================================================================
@@ -1232,8 +1338,8 @@ def qwen3_omni_moe_thinker_forward_patched(
             self.num_experts_per_tok,
             attention_mask,
         )
-        if labels is not None:
-            loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
+        if labels is not None and isinstance(aux_loss, torch.Tensor):
+            loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
     return Qwen3OmniMoeThinkerCausalLMOutputWithPast(
         loss=loss,
@@ -1242,6 +1348,7 @@ def qwen3_omni_moe_thinker_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         past_key_values=outputs.past_key_values,
+        router_logits=getattr(outputs, "router_logits", None),
         rope_deltas=self.rope_deltas,
     )
 
@@ -1251,12 +1358,26 @@ def qwen3_omni_moe_thinker_forward_patched(
 # 1. [MoE] Propagate `_moe_implementation` down to `config.thinker_config`
 #    and `config.thinker_config.text_config` so the fused SparseMoeBlock
 #    picks up the correct mode before sub-module construction.
-# 2. [Talker] Leave `has_talker` unchanged — training path never calls
-#    enable_talker (config.enable_audio_output=False).
+# 2. [Talker] Force `has_talker=False` — VeOmni's training path only
+#    forwards through `thinker` (see the patched `forward` below), so
+#    constructing the talker and code2wav would only add unused
+#    parameters and drag `Qwen3OmniMoeTalker*Layer` into the FSDP
+#    `_no_split_modules` aggregation (HF recursively merges children's
+#    `_no_split_modules` at `post_init`, see transformers
+#    `modeling_utils.PreTrainedModel.post_init`). Unused talker layers
+#    FSDP-wrapped but never forwarded cause a rank-desync hang during
+#    asymmetric-modality forward.
+# 3. [FSDP] After `post_init`, replace the aggregated
+#    `self._no_split_modules` with the exact VeOmni target set. The
+#    upstream top-level `Qwen3OmniMoePreTrainedModel._no_split_modules`
+#    lists `Qwen3OmniMoeDecoderLayer` (a typo — no such class exists),
+#    which `post_init` seeds into the aggregation. Resetting here
+#    removes the phantom entry and pins the set to the three real
+#    training targets.
 # ================================================================
 @config.override_method(
     "Qwen3OmniMoeForConditionalGeneration.__init__",
-    description="Propagate _moe_implementation to thinker_config / text_config before sub-module init",
+    description="Propagate _moe_implementation, skip talker for training, pin _no_split_modules to real training targets",
 )
 def qwen3_omni_moe_for_conditional_generation_init_patched(self, config):
     # --- Patch.1 ---
@@ -1266,10 +1387,37 @@ def qwen3_omni_moe_for_conditional_generation_init_patched(self, config):
     # --- Patch.1 ---
     super().__init__(config)
     self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration._from_config(config.thinker_config)
-    self.has_talker = config.enable_audio_output
-    if self.has_talker:
-        self.enable_talker()
+    # --- Patch.2 ---
+    self.has_talker = False
+    # --- Patch.2 ---
     self.post_init()
+    # --- Patch.3 ---
+    self._no_split_modules = {
+        "Qwen3OmniMoeThinkerTextDecoderLayer",
+        "Qwen3OmniMoeVisionBlock",
+        "Qwen3OmniMoeAudioEncoderLayer",
+    }
+    # --- Patch.3 ---
+
+
+# ================================================================
+# Patch: Qwen3OmniMoeForConditionalGeneration.enable_talker
+# The talker + code2wav classes are excluded from the generated file
+# (training never instantiates them), so the upstream body
+# `self.talker = Qwen3OmniMoeTalkerForConditionalGeneration._from_config(...)`
+# would fail at import-time static analysis and at call time. Replace
+# with an explicit NotImplementedError so the reason is clear if anything
+# reaches here.
+# ================================================================
+@config.override_method(
+    "Qwen3OmniMoeForConditionalGeneration.enable_talker",
+    description="Disable talker/code2wav path in the training modeling (excluded classes)",
+)
+def qwen3_omni_moe_enable_talker_patched(self):
+    raise NotImplementedError(
+        "talker / code2wav are not available in the VeOmni training modeling. "
+        "Use the upstream transformers implementation for TTS generation."
+    )
 
 
 # ================================================================

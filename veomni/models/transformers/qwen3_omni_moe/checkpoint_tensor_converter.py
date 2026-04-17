@@ -15,60 +15,64 @@
 """
 Runtime checkpoint tensor converter for Qwen3-Omni-MoE (thinker) models.
 
-HuggingFace ships Qwen3-Omni-MoE checkpoints with fused expert tensors,
-but stored in a layout that is *transposed* relative to the transformers v5
-modeling. This converter fixes the axis order in-place at load time; no
-per-expert stacking is needed (unlike `qwen3_moe`).
+HuggingFace's own loader would convert the on-disk per-expert keys into the
+fused modeling layout via `conversion_mapping.py` (the `qwen2_moe` recipe:
+`MergeModulelist(dim=0) + Concatenate(dim=1)`). VeOmni's loader reads
+safetensors directly and never invokes that recipe, so we reproduce it here.
 
-    HF checkpoint layout (thinker experts):
-        thinker.model.layers.{i}.mlp.experts.gate_up_proj  [E, H, 2*I]
-        thinker.model.layers.{i}.mlp.experts.down_proj     [E, I, H]
+    HF on-disk layout (per-expert split):
+        thinker.model.layers.{i}.mlp.experts.{j}.gate_proj.weight  [I, H]
+        thinker.model.layers.{i}.mlp.experts.{j}.up_proj.weight    [I, H]
+        thinker.model.layers.{i}.mlp.experts.{j}.down_proj.weight  [H, I]
 
-    Target v5 modeling layout:
+    Target v5 modeling layout (fused):
         thinker.model.layers.{i}.mlp.experts.gate_up_proj  [E, 2*I, H]
         thinker.model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 
-VeOmni's training save path can also emit the v5 layout directly (e.g.
-`save_pretrained(save_original_format=False)`), so the converter uses the
-dim-1 shape to distinguish HF layout from v5 layout and only transposes when
-needed; v5-layout tensors pass through untouched. Shapes matching neither
-layout raise loudly rather than silently corrupting weights.
+VeOmni's training save path can emit the v5 fused layout directly (e.g.
+`save_pretrained(save_original_format=False)`). Those keys do not match the
+per-expert regex here, so `maybe_convert_checkpoint_tensor` passes them
+through untouched — the fused shape already equals the modeling layout, so
+dispatch copies them into place.
 
-The talker tower (`talker.model.layers.{i}.mlp.experts.*`) is never trained
-via VeOmni's training path; its experts share the same layout convention, so
-the converter handles both tower prefixes through a single regex.
+The talker tower (`talker.model.layers.{i}.mlp.experts.*`) uses the same
+per-expert convention; the regex matches both tower prefixes so standalone
+talker tensors (if ever loaded through this converter) are handled uniformly.
 """
 
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from ....utils import logging
 from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
 
 
-# Matches fused-expert keys like: ...mlp.experts.{gate_up_proj|down_proj}
-_EXPERT_PATTERN = re.compile(r"^(.+\.mlp\.experts\.(?P<proj>gate_up_proj|down_proj))$")
+logger = logging.get_logger(__name__)
+
+# Matches per-expert split keys like:
+#   thinker.model.layers.0.mlp.experts.3.gate_proj.weight
+_EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
 class Qwen3OmniMoeCheckpointTensorConverter:
-    """Normalize fused expert tensors to the v5 modeling layout.
+    """Stack per-expert gate/up/down tensors into v5 fused layout at load time.
 
-    The incoming tensor is always 3-D with dim-0 == ``num_experts``. For each
-    projection we know both the HF layout and the v5 layout shapes exactly, so
-    we dispatch on dim-1:
+    Buffers per-expert tensors keyed by ``(prefix, proj_name)`` as they stream
+    from safetensors, stacks along dim-0 once all ``num_experts`` are collected,
+    then merges ``gate_proj`` + ``up_proj`` along dim-1 to form ``gate_up_proj``.
 
-    - ``gate_up_proj``: HF has dim-1 == ``hidden_size``, v5 has dim-1 == ``2 * intermediate_size``.
-    - ``down_proj``:    HF has dim-1 == ``intermediate_size``, v5 has dim-1 == ``hidden_size``.
-
-    Hidden size, intermediate size and their doubled variants are all distinct
-    integers for any realistic model, so the dispatch is unambiguous.
+    Args:
+        num_experts: Number of experts per MoE layer.
     """
 
-    def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
+    def __init__(self, num_experts: int):
         self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
+        # {(prefix, proj_name): {expert_id: tensor}}
+        self._expert_buffer: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
+        # {prefix: {proj_name: stacked_tensor}} — waiting for gate/up pair
+        self._stacked_buffer: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def can_handle(self, name: str) -> bool:
         return bool(_EXPERT_PATTERN.match(name))
@@ -78,31 +82,54 @@ class Qwen3OmniMoeCheckpointTensorConverter:
         if not match:
             return None
 
-        proj = match.group("proj")
+        prefix, expert_id_str, proj_name = match.groups()
+        expert_id = int(expert_id_str)
+        buf_key = (prefix, proj_name)
 
-        if tensor.ndim != 3 or tensor.shape[0] != self.num_experts:
-            raise RuntimeError(
-                f"Qwen3OmniMoe checkpoint converter: unexpected shape {tuple(tensor.shape)} for {name} "
-                f"(expected 3-D with dim-0 == num_experts={self.num_experts})"
-            )
+        if buf_key not in self._expert_buffer:
+            self._expert_buffer[buf_key] = {}
+        self._expert_buffer[buf_key][expert_id] = tensor
 
-        if proj == "gate_up_proj":
-            hf_mid, v5_mid = self.hidden_size, 2 * self.intermediate_size
-        else:  # down_proj
-            hf_mid, v5_mid = self.intermediate_size, self.hidden_size
+        if len(self._expert_buffer[buf_key]) < self.num_experts:
+            return None
 
-        if tensor.shape[1] == hf_mid:
-            converted = tensor.transpose(1, 2).contiguous()
-        elif tensor.shape[1] == v5_mid:
-            converted = tensor
-        else:
-            raise RuntimeError(
-                f"Qwen3OmniMoe checkpoint converter: unrecognized layout for {name} "
-                f"(shape={tuple(tensor.shape)}; expected dim-1 == {hf_mid} (HF) or {v5_mid} (v5))"
-            )
-        return ConvertedCheckpointTensor(name, converted)
+        stacked = torch.stack([self._expert_buffer[buf_key][i] for i in range(self.num_experts)])
+        del self._expert_buffer[buf_key]
+
+        if proj_name == "down_proj":
+            # v5 modeling layout is [E, H, I] — already matches stacked shape.
+            return ConvertedCheckpointTensor(f"{prefix}.experts.down_proj", stacked)
+
+        # gate_proj or up_proj — buffer for gate/up merge.
+        if prefix not in self._stacked_buffer:
+            self._stacked_buffer[prefix] = {}
+        self._stacked_buffer[prefix][proj_name] = stacked
+
+        if "gate_proj" in self._stacked_buffer[prefix] and "up_proj" in self._stacked_buffer[prefix]:
+            gate = self._stacked_buffer[prefix].pop("gate_proj")
+            up = self._stacked_buffer[prefix].pop("up_proj")
+            if not self._stacked_buffer[prefix]:
+                del self._stacked_buffer[prefix]
+            merged = torch.cat([gate, up], dim=1)  # [E, 2*I, H]
+            return ConvertedCheckpointTensor(f"{prefix}.experts.gate_up_proj", merged)
+
+        return None
 
     def finalize(self) -> List[ConvertedCheckpointTensor]:
+        """Raise if any buffers remain — incomplete experts indicate a bad checkpoint."""
+        errors: List[str] = []
+        if self._expert_buffer:
+            unflushed = {k: len(v) for k, v in self._expert_buffer.items()}
+            errors.append(
+                f"unflushed per-expert buffer (incomplete experts, expected {self.num_experts}): {unflushed}"
+            )
+        if self._stacked_buffer:
+            unflushed = {k: list(v.keys()) for k, v in self._stacked_buffer.items()}
+            errors.append(f"unflushed stacked buffer (missing gate/up pair): {unflushed}")
+        if errors:
+            raise RuntimeError(
+                "Qwen3OmniMoe checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors)
+            )
         return []
 
 
@@ -118,8 +145,4 @@ def create_qwen3_omni_moe_checkpoint_tensor_converter(model):
     config = model.config
     thinker_config = getattr(config, "thinker_config", config)
     text_config = getattr(thinker_config, "text_config", thinker_config)
-    return Qwen3OmniMoeCheckpointTensorConverter(
-        num_experts=text_config.num_experts,
-        hidden_size=text_config.hidden_size,
-        intermediate_size=text_config.moe_intermediate_size,
-    )
+    return Qwen3OmniMoeCheckpointTensorConverter(num_experts=text_config.num_experts)

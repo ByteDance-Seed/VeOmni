@@ -222,6 +222,36 @@ config = PatchConfig(
 | Remove unused class from output               | `config.exclude_from_output("<Class>")`                |
 | Inherit an entire sibling GPU config into an NPU config (reuse helpers / imports / post-import blocks; only override device-specific kernels) | `config.helpers.extend(gpu_config.helpers)` + `config.post_import_blocks.extend(gpu_config.post_import_blocks)` + `config.additional_imports.extend(gpu_config.additional_imports)` + import each `<fn>_patched` and re-register via `config.override_method(...)`. See `qwen3_vl_npu_patch_gen_config.py` |
 
+**Pruning inactive subtrees** (e.g. talker / code2wav in an omni model where
+training only uses the thinker): use `config.exclude_from_output(<Class>, ...)`
+to drop classes entirely from the generated file. This has three downstream
+ripples you must clean up in the same patch config — otherwise `make quality`
+or `import` will fail on the regenerated output:
+
+- **`_init_weights` `isinstance(...)` branches** — upstream's
+  `<M>PreTrainedModel._init_weights` typically has one `elif isinstance(module,
+  <ExcludedClass>)` branch per leaf init. Override it
+  (`@config.override_method("<M>PreTrainedModel._init_weights")`) and drop
+  every branch that references an excluded class.
+- **Public methods whose bodies reference excluded classes** — e.g.
+  `enable_talker` constructs the talker. Override it to
+  `raise NotImplementedError("<what>. Use upstream transformers for <purpose>.")`
+  so callers get a clear message instead of an F821/NameError at import.
+- **`__all__` is auto-filtered** by `veomni/patchgen/codegen.py` — any excluded
+  class name is removed from the generated `__all__` list automatically, so
+  you don't need a manual `drop_import_names` dance for it.
+- **Transitively-dead helper classes** — activations / small utility modules
+  used *only* by classes you just excluded will still land in the generated
+  file as dead code. Grep the generated output for each excluded class's
+  private helpers and add them to `exclude_from_output` too. Example:
+  `SnakeBeta` is only referenced by `Qwen3OmniMoeCode2WavDecoderResidualUnit`;
+  excluding Code2Wav without also excluding `SnakeBeta` leaves ~40 lines of
+  dead code in `generated/`.
+
+See `qwen3_omni_moe_gpu_patch_gen_config.py` for the canonical template
+(excludes the whole talker + code2wav subtree plus the dead-after-exclusion
+`SnakeBeta` activation, overrides `_init_weights` and `enable_talker`).
+
 **Cross-config reuse pattern** (qwen3_5_moe reusing qwen3_5):
 
 ```python
@@ -355,10 +385,44 @@ from Phase 1 has a corresponding decorator here.
 Skip for text-only LLMs.
 
 V5 MoE uses fused expert tensors `gate_up_proj [E, 2*I, H]` + `down_proj [E, H, I]`,
-but HF safetensor checkpoints ship **per-expert split** keys. A runtime converter
-avoids the old `scripts/moe_ckpt_merge/moe_merge.py` offline step.
+but HF safetensor checkpoints may ship either **per-expert split** keys *or*
+**pre-fused** keys (sometimes transposed) depending on the model. A runtime
+converter avoids the old `scripts/moe_ckpt_merge/moe_merge.py` offline step.
 
-**Pick the template by HF checkpoint key layout, not by model family:**
+**Verify the HF source layout empirically BEFORE picking a template** — do not
+infer it from model family / sibling converter docstrings, because those have
+been copy-pasted across unrelated layout families in the past (e.g. the initial
+qwen3_omni_moe converter shipped a qwen3_vl_moe-style transposer while the real
+checkpoint had per-expert split keys — silent load failure).
+
+Two authoritative sources:
+
+1. **HF's own mapping** — `transformers/conversion_mapping.py::_MODEL_TO_CONVERSION_PATTERN`
+   points the model_type at a WeightConverter recipe:
+   - `"qwen2_moe"` recipe = `MergeModulelist(dim=0) + Concatenate(dim=1)` →
+     source is **per-expert split** → qwen3_moe-style template.
+   - `"qwen3_vl_moe"` recipe = `Transpose(1, 2)` →
+     source is **pre-fused, transposed** → qwen3_vl_moe-style template.
+   - No entry or pass-through → source is **pre-fused, direct v5 layout** →
+     no converter needed (qwen3_5_moe-style).
+   Cross-family aliases are common: `qwen3_omni_moe → qwen2_moe`,
+   `deepseek_v3 → qwen2_moe`, etc. Always resolve the alias before choosing.
+2. **A real checkpoint's index** — sanity-check by grepping
+   `<ckpt>/model.safetensors.index.json`:
+   ```bash
+   python3 -c "
+   import json, sys
+   idx = json.load(open(sys.argv[1]))
+   per_expert = sum(1 for k in idx['weight_map'] if '.experts.' in k and k.endswith('gate_proj.weight'))
+   fused      = sum(1 for k in idx['weight_map'] if k.endswith('.experts.gate_up_proj'))
+   print(f'per-expert keys: {per_expert}, fused keys: {fused}')
+   " <ckpt_path>/model.safetensors.index.json
+   ```
+   If per-expert > 0 → qwen3_moe-style. If fused > 0 → inspect one tensor's
+   shape to distinguish transposed (qwen3_vl_moe-style) from direct v5 (no
+   converter).
+
+**Pick the template by the verified HF layout, not by model family:**
 
 - **HF ships per-expert split keys** (`*.mlp.experts.{j}.{gate|up|down}_proj.weight`)
   → template = `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`.
@@ -687,6 +751,16 @@ Extra e2e gotchas:
 - **MoE expert layout mismatch** → three distinct upstream layouts exist
   (qwen3_moe per-expert, qwen3_vl_moe transposed, qwen3_5_moe direct). Confirm
   which one applies before writing the converter.
+- **Copy-pasting a sibling converter's docstring** — the `__doc__` on a
+  neighboring `checkpoint_tensor_converter.py` is an unreliable source of truth
+  for the HF layout; it was written for *that* model, not yours, and survives
+  unchanged through copy-paste. Always cross-check against
+  `conversion_mapping._MODEL_TO_CONVERSION_PATTERN[<model_type>]` and a real
+  checkpoint's index file (Phase 3). This is exactly the trap the qwen3_omni_moe
+  migration hit — docstring claimed "HF ships fused, transposed" (copied from
+  qwen3_vl_moe) but HF actually ships per-expert split for qwen3_omni_moe
+  (via the `qwen2_moe` alias). Direct `from_pretrained(...)` silently loaded
+  zero expert weights until the converter was rewritten.
 - **Blind-transpose fused-key converter corrupts v5-save round-trip** — when HF
   and v5 use *identical* fused expert key names but different axis orders
   (qwen3_vl_moe pattern), a converter that transposes every matching key will
@@ -797,6 +871,26 @@ Extra e2e gotchas:
   first tested. Grids must be multiples of `spatial_merge_size` (merger
   requirement); under SP, scale one spatial dim by `sp_size` so the post-slice
   seq length stays a multiple of `sp_size`.
+- **`self.dtype` / cached `_dummy_data` in `dummy_forward` is wrong under
+  FSDP2 + MixedPrecisionConfig** — `self.dtype` returns the *first parameter's*
+  dtype, which under FSDP2+MixedPrecision is the stored dtype (fp32), not the
+  per-call compute dtype (bf16) the framework casts weights to at forward time.
+  If `dummy_forward` allocates inputs via `torch.zeros(..., dtype=self.dtype)`
+  or caches a `_dummy_data` buffer at `__init__`, the first conv/linear on a
+  text-only rank crashes with "Input type (float) and bias type
+  (c10::BFloat16) should be the same", while the multimodal rank hangs on the
+  collective — masquerading as an NCCL hang. Always look up dtype from a live
+  parameter at call time (e.g. `dtype = self.conv2d1.weight.dtype`,
+  `dtype = self.patch_embed.proj.weight.dtype`) and don't cache dummy tensors
+  across calls. See `qwen3_omni_moe_gpu_patch_gen_config.py`'s audio / vision
+  `dummy_forward` patches.
+- **FSDP2 "hang" may be a rank-asymmetric crash** — when one rank crashes
+  inside a collective-spanning forward (dtype mismatch, shape mismatch,
+  unexpected `None`), the surviving ranks block on the never-completing
+  collective and the test wall-clocks to SIGTERM. Re-run with
+  `TORCH_DISTRIBUTED_DEBUG=DETAIL` to force the per-rank exception to surface;
+  once you see the real traceback on the crashing rank, fix *that* rather than
+  hunting for deadlocks in the happy-path code.
 - **`gather_dim` for cos/sin in async Ulysses attention paths** — the correct
   seq dim depends on whether a pre-attention RoPE reshape has happened. In
   Qwen3-VL v5, `apply_interleaved_mrope` runs before attention and collapses
