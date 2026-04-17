@@ -32,8 +32,6 @@ from transformers.utils import (
 
 from ....ops import fused_moe_forward
 from ....utils import logging
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 logger = logging.get_logger(__name__)
@@ -287,15 +285,6 @@ def apply_veomni_qwen3_moe_patch():
     hf_qwen3_moe.Qwen3MoeForCausalLM.forward = qwen3_moe_forcausal_lm_forward
     hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = qwen3_moe_pretrained_model_init_weights
 
-    if IS_CUDA_AVAILABLE:
-        from .gpu_patch import apply_veomni_qwen3_moe_gpu_patch
+    from .device_patch import apply_veomni_qwen3_moe_device_patch
 
-        apply_veomni_qwen3_moe_gpu_patch()
-    elif IS_NPU_AVAILABLE and is_transformers_version_greater_or_equal_to("4.50.4"):
-        from .npu_patch import apply_qwen3_moe_npu_patch
-
-        apply_qwen3_moe_npu_patch()
-    else:
-        logger.warning_rank0(
-            "Qwen3ForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4."
-        )
+    apply_veomni_qwen3_moe_device_patch()

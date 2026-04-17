@@ -20,7 +20,7 @@ from typing import Callable, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -29,25 +29,13 @@ from veomni.distributed.sequence_parallel import (
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor_scale_grad,
 )
-
-from ....utils import logging
-from ....utils.import_utils import (
-    is_liger_kernel_available,
-    is_torch_npu_available,
-    is_transformers_version_greater_or_equal_to,
-)
-from .config_wan import WanConfig
-
-
-if is_liger_kernel_available():
-    from liger_kernel.transformers.rms_norm import LigerRMSNorm
-
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
 from veomni.distributed.sequence_parallel.async_ulysses_dit import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
+
+from ....utils import logging
+from .config_wan import WanConfig
 
 
 logger = logging.get_logger(__name__)
@@ -644,23 +632,6 @@ class WanModel(PreTrainedModel):
         x = self.unpatchify(x, (f, h, w))
         return x
 
-
-if is_liger_kernel_available():
-    RMSNorm = LigerRMSNorm
-    logger.info_rank0("Apply liger kernel to Wan.")
-
-if is_torch_npu_available() and is_transformers_version_greater_or_equal_to("4.50.4"):
-    from .npu_patch import apply_wan_npu_patch
-
-    apply_wan_npu_patch()
-
-try:
-    from veomni.ops.dit.rope_wan.rotary import apply_rotary_emb
-
-    rope_apply = apply_rotary_emb
-    logger.info_rank0("Apply fused interleaved rope to Wan.")
-except ImportError:
-    pass
 
 WAN_ATTENTION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {}
 WAN_ATTENTION_FUNCTIONS.update(ALL_ATTENTION_FUNCTIONS)

@@ -15,12 +15,31 @@
 import torch
 import transformers.models.deepseek_v3.modeling_deepseek_v3 as hf_deepseek_v3
 
-from ....ops.batch_invariant_ops import batch_invariant_rms_norm, triton_bmm
-from ....ops.ops_config import get_ops_config
-from ....utils import logging
+from ....ops.device_patch_utils import ImplSpec, apply_device_patches, rms_norm_patch, rope_patch, swiglu_patch
 
 
-logger = logging.get_logger(__name__)
+PATCHES = [
+    rope_patch(
+        "apply_rotary_pos_emb",
+        {
+            "liger_kernel": ImplSpec("liger_kernel.transformers.rope", "liger_rotary_pos_emb"),
+            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "apply_rotary_pos_emb_npu"),
+        },
+    ),
+    rms_norm_patch(
+        "DeepseekV3RMSNorm",
+        {
+            "liger_kernel": ImplSpec("liger_kernel.transformers.rms_norm", "LigerRMSNorm"),
+            "npu": ImplSpec("veomni.ops.npu_patch.npu_fused_operator", "rms_norm_forward_npu", replace_forward=True),
+        },
+    ),
+    swiglu_patch(
+        "DeepseekV3MLP",
+        {
+            "liger_kernel": ImplSpec("liger_kernel.transformers.swiglu", "LigerSwiGLUMLP"),
+        },
+    ),
+]
 
 
 def _make_deterministic_rope_forward():
@@ -31,6 +50,8 @@ def _make_deterministic_rope_forward():
     it with an explicit Triton batched-GEMM kernel eliminates this issue.
     """
     from transformers.models.deepseek_v3.modeling_deepseek_v3 import dynamic_rope_update
+
+    from ....ops.batch_invariant_ops import triton_bmm
 
     @torch.no_grad()
     @dynamic_rope_update
@@ -53,12 +74,9 @@ def _make_deterministic_rope_forward():
     return _deterministic_rope_forward
 
 
-def _patch_rms_norm():
-    """Replace DeepseekV3RMSNorm.forward with fused Triton kernel.
-
-    The fused kernel computes pow2+mean+rsqrt+weight in one pass per row,
-    which is both faster and batch-invariant.  Supports backward for training.
-    """
+def _patch_triton_rms_norm():
+    """Replace DeepseekV3RMSNorm.forward with fused Triton kernel."""
+    from ....ops.batch_invariant_ops import batch_invariant_rms_norm
 
     def _fused_rms_norm_forward(self, hidden_states):
         return batch_invariant_rms_norm(hidden_states, self.weight, self.variance_epsilon)
@@ -66,35 +84,14 @@ def _patch_rms_norm():
     hf_deepseek_v3.DeepseekV3RMSNorm.forward = _fused_rms_norm_forward
 
 
-def apply_veomni_deepseek_v3_gpu_patch():
-    ops_config = get_ops_config()
-
-    use_liger_rope = ops_config is not None and ops_config.rotary_pos_emb_implementation == "liger_kernel"
-    use_liger_rms = ops_config is not None and ops_config.rms_norm_implementation == "liger_kernel"
-    use_liger_swiglu = ops_config is not None and ops_config.swiglu_mlp_implementation == "liger_kernel"
-
-    if use_liger_rope or use_liger_rms or use_liger_swiglu:
-        applied = []
-        if use_liger_rope:
-            from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-            hf_deepseek_v3.apply_rotary_pos_emb = liger_rotary_pos_emb
-            applied.append("RoPE")
-        if use_liger_rms:
-            from liger_kernel.transformers.rms_norm import LigerRMSNorm
-
-            hf_deepseek_v3.DeepseekV3RMSNorm = LigerRMSNorm
-            applied.append("RMSNorm")
-        if use_liger_swiglu:
-            from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
-
-            hf_deepseek_v3.DeepseekV3MLP = LigerSwiGLUMLP
-            applied.append("SwiGLU")
-        logger.info_rank0(f"Apply liger kernel to DeepSeek-V3: {', '.join(applied)}.")
-    else:
-        # Fused Triton kernels: deterministic RoPE bmm + batch-invariant RMSNorm.
-        # Faster than native PyTorch and ensures numerical reproducibility
-        # across different batch compositions (required for VeRL rollout matching).
+def _custom_deepseek_v3(ops_config, applied):
+    if ops_config.rotary_pos_emb_implementation == "triton":
         hf_deepseek_v3.DeepseekV3RotaryEmbedding.forward = _make_deterministic_rope_forward()
-        _patch_rms_norm()
-        logger.info_rank0("Apply Triton RoPE and RMSNorm to DeepSeek-V3.")
+        applied.append("RoPE (triton)")
+    if ops_config.rms_norm_implementation == "triton":
+        _patch_triton_rms_norm()
+        applied.append("RMSNorm (triton)")
+
+
+def apply_veomni_deepseek_v3_device_patch():
+    apply_device_patches(hf_deepseek_v3, PATCHES, "DeepSeek-V3", custom_patches=_custom_deepseek_v3)

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any, Callable, Optional
 
 import torch
@@ -293,19 +292,24 @@ def chunk_loss_function(
     return chunk_loss, None
 
 
-def apply_veomni_loss_patch(cross_entropy_loss_implementation: str = "eager"):
+def apply_veomni_loss_patch(
+    cross_entropy_loss_implementation: str = "eager",
+    chunk_loss: bool = False,
+):
     """Bind the cross-entropy loss implementation.
 
     Args:
         cross_entropy_loss_implementation: ``"liger_kernel"``, ``"eager"``, or
             a custom string.
+        chunk_loss: If ``True`` and running on NPU, use chunked loss
+            computation for CausalLM.
     """
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
     LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
     global _cross_entropy
 
-    if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1" and is_torch_npu_available():
+    if chunk_loss and is_torch_npu_available():
         LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
 
     if cross_entropy_loss_implementation == "liger_kernel":

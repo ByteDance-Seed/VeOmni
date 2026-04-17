@@ -355,3 +355,7 @@ def apply_veomni_wan_transformer_patch() -> None:
     """
     _WanTransformer3DModel.forward = WanTransformer3DModel_forward
     logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
+
+    from veomni.models.transformers.wan.device_patch import apply_veomni_wan_device_patch
+
+    apply_veomni_wan_device_patch()

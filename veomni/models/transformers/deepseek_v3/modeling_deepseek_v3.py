@@ -25,10 +25,6 @@ from transformers.utils import TransformersKwargs
 
 from ....ops import fused_moe_forward
 from ....utils import logging
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import (
-    is_transformers_version_greater_or_equal_to,
-)
 
 
 # Flash Attention 2/3 require Q/K and V to have the same head dimension.
@@ -383,15 +379,6 @@ def apply_veomni_deepseek_v3_patch():
     hf_deepseek_v3.DeepseekV3ForCausalLM.forward = deepseek_v3_forcausal_lm_forward
     hf_deepseek_v3.DeepseekV3PreTrainedModel._init_weights = deepseek_v3_pretrained_model_init_weights
 
-    if IS_CUDA_AVAILABLE:
-        from .gpu_patch import apply_veomni_deepseek_v3_gpu_patch
+    from .device_patch import apply_veomni_deepseek_v3_device_patch
 
-        apply_veomni_deepseek_v3_gpu_patch()
-    elif IS_NPU_AVAILABLE and is_transformers_version_greater_or_equal_to("4.50.4"):
-        from .npu_patch import apply_deepseek_v3_npu_patch
-
-        apply_deepseek_v3_npu_patch()
-    else:
-        logger.warning_rank0(
-            "DeepseekV3ForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4."
-        )
+    apply_veomni_deepseek_v3_device_patch()

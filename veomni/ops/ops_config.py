@@ -15,13 +15,14 @@
 """Global ops implementation config singleton.
 
 This module stores the resolved ``OpsImplementationConfig`` so that model
-``gpu_patch.py`` files can query per-operation kernel selections without
-relying on environment variables.
+``gpu_patch.py`` and ``npu_patch.py`` files can query per-operation kernel
+selections without relying on environment variables.
 
 Typical lifecycle:
-1. ``OpsImplementationConfig.__post_init__`` resolves ``"auto"`` values.
+1. ``OpsImplementationConfig.__post_init__`` validates requested backends.
 2. ``set_ops_config(config)`` is called (from trainer or test harness).
-3. ``gpu_patch.py`` calls ``get_ops_config()`` to decide which kernels to apply.
+3. ``gpu_patch.py`` / ``npu_patch.py`` call ``get_ops_config()`` to decide
+   which kernels to apply.
 """
 
 from __future__ import annotations

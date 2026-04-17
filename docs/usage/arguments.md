@@ -138,10 +138,11 @@ without modifying the config class.
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
 | moe_implementation | `Optional[Literal["eager", "fused", "fused_quack"]]` | `None` | MoE implementation: `eager` (reference loop), `fused` (Triton), `fused_quack` (Quack CUTLASS, SM90+). |
 | cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`. |
-| rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`. |
+| rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
 | swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
-| rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`. |
+| rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
 | load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton`. |
+| chunk_loss | `bool` | `False` | Enable chunked loss computation for CausalLM on NPU. |
 
 ### DataArguments
 

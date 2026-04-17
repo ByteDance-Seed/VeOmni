@@ -63,7 +63,6 @@ from ....distributed.sequence_parallel import (
 )
 from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from ....utils.device import IS_CUDA_AVAILABLE
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -520,7 +519,6 @@ def apply_veomni_qwen2vl_patch():
     hf_qwen2vl.Qwen2VLDecoderLayer = Qwen2VLDecoderLayer
     hf_qwen2vl.VisionAttention.forward = VisionAttention_forward
 
-    if IS_CUDA_AVAILABLE:
-        from .gpu_patch import apply_veomni_qwen2vl_gpu_patch
+    from .device_patch import apply_veomni_qwen2vl_device_patch
 
-        apply_veomni_qwen2vl_gpu_patch()
+    apply_veomni_qwen2vl_device_patch()

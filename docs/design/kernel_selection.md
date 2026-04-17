@@ -14,6 +14,7 @@ All selections are driven by config fields in `OpsImplementationConfig`.
 | SwiGLU MLP | `swiglu_mlp_implementation` | `"eager"` | Model registration via ops config singleton |
 | Rotary embedding | `rotary_pos_emb_implementation` | `"eager"` | Model registration via ops config singleton |
 | Load-balancing loss | `load_balancing_loss_implementation` | `"eager"` | `apply_ops_config()` (before model build) |
+| Chunk loss (NPU) | `chunk_loss` | `False` | `apply_ops_config()` (before model build) |
 | MoE implementation | `moe_implementation` | `None` | `build_foundation_model` |
 
 All config fields live in `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`),
@@ -37,7 +38,7 @@ BaseTrainer._build_model()                    # (3) model build time
   ├─ apply_ops_config(ops_implementation)     # bind loss + LB patches
   └─ build_foundation_model(...)
        ├─ apply_veomni_fused_moe_patch(...)   # bind MoE kernel
-       ├─ gpu_patch.py reads ops config       # RMSNorm/RoPE/SwiGLU
+       ├─ device_patch.py reads ops config     # RMSNorm/RoPE/SwiGLU
        └─ model init + weight loading
 
 model.forward()                               # (4) runtime
@@ -128,7 +129,7 @@ Each operation can be independently controlled.
 
 ### What gets patched
 
-When set to `"liger_kernel"`, each model's `gpu_patch.py` replaces
+When set to `"liger_kernel"` or `"npu"`, each model's `device_patch.py` replaces
 HuggingFace module classes on the corresponding operation:
 
 | Config field | Original | Liger replacement |
@@ -144,7 +145,7 @@ Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
 ### Key files
 
 - Config singleton: `veomni/ops/ops_config.py` — `get_ops_config()`, `set_ops_config()`
-- `veomni/models/transformers/{model}/gpu_patch.py` (7 model-specific files)
+- `veomni/models/transformers/{model}/device_patch.py` (8 model-specific files)
 
 ---
 

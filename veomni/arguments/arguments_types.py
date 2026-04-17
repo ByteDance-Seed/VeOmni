@@ -629,9 +629,11 @@ class OpsImplementationConfig:
 
     Well-known values:
 
-    - ``"eager"`` (default): PyTorch reference implementation.
+    - ``"eager"`` (default): PyTorch / HuggingFace reference implementation.
     - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
       ``liger-kernel``).
+    - ``"npu"``: Ascend NPU fused implementation (requires ``torch_npu``).
+      Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from ``veomni.ops.npu_patch``.
     - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
       NPU with ``triton-ascend``).
     """
@@ -670,6 +672,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "RMSNorm implementation. "
             "'liger_kernel' uses LigerRMSNorm. "
+            "'npu' uses torch_npu.npu_rms_norm (requires torch_npu). "
+            "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3). "
             "'eager' (default) uses the HuggingFace default."
         },
     )
@@ -686,6 +690,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "Rotary positional embedding implementation. "
             "'liger_kernel' uses liger_rotary_pos_emb. "
+            "'npu' uses torch_npu.npu_rotary_mul (requires torch_npu). "
+            "'triton' uses deterministic Triton bmm kernel (DeepSeek V3). "
             "'eager' (default) uses the HuggingFace default."
         },
     )
@@ -695,6 +701,13 @@ class OpsImplementationConfig:
             "help": "MoE load-balancing loss implementation. "
             "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
             "'eager' (default) uses PyTorch reference."
+        },
+    )
+    chunk_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable chunked loss computation for CausalLM on NPU. "
+            "Replaces the VEOMNI_ENABLE_CHUNK_LOSS environment variable."
         },
     )
 
@@ -714,7 +727,10 @@ class OpsImplementationConfig:
 
     def _validate_implementations(self):
         """Validate that requested backends are actually available."""
+        from ..utils.import_utils import is_torch_npu_available
+
         liger = is_liger_kernel_available()
+        npu = is_torch_npu_available()
 
         for field_name in (
             "cross_entropy_loss_implementation",
@@ -722,8 +738,11 @@ class OpsImplementationConfig:
             "swiglu_mlp_implementation",
             "rotary_pos_emb_implementation",
         ):
-            if getattr(self, field_name) == "liger_kernel" and not liger:
+            value = getattr(self, field_name)
+            if value == "liger_kernel" and not liger:
                 raise ValueError(f"{field_name}='liger_kernel' requires liger-kernel to be installed.")
+            if value == "npu" and not npu:
+                raise ValueError(f"{field_name}='npu' requires torch_npu to be installed.")
 
 
 @dataclass

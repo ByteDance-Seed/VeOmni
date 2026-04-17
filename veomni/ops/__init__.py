@@ -78,6 +78,7 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
 
     apply_veomni_loss_patch(
         cross_entropy_loss_implementation=ops_config.cross_entropy_loss_implementation,
+        chunk_loss=ops_config.chunk_loss,
     )
     apply_veomni_load_balancing_loss_patch(
         load_balancing_loss_implementation=ops_config.load_balancing_loss_implementation,
