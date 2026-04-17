@@ -50,20 +50,29 @@ def build_ALL_OPS():
 
 
 def apply_ops_patch():
-    """Import-time ops patch: only registers attention implementations.
+    """Import-time ops patch.
 
-    Loss, load-balancing, and per-model kernel patches are deferred to
-    ``apply_ops_config()`` which is called after the YAML config is parsed
-    and ``OpsImplementationConfig`` is available.
+    Registers attention implementations and installs VeOmni's loss wrappers in
+    HuggingFace's ``LOSS_MAPPING``.  The loss install MUST happen at import
+    time (not only inside ``apply_ops_config``) because several code paths
+    build models directly via ``build_foundation_model`` without going through
+    ``BaseTrainer`` (e.g. unit tests, ad-hoc scripts).  VeOmni modeling code
+    calls ``self.loss_function(hidden_states=..., logits=None, ...)`` which
+    HF's stock ``ForCausalLMLoss`` cannot handle.
+
+    Load-balancing loss and per-model kernel patches remain deferred to
+    ``apply_ops_config()`` / each model's ``device_patch.py``.
     """
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
     else:
         from .kernels.attention import apply_veomni_attention_patch
+        from .kernels.cross_entropy import install_loss_mapping
 
         apply_veomni_attention_patch()
-        logger.info_rank0("✅ VeOmni attention patch applied.")
+        install_loss_mapping()
+        logger.info_rank0("✅ VeOmni attention + loss patches applied.")
 
 
 def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
@@ -80,9 +89,11 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     if modeling_backend == "hf":
         return
 
-    # Install VeOmni's loss wrappers in HF's LOSS_MAPPING before walking the
-    # registry: the NPU cross-entropy backend's side-effect then overrides
-    # LOSS_MAPPING["ForCausalLM"] to the chunked-loss variant.
+    # Re-install VeOmni's loss wrappers before walking the registry (already
+    # installed at import time by ``apply_ops_patch``; this is idempotent and
+    # makes the ordering explicit): the NPU cross-entropy backend's
+    # side-effect then overrides LOSS_MAPPING["ForCausalLM"] to the
+    # chunked-loss variant.
     from .kernels.cross_entropy import install_loss_mapping
 
     install_loss_mapping()
