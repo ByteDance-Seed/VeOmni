@@ -291,6 +291,13 @@ _TEST_CASES_TRANSFORMERS_V5 = [
         _DEFAULT_ATOL,
         id="qwen3_vl",
     ),
+    pytest.param(
+        "./tests/toy_config/qwen3vlmoe_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_vl_moe",
+    ),
 ]
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):

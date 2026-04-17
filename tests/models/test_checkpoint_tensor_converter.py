@@ -34,6 +34,10 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
 )
+from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import (
+    Qwen3VLMoeCheckpointTensorConverter,
+    create_qwen3_vl_moe_checkpoint_tensor_converter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -360,4 +364,197 @@ class TestQwen3MoeConverterIntegration:
             NUM_EXPERTS,
             HIDDEN_DIM,
             INTERMEDIATE_DIM,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for Qwen3VLMoeCheckpointTensorConverter
+# ---------------------------------------------------------------------------
+
+
+VLMOE_NUM_EXPERTS = 4
+VLMOE_HIDDEN = 8
+VLMOE_INTERMEDIATE = 6  # chosen so hidden != 2*intermediate (8 != 12) — layouts are unambiguous
+
+
+def _vlmoe_hf_gate_up(layer: int = 0) -> tuple[str, torch.Tensor]:
+    key = f"model.language_model.layers.{layer}.mlp.experts.gate_up_proj"
+    tensor = torch.arange(VLMOE_NUM_EXPERTS * VLMOE_HIDDEN * 2 * VLMOE_INTERMEDIATE, dtype=torch.float32).reshape(
+        VLMOE_NUM_EXPERTS, VLMOE_HIDDEN, 2 * VLMOE_INTERMEDIATE
+    )
+    return key, tensor
+
+
+def _vlmoe_hf_down(layer: int = 0) -> tuple[str, torch.Tensor]:
+    key = f"model.language_model.layers.{layer}.mlp.experts.down_proj"
+    tensor = torch.arange(VLMOE_NUM_EXPERTS * VLMOE_INTERMEDIATE * VLMOE_HIDDEN, dtype=torch.float32).reshape(
+        VLMOE_NUM_EXPERTS, VLMOE_INTERMEDIATE, VLMOE_HIDDEN
+    )
+    return key, tensor
+
+
+class TestQwen3VLMoeConverterCanHandle:
+    def setup_method(self):
+        self.converter = Qwen3VLMoeCheckpointTensorConverter(
+            num_experts=VLMOE_NUM_EXPERTS,
+            hidden_size=VLMOE_HIDDEN,
+            intermediate_size=VLMOE_INTERMEDIATE,
+        )
+
+    def test_matches_fused_keys(self):
+        assert self.converter.can_handle("model.language_model.layers.0.mlp.experts.gate_up_proj")
+        assert self.converter.can_handle("model.language_model.layers.10.mlp.experts.down_proj")
+        # Also matches text-only prefix (for Qwen3VLMoeTextModel standalone).
+        assert self.converter.can_handle("model.layers.3.mlp.experts.gate_up_proj")
+
+    def test_rejects_other_keys(self):
+        assert not self.converter.can_handle("model.language_model.layers.0.self_attn.q_proj.weight")
+        # Per-expert keys (the qwen3_moe HF layout) must NOT match here.
+        assert not self.converter.can_handle("model.language_model.layers.0.mlp.experts.0.gate_proj.weight")
+        assert not self.converter.can_handle("model.embed_tokens.weight")
+
+
+class TestQwen3VLMoeConverterConvert:
+    def setup_method(self):
+        self.converter = Qwen3VLMoeCheckpointTensorConverter(
+            num_experts=VLMOE_NUM_EXPERTS,
+            hidden_size=VLMOE_HIDDEN,
+            intermediate_size=VLMOE_INTERMEDIATE,
+        )
+
+    def test_hf_gate_up_proj_is_transposed(self):
+        key, tensor = _vlmoe_hf_gate_up()
+        result = self.converter.convert(key, tensor)
+        assert result is not None
+        assert result.name == key
+        assert result.tensor.shape == (VLMOE_NUM_EXPERTS, 2 * VLMOE_INTERMEDIATE, VLMOE_HIDDEN)
+        # transposing back should reproduce the HF tensor.
+        assert torch.equal(result.tensor.transpose(1, 2), tensor)
+        assert result.tensor.is_contiguous()
+
+    def test_hf_down_proj_is_transposed(self):
+        key, tensor = _vlmoe_hf_down()
+        result = self.converter.convert(key, tensor)
+        assert result is not None
+        assert result.tensor.shape == (VLMOE_NUM_EXPERTS, VLMOE_HIDDEN, VLMOE_INTERMEDIATE)
+        assert torch.equal(result.tensor.transpose(1, 2), tensor)
+
+    def test_v5_layout_passes_through_unchanged(self):
+        # Simulate a checkpoint previously saved by VeOmni in v5-native layout.
+        gate_up_v5 = torch.randn(VLMOE_NUM_EXPERTS, 2 * VLMOE_INTERMEDIATE, VLMOE_HIDDEN)
+        down_v5 = torch.randn(VLMOE_NUM_EXPERTS, VLMOE_HIDDEN, VLMOE_INTERMEDIATE)
+
+        gate_up_result = self.converter.convert("l.mlp.experts.gate_up_proj", gate_up_v5)
+        down_result = self.converter.convert("l.mlp.experts.down_proj", down_v5)
+
+        assert gate_up_result is not None and torch.equal(gate_up_result.tensor, gate_up_v5)
+        assert down_result is not None and torch.equal(down_result.tensor, down_v5)
+
+    def test_rejects_non_expert_key(self):
+        result = self.converter.convert("model.embed_tokens.weight", torch.randn(4, 4))
+        assert result is None
+
+    def test_raises_on_wrong_rank(self):
+        with pytest.raises(RuntimeError, match="expected 3-D"):
+            self.converter.convert(
+                "l.mlp.experts.gate_up_proj",
+                torch.randn(VLMOE_NUM_EXPERTS, VLMOE_HIDDEN),  # 2-D
+            )
+
+    def test_raises_on_wrong_num_experts(self):
+        with pytest.raises(RuntimeError, match="dim-0 == num_experts"):
+            self.converter.convert(
+                "l.mlp.experts.gate_up_proj",
+                torch.randn(VLMOE_NUM_EXPERTS + 1, VLMOE_HIDDEN, 2 * VLMOE_INTERMEDIATE),
+            )
+
+    def test_raises_on_unrecognized_middle_dim(self):
+        with pytest.raises(RuntimeError, match="unrecognized layout"):
+            self.converter.convert(
+                "l.mlp.experts.gate_up_proj",
+                torch.randn(VLMOE_NUM_EXPERTS, 999, VLMOE_HIDDEN),
+            )
+
+
+class TestQwen3VLMoeConverterFinalize:
+    def test_finalize_is_noop(self):
+        converter = Qwen3VLMoeCheckpointTensorConverter(
+            num_experts=VLMOE_NUM_EXPERTS,
+            hidden_size=VLMOE_HIDDEN,
+            intermediate_size=VLMOE_INTERMEDIATE,
+        )
+        key, tensor = _vlmoe_hf_gate_up()
+        converter.convert(key, tensor)
+        assert converter.finalize() == []
+
+
+class TestQwen3VLMoeConverterFactory:
+    def test_factory_with_nested_config(self):
+        # Top-level Qwen3VLMoeConfig — has nested `text_config`.
+        text_config = SimpleNamespace(
+            num_experts=VLMOE_NUM_EXPERTS,
+            hidden_size=VLMOE_HIDDEN,
+            moe_intermediate_size=VLMOE_INTERMEDIATE,
+        )
+        model = SimpleNamespace(config=SimpleNamespace(text_config=text_config))
+        converter = create_qwen3_vl_moe_checkpoint_tensor_converter(model)
+        assert isinstance(converter, Qwen3VLMoeCheckpointTensorConverter)
+        assert converter.num_experts == VLMOE_NUM_EXPERTS
+        assert converter.hidden_size == VLMOE_HIDDEN
+        assert converter.intermediate_size == VLMOE_INTERMEDIATE
+
+    def test_factory_with_flat_text_config(self):
+        # Qwen3VLMoeTextModel is constructed directly from Qwen3VLMoeTextConfig —
+        # the config has `num_experts` etc. at top level (no nested text_config).
+        flat = SimpleNamespace(
+            num_experts=VLMOE_NUM_EXPERTS,
+            hidden_size=VLMOE_HIDDEN,
+            moe_intermediate_size=VLMOE_INTERMEDIATE,
+        )
+        model = SimpleNamespace(config=flat)
+        converter = create_qwen3_vl_moe_checkpoint_tensor_converter(model)
+        assert converter.num_experts == VLMOE_NUM_EXPERTS
+        assert converter.hidden_size == VLMOE_HIDDEN
+        assert converter.intermediate_size == VLMOE_INTERMEDIATE
+
+
+class TestQwen3VLMoeConverterIntegration:
+    """End-to-end through `maybe_convert_checkpoint_tensor` using an HF-layout checkpoint."""
+
+    def test_full_layer_conversion(self):
+        converter = Qwen3VLMoeCheckpointTensorConverter(
+            num_experts=VLMOE_NUM_EXPERTS,
+            hidden_size=VLMOE_HIDDEN,
+            intermediate_size=VLMOE_INTERMEDIATE,
+        )
+
+        non_expert_keys = [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.mlp.gate.weight",
+        ]
+        dispatched = {}
+        for key in non_expert_keys:
+            t = torch.randn(4, 4)
+            result = maybe_convert_checkpoint_tensor(key, t, converter)
+            assert result is not None and result.name == key
+            dispatched[result.name] = result.tensor
+
+        for load_fn in (_vlmoe_hf_gate_up, _vlmoe_hf_down):
+            key, t = load_fn()
+            result = maybe_convert_checkpoint_tensor(key, t, converter)
+            assert result is not None
+            dispatched[result.name] = result.tensor
+
+        assert converter.finalize() == []
+
+        # Fused expert tensors are now in v5 modeling layout.
+        assert dispatched["model.language_model.layers.0.mlp.experts.gate_up_proj"].shape == (
+            VLMOE_NUM_EXPERTS,
+            2 * VLMOE_INTERMEDIATE,
+            VLMOE_HIDDEN,
+        )
+        assert dispatched["model.language_model.layers.0.mlp.experts.down_proj"].shape == (
+            VLMOE_NUM_EXPERTS,
+            VLMOE_HIDDEN,
+            VLMOE_INTERMEDIATE,
         )
