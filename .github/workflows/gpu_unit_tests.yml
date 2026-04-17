@@ -38,7 +38,11 @@ env:
   NCCL_DEBUG: "WARN"
 
 jobs:
+  lint:
+    uses: ./.github/workflows/check_pr_lint.yml
+
   setup:
+    needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     runs-on: ubuntu-latest
     outputs:
