@@ -8,6 +8,8 @@ from typing import Optional
 import pytest
 import torch
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type, get_torch_device
+
 # Importing `utils` now captures pristine HF class attributes (in its
 # `_PRISTINE_HF_CLASSES` snapshot) before any veomni import has a chance to
 # monkey-patch them. `apply_veomni_hf_unpatch()` restores them; we call it
@@ -93,7 +95,6 @@ CASES = [
 
 
 def _apply_determinism():
-    torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -102,22 +103,22 @@ def _apply_determinism():
 
 def _release():
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if IS_CUDA_AVAILABLE:
+        empty_cache()
 
 
 def _build_hf_model(case: Case):
-    """Return a CUDA, eval-mode HF model randomly initialised from config."""
+    """Return a device-resident, eval-mode HF model randomly initialised from config."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
     apply_veomni_hf_unpatch()
     config = AutoConfig.from_pretrained(case.path)
     torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-    # Init directly on CUDA so init-time buffers (e.g. rotary `inv_freq`) use
-    # the same arithmetic path as the veomni build, which allocates under
-    # `torch.device("cuda")` via its CustomizedModelingLoader.
-    with torch.device("cuda"):
+    get_torch_device().manual_seed_all(0)
+    # Init directly on device so init-time buffers (e.g. rotary `inv_freq`)
+    # use the same arithmetic path as the veomni build, which allocates under
+    # `torch.device(get_device_type())` via its CustomizedModelingLoader.
+    with torch.device(get_device_type()):
         model_hf = AutoModelForCausalLM.from_config(
             config,
             torch_dtype=_DTYPE_MAP[case.dtype],
@@ -127,7 +128,7 @@ def _build_hf_model(case: Case):
 
 
 def _build_veomni_model(case: Case, hf_state_dict):
-    """Return a CUDA, eval-mode veomni model with HF weights loaded."""
+    """Return a device-resident, eval-mode veomni model with HF weights loaded."""
     from veomni.models.auto import build_foundation_model
 
     model = build_foundation_model(
@@ -135,7 +136,7 @@ def _build_veomni_model(case: Case, hf_state_dict):
         weights_path=None,
         torch_dtype=case.dtype,
         attn_implementation=case.attn_implementation,
-        init_device="cuda",
+        init_device=get_device_type(),
     )
 
     if case.sync_weight_key is not None:
@@ -168,7 +169,7 @@ def test_logits_bitwise_equal(case: Case):
 
     if is_transformers_version_greater_or_equal_to("5.0.0"):
         pytest.skip("Scope is transformers v4 model definition only.")
-    if not torch.cuda.is_available():
+    if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.path):
         pytest.skip(f"Path not found: {case.path}")
@@ -177,10 +178,11 @@ def test_logits_bitwise_equal(case: Case):
 
     _apply_determinism()
 
-    gen = torch.Generator(device="cuda").manual_seed(0)
+    device_type = get_device_type()
+    gen = torch.Generator(device=device_type).manual_seed(0)
     # Vocab floor of 32000 dodges special tokens across Qwen3 (151936),
     # Qwen3MoE (151936), and DeepseekV3 (129280).
-    input_ids = torch.randint(0, 32000, (1, 32), device="cuda", dtype=torch.long, generator=gen)
+    input_ids = torch.randint(0, 32000, (1, 32), device=device_type, dtype=torch.long, generator=gen)
 
     # --- HF phase (must precede any veomni model build) ---
     model_hf = _build_hf_model(case)
