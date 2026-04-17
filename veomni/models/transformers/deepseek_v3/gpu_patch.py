@@ -68,6 +68,9 @@ def _patch_rms_norm():
 
 
 def apply_veomni_deepseek_v3_gpu_patch():
+    if get_env("VEOMNI_USE_FUSED_KERNELS") == "0":
+        logger.info_rank0("Skip GPU kernel patch for deepseek_v3 (VEOMNI_USE_FUSED_KERNELS=0).")
+        return
     if is_liger_kernel_available() and get_env("VEOMNI_USE_LIGER_KERNEL") == "1":
         from liger_kernel.transformers.rms_norm import LigerRMSNorm
         from liger_kernel.transformers.rope import liger_rotary_pos_emb

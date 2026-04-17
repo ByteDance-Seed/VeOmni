@@ -99,9 +99,13 @@ class PatchDeepseekV3NaiveMoe(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-
         if self._moe_implementation == "eager":
+            # Accumulate in top_k_weights dtype (fp32) to match HF's
+            # DeepseekV3MoE.moe, which allocates final_hidden_states with
+            # `dtype=topk_weights.dtype` and casts to input dtype only at
+            # return. Accumulating in bf16 per-expert introduces extra
+            # rounding that breaks bitwise parity with HF.
+            final_hidden_states = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
             with torch.no_grad():
                 expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
                 expert_mask = expert_mask.permute(2, 1, 0)
@@ -118,10 +122,12 @@ class PatchDeepseekV3NaiveMoe(nn.Module):
                 current_hidden_states = self.act_fn(gate) * up
                 current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
                 current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+                final_hidden_states.index_add_(0, token_idx, current_hidden_states)
+            final_hidden_states = final_hidden_states.to(hidden_states.dtype)
         elif self._moe_implementation == "fused":
-            # cast top_k_weights to dtype of final_hidden_states
-            top_k_weights = top_k_weights.to(final_hidden_states.dtype)
+            # cast top_k_weights to dtype of hidden_states to satisfy the
+            # fused MoE kernel's half-precision requirement
+            top_k_weights = top_k_weights.to(hidden_states.dtype)
 
             final_hidden_states = fused_moe_forward(
                 num_experts=self.num_experts,
