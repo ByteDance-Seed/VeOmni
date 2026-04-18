@@ -10,7 +10,7 @@ from transformers import set_seed
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.ops import apply_ops_config
-from veomni.utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from veomni.utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
 
 
 _LIGER_KERNEL = "liger_kernel"
@@ -19,6 +19,11 @@ _EAGER = "eager"
 # (it's unavailable on the NPU CI runner); otherwise every parametrized case
 # would fail in OpsImplementationConfig.__post_init__ with a ValueError.
 _USE_LIGER_KERNEL = [True, False] if is_liger_kernel_available() else [False]
+# NPU ships triton-ascend (not mainline ``triton``); the fused Triton
+# load-balancing-loss kernel at ``veomni/ops/kernels/load_balancing_loss/triton.py``
+# imports ``triton`` unconditionally, so fall back to the pure-PyTorch backend
+# when the mainline package is missing.
+_LOAD_BALANCING_LOSS_IMPL = "triton" if is_package_available("triton") else "eager"
 
 
 @dataclass(frozen=True)
@@ -370,7 +375,7 @@ def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig
         rms_norm_implementation=liger_impl,
         swiglu_mlp_implementation=liger_impl,
         rotary_pos_emb_implementation=liger_impl,
-        load_balancing_loss_implementation="triton",
+        load_balancing_loss_implementation=_LOAD_BALANCING_LOSS_IMPL,
     )
 
 
