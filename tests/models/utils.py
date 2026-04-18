@@ -179,7 +179,6 @@ def prepare_data(model_name: str, max_seq_len: int, model_config):
     Build a DummyDataLoader that yields raw features (list of 2 dicts).
     MainCollator packing + cu_seqlens precompute is done in the trainer (TrainerTest).
     """
-    from veomni.data.dummy_dataset import build_dummy_dataset
 
     dataset_name = MODEL_TO_DATASET.get(model_name, "text")
     dataset = build_dummy_dataset(dataset_name, 2, max_seq_len)
