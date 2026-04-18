@@ -473,7 +473,11 @@ def main():
                 extra_input = model.prepare_extra_input(latents)
                 # noise and target
                 noisy_latents = flow_scheduler.add_noise(
-                    latents, noise, timestep, args.train.micro_batch_size, args.train.accelerator.fsdp_config.mixed_precision.enable
+                    latents,
+                    noise,
+                    timestep,
+                    args.train.micro_batch_size,
+                    args.train.accelerator.fsdp_config.mixed_precision.enable,
                 )
                 training_target = flow_scheduler.training_target(latents, noise, timestep)
                 # predict noise
