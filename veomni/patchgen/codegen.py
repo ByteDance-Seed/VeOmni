@@ -1001,10 +1001,27 @@ class ModelingCodeGenerator:
                     output_parts.append("")
             elif isinstance(node, ast.Assign):
                 # Module-level assignments (like __all__, DOCSTRINGS, etc.)
-                # Use source extraction to preserve any associated comments
-                end_line = get_node_end_line(node, self.source_lines)
-                output_parts.append(extract_source_segment(self.source_lines, node.lineno, end_line))
-                output_parts.append("")
+                # Special case: if this is `__all__ = [...]` of string literals,
+                # filter out names that `exclude_from_output` dropped so the
+                # generated module doesn't claim to export missing classes
+                # (would otherwise fail F822 and break `from ... import *`).
+                if (
+                    self.config.exclude
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "__all__"
+                    and isinstance(node.value, (ast.List, ast.Tuple))
+                    and all(isinstance(elt, ast.Constant) and isinstance(elt.value, str) for elt in node.value.elts)
+                ):
+                    kept = [elt.value for elt in node.value.elts if elt.value not in self.config.exclude]
+                    rendered = "__all__ = [\n" + "".join(f'    "{name}",\n' for name in kept) + "]"
+                    output_parts.append(rendered)
+                    output_parts.append("")
+                else:
+                    # Use source extraction to preserve any associated comments
+                    end_line = get_node_end_line(node, self.source_lines)
+                    output_parts.append(extract_source_segment(self.source_lines, node.lineno, end_line))
+                    output_parts.append("")
             elif isinstance(node, ast.Expr):
                 # Module-level expressions (docstrings)
                 if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):

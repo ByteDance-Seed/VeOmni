@@ -34,6 +34,10 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
 )
+from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
+    Qwen3OmniMoeCheckpointTensorConverter,
+    create_qwen3_omni_moe_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import (
     Qwen3VLMoeCheckpointTensorConverter,
     create_qwen3_vl_moe_checkpoint_tensor_converter,
@@ -558,3 +562,239 @@ class TestQwen3VLMoeConverterIntegration:
             VLMOE_HIDDEN,
             VLMOE_INTERMEDIATE,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for Qwen3OmniMoeCheckpointTensorConverter
+# ---------------------------------------------------------------------------
+
+
+OMNIMOE_NUM_EXPERTS = 4
+OMNIMOE_HIDDEN = 8
+OMNIMOE_INTERMEDIATE = 6  # chosen so hidden != 2*intermediate (8 != 12) — layouts are unambiguous
+
+
+def _omnimoe_per_expert_key(prefix: str, expert_id: int, proj: str) -> str:
+    return f"{prefix}.experts.{expert_id}.{proj}.weight"
+
+
+def _omnimoe_per_expert_tensors(prefix: str = "thinker.model.layers.0.mlp"):
+    """Generate per-expert HF-layout tensors with unique fingerprints per (expert, proj)."""
+    tensors = {}
+    for e in range(OMNIMOE_NUM_EXPERTS):
+        # gate_proj / up_proj: [I, H]
+        for proj, base in (("gate_proj", 100.0), ("up_proj", 200.0)):
+            tensors[_omnimoe_per_expert_key(prefix, e, proj)] = torch.full(
+                (OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN), base + e, dtype=torch.float32
+            )
+        # down_proj: [H, I]
+        tensors[_omnimoe_per_expert_key(prefix, e, "down_proj")] = torch.full(
+            (OMNIMOE_HIDDEN, OMNIMOE_INTERMEDIATE), 300.0 + e, dtype=torch.float32
+        )
+    return tensors
+
+
+class TestQwen3OmniMoeConverterCanHandle:
+    def setup_method(self):
+        self.converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
+
+    def test_matches_thinker_per_expert_keys(self):
+        assert self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
+        assert self.converter.can_handle("thinker.model.layers.10.mlp.experts.3.up_proj.weight")
+        assert self.converter.can_handle("thinker.model.layers.5.mlp.experts.2.down_proj.weight")
+
+    def test_matches_talker_per_expert_keys(self):
+        # Talker tower shares the same expert layout convention.
+        assert self.converter.can_handle("talker.model.layers.0.mlp.experts.0.gate_proj.weight")
+        assert self.converter.can_handle("talker.model.layers.3.mlp.experts.1.down_proj.weight")
+
+    def test_matches_standalone_text_model_keys(self):
+        # When the thinker text submodel is loaded standalone the prefix is just `model.*`.
+        assert self.converter.can_handle("model.layers.3.mlp.experts.2.gate_proj.weight")
+
+    def test_rejects_other_keys(self):
+        assert not self.converter.can_handle("thinker.model.layers.0.self_attn.q_proj.weight")
+        # Fused keys (VeOmni-saved v5 layout) must NOT match — they pass through.
+        assert not self.converter.can_handle("thinker.model.layers.0.mlp.experts.gate_up_proj")
+        assert not self.converter.can_handle("thinker.model.layers.0.mlp.experts.down_proj")
+        assert not self.converter.can_handle("thinker.model.embed_tokens.weight")
+
+
+class TestQwen3OmniMoeConverterConvert:
+    def setup_method(self):
+        self.converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
+
+    def test_buffers_until_all_experts_arrive(self):
+        # gate_proj for experts 0..N-2 should return None (still buffering).
+        for e in range(OMNIMOE_NUM_EXPERTS - 1):
+            key = _omnimoe_per_expert_key("thinker.model.layers.0.mlp", e, "gate_proj")
+            result = self.converter.convert(key, torch.randn(OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN))
+            assert result is None
+
+    def test_gate_up_merge_after_full_stack(self):
+        prefix = "thinker.model.layers.0.mlp"
+        tensors = _omnimoe_per_expert_tensors(prefix)
+
+        # Feed all gate_proj — no emit yet (waiting for up_proj).
+        for e in range(OMNIMOE_NUM_EXPERTS):
+            result = self.converter.convert(
+                _omnimoe_per_expert_key(prefix, e, "gate_proj"),
+                tensors[_omnimoe_per_expert_key(prefix, e, "gate_proj")],
+            )
+            assert result is None
+
+        # Feed up_proj — the last one triggers the gate_up merge emission.
+        emitted = []
+        for e in range(OMNIMOE_NUM_EXPERTS):
+            result = self.converter.convert(
+                _omnimoe_per_expert_key(prefix, e, "up_proj"),
+                tensors[_omnimoe_per_expert_key(prefix, e, "up_proj")],
+            )
+            if result is not None:
+                emitted.append(result)
+
+        assert len(emitted) == 1
+        assert emitted[0].name == f"{prefix}.experts.gate_up_proj"
+        assert emitted[0].tensor.shape == (OMNIMOE_NUM_EXPERTS, 2 * OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN)
+
+        # Verify the merged tensor: rows 0..I are gate (100+e), rows I..2I are up (200+e).
+        merged = emitted[0].tensor
+        for e in range(OMNIMOE_NUM_EXPERTS):
+            assert torch.allclose(
+                merged[e, :OMNIMOE_INTERMEDIATE], torch.full_like(merged[e, :OMNIMOE_INTERMEDIATE], 100.0 + e)
+            )
+            assert torch.allclose(
+                merged[e, OMNIMOE_INTERMEDIATE:], torch.full_like(merged[e, OMNIMOE_INTERMEDIATE:], 200.0 + e)
+            )
+
+    def test_down_proj_emits_after_full_stack(self):
+        prefix = "thinker.model.layers.0.mlp"
+        tensors = _omnimoe_per_expert_tensors(prefix)
+
+        emitted = []
+        for e in range(OMNIMOE_NUM_EXPERTS):
+            result = self.converter.convert(
+                _omnimoe_per_expert_key(prefix, e, "down_proj"),
+                tensors[_omnimoe_per_expert_key(prefix, e, "down_proj")],
+            )
+            if result is not None:
+                emitted.append(result)
+
+        assert len(emitted) == 1
+        assert emitted[0].name == f"{prefix}.experts.down_proj"
+        # v5 layout for down_proj is [E, H, I] which matches stacking of HF [H, I].
+        assert emitted[0].tensor.shape == (OMNIMOE_NUM_EXPERTS, OMNIMOE_HIDDEN, OMNIMOE_INTERMEDIATE)
+
+    def test_rejects_non_expert_key(self):
+        result = self.converter.convert("thinker.model.embed_tokens.weight", torch.randn(4, 4))
+        assert result is None
+
+
+class TestQwen3OmniMoeConverterFinalize:
+    def test_finalize_noop_when_all_flushed(self):
+        converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
+        prefix = "thinker.model.layers.0.mlp"
+        tensors = _omnimoe_per_expert_tensors(prefix)
+        for key, t in tensors.items():
+            converter.convert(key, t)
+        assert converter.finalize() == []
+
+    def test_finalize_raises_on_incomplete_experts(self):
+        converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
+        # Feed only 2 of 4 gate_proj experts.
+        for e in range(2):
+            converter.convert(
+                _omnimoe_per_expert_key("thinker.model.layers.0.mlp", e, "gate_proj"),
+                torch.randn(OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN),
+            )
+        with pytest.raises(RuntimeError, match="incomplete checkpoint"):
+            converter.finalize()
+
+    def test_finalize_raises_on_missing_up_after_full_gate_stack(self):
+        converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
+        # Complete gate_proj but no up_proj — stacked buffer has dangling 'gate_proj'.
+        for e in range(OMNIMOE_NUM_EXPERTS):
+            converter.convert(
+                _omnimoe_per_expert_key("thinker.model.layers.0.mlp", e, "gate_proj"),
+                torch.randn(OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN),
+            )
+        with pytest.raises(RuntimeError, match="incomplete checkpoint"):
+            converter.finalize()
+
+
+class TestQwen3OmniMoeConverterFactory:
+    def test_factory_with_top_level_omni_config(self):
+        # Qwen3OmniMoeConfig — has `thinker_config.text_config`.
+        text_config = SimpleNamespace(num_experts=OMNIMOE_NUM_EXPERTS)
+        thinker_config = SimpleNamespace(text_config=text_config)
+        model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config))
+        converter = create_qwen3_omni_moe_checkpoint_tensor_converter(model)
+        assert isinstance(converter, Qwen3OmniMoeCheckpointTensorConverter)
+        assert converter.num_experts == OMNIMOE_NUM_EXPERTS
+
+    def test_factory_with_thinker_config(self):
+        # Qwen3OmniMoeThinkerForConditionalGeneration — `config.text_config`.
+        text_config = SimpleNamespace(num_experts=OMNIMOE_NUM_EXPERTS)
+        model = SimpleNamespace(config=SimpleNamespace(text_config=text_config))
+        converter = create_qwen3_omni_moe_checkpoint_tensor_converter(model)
+        assert converter.num_experts == OMNIMOE_NUM_EXPERTS
+
+    def test_factory_with_flat_text_config(self):
+        # Qwen3OmniMoeThinkerTextModel loaded standalone — flat config.
+        flat = SimpleNamespace(num_experts=OMNIMOE_NUM_EXPERTS)
+        model = SimpleNamespace(config=flat)
+        converter = create_qwen3_omni_moe_checkpoint_tensor_converter(model)
+        assert converter.num_experts == OMNIMOE_NUM_EXPERTS
+
+
+class TestQwen3OmniMoeConverterIntegration:
+    """End-to-end through `maybe_convert_checkpoint_tensor` using an HF per-expert checkpoint."""
+
+    def test_full_layer_conversion(self):
+        converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
+        prefix = "thinker.model.layers.0.mlp"
+
+        non_expert_keys = [
+            "thinker.model.layers.0.self_attn.q_proj.weight",
+            f"{prefix}.gate.weight",
+        ]
+        dispatched = {}
+        for key in non_expert_keys:
+            t = torch.randn(4, 4)
+            result = maybe_convert_checkpoint_tensor(key, t, converter)
+            assert result is not None and result.name == key
+            dispatched[result.name] = result.tensor
+
+        tensors = _omnimoe_per_expert_tensors(prefix)
+        for key, t in tensors.items():
+            result = maybe_convert_checkpoint_tensor(key, t, converter)
+            if result is not None:
+                dispatched[result.name] = result.tensor
+
+        assert converter.finalize() == []
+
+        # Fused expert tensors are now in v5 modeling layout.
+        assert dispatched[f"{prefix}.experts.gate_up_proj"].shape == (
+            OMNIMOE_NUM_EXPERTS,
+            2 * OMNIMOE_INTERMEDIATE,
+            OMNIMOE_HIDDEN,
+        )
+        assert dispatched[f"{prefix}.experts.down_proj"].shape == (
+            OMNIMOE_NUM_EXPERTS,
+            OMNIMOE_HIDDEN,
+            OMNIMOE_INTERMEDIATE,
+        )
+
+    def test_veomni_saved_fused_keys_pass_through(self):
+        """A VeOmni-saved checkpoint stores fused keys directly; converter should ignore them."""
+        converter = Qwen3OmniMoeCheckpointTensorConverter(num_experts=OMNIMOE_NUM_EXPERTS)
+        prefix = "thinker.model.layers.0.mlp"
+        gate_up = torch.randn(OMNIMOE_NUM_EXPERTS, 2 * OMNIMOE_INTERMEDIATE, OMNIMOE_HIDDEN)
+        down = torch.randn(OMNIMOE_NUM_EXPERTS, OMNIMOE_HIDDEN, OMNIMOE_INTERMEDIATE)
+        gate_up_res = maybe_convert_checkpoint_tensor(f"{prefix}.experts.gate_up_proj", gate_up, converter)
+        down_res = maybe_convert_checkpoint_tensor(f"{prefix}.experts.down_proj", down, converter)
+        # Pass-through: same tensor, same name.
+        assert gate_up_res is not None and torch.equal(gate_up_res.tensor, gate_up)
+        assert down_res is not None and torch.equal(down_res.tensor, down)
+        # Nothing was buffered.
+        assert converter.finalize() == []

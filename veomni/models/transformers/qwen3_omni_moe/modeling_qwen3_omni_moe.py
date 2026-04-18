@@ -1286,7 +1286,9 @@ class Qwen3OmniMoeForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoeForCond
 def _get_parallel_plan(_self):
     from .parallel_plan import get_parallel_plan
 
-    return get_parallel_plan()
+    # v4 thinker experts expose split gate_proj/up_proj (see Qwen3OmniMoeThinkerExperts),
+    # unlike the v5 fused gate_up_proj layout.
+    return get_parallel_plan(use_gate_up_proj=False)
 
 
 # ================================================================

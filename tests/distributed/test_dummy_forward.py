@@ -278,6 +278,13 @@ _omni_cases = [
         id="qwen3_omni_moe",
         marks=_v4_only,
     ),
+    pytest.param(
+        "qwen3_omni_moe",
+        "./tests/toy_config/qwen3omni_toy",
+        partial(_omni_batch, patch_size=16, is_qwen3_omni=True),
+        id="qwen3_omni_moe_v5",
+        marks=_v5_only,
+    ),
 ]
 
 
