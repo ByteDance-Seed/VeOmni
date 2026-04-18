@@ -202,28 +202,8 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
 # VLM test cases
 # ---------------------------------------------------------------------------
 
+# qwen2_vl / qwen2_5_vl / qwen3_vl / qwen3_vl_moe are migrated — only v5 params remain.
 _vlm_cases = [
-    pytest.param(
-        "qwen3_vl",
-        "./tests/toy_config/qwen3vl_toy",
-        partial(_vlm_batch, patch_size=16),
-        id="qwen3_vl",
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen2_vl",
-        "./tests/toy_config/qwen2vl_toy",
-        partial(_vlm_batch, patch_size=14),
-        id="qwen2_vl",
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen2_5_vl",
-        "./tests/toy_config/qwen25vl_toy",
-        partial(_vlm_batch, patch_size=14),
-        id="qwen2_5_vl",
-        marks=_v4_only,
-    ),
     pytest.param(
         "qwen2_5_vl",
         "./tests/toy_config/qwen25vl_toy",
@@ -263,19 +243,14 @@ def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn):
 # Omni test cases (vision + audio encoders)
 # ---------------------------------------------------------------------------
 
+# qwen2_5_omni is not migrated (out of scope, guarded under v5) — keep v4 entry.
+# qwen3_omni_moe is migrated — only the v5 param remains.
 _omni_cases = [
     pytest.param(
         "qwen2_5_omni",
         "./tests/toy_config/qwen25omni_toy",
         partial(_omni_batch, patch_size=14, is_qwen3_omni=False),
         id="qwen2_5_omni",
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3_omni_moe",
-        "./tests/toy_config/qwen3omni_toy",
-        partial(_omni_batch, patch_size=16, is_qwen3_omni=True),
-        id="qwen3_omni_moe",
         marks=_v4_only,
     ),
     pytest.param(

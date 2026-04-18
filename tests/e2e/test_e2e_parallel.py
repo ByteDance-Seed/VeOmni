@@ -93,6 +93,9 @@ def main(
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
+# Migrated models (qwen2 / qwen3 / qwen3_moe) no longer carry _v4_only entries —
+# their v5 variants are the canonical coverage. Non-migrated/guarded models
+# (llama3.1, seed_oss, deepseek_v3) stay under _v4_only.
 text_test_cases = [
     pytest.param(
         "llama3.1",
@@ -111,33 +114,6 @@ text_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
         marks=_v5_only,
-    ),
-    pytest.param(
-        "qwen2.5",
-        "./tests/toy_config/qwen25_toy",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3",
-        "./tests/toy_config/qwen3_toy",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3_moe",
-        "./tests/toy_config/qwen3_moe_toy",
-        True,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
     ),
     pytest.param(
         "qwen3_moe",
@@ -169,6 +145,7 @@ text_test_cases = [
     ),
 ]
 
+# qwen2vl / qwen2_5_vl are migrated — only the v5 params remain.
 qwen2vl_test_cases = [
     pytest.param(
         "qwen2vl",
@@ -176,23 +153,7 @@ qwen2vl_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen2vl",
-        "./tests/toy_config/qwen2vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
         marks=_v5_only,
-    ),
-    pytest.param(
-        "qwen25vl",
-        "./tests/toy_config/qwen25vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        marks=_v4_only,
     ),
     pytest.param(
         "qwen25vl",
@@ -204,6 +165,7 @@ qwen2vl_test_cases = [
     ),
 ]
 
+# qwen3_vl / qwen3_vl_moe are migrated — only the v5 params remain.
 qwen3vl_test_cases = [
     pytest.param(
         "qwen3vl",
@@ -212,25 +174,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3vl",
-        "./tests/toy_config/qwen3vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
         marks=_v5_only,
-    ),
-    pytest.param(
-        "qwen3vlmoe",
-        "./tests/toy_config/qwen3vlmoe_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
     ),
     pytest.param(
         "qwen3vlmoe",
@@ -272,15 +216,8 @@ qwen2omni_test_cases = [
     ),
 ]
 
+# qwen3_omni_moe is migrated — only the v5 param remains.
 qwen3omni_test_cases = [
-    pytest.param(
-        "qwen3_omni_moe",
-        "./tests/toy_config/qwen3omni_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        marks=_v4_only,
-    ),
     pytest.param(
         "qwen3_omni_moe",
         "./tests/toy_config/qwen3omni_toy",
