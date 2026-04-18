@@ -10,11 +10,15 @@ from transformers import set_seed
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.ops import apply_ops_config
-from veomni.utils.import_utils import is_torch_npu_available
+from veomni.utils.import_utils import is_liger_kernel_available, is_torch_npu_available
 
 
 _LIGER_KERNEL = "liger_kernel"
 _EAGER = "eager"
+# Only include the Liger-backed mode when the package is actually installed
+# (it's unavailable on the NPU CI runner); otherwise every parametrized case
+# would fail in OpsImplementationConfig.__post_init__ with a ValueError.
+_USE_LIGER_KERNEL = [True, False] if is_liger_kernel_available() else [False]
 
 
 @dataclass(frozen=True)
@@ -39,7 +43,6 @@ _VEOMNI_ATTN = [
     "veomni_flash_attention_2_with_sp",
     "veomni_flash_attention_3_with_sp",
 ]
-_USE_LIGER_KERNEL = [True, False]
 
 
 def _skip_fa3_npu(attn_impl: str) -> bool:
