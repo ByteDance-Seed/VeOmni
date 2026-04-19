@@ -207,7 +207,11 @@ class PackingCollator(DataCollator):
         if pad_len == 0:
             return batch
 
-        keys_to_pad = ["input_ids", "attention_mask", "labels", "position_ids"]
+        keys_to_pad = []
+        for key in self.collate_infos.keys():
+            if self.collate_infos[key].pack_dim == -1:
+                keys_to_pad.append(key)
+
         for key in keys_to_pad:
             if key in batch:
                 batch[key] = self.pad_feature_to_length(
