@@ -43,13 +43,13 @@ def _skip_no_cuda():
 
 
 def _get_triton_impl():
-    from veomni.ops.fused_load_balancing_loss.triton_kernel import load_balancing_loss_triton
+    from veomni.ops.kernels.load_balancing_loss.triton import load_balancing_loss_triton
 
     return load_balancing_loss_triton
 
 
 def _get_pytorch_impl():
-    from veomni.ops.fused_load_balancing_loss.torch_native import load_balancing_loss_pytorch
+    from veomni.ops.kernels.load_balancing_loss.eager import load_balancing_loss_pytorch
 
     return load_balancing_loss_pytorch
 

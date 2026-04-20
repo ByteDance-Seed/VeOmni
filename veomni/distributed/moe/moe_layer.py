@@ -24,7 +24,7 @@ from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unper
 
 
 if not is_torch_npu_available():
-    from ...ops.group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
+    from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
 
 def preprocess(

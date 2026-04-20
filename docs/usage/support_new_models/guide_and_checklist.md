@@ -245,7 +245,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.distributed.sequence_parallel.ulysses import _Gather  # all-gather with autograd
 
 from veomni.ops import fused_moe_forward
-from veomni.ops.fused_cross_entropy import ForCausalLMLoss
+from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,   # placeholder token ID for audio in input_ids

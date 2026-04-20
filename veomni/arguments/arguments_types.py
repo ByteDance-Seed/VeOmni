@@ -21,6 +21,7 @@ from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
+from ..utils.import_utils import is_liger_kernel_available
 
 
 logger = logging.get_logger(__name__)
@@ -620,7 +621,23 @@ class TrainingArguments:
 
 @dataclass
 class OpsImplementationConfig:
-    """model.ops_implementation.* — Attention / MoE kernel implementation."""
+    """model.ops_implementation.* — Attention, MoE, and fused kernel implementation.
+
+    Each ``*_implementation`` field selects the kernel backend for that operation.
+    The type is ``str`` (not ``Literal``) so that third-party backends can be
+    registered without modifying this class.
+
+    Well-known values:
+
+    - ``"eager"`` (default): PyTorch / HuggingFace reference implementation.
+    - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
+      ``liger-kernel``).
+    - ``"npu"``: Ascend NPU fused implementation (requires ``torch_npu``).
+      Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from
+      ``veomni.ops.kernels.{rms_norm,rotary}.npu``.
+    - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
+      NPU with ``triton-ascend``).
+    """
 
     attn_implementation: Optional[
         Literal[
@@ -643,6 +660,52 @@ class OpsImplementationConfig:
             "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
         },
     )
+    cross_entropy_loss_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Cross-entropy loss implementation. "
+            "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
+            "'npu' enables chunked loss computation for CausalLM on NPU "
+            "(requires torch_npu). "
+            "'eager' (default) uses PyTorch F.cross_entropy."
+        },
+    )
+    rms_norm_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "RMSNorm implementation. "
+            "'liger_kernel' uses LigerRMSNorm. "
+            "'npu' uses torch_npu.npu_rms_norm (requires torch_npu). "
+            "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3). "
+            "'eager' (default) uses the HuggingFace default."
+        },
+    )
+    swiglu_mlp_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "SwiGLU MLP implementation. "
+            "'liger_kernel' uses LigerSwiGLUMLP. "
+            "'eager' (default) uses the HuggingFace default."
+        },
+    )
+    rotary_pos_emb_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Rotary positional embedding implementation. "
+            "'liger_kernel' uses liger_rotary_pos_emb. "
+            "'npu' uses torch_npu.npu_rotary_mul (requires torch_npu). "
+            "'triton' uses deterministic Triton bmm kernel (DeepSeek V3). "
+            "'eager' (default) uses the HuggingFace default."
+        },
+    )
+    load_balancing_loss_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "MoE load-balancing loss implementation. "
+            "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
+            "'eager' (default) uses PyTorch reference."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
@@ -655,6 +718,32 @@ class OpsImplementationConfig:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
+
+        self._validate_implementations()
+
+    def _validate_implementations(self):
+        """Validate that requested backends are actually available.
+
+        Walks the kernel registry so new ops/backends are discovered
+        automatically.  Importing ``veomni.ops`` here is what triggers every
+        op module to call ``register_op``.
+        """
+        from ..ops import config as ops_config_pkg  # noqa: F401  import side-effect
+        from ..ops.config.registry import list_ops
+
+        for op in list_ops():
+            value = getattr(self, op.config_field)
+            backend = op.backends.get(value)
+            if backend is None:
+                continue
+            for pkg in backend.requires:
+                if pkg == "liger_kernel" and not is_liger_kernel_available():
+                    raise ValueError(f"{op.config_field}='{value}' requires liger-kernel to be installed.")
+                if pkg == "torch_npu":
+                    from ..utils.import_utils import is_torch_npu_available
+
+                    if not is_torch_npu_available():
+                        raise ValueError(f"{op.config_field}='{value}' requires torch_npu to be installed.")
 
 
 @dataclass

@@ -32,10 +32,11 @@ pip install -e .[npu_aarch64,transformers-stable]
 Make sure CANN_path is set to your CANN installation directory, e.g., export CANN_path=/usr/local/Ascend
 ```bash
 source $CANN_path/ascend-toolkit/set_env.sh
-
-# Add chunkloss feature
-export VEOMNI_ENABLE_CHUNK_LOSS=1
 ```
+
+To enable the NPU chunked cross-entropy loss, set
+`model.ops_implementation.cross_entropy_loss_implementation: npu` in your training YAML
+(replaces the legacy `VEOMNI_ENABLE_CHUNK_LOSS` environment variable).
 
 ### Video/Audio Processing Dependencies (Optional)
 

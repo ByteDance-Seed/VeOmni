@@ -57,7 +57,7 @@ No manual action is required. The patch is guarded by `_dcp_consolidation_patch_
 
 ## Implementation Details
 
-See `veomni/ops/dcp_consolidation.py` for full implementation.
+See `veomni/checkpoint/dcp_consolidation.py` for full implementation.
 
 ### Patch Application Flow
 
@@ -76,6 +76,6 @@ See `veomni/ops/dcp_consolidation.py` for full implementation.
 
 When upgrading PyTorch to a version other than 2.9.x:
 
-1. Update `_REQUIRED_TORCH_VERSION` in `veomni/ops/dcp_consolidation.py`
+1. Update `_REQUIRED_TORCH_VERSION` in `veomni/checkpoint/dcp_consolidation.py`
 2. Verify that `_process_output_file` function signature hasn't changed in the new PyTorch version
 3. Test this patch with HDFS FUSE to ensure compatibility

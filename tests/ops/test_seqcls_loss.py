@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-import veomni.ops.fused_cross_entropy as m
+import veomni.ops.kernels.cross_entropy as m
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_torch_device
 
@@ -126,6 +126,11 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
       - out_logits is the flattened *input* logits, because fused_liger_kernel_cross_entropy
         returns `(loss, logits)` without materializing projected logits.
     """
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.ops import apply_ops_config
+
+    apply_ops_config(OpsImplementationConfig(cross_entropy_loss_implementation="liger_kernel"))
+
     dev_api = get_torch_device()
     local_rank = 0
     dev_api.set_device(f"{get_device_type()}:{local_rank}")

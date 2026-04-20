@@ -33,8 +33,6 @@ from transformers.utils import (
 )
 
 from ....utils import logging
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 logger = logging.get_logger(__name__)
@@ -192,15 +190,6 @@ def apply_veomni_qwen3_patch():
     hf_qwen3.Qwen3ForCausalLM.forward = qwen3forcausallm_forward
     hf_qwen3.Qwen3ForSequenceClassification.forward = qwen3forSequenceClassification_forward
 
-    if IS_CUDA_AVAILABLE:
-        from .gpu_patch import apply_veomni_qwen3_gpu_patch
+    from .device_patch import apply_veomni_qwen3_device_patch
 
-        apply_veomni_qwen3_gpu_patch()
-    elif IS_NPU_AVAILABLE and is_transformers_version_greater_or_equal_to("4.50.4"):
-        from .npu_patch import apply_qwen3_npu_patch
-
-        apply_qwen3_npu_patch()
-    else:
-        logger.warning_rank0(
-            "Qwen3ForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4."
-        )
+    apply_veomni_qwen3_device_patch()

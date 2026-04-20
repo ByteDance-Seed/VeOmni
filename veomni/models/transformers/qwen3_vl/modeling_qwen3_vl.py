@@ -983,7 +983,6 @@ def apply_veomni_qwen3vl_patch():
     hf_qwen3vl.Qwen3VLModel = Qwen3VLModel
     hf_qwen3vl.Qwen3VLForConditionalGeneration = Qwen3VLForConditionalGeneration
 
-    if IS_NPU_AVAILABLE:
-        from .npu_patch import apply_qwen3vl_npu_patch
+    from .device_patch import apply_veomni_qwen3vl_device_patch
 
-        apply_qwen3vl_npu_patch()
+    apply_veomni_qwen3vl_device_patch()

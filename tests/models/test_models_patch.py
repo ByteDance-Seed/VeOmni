@@ -98,8 +98,9 @@ class TrainerTest(BaseTrainer):
         _apply_patches()
 
         model_name = self.model_config.model_type
-        self.args.model.ops_implementation.attn_implementation = model_mode.attn_implementation
-        self.args.model.ops_implementation.moe_implementation = model_mode.moe_implementation
+        from .utils import _build_ops_config_for_mode
+
+        self.args.model.ops_implementation = _build_ops_config_for_mode(model_mode)
 
         self._build_model()
         self._build_optimizer()

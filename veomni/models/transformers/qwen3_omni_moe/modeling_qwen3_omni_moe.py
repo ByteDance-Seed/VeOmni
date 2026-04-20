@@ -44,7 +44,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops import fused_moe_forward
-from ....ops.fused_cross_entropy import ForCausalLMLoss
+from ....ops.kernels.cross_entropy import ForCausalLMLoss
 from ....utils import logging
 from ....utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ..attention_utils import VARLEN_ATTENTION_TYPES

@@ -34,6 +34,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..ops import apply_ops_config
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -256,6 +257,7 @@ class DiTTrainer:
     def _build_model(self):
         logger.info_rank0("Build model")
         args: VeOmniDiTArguments = self.base.args
+        apply_ops_config(args.model.ops_implementation)
         dit_config = build_config(args.model.config_path)
         self.base.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")

@@ -34,7 +34,7 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/import_utils.py",
     "veomni/utils/device.py",
-    "veomni/ops/group_gemm/utils/benchmark_utils.py",
+    "veomni/ops/kernels/moe/_kernels/utils/benchmark_utils.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",
     "veomni/models/auto.py",
@@ -50,7 +50,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/transformers/qwen3/modeling_qwen3.py",
     "veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py",
     "veomni/arguments/arguments_types.py",
-    "veomni/ops/group_gemm/utils/device.py",
+    "veomni/ops/kernels/moe/_kernels/utils/device.py",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
 ]
