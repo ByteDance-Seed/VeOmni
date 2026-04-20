@@ -245,7 +245,7 @@ class OpsImplementationConfig:
     # Per-op implementation selection (all default to "eager" = original HF code)
     rms_norm_implementation: str = "eager"
     rms_norm_gated_implementation: str = "eager"
-    apply_rotary_pos_emb_implementation: str = "eager"
+    rotary_pos_emb_implementation: str = "eager"
     swiglu_mlp_implementation: str = "eager"
     moe_experts_implementation: str = "eager"
     cross_entropy_loss_implementation: str = "eager"
@@ -656,7 +656,7 @@ model:
   ops_implementation:
     attn_implementation: flash_attention_2
     rms_norm_implementation: eager              # only eager for qwen3_5 variant
-    apply_rotary_pos_emb_implementation: eager  # only eager for partial variant
+    rotary_pos_emb_implementation: eager  # only eager for partial variant
     moe_experts_implementation: triton_group_gemm
     cross_entropy_loss_implementation: liger_fused
     moe_load_balancing_loss_implementation: eager
