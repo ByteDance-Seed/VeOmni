@@ -98,6 +98,17 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     return found
 
 
+def _module_has_opslot(modeling_module, op_name: str) -> bool:
+    """Return True if *modeling_module* declares an OpSlot for *op_name*."""
+    if modeling_module is None:
+        return False
+    for name in dir(modeling_module):
+        obj = getattr(modeling_module, name, None)
+        if isinstance(obj, OpSlot) and obj.op_name == op_name:
+            return True
+    return False
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
@@ -193,17 +204,25 @@ def build_foundation_model(
     )
 
     # ── Kernel dispatch ────────────────────────────────────────────────────
-    # Try OpSlot binding first; fall back to the legacy MoE patch path for
-    # models that don't use OpSlots yet (qwen3_moe, etc.).
+    # Two independent dispatch mechanisms coexist:
+    #   1. OpSlot binding (preferred, patchgen-based models)
+    #   2. Legacy ``_apply_legacy_moe_patch`` (models not yet migrated to
+    #      patchgen that still call ``fused_moe_forward`` directly)
+    # They are decoupled: binding OpSlots never skips the legacy MoE patch,
+    # and the legacy patch is only applied when the model does not declare a
+    # ``moe_experts`` OpSlot of its own.
     modeling_module = sys.modules.get(model.__class__.__module__)
-    if (
-        ops_implementation is not None
-        and modeling_module is not None
-        and _bind_veomni_ops(modeling_module, ops_implementation)
-    ):
-        logger.info_rank0("OpSlot-based kernel dispatch active.")
-    elif moe_implementation is not None:
-        _apply_legacy_moe_patch(config, moe_implementation)
+    if ops_implementation is not None and modeling_module is not None:
+        if _bind_veomni_ops(modeling_module, ops_implementation):
+            logger.info_rank0("OpSlot-based kernel dispatch active.")
+
+    if moe_implementation is not None:
+        if _module_has_opslot(modeling_module, "moe_experts"):
+            logger.info_rank0(
+                f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
+            )
+        else:
+            _apply_legacy_moe_patch(config, moe_implementation)
 
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,

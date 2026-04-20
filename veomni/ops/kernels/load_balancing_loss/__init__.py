@@ -79,3 +79,26 @@ register_op(
         },
     )
 )
+
+
+# ── OpSlot kernel registration ───────────────────────────────────────────────
+
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+def _triton_load_balancing_loss_factory():
+    from .triton import load_balancing_loss_triton
+
+    return load_balancing_loss_triton
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="triton",
+        op_name="load_balancing_loss",
+        variant="standard",
+        factory=_triton_load_balancing_loss_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Fused Triton load-balancing loss for MoE",
+    )
+)
