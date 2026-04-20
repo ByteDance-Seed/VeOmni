@@ -148,7 +148,7 @@ def _fused_quack_kernel_factory():
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="fused_quack",
+        name="quack",
         op_name="moe_experts",
         variant="standard",
         factory=_fused_quack_kernel_factory,

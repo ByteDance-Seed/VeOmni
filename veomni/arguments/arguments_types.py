@@ -655,9 +655,17 @@ class OpsImplementationConfig:
     moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = field(
         default=None,
         metadata={
-            "help": "MoE implementation to use. "
-            "'eager' for reference loop, 'fused' for Triton group-gemm, "
-            "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
+            "help": "[DEPRECATED] Use 'moe_experts_implementation' instead. "
+            "Legacy MoE selector: 'eager'/'fused'/'fused_quack' "
+            "(the latter maps to 'quack' on the new field)."
+        },
+    )
+    moe_experts_implementation: Literal["eager", "fused", "quack"] = field(
+        default="eager",
+        metadata={
+            "help": "MoE experts forward implementation. "
+            "'fused' for Triton group-gemm, 'quack' for Quack CUTLASS/CuTe kernels (SM90+), "
+            "'eager' (default) for the reference loop."
         },
     )
     cross_entropy_loss_implementation: str = field(
@@ -707,11 +715,6 @@ class OpsImplementationConfig:
         },
     )
 
-    @property
-    def moe_experts_implementation(self) -> str:
-        """Bridge ``moe_implementation`` → ``moe_experts_implementation`` for OpSlot lookup."""
-        return self.moe_implementation or "eager"
-
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
@@ -724,7 +727,42 @@ class OpsImplementationConfig:
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
+        self._bridge_legacy_moe_implementation()
         self._validate_implementations()
+
+    def _bridge_legacy_moe_implementation(self):
+        """Bridge deprecated ``moe_implementation`` onto ``moe_experts_implementation``.
+
+        Existing configs still pass ``moe_implementation: fused`` / ``fused_quack``;
+        route them onto the new field (with ``fused_quack`` → ``quack``) and
+        emit a DeprecationWarning. If the user sets both, the new field wins
+        and we warn about the conflict.
+        """
+        if self.moe_implementation is None:
+            return
+
+        import warnings
+
+        legacy_to_new = {"eager": "eager", "fused": "fused", "fused_quack": "quack"}
+        mapped = legacy_to_new[self.moe_implementation]
+
+        if self.moe_experts_implementation != "eager" and self.moe_experts_implementation != mapped:
+            warnings.warn(
+                f"Both 'moe_implementation={self.moe_implementation}' and "
+                f"'moe_experts_implementation={self.moe_experts_implementation}' are set; "
+                "the new field takes precedence. Drop 'moe_implementation'.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return
+
+        warnings.warn(
+            f"'moe_implementation={self.moe_implementation}' is deprecated; "
+            f"use 'moe_experts_implementation={mapped}' instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        self.moe_experts_implementation = mapped
 
     def _validate_implementations(self):
         """Validate that requested backends are actually available.
