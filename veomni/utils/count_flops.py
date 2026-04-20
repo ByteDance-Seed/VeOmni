@@ -86,6 +86,7 @@ class VeomniFlopsCounter:
             "seed_oss": self._estimate_seed_flops,
             "qwen3_5": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
+            "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
         }
 
         self.config = config
@@ -708,7 +709,7 @@ class VeomniFlopsCounter:
 
         Vision encoder: delegates to _estimate_qwen3_vit_flop.
         """
-        text_config = self.config.text_config
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         hidden_size = text_config.hidden_size
         vocab_size = text_config.vocab_size
         num_hidden_layers = text_config.num_hidden_layers
