@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..utils import logging
-from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from ..utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
 
 logger = logging.get_logger(__name__)
@@ -47,12 +47,10 @@ class HardwareRequirement:
                     return False
             return True
         elif self.device_type == "npu":
-            try:
-                import torch_npu  # noqa: F401
-
-                return True
-            except ImportError:
-                return False
+            # IS_NPU_AVAILABLE == is_torch_npu_available(): requires both the
+            # torch_npu package AND an actual NPU device (unlike a bare import
+            # check, which passes on dev boxes that merely have the library).
+            return IS_NPU_AVAILABLE
         return False
 
 

@@ -61,7 +61,7 @@ if they implement the same variant.
 | `swiglu_mlp` | `standard` | SwiGLU MLP (gate/up/down) |
 | `attention` | `standard` | Multi-head / GQA attention (existing `ALL_ATTENTION_FUNCTIONS` — unchanged) |
 | `moe_experts` | `standard` | Expert GEMM dispatch (merged gate+up projection, HF v5 convention) |
-| `cross_entropy_loss` | `standard` | Cross-entropy with optional fused logit projection |
+| `cross_entropy_loss` | `causal`, `seq_cls` | Causal-LM CE (shifts labels) vs. sequence-classification CE (no shift) |
 | `moe_load_balancing_loss` | `standard` | Switch Transformer auxiliary loss |
 
 ### 2. Kernel Registry
@@ -194,14 +194,18 @@ KERNEL_REGISTRY.register(KernelSpec(
     hardware=HardwareRequirement("cuda", min_compute_capability=90),
 ))
 
-# -- cross_entropy_loss --
+# -- cross_entropy_loss (split by task to avoid mixing causal-LM label
+#    shifting with sequence-classification token-level labels) --
 KERNEL_REGISTRY.register(KernelSpec(
-    name="liger_fused",
-    op_name="cross_entropy_loss", variant="standard",
-    factory=lambda: __import__(
-        "veomni.ops.fused_cross_entropy.liger_kernel",
-        fromlist=["fused_liger_kernel_cross_entropy"],
-    ).fused_liger_kernel_cross_entropy,
+    name="liger_kernel",
+    op_name="cross_entropy_loss", variant="causal",
+    factory=_liger_fused_ce_causal_factory,   # partial(ForCausalLMLoss, cross_entropy_fn=liger)
+    hardware=HardwareRequirement("cuda"),
+))
+KERNEL_REGISTRY.register(KernelSpec(
+    name="liger_kernel",
+    op_name="cross_entropy_loss", variant="seq_cls",
+    factory=_liger_fused_ce_seq_cls_factory,  # partial(ForSequenceClassificationLoss, cross_entropy_fn=liger)
     hardware=HardwareRequirement("cuda"),
 ))
 ```
@@ -602,15 +606,18 @@ Both loss ops use the same `OpSlot` + if-else guard pattern.
 #### Cross-Entropy Loss
 
 ```python
-veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_seq_cls_loss   = OpSlot("cross_entropy_loss", "seq_cls")
 
-# In ForConditionalGeneration.forward:
+# In ForCausalLM.forward / ForConditionalGeneration.forward:
     if labels is not None:
         # +++ veomni: kernel dispatch +++
-        if veomni_cross_entropy_loss.has_kernel:
-            loss = veomni_cross_entropy_loss(logits, labels, self.config)
+        if veomni_causal_lm_loss.has_kernel:
+            loss, logits = veomni_causal_lm_loss(logits, labels, self.config)
         else:
             loss = self.loss_function(logits, labels, self.vocab_size, ...)
+
+# In ForSequenceClassification.forward the seq_cls OpSlot is used instead.
 ```
 
 #### MoE Load-Balancing Loss
@@ -692,7 +699,7 @@ build_foundation_model(config)                     # (4) model build time
   │         veomni_apply_rotary_pos_emb  = OpSlot("apply_rotary_pos_emb", "partial")
   │         veomni_moe_experts_forward   = OpSlot("moe_experts", "standard")
   │         veomni_load_balancing_loss   = OpSlot("moe_load_balancing_loss", "standard")
-  │         veomni_cross_entropy_loss    = OpSlot("cross_entropy_loss", "standard")
+  │         veomni_causal_lm_loss        = OpSlot("cross_entropy_loss", "causal")
   │         (all start with _kernel = None)
   │
   ├─ _bind_veomni_ops(module, ops_config):          #     bind from config
@@ -712,7 +719,7 @@ model.forward()                                    # (5) runtime
   │   └─ if veomni_moe_experts_forward.has_kernel:
   │        return veomni_moe_experts_forward(...)    #     → fused kernel
   │      else: <original HF expert loop>             #     → eager fallback
-  ├─ if veomni_cross_entropy_loss.has_kernel: ...    #     guard in forward
+  ├─ if veomni_causal_lm_loss.has_kernel: ...        #     guard in forward
   └─ if veomni_load_balancing_loss.has_kernel: ...   #     guard in forward
 ```
 
