@@ -28,7 +28,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from ..utils import logging
 from .kernel_registry import KERNEL_REGISTRY
+
+
+logger = logging.get_logger(__name__)
 
 
 class OpSlot:
@@ -39,11 +43,26 @@ class OpSlot:
         self.variant = variant
         self._kernel: Callable | None = None
         self._bound = False
+        self._impl_name: str | None = None
 
     def bind(self, impl_name: str) -> None:
-        """Resolve *impl_name* via the global registry and bind the result."""
+        """Resolve *impl_name* via the global registry and bind the result.
+
+        OpSlot instances are module-level globals, so two models sharing the
+        same modeling module share the same slot. Rebinding to a different
+        ``impl_name`` silently overrides the first binding for *both*
+        instances — we warn so eager-vs-fused evaluation setups spot the
+        collision early.
+        """
+        if self._bound and self._impl_name != impl_name:
+            logger.warning_rank0(
+                f"OpSlot('{self.op_name}', '{self.variant}') was already bound to "
+                f"'{self._impl_name}'; rebinding to '{impl_name}'. Any other model "
+                "instance sharing this module will pick up the new binding."
+            )
         self._kernel = KERNEL_REGISTRY.resolve(self.op_name, self.variant, impl_name)
         self._bound = True
+        self._impl_name = impl_name
 
     @property
     def has_kernel(self) -> bool:

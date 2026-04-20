@@ -58,12 +58,33 @@ class HardwareRequirement:
 
 @dataclass(frozen=True)
 class KernelSpec:
-    """Describes a single kernel implementation."""
+    """Describes a single kernel implementation registered under an op/variant.
 
-    name: str  # e.g. "triton_group_gemm"
-    op_name: str  # e.g. "moe_experts"
-    variant: str  # e.g. "standard"
-    factory: Callable[[], Callable]  # lazy import: () -> callable
+    Attributes:
+        name: Identifier exposed to users via the matching
+            ``OpsImplementationConfig`` field (e.g. ``"liger_kernel"``,
+            ``"triton"``, ``"quack"``). Must be unique within a given
+            ``(op_name, variant)`` bucket.
+        op_name: The logical op that this kernel implements (e.g.
+            ``"rms_norm"``, ``"moe_experts"``). Matches the ``OpSlot``'s
+            ``op_name``.
+        variant: Sub-variant of the op, used when a single op has multiple
+            forward-compatible shapes (e.g. ``"standard"`` vs ``"qwen3_5"``
+            RMSNorm). Kernels for different variants never collide.
+        factory: Zero-argument callable returning the concrete kernel
+            callable. Kept lazy so optional imports (Liger, Triton, etc.)
+            only load on demand.
+        hardware: Hardware gate enforced at ``resolve()`` time; raises
+            ``RuntimeError`` early when the requested kernel cannot run on
+            the current accelerator.
+        description: Free-form human-readable description, surfaced in
+            registry listings.
+    """
+
+    name: str
+    op_name: str
+    variant: str
+    factory: Callable[[], Callable]
     hardware: HardwareRequirement
     description: str = ""
 
