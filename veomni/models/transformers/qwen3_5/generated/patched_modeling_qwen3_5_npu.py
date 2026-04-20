@@ -9,8 +9,14 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: Qwen3_5RMSNorm
-#      Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
+#    - method_override: Qwen3_5RMSNorm.forward
+#      Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)
+#    - method_override: Qwen3_5RMSNormGated.forward
+#      Use fused rmsnorm and fused swiglu to impl gated rmsnorm
+#    - function_replacement: apply_rotary_pos_emb
+#      Use fused rope to impl partial rotary postion embedding
+#    - function_replacement: apply_rotary_pos_emb_vision
+#      Use fused rope to impl rotary postion embedding in vit
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
 #      Use device-agnostic get_device_id() for FusedRMSNormGated init
 #    - method_override: Qwen3_5GatedDeltaNet._get_local_conv1d_weight
@@ -30,7 +36,7 @@
 #    - method_override: Qwen3_5VisionModel.dummy_forward
 #      Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.
 #    - method_override: Qwen3_5Model.forward
-#      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-GPU sync avoidance via pre-computed metadata.
+#      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-NPU sync avoidance via pre-computed metadata.
 #    - method_override: Qwen3_5ForCausalLM.forward
 #      Support fused cross entropy path in Qwen3_5ForCausalLM.forward
 #    - method_override: Qwen3_5ForConditionalGeneration.get_position_id_func
@@ -53,6 +59,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch_npu import torch_npu
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
@@ -83,27 +90,12 @@ from veomni.utils.device import get_device_id
 
 
 # Additional import blocks for patches
-# Modification: We are not using https://github.com/Dao-AILab/causal-conv1d now
-# we are using the triton impl of causal_conv1d from fla.
-# TODO: Evaluate Tridao's impl in the future.
-try:
-    from fla.modules import FusedRMSNormGated
-    from fla.modules.convolution import causal_conv1d as causal_conv1d_fn
-    from fla.modules.convolution import causal_conv1d_update
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-except ImportError:
-    chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
-    FusedRMSNormGated = None
-    causal_conv1d_update, causal_conv1d_fn = None, None
-    logging.get_logger(__name__).warning(
-        "Failed to import FLA modules: fallback to eager implementation."
-        "This case can't support dynamic batching packing!"
-    )
-
-
-# ======================================================================
-# [HELPERS] Module-level helpers injected via config.add_helper
-# ======================================================================
+# TODO: Add torch npu ops chunk_gated_delta_rule and causal_conv1d_fn in the future.
+chunk_gated_delta_rule = None
+causal_conv1d_fn = None
+FusedRMSNormGated = None
+fused_recurrent_gated_delta_rule = None
+causal_conv1d_update = None
 
 
 def get_position_id(main_func, self, **kwargs):
@@ -311,6 +303,12 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         return freqs_t
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5RMSNormGated
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3_5RMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
@@ -318,15 +316,11 @@ class Qwen3_5RMSNormGated(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states, gate=None):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        # Norm before gate
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
+        hidden_states = torch.cat([gate, hidden_states], dim=-1)
+        hidden_states = torch_npu.npu_swiglu(hidden_states, dim=-1)
 
-        return hidden_states.to(input_dtype)
+        return hidden_states
 
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
@@ -668,7 +662,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     activation=self.activation,
                     seq_idx=None,
                     backend="triton",
-                    cu_seqlens=cu_seq_lens_q,
+                    cu_seqlens=cu_seq_lens_q.npu(),
                 )[0]
             else:
                 raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
@@ -718,7 +712,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     initial_state=None,
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=cu_seq_lens_q,
+                    cu_seqlens=cu_seq_lens_q.npu(),
                 )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
@@ -773,27 +767,12 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# Adapted from transformers.models.glm.modular_glm.apply_rotary_pos_emb
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb
+# Reason: Use fused rope to impl partial rotary postion embedding
+# Source: veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
+# ======================================================================
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Removes the interleaving of cos and sin from GLM
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -802,9 +781,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    # Apply rotary embeddings on the first half or full tensor
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_embed = torch_npu.npu_rotary_mul(q_rot, cos, sin)
+    k_embed = torch_npu.npu_rotary_mul(k_rot, cos, sin)
 
     # Concatenate back to full shape
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
@@ -945,13 +923,25 @@ class Qwen3_5MLP(nn.Module):
 
 
 # ======================================================================
-# [PATCHED CLASS] Qwen3_5RMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
-# Source: liger_kernel.transformers.rms_norm
+# [MODIFIED CLASS] Qwen3_5RMSNorm
+# Methods patched: forward
 # ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNormForQwen3Next
-from liger_kernel.transformers.rms_norm import LigerRMSNormForQwen3Next as Qwen3_5RMSNorm
+
+
+class Qwen3_5RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.eps)[0]
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
 # ======================================================================
@@ -991,7 +981,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
         assert cu_seq_lens_q is not None, (
             "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
-            "and to remove the full Flash Attention CPU-GPU sync."
+            "and to remove the full Flash Attention CPU-NPU sync."
         )
 
         # Token Mixer
@@ -1104,17 +1094,20 @@ class Qwen3_5VisionPatchMerger(nn.Module):
         return x
 
 
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
+# Reason: Use fused rope to impl rotary postion embedding in vit
+# Source: veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
+# ======================================================================
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
+    q, k = q.unsqueeze(0), k.unsqueeze(0)
+    cos = cos.unsqueeze(0).unsqueeze(2).float()
+    sin = sin.unsqueeze(0).unsqueeze(2).float()
+    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
+    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
+    q_embed, k_embed = q_embed.squeeze(0), k_embed.squeeze(0)
     return q_embed, k_embed
 
 

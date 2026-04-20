@@ -33,7 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Config,
@@ -918,6 +918,83 @@ def qwen3_5_model_forward(
     return Qwen3_5ModelOutputWithPast(
         **outputs,
         rope_deltas=self.rope_deltas,
+    )
+
+
+@config.override_method(
+    "Qwen3_5ForCausalLM.forward", description="Support fused cross entropy path in Qwen3_5ForCausalLM.forward"
+)
+def qwen3_5_forcausallm_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    labels: torch.LongTensor | None = None,
+    use_cache: bool | None = None,
+    cache_position: torch.LongTensor | None = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    **kwargs: Unpack[TransformersKwargs],
+) -> CausalLMOutputWithPast:
+    r"""
+    labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+        config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+        (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+    Example:
+
+    ```python
+    >>> from transformers import AutoTokenizer, Qwen3_5ForCausalLM
+
+    >>> model = Qwen3_5ForCausalLM.from_pretrained("Qwen/Qwen3_5-8B")
+    >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3_5-8B")
+
+    >>> prompt = "Hey, are you conscious? Can you talk to me?"
+    >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+    >>> # Generate
+    >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+    >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+    ```"""
+    outputs: BaseModelOutputWithPast = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    hidden_states = outputs.last_hidden_state
+    # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    hidden_states = hidden_states[:, slice_indices, :]
+
+    loss = None
+    logits = None
+    if labels is not None:
+        loss, logits = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
+    else:
+        logits = self.lm_head(hidden_states)
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
     )
 
 
