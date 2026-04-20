@@ -59,18 +59,9 @@ def set_batch_invariant_mode(enabled: bool = True):
     _batch_invariant_MODE, _batch_invariant_LIB = old_data
 
 
-# Re-export kernels used by model patches (e.g., DeepSeek V3 deterministic RoPE/RMSNorm).
-# These are Triton-based and only available on CUDA — guard the import to avoid
-# ``ModuleNotFoundError: No module named 'triton'`` on NPU environments.
-if IS_CUDA_AVAILABLE:
-    from .batch_invariant_ops import batch_invariant_rms_norm, triton_bmm  # noqa: E402
-
-
 __all__ = [
     "set_batch_invariant_mode",
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
-    "triton_bmm",
-    "batch_invariant_rms_norm",
 ]

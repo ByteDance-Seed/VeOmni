@@ -1,0 +1,25 @@
+---
+description: Do not use decorative section divider comments in Python code
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# No Section Divider Comments
+
+Do NOT add decorative section-divider comments like:
+
+```python
+# ---------------------------------------------------------------------------
+# Some Section Name
+# ---------------------------------------------------------------------------
+```
+
+or
+
+```python
+# ------------------------------------------------------------------
+# Some Section Name
+# ------------------------------------------------------------------
+```
+
+These add visual noise without value. If code needs grouping, use module-level or class-level docstrings, or simply rely on class/function structure.

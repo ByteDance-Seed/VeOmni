@@ -17,6 +17,7 @@ from transformers import PretrainedConfig
 
 from . import logging
 from .device import get_device_name
+from .import_utils import is_transformers_version_greater_or_equal_to
 
 
 logger = logging.get_logger(__name__)
@@ -85,6 +86,7 @@ class VeomniFlopsCounter:
             "seed_oss": self._estimate_seed_flops,
             "qwen3_5": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
+            "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
         }
 
         self.config = config
@@ -281,12 +283,20 @@ class VeomniFlopsCounter:
         return flops_achieved
 
     def _estimate_qwen2_vl_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-        hidden_size = self.config.hidden_size
-        vocab_size = self.config.vocab_size
-        num_hidden_layers = self.config.num_hidden_layers
-        num_key_value_heads = self.config.num_key_value_heads
-        num_attention_heads = self.config.num_attention_heads
-        intermediate_size = self.config.intermediate_size
+        if is_transformers_version_greater_or_equal_to("5.0.0"):
+            hidden_size = self.config.text_config.hidden_size
+            vocab_size = self.config.text_config.vocab_size
+            num_hidden_layers = self.config.text_config.num_hidden_layers
+            num_key_value_heads = self.config.text_config.num_key_value_heads
+            num_attention_heads = self.config.text_config.num_attention_heads
+            intermediate_size = self.config.text_config.intermediate_size
+        else:
+            hidden_size = self.config.hidden_size
+            vocab_size = self.config.vocab_size
+            num_hidden_layers = self.config.num_hidden_layers
+            num_key_value_heads = self.config.num_key_value_heads
+            num_attention_heads = self.config.num_attention_heads
+            intermediate_size = self.config.intermediate_size
 
         head_dim = hidden_size // num_attention_heads
         q_size = num_attention_heads * head_dim
@@ -699,7 +709,7 @@ class VeomniFlopsCounter:
 
         Vision encoder: delegates to _estimate_qwen3_vit_flop.
         """
-        text_config = self.config.text_config
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         hidden_size = text_config.hidden_size
         vocab_size = text_config.vocab_size
         num_hidden_layers = text_config.num_hidden_layers

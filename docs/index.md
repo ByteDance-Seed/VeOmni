@@ -27,6 +27,7 @@ get_started/installation/install_ascend_arm.md
 
 usage/arguments.md
 usage/basic_modules.md
+usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
@@ -34,6 +35,7 @@ usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
 usage/checkpoint_conversion.md
 usage/trainer.md
+usage/agent_workflow.md
 ```
 
 ```{toctree}

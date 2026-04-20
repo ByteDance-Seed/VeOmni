@@ -25,10 +25,6 @@ from transformers.utils import TransformersKwargs
 
 from ....ops import fused_moe_forward
 from ....utils import logging
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import (
-    is_transformers_version_greater_or_equal_to,
-)
 
 
 # Flash Attention 2/3 require Q/K and V to have the same head dimension.
@@ -99,9 +95,13 @@ class PatchDeepseekV3NaiveMoe(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-
         if self._moe_implementation == "eager":
+            # Accumulate in top_k_weights dtype (fp32) to match HF's
+            # DeepseekV3MoE.moe, which allocates final_hidden_states with
+            # `dtype=topk_weights.dtype` and casts to input dtype only at
+            # return. Accumulating in bf16 per-expert introduces extra
+            # rounding that breaks bitwise parity with HF.
+            final_hidden_states = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
             with torch.no_grad():
                 expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
                 expert_mask = expert_mask.permute(2, 1, 0)
@@ -118,10 +118,12 @@ class PatchDeepseekV3NaiveMoe(nn.Module):
                 current_hidden_states = self.act_fn(gate) * up
                 current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
                 current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+                final_hidden_states.index_add_(0, token_idx, current_hidden_states)
+            final_hidden_states = final_hidden_states.to(hidden_states.dtype)
         elif self._moe_implementation == "fused":
-            # cast top_k_weights to dtype of final_hidden_states
-            top_k_weights = top_k_weights.to(final_hidden_states.dtype)
+            # cast top_k_weights to dtype of hidden_states to satisfy the
+            # fused MoE kernel's half-precision requirement
+            top_k_weights = top_k_weights.to(hidden_states.dtype)
 
             final_hidden_states = fused_moe_forward(
                 num_experts=self.num_experts,
@@ -377,15 +379,6 @@ def apply_veomni_deepseek_v3_patch():
     hf_deepseek_v3.DeepseekV3ForCausalLM.forward = deepseek_v3_forcausal_lm_forward
     hf_deepseek_v3.DeepseekV3PreTrainedModel._init_weights = deepseek_v3_pretrained_model_init_weights
 
-    if IS_CUDA_AVAILABLE:
-        from .gpu_patch import apply_veomni_deepseek_v3_gpu_patch
+    from .device_patch import apply_veomni_deepseek_v3_device_patch
 
-        apply_veomni_deepseek_v3_gpu_patch()
-    elif IS_NPU_AVAILABLE and is_transformers_version_greater_or_equal_to("4.50.4"):
-        from .npu_patch import apply_deepseek_v3_npu_patch
-
-        apply_deepseek_v3_npu_patch()
-    else:
-        logger.warning_rank0(
-            "DeepseekV3ForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4."
-        )
+    apply_veomni_deepseek_v3_device_patch()

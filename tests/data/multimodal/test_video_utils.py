@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from veomni.data.multimodal.video_utils import (
+    _apply_dynamic_video_max_pixels,
     calculate_frame_indices,
     fetch_videos,
     fetch_videos_metadata,
@@ -814,3 +815,102 @@ def test_benchmark_audio_processing():
         assert_video_output_valid(videos[0], audios[0], **kwargs)
 
     print(f"{'=' * 85}")
+
+
+class TestApplyDynamicVideoMaxPixels:
+    """Tests for _apply_dynamic_video_max_pixels (Qwen3-VL dynamic token budget)."""
+
+    def test_noop_without_video_total_pixels(self):
+        """Without video_total_pixels, kwargs should be returned unchanged."""
+        kwargs = {"video_max_pixels": 602112, "video_min_pixels": 100352}
+        result = _apply_dynamic_video_max_pixels(nframes=20, kwargs=kwargs)
+        assert result is kwargs, "Should return the exact same dict object"
+
+    def test_noop_with_zero_nframes(self):
+        """With nframes=0, kwargs should be returned unchanged."""
+        kwargs = {"video_total_pixels": 90_000_000, "video_max_pixels": 602112}
+        result = _apply_dynamic_video_max_pixels(nframes=0, kwargs=kwargs)
+        assert result is kwargs
+
+    def test_few_frames_capped_by_video_max_pixels(self):
+        """With few frames, dynamic budget exceeds video_max_pixels and should be capped."""
+        # 20 frames: dynamic = 90_000_000 / 20 * 2 = 9_000_000 >> 602112
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        result = _apply_dynamic_video_max_pixels(nframes=20, kwargs=kwargs)
+        assert result["video_max_pixels"] == 602112
+
+    def test_many_frames_reduces_max_pixels(self):
+        """With many frames, dynamic budget should reduce video_max_pixels."""
+        # 600 frames: dynamic = 90_000_000 / 600 * 2 = 300_000 < 602112
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        result = _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        assert result["video_max_pixels"] == 300_000
+
+    def test_min_pixels_floor(self):
+        """Dynamic max should not go below video_min_pixels * 1.05."""
+        # 10000 frames: dynamic = 90_000_000 / 10000 * 2 = 18_000
+        # But min_pixels * 1.05 = 100352 * 1.05 = 105369
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        result = _apply_dynamic_video_max_pixels(nframes=10000, kwargs=kwargs)
+        assert result["video_max_pixels"] == int(100352 * 1.05)
+
+    def test_no_video_max_pixels_in_kwargs(self):
+        """If video_max_pixels is not set, dynamic budget is used directly."""
+        kwargs = {"video_total_pixels": 90_000_000, "frame_factor": 2}
+        result = _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        assert result["video_max_pixels"] == int(90_000_000 / 600 * 2)
+
+    def test_no_video_min_pixels_in_kwargs(self):
+        """If video_min_pixels is not set, no floor is applied."""
+        kwargs = {"video_total_pixels": 90_000_000, "video_max_pixels": 602112, "frame_factor": 2}
+        result = _apply_dynamic_video_max_pixels(nframes=10000, kwargs=kwargs)
+        # dynamic = 90_000_000 / 10000 * 2 = 18_000, no floor
+        assert result["video_max_pixels"] == 18_000
+
+    def test_original_kwargs_not_mutated(self):
+        """The original kwargs dict should not be modified."""
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "frame_factor": 2,
+        }
+        original_max = kwargs["video_max_pixels"]
+        _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        assert kwargs["video_max_pixels"] == original_max
+
+    def test_default_temporal_merge_factor(self):
+        """When frame_factor is not set, default temporal merge factor of 2 is used."""
+        kwargs = {"video_total_pixels": 90_000_000, "video_max_pixels": 602112}
+        result = _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        expected = int(90_000_000 / 600 * 2)  # default factor=2
+        assert result["video_max_pixels"] == expected
+
+    def test_training_seq_len_budget(self):
+        """Typical training config: max_seq_len=4096 based budget."""
+        # 4096 * 28^2 * 0.9 = 2_889_523
+        video_total_pixels = int(4096 * 28 * 28 * 0.9)
+        kwargs = {
+            "video_total_pixels": video_total_pixels,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        # 16 frames: dynamic = 2_889_523 / 16 * 2 = 361_190 < 602112
+        result = _apply_dynamic_video_max_pixels(nframes=16, kwargs=kwargs)
+        assert result["video_max_pixels"] < 602112
+        assert result["video_max_pixels"] > 100352

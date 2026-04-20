@@ -54,7 +54,7 @@ config.add_post_import_block(
     # These are bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_rms_norm = OpSlot("rms_norm", "standard")
-    veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "full")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
     veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
     veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
     """

@@ -33,7 +33,11 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    uses: ./.github/workflows/check_pr_lint.yml
+
   npu_unit_tests:
+    needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
     runs-on: [self-hosted, npu-0]
@@ -93,40 +97,47 @@ jobs:
           uv pip list
       - name: Run parallel tests
         run: |
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
+          uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_slice_input_tensor.py
+          uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
       - name: Run models tests
         run: |
-          uv run --frozen pytest -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -s -x tests/models/test_models_patch.py
-          uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
+          uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
-          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+          uv run --frozen pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+      - name: Run checkpoint callback unit tests
+        run: |
+          uv run --frozen pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
       - name: Run e2e dcp save and load test
         run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
+          uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
+      - name: Run distributed tests (dummy_forward)
+        run: |
+          uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
       - name: Run data tests
         run: |
-          uv run --frozen pytest -s -x tests/data
+          uv run --frozen pytest -v -s -x tests/data
       - name: Run ops tests
         run: |
-          uv run --frozen pytest -s -x tests/ops/test_comp.py
+          uv run --frozen pytest -v -s -x tests/ops/test_comp.py
       - name: Sync dependencies [transformers-v5]
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
       - name: Run models tests [transformers-v5]
         run: |
-          uv run  --frozen pytest -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run  --frozen pytest -v -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
+          uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
       - name: Run utils tests [transformers-v5]
         run: |
           # Need v5 to support newer models like Qwen3.5 count flops tests.
-          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/utils/test_count_flops.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -v -s -x tests/utils/test_count_flops.py

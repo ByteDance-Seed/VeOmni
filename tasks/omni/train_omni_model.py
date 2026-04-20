@@ -128,7 +128,7 @@ def main():
     model: SeedOmniModel = build_omni_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
         encoders=args.model.encoders,
         decoders=args.model.decoders,
         input_encoder=args.model.input_encoder,
@@ -254,7 +254,7 @@ def main():
         weights_path=args.model.model_path,
         enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-        enable_mixed_precision=args.train.enable_mixed_precision,
+        mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         init_device=args.train.init_device,
         enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,

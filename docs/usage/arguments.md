@@ -67,6 +67,7 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
+          * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
         * `OffloadConfig` — `train.accelerator.offload_config.*`
     * `CheckpointConfig` — `train.checkpoint.*`
 
@@ -126,12 +127,21 @@ Root config — assembles `model`, `data`, and `train`.
 
 ### OpsImplementationConfig
 
-`model.ops_implementation.*` — Attention and MoE kernel implementation.
+`model.ops_implementation.*` — Attention, MoE, and fused kernel implementation.
+
+Each `*_implementation` field selects the kernel backend for that operation.
+The type is `str` (not `Literal`) so third-party backends can be registered
+without modifying the config class.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]]` | `"flash_attention_2"` | Attention implementation to use. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
 | moe_implementation | `Optional[Literal["eager", "fused", "fused_quack"]]` | `None` | MoE implementation: `eager` (reference loop), `fused` (Triton), `fused_quack` (Quack CUTLASS, SM90+). |
+| cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss). |
+| rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
+| swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
+| rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
+| load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton`. |
 
 ### DataArguments
 
@@ -180,7 +190,6 @@ Root config — assembles `model`, `data`, and `train`.
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
-| enable_mixed_precision | `bool` | `True` | Enable mixed precision training. |
 | init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"cuda"` | Device for model weight initialization. Use `"meta"` or `"cpu"` for large models (>30B). |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
@@ -281,8 +290,23 @@ Root config — assembles `model`, `data`, and `train`.
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | full_shard | `bool` | `True` | Enable full sharding — equivalent to ZeRO-3. |
-| forward_prefetch | `bool` | `True` | Enable forward prefetch (FSDP1). |
+| forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload (FSDP1 only). |
+| mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
+
+### MixedPrecisionConfig
+
+`train.accelerator.fsdp_config.mixed_precision.*` — Mixed precision configuration.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `True` | Enable mixed precision training. |
+| param_dtype | `str` | `"bfloat16"` | Dtype for the unsharded parameter (DDP, FSDP1). |
+| reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1). |
+| buffer_dtype | `str` | `None` | Dtype for the buffer (DDP, FSDP1). |
+| output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (DDP, FSDP1). |
+| cast_forward_inputs | `bool` | `True` | Enable mixed precision cast forward inputs (FSDP2). |
+
 
 ### OffloadConfig
 

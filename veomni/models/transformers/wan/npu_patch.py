@@ -2,8 +2,6 @@ import torch
 import torch_npu
 from einops import rearrange
 
-from . import modeling_wan
-
 
 def rms_norm_forward_npu(self, x):
     """NPU optimized implementation for RMSNorm."""
@@ -20,9 +18,3 @@ def rope_apply_fused(x, **kwargs):
     x_float = x.to(torch.float32)
     x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode="interleave").flatten(-2)
     return x_out.to(x.dtype)
-
-
-def apply_wan_npu_patch():
-    # Patches for wan2.1 Model
-    modeling_wan.RMSNorm.forward = rms_norm_forward_npu
-    modeling_wan.rope_apply = rope_apply_fused

@@ -25,10 +25,10 @@ jobs:
       - uses: actions/setup-python@v3
       - name: Run device api usage normativity in VeOmni/tasks
         run: |
-          python tests/special_senity/check_device_api_usage.py -d tasks
+          python tests/special_sanity/check_device_api_usage.py -d tasks
       - name: Run device api usage normativity in VeOmni/veomni
         run: |
-          python tests/special_senity/check_device_api_usage.py -d veomni
+          python tests/special_sanity/check_device_api_usage.py -d veomni
       - name: Run device api usage normativity in VeOmni/tests
         run: |
-          python tests/special_senity/check_device_api_usage.py -d tests
+          python tests/special_sanity/check_device_api_usage.py -d tests

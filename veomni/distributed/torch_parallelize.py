@@ -27,6 +27,7 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
+from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..models.module_utils import _convert_weight_key as convert_weight_key
 from ..utils import logging
@@ -41,7 +42,12 @@ from .fsdp import (
     register_checkpoint_extension,
 )
 from .parallel_state import get_parallel_state
-from .utils import get_module_from_path, is_same_module_from_path, set_module_from_path, sort_fqn_by_submodule_first
+from .utils import (
+    get_module_from_path,
+    is_same_module_from_path,
+    set_module_from_path,
+    sort_fqn_by_submodule_first,
+)
 
 
 if is_torch_version_greater_than("2.4"):
@@ -86,7 +92,7 @@ def parallelize_model_fsdp1(
     weights_path: Optional[str] = None,
     enable_full_shard: bool = True,
     enable_shard_grad_op: bool = False,
-    enable_mixed_precision: bool = True,
+    mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     use_orig_params: bool = True,
     basic_modules: Optional[List[str]] = None,
     fsdp_no_shard_states=None,
@@ -97,6 +103,7 @@ def parallelize_model_fsdp1(
     """
     Apply ExtraParallel (e.g. Expert Parallel + Embed Parallel + ...) + FSDP1 parallel strategy to the model.
     """
+
     parallel_state = get_parallel_state()
 
     if parallel_state.any_extra_parallel_enabled:
@@ -156,17 +163,19 @@ def parallelize_model_fsdp1(
 
     fsdp_kwargs.update(kwargs.pop("fsdp_kwargs", {}))
 
-    if enable_mixed_precision:
+    if mixed_precision.enable:
         logger.info_rank0("Enable mixed precision training.")
-        mixed_precision = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.float32,
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=getattr(torch, mixed_precision.param_dtype) if mixed_precision.param_dtype else None,
+            reduce_dtype=getattr(torch, mixed_precision.reduce_dtype) if mixed_precision.reduce_dtype else None,
+            buffer_dtype=getattr(torch, mixed_precision.buffer_dtype)
+            if mixed_precision.buffer_dtype
+            else torch.float32,
         )
         if hasattr(model, "get_ignore_modules_in_mixed_precision"):
-            mixed_precision._module_classes_to_ignore += model.get_ignore_modules_in_mixed_precision()
+            mixed_precision_policy._module_classes_to_ignore += model.get_ignore_modules_in_mixed_precision()
 
-        fsdp_kwargs["mixed_precision"] = mixed_precision
+        fsdp_kwargs["mixed_precision"] = mixed_precision_policy
 
     if kwargs.get("init_device") == "cpu":
         logger.info_rank0("Enable rank0-only initialization.")
@@ -180,7 +189,9 @@ def parallelize_model_fsdp1(
 
         shard_states = kwargs.get("shard_states", {})
         if weights_path:
-            shard_states = parallel_load_safetensors(weights_path)
+            shard_states = parallel_load_safetensors(
+                weights_path, cpu_load_param_name=kwargs.get("cpu_load_param_name", None)
+            )
 
         fsdp_kwargs["param_init_fn"] = parallel_init_fsdp_fn(
             model,
@@ -282,7 +293,7 @@ def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     enable_reshard_after_forward: bool = True,
-    enable_mixed_precision: bool = True,
+    mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     **kwargs,
 ) -> "nn.Module":
@@ -309,6 +320,7 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
+
     parallel_state = get_parallel_state()
 
     # Step 0: Get target classes to shard later
@@ -404,10 +416,12 @@ def parallelize_model_fsdp2(
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
     # prepare mp_policy kwargs
-    if enable_mixed_precision:
+    if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            param_dtype=getattr(torch, mixed_precision.param_dtype) if mixed_precision.param_dtype else None,
+            reduce_dtype=getattr(torch, mixed_precision.reduce_dtype) if mixed_precision.reduce_dtype else None,
+            output_dtype=getattr(torch, mixed_precision.output_dtype) if mixed_precision.output_dtype else None,
+            cast_forward_inputs=mixed_precision.cast_forward_inputs,
         )
         fsdp_kwargs["mp_policy"] = mp_policy
 
@@ -460,7 +474,7 @@ def parallelize_model_fsdp2(
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
     if IS_NPU_AVAILABLE and parallel_state.any_extra_parallel_enabled:
-        from veomni.ops.npu_patch.hccl_premul_sum import apply_hccl_premul_sum_patch
+        from veomni.ops.platform.npu import apply_hccl_premul_sum_patch
 
         apply_hccl_premul_sum_patch()
 
@@ -518,7 +532,9 @@ def parallelize_model_fsdp2(
     fully_shard(model, **fsdp_kwargs)
 
     # configure manual prefetching when needed
-    need_manual_prefetch = parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+    need_manual_prefetch = (
+        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+    ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]
@@ -569,7 +585,7 @@ def build_parallelize_model(
     enable_shard_grad_op: bool = False,
     use_orig_params: bool = True,
     enable_reshard_after_forward: bool = True,
-    enable_mixed_precision: bool = True,
+    mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
@@ -577,6 +593,7 @@ def build_parallelize_model(
     """
     Applies parallel strategies to the model.
     """
+
     parallel_state = get_parallel_state()
 
     if not parallel_state.fsdp_enabled:
@@ -585,7 +602,7 @@ def build_parallelize_model(
         if kwargs.pop("enable_fsdp_offload", False):
             raise ValueError("Only FSDP training supports `enable_fsdp_offload`.")
 
-    if enable_mixed_precision:  # upcast to float32 before feed it to optimizer
+    if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
 
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
@@ -616,7 +633,7 @@ def build_parallelize_model(
                 weights_path=weights_path,
                 enable_full_shard=enable_full_shard,
                 enable_reshard_after_forward=enable_reshard_after_forward,
-                enable_mixed_precision=enable_mixed_precision,
+                mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 **kwargs,
             )
@@ -627,20 +644,24 @@ def build_parallelize_model(
                 enable_full_shard=enable_full_shard,
                 enable_shard_grad_op=enable_shard_grad_op,
                 use_orig_params=use_orig_params,
-                enable_mixed_precision=enable_mixed_precision,
+                mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 **kwargs,
             )
         else:
             ddp_kwargs = {"device_ids": [parallel_state.local_rank]}
-            if enable_mixed_precision:
+            if mixed_precision.enable:
                 logger.info_rank0("Enable mixed precision training.")
-                mixed_precision = MixedPrecision(
-                    param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
-                    buffer_dtype=torch.bfloat16,
+                mixed_precision_policy = MixedPrecision(
+                    param_dtype=getattr(torch, mixed_precision.param_dtype) if mixed_precision.param_dtype else None,
+                    reduce_dtype=getattr(torch, mixed_precision.reduce_dtype)
+                    if mixed_precision.reduce_dtype
+                    else None,
+                    buffer_dtype=getattr(torch, mixed_precision.buffer_dtype)
+                    if mixed_precision.buffer_dtype
+                    else torch.bfloat16,
                 )
-                ddp_kwargs["mixed_precision"] = mixed_precision
+                ddp_kwargs["mixed_precision"] = mixed_precision_policy
 
             model = DDP(model, **ddp_kwargs)
 

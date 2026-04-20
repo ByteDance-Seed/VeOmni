@@ -41,7 +41,13 @@ from transformers.modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+
+# Additional imports for patches
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
+)
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -57,12 +63,9 @@ from veomni.ops.dispatch import OpSlot
 
 
 veomni_rms_norm = OpSlot("rms_norm", "standard")
-veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "full")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
 veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
-
-# Additional imports for patches
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
 
 # ======================================================================
@@ -81,6 +84,7 @@ class Qwen3RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
         if veomni_rms_norm.has_kernel:
@@ -113,6 +117,7 @@ class Qwen3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
+    # ── SwiGLU MLP (OpSlot guard, functional Liger kernel) ───────────────────────
     def forward(self, x):
         # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
         if veomni_swiglu_mlp.has_kernel:
@@ -199,6 +204,7 @@ def rotate_half(x):
 # Reason: OpSlot guard for Liger fused RoPE
 # Source: veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
 # ======================================================================
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -421,6 +427,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    # ── Qwen3Model.forward (SP support) ─────────────────────────────────────────
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -516,6 +523,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    # ── Qwen3ForCausalLM.forward (fused cross-entropy via OpSlot) ────────────────
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -580,6 +588,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
+    # ── Qwen3ForSequenceClassification.forward (fused cross-entropy via OpSlot) ──
     def forward(
         self,
         input_ids=None,

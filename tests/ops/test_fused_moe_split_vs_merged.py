@@ -3,10 +3,10 @@ import torch
 import torch.nn.functional as F
 
 from veomni.distributed.moe.moe_layer import EPGroupGemm, EPMergedFc1GroupGemm
-from veomni.ops import fused_moe
-from veomni.ops.fused_moe import fused_moe_forward
-from veomni.ops.fused_moe.group_gemm import group_gemm_fused_moe_forward
-from veomni.ops.group_gemm.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from veomni.ops.kernels import moe as fused_moe
+from veomni.ops.kernels.moe import fused_moe_forward
+from veomni.ops.kernels.moe._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, is_sm90_or_above
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
@@ -265,7 +265,7 @@ def test_ep_quack_split_vs_merged(
     if not is_quack_gemm_available():
         pytest.skip("quack not available or GPU < SM90")
 
-    from veomni.ops.fused_moe.quack_gemm import EPMergedFc1QuackGroupGemm
+    from veomni.ops.kernels.moe.quack_gemm import EPMergedFc1QuackGroupGemm
 
     cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight = _make_ep_inputs(
         num_tokens, num_experts, hidden_dim, ffn_dim, seed
@@ -322,7 +322,7 @@ def test_ep_quack_split(
     if not is_quack_gemm_available():
         pytest.skip("quack not available or GPU < SM90")
 
-    from veomni.ops.fused_moe.quack_gemm import EPQuackGroupGemm
+    from veomni.ops.kernels.moe.quack_gemm import EPQuackGroupGemm
 
     cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, _, fc2_weight = _make_ep_inputs(
         num_tokens, num_experts, hidden_dim, ffn_dim, seed

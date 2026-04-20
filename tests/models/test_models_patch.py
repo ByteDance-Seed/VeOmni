@@ -8,7 +8,15 @@ import pytest
 import torch
 
 from veomni import _apply_patches
-from veomni.arguments import CheckpointConfig, DataArguments, ModelArguments, TrainingArguments
+from veomni.arguments import (
+    AcceleratorConfig,
+    CheckpointConfig,
+    DataArguments,
+    FSDPConfig,
+    MixedPrecisionConfig,
+    ModelArguments,
+    TrainingArguments,
+)
 from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -113,18 +121,19 @@ class TrainerTest(BaseTrainer):
         _apply_patches()
 
         model_name = self.model_config.model_type
-        self.args.model.ops_implementation.attn_implementation = model_mode.attn_implementation
-        self.args.model.ops_implementation.moe_implementation = model_mode.moe_implementation
+        from .utils import _build_ops_config_for_mode
+
+        self.args.model.ops_implementation = _build_ops_config_for_mode(model_mode)
 
         if model_mode.use_liger_kernel:
-            self.args.model.ops_implementation.rms_norm_implementation = "liger"
-            self.args.model.ops_implementation.swiglu_mlp_implementation = "liger"
-            self.args.model.ops_implementation.apply_rotary_pos_emb_implementation = "liger"
-            self.args.model.ops_implementation.cross_entropy_loss_implementation = "liger_fused"
+            self.args.model.ops_implementation.rms_norm_implementation = "liger_kernel"
+            self.args.model.ops_implementation.swiglu_mlp_implementation = "liger_kernel"
+            self.args.model.ops_implementation.rotary_pos_emb_implementation = "liger_kernel"
+            self.args.model.ops_implementation.cross_entropy_loss_implementation = "liger_kernel"
         else:
             self.args.model.ops_implementation.rms_norm_implementation = "eager"
             self.args.model.ops_implementation.swiglu_mlp_implementation = "eager"
-            self.args.model.ops_implementation.apply_rotary_pos_emb_implementation = "eager"
+            self.args.model.ops_implementation.rotary_pos_emb_implementation = "eager"
             self.args.model.ops_implementation.cross_entropy_loss_implementation = "eager"
 
         self._build_model()
@@ -290,6 +299,48 @@ _TEST_CASES_TRANSFORMERS_V5 = [
         _DEFAULT_ATOL,
         id="qwen3_5_moe",
     ),
+    pytest.param(
+        "./tests/toy_config/qwen2vl_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2_vl",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen2_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen25vl_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2_5_vl",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3vl_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_vl",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3vlmoe_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_vl_moe",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3omni_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen3_omni_moe",
+    ),
 ]
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
@@ -339,7 +390,11 @@ def test_models_patch_fwd_bwd(
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
-        enable_mixed_precision=False,
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(
+                mixed_precision=MixedPrecisionConfig(enable=False),
+            ),
+        ),
         enable_full_determinism=True,
         init_device=get_device_type(),
     )

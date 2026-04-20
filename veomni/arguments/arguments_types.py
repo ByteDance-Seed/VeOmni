@@ -16,10 +16,12 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
+from ..utils.import_utils import is_liger_kernel_available
 
 
 logger = logging.get_logger(__name__)
@@ -35,6 +37,7 @@ logger = logging.get_logger(__name__)
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
+#   │   |   └── mixed_precision.* → MixedPrecisionConfig
 #   │   └── offload_config.* → OffloadConfig
 #   └── checkpoint.*         → CheckpointConfig
 #
@@ -177,6 +180,46 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
+class MixedPrecisionConfig:
+    """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
+
+    enable: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision training."},
+    )
+    param_dtype: str = field(
+        default="bfloat16",
+        metadata={"help": "Dtype for the unsharded parameter (DDP, FSDP1, FSDP2)."},
+    )
+    reduce_dtype: str = field(
+        default="float32",
+        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1, FSDP2)."},
+    )
+    buffer_dtype: str = field(
+        default=None,
+        metadata={"help": "Dtype for the buffer (DDP, FSDP1)."},
+    )
+    output_dtype: str = field(
+        default=None,
+        metadata={"help": "Dtype for casting floating-point forward outputs (FSDP2)."},
+    )
+    cast_forward_inputs: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
+    )
+
+    def __post_init__(self):
+        def _check_dtype(dtype: str):
+            if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
+                raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")
+
+        _check_dtype(self.param_dtype)
+        _check_dtype(self.reduce_dtype)
+        _check_dtype(self.buffer_dtype)
+        _check_dtype(self.output_dtype)
+
+
+@dataclass
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
@@ -198,12 +241,13 @@ class FSDPConfig:
     )
     forward_prefetch: bool = field(
         default=True,
-        metadata={"help": "Enable forward prefetch for FSDP1."},
+        metadata={"help": "Enable forward prefetch."},
     )
     offload: bool = field(
         default=False,
         metadata={"help": "Enable CPU offload for FSDP1."},
     )
+    mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
 
 @dataclass
@@ -365,9 +409,9 @@ class TrainingArguments:
         default=200,
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
     )
-    enable_mixed_precision: bool = field(
-        default=True,
-        metadata={"help": "Enable mixed precision training."},
+    dyn_bsz_runtime: Literal["main", "worker"] = field(
+        default="main",
+        metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
@@ -516,7 +560,13 @@ class TrainingArguments:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # dataloader batch size
-        self.dataloader_batch_size = 1 if self.dyn_bsz else self.global_batch_size // acc.dp_size
+        if self.dyn_bsz:
+            if self.dyn_bsz_runtime == "main":
+                self.dataloader_batch_size = 1
+            else:
+                self.dataloader_batch_size = self.global_batch_size // acc.dp_size // self.micro_batch_size
+        else:
+            self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
 
     def _resolve_checkpoint_paths(self):
         ckpt = self.checkpoint
@@ -529,6 +579,15 @@ class TrainingArguments:
                 is_local_rank0=self.local_rank == 0,
                 ckpt_manager=ckpt.manager,
             )
+
+        if ckpt.load_path:
+            load_path = Path(os.path.normpath(os.path.abspath(ckpt.load_path)))
+            output_dir = Path(os.path.normpath(os.path.abspath(ckpt.output_dir)))
+
+            try:
+                load_path.relative_to(output_dir)
+            except ValueError:
+                logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
         # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
@@ -562,7 +621,23 @@ class TrainingArguments:
 
 @dataclass
 class OpsImplementationConfig:
-    """model.ops_implementation.* — Attention / MoE kernel implementation."""
+    """model.ops_implementation.* — Attention, MoE, and fused kernel implementation.
+
+    Each ``*_implementation`` field selects the kernel backend for that operation.
+    The type is ``str`` (not ``Literal``) so that third-party backends can be
+    registered without modifying this class.
+
+    Well-known values:
+
+    - ``"eager"`` (default): PyTorch / HuggingFace reference implementation.
+    - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
+      ``liger-kernel``).
+    - ``"npu"``: Ascend NPU fused implementation (requires ``torch_npu``).
+      Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from
+      ``veomni.ops.kernels.{rms_norm,rotary}.npu``.
+    - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
+      NPU with ``triton-ascend``).
+    """
 
     attn_implementation: Optional[
         Literal[
@@ -588,33 +663,47 @@ class OpsImplementationConfig:
     cross_entropy_loss_implementation: str = field(
         default="eager",
         metadata={
-            "help": "Cross-entropy loss kernel implementation. "
-            "'eager' for standard PyTorch, 'liger_fused' for Liger fused linear CE."
+            "help": "Cross-entropy loss implementation. "
+            "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
+            "'npu' enables chunked loss computation for CausalLM on NPU "
+            "(requires torch_npu). "
+            "'eager' (default) uses PyTorch F.cross_entropy."
         },
-    )
-    moe_load_balancing_loss_implementation: str = field(
-        default="eager",
-        metadata={"help": "MoE load-balancing loss kernel implementation. 'eager' for standard PyTorch."},
     )
     rms_norm_implementation: str = field(
         default="eager",
         metadata={
-            "help": "RMSNorm kernel implementation. "
-            "'eager' for standard PyTorch, 'liger' for LigerKernel fused RMSNorm."
+            "help": "RMSNorm implementation. "
+            "'liger_kernel' uses LigerRMSNorm. "
+            "'npu' uses torch_npu.npu_rms_norm (requires torch_npu). "
+            "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3). "
+            "'eager' (default) uses the HuggingFace default."
         },
     )
     swiglu_mlp_implementation: str = field(
         default="eager",
         metadata={
-            "help": "SwiGLU MLP kernel implementation. "
-            "'eager' for standard PyTorch, 'liger' for LigerKernel fused SwiGLU."
+            "help": "SwiGLU MLP implementation. "
+            "'liger_kernel' uses LigerSwiGLUMLP. "
+            "'eager' (default) uses the HuggingFace default."
         },
     )
-    apply_rotary_pos_emb_implementation: str = field(
+    rotary_pos_emb_implementation: str = field(
         default="eager",
         metadata={
-            "help": "Rotary positional embedding kernel implementation. "
-            "'eager' for standard PyTorch, 'liger' for LigerKernel fused RoPE."
+            "help": "Rotary positional embedding implementation. "
+            "'liger_kernel' uses liger_rotary_pos_emb. "
+            "'npu' uses torch_npu.npu_rotary_mul (requires torch_npu). "
+            "'triton' uses deterministic Triton bmm kernel (DeepSeek V3). "
+            "'eager' (default) uses the HuggingFace default."
+        },
+    )
+    load_balancing_loss_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "MoE load-balancing loss implementation. "
+            "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
+            "'eager' (default) uses PyTorch reference."
         },
     )
 
@@ -634,6 +723,32 @@ class OpsImplementationConfig:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
+
+        self._validate_implementations()
+
+    def _validate_implementations(self):
+        """Validate that requested backends are actually available.
+
+        Walks the kernel registry so new ops/backends are discovered
+        automatically.  Importing ``veomni.ops`` here is what triggers every
+        op module to call ``register_op``.
+        """
+        from ..ops import config as ops_config_pkg  # noqa: F401  import side-effect
+        from ..ops.config.registry import list_ops
+
+        for op in list_ops():
+            value = getattr(self, op.config_field)
+            backend = op.backends.get(value)
+            if backend is None:
+                continue
+            for pkg in backend.requires:
+                if pkg == "liger_kernel" and not is_liger_kernel_available():
+                    raise ValueError(f"{op.config_field}='{value}' requires liger-kernel to be installed.")
+                if pkg == "torch_npu":
+                    from ..utils.import_utils import is_torch_npu_available
+
+                    if not is_torch_npu_available():
+                        raise ValueError(f"{op.config_field}='{value}' requires torch_npu to be installed.")
 
 
 @dataclass
@@ -765,6 +880,10 @@ class DataloaderConfig:
     num_workers: int = field(
         default=2,
         metadata={"help": "Number of workers to load data."},
+    )
+    worker_num_threads: Optional[int] = field(
+        default=None,
+        metadata={"help": "Per-worker torch thread count for dataloader subprocesses."},
     )
     prefetch_factor: int = field(
         default=2,

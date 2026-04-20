@@ -23,7 +23,7 @@ import torch.nn as nn
 
 # Deferred imports inside _save_hf_safetensor_distributed:
 #   from torch.distributed.checkpoint import HuggingFaceStorageWriter   (line 90)
-#   from veomni.ops.dcp_consolidation import apply_dcp_consolidation_patch  (line 95)
+#   from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch  (line 95)
 #
 # These are NOT module-level attributes of save_safetensor_utils, so we must
 # patch them at their *source* module rather than the consumer.
@@ -69,7 +69,7 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
     with (
         # --- deferred imports: patch at source ---
         patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
-        patch("veomni.ops.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+        patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
         # --- module-level imports: patch on consumer ---
         patch(f"{_MOD}.get_model_save_state", mock_get_state),
         patch(f"{_MOD}.dcp", MagicMock(save=mock_dcp_save)),
@@ -252,7 +252,7 @@ class TestExecutionOrdering(unittest.TestCase):
 
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock(side_effect=fake_writer)),
-            patch("veomni.ops.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
             patch(f"{_MOD}.get_model_save_state", fake_get_state),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", MagicMock(is_initialized=MagicMock(return_value=False))),

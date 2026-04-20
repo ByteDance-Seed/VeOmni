@@ -12,6 +12,11 @@ data:
   mm_configs:
     image_max_pixels: 602112 # 28 * 28 * 768
     video_max_pixels: 602112 # 28 * 28 * 768
+    # Dynamic per-frame video resolution budget (official Qwen3-VL behavior).
+    # Formula: max_seq_len * (patch_size * merge_size)^2 * 0.9
+    # With max_seq_len=4096, patch=14, merge=2: 4096 * 28^2 * 0.9 ≈ 2889523
+    # Set higher (e.g. 128000 * 784 * 0.9) to match official inference defaults.
+    video_total_pixels: 2889523
     max_frames: 16
     fps: 2.0
     use_audio_in_video: false

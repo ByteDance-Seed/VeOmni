@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import copy
 import os
 import random
+import traceback
 from functools import partial
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
+import numpy as np
 import torch
 from datasets import IterableDataset as HFIterableDataset
 from datasets import interleave_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
 from huggingface_hub import hf_hub_download
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from ..utils.registry import Registry
 
@@ -249,6 +251,842 @@ class EnergonDataset(IterativeDataset):
             logger.debug(f"Dataset {type(self._data).__name__} does not support set_epoch or state reset")
 
 
+def get_length_by_attention_mask_fn(sample):
+    """Return token length from ``attention_mask``.
+
+    Defined as a top-level helper instead of an inline lambda because ``spawn``
+    worker mode requires the callable to be pickleable.
+    """
+    return int(sample["attention_mask"].sum())
+
+
+def _supports_output_index_for_resume(dataset: Any) -> bool:
+    return callable(getattr(dataset, "get_item", None)) and hasattr(dataset, "output_index_for_resume")
+
+
+class WeightedMultiSourceDataset(IterableDataset):
+    """Multi-source dataset with weighted sampling.
+
+    This dataset samples from multiple upstream iterable datasets according to a
+    (possibly token-adjusted) weight distribution.
+
+    It supports:
+    - Per-epoch deterministic randomness (seeded by epoch, dp rank, and worker id).
+    - Optional distributed sharding behavior controlled by ``upstream_sharded``.
+    - Stopping strategies for how to behave when an upstream source is exhausted.
+    - Optional resume-index passthrough for checkpointing buffers by index.
+    """
+
+    def __init__(
+        self,
+        datasets: Sequence[IterableDataset],
+        weights: Sequence[float],
+        seed: int = 42,
+        level: Literal["sample", "token"] = "sample",
+        sample_token_len_fn: Optional[Callable[[Any], float]] = None,
+        source_names: Optional[Sequence[str]] = None,
+        source_ids: Optional[Sequence[str]] = None,
+        upstream_sharded: bool = False,
+        stopping_strategy: Literal["first_exhausted", "all_exhausted", "never_exhausted"] = "first_exhausted",
+        output_index_for_resume: bool = False,
+    ) -> None:
+        """Initialize a WeightedMultiSourceDataset.
+
+        Args:
+            datasets: Upstream iterable datasets (one per source).
+            weights: Sampling weights aligned with ``datasets``.
+            seed: Base random seed.
+            level: Sampling level. ``sample`` uses ``weights`` directly; ``token`` reweights
+                by the inverse of the running average token length per source.
+            sample_token_len_fn: Function that returns the token length of a sample.
+                If not provided, a default heuristic is used.
+            source_names: Optional display names for each source (for meta fields).
+            source_ids: Optional stable IDs for each source (used in checkpoint state).
+            upstream_sharded: If False, performs deterministic modulo-based sharding by
+                dp rank on the produced samples. If True, assumes upstream datasets
+                already handle sharding/splitting.
+            stopping_strategy:
+                - ``first_exhausted``: Stop the whole dataset once any source is exhausted.
+                - ``all_exhausted``: Restart an exhausted source until all sources are exhausted.
+                - ``never_exhausted``: Always restart exhausted sources and never terminate.
+            output_index_for_resume: If True, yields ``(sample, (source_id, output_index))``
+                so downstream components can checkpoint buffers by output indices
+                and reconstruct them later.
+
+        Raises:
+            ValueError: If input arguments are invalid.
+        """
+        self._datasets = list(datasets)
+        self._weights = np.asarray(weights, dtype=np.float64)
+        self._seed = seed
+        self._level = level
+        self._sample_token_len_fn = sample_token_len_fn or self._default_sample_token_len
+        self._source_names = list(source_names) if source_names is not None else None
+        self._source_ids = list(source_ids) if source_ids is not None else []
+        self._upstream_sharded = upstream_sharded
+        self._stopping_strategy = stopping_strategy
+        self._ds_num = len(self._datasets)
+
+        if not self._source_names:
+            self._source_names = []
+            for i, dataset in enumerate(self._datasets):
+                if callable(getattr(dataset, "get_name", None)):
+                    self._source_names.append(dataset.get_name())
+                else:
+                    self._source_names.append(f"source_{i}")
+
+        if not self._source_ids:
+            self._source_ids = copy.deepcopy(self._source_names)
+
+        self._id2dataset = {
+            source_id: (dataset, ds_idx)
+            for ds_idx, (source_id, dataset) in enumerate(zip(self._source_ids, self._datasets))
+        }
+        self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
+        self._avg_len_count = [0 for _ in range(self._ds_num)]
+        self._global_sample_idx = 0
+        self._random_state = np.random.RandomState(seed=self._seed)
+        self._iters: List[Any] = []
+        self._epoch = 0
+        self._exhausted = [False for _ in range(self._ds_num)]
+        if self._weights.shape[0] != self._ds_num:
+            raise ValueError("weights length must match datasets length")
+        if self._source_names is not None and len(self._source_names) != self._ds_num:
+            raise ValueError("source_names length must match datasets length")
+        if len(self._source_ids) != self._ds_num:
+            raise ValueError("source_ids length must match datasets length")
+        if len(set(self._source_ids)) != self._ds_num:
+            raise ValueError("source_ids must be unique")
+        if self._level not in ("sample", "token"):
+            raise ValueError("level must be 'sample' or 'token'")
+        if self._stopping_strategy not in ("first_exhausted", "all_exhausted", "never_exhausted"):
+            raise ValueError("stopping_strategy must be 'first_exhausted', 'all_exhausted', or 'never_exhausted'")
+
+        parallel_state = get_parallel_state()
+        self.dp_rank = max(0, int(getattr(parallel_state, "dp_rank", 0)))
+        self.dp_size = max(1, int(getattr(parallel_state, "dp_size", 1)))
+
+        self.output_index_for_resume = output_index_for_resume
+
+        self._just_resumed = False
+
+    @property
+    def output_index_for_resume(self) -> bool:
+        """Whether to yield output indices alongside samples for resume."""
+        return self._output_index_for_resume
+
+    @output_index_for_resume.setter
+    def output_index_for_resume(self, value: bool) -> None:
+        """Enable or disable output-index emission for resume.
+
+        When enabled, each upstream dataset must provide:
+        - ``get_item(idx)`` to fetch a sample by index
+        - ``output_index_for_resume`` attribute to switch yielding ``(sample, idx)``
+
+        Args:
+            value: True to emit output indices for resume, False to disable.
+
+        Raises:
+            ValueError: If any upstream dataset cannot emit output indices for resume.
+        """
+        if value:
+            for source_id, (dataset, _ds_idx) in self._id2dataset.items():
+                if not _supports_output_index_for_resume(dataset):
+                    raise ValueError(
+                        f"output_index_for_resume is True, but dataset '{source_id}' does not have "
+                        f"get_item method or output_index_for_resume attribute to resume samples "
+                        f"in buffers based on idx"
+                    )
+        self._output_index_for_resume = value
+        for dataset in self._datasets:
+            if hasattr(dataset, "output_index_for_resume"):
+                dataset.output_index_for_resume = value
+
+    def get_item(self, resume_index):
+        """Fetch a single sample by its source ID and index within that source.
+
+        This is used by downstream checkpoint/resume logic that stores buffer
+        contents as ``(source_id, idx)`` pairs instead of full samples.
+
+        Args:
+            resume_index: A ``(source_id, idx)`` tuple. ``source_id`` identifies the
+                sub-dataset, and ``idx`` is the 0-based index within that sub-dataset.
+
+        Returns:
+            The sample returned by the underlying sub-dataset.
+
+        Raises:
+            AttributeError: If the underlying sub-dataset does not provide an index-based fetch API.
+        """
+        source_id, idx = resume_index
+        dataset, ds_idx = self._id2dataset[source_id]
+        get_item_fn = getattr(dataset, "get_item", None)
+        if callable(get_item_fn):
+            sample = get_item_fn(idx)
+            sample = self._attach_meta(sample, ds_idx)
+            return sample
+        raise AttributeError(f"dataset '{source_id}' does not implement get_item")
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch for deterministic sampling.
+
+        Args:
+            epoch: Current epoch number.
+        """
+        self._epoch = epoch
+        for dataset in self._datasets:
+            set_epoch_fn = getattr(dataset, "set_epoch", None)
+            if callable(set_epoch_fn):
+                set_epoch_fn(epoch)
+
+    def __iter__(self):
+        """Iterate and yield samples from multiple sources.
+
+        Yields:
+            If ``output_index_for_resume`` is False, yields a sample.
+            If ``output_index_for_resume`` is True, yields
+            ``(sample, (source_id, output_index))``.
+        """
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        if not self._just_resumed:
+            seed_seq = np.random.SeedSequence([self._seed, self._epoch, self.dp_rank, worker_id])
+            current_seed = int(seed_seq.generate_state(1, dtype=np.uint32)[0])
+            self._random_state = np.random.RandomState(current_seed)
+            self._exhausted = [False for _ in range(self._ds_num)]
+            self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
+            self._avg_len_count = [0 for _ in range(self._ds_num)]
+            self._global_sample_idx = 0
+        else:
+            self._just_resumed = False
+
+        self._iters = [iter(ds) for ds in self._datasets]
+        while True:
+            ds_idx = self._random_state.choice(self._ds_num, p=self._runtime_weights())
+            try:
+                sample = self._next_sample(ds_idx)
+            except StopIteration:
+                return
+            if sample is None:
+                continue
+
+            if self._output_index_for_resume:
+                sample, output_index = sample[0], sample[1]
+
+            token_len = self._sample_token_len_fn(sample)
+            if token_len <= 0:
+                continue
+            if self._level == "token":
+                self._avg_len_sum[ds_idx] += token_len
+                self._avg_len_count[ds_idx] += 1
+            self._global_sample_idx += 1
+            if not self._upstream_sharded and self._global_sample_idx % self.dp_size != self.dp_rank:
+                continue
+
+            sample = self._attach_meta(sample, ds_idx)
+
+            if self._output_index_for_resume:
+                yield sample, (self._source_ids[ds_idx], output_index)
+            else:
+                yield sample
+
+    def _runtime_weights(self) -> np.ndarray:
+        """Compute the per-source sampling probabilities for the current runtime state.
+
+        Returns:
+            A probability vector of shape ``(num_sources,)`` that sums to 1.
+
+        Raises:
+            ValueError: If the weight sum is non-positive.
+        """
+        if self._level == "sample":
+            weights = self._weights
+        else:
+            avg_lens = []
+            for idx in range(self._ds_num):
+                if self._avg_len_count[idx] > 0:
+                    avg_lens.append(self._avg_len_sum[idx] / self._avg_len_count[idx])
+                else:
+                    avg_lens.append(1.0)
+            weights = self._weights / np.asarray(avg_lens, dtype=np.float64)
+        total = float(np.sum(weights))
+        if total <= 0:
+            raise ValueError("sum of weights must be positive")
+        return weights / total
+
+    def _next_sample(self, ds_idx: int) -> Any:
+        """Fetch the next sample from a specific sub-dataset index.
+
+        Args:
+            ds_idx: Index of the sub-dataset to fetch from.
+
+        Returns:
+            The next sample from the chosen sub-dataset.
+
+        Raises:
+            StopIteration: When the dataset terminates under the configured stopping strategy.
+        """
+        while True:
+            try:
+                return next(self._iters[ds_idx])
+            except StopIteration:
+                if self._stopping_strategy == "first_exhausted":
+                    raise
+                if self._stopping_strategy == "all_exhausted":
+                    self._exhausted[ds_idx] = True
+                    if all(self._exhausted):
+                        raise
+                elif self._stopping_strategy == "never_exhausted":
+                    self._exhausted[ds_idx] = True
+                    if all(self._exhausted):
+                        self._exhausted = [False for _ in range(self._ds_num)]
+                logger.warning(
+                    f"Data source #{ds_idx} (source_name: {self._source_names[ds_idx]}) is exhausted, reset and continue"
+                )
+                self._iters[ds_idx] = iter(self._datasets[ds_idx])
+                try:
+                    return next(self._iters[ds_idx])
+                except StopIteration as e:
+                    raise RuntimeError(
+                        f"Data source #{ds_idx} (source_name: {self._source_names[ds_idx]}) remains exhausted "
+                        "immediately after reset"
+                    ) from e
+
+    def _attach_meta(self, sample: Any, ds_idx: int) -> Any:
+        """Attach per-source metadata fields onto a sample.
+
+        Adds:
+            - ``ds_idx``: the integer source index
+            - ``source_name``: optional display name if provided
+
+        Args:
+            sample: A sample or list of samples.
+            ds_idx: Source index for this sample.
+
+        Returns:
+            The updated sample (mutated in place when possible).
+        """
+        source_name = self._source_names[ds_idx] if self._source_names is not None else None
+        if isinstance(sample, list):
+            for item in sample:
+                if isinstance(item, dict):
+                    item["ds_idx"] = ds_idx
+                    if source_name is not None:
+                        item["source_name"] = source_name
+            return sample
+        if isinstance(sample, dict):
+            sample["ds_idx"] = ds_idx
+            if source_name is not None:
+                sample["source_name"] = source_name
+        return sample
+
+    def _default_sample_token_len(self, sample: Any) -> float:
+        """Default heuristic to estimate token length of a sample.
+
+        Args:
+            sample: A single sample or a list of samples.
+
+        Returns:
+            Estimated token length as a float.
+        """
+        if sample is None:
+            return 0
+        if isinstance(sample, list):
+            return float(sum(self._default_sample_token_len(item) for item in sample))
+        if not isinstance(sample, dict):
+            return 1.0
+        if "attention_mask" in sample:
+            attention_mask = sample["attention_mask"]
+            if isinstance(attention_mask, torch.Tensor):
+                return float(attention_mask.sum().item())
+            if isinstance(attention_mask, list):
+                return float(sum(attention_mask))
+        if "input_ids" in sample:
+            input_ids = sample["input_ids"]
+            if isinstance(input_ids, torch.Tensor):
+                return float(input_ids.numel())
+            if isinstance(input_ids, list):
+                return float(len(input_ids))
+        return 1.0
+
+    def state_dict(self) -> dict:
+        """Return a checkpointable state dict for this dataset."""
+        dataset_states_by_id = {}
+        for dataset, source_id in zip(self._datasets, self._source_ids):
+            state_fn = getattr(dataset, "state_dict", None)
+            getstate_fn = getattr(dataset, "__getstate__", None)
+            if callable(state_fn):
+                ds_state = state_fn()
+            elif callable(getstate_fn):
+                ds_state = getstate_fn()
+            else:
+                ds_state = None
+            dataset_states_by_id[source_id] = ds_state
+        avg_len_sum_by_id = {source_id: self._avg_len_sum[idx] for idx, source_id in enumerate(self._source_ids)}
+        avg_len_count_by_id = {source_id: self._avg_len_count[idx] for idx, source_id in enumerate(self._source_ids)}
+        # save _exhausted state
+        exhausted_by_id = {source_id: self._exhausted[idx] for idx, source_id in enumerate(self._source_ids)}
+        return {
+            "version": 0,
+            "topology": {
+                "source_ids": list(self._source_ids),
+                "source_names": list(self._source_names) if self._source_names is not None else None,
+                "weights": self._weights.tolist(),
+                "level": self._level,
+                "stopping_strategy": self._stopping_strategy,
+            },
+            "runtime": {
+                "random_state": self._random_state.get_state(),
+                "avg_len_sum": avg_len_sum_by_id,
+                "avg_len_count": avg_len_count_by_id,
+                "exhausted": exhausted_by_id,
+                "global_sample_idx": self._global_sample_idx,
+                "dataset_states": dataset_states_by_id,
+            },
+        }
+
+    def load_state_dict(
+        self,
+        state: dict,
+        reconcile_policy: Literal["strict", "allow_add", "allow_add_remove", "warn_only"] = "allow_add_remove",
+    ) -> None:
+        """Restore state from a previous ``state_dict()``.
+
+        Args:
+            state: State dict previously produced by ``state_dict()``.
+            reconcile_policy: Policy for handling source-id changes:
+                - ``strict``: error on any added/removed source.
+                - ``allow_add``: allow new sources but error on removed ones.
+                - ``allow_add_remove``: allow both add and remove.
+                - ``warn_only``: allow changes and log a warning.
+
+        Raises:
+            ValueError: If required state fields are missing or incompatible.
+        """
+        if "topology" not in state or "runtime" not in state:
+            raise ValueError("state_dict missing required keys: topology/runtime")
+        runtime = state["runtime"]
+        topology = state["topology"]
+        if "source_ids" not in topology:
+            raise ValueError("state_dict missing topology.source_ids")
+        saved_source_ids = topology["source_ids"]
+        added = []
+        removed = []
+        if saved_source_ids is not None:
+            saved_set = set(saved_source_ids)
+            added = [source_id for source_id in self._source_ids if source_id not in saved_set]
+            removed = [source_id for source_id in saved_source_ids if source_id not in set(self._source_ids)]
+            if added or removed:
+                if reconcile_policy == "strict":
+                    raise ValueError(
+                        f"source_ids mismatch: added={added} removed={removed} with policy={reconcile_policy}"
+                    )
+                if reconcile_policy == "allow_add" and removed:
+                    raise ValueError(
+                        f"source_ids removed not allowed: removed={removed} with policy={reconcile_policy}"
+                    )
+                if reconcile_policy == "warn_only":
+                    logger.warning(
+                        f"source_ids changed: added={added} removed={removed} with policy={reconcile_policy}"
+                    )
+        random_state = runtime["random_state"]
+        self._random_state.set_state(random_state)
+        avg_len_sum = runtime["avg_len_sum"]
+        avg_len_count = runtime["avg_len_count"]
+        if not isinstance(avg_len_sum, dict) or not isinstance(avg_len_count, dict):
+            raise ValueError("runtime.avg_len_sum and runtime.avg_len_count must be dicts keyed by source_id")
+        self._avg_len_sum = [float(avg_len_sum.get(source_id, 0.0)) for source_id in self._source_ids]
+        self._avg_len_count = [int(avg_len_count.get(source_id, 0)) for source_id in self._source_ids]
+        self._global_sample_idx = runtime.get("global_sample_idx", 0)
+        dataset_states = runtime["dataset_states"]
+        if not isinstance(dataset_states, dict):
+            raise ValueError("runtime.dataset_states must be a dict keyed by source_id")
+        dataset_states_by_id = dataset_states
+        for dataset, source_id in zip(self._datasets, self._source_ids):
+            ds_state = dataset_states_by_id.get(source_id)
+            if ds_state is None:
+                continue
+            load_state_fn = getattr(dataset, "load_state_dict", None)
+            if callable(load_state_fn):
+                load_state_fn(ds_state)
+
+        # Ensure _exhausted is re-initialized for the current source count
+        # This is important when sources are added/removed during checkpoint resume
+        if "exhausted" in runtime and isinstance(runtime["exhausted"], dict):
+            exhausted_dict = runtime["exhausted"]
+            self._exhausted = [bool(exhausted_dict.get(source_id, False)) for source_id in self._source_ids]
+        else:
+            self._exhausted = [False for _ in range(self._ds_num)]
+
+        self._just_resumed = True
+
+
+class DynamicBatchingSizeDataset(IterableDataset):
+    """Dynamic batching dataset that yields micro batches based on token count.
+
+    Unlike ``DynamicBatchSizeDataLoader``, which constructs micro batches in the
+    main process after fetching from a plain DataLoader, ``DynamicBatchingSizeDataset``
+    performs batching inside each DataLoader worker process.
+    It is also compatible with ``StatefulDataLoader``'s per-worker ``state_dict()`` /
+    ``load_state_dict()`` mechanism, enabling exact checkpoint / resume for dynamic-batching workloads.
+
+    Internally each worker maintains a sample buffer.  A micro batch is emitted once
+    the buffer holds at least ``ready_for_micro_batch_threshold`` samples **and** their
+    combined token count reaches ``micro_batch_seq_length``.  When the upstream dataset
+    is exhausted, remaining buffer contents are drained and emitted as final batches
+    regardless of the threshold.
+
+    Attributes:
+        dataset: The upstream iterable dataset to read samples from.
+        ready_for_micro_batch_threshold: Minimum number of samples that must be in the
+            buffer before a microbatch can be formed.
+        micro_batch_seq_length: Target total token count per micro batch (soft upper
+            bound; may be exceeded by a single overlong sample when
+            ``force_generate_long_sequence`` is True).
+        get_length_fn: Function that returns the token count of a single sample.
+        save_by_idx: Whether to checkpoint the buffer as sample indices (smaller checkpoint size)
+            rather than full sample tensors.
+        force_generate_long_sequence: If True, a sample whose length alone exceeds
+            ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
+            being silently discarded. This is not supported yet.
+    """
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        micro_batch_seq_length: int,
+        ready_for_micro_batch_threshold: int,
+        dynamic_batching_collate_fn: Callable,
+        save_by_idx: bool = True,
+        get_length_fn: Optional[Callable] = get_length_by_attention_mask_fn,
+        force_generate_long_sequence: bool = False,
+    ) -> None:
+        """Initialize the DynamicBatchingSizeDataset.
+
+        Args:
+            dataset: The underlying iterable dataset to batch from.
+            micro_batch_seq_length: Target total token count per micro batch.
+            ready_for_micro_batch_threshold: Minimum number of samples required in
+                buffer before attempting to create a batch.
+            save_by_idx: If True, saves sample indices for checkpoint resumption.
+                Requires dataset to have get_item method and output_index_for_resume attribute.
+            get_length_fn: Function to compute the length (token count) of a sample.
+                Defaults to len.
+            force_generate_long_sequence: If True, a sample whose length alone exceeds
+                ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
+                being silently discarded. This is not supported yet.
+
+        Resume flow when ``save_by_idx=True``::
+
+            Runtime path
+            ------------
+            DynamicBatchingSizeDataset
+            +- sets dataset.output_index_for_resume = True
+            +- reads from dataset.__iter__()
+            |  `- WeightedMultiSourceDataset.__iter__()
+            |     +- reads from source dataset 'zh'.__iter__()
+            |     +- gets inner_index = 17 from source dataset 'zh'
+            |     +- sample comes from source_dataset['zh'].get_item(17)
+            |     |  `- [
+            |     |      {'input_ids': [11, 22], 'attention_mask': [1, 1]},
+            |     |      {'input_ids': [33], 'attention_mask': [1]},
+            |     |     ]
+            |     `- yields ([...], ('zh', 17))
+            `- keeps
+               +- runtime buffer: [
+               |     ({'input_ids': [11, 22], 'attention_mask': [1, 1]}, 2),
+               |     ({'input_ids': [33], 'attention_mask': [1]}, 1),
+               |  ]
+               `- checkpoint buffer: [(('zh', 17), 0), (('zh', 17), 1)]
+
+            Resume path
+            -----------
+            checkpoint['buffer']
+            `- [(('zh', 17), 0), (('zh', 17), 1)]
+               `- load_state_dict()
+                  +- WeightedMultiSourceDataset.get_item(('zh', 17))
+                  |  +- 'zh' -> select source dataset 'zh'
+                  |  `- 17 -> source_dataset['zh'].get_item(17)
+                  `- select sample_idx=1 from the returned list
+
+        Raises:
+            ValueError: If ``save_by_idx`` is True but ``dataset`` does not expose the
+                ``get_item()`` method and ``output_index_for_resume`` attribute required to
+                reconstruct the buffer from indices on resume.
+        """
+        if not isinstance(dataset, IterableDataset):
+            raise TypeError(
+                f"DynamicBatchingSizeDataset does not support Mapping style datasets now, the dataset's type must be IterableDataset, got {type(dataset).__name__}"
+            )
+        self.dataset = dataset
+        self.dynamic_batching_collate_fn = dynamic_batching_collate_fn
+        self.ready_for_micro_batch_threshold = ready_for_micro_batch_threshold
+        self.micro_batch_seq_length = micro_batch_seq_length
+        self.get_length_fn = get_length_fn
+
+        self.save_by_idx = save_by_idx
+
+        if force_generate_long_sequence:
+            raise ValueError("force_generate_long_sequence is not supported yet.")
+        self.force_generate_long_sequence = force_generate_long_sequence
+
+        self._buffer = []
+        self._buffer_of_output_index = []
+        self._buffer_token_count = 0
+
+        self._just_resumed = False  # Flag to indicate if the dataset has just been resumed from a checkpoint, used to skip buffer checks on the first iteration after resume.
+
+    @property
+    def save_by_idx(self) -> bool:
+        return self._save_by_idx
+
+    @save_by_idx.setter
+    def save_by_idx(self, value: bool) -> None:
+        if value and not _supports_output_index_for_resume(self.dataset):
+            raise ValueError(
+                "save_by_idx is True, but dataset does not have get_item method or output_index_for_resume attribute to resume samples in buffers based on idx"
+            )
+        self._save_by_idx = value
+        if hasattr(self.dataset, "output_index_for_resume"):
+            self.dataset.output_index_for_resume = value
+
+    def __iter__(self):
+        """Iterate over the dataset and yield dynamically batched micro batches.
+
+        Buffers samples from the underlying dataset and yields micro batches when
+        the buffer contains enough samples and tokens. Each yielded batch is collated
+        using the dynamic_batching_collate_fn.
+
+        Yields:
+            Collated micro batch when buffer conditions are met.
+
+        Raises:
+            Exception: Re-raises any exception other than StopIteration encountered
+                during iteration.
+        """
+        self._data_iter = iter(self.dataset)
+
+        if not self._just_resumed:
+            # Clear buffer state on new iteration unless we just resumed from a checkpoint,
+            # in which case we want to keep the buffer contents.
+            self._buffer = []
+            self._buffer_of_output_index = []
+            self._buffer_token_count = 0
+        else:
+            self._just_resumed = False
+
+        while True:
+            try:
+                if (
+                    len(self._buffer) >= self.ready_for_micro_batch_threshold
+                    and self._buffer_token_count >= self.micro_batch_seq_length
+                ):
+                    micro_batch = self._get_micro_batch()
+                    micro_batch = self.dynamic_batching_collate_fn(micro_batch)
+                    if micro_batch is not None:
+                        yield micro_batch
+                    else:
+                        logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
+
+                item = next(self._data_iter)
+                if self.save_by_idx:
+                    item, output_index = item
+                else:
+                    output_index = None
+
+                samples_to_add = item if isinstance(item, list) else [item]
+                for sample_idx, sample in enumerate(samples_to_add):
+                    length = self.get_length_fn(sample)
+                    if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
+                        # TODO: record the count of discarded long examples for monitoring
+                        logger.warning(
+                            f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
+                        )
+                        continue
+
+                    self._buffer.append((sample, length))
+                    if self.save_by_idx:
+                        # Save one output-index entry per buffered sample.
+                        # An upstream dataset may yield ``list[dict]`` in one
+                        # iteration, and ``sample_idx`` selects the buffered
+                        # sample within that list during resume.
+                        self._buffer_of_output_index.append((output_index, sample_idx))
+                    self._buffer_token_count += length
+
+            except Exception as e:
+                if isinstance(e, StopIteration):
+                    while len(self._buffer) > 0:
+                        micro_batch = self._get_micro_batch()
+                        micro_batch = self.dynamic_batching_collate_fn(micro_batch)
+                        if micro_batch is not None:
+                            yield micro_batch
+                        else:
+                            logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
+                    return
+                else:
+                    logger.error(f"DynamicBatchDataset iter data exception: {e} \n{traceback.format_exc()}")
+                    raise
+
+    def _get_micro_batch(self):
+        """Construct a micro batch from buffered samples using a greedy first-fit strategy.
+
+        Iterates the buffer in order and greedily adds each sample whose length fits
+        within the remaining token budget (``micro_batch_seq_length - seq_length``).
+        Samples that do not fit are left in the buffer for subsequent batches.
+
+        Special case: when the buffer's first sample alone exceeds
+        ``micro_batch_seq_length`` and ``force_generate_long_sequence`` is True, that
+        sample is taken unconditionally (``seq_length == 0`` guard) so that the dataset
+        never stalls on an overlong sequence.
+
+        Returns:
+            list: Non-empty list of samples forming the micro batch.
+
+        Raises:
+            AssertionError: If no sample could be selected (should never happen under
+                normal operation).
+        """
+        micro_batch = []
+        seq_length = 0
+        indices_to_remove_from_buffer = []
+
+        for idx, item in enumerate(self._buffer):
+            sample, length = item[0], item[1]
+
+            if length + seq_length > self.micro_batch_seq_length:
+                if seq_length > 0:
+                    continue
+                elif not self.force_generate_long_sequence:
+                    # Usually it is impossible to reach this branch because too long samples would not be added to the buffer if force_generate_long_sequence is False.
+                    continue
+
+            micro_batch.append(sample)
+            seq_length += length
+            self._buffer_token_count -= length
+            indices_to_remove_from_buffer.append(idx)
+
+            if seq_length >= self.micro_batch_seq_length:
+                break
+
+        # Remove selected items from buffer (iterate backwards to maintain indices)
+        for idx in reversed(indices_to_remove_from_buffer):
+            del self._buffer[idx]
+            if self.save_by_idx:
+                del self._buffer_of_output_index[idx]
+
+        assert len(micro_batch) > 0
+        return micro_batch
+
+    def state_dict(self):
+        """Get the state dictionary for checkpointing.
+
+        Saves the current buffer state and token count. If save_by_idx is True,
+        only saves sample indices; otherwise saves the full buffer contents.
+        Also saves the upstream dataset state if available.
+
+        Returns:
+            dict: State dictionary containing:
+                - save_by_idx: Whether indices are saved instead of samples.
+                - buffer_token_count: Total token count in the buffer.
+                - buffer: Buffered samples or their indices.
+                - dynamic_batch_upstream_dataset_state: Upstream dataset state (if available).
+        """
+        state = {
+            "save_by_idx": self.save_by_idx,
+            # Make sure we store an integer instead of any tensor
+            "buffer_token_count": int(self._buffer_token_count),
+        }
+
+        # the state_dict might be called frequently with StatefulDataloaders(see more details of snapshot_every_n_steps)
+        # so we try to not include extra calculations here.
+        if self.save_by_idx:
+            state["buffer"] = copy.deepcopy(self._buffer_of_output_index)
+        else:
+            # deepcopy buffer so that it can be transfered through multiple processes
+            state["buffer"] = copy.deepcopy(self._buffer)
+
+        if hasattr(self.dataset, "state_dict"):
+            state["dynamic_batch_upstream_dataset_state"] = self.dataset.state_dict()
+
+        return state
+
+    def load_state_dict(self, state_dict):
+        """Load state from a checkpoint.
+
+        Restores the buffer and token count from a saved state. Handles both
+        index-based and full-sample buffer restoration based on the saved state.
+        Also restores the upstream dataset state if available.
+
+        Args:
+            state_dict: State dictionary from a previous checkpoint, containing:
+                - save_by_idx: Whether the saved buffer contains indices.
+                - buffer: Saved buffer (samples or indices).
+                - buffer_token_count: Saved token count.
+                - dynamic_batch_upstream_dataset_state: Upstream dataset state (optional).
+
+        Raises:
+            AssertionError: If the restored ``buffer_token_count`` does not match the
+                sum of token lengths recomputed from the reconstructed buffer.
+            ValueError: If ``save_by_idx`` is True on the current instance but the
+                checkpoint buffer holds some full samples instead of indices (incompatible
+                checkpoint format).
+        """
+        # prev_save_by_idx does not have to be equal to self.save_by_idx, however, we still need to resume the buffer according to it.
+        prev_save_by_idx = state_dict["save_by_idx"]
+        if prev_save_by_idx:
+            self._buffer = []
+            self._buffer_of_output_index = []
+            cached_output_index = None
+            cached_restored_samples = None
+            for output_index_entry in state_dict["buffer"]:
+                # Each checkpoint entry points to exactly one buffered sample:
+                # ``output_index`` identifies the upstream item and ``sample_idx``
+                # selects one sample after flattening a possible ``list[dict]``.
+                output_index, sample_idx = output_index_entry
+                if output_index != cached_output_index:
+                    restored_item = self.dataset.get_item(output_index)
+                    cached_restored_samples = restored_item if isinstance(restored_item, list) else [restored_item]
+                    cached_output_index = output_index
+                restored_sample = cached_restored_samples[sample_idx]
+                length = self.get_length_fn(restored_sample)
+                self._buffer.append((restored_sample, length))
+                if self.save_by_idx:
+                    self._buffer_of_output_index.append(output_index_entry)
+                self._buffer_token_count += length
+        else:
+            self._buffer = state_dict["buffer"]
+            if self.save_by_idx and len(self._buffer) > 0:
+                raise ValueError("save_by_idx is True, but previous buffer contains valid samples instead of indices")
+            self._buffer_of_output_index = []
+
+        self._buffer_token_count = state_dict["buffer_token_count"]
+        # Verify buffer_token_count matches the sum of token lengths
+        assert self._buffer_token_count == sum([item[1] for item in self._buffer]), (
+            "buffer_token_count does not match the sum of token lengths in buffer"
+        )
+        assert self._buffer_token_count == sum(self.get_length_fn(item[0]) for item in self._buffer), (
+            "buffer_token_count does not match the sum of lengths computed from samples in buffer"
+        )
+        del state_dict["buffer"]
+
+        if "dynamic_batch_upstream_dataset_state" in state_dict:
+            self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
+
+        self._just_resumed = True
+
+    def set_epoch(self, epoch: int):
+        """Set the epoch for the upstream dataset.
+
+        Passes the epoch to the upstream dataset if it supports set_epoch.
+        Has no direct effect on dynamic batching itself.
+
+        Args:
+            epoch: The epoch number to set.
+        """
+        if hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(epoch)
+
+
 def get_data_files(train_path):
     data_files = []
     data_paths = train_path.split(",")
@@ -312,6 +1150,7 @@ def build_iterable_dataset(
     seed: int = 42,
     source_name: Optional[str] = None,
     split_by_node: bool = True,
+    shuffle: bool = True,
     **kwargs,
 ) -> "IterableDataset":
     """
@@ -328,7 +1167,8 @@ def build_iterable_dataset(
     logger.info_rank0("Start building iterative dataset")
     data_files, file_extenstion = get_data_files(train_path)
     dataset = load_dataset(file_extenstion, data_files=data_files, split=namespace, streaming=True)
-    dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
+    if shuffle:
+        dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
 
     if split_by_node:
         parallel_state = get_parallel_state()
@@ -512,3 +1352,50 @@ def build_energon_dataset(
 
     # Wrap in our EnergonDataset for Megatron-Energon specific functionality
     return EnergonDataset(dataset, transform)
+
+
+@DATASET_REGISTRY.register("veomni_weighted_multisource")
+def build_weighted_multisource_dataset(
+    train_path: str,
+    transform: Optional[Callable] = None,
+    seed: int = 42,
+    shuffle: bool = True,
+    **kwargs: Any,
+) -> IterableDataset:
+    multisource_config = parse_multisource_config(train_path)
+    schedule = multisource_config["schedule"]
+    if len(schedule) != 1 or schedule[0].get("schedule_type") != "const":
+        raise ValueError("simple_multisource only supports a single const schedule now")
+    weights = schedule[0]["weights"]
+
+    sources = multisource_config["sources"]
+    source_names = multisource_config.get("names")
+    source_ids = multisource_config.get(
+        "source_names", source_names
+    )  # if source_ids is not provided, use source_names as source_ids
+
+    level = multisource_config.get("level", "sample")
+    stopping_strategy = multisource_config.get("stopping_strategy", "first_exhausted")
+    split_by_node = multisource_config.get("upstream_sharded", True)
+
+    datasets = [
+        build_iterable_dataset(
+            train_path=source,
+            seed=seed,
+            transform=transform,
+            split_by_node=split_by_node,
+            shuffle=shuffle,
+        )
+        for source in sources
+    ]
+
+    return WeightedMultiSourceDataset(
+        datasets=datasets,
+        weights=weights,
+        seed=seed,
+        level=level,
+        source_names=source_names,
+        source_ids=source_ids,
+        upstream_sharded=split_by_node,
+        stopping_strategy=stopping_strategy,
+    )

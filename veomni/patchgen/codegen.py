@@ -69,12 +69,77 @@ def get_module_source(module_name: str) -> str:
     return source
 
 
+def _unwrap_to_inspectable(obj: Any) -> Any:
+    """Follow ``__wrapped__`` links so ``inspect`` can find source.
+
+    Decorators like ``functools.lru_cache`` return wrapper objects that
+    ``inspect.getsourcelines`` cannot resolve. The original function is
+    reachable via ``__wrapped__`` (set by ``functools.wraps``).
+    """
+    while hasattr(obj, "__wrapped__"):
+        obj = obj.__wrapped__
+    return obj
+
+
 def get_object_source(obj: Any) -> str:
     """Get the source code of a class or function, preserving comments."""
     try:
-        return inspect.getsource(obj)
+        return inspect.getsource(_unwrap_to_inspectable(obj))
     except (OSError, TypeError):
         return ""
+
+
+def get_object_source_with_leading_comments(obj: Any) -> str:
+    """Get object source including contiguous leading ``#`` comment lines.
+
+    ``inspect.getsource`` starts at the first decorator and drops any comment
+    block sitting directly above it. Patch config files use those blocks to
+    document *why* a patch exists (e.g. the numbered ``Patch.N`` headers), so
+    we rewind through preceding comment/blank lines and prepend them.
+    """
+    obj = _unwrap_to_inspectable(obj)
+    try:
+        src_lines, start_lineno = inspect.getsourcelines(obj)
+        source_file = inspect.getsourcefile(obj)
+    except (OSError, TypeError):
+        return ""
+
+    if not source_file:
+        return "".join(src_lines)
+
+    try:
+        with open(source_file, encoding="utf-8") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return "".join(src_lines)
+
+    # start_lineno is 1-indexed; walk backwards collecting contiguous
+    # comment and blank lines (stop at any code line).
+    idx = start_lineno - 1
+    actual_start = idx
+    while actual_start > 0:
+        raw = all_lines[actual_start - 1].rstrip("\n")
+        stripped = raw.strip()
+        if stripped == "":
+            actual_start -= 1
+            continue
+        # Only absorb comments that sit at column 0 — otherwise we'd cross
+        # into the previous function's indented trailing comments.
+        if raw.startswith("#"):
+            actual_start -= 1
+            continue
+        break
+
+    leading = all_lines[actual_start:idx]
+    # Trim pure-blank lines on both sides so the comment hugs the
+    # definition — otherwise blanks between the comment and the
+    # decorator/def survive into the generated file and bloat the diff.
+    while leading and leading[0].strip() == "":
+        leading.pop(0)
+    while leading and leading[-1].strip() == "":
+        leading.pop()
+
+    return "".join(leading) + "".join(src_lines)
 
 
 def extract_source_segment(source_lines: list[str], start_line: int, end_line: int) -> str:
@@ -253,7 +318,9 @@ def strip_patch_decorators(source: str) -> str:
 
     by tracking parenthesis depth until the decorator is fully closed.
     """
-    _PATCH_DECORATOR_RE = re.compile(r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init)\b")
+    _PATCH_DECORATOR_RE = re.compile(
+        r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init|add_helper)\b"
+    )
     source_lines = source.splitlines()
     filtered_lines: list[str] = []
     in_patch_decorator = False
@@ -273,6 +340,41 @@ def strip_patch_decorators(source: str) -> str:
             continue
         filtered_lines.append(line)
     return "\n".join(filtered_lines)
+
+
+def _split_leading_comments(source: str) -> tuple[list[str], str]:
+    """Split ``source`` into (leading comment lines, rest starting at def/decorator).
+
+    Used to relocate the patch-header comment block *above* the HF decorators
+    when injecting a replacement method into a class.
+    """
+    lines = source.splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(("def ", "async def ", "@", "class ")):
+            break
+        i += 1
+    leading = lines[:i]
+    while leading and leading[-1].strip() == "":
+        leading.pop()
+    return leading, "\n".join(lines[i:])
+
+
+def _collapse_blank_lines(source: str, max_consecutive: int = 2) -> str:
+    """Collapse runs of more than ``max_consecutive`` blank lines."""
+    lines = source.splitlines()
+    out: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run <= max_consecutive:
+                out.append(line)
+        else:
+            blank_run = 0
+            out.append(line)
+    return "\n".join(out)
 
 
 def _apply_name_map(source: str, name_map: dict[str, str] | None) -> str:
@@ -415,19 +517,9 @@ class ModelingCodeGenerator:
                 filtered_node = ast.Import(names=filtered_names)
                 output_lines.append(ast_to_source(filtered_node))
 
-        # Add custom post-import blocks from config
-        if self.config.post_import_blocks:
-            output_lines.append("")
-            output_lines.append("# Additional import blocks for patches")
-            for block in self.config.post_import_blocks:
-                block = textwrap.dedent(block).strip()
-                if block:
-                    output_lines.append(block)
-                    output_lines.append("")
-            if output_lines and output_lines[-1] == "":
-                output_lines.pop()
-
-        # Add additional imports from config
+        # Add additional imports from config first — keep these before the
+        # post-import blocks (and before helpers) so helper bodies can rely
+        # on any names declared via ``add_import``.
         if self.config.additional_imports:
             output_lines.append("")
             output_lines.append("# Additional imports for patches")
@@ -444,7 +536,45 @@ class ModelingCodeGenerator:
                     else:
                         output_lines.append(f"import {imp.module}")
 
+        # Add custom post-import blocks from config
+        if self.config.post_import_blocks:
+            output_lines.append("")
+            output_lines.append("# Additional import blocks for patches")
+            for block in self.config.post_import_blocks:
+                block = textwrap.dedent(block).strip()
+                if block:
+                    output_lines.append(block)
+                    output_lines.append("")
+            if output_lines and output_lines[-1] == "":
+                output_lines.pop()
+
         return "\n".join(output_lines)
+
+    def _generate_helpers(self) -> str:
+        """Emit module-level helpers registered via ``config.add_helper``.
+
+        Each helper's source (including any leading ``#`` comment block) is
+        copied verbatim, with the ``@config.add_helper`` decorator stripped
+        so the generated file stays self-contained.
+        """
+        if not self.config.helpers:
+            return ""
+
+        lines: list[str] = [
+            "",
+            f"# {'=' * 70}",
+            "# [HELPERS] Module-level helpers injected via config.add_helper",
+            f"# {'=' * 70}",
+        ]
+        for helper in self.config.helpers:
+            src = get_object_source_with_leading_comments(helper)
+            if not src:
+                continue
+            src = textwrap.dedent(src)
+            src = strip_patch_decorators(src)
+            lines.append("")
+            lines.append(src.rstrip())
+        return "\n".join(lines)
 
     def _apply_class_replacement(
         self,
@@ -471,7 +601,7 @@ class ModelingCodeGenerator:
 
         if patch.replacement:
             # Get source of replacement class (preserves comments)
-            replacement_source = get_object_source(patch.replacement)
+            replacement_source = get_object_source_with_leading_comments(patch.replacement)
             if replacement_source:
                 # Rename the class to match original using simple text replacement
                 replacement_source = textwrap.dedent(replacement_source)
@@ -522,8 +652,8 @@ class ModelingCodeGenerator:
         if not patch.replacement:
             return class_node, "", False
 
-        # Get source of replacement method (preserves comments)
-        replacement_source = get_object_source(patch.replacement)
+        # Get source of replacement method (preserves leading comment block too)
+        replacement_source = get_object_source_with_leading_comments(patch.replacement)
         if not replacement_source:
             return class_node, "", False
 
@@ -600,7 +730,7 @@ class ModelingCodeGenerator:
         lines.append(f"# {'=' * 70}")
 
         if patch.replacement:
-            replacement_source = get_object_source(patch.replacement)
+            replacement_source = get_object_source_with_leading_comments(patch.replacement)
             if replacement_source:
                 replacement_source = textwrap.dedent(replacement_source)
                 replacement_source = _apply_name_map(replacement_source, patch.name_map)
@@ -702,7 +832,7 @@ class ModelingCodeGenerator:
 
         if method_node:
             # Replace existing method body while preserving untouched class formatting.
-            method_start = method_node.lineno - 1  # 0-indexed
+            method_start = method_node.lineno - 1  # 0-indexed; `def` line
             method_end = (
                 method_node.end_lineno
                 if hasattr(method_node, "end_lineno") and method_node.end_lineno
@@ -714,8 +844,27 @@ class ModelingCodeGenerator:
             else:
                 method_indent = class_indent + 4
 
-            indented_preserved_lines = self._indent_preserved_source(preserved_source, method_indent)
-            new_source_lines = source_lines[:method_start] + indented_preserved_lines + source_lines[method_end:]
+            # Place patch-header comments *above* the decorators rather than
+            # between `@decorator` lines and `def`. Decorators from the HF
+            # source (e.g. `@capture_outputs`) stay in place.
+            leading_lines, def_source = _split_leading_comments(preserved_source)
+            indented_leading = (
+                self._indent_preserved_source("\n".join(leading_lines), method_indent) if leading_lines else []
+            )
+            indented_def = self._indent_preserved_source(def_source, method_indent)
+
+            if method_node.decorator_list:
+                decorator_start = min(d.lineno for d in method_node.decorator_list) - 1
+            else:
+                decorator_start = method_start
+
+            new_source_lines = (
+                source_lines[:decorator_start]
+                + indented_leading
+                + source_lines[decorator_start:method_start]
+                + indented_def
+                + source_lines[method_end:]
+            )
             return "\n".join(new_source_lines)
 
         # If the method does not exist, inject it while preserving class formatting.
@@ -828,7 +977,14 @@ class ModelingCodeGenerator:
         output_parts.append(self._transform_imports(import_nodes))
         output_parts.append("")
 
-        # 3. Process ALL module-level nodes in their original order
+        # 3. Emit module-level helpers (config.add_helper) after the import
+        # block so subsequent classes / functions can reference them.
+        helpers_block = self._generate_helpers()
+        if helpers_block:
+            output_parts.append(helpers_block)
+            output_parts.append("")
+
+        # 4. Process ALL module-level nodes in their original order
         # This preserves the exact structure of the original file
         for node in self.source_ast.body:
             # Skip import statements (already handled above)
@@ -845,10 +1001,27 @@ class ModelingCodeGenerator:
                     output_parts.append("")
             elif isinstance(node, ast.Assign):
                 # Module-level assignments (like __all__, DOCSTRINGS, etc.)
-                # Use source extraction to preserve any associated comments
-                end_line = get_node_end_line(node, self.source_lines)
-                output_parts.append(extract_source_segment(self.source_lines, node.lineno, end_line))
-                output_parts.append("")
+                # Special case: if this is `__all__ = [...]` of string literals,
+                # filter out names that `exclude_from_output` dropped so the
+                # generated module doesn't claim to export missing classes
+                # (would otherwise fail F822 and break `from ... import *`).
+                if (
+                    self.config.exclude
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "__all__"
+                    and isinstance(node.value, (ast.List, ast.Tuple))
+                    and all(isinstance(elt, ast.Constant) and isinstance(elt.value, str) for elt in node.value.elts)
+                ):
+                    kept = [elt.value for elt in node.value.elts if elt.value not in self.config.exclude]
+                    rendered = "__all__ = [\n" + "".join(f'    "{name}",\n' for name in kept) + "]"
+                    output_parts.append(rendered)
+                    output_parts.append("")
+                else:
+                    # Use source extraction to preserve any associated comments
+                    end_line = get_node_end_line(node, self.source_lines)
+                    output_parts.append(extract_source_segment(self.source_lines, node.lineno, end_line))
+                    output_parts.append("")
             elif isinstance(node, ast.Expr):
                 # Module-level expressions (docstrings)
                 if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
@@ -859,6 +1032,7 @@ class ModelingCodeGenerator:
 
         # 4. Join and format output
         output = "\n".join(output_parts)
+        output = _collapse_blank_lines(output, max_consecutive=2)
 
         # 5. Write to file if path provided
         if output_path:

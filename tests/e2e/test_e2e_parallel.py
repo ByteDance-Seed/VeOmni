@@ -5,11 +5,13 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from utils import DummyDataset, compare_multi_items, prepare_exec_cmd, print_all_values
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
+
+from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from .utils import prepare_exec_cmd
 
 
 # See
@@ -44,11 +46,15 @@ def main(
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
-    # Qwen3_5Moe uses stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I])
-    # which is also the native HF safetensor format for this model. HF's save_pretrained() with
-    # save_original_format=True calls revert_weight_conversion() that splits them into per-expert
-    # keys (experts.*.gate_proj.weight, etc.), but VeOmni's load_model_weights doesn't apply the
-    # reverse merge. Disable save_original_format for qwen3_5_moe to save in native stacked format.
+    # Models with stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I]):
+    #
+    # - qwen3_5_moe: native HF safetensor format is already stacked. HF's save_pretrained() with
+    #   save_original_format=True calls revert_weight_conversion() that splits them into per-expert
+    #   keys (experts.*.gate_proj.weight, etc.), but VeOmni has no runtime converter for this model.
+    #   Disable save_original_format to save in native stacked format.
+    #
+    # - qwen3_moe (v5): VeOmni registers a runtime CheckpointTensorConverter that merges per-expert
+    #   HF keys back to fused format at load time, so save_original_format=True works correctly.
     save_original_format = model_name != "qwen3_5_moe"
     _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
 
@@ -65,8 +71,9 @@ def main(
     )
     res = {}
     log_keys = []
-    for task_name, cmd in command_list:
+    for task_name, cmd_kwargs in command_list:
         print(f"{'-' * 10} {task_name} {'-' * 10}")
+        cmd = build_torchrun_cmd(**cmd_kwargs)
         subprocess.run(cmd, check=True)
         with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
             output = json.load(f)
@@ -77,8 +84,8 @@ def main(
         res[task_name] = output
 
     for key in log_keys:
-        print_all_values(res, key, model_type=model_name)
-    compare_multi_items(model_name, res, rtol=rtol, atol=atol)
+        print_comparison_table(res, key, title=model_name)
+    compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
 
@@ -95,6 +102,15 @@ text_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen2",
+        "./tests/toy_config/qwen2_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
     ),
     pytest.param(
         "qwen2.5",
@@ -122,6 +138,16 @@ text_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3_moe",
+        "./tests/toy_config/qwen3_moe_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
+        id="qwen3_moe_v5",
     ),
     pytest.param(
         "seed_oss",
@@ -153,12 +179,28 @@ qwen2vl_test_cases = [
         marks=_v4_only,
     ),
     pytest.param(
+        "qwen2vl",
+        "./tests/toy_config/qwen2vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v5_only,
+    ),
+    pytest.param(
         "qwen25vl",
         "./tests/toy_config/qwen25vl_toy",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen25vl",
+        "./tests/toy_config/qwen25vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v5_only,
     ),
 ]
 
@@ -173,6 +215,15 @@ qwen3vl_test_cases = [
         marks=_v4_only,
     ),
     pytest.param(
+        "qwen3vl",
+        "./tests/toy_config/qwen3vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
+    ),
+    pytest.param(
         "qwen3vlmoe",
         "./tests/toy_config/qwen3vlmoe_toy",
         True,
@@ -180,6 +231,15 @@ qwen3vl_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3vlmoe",
+        "./tests/toy_config/qwen3vlmoe_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_v5_only,
     ),
     pytest.param(
         "qwen3_5_moe",
@@ -220,6 +280,14 @@ qwen3omni_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         marks=_v4_only,
+    ),
+    pytest.param(
+        "qwen3_omni_moe",
+        "./tests/toy_config/qwen3omni_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        marks=_v5_only,
     ),
 ]
 

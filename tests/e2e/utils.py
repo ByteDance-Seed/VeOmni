@@ -1,6 +1,4 @@
-import math
 import os
-import random
 import re
 from dataclasses import dataclass
 from typing import Dict
@@ -8,14 +6,12 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 import torch
-import torch.distributed as dist
-from datasets import Dataset
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from veomni.data.dummy_dataset import build_dummy_dataset
-from veomni.utils.helper import get_cache_dir
+from ..tools import DummyDataset as DummyDataset
+from ..tools import ParallelConfig
 
 
 def parse_training_log(log_content) -> pd.DataFrame:
@@ -75,56 +71,8 @@ def compare_log(base_log_df: pd.DataFrame, compare_log_df: pd.DataFrame):
     check_metric(base_log_df["grad_norm"], compare_log_df["grad_norm"], name="grad_norm")
 
 
-class DummyDataset:
-    def __init__(self, num_samples=16, seq_len=8192, dataset_type: str = "text") -> None:
-        self.num_samples = num_samples
-        self.seq_len = seq_len
-        self.num_shard = 2
-
-        self.save_path = get_cache_dir(f"./{dataset_type}")
-
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            self.dataset = build_dummy_dataset(dataset_type, self.num_samples, self.seq_len)
-            self.build_dummy_dataset()
-
-        if dist.is_initialized():
-            dist.barrier()
-
-    def generate_data(self):
-        num_samples = len(self.dataset)
-        for index in range(num_samples):
-            item = self.dataset[index][0]
-            yield item
-
-    def build_dummy_dataset(self):
-        if not os.path.exists(self.save_path):
-            os.makedirs(self.save_path)
-
-        batch_len = math.ceil(self.num_samples / self.num_shard)
-        print(f"Total length: {self.num_samples}, batch length: {batch_len}")
-
-        index = 0
-        for _i in range(0, self.num_samples, batch_len):
-            print(f"Generating {index}th parquet file")
-            ds = Dataset.from_generator(
-                self.generate_data,
-                keep_in_memory=True,
-                num_proc=1,
-            )
-            ds.to_parquet(os.path.join(self.save_path, f"{index}.parquet"))
-            index += 1
-
-    def clean_cache(self):
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            if os.path.exists(self.save_path):
-                os.system(f"rm -rf {self.save_path}")
-
-    def __del__(self):
-        self.clean_cache()
-
-
 @dataclass(frozen=True)
-class ModelMode:
+class ParallelMode:
     sp_size: int
     ep_size: int
 
@@ -139,7 +87,7 @@ _EP_SIZE = [1, 2]
 def _base_model_modes():
     modes = []
     for sp_size in _SP_SIZE:
-        modes.append(ModelMode(sp_size, 1))
+        modes.append(ParallelMode(sp_size, 1))
     return modes
 
 
@@ -147,7 +95,7 @@ def _moe_model_modes():
     modes = []
     for sp_size in _SP_SIZE:
         for ep_size in _EP_SIZE:
-            modes.append(ModelMode(sp_size, ep_size))
+            modes.append(ParallelMode(sp_size, ep_size))
     return modes
 
 
@@ -160,11 +108,15 @@ def prepare_exec_cmd(
     output_dir: str,
     is_moe: bool,
     max_sp_size: int | None = None,
-) -> str:
-    """Build torchrun commands for every (task, parallel-mode) combination.
+) -> list[tuple[str, dict]]:
+    """Prepare torchrun command kwargs for every (task, parallel-mode) combination.
+
+    Port allocation is deferred to execution time to avoid TOCTOU races —
+    the caller must pass each dict to ``build_torchrun_cmd(**kwargs)`` right
+    before ``subprocess.run()``.
 
     Args:
-        test_tasks: Script basenames under tests/e2e/ to run (e.g. ["train_text_test"]).
+        test_tasks: Script basenames under tests/train_scripts/ to run (e.g. ["train_text_test"]).
         model_name: Short name used for directory naming and log output.
         config_path: Path to the model's toy config directory or config.json.
         model_path: Path to materialized model weights.
@@ -175,47 +127,27 @@ def prepare_exec_cmd(
             Use 1 to skip sp=2 when the model does not support sequence parallelism yet.
 
     Returns:
-        List of (task_name, command) tuples, where command is a list of strings
-        suitable for subprocess.run.
+        List of (task_name, cmd_kwargs) tuples, where cmd_kwargs is a dict of
+        keyword arguments for :func:`build_torchrun_cmd`.
     """
-    model_modes: ModelMode = _base_model_modes() if not is_moe else _moe_model_modes()
+    model_modes: list[ParallelMode] = _base_model_modes() if not is_moe else _moe_model_modes()
     if max_sp_size is not None:
         model_modes = [m for m in model_modes if m.sp_size <= max_sp_size]
 
     command_list = []
     for task in test_tasks:
         for mode in model_modes:
-            port = 12345 + random.randint(0, 100)
-            command = [
-                "torchrun",
-                "--nnodes=1",
-                f"--nproc_per_node={mode.sp_size * 4}",
-                f"--master_port={port}",
-                f"tests/e2e/{task}.py",
-                f"--model.config_path={config_path}",
-                f"--data.train_path={train_path}",
-                "--data.dyn_bsz_buffer_size=1",
-                "--train.global_batch_size=16",
-                "--train.micro_batch_size=1",
-                "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-                "--model.ops_implementation.attn_implementation=flash_attention_2",
-                "--model.ops_implementation.moe_implementation=fused",
-                "--train.init_device=meta",
-                f"--train.accelerator.ulysses_size={mode.sp_size}",
-                f"--train.accelerator.ep_size={mode.ep_size}",
-                "--train.bsz_warmup_ratio=0",
-                "--train.num_train_epochs=1",
-                "--train.checkpoint.save_epochs=0",
-                "--train.checkpoint.save_steps=0",
-                "--train.checkpoint.save_hf_weights=False",
-                "--train.enable_full_determinism=True",
-                "--train.enable_batch_invariant_mode=True",
-                "--train.max_steps=2",
-                f"--train.checkpoint.output_dir={os.path.join(output_dir, f'{model_name}_{task}_{mode}')}",
-                f"--model.model_path={model_path}",
-            ]
             task_name = f"{model_name}_{task}_{mode}"
-            command_list.append((task_name, command))
+            cmd_kwargs = dict(
+                script=f"tests/train_scripts/{task}.py",
+                config_path=config_path,
+                model_path=model_path,
+                train_path=train_path,
+                output_dir=os.path.join(output_dir, task_name),
+                parallel_config=ParallelConfig(sp_size=mode.sp_size, ep_size=mode.ep_size, fsdp_mode="fsdp2"),
+                nproc=mode.sp_size * 4,
+            )
+            command_list.append((task_name, cmd_kwargs))
 
     return command_list
 

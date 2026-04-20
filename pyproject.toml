@@ -269,7 +269,7 @@ name = "flash-attn-3"
 requires-dist = ["torch"]
 
 [tool.setuptools.dynamic]
-version = {attr = "veomni.__version__"}
+version = {attr = "veomni._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]

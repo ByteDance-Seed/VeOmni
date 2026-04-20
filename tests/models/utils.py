@@ -7,8 +7,23 @@ from rich.console import Console
 from rich.table import Table
 from transformers import set_seed
 
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.dummy_dataset import build_dummy_dataset
-from veomni.utils.import_utils import is_torch_npu_available
+from veomni.ops import apply_ops_config
+from veomni.utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
+
+
+_LIGER_KERNEL = "liger_kernel"
+_EAGER = "eager"
+# Only include the Liger-backed mode when the package is actually installed
+# (it's unavailable on the NPU CI runner); otherwise every parametrized case
+# would fail in OpsImplementationConfig.__post_init__ with a ValueError.
+_USE_LIGER_KERNEL = [True, False] if is_liger_kernel_available() else [False]
+# NPU ships triton-ascend (not mainline ``triton``); the fused Triton
+# load-balancing-loss kernel at ``veomni/ops/kernels/load_balancing_loss/triton.py``
+# imports ``triton`` unconditionally, so fall back to the pure-PyTorch backend
+# when the mainline package is missing.
+_LOAD_BALANCING_LOSS_IMPL = "triton" if is_package_available("triton") else "eager"
 
 
 @dataclass(frozen=True)
@@ -16,21 +31,23 @@ class ModelMode:
     modeling_backend: str
     attn_implementation: str
     sync_weight_func: Optional[Callable] = None
-    moe_implementation: str = "eager"  # 修正类型匹配
+    moe_implementation: str = "eager"
     use_liger_kernel: bool = False
 
     def __str__(self):
-        return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]]"
+        return (
+            f"{self.modeling_backend}_[attn-{self.attn_implementation}]"
+            f"_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]"
+        )
 
 
-# HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
+# HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN x _USE_LIGER_KERNEL.
 # On NPU skip FA3.
 _HF_ATTN = ["flash_attention_2", "flash_attention_3"]
 _VEOMNI_ATTN = [
     "veomni_flash_attention_2_with_sp",
     "veomni_flash_attention_3_with_sp",
 ]
-_USE_LIGER_KERNEL = [True, False]
 
 
 def _skip_fa3_npu(attn_impl: str) -> bool:
@@ -162,6 +179,7 @@ def prepare_data(model_name: str, max_seq_len: int, model_config):
     Build a DummyDataLoader that yields raw features (list of 2 dicts).
     MainCollator packing + cu_seqlens precompute is done in the trainer (TrainerTest).
     """
+
     dataset_name = MODEL_TO_DATASET.get(model_name, "text")
     dataset = build_dummy_dataset(dataset_name, 2, max_seq_len)
 
@@ -199,7 +217,7 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
             row_cells.append(str(mode_data[field]))
 
         val_obj = output.get(value_key, "N/A")
-        val_str = f"{val_obj.item() if hasattr(val_obj, 'item') else val_obj:.8f}"  # 这里加上了.4f保留小数
+        val_str = f"{val_obj.item() if hasattr(val_obj, 'item') else val_obj:.8f}"
         row_cells.append(val_str)
 
         table.add_row(*row_cells)
@@ -227,21 +245,137 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
                 raise AssertionError(f"{key} not match") from e
 
 
+# ---------------------------------------------------------------------------
+# Pristine snapshots of HF model classes taken at module import — before any
+# veomni import has a chance to monkey-patch them. `apply_veomni_hf_unpatch`
+# restores them so a second test in the same process can build an HF model
+# that is genuinely un-patched. Keep the module imports inside this block
+# so that util users who never need them are not forced to pay the cost.
+# ---------------------------------------------------------------------------
+import transformers.models.deepseek_v3.modeling_deepseek_v3 as _hf_ds3  # noqa: E402
+import transformers.models.qwen3.modeling_qwen3 as _hf_qwen3  # noqa: E402
+import transformers.models.qwen3_moe.modeling_qwen3_moe as _hf_qwen3_moe  # noqa: E402
+
+
+# Cover every patch site reachable from apply_veomni_*_patch() + the Liger
+# and Triton branches of apply_veomni_*_gpu_patch(). We capture:
+# - forward methods (undo in-class forward replacement, used by both the
+#   always-on patch and the Triton branch's _patch_rms_norm / RoPE forward)
+# - whole classes (undo module-level class swap done by the Liger branch
+#   and by DeepseekV3MoE / Qwen3MoeSparseMoeBlock replacements)
+# - module-level functions (apply_rotary_pos_emb is replaced by Liger)
+#
+# Restore order matters: we first reset in-class attributes on the pristine
+# class objects, then restore the module-level names. That way, even if a
+# prior test mutated `Class.forward` and then swapped in a Liger class at
+# the module level, both layers are reverted.
+_PRISTINE_HF = {
+    # qwen3
+    "qwen3.CausalLM.forward": _hf_qwen3.Qwen3ForCausalLM.forward,
+    "qwen3.SeqCls.forward": _hf_qwen3.Qwen3ForSequenceClassification.forward,
+    "qwen3.apply_rotary_pos_emb": _hf_qwen3.apply_rotary_pos_emb,
+    "qwen3.RMSNorm.cls": _hf_qwen3.Qwen3RMSNorm,
+    "qwen3.RMSNorm.forward": _hf_qwen3.Qwen3RMSNorm.forward,
+    "qwen3.MLP.cls": _hf_qwen3.Qwen3MLP,
+    # qwen3_moe
+    "qwen3_moe.CausalLM.forward": _hf_qwen3_moe.Qwen3MoeForCausalLM.forward,
+    "qwen3_moe.MoeBlock.cls": _hf_qwen3_moe.Qwen3MoeSparseMoeBlock,
+    "qwen3_moe.PreTrained.init_weights": _hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights,
+    "qwen3_moe.apply_rotary_pos_emb": _hf_qwen3_moe.apply_rotary_pos_emb,
+    "qwen3_moe.RMSNorm.cls": _hf_qwen3_moe.Qwen3MoeRMSNorm,
+    "qwen3_moe.RMSNorm.forward": _hf_qwen3_moe.Qwen3MoeRMSNorm.forward,
+    "qwen3_moe.MLP.cls": _hf_qwen3_moe.Qwen3MoeMLP,
+    # deepseek_v3
+    "ds3.Attention.forward": _hf_ds3.DeepseekV3Attention.forward,
+    "ds3.CausalLM.forward": _hf_ds3.DeepseekV3ForCausalLM.forward,
+    "ds3.MoE.cls": _hf_ds3.DeepseekV3MoE,
+    "ds3.PreTrained.init_weights": _hf_ds3.DeepseekV3PreTrainedModel._init_weights,
+    "ds3.apply_rotary_pos_emb": _hf_ds3.apply_rotary_pos_emb,
+    "ds3.RotaryEmb.cls": _hf_ds3.DeepseekV3RotaryEmbedding,
+    "ds3.RotaryEmb.forward": _hf_ds3.DeepseekV3RotaryEmbedding.forward,
+    "ds3.RMSNorm.cls": _hf_ds3.DeepseekV3RMSNorm,
+    "ds3.RMSNorm.forward": _hf_ds3.DeepseekV3RMSNorm.forward,
+    "ds3.MLP.cls": _hf_ds3.DeepseekV3MLP,
+}
+
+
+def apply_veomni_hf_unpatch():
+    """Undo in-place veomni monkey-patches on HF model modules.
+
+    `apply_veomni_*_patch()` in each of `qwen3/`, `qwen3_moe/`, `deepseek_v3/`
+    mutates the HF model modules directly (forward swaps, class swaps, new
+    `get_parallel_plan` methods). Without this restore, the first parametrize
+    case to build a veomni model leaks its patches into every subsequent HF
+    build in the same test session.
+    """
+    # Step 1: restore in-class forward methods on pristine class objects.
+    # This handles both the always-on forward swaps and the Triton branch's
+    # in-class mutations (DeepseekV3RotaryEmbedding.forward / DeepseekV3RMSNorm.forward).
+    _PRISTINE_HF["qwen3.RMSNorm.cls"].forward = _PRISTINE_HF["qwen3.RMSNorm.forward"]
+    _PRISTINE_HF["qwen3_moe.RMSNorm.cls"].forward = _PRISTINE_HF["qwen3_moe.RMSNorm.forward"]
+    _PRISTINE_HF["ds3.RotaryEmb.cls"].forward = _PRISTINE_HF["ds3.RotaryEmb.forward"]
+    _PRISTINE_HF["ds3.RMSNorm.cls"].forward = _PRISTINE_HF["ds3.RMSNorm.forward"]
+
+    _hf_qwen3.Qwen3ForCausalLM.forward = _PRISTINE_HF["qwen3.CausalLM.forward"]
+    _hf_qwen3.Qwen3ForSequenceClassification.forward = _PRISTINE_HF["qwen3.SeqCls.forward"]
+    _hf_qwen3_moe.Qwen3MoeForCausalLM.forward = _PRISTINE_HF["qwen3_moe.CausalLM.forward"]
+    _hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = _PRISTINE_HF["qwen3_moe.PreTrained.init_weights"]
+    _hf_ds3.DeepseekV3Attention.forward = _PRISTINE_HF["ds3.Attention.forward"]
+    _hf_ds3.DeepseekV3ForCausalLM.forward = _PRISTINE_HF["ds3.CausalLM.forward"]
+    _hf_ds3.DeepseekV3PreTrainedModel._init_weights = _PRISTINE_HF["ds3.PreTrained.init_weights"]
+
+    # Step 2: restore module-level names for classes / functions that the
+    # Liger branch swaps out wholesale, plus the class swaps done by the
+    # always-on patch (Qwen3MoeSparseMoeBlock, DeepseekV3MoE).
+    _hf_qwen3.apply_rotary_pos_emb = _PRISTINE_HF["qwen3.apply_rotary_pos_emb"]
+    _hf_qwen3.Qwen3RMSNorm = _PRISTINE_HF["qwen3.RMSNorm.cls"]
+    _hf_qwen3.Qwen3MLP = _PRISTINE_HF["qwen3.MLP.cls"]
+    _hf_qwen3_moe.Qwen3MoeSparseMoeBlock = _PRISTINE_HF["qwen3_moe.MoeBlock.cls"]
+    _hf_qwen3_moe.apply_rotary_pos_emb = _PRISTINE_HF["qwen3_moe.apply_rotary_pos_emb"]
+    _hf_qwen3_moe.Qwen3MoeRMSNorm = _PRISTINE_HF["qwen3_moe.RMSNorm.cls"]
+    _hf_qwen3_moe.Qwen3MoeMLP = _PRISTINE_HF["qwen3_moe.MLP.cls"]
+    _hf_ds3.DeepseekV3MoE = _PRISTINE_HF["ds3.MoE.cls"]
+    _hf_ds3.apply_rotary_pos_emb = _PRISTINE_HF["ds3.apply_rotary_pos_emb"]
+    _hf_ds3.DeepseekV3RotaryEmbedding = _PRISTINE_HF["ds3.RotaryEmb.cls"]
+    _hf_ds3.DeepseekV3RMSNorm = _PRISTINE_HF["ds3.RMSNorm.cls"]
+    _hf_ds3.DeepseekV3MLP = _PRISTINE_HF["ds3.MLP.cls"]
+
+    # Step 3: remove `get_parallel_plan` methods injected onto HF causal-LM
+    # classes by apply_veomni_*_patch.
+    for cls in (_hf_qwen3_moe.Qwen3MoeForCausalLM, _hf_ds3.DeepseekV3ForCausalLM):
+        if "get_parallel_plan" in cls.__dict__:
+            delattr(cls, "get_parallel_plan")
+
+
 def apply_veomni_loss_unpatch():
     from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
 
-    from veomni.ops import fused_cross_entropy
+    from veomni.ops.kernels import cross_entropy
 
-    fused_cross_entropy._cross_entropy = None
+    cross_entropy._cross_entropy = None
 
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
 
 
 def apply_veomni_moe_unpatch():
-    from veomni.ops import fused_moe
+    from veomni.ops.kernels import moe
 
-    fused_moe._fused_moe_forward = None
+    moe._fused_moe_forward = None
+
+
+def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig:
+    """Build an OpsImplementationConfig from a ModelMode for testing."""
+    liger_impl = _LIGER_KERNEL if model_mode.use_liger_kernel else _EAGER
+    return OpsImplementationConfig(
+        attn_implementation=model_mode.attn_implementation,
+        moe_implementation=model_mode.moe_implementation if model_mode.moe_implementation != "eager" else None,
+        cross_entropy_loss_implementation=liger_impl,
+        rms_norm_implementation=liger_impl,
+        swiglu_mlp_implementation=liger_impl,
+        rotary_pos_emb_implementation=liger_impl,
+        load_balancing_loss_implementation=_LOAD_BALANCING_LOSS_IMPL,
+    )
 
 
 def set_environ_param(model_mode: ModelMode):
@@ -252,7 +386,5 @@ def set_environ_param(model_mode: ModelMode):
     else:
         os.environ["MODELING_BACKEND"] = "hf"
 
-    if model_mode.use_liger_kernel:
-        os.environ["VEOMNI_USE_LIGER_KERNEL"] = "1"
-    else:
-        os.environ["VEOMNI_USE_LIGER_KERNEL"] = "0"
+    ops_config = _build_ops_config_for_mode(model_mode)
+    apply_ops_config(ops_config)

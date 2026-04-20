@@ -72,6 +72,7 @@ class TrainerTest(BaseTrainer):
         self.environ_meter_callback.on_epoch_begin(self.state)
         self.checkpointer_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
+        self.state.curr_step = 0
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
@@ -93,6 +94,7 @@ class TrainerTest(BaseTrainer):
         data_iterator: Any,
     ) -> Dict[str, float]:
         self.state.global_step += 1
+        self.state.curr_step += 1
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.on_step_begin(micro_batches=micro_batches)
         self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
@@ -133,7 +135,12 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 class CheckCallback(Callback):
     trainer: TrainerTest
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        """
+        from itertools import groupby
+        micro_batches_output = [[k  for k, _ in groupby(micro_batch["input_ids"].tolist()[0])]  for micro_batch in micro_batches]
+        logger.error(f"[rank{get_parallel_state().global_rank}][epoch{state.epoch}][curr_step{state.curr_step}][step {state.global_step}] micro_batches_output: {micro_batches_output}")
+        """
         if state.global_step == 1 and get_parallel_state().sp_enabled:
             assert (
                 micro_batches[0]["input_ids"].shape[-1] * get_parallel_state().sp_size
@@ -199,6 +206,7 @@ def main():
     args: VeOmniArguments = parse_args(VeOmniArguments)
     trainer = TrainerTest(args)
     trainer.train()
+    assert trainer.args.train.checkpoint.load_path is not None
     trainer.resume_train()
 
 
@@ -229,6 +237,12 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         "--train.accelerator.ulysses_size=2",
         "--train.bsz_warmup_ratio=0",
         "--data.dataloader.num_workers=1",
+        # Force pin_memory=False: on NPU the pin_memory background thread
+        # races with HCCL teardown (triggered inside destroy_distributed) and
+        # aborts the process with SIGABRT. The tests use DummyDataset so
+        # pin_memory provides no benefit anyway. Mirrors the fix in #639 for
+        # tests/data/test_multisource_dataset.py.
+        "--data.dataloader.pin_memory=False",
         "--train.num_train_epochs=5",
         "--train.checkpoint.output_dir=.tests/cache",
     ]
@@ -274,6 +288,8 @@ def dummy_native_dataset_ci():
     del dummy_dataset
 
 
+# When tested under mapping datasets, each rank will see the same data from the upstream dataset but will only visit a chunk of it by StatefulDistributedSampler defined in build_native_dataloader. When the dataset is drained, the dataloader will re-create the iterator of the dataset. The random shuffle of the data by the sampler will be updated for each epoch by the StatefulDistributedSampler controlled by its seed, which is the same behavior as PyTorch's DistributedSampler
+# When tested under iterable datasets, each rank will get the same data from the upstream dataset, and the dataset is shuffled and splited into the small chunk which each rank visit. When it is drained, the dataloader will just re-create an iter of the dataset. The random shuffle of the data will be updated for each epoch by set_epoch method of the dataset controled by the seed passed in.
 TEST_DATASETS = ["mapping", "iterable"]
 DYN_BSZ = [True, False]
 

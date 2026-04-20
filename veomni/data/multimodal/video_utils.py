@@ -347,6 +347,46 @@ def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
     return video, video_fps, audio, audio_fps
 
 
+def _apply_dynamic_video_max_pixels(nframes: int, kwargs: dict) -> dict:
+    """Apply dynamic per-frame video_max_pixels based on total pixel budget.
+
+    When ``video_total_pixels`` is present in *kwargs*, the per-frame
+    ``video_max_pixels`` is capped so that the total visual tokens across all
+    frames stay within budget.  This mirrors the official Qwen3-VL
+    ``qwen-vl-utils`` logic::
+
+        max_pixels = min(video_max_pixels, video_total_pixels / nframes * temporal_merge_factor)
+        max_pixels = max(max_pixels, video_min_pixels * 1.05)
+
+    If ``video_total_pixels`` is absent the original *kwargs* is returned
+    unchanged, so the function is a no-op for Qwen2-VL / Qwen2.5-VL configs
+    that do not set it.
+
+    Args:
+        nframes: Number of frames after temporal sampling (including padding).
+        kwargs: Processing parameters (may contain ``video_total_pixels``,
+            ``video_max_pixels``, ``video_min_pixels``, ``frame_factor``).
+
+    Returns:
+        A (possibly new) kwargs dict with updated ``video_max_pixels``.
+    """
+    video_total_pixels = kwargs.get("video_total_pixels")
+    if video_total_pixels is None or nframes <= 0:
+        return kwargs
+
+    temporal_merge_factor = kwargs.get("frame_factor", 2) or 2
+    video_max_pixels = kwargs.get("video_max_pixels")
+    video_min_pixels = kwargs.get("video_min_pixels")
+
+    dynamic_max = video_total_pixels / nframes * temporal_merge_factor
+    if video_max_pixels is not None:
+        dynamic_max = min(dynamic_max, video_max_pixels)
+    if video_min_pixels is not None:
+        dynamic_max = max(dynamic_max, video_min_pixels * 1.05)
+
+    return {**kwargs, "video_max_pixels": int(dynamic_max)}
+
+
 def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_video: bool = True, **kwargs):
     """Load and process video using torchcodec (video) and PyAV (audio).
 
@@ -373,13 +413,19 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         video_fps = kwargs.get("fps", 2.0)
         audio, audio_fps = None, None
 
-        video, _ = smart_video_nframes(smart_resize(video, **kwargs), video_fps, **kwargs)
+        # Pre-compute nframes for dynamic max_pixels before spatial resize
+        indices, pad_count = calculate_frame_indices(total_frames=video.shape[0], video_fps=video_fps, **kwargs)
+        resize_kwargs = _apply_dynamic_video_max_pixels(len(indices) + pad_count, kwargs)
+        video, _ = smart_video_nframes(smart_resize(video, **resize_kwargs), video_fps, **kwargs)
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
     elif isinstance(video_input, dict):
         video, video_fps, audio, audio_fps = _dict_to_video_audio(video_input)
-        video, _ = smart_video_nframes(smart_resize(video, **kwargs), video_fps, **kwargs)
+        # Pre-compute nframes for dynamic max_pixels before spatial resize
+        indices, pad_count = calculate_frame_indices(total_frames=video.shape[0], video_fps=video_fps, **kwargs)
+        resize_kwargs = _apply_dynamic_video_max_pixels(len(indices) + pad_count, kwargs)
+        video, _ = smart_video_nframes(smart_resize(video, **resize_kwargs), video_fps, **kwargs)
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
@@ -422,7 +468,9 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         else:
             raise e
 
-    resized_frames = smart_resize(frames, **kwargs)
+    nframes = len(sampled_indices) + pad_count
+    resize_kwargs = _apply_dynamic_video_max_pixels(nframes, kwargs)
+    resized_frames = smart_resize(frames, **resize_kwargs)
 
     if pad_count > 0:
         last_frame = resized_frames[-1:].expand(pad_count, -1, -1, -1)

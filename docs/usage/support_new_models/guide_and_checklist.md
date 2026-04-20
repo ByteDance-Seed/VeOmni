@@ -210,6 +210,7 @@ For implementation details of each patch, refer to the example docs.
 - [ ] `MODEL_TO_DATASET` entry in `tests/models/utils.py`
 - [ ] `pytest.param` in `test_cases` in `tests/models/test_models_patch.py` (Level 1)
 - [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
+- [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/models/test_vlm_trainer.py`
 
 ---
 
@@ -244,7 +245,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.distributed.sequence_parallel.ulysses import _Gather  # all-gather with autograd
 
 from veomni.ops import fused_moe_forward
-from veomni.ops.fused_cross_entropy import ForCausalLMLoss
+from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,   # placeholder token ID for audio in input_ids

@@ -29,8 +29,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
 from ....utils import logging
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 logger = logging.get_logger(__name__)
@@ -121,15 +119,6 @@ def apply_veomni_seed_oss_patch():
     logger.info_rank0("Apply VeOmni patch to SeedOss.")
     hf_seed_oss.SeedOssForCausalLM.forward = seed_oss_forcausallm_forward
 
-    if IS_CUDA_AVAILABLE:
-        from .gpu_patch import apply_veomni_seed_oss_gpu_patch
+    from .device_patch import apply_veomni_seed_oss_device_patch
 
-        apply_veomni_seed_oss_gpu_patch()
-    elif IS_NPU_AVAILABLE and is_transformers_version_greater_or_equal_to("4.50.4"):
-        from .npu_patch import apply_seed_oss_npu_patch
-
-        apply_seed_oss_npu_patch()
-    else:
-        logger.warning_rank0(
-            "SeedOssForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4."
-        )
+    apply_veomni_seed_oss_device_patch()

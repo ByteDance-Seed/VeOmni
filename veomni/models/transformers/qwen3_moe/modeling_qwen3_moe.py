@@ -32,8 +32,6 @@ from transformers.utils import (
 
 from ....ops import fused_moe_forward
 from ....utils import logging
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 logger = logging.get_logger(__name__)
@@ -129,13 +127,17 @@ class PatchQwen3MoeTopKRouter(nn.Module):
         self.register_forward_hook(router_forward_hook)
 
     def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
         router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        router_top_value = router_top_value.to(router_logits.dtype)
+        # Cast back to input dtype — matches HF's Qwen3MoeSparseMoeBlock semantics
+        # so the expert multiplication `expert_output * routing_weights` is done
+        # in input dtype rather than promoted to fp32 (which drops bf16 rounding).
+        router_top_value = router_top_value.to(input_dtype)
         router_scores = router_top_value
         return router_logits, router_scores, router_indices
 
@@ -278,20 +280,11 @@ def apply_veomni_qwen3_moe_patch():
     hf_qwen3_moe.Qwen3MoeSparseMoeBlock = PatchQwen3MoeSparseMoeBlock
     from .parallel_plan import get_parallel_plan
 
-    hf_qwen3_moe.Qwen3MoeForCausalLM.get_parallel_plan = lambda self: get_parallel_plan()
+    hf_qwen3_moe.Qwen3MoeForCausalLM.get_parallel_plan = lambda self: get_parallel_plan(use_gate_up_proj=False)
 
     hf_qwen3_moe.Qwen3MoeForCausalLM.forward = qwen3_moe_forcausal_lm_forward
     hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = qwen3_moe_pretrained_model_init_weights
 
-    if IS_CUDA_AVAILABLE:
-        from .gpu_patch import apply_veomni_qwen3_moe_gpu_patch
+    from .device_patch import apply_veomni_qwen3_moe_device_patch
 
-        apply_veomni_qwen3_moe_gpu_patch()
-    elif IS_NPU_AVAILABLE and is_transformers_version_greater_or_equal_to("4.50.4"):
-        from .npu_patch import apply_qwen3_moe_npu_patch
-
-        apply_qwen3_moe_npu_patch()
-    else:
-        logger.warning_rank0(
-            "Qwen3ForCausalLM in VeOmni only support CUDA or NPU with transformers version >= 4.50.4."
-        )
+    apply_veomni_qwen3_moe_device_patch()

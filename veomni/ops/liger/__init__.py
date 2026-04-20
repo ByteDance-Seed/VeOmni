@@ -49,7 +49,7 @@ def _liger_rms_norm_factory():
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="liger",
+        name="liger_kernel",
         op_name="rms_norm",
         variant="standard",
         factory=_liger_rms_norm_factory,
@@ -87,7 +87,7 @@ def _liger_rms_norm_qwen3_5_factory():
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="liger",
+        name="liger_kernel",
         op_name="rms_norm",
         variant="qwen3_5",
         factory=_liger_rms_norm_qwen3_5_factory,
@@ -101,8 +101,8 @@ KERNEL_REGISTRY.register(
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="liger",
-        op_name="apply_rotary_pos_emb",
+        name="liger_kernel",
+        op_name="rotary_pos_emb",
         variant="full",
         factory=lambda: (
             __import__("liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]).liger_rotary_pos_emb
@@ -132,7 +132,7 @@ def _liger_swiglu_factory():
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="liger",
+        name="liger_kernel",
         op_name="swiglu_mlp",
         variant="standard",
         factory=_liger_swiglu_factory,

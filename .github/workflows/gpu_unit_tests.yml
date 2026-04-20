@@ -38,7 +38,11 @@ env:
   NCCL_DEBUG: "WARN"
 
 jobs:
+  lint:
+    uses: ./.github/workflows/check_pr_lint.yml
+
   setup:
+    needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     runs-on: ubuntu-latest
     outputs:
@@ -94,6 +98,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
+          uv run --frozen pytest -s -x tests/models/test_models_logits_equal.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
@@ -103,6 +108,9 @@ jobs:
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
+      - name: Run distributed tests (dummy_forward)
+        run: |
+          uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data
@@ -118,10 +126,14 @@ jobs:
         run: |
           uv run  --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
+      - name: Run e2e dcp save and load test [transformers-v5]
+        run: |
+          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run utils tests [transformers-v5]
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |

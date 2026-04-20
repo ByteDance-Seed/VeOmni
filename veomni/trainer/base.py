@@ -57,6 +57,7 @@ from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import init_parallel_state
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
+from ..ops import apply_ops_config
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
@@ -237,10 +238,11 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_model(self):
         logger.info_rank0("Build model")
+        apply_ops_config(self.args.model.ops_implementation)
         self.model = build_foundation_model(
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
-            torch_dtype="float32" if self.args.train.enable_mixed_precision else "bfloat16",
+            torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
             attn_implementation=self.args.model.ops_implementation.attn_implementation,
             moe_implementation=self.args.model.ops_implementation.moe_implementation,
             init_device=self.args.train.init_device,
@@ -304,6 +306,7 @@ class BaseTrainer(Stateful, ABC):
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
+            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
@@ -320,7 +323,7 @@ class BaseTrainer(Stateful, ABC):
             weights_path=args.model.model_path,
             enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-            enable_mixed_precision=args.train.enable_mixed_precision,
+            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=list(
@@ -571,6 +574,7 @@ class BaseTrainer(Stateful, ABC):
             self.on_epoch_end()
 
             self.start_step = 0
+
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
         self.on_train_end()

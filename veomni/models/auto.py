@@ -72,7 +72,7 @@ def _apply_legacy_moe_patch(config, moe_implementation):
         config._moe_implementation = "eager"
     else:
         config._moe_implementation = "fused"
-        from ..ops.fused_moe import apply_veomni_fused_moe_patch
+        from ..ops.kernels.moe import apply_veomni_fused_moe_patch
 
         apply_veomni_fused_moe_patch(moe_implementation=moe_implementation)
 

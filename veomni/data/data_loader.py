@@ -13,8 +13,9 @@
 # limitations under the License.
 
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
+import torch
 from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -29,7 +30,8 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dynamic_batching import DynamicBatchingSizeDataset, DynamicBatchSizeDataLoader, TextBatchingStrategy
+from .dataset import DynamicBatchingSizeDataset, get_length_by_attention_mask_fn
+from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
 DATALOADER_REGISTRY = Registry("dataloader")
@@ -51,6 +53,13 @@ class DistributedDataloader(StatefulDataLoader):
             self.dataset.set_epoch(epoch)
 
 
+def _build_worker_init_fn(worker_num_threads: int) -> Callable[[int], None]:
+    def worker_init_fn(_worker_id: int) -> None:
+        torch.set_num_threads(worker_num_threads)
+
+    return worker_init_fn
+
+
 @DATALOADER_REGISTRY.register("native")
 def build_native_dataloader(
     dataset: "Dataset",
@@ -62,11 +71,11 @@ def build_native_dataloader(
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
-    dyn_bsz_in_dataloader: bool = True,  # If True, dynamic batching is handled in the main process via DynamicBatchSizeDataLoader (legacy).
-    # If False, batching is done inside each DataLoader worker via DynamicBatchingSizeDataset, which supports StatefulDataLoader checkpoint/resume.
-    dyn_bsz_dataset_save_by_idx: bool = True,  # Whether to save buffer by index for checkpointing when dyn_bsz_in_dataloader is False.
-    dyn_bsz_buffer_size: int = 500,
+    dyn_bsz_runtime: Literal["main", "worker"] = "main",
+    dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
+    dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
+    worker_num_threads: Optional[int] = None,
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
@@ -75,7 +84,57 @@ def build_native_dataloader(
     collate_fn: Optional[Callable] = None,
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
+    multiprocessing_context=None,
 ) -> "DistributedDataloader":
+    """Build the native training dataloader.
+
+    Args:
+        dyn_bsz_runtime: Which process dynamic batching runs in. ``"main"`` keeps the
+            legacy main-process ``DynamicBatchSizeDataLoader`` path, while ``"worker"``
+            batches inside each DataLoader worker via ``DynamicBatchingSizeDataset`` so
+            worker state can participate in ``StatefulDataLoader`` checkpoint/resume.
+
+            Data format by stage when ``dyn_bsz=True``:
+
+            ``dyn_bsz_runtime="main"``
+
+                dataset
+                  │  yields: ``list[dict]``
+                  ▼
+                DataLoader(batch_size=1, collate_fn=UnpackDataCollator)
+                  │  yields: ``list[dict]``
+                  ▼
+                DynamicBatchSizeDataLoader / TextBatchingStrategy
+                  │  flatten each upstream item: ``list[dict]`` -> ``dict``
+                  │  internal buffer entry: ``dict``
+                  │  micro batch from strategy: ``list[dict]``
+                  ▼
+                trainer step input
+                     ``list[list[dict]]``
+                     (outer list = micro batches in one optimizer step,
+                      inner list = samples in one micro batch)
+
+            ``dyn_bsz_runtime="worker"``
+
+                dataset
+                  │  yields: ``list[dict]``
+                  ▼
+                DynamicBatchingSizeDataset (inside each worker)
+                  │  flatten each upstream item: ``list[dict]`` -> ``dict``
+                  │  internal buffer entry: ``dict``
+                  │  micro batch before collate: ``list[dict]``
+                  ▼
+                StatefulDataLoader(batch_size=num_micro_batch, collate_fn=NoopDataCollator)
+                  │ ``list[list[dict]]``
+                  ▼
+                trainer step input
+                  │ ``list[list[dict]]``
+
+        multiprocessing_context: Optional worker start method override.
+            Use ``"spawn"`` when worker-side code must be pickle-safe and should not
+            inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
+            Example: ``multiprocessing_context="spawn"``.
+    """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
@@ -105,7 +164,7 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        if dyn_bsz_in_dataloader:
+        if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,
                 buffer_size=dyn_bsz_buffer_size,
@@ -115,12 +174,11 @@ def build_native_dataloader(
 
             collate_fn = UnpackDataCollator()
         else:
-            dataloader_batch_size = num_micro_batch
             dataset = DynamicBatchingSizeDataset(
                 dataset=dataset,
                 micro_batch_seq_length=batching_token_len,
                 ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
-                get_length_fn=lambda x: int(x["attention_mask"].sum()),
+                get_length_fn=get_length_by_attention_mask_fn,
                 dynamic_batching_collate_fn=dyn_bsz_collate_fn,
                 save_by_idx=dyn_bsz_dataset_save_by_idx,
             )
@@ -146,6 +204,7 @@ def build_native_dataloader(
             seed=seed,
         )
 
+    worker_init_fn = _build_worker_init_fn(worker_num_threads) if worker_num_threads is not None else None
     dataloader = DistributedDataloader(
         dataset,
         batch_size=dataloader_batch_size,
@@ -156,8 +215,11 @@ def build_native_dataloader(
         pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
+        worker_init_fn=worker_init_fn,
+        multiprocessing_context=multiprocessing_context,
     )
-    if dyn_bsz and dyn_bsz_in_dataloader:
+
+    if dyn_bsz and dyn_bsz_runtime == "main":
         dataloader = DynamicBatchSizeDataLoader(
             dataloader,
             batching_strategy=batching_strategy,

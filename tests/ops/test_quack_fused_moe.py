@@ -66,7 +66,7 @@ class TestQuackFusedMoe:
 
     def test_split_fc1(self, num_tokens, num_experts, hidden_dim, ffn_dim, topk):
         """Test split fc1 weights path against eager reference."""
-        from veomni.ops.fused_moe.quack_gemm import quack_gemm_fused_moe_forward
+        from veomni.ops.kernels.moe.quack_gemm import quack_gemm_fused_moe_forward
 
         device = torch.device(get_device_type())
         dtype = torch.bfloat16
@@ -119,7 +119,7 @@ class TestQuackFusedMoe:
 
     def test_merged_fc1(self, num_tokens, num_experts, hidden_dim, ffn_dim, topk):
         """Test merged fc1_1_2 weights path against eager reference."""
-        from veomni.ops.fused_moe.quack_gemm import quack_gemm_fused_moe_forward
+        from veomni.ops.kernels.moe.quack_gemm import quack_gemm_fused_moe_forward
 
         device = torch.device(get_device_type())
         dtype = torch.bfloat16
@@ -195,7 +195,7 @@ class TestBuildMoeIndices:
             A_idx (token indices) = [0, 1, 3, 1, 2, 3, 0, 2]  (flat_idx // topk)
             scatter_index: inverse of sorted_order, reshaped to [4, 2]
         """
-        from veomni.ops.fused_moe.quack_gemm import _build_moe_indices
+        from veomni.ops.kernels.moe.quack_gemm import _build_moe_indices
 
         device = torch.device(get_device_type())
         expert_index = torch.tensor([[0, 2], [1, 0], [2, 1], [0, 1]], device=device)
@@ -221,7 +221,7 @@ class TestBuildMoeIndices:
 
     def test_all_same_expert(self):
         """All tokens routed to the same expert."""
-        from veomni.ops.fused_moe.quack_gemm import _build_moe_indices
+        from veomni.ops.kernels.moe.quack_gemm import _build_moe_indices
 
         device = torch.device(get_device_type())
         expert_index = torch.zeros(8, 1, dtype=torch.long, device=device)

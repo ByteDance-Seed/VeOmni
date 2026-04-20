@@ -34,6 +34,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..ops import apply_ops_config
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -256,6 +257,7 @@ class DiTTrainer:
     def _build_model(self):
         logger.info_rank0("Build model")
         args: VeOmniDiTArguments = self.base.args
+        apply_ops_config(args.model.ops_implementation)
         dit_config = build_config(args.model.config_path)
         self.base.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
@@ -267,7 +269,7 @@ class DiTTrainer:
             self.base.model = build_foundation_model(
                 config_path=args.model.config_path,
                 weights_path=args.model.model_path,
-                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 attn_implementation=args.model.ops_implementation.attn_implementation,
                 moe_implementation=args.model.ops_implementation.moe_implementation,
                 init_device=args.train.init_device,
@@ -401,6 +403,7 @@ class DiTTrainer:
                 bsz_warmup_ratio=args.train.bsz_warmup_ratio,
                 bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
                 dyn_bsz=args.train.dyn_bsz,
+                dyn_bsz_runtime=args.train.dyn_bsz_runtime,
                 dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
                 num_workers=args.data.dataloader.num_workers,
                 drop_last=args.data.dataloader.drop_last,
