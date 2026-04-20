@@ -16,6 +16,8 @@ from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_
 
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_omni")
 def register_qwen2_5_omni_config():
+    raise_if_not_migrated_to_v5("qwen2_5_omni")
+
     from .configuration_qwen2_5_omni import Qwen2_5OmniConfig, apply_veomni_qwen25_omni_patch
 
     apply_veomni_qwen25_omni_patch()
@@ -43,6 +45,8 @@ def register_qwen2_5_omni_modeling(architecture: str):
 
 @MODEL_PROCESSOR_REGISTRY.register("Qwen2_5OmniProcessor")
 def register_qwen2_5_omni_processor():
+    raise_if_not_migrated_to_v5("qwen2_5_omni")
+
     from .processing_qwen2_5_omni import Qwen2_5OmniProcessor, apply_veomni_qwen25_omni_patch
 
     apply_veomni_qwen25_omni_patch()
