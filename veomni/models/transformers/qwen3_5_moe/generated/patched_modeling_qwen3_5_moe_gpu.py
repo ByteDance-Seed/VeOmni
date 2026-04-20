@@ -120,7 +120,7 @@ from veomni.ops.dispatch import OpSlot
 
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 
 
@@ -2546,8 +2546,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         logits = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_cross_entropy_loss.has_kernel:
-                loss, logits = veomni_cross_entropy_loss(
+            if veomni_causal_lm_loss.has_kernel:
+                loss, logits = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,

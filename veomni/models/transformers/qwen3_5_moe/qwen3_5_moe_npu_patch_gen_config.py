@@ -97,7 +97,7 @@ config.add_post_import_block(
     # These are bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-    veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
+    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     """
 )

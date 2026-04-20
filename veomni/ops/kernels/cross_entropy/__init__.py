@@ -108,6 +108,7 @@ def ForSequenceClassificationLoss(
     num_labels: int = None,
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
+    cross_entropy_fn: Optional[Callable] = None,
     **kwargs,
 ) -> torch.Tensor:
     r"""
@@ -172,6 +173,8 @@ def ForSequenceClassificationLoss(
     # Enable model parallelism
     target = target.to(device)
 
+    # Resolve the cross-entropy implementation: explicit arg > module global > eager fallback.
+    loss_func = cross_entropy_fn or _cross_entropy
     if hidden_states is None or weights is None:
         logger.warning_once(
             "hidden_states or weights is None, use eager loss implementation."
@@ -179,8 +182,6 @@ def ForSequenceClassificationLoss(
             "to pass `hidden_states` and `weights` to `loss_function`."
         )
         loss_func = eager_cross_entropy
-    else:
-        loss_func = _cross_entropy
 
     loss, logits = loss_func(
         logits,
@@ -246,11 +247,10 @@ def install_loss_mapping() -> None:
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
-def _liger_fused_ce_factory():
-    """Return ForCausalLMLoss with the Liger fused CE kernel bound via partial.
+def _liger_fused_ce_causal_factory():
+    """ForCausalLMLoss bound to the Liger fused CE kernel.
 
-    This ensures the OpSlot path gets the full preprocessing (label shifting,
-    flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
+    Used for causal-LM heads (label shifting + SP reduction).
     """
     from functools import partial
 
@@ -259,13 +259,36 @@ def _liger_fused_ce_factory():
     return partial(ForCausalLMLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
 
 
+def _liger_fused_ce_seq_cls_factory():
+    """ForSequenceClassificationLoss bound to the Liger fused CE kernel.
+
+    Used for sequence-classification heads (no label shifting; token-level labels).
+    """
+    from functools import partial
+
+    from .liger import fused_liger_kernel_cross_entropy
+
+    return partial(ForSequenceClassificationLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
 KERNEL_REGISTRY.register(
     KernelSpec(
         name="liger_kernel",
         op_name="cross_entropy_loss",
-        variant="standard",
-        factory=_liger_fused_ce_factory,
+        variant="causal",
+        factory=_liger_fused_ce_causal_factory,
         hardware=HardwareRequirement(device_type="gpu"),
-        description="Liger fused linear cross-entropy loss (with label shifting and SP reduction)",
+        description="Liger fused linear cross-entropy loss for causal LM (shifts labels, SP reduction)",
+    )
+)
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="cross_entropy_loss",
+        variant="seq_cls",
+        factory=_liger_fused_ce_seq_cls_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Liger fused linear cross-entropy loss for sequence classification (no shift)",
     )
 )

@@ -176,10 +176,16 @@ def compare_multi_items(model_name: str, outputs_dict: Dict, rtol=0.01, atol=0.0
     base_task = next(iter(outputs_dict))
     base_output = outputs_dict[base_task]
 
+    base_keys = set(base_output.keys())
     for task, output in outputs_dict.items():
         if task == base_task:
             continue
-        for key in output.keys():
+        if set(output.keys()) != base_keys:
+            raise AssertionError(
+                f"Output keys for task '{task}' do not match base task '{base_task}': "
+                f"missing={base_keys - output.keys()}, extra={output.keys() - base_keys}"
+            )
+        for key in base_keys:
             try:
                 torch.testing.assert_close(
                     output[key],

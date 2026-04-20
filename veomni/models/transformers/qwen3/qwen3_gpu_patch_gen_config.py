@@ -56,7 +56,8 @@ config.add_post_import_block(
     veomni_rms_norm = OpSlot("rms_norm", "standard")
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
     veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
-    veomni_cross_entropy_loss = OpSlot("cross_entropy_loss", "standard")
+    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_seq_cls_loss = OpSlot("cross_entropy_loss", "seq_cls")
     """
 )
 
@@ -232,8 +233,8 @@ def qwen3_forcausallm_forward_patched(
     logits = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_cross_entropy_loss.has_kernel:
-            loss, logits = veomni_cross_entropy_loss(
+        if veomni_causal_lm_loss.has_kernel:
+            loss, logits = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -291,8 +292,8 @@ def qwen3forsequenceclassification_forward_patched(
     logits = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_cross_entropy_loss.has_kernel:
-            loss, logits = veomni_cross_entropy_loss(
+        if veomni_seq_cls_loss.has_kernel:
+            loss, logits = veomni_seq_cls_loss(
                 logits=logits,
                 labels=labels,
                 num_labels=self.num_labels,
