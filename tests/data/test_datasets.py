@@ -237,6 +237,12 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         "--train.accelerator.ulysses_size=2",
         "--train.bsz_warmup_ratio=0",
         "--data.dataloader.num_workers=1",
+        # Force pin_memory=False: on NPU the pin_memory background thread
+        # races with HCCL teardown (triggered inside destroy_distributed) and
+        # aborts the process with SIGABRT. The tests use DummyDataset so
+        # pin_memory provides no benefit anyway. Mirrors the fix in #639 for
+        # tests/data/test_multisource_dataset.py.
+        "--data.dataloader.pin_memory=False",
         "--train.num_train_epochs=5",
         "--train.checkpoint.output_dir=.tests/cache",
     ]
