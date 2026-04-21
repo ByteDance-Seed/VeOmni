@@ -14,6 +14,7 @@
 
 
 import functools
+import sys
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
@@ -23,7 +24,9 @@ from transformers import (
     PreTrainedModel,
 )
 
+from ..arguments.arguments_types import OpsImplementationConfig
 from ..distributed.parallel_state import get_parallel_state
+from ..ops.dispatch import OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from ..utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -58,6 +61,43 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
+def _apply_legacy_moe_patch(config, moe_implementation):
+    """Legacy MoE dispatch path for models that don't use OpSlot."""
+    if moe_implementation not in ["eager", "fused", "fused_quack"]:
+        raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
+    logger.info_rank0(f"MoE implementation: {moe_implementation}")
+
+    if moe_implementation == "eager":
+        logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
+        config._moe_implementation = "eager"
+    else:
+        config._moe_implementation = "fused"
+        from ..ops.kernels.moe import apply_veomni_fused_moe_patch
+
+        apply_veomni_fused_moe_patch(moe_implementation=moe_implementation)
+
+
+def _resolve_impl_name(op_name: str, ops_config: OpsImplementationConfig) -> str:
+    """Resolve the kernel name for a given op from OpsImplementationConfig."""
+    return getattr(ops_config, f"{op_name}_implementation", "eager")
+
+
+def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
+    """Bind all OpSlot instances found in *modeling_module*.
+
+    Returns ``True`` if at least one OpSlot was found (and bound).
+    """
+    found = False
+    for name in dir(modeling_module):
+        obj = getattr(modeling_module, name, None)
+        if isinstance(obj, OpSlot):
+            impl_name = _resolve_impl_name(obj.op_name, ops_config)
+            obj.bind(impl_name)
+            logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
+            found = True
+    return found
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
@@ -80,6 +120,7 @@ def build_foundation_model(
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
+    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -93,20 +134,6 @@ def build_foundation_model(
         config = config_path
     else:
         config = build_config(config_path, **config_kwargs)
-
-    if moe_implementation is not None:
-        if moe_implementation not in ["eager", "fused", "fused_quack"]:
-            raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
-        logger.info_rank0(f"MoE implementation: {moe_implementation}")
-
-        if moe_implementation == "eager":
-            logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
-            config._moe_implementation = "eager"
-        else:
-            config._moe_implementation = "fused"
-            from ..ops.kernels.moe import apply_veomni_fused_moe_patch
-
-            apply_veomni_fused_moe_patch(moe_implementation=moe_implementation)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
@@ -164,6 +191,19 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
+
+    # ── Kernel dispatch ────────────────────────────────────────────────────
+    # Try OpSlot binding first; fall back to the legacy MoE patch path for
+    # models that don't use OpSlots yet (qwen3_moe, etc.).
+    modeling_module = sys.modules.get(model.__class__.__module__)
+    if (
+        ops_implementation is not None
+        and modeling_module is not None
+        and _bind_veomni_ops(modeling_module, ops_implementation)
+    ):
+        logger.info_rank0("OpSlot-based kernel dispatch active.")
+    elif moe_implementation is not None:
+        _apply_legacy_moe_patch(config, moe_implementation)
 
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,

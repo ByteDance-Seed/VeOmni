@@ -707,6 +707,11 @@ class OpsImplementationConfig:
         },
     )
 
+    @property
+    def moe_experts_implementation(self) -> str:
+        """Bridge ``moe_implementation`` → ``moe_experts_implementation`` for OpSlot lookup."""
+        return self.moe_implementation or "eager"
+
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {

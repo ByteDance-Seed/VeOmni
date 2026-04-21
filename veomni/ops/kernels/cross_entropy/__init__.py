@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,7 @@ def ForCausalLMLoss(
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
+    cross_entropy_fn: Optional[Callable] = None,
     **kwargs,
 ) -> torch.Tensor:
     # pop fused loss kwargs
@@ -73,6 +74,8 @@ def ForCausalLMLoss(
     # Enable model parallelism
     shift_labels = shift_labels.to(device)
 
+    # Resolve the cross-entropy implementation: explicit arg > module global > eager fallback.
+    loss_func = cross_entropy_fn or _cross_entropy
     if hidden_states is None or weights is None:
         logger.warning_once(
             "hidden_states or weights is None, use eager loss implementation."
@@ -80,8 +83,6 @@ def ForCausalLMLoss(
             "to pass `hidden_states` and `weights` to `loss_function`."
         )
         loss_func = eager_cross_entropy
-    else:
-        loss_func = _cross_entropy
     loss, logits = loss_func(
         logits,
         shift_labels,
@@ -238,3 +239,33 @@ def install_loss_mapping() -> None:
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
     LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
+
+
+# ── OpSlot kernel registration ───────────────────────────────────────────────
+
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+def _liger_fused_ce_factory():
+    """Return ForCausalLMLoss with the Liger fused CE kernel bound via partial.
+
+    This ensures the OpSlot path gets the full preprocessing (label shifting,
+    flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
+    """
+    from functools import partial
+
+    from .liger import fused_liger_kernel_cross_entropy
+
+    return partial(ForCausalLMLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="cross_entropy_loss",
+        variant="standard",
+        factory=_liger_fused_ce_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Liger fused linear cross-entropy loss (with label shifting and SP reduction)",
+    )
+)
