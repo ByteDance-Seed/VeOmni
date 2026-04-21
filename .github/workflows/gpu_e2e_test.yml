@@ -52,7 +52,6 @@ jobs:
       options: >-
         --gpus all
         --ipc host
-        --network host
         --shm-size 32g
     env:
       HF_HUB_ENABLE_HF_TRANSFER: 1
