@@ -22,6 +22,8 @@ from veomni.models import build_foundation_model, build_processor
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
+from ...tools import hf_local_or_remote
+
 
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
@@ -62,14 +64,16 @@ class ModelTestConfig:
 
 def load_hf_processor(model_path):
     """Load HuggingFace processor from model path."""
-    print(f"\n[Setup] Loading HF processor from path: {model_path}")
-    return AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    resolved = hf_local_or_remote(model_path)
+    print(f"\n[Setup] Loading HF processor from path: {resolved}")
+    return AutoProcessor.from_pretrained(resolved, trust_remote_code=True)
 
 
 def load_hf_model(model_path):
     """Load HuggingFace model from model path."""
-    print(f"\n[Setup] Loading HF model from path: {model_path}")
-    return AutoModelForImageTextToText.from_pretrained(model_path, trust_remote_code=True)
+    resolved = hf_local_or_remote(model_path)
+    print(f"\n[Setup] Loading HF model from path: {resolved}")
+    return AutoModelForImageTextToText.from_pretrained(resolved, trust_remote_code=True)
 
 
 def hf_process_sample(config: ModelTestConfig, hf_processor, hf_model):
@@ -124,8 +128,9 @@ def hf_process_sample(config: ModelTestConfig, hf_processor, hf_model):
 
 def load_veomni_processor(model_path):
     """Load VeOmni processor from model path."""
-    print(f"\n[Setup] Loading VeOmni processor from path: {model_path}")
-    return build_processor(model_path)
+    resolved = hf_local_or_remote(model_path)
+    print(f"\n[Setup] Loading VeOmni processor from path: {resolved}")
+    return build_processor(resolved)
 
 
 def load_veomni_model(config_path, device):

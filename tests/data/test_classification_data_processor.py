@@ -5,6 +5,8 @@ from transformers import AutoTokenizer
 from veomni.data.data_transform import process_classification_example
 from veomni.utils.constants import IGNORE_INDEX
 
+from ..tools import hf_local_or_remote
+
 
 class DummyTokenizer:
     """
@@ -172,7 +174,7 @@ def test_tokens_length_equals_max_seq_len_no_truncation():
 
 def test_process_classification_example_whitespace_with_real_qwen3_tokenizer():
     tok = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-Embedding-0.6B",
+        hf_local_or_remote("Qwen/Qwen3-Embedding-0.6B"),
         trust_remote_code=False,
     )
 
