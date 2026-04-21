@@ -58,7 +58,14 @@ jobs:
       # 8-card isolation does NOT carry over. GHA's container.options can't read
       # `runner.*` to emit a per-slice --device list, so we mount all 16 and pin
       # CANN via ASCEND_VISIBLE_DEVICES (derived from $RUNNER_NAME below).
+      #
+      # --cap-add=ALL is required: Ascend's dcmi library fails to init in a
+      # plain non-privileged container ("dcmi model initialized failed ... -8020").
+      # `--cap-add=ALL` is the minimum that makes dcmi work without going full
+      # `--privileged` (which would also mount host /dev and break the device
+      # list above). Trusted CI, acceptable trade-off.
       options: >-
+        --cap-add=ALL
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
