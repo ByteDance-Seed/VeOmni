@@ -34,34 +34,30 @@ permissions:
 
 env:
   IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
-  DYNAMIC_RUNNER_ENDPOINT: "https://sd4hav466omp034ocfn0g.apigateway-cn-beijing.volceapi.com/veomni/runner"
   NCCL_DEBUG: "WARN"
 
 jobs:
   lint:
     uses: ./.github/workflows/check_pr_lint.yml
 
-  setup:
-    needs: lint
-    if: github.repository_owner == 'ByteDance-Seed'
-    runs-on: ubuntu-latest
-    outputs:
-      runner-label: ${{ steps.create-runner.outputs.runner-label }}
-      mlp-task-id: ${{ steps.create-runner.outputs.mlp-task-id }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: create-runner
-        uses: volcengine/vemlp-github-runner@v1
-        with:
-          mode: "create"
-          faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
-          mlp-image: "${{ env.IMAGE }}"
-
   gpu_unit_tests:
     if: github.repository_owner == 'ByteDance-Seed'
-    needs: setup
-    runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
+    needs: lint
+    # Self-hosted L20-8 fleet managed by github_runner/ (ansible). Any free
+    # `l20-8` runner is picked; use `[self-hosted, l20-N]` to pin to a specific
+    # box. See github_runner/README.md for the full label scheme.
+    runs-on: [self-hosted, l20-8]
     timeout-minutes: 60 # Increase this timeout value as needed
+    # The self-hosted runner itself is a minimal myoung34/github-runner container
+    # with just the runner + docker CLI; real CI work runs inside the VeOmni GPU
+    # image as a sibling container via the host docker socket.
+    container:
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
+      options: >-
+        --gpus all
+        --ipc host
+        --network host
+        --shm-size 32g
     env:
       HF_HUB_ENABLE_HF_TRANSFER: 1
       NCCL_DEBUG: "WARN"
@@ -140,15 +136,3 @@ jobs:
           # Need v5 to support newer models like Qwen3.5 count flops tests.
           uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/utils/test_count_flops.py
       # TODO: Run other tests in transformers v5 env as well.
-
-  cleanup:
-    runs-on: ubuntu-latest
-    needs: [setup, gpu_unit_tests]
-    if: always()
-    steps:
-      - id: destroy-runner
-        uses: volcengine/vemlp-github-runner@v1
-        with:
-          mode: "destroy"
-          faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
-          mlp-task-id: "${{ needs.setup.outputs.mlp-task-id }}"

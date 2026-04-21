@@ -40,28 +40,33 @@ jobs:
     needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
-    runs-on: [self-hosted, npu-0]
+    # Pick any free 8-card 910B slice (910b-0..5). See
+    # github_runner/README.md for the full label scheme. Use
+    # `[self-hosted, 910b-N]` if you need to pin to a specific runner, or
+    # `[self-hosted, 910b-host-N]` to pin to a specific physical machine.
+    runs-on: [self-hosted, 910b-8]
     timeout-minutes: 60 # Increase this timeout value as needed
     container:
       image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
-        - /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/
-        - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
-        - /etc/ascend_install.info:/etc/ascend_install.info
+        # Whole driver tree so CANN can find all .so's (libc_sec.so, ...).
+        - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+        - /etc/ascend_install.info:/etc/ascend_install.info:ro
         - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
-        # - /data00/dataset:/github/home/dataset
-        # - /data00/models:/github/home/models
-        # Use self-host cache speed up pip and model download
-        # - /home/action/actions-runner/_work/cache:/github/home/.cache/
+        # Shared CI asset mount (samples/models/datasets live under /data00/assets
+        # on the host; see github_runner/group_vars/npu_nodes.yml).
+        - /data00/assets:/data00/assets:ro
       options: >-
-        --device /dev/davinci0
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
+        --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+        --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+        --device /dev/davinci8 --device /dev/davinci9 --device /dev/davinci10 --device /dev/davinci11
+        --device /dev/davinci12 --device /dev/davinci13 --device /dev/davinci14 --device /dev/davinci15
         --network host
-        --privileged
         --shm-size 16g
     env:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
@@ -70,6 +75,29 @@ jobs:
       CI_SAMPLES_DIR: "/data00/assets/samples"
 
     steps:
+      - name: Set ASCEND_VISIBLE_DEVICES from runner slice
+        # $RUNNER_NAME is injected automatically by the GitHub Actions runner
+        # and equals the `npu_runner_specs[*].name` from the ansible deploy
+        # (910b-0, 910b-1, ..., 910b-5). Even-suffix slices own cards 0-7,
+        # odd-suffix slices own cards 8-15. See github_runner/README.md.
+        run: |
+          case "$RUNNER_NAME" in
+            910b-*)
+              slice_num="${RUNNER_NAME#910b-}"
+              if [ "$((slice_num % 2))" -eq 0 ]; then
+                cards="0,1,2,3,4,5,6,7"
+              else
+                cards="8,9,10,11,12,13,14,15"
+              fi
+              ;;
+            *)
+              echo "Unexpected RUNNER_NAME=$RUNNER_NAME; falling back to first 8 cards" >&2
+              cards="0,1,2,3,4,5,6,7"
+              ;;
+          esac
+          echo "ASCEND_VISIBLE_DEVICES=$cards" >> "$GITHUB_ENV"
+          echo "ASCEND_RT_VISIBLE_DEVICES=$cards" >> "$GITHUB_ENV"
+          echo "Runner $RUNNER_NAME -> ASCEND_VISIBLE_DEVICES=$cards"
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
