@@ -45,21 +45,21 @@ dev = [
 ]
 audio = [
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 # Alias for audio extra - includes both video and audio processing dependencies
 video = [
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
   "diffusers==0.36.0",
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
   "ftfy",
@@ -89,7 +89,9 @@ gpu = [
   "nvidia-cusparselt-cu12",
   "nvidia-nccl-cu12",
   "liger-kernel",
-  "flash-attn",
+  # flash-attn v2 has no torch-2.9-compatible cp312 wheel; users on Python 3.12 must
+  # either skip fa2 or supply their own source.
+  "flash-attn; python_version == '3.11'",
   "flash-attn-3",
   "hf_transfer",
   "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
@@ -229,18 +231,22 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Download fa2 and fa3 wheels directly to avoid build issues.
+# flash-attn v2 has no torch-2.9-compatible cp312 wheel available publicly. We gate the
+# cp311 URL so 3.12 resolution doesn't pick an ABI-incompatible wheel; 3.12 users wanting
+# fa2 must supply their own source (e.g. via workspace root's [tool.uv.sources]).
 flash-attn = [
   # torch 2.9+cu129
   # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.9+.
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"},
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'"},
 ]
 flash-attn-3 = [
-  # torch 2.9+cu129
+  # torch 2.9+cu129 — cp39-abi3 (stable ABI) works on both 3.11 and 3.12.
   { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
@@ -248,7 +254,9 @@ flash-attn-3 = [
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 
 # Download av wheel directly to avoid FFmpeg build dependency issues in CI.
-av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video' or extra == 'dit'" }
+# av 14.4.0 has no cp312 binary on pypi; gate with python_version so 3.12 universal-lock
+# resolution for audio/video/dit extras can fall through to a workspace-root source.
+av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" }
 
 [[tool.uv.index]]
 name = "pytorch"
