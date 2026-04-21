@@ -136,7 +136,8 @@ without modifying the config class.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
-| moe_implementation | `Optional[Literal["eager", "fused", "fused_quack"]]` | `None` | MoE implementation: `eager` (reference loop), `fused` (Triton), `fused_quack` (Quack CUTLASS, SM90+). |
+| moe_implementation | `Literal["eager", "fused"]` | `"eager"` | MoE experts forward mode. `fused` binds a fused kernel (selected via `fused_moe_kernel`); `eager` runs the reference loop. Accepts deprecated value `fused_quack` as an alias for `fused` + `fused_moe_kernel=quack`. |
+| fused_moe_kernel | `Literal["triton", "quack"]` | `"triton"` | Backend kernel used when `moe_implementation="fused"`. `triton` uses Triton group-gemm; `quack` uses Quack CUTLASS/CuTe (SM90+). Ignored on NPU (NPU always uses its own fused kernel). |
 | cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss). |
 | rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
 | swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |

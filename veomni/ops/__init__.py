@@ -102,8 +102,8 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
 
     applied = apply_global_ops(ops_config)
     # NOTE: fused MoE patch is applied in build_foundation_model() based on
-    # the moe_implementation parameter; per-model kernels are applied by each
-    # model's device_patch.py.
+    # the (moe_implementation, fused_moe_kernel) pair; per-model kernels are
+    # applied by each model's device_patch.py.
     logger.info_rank0(f"✅ VeOmni ops config applied: {', '.join(applied) if applied else '(defaults only)'}.")
     logger.info_rank0(format_kernel_functions())
 

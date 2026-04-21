@@ -652,20 +652,22 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
-    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = field(
-        default=None,
-        metadata={
-            "help": "[DEPRECATED] Use 'moe_experts_implementation' instead. "
-            "Legacy MoE selector: 'eager'/'fused'/'fused_quack' "
-            "(the latter maps to 'quack' on the new field)."
-        },
-    )
-    moe_experts_implementation: Literal["eager", "fused", "quack"] = field(
+    moe_implementation: Literal["eager", "fused", "fused_quack"] = field(
         default="eager",
         metadata={
-            "help": "MoE experts forward implementation. "
-            "'fused' for Triton group-gemm, 'quack' for Quack CUTLASS/CuTe kernels (SM90+), "
-            "'eager' (default) for the reference loop."
+            "help": "MoE experts forward mode. "
+            "'fused' binds a fused kernel (selected via 'fused_moe_kernel'). "
+            "'eager' (default) runs the reference loop. "
+            "'fused_quack' is a deprecated alias for moe_implementation='fused' + fused_moe_kernel='quack'."
+        },
+    )
+    fused_moe_kernel: Literal["triton", "quack"] = field(
+        default="triton",
+        metadata={
+            "help": "Backend kernel used when moe_implementation='fused'. "
+            "'triton' (default) uses the Triton group-gemm kernel. "
+            "'quack' uses the Quack CUTLASS/CuTe kernel (requires SM90+). "
+            "Ignored when moe_implementation='eager' or on NPU (NPU always uses its own fused kernel)."
         },
     )
     cross_entropy_loss_implementation: str = field(
@@ -727,42 +729,44 @@ class OpsImplementationConfig:
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
-        self._bridge_legacy_moe_implementation()
+        self._bridge_legacy_fused_quack()
         self._validate_implementations()
 
-    def _bridge_legacy_moe_implementation(self):
-        """Bridge deprecated ``moe_implementation`` onto ``moe_experts_implementation``.
+    def _bridge_legacy_fused_quack(self):
+        """Bridge the deprecated ``moe_implementation="fused_quack"`` value.
 
-        Existing configs still pass ``moe_implementation: fused`` / ``fused_quack``;
-        route them onto the new field (with ``fused_quack`` → ``quack``) and
-        emit a DeprecationWarning. If the user sets both, the new field wins
-        and we warn about the conflict.
+        Older configs conflated mode and backend kernel into a single field
+        (``fused_quack``). Map that onto the split pair
+        (``moe_implementation="fused"`` + ``fused_moe_kernel="quack"``) and
+        emit a DeprecationWarning.
         """
-        if self.moe_implementation is None:
+        if self.moe_implementation != "fused_quack":
             return
 
         import warnings
 
-        legacy_to_new = {"eager": "eager", "fused": "fused", "fused_quack": "quack"}
-        mapped = legacy_to_new[self.moe_implementation]
-
-        if self.moe_experts_implementation != "eager" and self.moe_experts_implementation != mapped:
-            warnings.warn(
-                f"Both 'moe_implementation={self.moe_implementation}' and "
-                f"'moe_experts_implementation={self.moe_experts_implementation}' are set; "
-                "the new field takes precedence. Drop 'moe_implementation'.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-            return
-
         warnings.warn(
-            f"'moe_implementation={self.moe_implementation}' is deprecated; "
-            f"use 'moe_experts_implementation={mapped}' instead.",
+            "moe_implementation='fused_quack' is deprecated; use "
+            "moe_implementation='fused' with fused_moe_kernel='quack' instead.",
             DeprecationWarning,
             stacklevel=3,
         )
-        self.moe_experts_implementation = mapped
+        self.moe_implementation = "fused"
+        self.fused_moe_kernel = "quack"
+
+    def resolve_impl_name(self, op_name: str) -> str:
+        """Return the kernel name to bind for ``op_name``.
+
+        For most ops this is simply the value of ``<op_name>_implementation``.
+        ``moe_experts`` is the one op whose user-facing selection is split
+        across two fields — ``moe_implementation`` picks the mode, and
+        ``fused_moe_kernel`` picks the backend when fused.
+        """
+        if op_name == "moe_experts":
+            if self.moe_implementation == "eager":
+                return "eager"
+            return self.fused_moe_kernel
+        return getattr(self, f"{op_name}_implementation", "eager")
 
     def _validate_implementations(self):
         """Validate that requested backends are actually available.

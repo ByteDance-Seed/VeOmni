@@ -61,11 +61,11 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
-def _apply_legacy_moe_patch(config, moe_implementation):
+def _apply_legacy_moe_patch(config, moe_implementation: str, fused_moe_kernel: str):
     """Legacy MoE dispatch path for models that don't use OpSlot."""
-    if moe_implementation not in ["eager", "fused", "fused_quack"]:
+    if moe_implementation not in ("eager", "fused"):
         raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
-    logger.info_rank0(f"MoE implementation: {moe_implementation}")
+    logger.info_rank0(f"MoE implementation: {moe_implementation} (kernel={fused_moe_kernel})")
 
     if moe_implementation == "eager":
         logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
@@ -74,12 +74,7 @@ def _apply_legacy_moe_patch(config, moe_implementation):
         config._moe_implementation = "fused"
         from ..ops.kernels.moe import apply_veomni_fused_moe_patch
 
-        apply_veomni_fused_moe_patch(moe_implementation=moe_implementation)
-
-
-def _resolve_impl_name(op_name: str, ops_config: OpsImplementationConfig) -> str:
-    """Resolve the kernel name for a given op from OpsImplementationConfig."""
-    return getattr(ops_config, f"{op_name}_implementation", "eager")
+        apply_veomni_fused_moe_patch(fused_moe_kernel=fused_moe_kernel)
 
 
 def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
@@ -91,7 +86,7 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
         if isinstance(obj, OpSlot):
-            impl_name = _resolve_impl_name(obj.op_name, ops_config)
+            impl_name = ops_config.resolve_impl_name(obj.op_name)
             obj.bind(impl_name)
             logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
             found = True
@@ -126,7 +121,8 @@ def build_foundation_model(
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
-    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
+    moe_implementation: Optional[Literal["eager", "fused"]] = None,
+    fused_moe_kernel: Literal["triton", "quack"] = "triton",
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
@@ -215,7 +211,7 @@ def build_foundation_model(
                 f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
             )
         else:
-            _apply_legacy_moe_patch(config, moe_implementation)
+            _apply_legacy_moe_patch(config, moe_implementation, fused_moe_kernel)
 
     model = loader.load_model(
         init_kwargs=init_kwargs,

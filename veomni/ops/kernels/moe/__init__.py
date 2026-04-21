@@ -62,14 +62,14 @@ def fused_moe_forward(
 
 
 def apply_veomni_fused_moe_patch(
-    moe_implementation: Literal["fused", "fused_quack"] = "fused",
+    fused_moe_kernel: Literal["triton", "quack"] = "triton",
 ):
     """Bind the global ``_fused_moe_forward`` function pointer.
 
     Args:
-        moe_implementation: Which fused MoE kernel to activate.
-            ``"fused"`` uses the Triton group-gemm kernels (default).
-            ``"fused_quack"`` uses the Quack CUTLASS/CuTe kernels (SM90+).
+        fused_moe_kernel: Which fused MoE kernel to activate.
+            ``"triton"`` uses the Triton group-gemm kernels (default).
+            ``"quack"`` uses the Quack CUTLASS/CuTe kernels (SM90+).
             On NPU devices the parameter is ignored and the NPU kernel is
             always selected.
     """
@@ -78,16 +78,16 @@ def apply_veomni_fused_moe_patch(
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
-    elif moe_implementation == "fused_quack":
+    elif fused_moe_kernel == "quack":
         if not is_quack_gemm_available():
             raise RuntimeError(
-                "moe_implementation='fused_quack' requires the quack package and an SM90+ GPU. "
-                "Please install quack or use moe_implementation='fused'."
+                "fused_moe_kernel='quack' requires the quack package and an SM90+ GPU. "
+                "Please install quack or use fused_moe_kernel='triton'."
             )
         from .quack_gemm import quack_gemm_fused_moe_forward
 
         _fused_moe_forward = quack_gemm_fused_moe_forward
-    elif moe_implementation == "fused" and is_fused_moe_available():
+    elif fused_moe_kernel == "triton" and is_fused_moe_available():
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
@@ -122,7 +122,7 @@ def _make_moe_experts_adapter(raw_forward):
     return adapter
 
 
-def _fused_moe_kernel_factory():
+def _triton_kernel_factory():
     from .group_gemm import group_gemm_fused_moe_forward
 
     return _make_moe_experts_adapter(group_gemm_fused_moe_forward)
@@ -130,17 +130,17 @@ def _fused_moe_kernel_factory():
 
 KERNEL_REGISTRY.register(
     KernelSpec(
-        name="fused",
+        name="triton",
         op_name="moe_experts",
         variant="standard",
-        factory=_fused_moe_kernel_factory,
+        factory=_triton_kernel_factory,
         hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
         description="Triton group-gemm fused MoE forward",
     )
 )
 
 
-def _fused_quack_kernel_factory():
+def _quack_kernel_factory():
     from .quack_gemm import quack_gemm_fused_moe_forward
 
     return _make_moe_experts_adapter(quack_gemm_fused_moe_forward)
@@ -151,7 +151,7 @@ KERNEL_REGISTRY.register(
         name="quack",
         op_name="moe_experts",
         variant="standard",
-        factory=_fused_quack_kernel_factory,
+        factory=_quack_kernel_factory,
         hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
         description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
     )

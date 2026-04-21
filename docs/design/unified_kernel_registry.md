@@ -251,7 +251,9 @@ class OpsImplementationConfig:
     rms_norm_gated_implementation: str = "eager"
     rotary_pos_emb_implementation: str = "eager"
     swiglu_mlp_implementation: str = "eager"
-    moe_experts_implementation: str = "eager"
+    # MoE: mode ("eager" | "fused") + backend kernel ("triton" | "quack")
+    moe_implementation: Literal["eager", "fused"] = "eager"
+    fused_moe_kernel: Literal["triton", "quack"] = "triton"
     cross_entropy_loss_implementation: str = "eager"
     moe_load_balancing_loss_implementation: str = "eager"
 ```
@@ -262,7 +264,8 @@ Convenience preset:
 model:
   ops_implementation:
     preset: liger   # expands to rms_norm=liger, rope=liger, swiglu=liger, loss=liger_fused
-    moe_experts_implementation: triton_group_gemm  # override individual op
+    moe_implementation: fused       # override individual op
+    fused_moe_kernel: triton
 ```
 
 Preset expansion is best-effort: if the model's variant for an op has no `liger`
@@ -317,8 +320,9 @@ User YAML                    OpsImplementationConfig              OpSlot.bind()
 ─────────                    ───────────────────────              ─────────────
 model:                       @dataclass
   ops_implementation:  ───→  class OpsImplementationConfig:
-    moe_experts_impl:            moe_experts_implementation: str
-      triton_group_gemm                    │
+    moe_implementation:          moe_implementation: Literal[...]
+      fused                      fused_moe_kernel:   Literal[...]
+    fused_moe_kernel: triton             │
                                            ▼
                              build_foundation_model(config)
                                ├─ import patched_modeling_qwen3_5_moe_gpu
@@ -331,7 +335,7 @@ model:                       @dataclass
                                ├─ _bind_veomni_ops(module, ops_config):
                                │    for name, obj in vars(module).items():
                                │        if isinstance(obj, OpSlot):
-                               │            impl = ops_config.<obj.op_name>_implementation
+                               │            impl = ops_config.resolve_impl_name(obj.op_name)
                                │            obj.bind(impl)     ← resolves via KERNEL_REGISTRY
                                │
                                └─ model init + weight loading
@@ -349,9 +353,7 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig):
     """Find all OpSlot instances in the module and bind them."""
     for name, obj in vars(modeling_module).items():
         if isinstance(obj, OpSlot):
-            impl_name = getattr(
-                ops_config, f"{obj.op_name}_implementation", "eager"
-            )
+            impl_name = ops_config.resolve_impl_name(obj.op_name)
             obj.bind(impl_name)  # validates variant + hardware
 ```
 
@@ -664,7 +666,8 @@ model:
     attn_implementation: flash_attention_2
     rms_norm_implementation: eager              # only eager for qwen3_5 variant
     rotary_pos_emb_implementation: eager  # only eager for partial variant
-    moe_experts_implementation: triton_group_gemm
+    moe_implementation: fused
+    fused_moe_kernel: triton
     cross_entropy_loss_implementation: liger_fused
     moe_load_balancing_loss_implementation: eager
 ```
@@ -704,8 +707,8 @@ build_foundation_model(config)                     # (4) model build time
   │
   ├─ _bind_veomni_ops(module, ops_config):          #     bind from config
   │    for each OpSlot in vars(module):
-  │        impl = ops_config.<slot.op_name>_implementation   # e.g. "triton_group_gemm"
-  │        slot.bind(impl)                                   # KERNEL_REGISTRY.resolve()
+  │        impl = ops_config.resolve_impl_name(slot.op_name)  # e.g. "triton"
+  │        slot.bind(impl)                                    # KERNEL_REGISTRY.resolve()
   │
   └─ model init + weight loading
 
@@ -732,8 +735,8 @@ model.forward()                                    # (5) runtime
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | `rms_norm_implementation: liger` etc. | Deprecate env var; keep compat for 1 release |
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
-| `apply_veomni_fused_moe_patch()` | `moe_experts_implementation` + `OpSlot` | Remove standalone patch function |
-| `moe_implementation` config field | `moe_experts_implementation` | Rename, keep alias for 1 release |
+| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | Kept for legacy-dispatch models (qwen3_moe etc.) until they adopt OpSlot |
+| `moe_implementation: fused_quack` (single field) | `moe_implementation=fused` + `fused_moe_kernel=quack` | Legacy value accepted with DeprecationWarning |
 
 ---
 

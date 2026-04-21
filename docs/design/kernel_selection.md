@@ -14,7 +14,8 @@ All selections are driven by config fields in `OpsImplementationConfig`.
 | SwiGLU MLP | `swiglu_mlp_implementation` | `"eager"` | Model registration via ops config singleton |
 | Rotary embedding | `rotary_pos_emb_implementation` | `"eager"` | Model registration via ops config singleton |
 | Load-balancing loss | `load_balancing_loss_implementation` | `"eager"` | `apply_ops_config()` (before model build) |
-| MoE implementation | `moe_implementation` | `None` | `build_foundation_model` |
+| MoE mode | `moe_implementation` | `"eager"` | `build_foundation_model` |
+| Fused MoE kernel | `fused_moe_kernel` | `"triton"` | `build_foundation_model` (used when `moe_implementation="fused"`) |
 
 All config fields live in `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`),
 accessible via `model.ops_implementation.*` in YAML.
@@ -185,20 +186,25 @@ model:
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused          # Triton group-gemm (default fused path)
-    # moe_implementation: fused_quack  # Quack CUTLASS/CuTe kernels (SM90+)
-    # moe_implementation: eager        # Reference PyTorch loop (very slow, debug only)
+    moe_implementation: fused       # bind a fused kernel (picked by fused_moe_kernel)
+    fused_moe_kernel: triton        # Triton group-gemm (default)
+    # fused_moe_kernel: quack       # Quack CUTLASS/CuTe kernels (SM90+)
+    # moe_implementation: eager     # Reference PyTorch loop (very slow, debug only)
 ```
 
-**Field:** `OpsImplementationConfig.moe_implementation`
-**Default:** `None` (falls back to `"eager"` per model config)
+**Fields:** `OpsImplementationConfig.moe_implementation` + `OpsImplementationConfig.fused_moe_kernel`
+**Defaults:** `moe_implementation="eager"`, `fused_moe_kernel="triton"`
 
-| Value | Kernel | Hardware | EP support |
-|-------|--------|----------|:----------:|
-| `eager` | PyTorch expert loop | Any | No |
-| `fused` | Triton group-gemm | SM70+ (V100+) | Yes |
-| `fused_quack` | Quack CUTLASS/CuTe | SM90+ (H100+) | No |
-| *(NPU auto)* | NPU group-gemm | Ascend NPU | Yes |
+| `moe_implementation` | `fused_moe_kernel` | Kernel | Hardware | EP support |
+|----------------------|--------------------|--------|----------|:----------:|
+| `eager` | *(ignored)* | PyTorch expert loop | Any | No |
+| `fused` | `triton` | Triton group-gemm | SM70+ (V100+) | Yes |
+| `fused` | `quack` | Quack CUTLASS/CuTe | SM90+ (H100+) | No |
+| `fused` | *(ignored on NPU)* | NPU group-gemm | Ascend NPU | Yes |
+
+The legacy value `moe_implementation: fused_quack` is accepted (with a
+`DeprecationWarning`) and mapped to `moe_implementation=fused` +
+`fused_moe_kernel=quack`.
 
 ### Key files
 
@@ -279,8 +285,8 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | `apply_veomni_fused_moe_patch()` replaces the global `fused_moe_forward` function pointer, keyed by `config._moe_implementation ∈ {"eager", "fused"}`. The actual GEMM backend (Triton vs Quack) is selected inside the patch function. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused"` / `"fused_quack"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **Mechanism** | `apply_veomni_fused_moe_patch()` replaces the global `fused_moe_forward` function pointer, keyed by `config._moe_implementation ∈ {"eager", "fused"}`. The GEMM backend (Triton vs Quack) is selected by `OpsImplementationConfig.fused_moe_kernel`. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused"`) + `fused_moe_kernel` (`"triton"` / `"quack"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
 | **EP support** | Triton `fused` path supports Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Deferred to `build_foundation_model()` | Decorator at class definition time; dispatch at forward time |
 
