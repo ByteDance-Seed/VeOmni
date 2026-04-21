@@ -77,27 +77,27 @@ jobs:
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
-        # $RUNNER_NAME is injected by the GitHub Actions runner and equals the
-        # `npu_runner_specs[*].name` from ansible (910b-0..5). Even-suffix slices
-        # own cards 0-7, odd-suffix own 8-15. See github_runner/README.md.
+        # See npu_unit_tests.yml for the full rationale. We match the runner
+        # name (910b-0 .. 910b-5) and map even slices to cards 0-7, odd slices
+        # to 8-15. Fall back to the low slice if the name can't be parsed.
+        shell: bash
         run: |
-          case "$RUNNER_NAME" in
-            910b-*)
-              slice_num="${RUNNER_NAME#910b-}"
-              if [ "$((slice_num % 2))" -eq 0 ]; then
-                cards="0,1,2,3,4,5,6,7"
-              else
-                cards="8,9,10,11,12,13,14,15"
-              fi
-              ;;
-            *)
-              echo "Unexpected RUNNER_NAME=$RUNNER_NAME; falling back to first 8 cards" >&2
-              cards="0,1,2,3,4,5,6,7"
-              ;;
-          esac
-          echo "ASCEND_VISIBLE_DEVICES=$cards" >> "$GITHUB_ENV"
-          echo "ASCEND_RT_VISIBLE_DEVICES=$cards" >> "$GITHUB_ENV"
-          echo "Runner $RUNNER_NAME -> ASCEND_VISIBLE_DEVICES=$cards"
+          set -u
+          echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+          echo "HOSTNAME=${HOSTNAME:-<unset>}"
+          name="${RUNNER_NAME:-${HOSTNAME:-}}"
+          cards="0,1,2,3,4,5,6,7"
+          if [[ "$name" =~ ^910b-([0-9]+)$ ]]; then
+            slice_num="${BASH_REMATCH[1]}"
+            if (( slice_num % 2 != 0 )); then
+              cards="8,9,10,11,12,13,14,15"
+            fi
+            echo "Detected slice $slice_num -> cards $cards"
+          else
+            echo "WARN: could not parse 910b-N from '$name'; defaulting to $cards" >&2
+          fi
+          echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+          echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
