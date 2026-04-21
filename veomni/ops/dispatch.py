@@ -42,8 +42,7 @@ class OpSlot:
         self.op_name = op_name
         self.variant = variant
         self._kernel: Callable | None = None
-        self._bound = False
-        self._impl_name: str | None = None
+        self._impl_name: str | None = None  # None ⇔ bind() has not been called
 
     def bind(self, impl_name: str) -> None:
         """Resolve *impl_name* via the global registry and bind the result.
@@ -54,14 +53,13 @@ class OpSlot:
         instances — we warn so eager-vs-fused evaluation setups spot the
         collision early.
         """
-        if self._bound and self._impl_name != impl_name:
+        if self._impl_name is not None and self._impl_name != impl_name:
             logger.warning_rank0(
                 f"OpSlot('{self.op_name}', '{self.variant}') was already bound to "
                 f"'{self._impl_name}'; rebinding to '{impl_name}'. Any other model "
                 "instance sharing this module will pick up the new binding."
             )
         self._kernel = KERNEL_REGISTRY.resolve(self.op_name, self.variant, impl_name)
-        self._bound = True
         self._impl_name = impl_name
 
     @property
@@ -73,12 +71,6 @@ class OpSlot:
         both "bound to eager" (``KERNEL_REGISTRY.resolve`` returned ``None``)
         and "never bound".
         """
-        # TODO(compile): `use_non_eager_impl` + `__call__` go through Python
-        # attribute access on a non-nn.Module object, which can cause Dynamo
-        # graph breaks when modeling code is wrapped with torch.compile. Once
-        # the training path starts using torch.compile, mark the bound kernel
-        # as constant (e.g. via torch.compiler.assume_constant_result) so the
-        # guard branch can be dead-code-eliminated at trace time.
         return self._kernel is not None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -90,7 +82,10 @@ class OpSlot:
         return self._kernel(*args, **kwargs)
 
     def __repr__(self) -> str:
-        state = "unbound"
-        if self._bound:
-            state = f"kernel={self._kernel}" if self._kernel else "eager"
+        if self._impl_name is None:
+            state = "unbound"
+        elif self._kernel is None:
+            state = "eager"
+        else:
+            state = f"kernel={self._kernel}"
         return f"OpSlot(op_name={self.op_name!r}, variant={self.variant!r}, {state})"
