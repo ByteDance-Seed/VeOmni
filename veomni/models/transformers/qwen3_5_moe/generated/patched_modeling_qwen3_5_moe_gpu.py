@@ -1001,7 +1001,7 @@ class Qwen3_5MoeExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         # Modification: OpSlot guard — dispatch to fused MoE kernel when bound.
-        if veomni_moe_experts_forward.has_kernel:
+        if veomni_moe_experts_forward.use_non_eager_impl:
             return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
 
         # Original HF eager loop below, unchanged.
@@ -1095,7 +1095,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
     # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
     def forward(self, x):
         # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
-        if veomni_rms_norm.has_kernel:
+        if veomni_rms_norm.use_non_eager_impl:
             return veomni_rms_norm(x, self.weight, self.eps)
         # Original HF code below, unchanged.
         output = self._norm(x.float())
@@ -2546,7 +2546,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         logits = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_causal_lm_loss.has_kernel:
+            if veomni_causal_lm_loss.use_non_eager_impl:
                 loss, logits = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
@@ -2568,7 +2568,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         aux_loss = None
         if kwargs.get("output_router_logits", False):
             # Modification: OpSlot guard for load-balancing loss.
-            if veomni_load_balancing_loss.has_kernel:
+            if veomni_load_balancing_loss.use_non_eager_impl:
                 aux_loss = veomni_load_balancing_loss(
                     outputs.router_logits,
                     self.config.text_config.num_experts,

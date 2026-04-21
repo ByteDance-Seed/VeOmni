@@ -79,11 +79,11 @@ class TrainerTest(BaseTrainer):
             if not isinstance(obj, OpSlot) or obj.op_name not in self._LIGER_OP_NAMES:
                 continue
             if model_mode.use_liger_kernel:
-                assert obj.has_kernel, (
+                assert obj.use_non_eager_impl, (
                     f"OpSlot {name} ({obj.op_name}/{obj.variant}) should have kernel when use_liger_kernel=True"
                 )
             else:
-                assert not obj.has_kernel, (
+                assert not obj.use_non_eager_impl, (
                     f"OpSlot {name} ({obj.op_name}/{obj.variant}) should be eager when use_liger_kernel=False"
                 )
 

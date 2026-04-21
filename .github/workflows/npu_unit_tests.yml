@@ -125,6 +125,7 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
+          uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
       - name: Sync dependencies [transformers-v5]
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev

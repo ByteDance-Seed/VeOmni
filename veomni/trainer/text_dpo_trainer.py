@@ -141,7 +141,6 @@ class TextDPOTrainer:
             torch_dtype=args.dpo_config.refer_model_precision,
             attn_implementation=args.model.ops_implementation.attn_implementation,
             moe_implementation=args.model.ops_implementation.moe_implementation,
-            fused_moe_kernel=args.model.ops_implementation.fused_moe_kernel,
             init_device=args.train.init_device,
         )
 

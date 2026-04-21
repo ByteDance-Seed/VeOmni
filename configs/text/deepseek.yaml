@@ -2,7 +2,7 @@ model:
   # model_path: deepseek-ai/DeepSeek-V3-0324
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: fused
+    moe_implementation: fused_triton
 
 data:
   train_path: fineweb_100BT

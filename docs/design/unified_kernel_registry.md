@@ -251,9 +251,8 @@ class OpsImplementationConfig:
     rms_norm_gated_implementation: str = "eager"   # (proposed — not yet shipped)
     rotary_pos_emb_implementation: str = "eager"
     swiglu_mlp_implementation: str = "eager"
-    # MoE: mode ("eager" | "fused") + backend kernel ("triton" | "quack")
-    moe_implementation: Literal["eager", "fused"] = "eager"
-    fused_moe_kernel: Literal["triton", "quack"] = "triton"
+    # MoE: single-field backend selection — no silent hardware fallback.
+    moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = "eager"
     cross_entropy_loss_implementation: str = "eager"
     load_balancing_loss_implementation: str = "eager"
 ```
@@ -267,7 +266,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
-| `moe_implementation` + `fused_moe_kernel` | `eager` \| `fused`; backend `triton` \| `quack` | `fused_moe_kernel` ignored when `moe_implementation="eager"` and on NPU |
+| `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field; mismatches (e.g. `fused_triton` on NPU) raise in `apply_veomni_fused_moe_patch` rather than silently falling back |
 | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | |
 | `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
 
@@ -284,8 +283,7 @@ Convenience preset:
 model:
   ops_implementation:
     preset: liger   # expands to rms_norm=liger, rope=liger, swiglu=liger, loss=liger_fused
-    moe_implementation: fused       # override individual op
-    fused_moe_kernel: triton
+    moe_implementation: fused_triton  # override individual op
 ```
 
 Preset expansion is best-effort: if the model's variant for an op has no `liger`
@@ -318,7 +316,7 @@ class OpSlot:
         self._kernel = KERNEL_REGISTRY.resolve(self.op_name, self.variant, impl_name)
 
     @property
-    def has_kernel(self) -> bool:
+    def use_non_eager_impl(self) -> bool:
         return self._kernel is not None
 
     def __call__(self, *args, **kwargs):
@@ -341,8 +339,7 @@ User YAML                    OpsImplementationConfig              OpSlot.bind()
 model:                       @dataclass
   ops_implementation:  ───→  class OpsImplementationConfig:
     moe_implementation:          moe_implementation: Literal[...]
-      fused                      fused_moe_kernel:   Literal[...]
-    fused_moe_kernel: triton             │
+      fused_triton                         │
                                            ▼
                              build_foundation_model(config)
                                ├─ import patched_modeling_qwen3_5_moe_gpu
@@ -355,14 +352,14 @@ model:                       @dataclass
                                ├─ _bind_veomni_ops(module, ops_config):
                                │    for name, obj in vars(module).items():
                                │        if isinstance(obj, OpSlot):
-                               │            impl = ops_config.resolve_impl_name(obj.op_name)
+                               │            impl = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
                                │            obj.bind(impl)     ← resolves via KERNEL_REGISTRY
                                │
                                └─ model init + weight loading
 ```
 
 After binding, the `OpSlot` globals are live. When methods call
-`veomni_moe_experts_forward.has_kernel`, they reference the same bound
+`veomni_moe_experts_forward.use_non_eager_impl`, they reference the same bound
 module-level object. No additional plumbing is needed — Python's normal
 module-global lookup does the work.
 
@@ -373,7 +370,7 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig):
     """Find all OpSlot instances in the module and bind them."""
     for name, obj in vars(modeling_module).items():
         if isinstance(obj, OpSlot):
-            impl_name = ops_config.resolve_impl_name(obj.op_name)
+            impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
             obj.bind(impl_name)  # validates variant + hardware
 ```
 
@@ -395,7 +392,7 @@ each replaceable function or method. Call sites stay unchanged.
 3. Patchgen adds a 2-line guard at the **top of each replaceable function or
    method**:
    ```python
-   if veomni_<op>.has_kernel:
+   if veomni_<op>.use_non_eager_impl:
        return veomni_<op>(...)
    # original HF code below, unchanged
    ```
@@ -422,7 +419,7 @@ veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "partial")
 @config.replace_function("apply_rotary_pos_emb")
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     # +++ veomni: kernel dispatch +++
-    if veomni_apply_rotary_pos_emb.has_kernel:
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
         return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
     # --- original HF code below, unchanged ---
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -451,7 +448,7 @@ veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "partial")
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     # +++ veomni: kernel dispatch (2 lines added) +++
-    if veomni_apply_rotary_pos_emb.has_kernel:
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
         return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
     # --- original HF code below, unchanged ---
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -495,7 +492,7 @@ class Qwen3_5MoeExperts(nn.Module):
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         # +++ veomni: kernel dispatch (2 lines added) +++
-        if veomni_moe_experts_forward.has_kernel:
+        if veomni_moe_experts_forward.use_non_eager_impl:
             return veomni_moe_experts_forward(
                 self, hidden_states, top_k_index, top_k_weights
             )
@@ -634,7 +631,7 @@ veomni_seq_cls_loss   = OpSlot("cross_entropy_loss", "seq_cls")
 # In ForCausalLM.forward / ForConditionalGeneration.forward:
     if labels is not None:
         # +++ veomni: kernel dispatch +++
-        if veomni_causal_lm_loss.has_kernel:
+        if veomni_causal_lm_loss.use_non_eager_impl:
             loss, logits = veomni_causal_lm_loss(logits, labels, self.config)
         else:
             loss = self.loss_function(logits, labels, self.vocab_size, ...)
@@ -655,7 +652,7 @@ def load_balancing_loss_func(gate_logits, num_experts, top_k, attention_mask=Non
 
 # Call site in ForCausalLM/ForConditionalGeneration.forward:
     # +++ veomni: kernel dispatch +++
-    if veomni_load_balancing_loss.has_kernel:
+    if veomni_load_balancing_loss.use_non_eager_impl:
         aux_loss = veomni_load_balancing_loss(outputs.router_logits, ...)
     else:
         aux_loss = load_balancing_loss_func(outputs.router_logits, ...)
@@ -686,8 +683,7 @@ model:
     attn_implementation: flash_attention_2
     rms_norm_implementation: eager              # only eager for qwen3_5 variant
     rotary_pos_emb_implementation: eager  # only eager for partial variant
-    moe_implementation: fused
-    fused_moe_kernel: triton
+    moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_fused
     load_balancing_loss_implementation: eager
 ```
@@ -727,23 +723,23 @@ build_foundation_model(config)                     # (4) model build time
   │
   ├─ _bind_veomni_ops(module, ops_config):          #     bind from config
   │    for each OpSlot in vars(module):
-  │        impl = ops_config.resolve_impl_name(slot.op_name)  # e.g. "triton"
+  │        impl = getattr(ops_config, f"{slot.op_name}_implementation", "eager")
   │        slot.bind(impl)                                    # KERNEL_REGISTRY.resolve()
   │
   └─ model init + weight loading
 
 model.forward()                                    # (5) runtime
   ├─ apply_rotary_pos_emb(...)                     #     function called as normal
-  │   └─ if veomni_apply_rotary_pos_emb.has_kernel:#     guard checks module global
+  │   └─ if veomni_apply_rotary_pos_emb.use_non_eager_impl:#     guard checks module global
   │        return veomni_apply_rotary_pos_emb(...)  #     → fused kernel
   │      else: <original HF code>                   #     → eager fallback
   ├─ attention: ALL_ATTENTION_FUNCTIONS[...]         #     unchanged
   ├─ experts.forward(...)
-  │   └─ if veomni_moe_experts_forward.has_kernel:
+  │   └─ if veomni_moe_experts_forward.use_non_eager_impl:
   │        return veomni_moe_experts_forward(...)    #     → fused kernel
   │      else: <original HF expert loop>             #     → eager fallback
-  ├─ if veomni_causal_lm_loss.has_kernel: ...        #     guard in forward
-  └─ if veomni_load_balancing_loss.has_kernel: ...   #     guard in forward
+  ├─ if veomni_causal_lm_loss.use_non_eager_impl: ...        #     guard in forward
+  └─ if veomni_load_balancing_loss.use_non_eager_impl: ...   #     guard in forward
 ```
 
 ---
@@ -756,7 +752,7 @@ model.forward()                                    # (5) runtime
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
 | `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | Kept for legacy-dispatch models (qwen3_moe etc.) until they adopt OpSlot |
-| `moe_implementation: fused_quack` (single field) | `moe_implementation=fused` + `fused_moe_kernel=quack` | Breaking change — old configs must be updated |
+| `moe_implementation=fused` + `fused_moe_kernel=quack` (two fields) | `moe_implementation: fused_quack` (single field) | Breaking change — collapsed into one field; also adds `fused_npu` to remove silent NPU fallback |
 
 ---
 

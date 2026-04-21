@@ -61,20 +61,33 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
-def _apply_legacy_moe_patch(config, moe_implementation: str, fused_moe_kernel: str):
-    """Legacy MoE dispatch path for models that don't use OpSlot."""
-    if moe_implementation not in ("eager", "fused"):
-        raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
-    logger.info_rank0(f"MoE implementation: {moe_implementation} (kernel={fused_moe_kernel})")
+def apply_moe_patch_transformers_v4(config, moe_implementation: str):
+    """Legacy MoE dispatch path for models that don't use OpSlot.
 
+    User-facing ``moe_implementation`` is a single field with values
+    ``"eager"``/``"fused_triton"``/``"fused_quack"``. Legacy modeling code
+    (qwen3_moe, deepseek_v3, etc.) only checks ``config._moe_implementation``
+    for the coarse ``"eager"``/``"fused"`` distinction, so we split the user
+    value into (mode, kernel) here and bind the fused kernel separately.
+    """
     if moe_implementation == "eager":
         logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
         config._moe_implementation = "eager"
-    else:
-        config._moe_implementation = "fused"
-        from ..ops.kernels.moe import apply_veomni_fused_moe_patch
+        return
 
-        apply_veomni_fused_moe_patch(fused_moe_kernel=fused_moe_kernel)
+    if not moe_implementation.startswith("fused_"):
+        raise ValueError(
+            f"Invalid moe_implementation: {moe_implementation!r}. "
+            "Expected one of: 'eager', 'fused_triton', 'fused_quack'."
+        )
+
+    fused_moe_kernel = moe_implementation.removeprefix("fused_")
+    logger.info_rank0(f"MoE implementation: fused (kernel={fused_moe_kernel})")
+    config._moe_implementation = "fused"
+
+    from ..ops.kernels.moe import apply_veomni_fused_moe_patch
+
+    apply_veomni_fused_moe_patch(fused_moe_kernel=fused_moe_kernel)
 
 
 def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
@@ -86,7 +99,19 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
         if isinstance(obj, OpSlot):
-            impl_name = ops_config.resolve_impl_name(obj.op_name)
+            # `moe_experts` is the one op whose user-facing config field is not
+            # `moe_experts_implementation` but `moe_implementation`, and its
+            # values carry a `fused_` prefix (e.g. `fused_triton`) that the
+            # KERNEL_REGISTRY entries don't. Translate here so the registry
+            # lookup finds the kernel and the HardwareRequirement check fires.
+            if obj.op_name == "moe_experts":
+                impl_name = (
+                    "eager"
+                    if ops_config.moe_implementation == "eager"
+                    else ops_config.moe_implementation.removeprefix("fused_")
+                )
+            else:
+                impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
             obj.bind(impl_name)
             logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
             found = True
@@ -121,8 +146,7 @@ def build_foundation_model(
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
-    moe_implementation: Optional[Literal["eager", "fused"]] = None,
-    fused_moe_kernel: Literal["triton", "quack"] = "triton",
+    moe_implementation: Optional[Literal["eager", "fused_triton", "fused_quack"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
@@ -232,7 +256,7 @@ def build_foundation_model(
                 f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
             )
         else:
-            _apply_legacy_moe_patch(config, moe_implementation, fused_moe_kernel)
+            apply_moe_patch_transformers_v4(config, moe_implementation)
 
     model = loader.load_model(
         init_kwargs=init_kwargs,

@@ -62,23 +62,30 @@ def fused_moe_forward(
 
 
 def apply_veomni_fused_moe_patch(
-    fused_moe_kernel: Literal["triton", "quack"] = "triton",
+    fused_moe_kernel: Literal["triton", "quack", "npu"] = "triton",
 ):
     """Bind the global ``_fused_moe_forward`` function pointer.
 
     Args:
         fused_moe_kernel: Which fused MoE kernel to activate.
-            ``"triton"`` uses the Triton group-gemm kernels (default).
-            ``"quack"`` uses the Quack CUTLASS/CuTe kernels (SM90+).
-            On NPU devices the parameter is ignored and the NPU kernel is
-            always selected.
+            ``"triton"`` uses the Triton group-gemm kernels (GPU, SM70+).
+            ``"quack"`` uses the Quack CUTLASS/CuTe kernels (GPU, SM90+).
+            ``"npu"`` uses the NPU group-gemm kernel (requires torch_npu).
+            The kernel must match the hardware; mismatches raise here rather
+            than silently falling back to a different backend.
     """
     global _fused_moe_forward
-    if is_torch_npu_available():
+    if fused_moe_kernel == "npu":
+        if not is_torch_npu_available():
+            raise RuntimeError(
+                "fused_moe_kernel='npu' requires torch_npu and an NPU device. On GPU, use 'triton' or 'quack' instead."
+            )
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
     elif fused_moe_kernel == "quack":
+        if is_torch_npu_available():
+            raise RuntimeError("fused_moe_kernel='quack' is GPU-only. Use 'npu' on NPU devices.")
         if not is_quack_gemm_available():
             raise RuntimeError(
                 "fused_moe_kernel='quack' requires the quack package and an SM90+ GPU. "
@@ -87,12 +94,16 @@ def apply_veomni_fused_moe_patch(
         from .quack_gemm import quack_gemm_fused_moe_forward
 
         _fused_moe_forward = quack_gemm_fused_moe_forward
-    elif fused_moe_kernel == "triton" and is_fused_moe_available():
+    elif fused_moe_kernel == "triton":
+        if is_torch_npu_available():
+            raise RuntimeError("fused_moe_kernel='triton' is GPU-only. Use 'npu' on NPU devices.")
+        if not is_fused_moe_available():
+            raise RuntimeError("fused_moe_kernel='triton' requires triton to be installed and a supported GPU.")
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
-        _fused_moe_forward = None
+        raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
 
 
 # ── OpSlot kernel registrations ──────────────────────────────────────────────
@@ -164,5 +175,23 @@ KERNEL_REGISTRY.register(
         factory=_quack_kernel_factory,
         hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
         description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
+    )
+)
+
+
+def _npu_kernel_factory():
+    from .npu_group_gemm import npu_fused_moe_forward
+
+    return _make_moe_experts_adapter(npu_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_npu_kernel_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU group-gemm fused MoE forward",
     )
 )

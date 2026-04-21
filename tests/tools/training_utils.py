@@ -79,7 +79,7 @@ def build_torchrun_cmd(
         "--train.global_batch_size=16",
         "--train.micro_batch_size=1",
         "--model.ops_implementation.attn_implementation=flash_attention_2",
-        "--model.ops_implementation.moe_implementation=fused",
+        "--model.ops_implementation.moe_implementation=fused_triton",
         f"--train.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",

@@ -19,8 +19,7 @@ selection knob.
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"eager"` | Model registration via ops config singleton |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"eager"` | `apply_ops_config()` (before model build) |
-| MoE mode | `moe_implementation` | `eager`, `fused` | `"eager"` | `build_foundation_model` |
-| Fused MoE kernel | `fused_moe_kernel` | `triton`, `quack` (SM90+); ignored on NPU | `"triton"` | `build_foundation_model` (used when `moe_implementation="fused"`) |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"eager"` | `build_foundation_model` |
 
 The per-op fields are typed as plain `str` (not `Literal`), so third-party
 backends can be registered via `extra_backends` in a model's `device_patch.py`
@@ -53,7 +52,7 @@ BaseTrainer._build_model()                    # (3) model build time
 model.forward()                               # (4) runtime
   ├─ attention: ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
   ├─ loss: self.loss_function(...) -> LOSS_MAPPING[...] (pre-bound partial)
-  │         OR veomni_causal_lm_loss(...) via OpSlot.has_kernel guard
+  │         OR veomni_causal_lm_loss(...) via OpSlot.use_non_eager_impl guard
   ├─ RMSNorm/RoPE/SwiGLU: Liger or HF default (set at registration)
   └─ MoE: fused_moe_forward(...) or eager loop
 ```
@@ -264,21 +263,24 @@ selected backend automatically — no per-model patching needed.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused       # bind a fused kernel (picked by fused_moe_kernel)
-    fused_moe_kernel: triton        # Triton group-gemm (default)
-    # fused_moe_kernel: quack       # Quack CUTLASS/CuTe kernels (SM90+)
-    # moe_implementation: eager     # Reference PyTorch loop (very slow, debug only)
+    moe_implementation: fused_triton   # Triton group-gemm (GPU, SM70+)
+    # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (GPU, SM90+)
+    # moe_implementation: fused_npu    # NPU group-gemm (Ascend)
+    # moe_implementation: eager        # Reference PyTorch loop (very slow, debug only)
 ```
 
-**Fields:** `OpsImplementationConfig.moe_implementation` + `OpsImplementationConfig.fused_moe_kernel`
-**Defaults:** `moe_implementation="eager"`, `fused_moe_kernel="triton"`
+**Field:** `OpsImplementationConfig.moe_implementation`
+**Default:** `"eager"`
 
-| `moe_implementation` | `fused_moe_kernel` | Kernel | Hardware | EP support |
-|----------------------|--------------------|--------|----------|:----------:|
-| `eager` | *(ignored)* | PyTorch expert loop | Any | No |
-| `fused` | `triton` | Triton group-gemm | SM70+ (V100+) | Yes |
-| `fused` | `quack` | Quack CUTLASS/CuTe | SM90+ (H100+) | No |
-| `fused` | *(ignored on NPU)* | NPU group-gemm | Ascend NPU | Yes |
+The mode and kernel backend are expressed as a single field. Mismatches raise
+at ``apply_veomni_fused_moe_patch`` time — no silent hardware fallback.
+
+| Value | Kernel | Hardware | EP support |
+|-------|--------|----------|:----------:|
+| `eager` | PyTorch expert loop | Any | No |
+| `fused_triton` | Triton group-gemm | GPU, SM70+ (V100+) | Yes |
+| `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
+| `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 
 ### Key files
 
@@ -359,9 +361,9 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | `apply_veomni_fused_moe_patch()` replaces the global `fused_moe_forward` function pointer, keyed by `config._moe_implementation ∈ {"eager", "fused"}`. The GEMM backend (Triton vs Quack) is selected by `OpsImplementationConfig.fused_moe_kernel`. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused"`) + `fused_moe_kernel` (`"triton"` / `"quack"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
-| **EP support** | Triton `fused` path supports Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
+| **Mechanism** | `apply_veomni_fused_moe_patch()` replaces the global `fused_moe_forward` function pointer. Internally `config._moe_implementation ∈ {"eager", "fused"}` flags whether the patched experts should call the pointer at all; the actual kernel (Triton / Quack / NPU) is selected by `OpsImplementationConfig.moe_implementation`. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"fused_npu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **EP support** | `fused_triton` and `fused_npu` paths support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Deferred to `build_foundation_model()` | Decorator at class definition time; dispatch at forward time |
 
 NOTE: transformers v5 moe hard codes 2 impl "batched_mm" and "grouped_mm" and does not provide a registration way for others to register other moe impl.
@@ -493,7 +495,7 @@ currently exist in the `kernels-community` hub.
 model:
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: fused
+    moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_kernel
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: eager           # disable Liger for MLP only

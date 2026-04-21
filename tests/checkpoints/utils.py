@@ -51,7 +51,7 @@ def get_checkpoint_test_command(
         "tests/checkpoints/test_trainer_saveload.py",
         f"--model.config_path {config_path}",
         f"--model.tokenizer_path {tokenizer_path}",
-        "--model.ops_implementation.moe_implementation fused",
+        "--model.ops_implementation.moe_implementation fused_triton",
         "--model.ops_implementation.attn_implementation flash_attention_2",
         "--data.train_path dummy",
         "--data.max_seq_len 128",

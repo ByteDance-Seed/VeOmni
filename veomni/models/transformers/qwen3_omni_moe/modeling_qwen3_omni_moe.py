@@ -749,7 +749,7 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(hf_qwen3_omni_moe.Qwen3OmniMoeThinke
         self.norm_topk_prob = config.norm_topk_prob
         # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
         # qwen3_5_moe; reading config at __init__ time forces auto.py to run
-        # _apply_legacy_moe_patch *before* loader.load_model.
+        # apply_moe_patch_transformers_v4 *before* loader.load_model.
         self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)

@@ -920,7 +920,7 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
         # --- Patch.2 ---
         # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
         # qwen3_5_moe; reading config at __init__ time forces auto.py to run
-        # _apply_legacy_moe_patch *before* loader.load_model.
+        # apply_moe_patch_transformers_v4 *before* loader.load_model.
         self._moe_implementation = getattr(config, "_moe_implementation", "eager")
         # --- Patch.2 ---
 

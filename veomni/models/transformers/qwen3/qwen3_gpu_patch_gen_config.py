@@ -24,13 +24,9 @@ This file itself is not runnable. It's used to generate the runnable explicitly 
 "generated/patched_modeling_qwen3_gpu.py".
 """
 
-from typing import Optional
-
 import torch
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
@@ -71,7 +67,7 @@ config.add_post_import_block(
 )
 def qwen3_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
     # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
-    if veomni_rms_norm.has_kernel:
+    if veomni_rms_norm.use_non_eager_impl:
         return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
     # Original HF code below, unchanged.
     input_dtype = hidden_states.dtype
@@ -90,7 +86,7 @@ def qwen3_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Te
 )
 def qwen3_mlp_forward_patched(self, x):
     # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
-    if veomni_swiglu_mlp.has_kernel:
+    if veomni_swiglu_mlp.use_non_eager_impl:
         return veomni_swiglu_mlp(self, x)
     # Original HF code below, unchanged.
     down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -106,93 +102,17 @@ def apply_rotary_pos_emb_patched(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Modification: OpSlot guard — use fused RoPE kernel when bound.
-    if veomni_apply_rotary_pos_emb.has_kernel:
-        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
     # Original HF code below, unchanged.
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-# ── Qwen3Model.forward (SP support) ─────────────────────────────────────────
-
-
-@config.override_method("Qwen3Model.forward", description="Support SP in Qwen3Model.forward")
-def qwen3_model_forward_patched(
-    self,
-    input_ids: torch.LongTensor | None = None,
-    attention_mask: torch.Tensor | None = None,
-    position_ids: torch.LongTensor | None = None,
-    past_key_values: Cache | None = None,
-    inputs_embeds: torch.FloatTensor | None = None,
-    use_cache: bool | None = None,
-    cache_position: torch.LongTensor | None = None,
-    **kwargs: Unpack[TransformersKwargs],
-) -> BaseModelOutputWithPast:
-    if (input_ids is None) ^ (inputs_embeds is not None):
-        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-    if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids)
-
-    if use_cache and past_key_values is None:
-        past_key_values = DynamicCache(config=self.config)
-
-    if cache_position is None:
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-        )
-
-    if position_ids is None:
-        position_ids = cache_position.unsqueeze(0)
-
-    # It may already have been prepared by e.g. `generate`
-    if not isinstance(causal_mask_mapping := attention_mask, dict):
-        # Prepare mask arguments
-        mask_kwargs = {
-            "config": self.config,
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "position_ids": position_ids,
-        }
-        # Create the masks
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-        }
-        # The sliding window alternating layers are not always activated depending on the config
-        if self.has_sliding_layers:
-            causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-
-    hidden_states = inputs_embeds
-
-    position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-        hidden_states = decoder_layer(
-            hidden_states,
-            attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-            position_embeddings=position_embeddings,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-    hidden_states = self.norm(hidden_states)
-    return BaseModelOutputWithPast(
-        last_hidden_state=hidden_states,
-        past_key_values=past_key_values if use_cache else None,
-    )
 
 
 # ── Qwen3ForCausalLM.forward (fused cross-entropy via OpSlot) ────────────────
@@ -233,7 +153,7 @@ def qwen3_forcausallm_forward_patched(
     logits = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.has_kernel:
+        if veomni_causal_lm_loss.use_non_eager_impl:
             loss, logits = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
@@ -292,7 +212,7 @@ def qwen3forsequenceclassification_forward_patched(
     logits = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_seq_cls_loss.has_kernel:
+        if veomni_seq_cls_loss.use_non_eager_impl:
             loss, logits = veomni_seq_cls_loss(
                 logits=logits,
                 labels=labels,

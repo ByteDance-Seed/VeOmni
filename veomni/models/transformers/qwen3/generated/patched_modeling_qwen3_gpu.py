@@ -15,8 +15,6 @@
 #      OpSlot guard for Liger fused SwiGLU MLP
 #    - function_replacement: apply_rotary_pos_emb
 #      OpSlot guard for Liger fused RoPE
-#    - method_override: Qwen3Model.forward
-#      Support SP in Qwen3Model.forward
 #    - method_override: Qwen3ForCausalLM.forward
 #      OpSlot guard for fused cross entropy in Qwen3ForCausalLM.forward
 #    - method_override: Qwen3ForSequenceClassification.forward
@@ -88,7 +86,7 @@ class Qwen3RMSNorm(nn.Module):
     # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
-        if veomni_rms_norm.has_kernel:
+        if veomni_rms_norm.use_non_eager_impl:
             return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
         # Original HF code below, unchanged.
         input_dtype = hidden_states.dtype
@@ -121,7 +119,7 @@ class Qwen3MLP(nn.Module):
     # ── SwiGLU MLP (OpSlot guard, functional Liger kernel) ───────────────────────
     def forward(self, x):
         # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
-        if veomni_swiglu_mlp.has_kernel:
+        if veomni_swiglu_mlp.use_non_eager_impl:
             return veomni_swiglu_mlp(self, x)
         # Original HF code below, unchanged.
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -211,12 +209,11 @@ def apply_rotary_pos_emb(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Modification: OpSlot guard — use fused RoPE kernel when bound.
-    if veomni_apply_rotary_pos_emb.has_kernel:
-        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
     # Original HF code below, unchanged.
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -403,12 +400,6 @@ class Qwen3PreTrainedModel(PreTrainedModel):
     }
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3Model
-# Methods patched: forward
-# ======================================================================
-
-
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
     def __init__(self, config: Qwen3Config):
@@ -428,7 +419,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    # ── Qwen3Model.forward (SP support) ─────────────────────────────────────────
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -481,7 +471,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
-
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
@@ -558,7 +547,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         logits = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_causal_lm_loss.has_kernel:
+            if veomni_causal_lm_loss.use_non_eager_impl:
                 loss, logits = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
@@ -618,7 +607,7 @@ class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreT
         logits = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_seq_cls_loss.has_kernel:
+            if veomni_seq_cls_loss.use_non_eager_impl:
                 loss, logits = veomni_seq_cls_loss(
                     logits=logits,
                     labels=labels,

@@ -19,7 +19,7 @@ At model-build time, ``_bind_veomni_ops`` resolves each slot to a concrete
 kernel (or ``None`` for eager) via the global ``KERNEL_REGISTRY``.
 Inside the model's ``forward`` methods, the pattern is a simple 2-line guard::
 
-    if veomni_moe_experts_forward.has_kernel:
+    if veomni_moe_experts_forward.use_non_eager_impl:
         return veomni_moe_experts_forward(self, hidden_states, ...)
     # original HF code below, unchanged
 """
@@ -65,21 +65,27 @@ class OpSlot:
         self._impl_name = impl_name
 
     @property
-    def has_kernel(self) -> bool:
-        """``True`` when a non-eager kernel is bound."""
-        # TODO(compile): `has_kernel` + `__call__` go through Python attribute
-        # access on a non-nn.Module object, which can cause Dynamo graph breaks
-        # when modeling code is wrapped with torch.compile. Once the training
-        # path starts using torch.compile, mark the bound kernel as constant
-        # (e.g. via torch.compiler.assume_constant_result) so the guard branch
-        # can be dead-code-eliminated at trace time.
+    def use_non_eager_impl(self) -> bool:
+        """``True`` when a non-eager kernel is bound.
+
+        Named for the guard pattern at call sites: ``if slot.use_non_eager_impl:
+        use replacement else fall through to eager HF code``. ``False`` covers
+        both "bound to eager" (``KERNEL_REGISTRY.resolve`` returned ``None``)
+        and "never bound".
+        """
+        # TODO(compile): `use_non_eager_impl` + `__call__` go through Python
+        # attribute access on a non-nn.Module object, which can cause Dynamo
+        # graph breaks when modeling code is wrapped with torch.compile. Once
+        # the training path starts using torch.compile, mark the bound kernel
+        # as constant (e.g. via torch.compiler.assume_constant_result) so the
+        # guard branch can be dead-code-eliminated at trace time.
         return self._kernel is not None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self._kernel is None:
             raise RuntimeError(
                 f"OpSlot('{self.op_name}', '{self.variant}') has no kernel bound. "
-                "Call .bind() first or check .has_kernel before calling."
+                "Call .bind() first or check .use_non_eager_impl before calling."
             )
         return self._kernel(*args, **kwargs)
 
