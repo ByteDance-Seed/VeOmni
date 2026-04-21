@@ -955,17 +955,20 @@
          super().__init__()
          self.num_experts = config.num_experts
          self.hidden_dim = config.hidden_size
-@@ -1355,6 +1531,9 @@
+@@ -1355,6 +1531,12 @@
          self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
 +        # --- Patch.2 ---
++        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
++        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
++        # _apply_legacy_moe_patch *before* loader.load_model.
 +        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 +        # --- Patch.2 ---
 
      def forward(
          self,
-@@ -1363,22 +1542,38 @@
+@@ -1363,22 +1545,38 @@
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
          final_hidden_states = torch.zeros_like(hidden_states)
@@ -1020,7 +1023,7 @@
 
          return final_hidden_states
 
-@@ -1661,6 +1856,12 @@
+@@ -1661,6 +1859,12 @@
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
@@ -1033,7 +1036,7 @@
  @auto_docstring(
      custom_intro=(
          "Text part of Qwen3OmniMoeThinker, "
-@@ -1693,35 +1894,35 @@
+@@ -1693,35 +1897,35 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1088,7 +1091,7 @@
          if use_cache and past_key_values is None and not torch.jit.is_tracing():
              past_key_values = DynamicCache(config=self.config)
 
-@@ -1734,7 +1935,6 @@
+@@ -1734,7 +1938,6 @@
                  past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
              )
 
@@ -1096,7 +1099,7 @@
          if position_ids is None:
              position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
          elif position_ids.ndim == 2:
-@@ -1757,10 +1957,8 @@
+@@ -1757,10 +1960,8 @@
 
          hidden_states = inputs_embeds
 
@@ -1107,7 +1110,7 @@
          for layer_idx, decoder_layer in enumerate(self.layers):
              layer_outputs = decoder_layer(
                  hidden_states,
-@@ -1773,7 +1971,6 @@
+@@ -1773,7 +1974,6 @@
              )
              hidden_states = layer_outputs
 
@@ -1115,7 +1118,7 @@
              if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
                  hidden_states = self._deepstack_process(
                      hidden_states,
-@@ -1783,18 +1980,37 @@
+@@ -1783,18 +1983,37 @@
 
          hidden_states = self.norm(hidden_states)
 
@@ -1157,7 +1160,7 @@
          hidden_states[visual_pos_masks, :] = local_this
          return hidden_states
 
-@@ -1890,6 +2106,12 @@
+@@ -1890,6 +2109,12 @@
 
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
@@ -1170,7 +1173,7 @@
 
 
  @auto_docstring(
-@@ -1967,38 +2189,26 @@
+@@ -1967,38 +2192,26 @@
          pixel_values = pixel_values.type(self.visual.dtype)
          return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
 
@@ -1223,7 +1226,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -2050,6 +2260,25 @@
+@@ -2050,6 +2263,25 @@
          special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
          return special_image_mask, special_video_mask, special_audio_mask
 
@@ -1249,7 +1252,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -2061,7 +2290,6 @@
+@@ -2061,7 +2293,6 @@
          image_grid_thw=None,
          video_grid_thw=None,
          attention_mask=None,
@@ -1257,7 +1260,7 @@
          audio_feature_lengths=None,
          position_ids=None,
          past_key_values=None,
-@@ -2069,151 +2297,231 @@
+@@ -2069,151 +2300,231 @@
          rope_deltas=None,
          labels=None,
          use_cache=None,
@@ -1586,7 +1589,7 @@
                      audio_feature_lengths,
                      video_second_per_grid,
                  )
-@@ -2221,11 +2529,20 @@
+@@ -2221,11 +2532,20 @@
                  self.rope_deltas = rope_deltas
              else:
                  batch_size, seq_length = input_ids.shape
@@ -1608,7 +1611,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2235,19 +2552,28 @@
+@@ -2235,19 +2555,28 @@
              use_cache=use_cache,
              output_router_logits=output_router_logits,
              cache_position=cache_position,
@@ -1642,7 +1645,7 @@
 
          aux_loss = None
          if output_router_logits:
-@@ -2257,8 +2583,8 @@
+@@ -2257,8 +2586,8 @@
                  self.num_experts_per_tok,
                  attention_mask,
              )
@@ -1653,7 +1656,7 @@
 
          return Qwen3OmniMoeThinkerCausalLMOutputWithPast(
              loss=loss,
-@@ -2267,6 +2593,7 @@
+@@ -2267,6 +2596,7 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              past_key_values=outputs.past_key_values,
@@ -1661,7 +1664,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -2319,1548 +2646,97 @@
+@@ -2319,1548 +2649,97 @@
 
          return model_inputs
 
@@ -3291,7 +3294,7 @@
 
      def disable_talker(self):
          if hasattr(self, "talker"):
-@@ -4132,19 +3008,41 @@
+@@ -4132,19 +3011,41 @@
 
          return thinker_result.sequences, talker_wavs.float()
 

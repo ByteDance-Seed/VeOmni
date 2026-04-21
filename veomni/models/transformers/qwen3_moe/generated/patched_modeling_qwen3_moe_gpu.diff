@@ -154,7 +154,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -198,34 +204,34 @@
+@@ -198,34 +204,37 @@
          return attn_output, attn_weights
 
 
@@ -207,11 +207,14 @@
 +        )
 +        self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
++        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
++        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
++        # _apply_legacy_moe_patch *before* loader.load_model.
 +        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
      def forward(
          self,
-@@ -234,22 +240,38 @@
+@@ -234,22 +243,38 @@
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
          final_hidden_states = torch.zeros_like(hidden_states)
@@ -266,7 +269,7 @@
 
          return final_hidden_states
 
-@@ -289,25 +311,14 @@
+@@ -289,25 +314,14 @@
          return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
@@ -300,7 +303,7 @@
 
 
  class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
-@@ -454,6 +465,12 @@
+@@ -454,6 +468,12 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -313,7 +316,7 @@
  @auto_docstring
  class Qwen3MoeModel(Qwen3MoePreTrainedModel):
      def __init__(self, config: Qwen3MoeConfig):
-@@ -500,6 +517,7 @@
+@@ -500,6 +520,7 @@
              cache_position = torch.arange(
                  past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
              )
@@ -321,7 +324,7 @@
          if position_ids is None:
              position_ids = cache_position.unsqueeze(0)
 
-@@ -616,6 +634,12 @@
+@@ -616,6 +637,12 @@
 
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
@@ -334,7 +337,7 @@
 
 
  @auto_docstring
-@@ -652,34 +676,10 @@
+@@ -652,34 +679,10 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> MoeCausalLMOutputWithPast:
@@ -369,7 +372,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -693,13 +693,21 @@
+@@ -693,13 +696,21 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -394,7 +397,7 @@
 
          aux_loss = None
          if output_router_logits:
-@@ -710,7 +718,7 @@
+@@ -710,7 +721,7 @@
                  attention_mask,
              )
              if labels is not None:
@@ -403,7 +406,7 @@
 
          return MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -722,6 +730,11 @@
+@@ -722,6 +733,11 @@
              router_logits=outputs.router_logits,
          )
 

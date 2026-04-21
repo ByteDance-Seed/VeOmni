@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,7 @@ def ForCausalLMLoss(
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
+    cross_entropy_fn: Optional[Callable] = None,
     **kwargs,
 ) -> torch.Tensor:
     # pop fused loss kwargs
@@ -73,6 +74,8 @@ def ForCausalLMLoss(
     # Enable model parallelism
     shift_labels = shift_labels.to(device)
 
+    # Resolve the cross-entropy implementation: explicit arg > module global > eager fallback.
+    loss_func = cross_entropy_fn or _cross_entropy
     if hidden_states is None or weights is None:
         logger.warning_once(
             "hidden_states or weights is None, use eager loss implementation."
@@ -80,8 +83,6 @@ def ForCausalLMLoss(
             "to pass `hidden_states` and `weights` to `loss_function`."
         )
         loss_func = eager_cross_entropy
-    else:
-        loss_func = _cross_entropy
     loss, logits = loss_func(
         logits,
         shift_labels,
@@ -107,6 +108,7 @@ def ForSequenceClassificationLoss(
     num_labels: int = None,
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
+    cross_entropy_fn: Optional[Callable] = None,
     **kwargs,
 ) -> torch.Tensor:
     r"""
@@ -171,6 +173,8 @@ def ForSequenceClassificationLoss(
     # Enable model parallelism
     target = target.to(device)
 
+    # Resolve the cross-entropy implementation: explicit arg > module global > eager fallback.
+    loss_func = cross_entropy_fn or _cross_entropy
     if hidden_states is None or weights is None:
         logger.warning_once(
             "hidden_states or weights is None, use eager loss implementation."
@@ -178,8 +182,6 @@ def ForSequenceClassificationLoss(
             "to pass `hidden_states` and `weights` to `loss_function`."
         )
         loss_func = eager_cross_entropy
-    else:
-        loss_func = _cross_entropy
 
     loss, logits = loss_func(
         logits,
@@ -238,3 +240,55 @@ def install_loss_mapping() -> None:
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
     LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
+
+
+# ── OpSlot kernel registration ───────────────────────────────────────────────
+
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+def _liger_fused_ce_causal_factory():
+    """ForCausalLMLoss bound to the Liger fused CE kernel.
+
+    Used for causal-LM heads (label shifting + SP reduction).
+    """
+    from functools import partial
+
+    from .liger import fused_liger_kernel_cross_entropy
+
+    return partial(ForCausalLMLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
+def _liger_fused_ce_seq_cls_factory():
+    """ForSequenceClassificationLoss bound to the Liger fused CE kernel.
+
+    Used for sequence-classification heads (no label shifting; token-level labels).
+    """
+    from functools import partial
+
+    from .liger import fused_liger_kernel_cross_entropy
+
+    return partial(ForSequenceClassificationLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="cross_entropy_loss",
+        variant="causal",
+        factory=_liger_fused_ce_causal_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Liger fused linear cross-entropy loss for causal LM (shifts labels, SP reduction)",
+    )
+)
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="cross_entropy_loss",
+        variant="seq_cls",
+        factory=_liger_fused_ce_seq_cls_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Liger fused linear cross-entropy loss for sequence classification (no shift)",
+    )
+)

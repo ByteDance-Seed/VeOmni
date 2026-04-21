@@ -231,6 +231,9 @@ class Qwen3MoeExperts(torch.nn.Module):
         )
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
+        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
+        # _apply_legacy_moe_patch *before* loader.load_model.
         self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
     def forward(

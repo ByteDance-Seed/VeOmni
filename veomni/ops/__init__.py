@@ -21,9 +21,10 @@ from ..utils.env import get_env
 
 # Eagerly import kernel packages so that every op registers itself with the
 # registry.  Order does not matter; each ``register_op`` call is idempotent.
-from . import kernels  # noqa: F401  triggers all register_op() calls
+from . import kernels, liger  # noqa: F401  triggers all register_op() calls
 from .config.registry import apply_global_ops
 from .config.singleton import set_ops_config
+from .dispatch import OpSlot
 from .kernels import attention, cross_entropy, load_balancing_loss, moe  # noqa: F401
 from .kernels.load_balancing_loss import load_balancing_loss_func
 from .kernels.moe import fused_moe_forward
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "fused_moe_forward",
+    "OpSlot",
     "load_balancing_loss_func",
 ]
 

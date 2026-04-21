@@ -246,6 +246,7 @@ class BaseTrainer(Stateful, ABC):
             attn_implementation=self.args.model.ops_implementation.attn_implementation,
             moe_implementation=self.args.model.ops_implementation.moe_implementation,
             init_device=self.args.train.init_device,
+            ops_implementation=self.args.model.ops_implementation,
         )
         self.model_config = self.model.config
 
