@@ -64,6 +64,11 @@ def ForCausalLMLoss(
     num_items_in_batch: int | None = None,
     ignore_index: int = -100,
     shift_labels: torch.Tensor | None = None,
+    # `*,` marks everything below as keyword-only. HF calls this wrapper with
+    # positional args (logits, labels, vocab_size, ...); keeping `cross_entropy_fn`
+    # keyword-only guarantees the pre-bound kernel from `install_loss_mapping` /
+    # `KERNEL_REGISTRY` (via `functools.partial`) cannot be silently overwritten
+    # by a positional arg overflowing into this slot.
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
@@ -125,6 +130,9 @@ def ForSequenceClassificationLoss(
     num_labels: int = None,
     num_items_in_batch: int | None = None,
     ignore_index: int = -100,
+    # `*,` marks `cross_entropy_fn` keyword-only — same reason as in
+    # `ForCausalLMLoss`: the inner kernel is bound once at install time via
+    # `partial(..., cross_entropy_fn=...)` and must not be reachable via positional args.
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
@@ -262,6 +270,15 @@ def install_loss_mapping(impl: str = "eager") -> str:
         # SP-aware reduction path in ``ForCausalLMLoss`` still runs. Sequence
         # classification is causal-only for chunked loss, so that also stays
         # on the eager wrapper.
+        #
+        # TODO(unify): chunk_loss_function breaks the ``partial(ForCausalLMLoss,
+        # cross_entropy_fn=...)`` pattern because it (a) drives the outer
+        # chunk loop via a custom autograd.Function, (b) operates on
+        # ``hidden_states`` not pre-flattened logits, and (c) does its own
+        # label shifting. Unifying it as a standard ``cross_entropy_fn`` would
+        # require splitting those responsibilities between the wrapper and the
+        # inner kernel — probably by letting the wrapper skip its shift/flatten
+        # path when the inner kernel advertises ``owns_chunking=True``.
         LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
         LOSS_MAPPING["ForConditionalGeneration"] = partial(ForCausalLMLoss, cross_entropy_fn=eager_cross_entropy)
         LOSS_MAPPING["ForSequenceClassification"] = partial(

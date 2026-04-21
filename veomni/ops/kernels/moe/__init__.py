@@ -103,8 +103,18 @@ from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 def _make_moe_experts_adapter(raw_forward):
     """Adapt the raw fused MoE kernel to the OpSlot call signature.
 
-    OpSlot invokes with ``(self, hidden_states, top_k_index, top_k_weights)``
-    but the raw kernel uses ``(num_experts, routing_weights, ...)``.
+    The generated modeling code calls the slot as a bound method of the
+    HF experts module::
+
+        veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+
+    The raw kernels (``group_gemm_fused_moe_forward`` /
+    ``quack_gemm_fused_moe_forward``) instead take the flat tensor-level
+    signature ``(num_experts, routing_weights, selected_experts,
+    hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight,
+    fc1_1_2_weight)``. This adapter pulls ``num_experts``/``gate_up_proj``/
+    ``down_proj`` off ``self`` and forwards everything else positionally so
+    the OpSlot stays a drop-in replacement for the HF ``forward``.
     """
 
     def adapter(self, hidden_states, top_k_index, top_k_weights):

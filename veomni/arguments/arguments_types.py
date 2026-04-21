@@ -652,13 +652,12 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
-    moe_implementation: Literal["eager", "fused", "fused_quack"] = field(
+    moe_implementation: Literal["eager", "fused"] = field(
         default="eager",
         metadata={
             "help": "MoE experts forward mode. "
             "'fused' binds a fused kernel (selected via 'fused_moe_kernel'). "
-            "'eager' (default) runs the reference loop. "
-            "'fused_quack' is a deprecated alias for moe_implementation='fused' + fused_moe_kernel='quack'."
+            "'eager' (default) runs the reference loop."
         },
     )
     fused_moe_kernel: Literal["triton", "quack"] = field(
@@ -729,30 +728,7 @@ class OpsImplementationConfig:
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
-        self._bridge_legacy_fused_quack()
         self._validate_implementations()
-
-    def _bridge_legacy_fused_quack(self):
-        """Bridge the deprecated ``moe_implementation="fused_quack"`` value.
-
-        Older configs conflated mode and backend kernel into a single field
-        (``fused_quack``). Map that onto the split pair
-        (``moe_implementation="fused"`` + ``fused_moe_kernel="quack"``) and
-        emit a DeprecationWarning.
-        """
-        if self.moe_implementation != "fused_quack":
-            return
-
-        import warnings
-
-        warnings.warn(
-            "moe_implementation='fused_quack' is deprecated; use "
-            "moe_implementation='fused' with fused_moe_kernel='quack' instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        self.moe_implementation = "fused"
-        self.fused_moe_kernel = "quack"
 
     def resolve_impl_name(self, op_name: str) -> str:
         """Return the kernel name to bind for ``op_name``.

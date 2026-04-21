@@ -6,19 +6,25 @@ All selections are driven by config fields in `OpsImplementationConfig`.
 
 ## Quick Reference
 
-| Kernel | Config field | Default | Selection time |
-|--------|-------------|---------|----------------|
-| Attention | `attn_implementation` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `"eager"` | `apply_ops_config()` (before model build) |
-| RMSNorm | `rms_norm_implementation` | `"eager"` | Model registration via ops config singleton |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `"eager"` | Model registration via ops config singleton |
-| Rotary embedding | `rotary_pos_emb_implementation` | `"eager"` | Model registration via ops config singleton |
-| Load-balancing loss | `load_balancing_loss_implementation` | `"eager"` | `apply_ops_config()` (before model build) |
-| MoE mode | `moe_implementation` | `"eager"` | `build_foundation_model` |
-| Fused MoE kernel | `fused_moe_kernel` | `"triton"` | `build_foundation_model` (used when `moe_implementation="fused"`) |
+Every configurable kernel lives under `model.ops_implementation.*` in YAML and
+maps to a field on `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`).
+Below is the full list — if a field is not in this table, it is not a kernel
+selection knob.
 
-All config fields live in `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`),
-accessible via `model.ops_implementation.*` in YAML.
+| Kernel | Config field | Available values | Default | Selection time |
+|--------|-------------|------------------|---------|----------------|
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | `"eager"` | `apply_ops_config()` (before model build) |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"eager"` | Model registration via ops config singleton |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"eager"` | `apply_ops_config()` (before model build) |
+| MoE mode | `moe_implementation` | `eager`, `fused` | `"eager"` | `build_foundation_model` |
+| Fused MoE kernel | `fused_moe_kernel` | `triton`, `quack` (SM90+); ignored on NPU | `"triton"` | `build_foundation_model` (used when `moe_implementation="fused"`) |
+
+The per-op fields are typed as plain `str` (not `Literal`), so third-party
+backends can be registered via `extra_backends` in a model's `device_patch.py`
+without modifying `OpsImplementationConfig`.
 
 ---
 
@@ -144,30 +150,66 @@ model cannot be patched.
 
 ---
 
-## 3. Liger Fused Ops (RMSNorm, RoPE, SwiGLU MLP)
+## 3. Per-Model Ops (RMSNorm, RoPE, SwiGLU MLP)
+
+Each operation can be independently controlled. Despite the historical
+"Liger fused ops" label, these fields are *not* Liger-only: they also accept
+`npu` (for Ascend NPU backends) and `triton` (for model-specific Triton
+kernels registered in the model's `device_patch.py`, e.g. DeepSeek-V3's
+batch-invariant RMSNorm and deterministic RoPE).
 
 ### Config
 
 ```yaml
 model:
   ops_implementation:
-    rms_norm_implementation: eager             # or "liger_kernel", or custom str
-    swiglu_mlp_implementation: eager           # or "liger_kernel", or custom str
-    rotary_pos_emb_implementation: eager       # or "liger_kernel", or custom str
+    rms_norm_implementation: eager             # eager | liger_kernel | npu | triton
+    swiglu_mlp_implementation: eager           # eager | liger_kernel
+    rotary_pos_emb_implementation: eager       # eager | liger_kernel | npu | triton
 ```
 
-Each operation can be independently controlled.
+### Available implementations
+
+#### `rms_norm_implementation`
+
+| Value | Implementation | Requirements |
+|-------|---------------|---|
+| `liger_kernel` | `LigerRMSNorm` | `liger-kernel` package |
+| `npu` | `torch_npu.npu_rms_norm` | `torch_npu` |
+| `triton` | Model-specific Triton kernel registered via `extra_backends` (e.g. DeepSeek-V3 batch-invariant RMSNorm) | `triton`, per-model registration |
+| `eager` | HuggingFace default (`{Model}RMSNorm`) | — |
+
+#### `rotary_pos_emb_implementation`
+
+| Value | Implementation | Requirements |
+|-------|---------------|---|
+| `liger_kernel` | `liger_rotary_pos_emb` | `liger-kernel` package |
+| `npu` | `torch_npu.npu_rotary_mul` | `torch_npu` |
+| `triton` | Model-specific Triton kernel registered via `extra_backends` (e.g. DeepSeek-V3 deterministic RoPE) | `triton`, per-model registration |
+| `eager` | HuggingFace default (`apply_rotary_pos_emb`) | — |
+
+#### `swiglu_mlp_implementation`
+
+| Value | Implementation | Requirements |
+|-------|---------------|---|
+| `liger_kernel` | `LigerSwiGLUMLP` | `liger-kernel` package |
+| `eager` | HuggingFace default (`{Model}MLP`) | — |
 
 ### What gets patched
 
-When set to `"liger_kernel"` or `"npu"`, each model's `device_patch.py` replaces
-HuggingFace module classes on the corresponding operation:
+For each selected backend, the model's `device_patch.py` either swaps the
+target HF class (`replace_forward=False`) or rebinds its `forward`
+(`replace_forward=True`). The summary of the Liger swap shape (the most
+common case):
 
 | Config field | Original | Liger replacement |
 |---|---|---|
 | `rms_norm_implementation` | `{Model}RMSNorm` | `LigerRMSNorm` |
 | `rotary_pos_emb_implementation` | `apply_rotary_pos_emb` | `liger_rotary_pos_emb` |
 | `swiglu_mlp_implementation` | `{Model}MLP` | `LigerSwiGLUMLP` |
+
+The `npu` and `triton` backends follow the same `device_patch.py` flow — the
+only difference is the kernel callable on the other side of the registry.
 
 ### Models with Liger support
 
@@ -177,7 +219,8 @@ Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
 
 - Config singleton: `veomni/ops/config/singleton.py` — `get_ops_config()`, `set_ops_config()`
 - Unified registry: `veomni/ops/config/registry.py` — `register_op()`, `apply_per_model_patches()`, `apply_global_ops()`
-- `veomni/models/transformers/{model}/device_patch.py` (9 model-specific files)
+- OSS backend registration: `veomni/ops/kernels/{rms_norm,rotary,swiglu}/__init__.py`
+- Per-model `extra_backends` (e.g. DeepSeek-V3 Triton): `veomni/models/transformers/{model}/device_patch.py`
 
 ---
 
@@ -197,12 +240,18 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `triton` | Fused Triton kernel | GPU |
-| `eager` | PyTorch reference | — |
+| `triton` | Fused Triton kernel (`_load_balancing_loss` is rebound by `apply_ops_config` via the registry's `global_slot`) | `triton` on CUDA, or `triton-ascend` on Ascend NPU |
+| `eager` | Pure-PyTorch reference (`load_balancing_loss_pytorch`) | — |
+
+This is a `GLOBAL`-scope op: the function pointer
+`veomni.ops.kernels.load_balancing_loss._load_balancing_loss` is rebound
+once per process from `apply_ops_config()`, and every call site that
+imports `from veomni.ops import load_balancing_loss_func` picks up the
+selected backend automatically — no per-model patching needed.
 
 ### Key files
 
-- Selection: `veomni/ops/kernels/load_balancing_loss/__init__.py`
+- Selection: `veomni/ops/kernels/load_balancing_loss/__init__.py` — `register_op(...)` entry
 - Triton impl: `veomni/ops/kernels/load_balancing_loss/triton.py`
 - Eager impl: `veomni/ops/kernels/load_balancing_loss/eager.py`
 
@@ -230,10 +279,6 @@ model:
 | `fused` | `triton` | Triton group-gemm | SM70+ (V100+) | Yes |
 | `fused` | `quack` | Quack CUTLASS/CuTe | SM90+ (H100+) | No |
 | `fused` | *(ignored on NPU)* | NPU group-gemm | Ascend NPU | Yes |
-
-The legacy value `moe_implementation: fused_quack` is accepted (with a
-`DeprecationWarning`) and mapped to `moe_implementation=fused` +
-`fused_moe_kernel=quack`.
 
 ### Key files
 

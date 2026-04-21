@@ -67,6 +67,12 @@ class OpSlot:
     @property
     def has_kernel(self) -> bool:
         """``True`` when a non-eager kernel is bound."""
+        # TODO(compile): `has_kernel` + `__call__` go through Python attribute
+        # access on a non-nn.Module object, which can cause Dynamo graph breaks
+        # when modeling code is wrapped with torch.compile. Once the training
+        # path starts using torch.compile, mark the bound kernel as constant
+        # (e.g. via torch.compiler.assume_constant_result) so the guard branch
+        # can be dead-code-eliminated at trace time.
         return self._kernel is not None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:

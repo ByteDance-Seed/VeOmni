@@ -127,7 +127,6 @@ def build_foundation_model(
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
-    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
@@ -248,8 +247,8 @@ def build_foundation_model(
     # only guaranteed to be importable once the loader has instantiated the
     # model class).
     modeling_module = sys.modules.get(model.__class__.__module__)
-    if ops_implementation is not None and modeling_module is not None:
-        if _bind_veomni_ops(modeling_module, ops_implementation):
+    if modeling_module is not None:
+        if _bind_veomni_ops(modeling_module, get_ops_config()):
             logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     if is_torch_npu_available():

@@ -247,7 +247,6 @@ class BaseTrainer(Stateful, ABC):
             moe_implementation=self.args.model.ops_implementation.moe_implementation,
             fused_moe_kernel=self.args.model.ops_implementation.fused_moe_kernel,
             init_device=self.args.train.init_device,
-            ops_implementation=self.args.model.ops_implementation,
         )
         self.model_config = self.model.config
 

@@ -248,15 +248,35 @@ class OpsImplementationConfig:
 
     # Per-op implementation selection (all default to "eager" = original HF code)
     rms_norm_implementation: str = "eager"
-    rms_norm_gated_implementation: str = "eager"
+    rms_norm_gated_implementation: str = "eager"   # (proposed — not yet shipped)
     rotary_pos_emb_implementation: str = "eager"
     swiglu_mlp_implementation: str = "eager"
     # MoE: mode ("eager" | "fused") + backend kernel ("triton" | "quack")
     moe_implementation: Literal["eager", "fused"] = "eager"
     fused_moe_kernel: Literal["triton", "quack"] = "triton"
     cross_entropy_loss_implementation: str = "eager"
-    moe_load_balancing_loss_implementation: str = "eager"
+    load_balancing_loss_implementation: str = "eager"
 ```
+
+**Shipped today** (what is actually on `OpsImplementationConfig` as of this
+PR — see `veomni/arguments/arguments_types.py`):
+
+| Field | Available values | Notes |
+|-------|------------------|-------|
+| `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | VeOmni rewrites FA2/3/4 to SP-aware variants under `MODELING_BACKEND=veomni` |
+| `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
+| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
+| `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
+| `moe_implementation` + `fused_moe_kernel` | `eager` \| `fused`; backend `triton` \| `quack` | `fused_moe_kernel` ignored when `moe_implementation="eager"` and on NPU |
+| `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | |
+| `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
+
+`rms_norm_gated_implementation` is listed above because it is called out in
+the op taxonomy (§1) as a replaceable variant for Qwen3.5 MoE's
+`RMSNormGated`, but the corresponding config field is not yet on
+`OpsImplementationConfig` and the op has no non-eager backend registered.
+It is tracked here so the design stays coherent; when a fused kernel lands
+the field will be added alongside.
 
 Convenience preset:
 
@@ -669,7 +689,7 @@ model:
     moe_implementation: fused
     fused_moe_kernel: triton
     cross_entropy_loss_implementation: liger_fused
-    moe_load_balancing_loss_implementation: eager
+    load_balancing_loss_implementation: eager
 ```
 
 **Validation at `build_foundation_model` time:**
@@ -736,7 +756,7 @@ model.forward()                                    # (5) runtime
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
 | `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | Kept for legacy-dispatch models (qwen3_moe etc.) until they adopt OpSlot |
-| `moe_implementation: fused_quack` (single field) | `moe_implementation=fused` + `fused_moe_kernel=quack` | Legacy value accepted with DeprecationWarning |
+| `moe_implementation: fused_quack` (single field) | `moe_implementation=fused` + `fused_moe_kernel=quack` | Breaking change — old configs must be updated |
 
 ---
 
