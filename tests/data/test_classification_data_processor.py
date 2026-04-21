@@ -1,11 +1,16 @@
+import os
+import sys
+
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import pytest
 import torch
+from tools import hf_local_or_remote
 from transformers import AutoTokenizer
 
 from veomni.data.data_transform import process_classification_example
 from veomni.utils.constants import IGNORE_INDEX
-
-from ..tools import hf_local_or_remote
 
 
 class DummyTokenizer:
