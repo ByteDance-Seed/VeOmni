@@ -98,13 +98,13 @@ jobs:
           fi
           echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
           echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
-      - name: Set up proxy
-        run: |
-          CURRENT_PROXY=$(cat /tmp/latest_proxy)
-          echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+      # - name: Set up proxy
+      #   run: |
+      #     CURRENT_PROXY=$(cat /tmp/latest_proxy)
+      #     echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
       - name: Check npu and CANN info
         run: |
           cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
