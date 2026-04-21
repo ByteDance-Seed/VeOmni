@@ -7,11 +7,17 @@
 # - Qwen3-VL: Qwen/Qwen3-VL-2B-Instruct (uses process_sample_qwen3_vl)
 # - Qwen3.5: Qwen/Qwen3.5-0.8B (uses process_sample_qwen3_vl_transformers_v5)
 
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
 import pytest
 import torch
+from tools import hf_local_or_remote
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from veomni.data import build_multimodal_chat_template
@@ -21,8 +27,6 @@ from veomni.data.data_transform import (
 from veomni.models import build_foundation_model, build_processor
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-from ...tools import hf_local_or_remote
 
 
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")

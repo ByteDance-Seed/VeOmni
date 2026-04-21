@@ -2,9 +2,13 @@
 # One base_config; per-model only config_path/tokenizer_path; each model tests 3 EP cases.
 
 import os
+import sys
 
-from ..tools import hf_local_or_remote
-from ..tools.launch_utils import find_free_port
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from tools import hf_local_or_remote
+from tools.launch_utils import find_free_port
 
 
 MODEL_CONFIGS = {
