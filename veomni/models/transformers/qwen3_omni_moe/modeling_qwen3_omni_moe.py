@@ -35,9 +35,7 @@ from transformers.processing_utils import Unpack
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     slice_input_tensor,
     sp_pad_and_slice,
     unpad_tensor,
@@ -856,9 +854,9 @@ def get_position_id(main_func, self, **kwargs):
 # 3. [Audio] get_audio_features handles flat input and SP
 # 4. [Mask]  Use pre-computed image_mask/video_mask/audio_mask
 # 5. [ViT]   Pop flash-attention kwargs before ViT forward
-# 6. [SP]    gather_seq_scatter_heads on input/image/video/audio embeddings
+# 6. [SP]    gather_outputs on input/image/video/audio embeddings
 # 7. [FSDP]  Dummy ViT/audio forward when pixel_values/input_features is None
-# 8. [SP]    gather_heads_scatter_seq after multimodal merging
+# 8. [SP]    slice_input_tensor after multimodal merging
 # 9. [SP]    all_gather deepstack embeddings then select per-rank visual token slice
 # 10.[Loss]  Delegate loss to ForCausalLMLoss
 # 11.[PosIDs] Transpose pre-computed position_ids from (bs, 3, L) to (3, bs, L)
@@ -974,9 +972,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
         # [SP] Gather seq and scatter heads on inputs_embeds so multimodal fill-back operates on the
         # full sequence: (batch_size, seq_len // sp_size, hidden_size) -> (batch_size, seq_len, hidden_size // sp_size)
         if self.training and get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 
         # --- Patch.13 ---
         if input_features is not None:
@@ -998,9 +994,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             # [SP] audio_tower returns seq-sliced features; gather seq and scatter heads to match
             # inputs_embeds layout before fill-back.
             if self.training and get_parallel_state().sp_enabled:
-                audio_features = gather_seq_scatter_heads(
-                    audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-                )
+                audio_features = gather_outputs(audio_features, gather_dim=0, group=get_parallel_state().sp_group)
             # Drop any padding tokens beyond the actual audio placeholder count.
             n_audio_tokens = audio_mask.sum().long().item()
             audio_features = audio_features[:n_audio_tokens]
@@ -1022,9 +1016,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             # [SP] Gather seq and scatter heads on image_embeds:
             # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size // sp_size)
             if self.training and get_parallel_state().sp_enabled:
-                image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
             # [Mask] Get token count from pre-computed mask and expand to inputs_embeds shape.
             n_image_tokens = image_mask.sum().long().item()
@@ -1055,9 +1047,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             # [SP] Gather seq and scatter heads on video_embeds:
             # (seq_len // sp_size, hidden_size) -> (seq_len, hidden_size // sp_size)
             if self.training and get_parallel_state().sp_enabled:
-                video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
             # [Mask] Get token count from pre-computed mask and expand to inputs_embeds shape.
             n_video_tokens = video_mask.sum().long().item()
@@ -1091,9 +1081,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
         # [SP] Restore seq-parallel layout after fill-back:
         # (batch_size, seq_len, hidden_size // sp_size) -> (batch_size, seq_len // sp_size, hidden_size)
         if self.training and get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
             # [SP] all_gather deepstack embeddings and select the per-rank visual token slice
             # using the full-sequence mask.

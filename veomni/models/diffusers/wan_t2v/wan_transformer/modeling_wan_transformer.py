@@ -232,7 +232,7 @@ def WanTransformer3DModel_forward(
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
     if get_parallel_state().sp_enabled:
-        hidden_states = gather_outputs(hidden_states, gather_dim=1)
+        hidden_states = gather_outputs(hidden_states, gather_dim=1, scale_grad=True)
 
     # 5. Output: norm → projection → unpatchify
     if temb.ndim == 3:

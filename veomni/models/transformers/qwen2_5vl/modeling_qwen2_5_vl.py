@@ -49,9 +49,9 @@ from transformers.utils import (
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
+    gather_outputs,
     pad_tensor,
+    slice_input_tensor,
     sp_pad_and_slice,
     unpad_tensor,
 )
@@ -184,9 +184,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
     # --- Patch.1 ---
     unpadded_dim_size = cu_seqlens[-1]
     if get_parallel_state().sp_enabled:
-        hidden_states = gather_seq_scatter_heads(
-            hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
         sp_padding_size = hidden_states.size(0) - unpadded_dim_size
         if sp_padding_size > 0:
             hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
@@ -213,9 +211,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
             cu_window_seqlens = torch.cat([cu_window_seqlens, new_cumsum.unsqueeze(0)], dim=0)
             # --- Patch.2 ---
         # --- Patch.1 ---
-        hidden_states = gather_heads_scatter_seq(
-            hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
         # --- Patch.2 ---
         emb = sp_pad_and_slice(emb, dim=0)
@@ -255,9 +251,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
         sp_padding_size = hidden_states.size(0) - unpadded_dim_size
-        hidden_states = gather_seq_scatter_heads(
-            hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
         if sp_padding_size > 0:
             hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
     # --- Patch.1 ---
@@ -268,9 +262,7 @@ def Qwen2_5_VisionTransformerPretrainedModel_forward(
     if get_parallel_state().sp_enabled:
         if sp_padding_size > 0:
             hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
-        hidden_states = gather_heads_scatter_seq(
-            hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
     return hidden_states
@@ -421,18 +413,15 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
 
         # --- Patch.3 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+
         # --- Patch.3 ---
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             # --- Patch.3 ---
             if get_parallel_state().sp_enabled:
-                image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             # --- Patch.3 ---
             n_image_tokens = image_mask.sum().long().item()
             image_embeds = image_embeds[:n_image_tokens]
@@ -449,9 +438,7 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
             # --- Patch.3 ---
             if get_parallel_state().sp_enabled:
-                video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             # --- Patch.3 ---
             n_video_tokens = video_mask.sum().long().item()
             video_embeds = video_embeds[:n_video_tokens]
@@ -467,9 +454,7 @@ class Qwen2_5_VLModel(_Qwen2_5_VLModel):
 
         # --- Patch.3 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         # --- Patch.3 ---
 
         if position_ids is None:

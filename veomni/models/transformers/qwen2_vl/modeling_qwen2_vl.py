@@ -56,9 +56,9 @@ from transformers.processing_utils import Unpack
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
+    gather_outputs,
     pad_tensor,
+    slice_input_tensor,
     sp_pad_and_slice,
 )
 from ....utils import logging
@@ -310,18 +310,15 @@ class Qwen2VLModel(_Qwen2VLModel):
 
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
-                inputs_embeds = gather_seq_scatter_heads(
-                    inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-                )
+                inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+
             # --- Patch.1 ---
 
             if pixel_values is not None:
                 image_embeds = self.get_image_features(pixel_values, image_grid_thw)
                 # --- Patch.1 ---
                 if get_parallel_state().sp_enabled:
-                    image_embeds = gather_seq_scatter_heads(
-                        image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                    )
+                    image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 # --- Patch.1 ---
                 image_embeds = image_embeds[: image_mask.sum()]
                 image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -338,9 +335,7 @@ class Qwen2VLModel(_Qwen2VLModel):
                 video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
                 # --- Patch.1 ---
                 if get_parallel_state().sp_enabled:
-                    video_embeds = gather_seq_scatter_heads(
-                        video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                    )
+                    video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 # --- Patch.1 ---
                 video_embeds = video_embeds[: video_mask.sum()]
                 video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -355,9 +350,7 @@ class Qwen2VLModel(_Qwen2VLModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         if position_ids is None:
