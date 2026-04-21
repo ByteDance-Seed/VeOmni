@@ -284,6 +284,13 @@ def install_loss_mapping(impl: str = "eager") -> str:
         LOSS_MAPPING["ForSequenceClassification"] = partial(
             ForSequenceClassificationLoss, cross_entropy_fn=eager_cross_entropy
         )
+        logger.warning_rank0(
+            "cross_entropy_loss_implementation='npu' applies only to ForCausalLM; "
+            "ForConditionalGeneration (VLMs) and ForSequenceClassification fall back "
+            "to the eager cross-entropy wrapper because chunk_loss is causal-only "
+            "and does not support SP reduction. If profiling, expect eager numbers "
+            "for those loss types."
+        )
         return "CrossEntropy (npu chunk_loss)"
 
     ce_fn = _resolve_cross_entropy_fn(impl)

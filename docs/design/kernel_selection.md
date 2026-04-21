@@ -366,7 +366,7 @@ All four are defined in `transformers.integrations`:
 | **EP support** | `fused_triton` and `fused_npu` paths support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Deferred to `build_foundation_model()` | Decorator at class definition time; dispatch at forward time |
 
-NOTE: transformers v5 moe hard codes 2 impl "batched_mm" and "grouped_mm" and does not provide a registration way for others to register other moe impl.
+**Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused kernels, so backends like VeOmni's Triton / Quack / NPU group-gemm must be plugged in through the `OpSlot` dispatch layer rather than via `ALL_EXPERTS_FUNCTIONS`.
 
 ### 5.3 Gaps — What Transformers v5 Does NOT Cover
 
