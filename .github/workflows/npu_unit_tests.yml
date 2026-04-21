@@ -58,7 +58,15 @@ jobs:
         # Shared CI asset mount (samples/models/datasets live under /data00/assets
         # on the host; see github_runner/group_vars/npu_nodes.yml).
         - /data00/assets:/data00/assets:ro
+      # --cap-add=ALL is required: Ascend's dcmi library (used by npu-smi,
+      # torch_npu, CANN) fails in a non-privileged container with only the
+      # default cap set:
+      #   "dcmi model initialized failed, because the device is used. ret -8020"
+      # Empirically `--cap-add=ALL` is the minimum that makes dcmi init work
+      # without going full `--privileged` (which also mounts host /dev and
+      # defeats our device-list isolation). Trusted CI, acceptable trade-off.
       options: >-
+        --cap-add=ALL
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
