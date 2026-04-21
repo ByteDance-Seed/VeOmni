@@ -27,8 +27,8 @@ from transformers.modeling_outputs import ModelOutput
 from ...distributed.parallel_plan import ParallelPlan
 from ...distributed.parallel_state import get_parallel_state
 from ...distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
+    gather_outputs,
+    slice_input_tensor,
 )
 from ...utils import logging
 from ...utils.constants import IGNORE_INDEX
@@ -150,8 +150,8 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                     inputs_embeds
                 )
                 if get_parallel_state().sp_enabled:
-                    input_image_features = gather_seq_scatter_heads(
-                        input_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                    input_image_features = gather_outputs(
+                        input_image_features, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 input_image_features = input_image_features[: input_image_mask.sum()]
                 image_mask = input_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -168,8 +168,8 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                     inputs_embeds
                 )
                 if get_parallel_state().sp_enabled:
-                    output_image_features = gather_seq_scatter_heads(
-                        output_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                    output_image_features = gather_outputs(
+                        output_image_features, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 output_image_features = output_image_features[: output_image_mask.sum()]
                 image_mask = output_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -194,8 +194,8 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                         inputs_embeds
                     )
                 if get_parallel_state().sp_enabled:
-                    input_video_features = gather_seq_scatter_heads(
-                        input_video_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                    input_video_features = gather_outputs(
+                        input_video_features, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 input_video_features = input_video_features[: input_video_mask.sum()]
                 video_mask = input_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -220,8 +220,8 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
                 )
                 # TODO: sp_check
                 if get_parallel_state().sp_enabled:
-                    input_audio_features = gather_seq_scatter_heads(
-                        input_audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                    input_audio_features = gather_outputs(
+                        input_audio_features, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 input_audio_features = input_audio_features[: input_audio_mask.sum()]
                 audio_mask = input_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -238,9 +238,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
         decoder_inputs = {}
 
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 
         if "image" in self.modality:
             inputs_embeds = self.image_forward(inputs_embeds, decoder_inputs, **kwargs)
@@ -252,9 +250,7 @@ class SeedOmniEncoderModel(SeedOmniPreTrainedModel):
             inputs_embeds = self.audio_forward(inputs_embeds, decoder_inputs, **kwargs)
 
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         return {"inputs_embeds": inputs_embeds, "decoder_inputs": decoder_inputs}
 
 
@@ -300,8 +296,8 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
             if input_image_inputs:
                 input_image_features, _ = self.image_decoder.lm_encode(**input_image_inputs)
                 if get_parallel_state().sp_enabled:
-                    input_image_features = gather_seq_scatter_heads(
-                        input_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                    input_image_features = gather_outputs(
+                        input_image_features, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 input_image_features = input_image_features[: input_image_mask.sum()]
                 image_mask = input_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -317,8 +313,8 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
             if output_image_inputs:
                 output_image_features, output_image_indices = self.image_decoder.lm_encode(**output_image_inputs)
                 if get_parallel_state().sp_enabled:
-                    output_image_features = gather_seq_scatter_heads(
-                        output_image_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                    output_image_features = gather_outputs(
+                        output_image_features, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 output_image_features = output_image_features[: output_image_mask.sum()]
                 image_mask = output_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -339,17 +335,13 @@ class SeedOmniDecoderModel(SeedOmniPreTrainedModel):
         decoder_inputs = kwargs.pop("decoder_inputs", {})
 
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 
         if "image" in self.modality:
             inputs_embeds = self.image_encode(inputs_embeds, decoder_inputs, **kwargs)
 
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
         return {"inputs_embeds": inputs_embeds, "decoder_inputs": decoder_inputs}
 

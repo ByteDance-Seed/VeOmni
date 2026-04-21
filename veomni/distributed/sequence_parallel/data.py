@@ -105,7 +105,7 @@ def gather_outputs(
     gather_dim: int,
     padding_dim: Optional[int] = None,
     unpad_dim_size: Optional[int] = None,
-    scale_grad=True,
+    scale_grad=False,
     group: ProcessGroup = None,
 ):
     """
