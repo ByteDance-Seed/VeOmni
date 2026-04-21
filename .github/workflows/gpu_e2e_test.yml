@@ -49,15 +49,25 @@ jobs:
     timeout-minutes: 60 # Increase this timeout value as needed
     container:
       image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
+      volumes:
+        # Shared CI asset NFS (see gpu_unit_tests.yml for details).
+        - /mnt/veomni_ci:/mnt/veomni_ci:ro
       options: >-
         --gpus all
         --ipc host
         --shm-size 32g
     env:
-      HF_HUB_ENABLE_HF_TRANSFER: 1
+      # hf-mirror is a safety net; actual model data should come from the NFS
+      # share via CI_HF_MODELS_DIR (see tests/tools/__init__::hf_local_or_remote).
+      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
+      HF_ENDPOINT: "https://hf-mirror.com"
+      HF_HUB_ENABLE_HF_TRANSFER: "0" # hf-mirror does not support hf_transfer
       NCCL_DEBUG: "WARN"
-      CI_MODEL_DIR: "/root/models/Qwen"
-      CI_DATASET_DIR: "/root/models/hf_data"
+      # Shared NFS paths (see workflow container.volumes above).
+      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
+      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
+      CI_MODEL_DIR: "/mnt/veomni_ci/models/Qwen"
+      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

@@ -51,8 +51,8 @@ jobs:
         - /usr/local/Ascend/driver:/usr/local/Ascend/driver
         - /etc/ascend_install.info:/etc/ascend_install.info:ro
         - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
-        - /data00/assets/dataset:/github/home/dataset
-        - /data00/assets/models:/github/home/models
+        # Shared CI asset NFS (see npu_unit_tests.yml for details).
+        - /mnt/veomni_ci:/mnt/veomni_ci:ro
       # See npu_unit_tests.yml for the full rationale: `container:` starts a
       # sibling container via the host docker socket, so the runner container's
       # 8-card isolation does NOT carry over. GHA's container.options can't read
@@ -78,9 +78,12 @@ jobs:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-      CI_SAMPLES_DIR: "/data00/assets/samples"
-      CI_MODEL_DIR: "/github/home/models/Qwen"
-      CI_DATASET_DIR: "/github/home/dataset"
+      # Shared NFS paths (see workflow container.volumes and
+      # github_runner/group_vars/all.yml::veomni_ci_nfs_*).
+      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
+      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
+      CI_MODEL_DIR: "/mnt/veomni_ci/models/Qwen"
+      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice

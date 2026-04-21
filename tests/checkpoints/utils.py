@@ -3,6 +3,7 @@
 
 import os
 
+from ..tools import hf_local_or_remote
 from ..tools.launch_utils import find_free_port
 
 
@@ -42,7 +43,7 @@ def get_checkpoint_test_command(
     save_hf_weights=False,
 ):
     config_path = MODEL_CONFIGS[model_name]["config_path"]
-    tokenizer_path = MODEL_CONFIGS[model_name]["tokenizer_path"]
+    tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
     output_dir = get_output_dir(model_name, ep_size)
     port = find_free_port()
 
