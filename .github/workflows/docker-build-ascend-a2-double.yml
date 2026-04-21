@@ -13,8 +13,9 @@ on:
 
 env:
   QUAY_REPO: quay.io/ascend/veomni
-  CACHE_REPO: ghcr.io/ByteDance-Seed/veomni
+  CACHE_REPO: ghcr.io/phdddd/veomni
   ARTIFACT_PREFIX: digests-a2
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-push-digest:
