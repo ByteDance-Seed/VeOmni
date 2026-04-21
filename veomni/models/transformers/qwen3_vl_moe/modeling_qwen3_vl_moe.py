@@ -74,6 +74,9 @@ logger = logging.get_logger(__name__)
 class Qwen3VLMoeTextExperts(_Qwen3VLMoeTextExperts):
     def __init__(self, config):
         super().__init__(config)
+        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
+        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
+        # _apply_legacy_moe_patch *before* loader.load_model.
         self.moe_implementation = getattr(config, "_moe_implementation", "eager")
 
     # --- Patch.1 ---
