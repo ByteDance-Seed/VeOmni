@@ -30,6 +30,25 @@ def fused_liger_kernel_cross_entropy(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
-    weights = kwargs.pop("weights")
-    hidden_states = kwargs.pop("hidden_states")
+    hidden_states = kwargs.pop("hidden_states", None)
+    weights = kwargs.pop("weights", None)
+    if hidden_states is None or weights is None:
+        # Fused linear + CE avoids materializing the full logits tensor by
+        # doing the projection inside the Liger kernel — which means it needs
+        # the pre-projection hidden states *and* the projection weights. If
+        # either is missing, the model's forward was not patched to pass them
+        # through to ``self.loss_function`` / the OpSlot. Fail loudly so the
+        # user either patches the model or consciously switches to eager.
+        raise RuntimeError(
+            "fused_liger_kernel_cross_entropy requires `hidden_states` and `weights` "
+            f"(got hidden_states={'set' if hidden_states is not None else 'None'}, "
+            f"weights={'set' if weights is not None else 'None'}).\n"
+            "Fix: patch the model's `ForCausalLM.forward` / "
+            "`ForSequenceClassification.forward` to pass "
+            "`hidden_states=hidden_states, weights=self.lm_head.weight` into "
+            "`self.loss_function(...)` — see "
+            "`veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py` "
+            "for a reference pattern. Alternatively, set "
+            "`model.ops_implementation.cross_entropy_loss_implementation` to `eager`."
+        )
     return liger_kernel_cross_entropy(weights, hidden_states, labels), logits

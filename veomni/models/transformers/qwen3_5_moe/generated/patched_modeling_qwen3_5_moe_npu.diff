@@ -1367,7 +1367,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,27 +2511,50 @@
+@@ -2156,27 +2511,52 @@
          )
 
          hidden_states = outputs[0]
@@ -1393,7 +1393,9 @@
 +                )
 +            else:
 +                logits = self.lm_head(hidden_states)
-+                loss = self.loss_function(
++                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
++                # returns (loss, logits); unpack to match the OpSlot branch above.
++                loss, logits = self.loss_function(
 +                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
 +                )
 +        else:
@@ -1430,7 +1432,7 @@
 
          return Qwen3_5MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -2413,6 +2791,19 @@
+@@ -2413,6 +2793,19 @@
 
          return input_ids, model_kwargs
 

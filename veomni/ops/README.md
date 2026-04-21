@@ -36,7 +36,8 @@ depending on when and where the kernel is bound:
 | Scope | Who binds | When | What gets replaced |
 |-------|-----------|------|--------------------|
 | **import-time** | `apply_ops_patch()` | `import veomni` | Registers VeOmni attention kernels in HF's `ALL_ATTENTION_FUNCTIONS`. Gated by `MODELING_BACKEND`. |
-| **GLOBAL** | `apply_global_ops()` via `apply_ops_config()` | Before model build, in `BaseTrainer` | Module-level function pointer shared by all models (e.g. `veomni.ops.kernels.cross_entropy._cross_entropy`). |
+| **LOSS_MAPPING** | `install_loss_mapping()` via `apply_ops_config()` | Before model build, in `BaseTrainer` | `LOSS_MAPPING["ForCausalLM"/"ForConditionalGeneration"/"ForSequenceClassification"]` bound to `partial(<wrapper>, cross_entropy_fn=<impl>)`. |
+| **GLOBAL** | `apply_global_ops()` via `apply_ops_config()` | Before model build, in `BaseTrainer` | Module-level function pointer shared by all models (e.g. `veomni.ops.kernels.load_balancing_loss._load_balancing_loss`). |
 | **PER_MODEL** | `apply_per_model_patches()` in each model's `device_patch.py` | During `build_foundation_model()` | `setattr(hf_module, "<ClassOrFuncName>", …)` on the HF modeling module (different class name per model). |
 | **build-time** | `apply_veomni_fused_moe_patch()` | During `build_foundation_model()` | `veomni.ops.kernels.moe._fused_moe_forward`; NPU auto-overrides to the NPU group-gemm kernel. |
 
@@ -45,7 +46,7 @@ depending on when and where the kernel is bound:
 | Kernel | Config key | Scope | Default | Available backends |
 |---|---|:-:|---|---|
 | Attention | `attn_implementation` | import-time | `flash_attention_2` | `eager`, `sdpa`, `flash_attention_2/3/4`, `native-sparse` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | GLOBAL | `eager` | `eager`, `liger_kernel`, `npu` (chunked loss) |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | LOSS_MAPPING | `eager` | `eager`, `liger_kernel`, `npu` (chunked loss) |
 | Load-balancing loss | `load_balancing_loss_implementation` | GLOBAL | `eager` | `eager`, `triton` |
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
@@ -195,12 +196,16 @@ Example: add `layer_norm` as a per-model op.
 ### GLOBAL instead of PER_MODEL
 
 For ops that are a single function pointer shared across all models (like
-`cross_entropy_loss`), set `scope=OpScope.GLOBAL` and provide a
+`load_balancing_loss`), set `scope=OpScope.GLOBAL` and provide a
 `global_slot="<module>:<attr>"`. `apply_global_ops()` writes the selected
-backend to that slot; callers `from ... import <attr>` and call it. Use
-`side_effect` for follow-up installation (e.g. writing into HuggingFace's
-`LOSS_MAPPING`) — see `kernels/cross_entropy/__init__.py` for the full
-pattern.
+backend to that slot; callers `from ... import <attr>` and call it. See
+`kernels/load_balancing_loss/__init__.py` for the full pattern.
+
+Cross-entropy is handled separately via `LOSS_MAPPING` scope (see
+`install_loss_mapping` in `kernels/cross_entropy/__init__.py`) — it needs
+three distinct wrapper shapes (`ForCausalLM`, `ForConditionalGeneration`,
+`ForSequenceClassification`) rather than a single function pointer, so the
+GLOBAL slot pattern does not fit.
 
 ---
 

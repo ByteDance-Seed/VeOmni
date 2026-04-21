@@ -2557,7 +2557,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss = self.loss_function(
+                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
+                # returns (loss, logits); unpack to match the OpSlot branch above.
+                loss, logits = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
                 )
         else:

@@ -764,7 +764,9 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss = self.loss_function(
+            # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
+            # returns (loss, logits); unpack to match the OpSlot branch above.
+            loss, logits = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:

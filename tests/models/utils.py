@@ -348,14 +348,15 @@ def apply_veomni_hf_unpatch():
 
 
 def apply_veomni_loss_unpatch():
-    from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
-
-    from veomni.ops.kernels import cross_entropy
-
-    cross_entropy._cross_entropy = None
+    from transformers.loss.loss_utils import (
+        LOSS_MAPPING,
+        ForCausalLMLoss,
+        ForSequenceClassificationLoss,
+    )
 
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
+    LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
 
 
 def apply_veomni_moe_unpatch():

@@ -133,7 +133,29 @@ def build_foundation_model(
     Builds the foundation model.
 
     If weights_path is provided, it loads the pre-trained weights, otherwise it initializes weights.
+
+    Contract: ``apply_ops_config(ops_implementation)`` must run before this
+    function so that ``LOSS_MAPPING`` contains VeOmni's loss wrappers.
+    ``BaseTrainer`` does this automatically; standalone scripts (tests, eval
+    harnesses) that call ``build_foundation_model`` directly should call
+    ``apply_ops_config`` themselves. If we detect that nobody did, we install
+    defaults with a warning rather than letting the model fail later with a
+    cryptic kwargs mismatch inside HuggingFace's stock loss wrapper.
     """
+    from ..ops import apply_ops_config
+    from ..ops.config.singleton import get_ops_config
+
+    if get_ops_config() is None:
+        logger.warning_rank0(
+            "build_foundation_model was called before apply_ops_config. VeOmni "
+            "assumes training goes through BaseTrainer, which installs the ops "
+            "config for you. Installing OpsImplementationConfig() defaults now "
+            "so self.loss_function() does not trip on missing kwargs. If you "
+            "are running a standalone script, call apply_ops_config(...) "
+            "yourself before build_foundation_model to pick kernel backends."
+        )
+        apply_ops_config(OpsImplementationConfig())
+
     if config_kwargs is None:
         config_kwargs = {}
 
