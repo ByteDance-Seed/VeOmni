@@ -1,0 +1,152 @@
+name: docker-build-ascend-a2-multiarch
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "docker/ascend/Dockerfile.ascend_8.3.rc2_a2"
+      - "docker/ascend/Dockerfile.ascend_8.3.rc2_a2.arm"
+      - ".github/workflows/docker-build-ascend-a2-double.yml"
+  release:
+    types: [ published ]
+
+env:
+  QUAY_REPO: quay.io/ascend/veomni
+  CACHE_REPO: ghcr.io/ByteDance-Seed/veomni
+  ARTIFACT_PREFIX: digests-a2
+
+jobs:
+  build-push-digest:
+    name: Build ${{ matrix.tag }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      packages: write
+      contents: read
+    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'phdddd' }}
+    strategy:
+      matrix:
+        include:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            tag: amd64
+            dockerfile: ./docker/ascend/Dockerfile.ascend_8.3.rc2_a2
+          - arch: linux/arm64
+            runner: ubuntu-22.04-arm
+            tag: arm64
+            dockerfile: ./docker/ascend/Dockerfile.ascend_8.3.rc2_a2.arm
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Login to GHCR (for cache)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute cache tag
+        id: cache-tag
+        run: |
+          echo "value=buildcache-a2-${{ matrix.tag }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push (by digest)
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.arch }}
+          outputs: type=image,name=${{ env.QUAY_REPO }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.CACHE_REPO }}:${{ steps.cache-tag.outputs.value }}
+          cache-to: type=registry,ref=${{ env.CACHE_REPO }}:${{ steps.cache-tag.outputs.value }},mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            PIP_INDEX=https://pypi.org/simple
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-${{ matrix.tag }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-image:
+    runs-on: ubuntu-latest
+    needs: build-push-digest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: ${{ env.ARTIFACT_PREFIX }}-*
+          merge-multiple: true
+
+      - name: Get base image name & tag
+        id: base_image
+        run: |
+          BASE_IMAGE_FULL=$(grep '^FROM' ./docker/ascend/Dockerfile.ascend_8.3.rc2_a2 | head -1 | cut -d' ' -f2)
+          BASE_IMAGE_TAG=$(echo "$BASE_IMAGE_FULL" | cut -d':' -f2)
+          NEW_IMAGE_NAME="veomni-$BASE_IMAGE_TAG"
+          echo "base_image_tag=$BASE_IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "new_image_name=$NEW_IMAGE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Compute final tag
+        id: version
+        run: |
+          BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's/refs\/heads\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
+          BASE_NAME="${{ steps.base_image.outputs.new_image_name }}"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+            echo "tag=$BASE_NAME-$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          elif [ "$BRANCH_NAME" = "main" ]; then
+            echo "tag=$BASE_NAME-latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$BASE_NAME-$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to Quay
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Merge and push multi-arch image
+        env:
+          IMAGE: ${{ env.QUAY_REPO }}
+          TAG: ${{ env.QUAY_REPO }}:${{ steps.version.outputs.tag }}
+        run: |
+          DIGESTS=$(printf "$IMAGE@sha256:%s " $(ls ${{ runner.temp }}/digests))
+          docker buildx imagetools create -t $TAG $DIGESTS
+          echo "✅ Multi-arch image published: $TAG"
