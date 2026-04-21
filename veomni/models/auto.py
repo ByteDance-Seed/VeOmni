@@ -30,7 +30,7 @@ from ..ops.dispatch import OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from ..utils.import_utils import is_transformers_version_greater_or_equal_to
-from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
+from .loader import BaseModelLoader, get_loader, get_model_class, get_model_config, get_model_processor
 
 
 if TYPE_CHECKING:
@@ -196,6 +196,27 @@ def build_foundation_model(
     else:
         empty_init = False
 
+    # ── Pre-load: legacy MoE config patch ─────────────────────────────────
+    # Models like qwen3_moe capture ``config._moe_implementation`` inside
+    # ``PatchQwen3MoeExperts.__init__``, so the legacy patch has to land on
+    # *config* before ``loader.load_model`` instantiates the experts.
+    # We look up the modeling module via ``get_model_class`` (config → class)
+    # so we can skip the legacy patch for models that own a ``moe_experts``
+    # OpSlot (qwen3_5_moe and friends).
+    #
+    # TODO(kernel-registry): migrate the remaining legacy ``_moe_implementation``
+    # users to the OpSlot("moe_experts", …) + KERNEL_REGISTRY pattern that
+    # qwen3_5_moe already uses; once they do, drop this whole pre-load block.
+    # Current holdouts: qwen3_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3.
+    if moe_implementation is not None:
+        pre_load_modeling_module = sys.modules.get(get_model_class(config).__module__)
+        if _module_has_opslot(pre_load_modeling_module, "moe_experts"):
+            logger.info_rank0(
+                f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
+            )
+        else:
+            _apply_legacy_moe_patch(config, moe_implementation)
+
     model = loader.load_model(
         init_kwargs=init_kwargs,
         weights_path=weights_path,
@@ -203,26 +224,15 @@ def build_foundation_model(
         init_device=init_device,
     )
 
-    # ── Kernel dispatch ────────────────────────────────────────────────────
-    # Two independent dispatch mechanisms coexist:
-    #   1. OpSlot binding (preferred, patchgen-based models)
-    #   2. Legacy ``_apply_legacy_moe_patch`` (models not yet migrated to
-    #      patchgen that still call ``fused_moe_forward`` directly)
-    # They are decoupled: binding OpSlots never skips the legacy MoE patch,
-    # and the legacy patch is only applied when the model does not declare a
-    # ``moe_experts`` OpSlot of its own.
+    # ── Post-load: OpSlot binding ─────────────────────────────────────────
+    # OpSlots are module-level singletons, so binding them after the model
+    # is constructed is fine (and necessary — the patched modeling module is
+    # only guaranteed to be importable once the loader has instantiated the
+    # model class).
     modeling_module = sys.modules.get(model.__class__.__module__)
     if ops_implementation is not None and modeling_module is not None:
         if _bind_veomni_ops(modeling_module, ops_implementation):
             logger.info_rank0("OpSlot-based kernel dispatch active.")
-
-    if moe_implementation is not None:
-        if _module_has_opslot(modeling_module, "moe_experts"):
-            logger.info_rank0(
-                f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
-            )
-        else:
-            _apply_legacy_moe_patch(config, moe_implementation)
 
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
