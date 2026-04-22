@@ -89,9 +89,7 @@ gpu = [
   "nvidia-cusparselt-cu12",
   "nvidia-nccl-cu12",
   "liger-kernel",
-  # flash-attn v2 has no torch-2.9-compatible cp312 wheel; users on Python 3.12 must
-  # either skip fa2 or supply their own source.
-  "flash-attn; python_version == '3.11'",
+  "flash-attn",
   "flash-attn-3",
   "hf_transfer",
   "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
@@ -237,13 +235,12 @@ torch = [
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Download fa2 and fa3 wheels directly to avoid build issues.
-# flash-attn v2 has no torch-2.9-compatible cp312 wheel available publicly. We gate the
-# cp311 URL so 3.12 resolution doesn't pick an ABI-incompatible wheel; 3.12 users wanting
-# fa2 must supply their own source (e.g. via workspace root's [tool.uv.sources]).
+# Both wheels are built against torch 2.9+cu129. From
+# https://github.com/Luosuu/flash-attention-prebuild-wheels since there is no official
+# FA2 prebuilt wheel for torch 2.9+.
 flash-attn = [
-  # torch 2.9+cu129
-  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.9+.
   { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'"},
+  { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2py312cu129torch29/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'"},
 ]
 flash-attn-3 = [
   # torch 2.9+cu129 — cp39-abi3 (stable ABI) works on both 3.11 and 3.12.
