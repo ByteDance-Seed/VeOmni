@@ -243,7 +243,7 @@ torchaudio = { index = "pytorch" }
 # FA2 prebuilt wheel for torch 2.9+.
 flash-attn = [
   { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'"},
-  { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2py312cu129torch29/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'"},
+  { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'"},
 ]
 flash-attn-3 = [
   # torch 2.9+cu129 — cp39-abi3 (stable ABI) works on both 3.11 and 3.12.
