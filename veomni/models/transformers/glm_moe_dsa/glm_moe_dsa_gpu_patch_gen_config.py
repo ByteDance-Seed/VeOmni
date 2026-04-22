@@ -13,6 +13,18 @@ config = PatchConfig(
     description="GLM-5 with GPU replacements",
 )
 
+# TODO: glm_moe_dsa GPU and NPU configs are currently full copies of each
+# other. Consider consolidating (NPU config imports shared patch functions
+# from this module) once NPU-specific divergence is clearer.
+config.add_post_import_block(
+    """
+    # ── OpSlot declarations ──────────────────────────────────────────────────
+    # Bound at model-build time by _bind_veomni_ops() in auto.py.
+    from veomni.ops.dispatch import OpSlot
+    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    """
+)
+
 
 @config.override_method(
     "GlmMoeDsaForCausalLM.forward",
@@ -48,16 +60,19 @@ def glm_moe_dsa_forcausallm_forward_patched(
     loss = None
     logits = None
     if labels is not None:
-        # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
-        # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
-        loss, logits = self.loss_function(
-            logits=logits,
-            labels=labels,
-            vocab_size=self.config.vocab_size,
-            hidden_states=hidden_states,
-            weights=self.lm_head.weight,
-            **kwargs,
-        )
+        # Modification: OpSlot guard for cross-entropy loss.
+        if veomni_causal_lm_loss.use_non_eager_impl:
+            loss, logits = veomni_causal_lm_loss(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states)
+            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 

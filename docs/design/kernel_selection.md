@@ -126,8 +126,14 @@ model:
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | `fused_liger_kernel_cross_entropy` | `liger-kernel` package |
-| `npu` | `chunk_loss_function` (chunked loss for `ForCausalLM`) | `torch_npu` |
+| `npu` | `chunk_loss_function` (chunked loss for `ForCausalLM` and `ForConditionalGeneration`; SP reduction handled internally) | `torch_npu` |
 | `eager` | `eager_cross_entropy` (PyTorch `F.cross_entropy`) | — |
+
+The `npu` chunk-loss binds only to `ForCausalLM` and
+`ForConditionalGeneration`; `ForSequenceClassification` stays on
+`eager_cross_entropy` because chunk_loss hard-codes the causal
+`labels[..., 1:]` shift (incompatible with token-level classification
+labels).
 
 Selecting `liger_kernel` requires that the model's forward pass pass
 `hidden_states=` and `weights=self.lm_head.weight` through

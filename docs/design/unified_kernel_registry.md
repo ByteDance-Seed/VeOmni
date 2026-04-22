@@ -208,6 +208,14 @@ KERNEL_REGISTRY.register(KernelSpec(
     factory=_liger_fused_ce_seq_cls_factory,  # partial(ForSequenceClassificationLoss, cross_entropy_fn=liger)
     hardware=HardwareRequirement("cuda"),
 ))
+# NPU chunk-loss backs the causal variant only; chunk_loss hard-codes the
+# `labels[..., 1:]` shift so ForSequenceClassification stays on eager.
+KERNEL_REGISTRY.register(KernelSpec(
+    name="npu",
+    op_name="cross_entropy_loss", variant="causal",
+    factory=_npu_chunk_loss_causal_factory,   # chunk_loss_function (handles SP reduction internally)
+    hardware=HardwareRequirement("npu"),
+))
 ```
 
 **Internal registration** (in an internal package, never in OSS):

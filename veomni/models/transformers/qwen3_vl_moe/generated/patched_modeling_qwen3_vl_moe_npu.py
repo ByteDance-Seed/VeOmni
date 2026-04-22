@@ -110,10 +110,17 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
 from veomni.ops import fused_moe_forward
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
-# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+# Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+
+# ── OpSlot declarations ──────────────────────────────────────────────────
+# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+from veomni.ops.dispatch import OpSlot
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")

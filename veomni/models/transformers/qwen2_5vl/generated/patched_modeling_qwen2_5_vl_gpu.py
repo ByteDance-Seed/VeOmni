@@ -69,7 +69,15 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
     unpad_tensor,
 )
+
+# Additional import blocks for patches
+# ── OpSlot declarations ──────────────────────────────────────────────────
+# Bound at model-build time by _bind_veomni_ops() in auto.py.
+from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+
+
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
 
 # ======================================================================
@@ -1767,16 +1775,21 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         loss = None
         logits = None
         if labels is not None:
-            # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
-            # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
-            loss, logits = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
+            # Modification: OpSlot guard for cross-entropy loss.
+            if veomni_causal_lm_loss.use_non_eager_impl:
+                loss, logits = veomni_causal_lm_loss(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+            else:
+                logits = self.lm_head(hidden_states)
+                loss, _ = self.loss_function(
+                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                )
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.1 ---
