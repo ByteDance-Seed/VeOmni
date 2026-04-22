@@ -38,12 +38,15 @@ To enable the NPU chunked cross-entropy loss, set
 `model.ops_implementation.cross_entropy_loss_implementation: npu` in your training YAML
 (replaces the legacy `VEOMNI_ENABLE_CHUNK_LOSS` environment variable).
 
-> **Note:** The NPU chunked cross-entropy applies only to `ForCausalLM`.
-> Models whose loss type is `ForConditionalGeneration` (VLMs) or
-> `ForSequenceClassification` transparently fall back to the eager
-> cross-entropy wrapper, because the chunk-loss kernel is causal-only and
-> does not support SP reduction. A `warning_rank0` is logged at install
-> time; expect eager-level numbers for those loss types during profiling.
+> **Note:** The NPU chunked cross-entropy backs both `ForCausalLM` and
+> `ForConditionalGeneration` (VLMs) — chunk_loss now does the SP reduction
+> itself, so VLMs with Ulysses SP enabled get the correct loss. Only
+> `ForSequenceClassification` stays on the eager wrapper: chunk_loss
+> hard-codes the causal `labels[..., 1:]` shift, which is incompatible
+> with the token-level (no-shift) labels that
+> `ForSequenceClassificationLoss` expects. A `warning_rank0` is logged at
+> install time; expect eager-level numbers for sequence-classification
+> losses during profiling.
 
 ### Video/Audio Processing Dependencies (Optional)
 

@@ -1151,7 +1151,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1993,22 +2409,32 @@
+@@ -1993,22 +2409,50 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1162,35 +1162,57 @@
 +        logits = None
          if labels is not None:
 -            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
-+            loss, logits = self.loss_function(
-+                logits=logits,
-+                labels=labels,
-+                vocab_size=self.config.vocab_size,
-+                hidden_states=hidden_states,
-+                weights=self.lm_head.weight,
-+                **kwargs,
-+            )
++            # Modification: OpSlot guard for cross-entropy loss.
++            if veomni_causal_lm_loss.use_non_eager_impl:
++                loss, logits = veomni_causal_lm_loss(
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
++                )
++            else:
++                logits = self.lm_head(hidden_states)
++                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
++                # returns (loss, logits); unpack to match the OpSlot branch above.
++                loss, logits = self.loss_function(
++                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
++                )
 +        else:
 +            logits = self.lm_head(hidden_states)
 
          aux_loss = None
 -        if output_router_logits:
-+        if kwargs.get("output_router_logits", False):
-             aux_loss = load_balancing_loss_func(
-                 outputs.router_logits,
+-            aux_loss = load_balancing_loss_func(
+-                outputs.router_logits,
 -                self.num_experts,
 -                self.num_experts_per_tok,
-+                self.config.num_experts,
-+                self.config.num_experts_per_tok,
-                 attention_mask,
-             )
+-                attention_mask,
+-            )
++        if kwargs.get("output_router_logits", False):
++            # Modification: OpSlot guard for load-balancing loss.
++            if veomni_load_balancing_loss.use_non_eager_impl:
++                aux_loss = veomni_load_balancing_loss(
++                    outputs.router_logits,
++                    self.config.num_experts,
++                    self.config.num_experts_per_tok,
++                    attention_mask,
++                )
++            else:
++                aux_loss = load_balancing_loss_func(
++                    outputs.router_logits,
++                    self.config.num_experts,
++                    self.config.num_experts_per_tok,
++                    attention_mask,
++                )
              if labels is not None:
 -                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 +                loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
 
          return MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -2019,6 +2445,12 @@
+@@ -2019,6 +2463,12 @@
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
          )
@@ -1203,7 +1225,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2505,7 @@
+@@ -2073,6 +2523,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1211,7 +1233,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2090,57 +2523,6 @@
+@@ -2090,57 +2541,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
@@ -1269,7 +1291,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,27 +2538,52 @@
+@@ -2156,27 +2556,52 @@
          )
 
          hidden_states = outputs[0]
@@ -1334,7 +1356,7 @@
 
          return Qwen3_5MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -2413,6 +2820,19 @@
+@@ -2413,6 +2838,19 @@
 
          return input_ids, model_kwargs
 

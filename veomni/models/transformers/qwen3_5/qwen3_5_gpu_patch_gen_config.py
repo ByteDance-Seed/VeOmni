@@ -978,6 +978,8 @@ def qwen3_5_forcausallm_forward_patched(
     loss = None
     logits = None
     if labels is not None:
+        # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
+        # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
         loss, logits = self.loss_function(
             logits=logits,
             labels=labels,
@@ -1059,6 +1061,8 @@ def qwen3_5_forconditional_generation_forward_patched(
     loss = None
     logits = None
     if labels is not None:
+        # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
+        # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
         loss, logits = self.loss_function(
             logits=logits,
             labels=labels,

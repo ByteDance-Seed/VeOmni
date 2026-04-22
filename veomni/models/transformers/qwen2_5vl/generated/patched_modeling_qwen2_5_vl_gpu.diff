@@ -741,7 +741,7 @@
              input_ids=input_ids,
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
-@@ -1564,17 +1759,25 @@
+@@ -1564,17 +1759,27 @@
              **kwargs,
          )
 
@@ -761,6 +761,8 @@
 -            loss = self.loss_function(
 -                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
 -            )
++            # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
++            # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
 +            loss, logits = self.loss_function(
 +                logits=logits,
 +                labels=labels,
@@ -775,7 +777,7 @@
 
          return Qwen2_5_VLCausalLMOutputWithPast(
              loss=loss,
-@@ -1803,5 +2006,25 @@
+@@ -1803,5 +2008,25 @@
 
          return input_ids, model_kwargs
 

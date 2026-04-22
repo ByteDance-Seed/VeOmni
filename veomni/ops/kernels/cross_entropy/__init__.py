@@ -111,7 +111,6 @@ def ForCausalLMLoss(
         vocab_size,
         num_items_in_batch,
         ignore_index,
-        shift_labels,
         hidden_states=hidden_states,
         weights=weights,
         **kwargs,
@@ -209,7 +208,6 @@ def ForSequenceClassificationLoss(
         num_labels,
         num_items_in_batch,
         ignore_index,
-        target,
         hidden_states=hidden_states,
         weights=weights,
         **kwargs,
@@ -264,32 +262,30 @@ def install_loss_mapping(impl: str = "eager") -> str:
             raise RuntimeError("cross_entropy_loss_implementation='npu' requires torch_npu to be installed.")
         # NPU chunk-loss is a standalone LOSS_MAPPING entry with its own
         # chunked autograd function; it handles hidden_states/weights directly
-        # but does **not** do SP reduction (the Function returns a scalar).
-        # Scope it to ``ForCausalLM`` only — VLMs whose loss_type is
-        # ``ForConditionalGeneration`` stay on the eager wrapper so that the
-        # SP-aware reduction path in ``ForCausalLMLoss`` still runs. Sequence
-        # classification is causal-only for chunked loss, so that also stays
-        # on the eager wrapper.
+        # and now also applies the SP reduction internally (see chunk_loss.py),
+        # so both ForCausalLM and ForConditionalGeneration can route through
+        # it safely. ForSequenceClassification stays on the eager wrapper:
+        # chunk_loss hard-codes the causal ``labels[..., 1:]`` shift, which is
+        # incompatible with the token-level (no-shift) labels that
+        # ``ForSequenceClassificationLoss`` expects.
         #
-        # TODO(unify): chunk_loss_function breaks the ``partial(ForCausalLMLoss,
-        # cross_entropy_fn=...)`` pattern because it (a) drives the outer
-        # chunk loop via a custom autograd.Function, (b) operates on
-        # ``hidden_states`` not pre-flattened logits, and (c) does its own
-        # label shifting. Unifying it as a standard ``cross_entropy_fn`` would
-        # require splitting those responsibilities between the wrapper and the
-        # inner kernel — probably by letting the wrapper skip its shift/flatten
-        # path when the inner kernel advertises ``owns_chunking=True``.
+        # TODO(unify): chunk_loss_function still breaks the
+        # ``partial(ForCausalLMLoss, cross_entropy_fn=...)`` pattern because it
+        # (a) drives the outer chunk loop via a custom autograd.Function,
+        # (b) operates on ``hidden_states`` not pre-flattened logits, and
+        # (c) does its own label shifting. Unifying it as a standard
+        # ``cross_entropy_fn`` would require letting the wrapper skip its
+        # shift/flatten path when the inner kernel advertises ``owns_chunking=True``.
         LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
-        LOSS_MAPPING["ForConditionalGeneration"] = partial(ForCausalLMLoss, cross_entropy_fn=eager_cross_entropy)
+        LOSS_MAPPING["ForConditionalGeneration"] = chunk_loss_function
         LOSS_MAPPING["ForSequenceClassification"] = partial(
             ForSequenceClassificationLoss, cross_entropy_fn=eager_cross_entropy
         )
         logger.warning_rank0(
-            "cross_entropy_loss_implementation='npu' applies only to ForCausalLM; "
-            "ForConditionalGeneration (VLMs) and ForSequenceClassification fall back "
-            "to the eager cross-entropy wrapper because chunk_loss is causal-only "
-            "and does not support SP reduction. If profiling, expect eager numbers "
-            "for those loss types."
+            "cross_entropy_loss_implementation='npu' routes ForCausalLM and "
+            "ForConditionalGeneration through chunk_loss; ForSequenceClassification "
+            "falls back to the eager wrapper because chunk_loss hard-codes the causal "
+            "label shift."
         )
         return "CrossEntropy (npu chunk_loss)"
 
@@ -346,3 +342,33 @@ KERNEL_REGISTRY.register(
         description="Liger fused linear cross-entropy loss for sequence classification (no shift)",
     )
 )
+
+
+def _npu_chunk_loss_causal_factory():
+    """NPU chunked cross-entropy for causal LM.
+
+    Unlike the Liger factory above, ``chunk_loss_function`` is itself the
+    full loss wrapper: it drives its own chunked autograd ``Function``,
+    does its own label shift, and projects ``hidden_states`` through
+    ``weights`` internally. No ``partial(ForCausalLMLoss, ...)`` wrapping
+    is needed — returning it bare matches how ``install_loss_mapping("npu")``
+    installs it into ``LOSS_MAPPING["ForCausalLM"]``.
+    """
+    from .chunk_loss import chunk_loss_function
+
+    return chunk_loss_function
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="cross_entropy_loss",
+        variant="causal",
+        factory=_npu_chunk_loss_causal_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU chunked cross-entropy loss for causal LM (no SP reduction)",
+    )
+)
+# No ``seq_cls`` variant: ``chunk_loss_function`` hard-codes causal label
+# shifting. Sequence-classification heads on NPU stay on eager via the
+# LOSS_MAPPING branch in ``install_loss_mapping("npu")``.

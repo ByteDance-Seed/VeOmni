@@ -266,7 +266,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -485,13 +474,21 @@
+@@ -485,13 +474,23 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -278,6 +278,8 @@
 +        logits = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
++            # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
++            # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
 +            loss, logits = self.loss_function(
 +                logits=logits,
 +                labels=labels,

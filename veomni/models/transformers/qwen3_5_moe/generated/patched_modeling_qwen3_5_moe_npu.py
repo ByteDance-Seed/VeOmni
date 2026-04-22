@@ -2387,25 +2387,43 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         loss = None
         logits = None
         if labels is not None:
-            loss, logits = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
+            # Modification: OpSlot guard for cross-entropy loss.
+            if veomni_causal_lm_loss.use_non_eager_impl:
+                loss, logits = veomni_causal_lm_loss(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+            else:
+                logits = self.lm_head(hidden_states)
+                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
+                # returns (loss, logits); unpack to match the OpSlot branch above.
+                loss, logits = self.loss_function(
+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                )
         else:
             logits = self.lm_head(hidden_states)
 
         aux_loss = None
         if kwargs.get("output_router_logits", False):
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.config.num_experts,
-                self.config.num_experts_per_tok,
-                attention_mask,
-            )
+            # Modification: OpSlot guard for load-balancing loss.
+            if veomni_load_balancing_loss.use_non_eager_impl:
+                aux_loss = veomni_load_balancing_loss(
+                    outputs.router_logits,
+                    self.config.num_experts,
+                    self.config.num_experts_per_tok,
+                    attention_mask,
+                )
+            else:
+                aux_loss = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.config.num_experts,
+                    self.config.num_experts_per_tok,
+                    attention_mask,
+                )
             if labels is not None:
                 loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
 

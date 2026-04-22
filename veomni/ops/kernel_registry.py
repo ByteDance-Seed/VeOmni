@@ -46,12 +46,12 @@ class HardwareRequirement:
                 if get_gpu_compute_capability() < self.min_compute_capability:
                     return False
             return True
-        elif self.device_type == "npu":
+        if self.device_type == "npu":
             # IS_NPU_AVAILABLE == is_torch_npu_available(): requires both the
             # torch_npu package AND an actual NPU device (unlike a bare import
             # check, which passes on dev boxes that merely have the library).
             return IS_NPU_AVAILABLE
-        return False
+        raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu' or 'npu')")
 
 
 @dataclass(frozen=True)

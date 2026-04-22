@@ -108,8 +108,16 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
 
 # Additional imports for patches
 from veomni.ops import fused_moe_forward
+
+# ── OpSlot declarations ──────────────────────────────────────────────────
+# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 
 
 # ======================================================================
@@ -2150,14 +2158,23 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         loss = None
         logits = None
         if labels is not None:
-            loss, logits = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
+            # Modification: OpSlot guard for cross-entropy loss.
+            if veomni_causal_lm_loss.use_non_eager_impl:
+                loss, logits = veomni_causal_lm_loss(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+            else:
+                logits = self.lm_head(hidden_states)
+                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
+                # returns (loss, logits); unpack to match the OpSlot branch above.
+                loss, logits = self.loss_function(
+                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                )
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.1 ---
@@ -2165,12 +2182,21 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         # --- Patch.2 ---
         aux_loss = None
         if kwargs.get("output_router_logits", False):
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.config.text_config.num_experts,
-                self.config.text_config.num_experts_per_tok,
-                attention_mask,
-            )
+            # Modification: OpSlot guard for load-balancing loss.
+            if veomni_load_balancing_loss.use_non_eager_impl:
+                aux_loss = veomni_load_balancing_loss(
+                    outputs.router_logits,
+                    self.config.text_config.num_experts,
+                    self.config.text_config.num_experts_per_tok,
+                    attention_mask,
+                )
+            else:
+                aux_loss = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.config.text_config.num_experts,
+                    self.config.text_config.num_experts_per_tok,
+                    attention_mask,
+                )
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
         # --- Patch.2 ---

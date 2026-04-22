@@ -2114,6 +2114,8 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         loss = None
         logits = None
         if labels is not None:
+            # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
+            # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
             loss, logits = self.loss_function(
                 logits=logits,
                 labels=labels,
@@ -2260,6 +2262,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         loss = None
         logits = None
         if labels is not None:
+            # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
+            # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
             loss, logits = self.loss_function(
                 logits=logits,
                 labels=labels,

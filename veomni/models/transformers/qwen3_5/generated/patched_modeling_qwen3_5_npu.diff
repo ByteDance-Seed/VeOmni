@@ -1124,7 +1124,7 @@
 
 
  @auto_docstring
-@@ -1775,11 +2102,21 @@
+@@ -1775,11 +2102,23 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1135,6 +1135,8 @@
 +        logits = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
++            # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
++            # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
 +            loss, logits = self.loss_function(
 +                logits=logits,
 +                labels=labels,
@@ -1148,7 +1150,7 @@
 
          return CausalLMOutputWithPast(
              loss=loss,
-@@ -1817,6 +2154,12 @@
+@@ -1817,6 +2156,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1161,7 +1163,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1888,53 +2231,6 @@
+@@ -1888,53 +2233,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5CausalLMOutputWithPast:
@@ -1215,7 +1217,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,14 +2246,23 @@
+@@ -1950,14 +2248,25 @@
          )
 
          hidden_states = outputs[0]
@@ -1229,6 +1231,8 @@
 +        logits = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
++            # TODO(PR#678): wrap with OpSlot guard for cross_entropy_loss dispatch
++            # (see veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py).
 +            loss, logits = self.loss_function(
 +                logits=logits,
 +                labels=labels,
@@ -1242,7 +1246,7 @@
 
          return Qwen3_5CausalLMOutputWithPast(
              loss=loss,
-@@ -2192,6 +2497,13 @@
+@@ -2192,6 +2501,13 @@
 
          return input_ids, model_kwargs
 

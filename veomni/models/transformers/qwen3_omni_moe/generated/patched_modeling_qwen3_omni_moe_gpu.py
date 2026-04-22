@@ -36,7 +36,7 @@
 #    - method_override: Qwen3OmniMoeThinkerForConditionalGeneration.forward
 #      VeOmni SP + FSDP + precomputed masks + fused loss + precomputed multimodal position-ids
 #    - method_override: Qwen3OmniMoeForConditionalGeneration.__init__
-#      Propagate _moe_implementation, skip talker for training, pin _no_split_modules to real training targets
+#      Propagate _moe_implementation, skip talker, pin _no_split_modules, drop talker/code2wav keys on state-dict load
 #    - method_override: Qwen3OmniMoeForConditionalGeneration.enable_talker
 #      Disable talker/code2wav path in the training modeling (excluded classes)
 #    - method_override: Qwen3OmniMoeForConditionalGeneration.forward
@@ -109,10 +109,19 @@ from veomni.distributed.sequence_parallel import (
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops import fused_moe_forward
+
+# Additional import blocks for patches
+# ── OpSlot declarations ──────────────────────────────────────────────────
+# Only the Thinker forward is in VeOmni's training path (Talker/CodePredictor
+# are inference-only speech paths excluded from the generated file).
+from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
 
-# Additional import blocks for patches
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+
+
 def get_position_id(main_func, self, **kwargs):
     """Per-sample position-ids for VeOmni dataloader workers.
 
@@ -2565,27 +2574,49 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         loss = None
         logits = None
         if labels is not None:
-            loss, logits = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                ignore_index=IGNORE_INDEX,
-                **kwargs,
-            )
+            # Modification: OpSlot guard for cross-entropy loss.
+            if veomni_causal_lm_loss.use_non_eager_impl:
+                loss, logits = veomni_causal_lm_loss(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    ignore_index=IGNORE_INDEX,
+                    **kwargs,
+                )
+            else:
+                logits = self.lm_head(hidden_states)
+                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
+                # returns (loss, logits); unpack to match the OpSlot branch above.
+                loss, logits = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    ignore_index=IGNORE_INDEX,
+                    **kwargs,
+                )
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.8 ---
 
         aux_loss = None
         if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
+            # Modification: OpSlot guard for load-balancing loss.
+            if veomni_load_balancing_loss.use_non_eager_impl:
+                aux_loss = veomni_load_balancing_loss(
+                    outputs.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    attention_mask,
+                )
+            else:
+                aux_loss = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    attention_mask,
+                )
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
@@ -2725,6 +2756,28 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
             "Qwen3OmniMoeAudioEncoderLayer",
         }
         # --- Patch.3 ---
+
+        # --- Patch.4 ---
+        # Training builds the model with ``has_talker=False`` and excludes
+        # ``Qwen3OmniMoeTalker*`` / ``Qwen3OmniMoeCode2Wav*`` classes from the
+        # generated module entirely. Full pretrained checkpoints and HF-backend
+        # state_dicts (e.g. the bitwise-equal patch test deep-copies the HF
+        # model.state_dict() before handing it to VeOmni's load_state_dict)
+        # still carry ``talker.*`` / ``code2wav.*`` keys, and the default
+        # strict load_state_dict raises on them. Strip those keys at the
+        # top-level prefix before the strict check fires — the rest of the
+        # state_dict (thinker.*) loads unchanged.
+        def _drop_talker_and_code2wav_keys(
+            module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        ):
+            if prefix:  # only filter at the top-level module
+                return
+            for k in list(state_dict.keys()):
+                if k.startswith("talker.") or k.startswith("code2wav."):
+                    del state_dict[k]
+
+        self.register_load_state_dict_pre_hook(_drop_talker_and_code2wav_keys)
+        # --- Patch.4 ---
 
     # ================================================================
     # Patch: Qwen3OmniMoeForConditionalGeneration.enable_talker
