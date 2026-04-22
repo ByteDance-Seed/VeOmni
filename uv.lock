@@ -835,13 +835,13 @@ wheels = [
 [[package]]
 name = "flash-attn"
 version = "2.8.3+cu129torch2.9"
-source = { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2py312cu129torch29/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl" }
+source = { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl" }
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform != 'linux'",
 ]
 wheels = [
-    { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2py312cu129torch29/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", hash = "sha256:bff2576fc51f8f7203f03027d3ff5c4cb88032ba9c673737ffa48a87d04ca7a4" },
+    { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", hash = "sha256:bff2576fc51f8f7203f03027d3ff5c4cb88032ba9c673737ffa48a87d04ca7a4" },
 ]
 
 [package.metadata]
@@ -3746,7 +3746,7 @@ fa4 = [
 ]
 gpu = [
     { name = "cuda-python", version = "12.9.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "flash-attn", version = "2.8.3+cu129torch2.9", source = { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2py312cu129torch29/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl" }, marker = "(python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "flash-attn", version = "2.8.3+cu129torch2.9", source = { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl" }, marker = "(python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "flash-attn", version = "2.8.4", source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl" }, marker = "(python_full_version < '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers5-exp' and extra == 'group-6-veomni-transformers-stable')" },
     { name = "flash-attn-3" },
     { name = "flash-linear-attention" },
@@ -3837,7 +3837,7 @@ requires-dist = [
     { name = "expecttest", marker = "extra == 'dev'", specifier = ">=0.3.0,<0.4" },
     { name = "flash-attn", marker = "python_full_version == '3.11.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl" },
     { name = "flash-attn", marker = "(python_full_version < '3.11' and extra == 'gpu') or (python_full_version >= '3.13' and extra == 'gpu')" },
-    { name = "flash-attn", marker = "python_full_version == '3.12.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2py312cu129torch29/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "python_full_version == '3.12.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl" },
     { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl" },
     { name = "flash-attn-4", marker = "extra == 'fa4'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
