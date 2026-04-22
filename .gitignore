@@ -80,8 +80,8 @@ target/
 profile_default/
 ipython_config.py
 
-# pyenv
-.python-version
+# pyenv: .python-version is checked in to pin uv's default interpreter to 3.11.
+# Cannot remove from .gitignore without keeping the file intentional.
 
 # celery beat schedule file
 celerybeat-schedule
