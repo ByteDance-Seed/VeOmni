@@ -11,7 +11,7 @@ name = "veomni"
 dynamic = ["version"]
 description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
 readme = "README.md"
-requires-python = ">=3.11, <3.12"
+requires-python = ">=3.11, <3.13"
 license = { file = "LICENSE" }
 authors = [
   { name="ByteDance-Seed", email="doubao-llm@bytedance.com" },
@@ -45,21 +45,24 @@ dev = [
 ]
 audio = [
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 # Alias for audio extra - includes both video and audio processing dependencies
 video = [
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
   "diffusers==0.36.0",
   "torchcodec",
-  "av>=14.3.0,<15.0",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
   "ftfy",
@@ -229,26 +232,34 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu' },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Download fa2 and fa3 wheels directly to avoid build issues.
+# Both wheels are built against torch 2.9+cu129. From
+# https://github.com/Luosuu/flash-attention-prebuild-wheels since there is no official
+# FA2 prebuilt wheel for torch 2.9+.
 flash-attn = [
-  # torch 2.9+cu129
-  # From https://github.com/mjun0812/flash-attention-prebuild-wheels since there is no official FA2 prebuilt wheel for torch 2.9+.
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu'"},
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'"},
+  { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2py312cu129torch29/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'"},
 ]
 flash-attn-3 = [
-  # torch 2.9+cu129
+  # torch 2.9+cu129 — cp39-abi3 (stable ABI) works on both 3.11 and 3.12.
   { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
 ]
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
 # Pinned to 03/18/2026 latest main commit.
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 
-# Download av wheel directly to avoid FFmpeg build dependency issues in CI.
-av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "extra == 'audio' or extra == 'video' or extra == 'dit'" }
+# Download av wheels directly to avoid FFmpeg build dependency issues in CI.
+# 3.11 uses av 14.4.0 (latest 14.x with cp311 wheel). 3.12 falls back to av 14.2.0 — the
+# newest 14.x release with a cp312 wheel on pypi (14.3.0 and 14.4.0 are 3.11-only).
+av = [
+  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" },
+  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.12'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch"
