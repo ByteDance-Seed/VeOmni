@@ -46,6 +46,7 @@ dev = [
 audio = [
   "torchcodec",
   "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
@@ -53,6 +54,7 @@ audio = [
 video = [
   "torchcodec",
   "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
@@ -60,6 +62,7 @@ dit = [
   "diffusers==0.36.0",
   "torchcodec",
   "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
   "ftfy",
@@ -250,10 +253,13 @@ flash-attn-3 = [
 # Pinned to 03/18/2026 latest main commit.
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 
-# Download av wheel directly to avoid FFmpeg build dependency issues in CI.
-# av 14.4.0 has no cp312 binary on pypi; gate with python_version so 3.12 universal-lock
-# resolution for audio/video/dit extras can fall through to a workspace-root source.
-av = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" }
+# Download av wheels directly to avoid FFmpeg build dependency issues in CI.
+# 3.11 uses av 14.4.0 (latest 14.x with cp311 wheel). 3.12 falls back to av 14.2.0 — the
+# newest 14.x release with a cp312 wheel on pypi (14.3.0 and 14.4.0 are 3.11-only).
+av = [
+  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" },
+  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.12'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch"
