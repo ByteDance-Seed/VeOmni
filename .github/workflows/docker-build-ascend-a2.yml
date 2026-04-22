@@ -122,7 +122,7 @@ jobs:
       - name: Compute final tag
         id: version
         run: |
-          BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's/refs\/heads\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
+          BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's/^refs\/(heads|tags)\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
           BASE_NAME="${{ steps.base_image.outputs.new_image_name }}"
           if [ "${{ github.event_name }}" = "release" ]; then
             RELEASE_TAG="${{ github.event.release.tag_name }}"
