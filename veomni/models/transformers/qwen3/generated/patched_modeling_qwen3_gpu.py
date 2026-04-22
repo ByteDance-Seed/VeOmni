@@ -558,7 +558,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+                loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
 
@@ -618,7 +618,7 @@ class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreT
                 )
             else:
                 logits = self.score(hidden_states)
-                loss = self.loss_function(logits=logits, labels=labels, num_labels=self.num_labels, **kwargs)
+                loss, _ = self.loss_function(logits=logits, labels=labels, num_labels=self.num_labels, **kwargs)
         else:
             logits = self.score(hidden_states)
 

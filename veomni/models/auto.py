@@ -78,7 +78,7 @@ def apply_moe_patch_transformers_v4(config, moe_implementation: str):
     if not moe_implementation.startswith("fused_"):
         raise ValueError(
             f"Invalid moe_implementation: {moe_implementation!r}. "
-            "Expected one of: 'eager', 'fused_triton', 'fused_quack'."
+            "Expected one of: 'eager', 'fused_triton', 'fused_quack', 'fused_npu'."
         )
 
     fused_moe_kernel = moe_implementation.removeprefix("fused_")
@@ -146,7 +146,7 @@ def build_foundation_model(
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
-    moe_implementation: Optional[Literal["eager", "fused_triton", "fused_quack"]] = None,
+    moe_implementation: Optional[Literal["eager", "fused_triton", "fused_quack", "fused_npu"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,

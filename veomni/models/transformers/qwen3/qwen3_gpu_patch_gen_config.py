@@ -164,7 +164,7 @@ def qwen3_forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
@@ -223,7 +223,7 @@ def qwen3forsequenceclassification_forward_patched(
             )
         else:
             logits = self.score(hidden_states)
-            loss = self.loss_function(logits=logits, labels=labels, num_labels=self.num_labels, **kwargs)
+            loss, _ = self.loss_function(logits=logits, labels=labels, num_labels=self.num_labels, **kwargs)
     else:
         logits = self.score(hidden_states)
 

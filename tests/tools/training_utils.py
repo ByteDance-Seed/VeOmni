@@ -11,7 +11,14 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from veomni.utils.import_utils import is_torch_npu_available
+
 from .launch_utils import find_free_port
+
+
+# Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
+# kernel is the only option; on GPU default to Triton (SM70+).
+_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
 
 
 def release_device_memory():
@@ -79,7 +86,7 @@ def build_torchrun_cmd(
         "--train.global_batch_size=16",
         "--train.micro_batch_size=1",
         "--model.ops_implementation.attn_implementation=flash_attention_2",
-        "--model.ops_implementation.moe_implementation=fused_triton",
+        f"--model.ops_implementation.moe_implementation={_FUSED_MOE_IMPL}",
         f"--train.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",

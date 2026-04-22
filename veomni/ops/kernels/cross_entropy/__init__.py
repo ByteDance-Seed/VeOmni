@@ -72,7 +72,7 @@ def ForCausalLMLoss(
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
 
@@ -136,7 +136,7 @@ def ForSequenceClassificationLoss(
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Token-level loss for sequence classification.
 

@@ -29,7 +29,7 @@ def fused_liger_kernel_cross_entropy(
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
     if hidden_states is None or weights is None:
