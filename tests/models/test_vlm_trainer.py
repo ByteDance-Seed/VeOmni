@@ -13,6 +13,8 @@ from veomni.trainer.vlm_trainer import (
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
+pytestmark = [pytest.mark.unit, pytest.mark.v5_only]
+
 _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4 = [
     pytest.param("./tests/toy_config/qwen2vl_toy", id="qwen2_vl"),
     pytest.param("./tests/toy_config/qwen25vl_toy", id="qwen2_5_vl"),

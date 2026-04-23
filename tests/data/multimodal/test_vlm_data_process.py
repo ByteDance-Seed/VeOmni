@@ -29,6 +29,8 @@ from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
+pytestmark = pytest.mark.unit
+
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
 

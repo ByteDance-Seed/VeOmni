@@ -4,6 +4,9 @@ import torch
 from veomni.distributed.sequence_parallel import data as sp_data
 
 
+pytestmark = pytest.mark.unit
+
+
 class TestSliceInputTensor:
     """Unit tests for slice_input_tensor function."""
 

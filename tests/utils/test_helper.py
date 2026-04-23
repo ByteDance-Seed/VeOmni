@@ -3,6 +3,7 @@ import random
 import subprocess
 from dataclasses import dataclass, field
 
+import pytest
 import torch
 import torch.distributed as dist
 from transformers import Qwen2Config
@@ -12,6 +13,8 @@ from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
+
+pytestmark = pytest.mark.unit
 
 logger = helper.create_logger(__name__)
 

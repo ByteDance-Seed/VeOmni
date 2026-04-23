@@ -20,6 +20,9 @@ from transformers import AutoConfig
 from veomni.utils.count_flops import VeomniFlopsCounter
 
 
+pytestmark = [pytest.mark.unit, pytest.mark.v5_only]
+
+
 @pytest.fixture(autouse=True)
 def mock_device_flops():
     with patch("veomni.utils.count_flops.get_device_flops", return_value=1000.0):

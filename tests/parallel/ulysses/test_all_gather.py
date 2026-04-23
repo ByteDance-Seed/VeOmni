@@ -22,6 +22,9 @@ from .utils import (
 )
 
 
+pytestmark = pytest.mark.unit
+
+
 class AllToAllCommTest(SequenceParallelTest):
     @staticmethod
     def _get_even_input_data():

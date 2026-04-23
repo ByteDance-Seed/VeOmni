@@ -30,6 +30,12 @@ from .utils import (
 )
 
 
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skip(reason="FIXME: async Ulysses test not yet verified in CI, see gpu_unit_tests.yml TODO"),
+]
+
+
 class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
     @staticmethod
     def _get_input_data():

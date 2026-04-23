@@ -18,6 +18,8 @@ from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
+pytestmark = pytest.mark.unit
+
 try:
     from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 except ImportError:  # pragma: no cover - torch < 2.2 fallback

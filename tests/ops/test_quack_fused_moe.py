@@ -6,10 +6,13 @@ from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_quack_gemm_available
 
 
-pytestmark = pytest.mark.skipif(
-    not is_quack_gemm_available(),
-    reason="quack not available or GPU < SM90",
-)
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skipif(
+        not is_quack_gemm_available(),
+        reason="quack not available or GPU < SM90",
+    ),
+]
 
 
 def _eager_moe_forward(

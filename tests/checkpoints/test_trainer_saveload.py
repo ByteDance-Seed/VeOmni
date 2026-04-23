@@ -28,6 +28,8 @@ from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, H
 from veomni.utils import helper
 
 
+pytestmark = pytest.mark.unit
+
 os.environ["NCCL_DEBUG"] = "OFF"
 
 # To prevent DCP from complaining "too many open files"

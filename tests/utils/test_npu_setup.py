@@ -4,6 +4,9 @@ import pytest
 from veomni.utils.import_utils import is_torch_npu_available
 
 
+pytestmark = [pytest.mark.unit, pytest.mark.npu_only]
+
+
 def get_package_version(package_name):
     try:
         version = pkg_resources.get_distribution(package_name).version

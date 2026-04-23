@@ -46,6 +46,8 @@ from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
 
 
+pytestmark = pytest.mark.unit
+
 logger = helper.create_logger(__name__)
 
 

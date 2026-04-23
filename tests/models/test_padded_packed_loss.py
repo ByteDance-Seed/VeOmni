@@ -8,6 +8,9 @@ from veomni.ops import apply_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
+pytestmark = pytest.mark.unit
+
+
 def _skip_if_no_flash_attn():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA is required for flash-attn.")

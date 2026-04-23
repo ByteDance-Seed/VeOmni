@@ -17,6 +17,9 @@
 import pytest
 
 
+pytestmark = pytest.mark.unit
+
+
 def test_preprocessor_registration():
     """Test that custom preprocessors can be registered"""
     from veomni.data.multimodal import PREPROCESSOR_REGISTRY

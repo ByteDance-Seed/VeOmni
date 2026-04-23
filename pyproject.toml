@@ -312,6 +312,23 @@ line-ending = "auto"
 
 [tool.pytest.ini_options]
 markers = [
-    "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
+    # Test-kind markers. Exactly one should be set on every test file via
+    # `pytestmark = pytest.mark.unit` (or `pytest.mark.e2e`). CI workflows
+    # select tests by these markers (see .github/workflows/_test_runner.yml)
+    # instead of enumerating file paths.
+    "unit: fast unit / multi-device tests that run in the {gpu,npu}_unit_tests workflows",
+    "e2e: heavyweight end-to-end tests (torchrun-based) that run in the {gpu,npu}_e2e_tests workflows",
+    # Device gates. Enforced by tests/conftest.py based on VEOMNI_TEST_DEVICE
+    # (set by CI to `gpu` or `npu`). Locally the detection falls back to
+    # `veomni.utils.device.IS_NPU_AVAILABLE`.
+    "gpu_only: test only runs on GPU CI (skipped under VEOMNI_TEST_DEVICE=npu)",
+    "npu_only: test only runs on NPU CI (skipped under VEOMNI_TEST_DEVICE=gpu)",
+    # Backend / stack gates.
+    "v5_only: requires transformers >= 5.0.0 (skipped under the transformers-stable group)",
+    "dit: requires the `dit` extra (diffusers) to be installed",
+    # Historical marker, kept for targeted local runs. No longer used by CI.
     "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
+    # Benchmark-style tests used by `tests/data/multimodal/test_video_utils.py`
+    # (not run in CI; invoke via `pytest -m benchmark`).
+    "benchmark: marks long-running performance benchmarks (deselect with '-m \"not benchmark\"')",
 ]

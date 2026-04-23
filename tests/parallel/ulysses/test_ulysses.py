@@ -29,6 +29,9 @@ from .utils import (
 )
 
 
+pytestmark = pytest.mark.unit
+
+
 class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
     @staticmethod
     def _get_input_data():

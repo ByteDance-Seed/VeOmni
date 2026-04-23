@@ -44,6 +44,8 @@ from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import 
 )
 
 
+pytestmark = pytest.mark.unit
+
 # ---------------------------------------------------------------------------
 # Tests for base protocol helpers
 # ---------------------------------------------------------------------------

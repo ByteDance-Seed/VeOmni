@@ -9,6 +9,9 @@ from veomni.models import build_foundation_model
 from veomni.utils.device import get_device_type, synchronize
 
 
+pytestmark = pytest.mark.unit
+
+
 def generate_grid_thw(batch: int, spatial_merge_size: int, min_t=1, max_t=4, min_hw=14, max_hw=56, device="cpu"):
     grid_thw = torch.zeros((batch, 3), dtype=torch.long, device=device)
 

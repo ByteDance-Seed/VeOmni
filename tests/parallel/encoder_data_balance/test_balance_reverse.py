@@ -3,12 +3,16 @@ import random
 import subprocess
 import sys
 
+import pytest
 import torch
 import torch.distributed as dist
 
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+
+pytestmark = pytest.mark.unit
 
 
 def construct_data():

@@ -23,10 +23,12 @@ from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, get_dist_comm
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
-# Only run in CI when ulysses SP or Qwen3.5 model code is touched.
-# Skip entirely on NPU — FLA triton kernels are GPU-only.
-# Skip if transformers < 5.0.0 — Qwen3.5 is a transformers v5 model.
+# FLA triton kernels are GPU-only; Qwen3.5 is a transformers v5 model.
+# The `qwen3_5_ulysses` marker is kept for targeted local runs.
 pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.gpu_only,
+    pytest.mark.v5_only,
     pytest.mark.qwen3_5_ulysses,
     pytest.mark.skipif(
         IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet Ulysses tests require GPU (FLA triton kernels)"

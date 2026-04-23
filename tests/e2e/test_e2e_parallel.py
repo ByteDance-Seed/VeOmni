@@ -10,9 +10,11 @@ from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
-from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools import build_torchrun_cmd, compare_metrics, print_comparison_table
 from .utils import prepare_exec_cmd
 
+
+pytestmark = pytest.mark.e2e
 
 # See
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
@@ -303,52 +305,8 @@ wan_dit_test_cases = [
 ]
 
 
-@pytest.fixture(scope="session")
-def dummy_text_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="text")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
-
-
-@pytest.fixture(scope="session")
-def dummy_qwen2vl_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen2vl")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
-
-
-@pytest.fixture(scope="session")
-def dummy_qwen3vl_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen3vl")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
-
-
-@pytest.fixture(scope="session")
-def dummy_qwen2omni_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen2omni")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
-
-
-@pytest.fixture(scope="session")
-def dummy_qwen3omni_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen3omni")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
-
-
-@pytest.fixture(scope="session")
-def dummy_wan_t2v_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="wan_t2v")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
+# Session-scoped dummy dataset fixtures live in `tests/e2e/conftest.py` so
+# they can be shared across future per-modality test splits without churn.
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", text_test_cases)

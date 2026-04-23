@@ -34,6 +34,8 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 from ..tools import ParallelConfig
 
 
+pytestmark = pytest.mark.e2e
+
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")

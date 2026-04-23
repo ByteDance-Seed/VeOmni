@@ -36,6 +36,8 @@ from .utils import (
 from .weight_sync_adapters import get_sync_weight_func
 
 
+pytestmark = pytest.mark.unit
+
 os.environ["NCCL_DEBUG"] = "OFF"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # enable_full_determinism(42)
