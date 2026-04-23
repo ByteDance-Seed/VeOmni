@@ -252,6 +252,22 @@ def install_loss_mapping(impl: str = "eager") -> str:
     modeling code calls ``self.loss_function(hidden_states=..., logits=None,
     ...)`` which HF's stock ``ForCausalLMLoss`` cannot handle.
 
+    Contract — return type: **VeOmni's wrappers return ``(loss, logits)``**,
+    not a bare ``torch.Tensor``. The tuple is load-bearing: fused kernels
+    (Liger fused linear+CE, NPU ``chunk_loss_function``) fold the
+    ``lm_head`` projection into the loss, so the kernel — not the caller —
+    is where logits come out. Every VeOmni-patched v5 modeling file in-tree
+    unpacks as ``loss, _ = self.loss_function(...)`` (or
+    ``loss, logits = ...`` when the caller needs the fused logits).
+
+    This diverges from upstream ``transformers.loss.loss_utils.ForCausalLMLoss``
+    which returns a bare ``Tensor``. Mixing ``install_loss_mapping`` with
+    an unpatched HF model's ``forward`` (which still does ``loss =
+    self.loss_function(...)``) is therefore unsupported — you're expected
+    to run through ``BaseTrainer`` so every model in the process is patched
+    coherently. See ``docs/design/kernel_selection.md`` ("BaseTrainer
+    contract" and the v4/v5 impact table) for the full contract.
+
     Returns the human-readable label (e.g. ``"CrossEntropy (liger_kernel)"``)
     for logging.
     """
