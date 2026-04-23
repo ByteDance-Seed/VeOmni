@@ -91,7 +91,7 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra npu --extra audio --group dev
+          uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -125,9 +125,10 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
+          uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
       - name: Sync dependencies [transformers-v5]
         run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
+          uv sync --frozen --python 3.11 --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
       - name: Run models tests [transformers-v5]
         run: |
           uv run  --frozen pytest -v -s -x tests/models/test_model_registry.py

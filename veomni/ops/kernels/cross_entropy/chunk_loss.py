@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked cross-entropy loss for ``ForCausalLM`` on NPU.
+"""Chunked cross-entropy loss for causal LM heads on NPU.
 
 Used when ``OpsImplementationConfig.cross_entropy_loss_implementation == "npu"``.
 The outer ``chunk_loss_function`` splits the sequence into chunks and calls the
-currently-bound ``_cross_entropy`` implementation on each chunk, accumulating
-gradients via a custom autograd ``Function``.
+eager cross-entropy on each chunk, accumulating gradients via a custom autograd
+``Function``. The chunked path always uses eager — it is installed directly into
+``LOSS_MAPPING["ForCausalLM"]`` / ``LOSS_MAPPING["ForConditionalGeneration"]``
+by ``install_loss_mapping("npu")`` and never reaches ``ForCausalLMLoss``.
+
+Causal-only: the function hard-codes a causal label shift, so it cannot back
+``ForSequenceClassification`` (token-level labels, no shift). SP reduction is
+applied here so VLMs with SP enabled produce correct losses.
 """
 
 from typing import Any, Callable, Optional
@@ -26,6 +32,8 @@ import torch
 import torch.nn.functional as F
 
 from ....distributed.parallel_state import get_parallel_state
+from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
+from .eager import eager_cross_entropy
 
 
 class ChunkLoss(torch.autograd.Function):
@@ -85,19 +93,20 @@ def chunk_loss_function(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
-    if not get_parallel_state().sp_enabled:
+    sp_enabled = get_parallel_state().sp_enabled
+    # Snapshot the pre-shift labels for the SP denominator — the non-SP branch
+    # below rewrites `labels` in place with the shifted view.
+    sp_reduction_labels = labels
+
+    if not sp_enabled:
         labels = labels[..., 1:].contiguous()
         hidden_states = hidden_states[..., :-1, :].contiguous()
 
     def ce_loss_func(hidden_states, weight, bias, labels, num_items_in_batch, ignore_index=-100, **kwargs):
-        # Resolve the globally-bound cross-entropy implementation at call time so
-        # that reassignments via ``apply_veomni_loss_patch`` are respected.
-        from . import _cross_entropy as loss_func
-
         labels = labels.view(-1)
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
         logits = F.linear(hidden_states, weight).float()
-        loss, logits = loss_func(
+        loss, logits = eager_cross_entropy(
             logits,
             labels,
             vocab_size,
@@ -118,17 +127,10 @@ def chunk_loss_function(
     ]
 
     chunk_loss = ChunkLoss.apply(hidden_states, weights, None, ce_loss_func, loss_kwargs_chunks, chunk_size)
+
+    # Match ``ForCausalLMLoss`` SP behavior so chunk_loss can back both
+    # ForCausalLM and ForConditionalGeneration heads when SP is enabled.
+    if sp_enabled:
+        num_valid_tokens = (sp_reduction_labels != ignore_index).sum()
+        chunk_loss = reduce_sequence_parallel_loss(chunk_loss, num_valid_tokens)
     return chunk_loss, None
-
-
-def install_chunk_loss() -> None:
-    """Side-effect for the ``cross_entropy_loss_implementation="npu"`` backend.
-
-    Called by the registry after the base ``_cross_entropy`` slot has been
-    bound.  Overrides ``LOSS_MAPPING["ForCausalLM"]`` to dispatch through
-    ``chunk_loss_function``, which splits the sequence and calls the
-    currently-bound ``_cross_entropy`` on each chunk.
-    """
-    from transformers.loss.loss_utils import LOSS_MAPPING
-
-    LOSS_MAPPING["ForCausalLM"] = chunk_loss_function

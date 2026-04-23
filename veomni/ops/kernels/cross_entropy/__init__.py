@@ -12,7 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+"""Cross-entropy loss wrappers and dispatch.
+
+``ForCausalLMLoss`` and ``ForSequenceClassificationLoss`` own the outer policy
+(label shifting for causal LM, SP-aware reduction) and delegate the actual
+cross-entropy computation to ``cross_entropy_fn`` — a single required-style
+keyword argument. The wrapper never decides which inner kernel to use: that
+decision is made once, at ``install_loss_mapping`` / ``KERNEL_REGISTRY.resolve``
+time, and baked in via ``functools.partial``.
+
+Two dispatch paths reach these wrappers:
+
+1. ``LOSS_MAPPING``: ``install_loss_mapping(impl)`` binds
+   ``partial(ForCausalLMLoss, cross_entropy_fn=<impl>)`` into
+   ``LOSS_MAPPING["ForCausalLM"]`` etc. Models that call
+   ``self.loss_function(...)`` go through this path.
+
+2. ``KERNEL_REGISTRY`` / ``OpSlot``: the registered factories below return the
+   same ``partial(...)`` shape, bound to ``veomni_causal_lm_loss`` /
+   ``veomni_seq_cls_loss`` at model-build time. Generated modeling code that
+   already knows it wants a fused kernel calls the ``OpSlot`` directly.
+
+Contract: ``apply_ops_config(ops_config)`` must run before any model is built,
+otherwise ``LOSS_MAPPING`` contains HuggingFace's stock wrapper which does not
+understand ``hidden_states=``/``weights=`` kwargs. ``BaseTrainer`` arranges
+this; standalone scripts must call ``apply_ops_config`` themselves (and
+``build_foundation_model`` emits a warning + installs defaults if they don't).
+"""
+
+from functools import partial
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -20,7 +49,7 @@ import torch.nn as nn
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ....utils import logging
-from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
+from ....utils.import_utils import is_liger_kernel_available, is_torch_npu_available
 from .chunk_loss import chunk_loss_function  # noqa: F401 re-export for legacy callers
 from .eager import eager_cross_entropy
 
@@ -28,19 +57,22 @@ from .eager import eager_cross_entropy
 logger = logging.get_logger(__name__)
 
 
-_cross_entropy = eager_cross_entropy
-
-
 def ForCausalLMLoss(
     logits: torch.Tensor = None,
     labels: torch.Tensor = None,
     vocab_size: int = None,
-    num_items_in_batch: Optional[int] = None,
+    num_items_in_batch: int | None = None,
     ignore_index: int = -100,
-    shift_labels: Optional[torch.Tensor] = None,
+    shift_labels: torch.Tensor | None = None,
+    # `*,` marks everything below as keyword-only. HF calls this wrapper with
+    # positional args (logits, labels, vocab_size, ...); keeping `cross_entropy_fn`
+    # keyword-only guarantees the pre-bound kernel from `install_loss_mapping` /
+    # `KERNEL_REGISTRY` (via `functools.partial`) cannot be silently overwritten
+    # by a positional arg overflowing into this slot.
+    *,
+    cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> torch.Tensor:
-    # pop fused loss kwargs
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
 
@@ -73,22 +105,12 @@ def ForCausalLMLoss(
     # Enable model parallelism
     shift_labels = shift_labels.to(device)
 
-    if hidden_states is None or weights is None:
-        logger.warning_once(
-            "hidden_states or weights is None, use eager loss implementation."
-            "To enable fused linear cross entropy loss, please patch modeling.py `forward` function "
-            "to pass `hidden_states` and `weights` to `loss_function`."
-        )
-        loss_func = eager_cross_entropy
-    else:
-        loss_func = _cross_entropy
-    loss, logits = loss_func(
+    loss, logits = cross_entropy_fn(
         logits,
         shift_labels,
         vocab_size,
         num_items_in_batch,
         ignore_index,
-        shift_labels,
         hidden_states=hidden_states,
         weights=weights,
         **kwargs,
@@ -105,10 +127,15 @@ def ForSequenceClassificationLoss(
     logits: torch.Tensor = None,
     labels: torch.Tensor = None,
     num_labels: int = None,
-    num_items_in_batch: Optional[int] = None,
+    num_items_in_batch: int | None = None,
     ignore_index: int = -100,
+    # `*,` marks `cross_entropy_fn` keyword-only — same reason as in
+    # `ForCausalLMLoss`: the inner kernel is bound once at install time via
+    # `partial(..., cross_entropy_fn=...)` and must not be reachable via positional args.
+    *,
+    cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Token-level loss for sequence classification.
 
@@ -129,6 +156,10 @@ def ForSequenceClassificationLoss(
             Used to accurately calculate the average loss for each sample.
         ignore_index (`int`, defaults to `-100`):
             Label value to ignore when computing the loss.
+        cross_entropy_fn (`Callable`):
+            Inner CE kernel, pre-bound by ``install_loss_mapping`` /
+            ``KERNEL_REGISTRY``. Defaults to eager for direct in-process calls
+            (e.g. tests); production dispatch always provides an explicit value.
         hidden_states (`torch.Tensor`):
             Hidden states, used for fused linear cross-entropy.
         weights (`torch.Tensor`):
@@ -171,23 +202,12 @@ def ForSequenceClassificationLoss(
     # Enable model parallelism
     target = target.to(device)
 
-    if hidden_states is None or weights is None:
-        logger.warning_once(
-            "hidden_states or weights is None, use eager loss implementation."
-            "To enable fused linear cross entropy loss, please patch modeling.py `forward` function "
-            "to pass `hidden_states` and `weights` to `loss_function`."
-        )
-        loss_func = eager_cross_entropy
-    else:
-        loss_func = _cross_entropy
-
-    loss, logits = loss_func(
+    loss, logits = cross_entropy_fn(
         logits,
         target,
         num_labels,
         num_items_in_batch,
         ignore_index,
-        target,
         hidden_states=hidden_states,
         weights=weights,
         **kwargs,
@@ -200,41 +220,171 @@ def ForSequenceClassificationLoss(
     return loss, logits
 
 
-register_op(
-    OpSpec(
-        name="cross_entropy_loss",
-        config_field="cross_entropy_loss_implementation",
-        label="CrossEntropy",
-        scope=OpScope.GLOBAL,
-        default="eager",
-        global_slot="veomni.ops.kernels.cross_entropy:_cross_entropy",
-        backends={
-            "eager": BackendSpec(entry="veomni.ops.kernels.cross_entropy.eager:eager_cross_entropy"),
-            "liger_kernel": BackendSpec(
-                entry="veomni.ops.kernels.cross_entropy.liger:fused_liger_kernel_cross_entropy",
-                requires=("liger_kernel",),
-            ),
-            # NPU chunked loss still uses eager as the inner kernel; the
-            # side_effect installs ``chunk_loss_function`` in ``LOSS_MAPPING``.
-            "npu": BackendSpec(
-                entry="veomni.ops.kernels.cross_entropy.eager:eager_cross_entropy",
-                side_effect="veomni.ops.kernels.cross_entropy.chunk_loss:install_chunk_loss",
-                requires=("torch_npu",),
-            ),
-        },
+# ── LOSS_MAPPING installation ────────────────────────────────────────────────
+
+
+def _resolve_cross_entropy_fn(impl: str) -> Callable:
+    """Return the inner CE kernel callable for ``impl`` (one of
+    ``"eager"`` / ``"liger_kernel"``). The NPU path does not go through this
+    helper — see ``install_loss_mapping``."""
+    if impl == "eager":
+        return eager_cross_entropy
+    if impl == "liger_kernel":
+        if not is_liger_kernel_available():
+            raise RuntimeError(
+                "cross_entropy_loss_implementation='liger_kernel' but liger-kernel "
+                "is not installed. Install liger-kernel, or set the field to 'eager'."
+            )
+        from .liger import fused_liger_kernel_cross_entropy
+
+        return fused_liger_kernel_cross_entropy
+    raise ValueError(
+        f"Unknown cross_entropy_loss_implementation: {impl!r}. Valid options: 'eager', 'liger_kernel', 'npu'."
+    )
+
+
+def install_loss_mapping(impl: str = "eager") -> str:
+    """Install VeOmni's loss wrappers into HuggingFace's ``LOSS_MAPPING``,
+    pre-bound to the cross-entropy kernel selected by *impl*.
+
+    This is the single entry point for loss dispatch and is called by
+    ``apply_ops_config``. Must run before ``build_foundation_model``: VeOmni
+    modeling code calls ``self.loss_function(hidden_states=..., logits=None,
+    ...)`` which HF's stock ``ForCausalLMLoss`` cannot handle.
+
+    Contract — return type: **VeOmni's wrappers return ``(loss, logits)``**,
+    not a bare ``torch.Tensor``. The tuple is load-bearing: fused kernels
+    (Liger fused linear+CE, NPU ``chunk_loss_function``) fold the
+    ``lm_head`` projection into the loss, so the kernel — not the caller —
+    is where logits come out. Every VeOmni-patched v5 modeling file in-tree
+    unpacks as ``loss, _ = self.loss_function(...)`` (or
+    ``loss, logits = ...`` when the caller needs the fused logits).
+
+    This diverges from upstream ``transformers.loss.loss_utils.ForCausalLMLoss``
+    which returns a bare ``Tensor``. Mixing ``install_loss_mapping`` with
+    an unpatched HF model's ``forward`` (which still does ``loss =
+    self.loss_function(...)``) is therefore unsupported — you're expected
+    to run through ``BaseTrainer`` so every model in the process is patched
+    coherently. See ``docs/design/kernel_selection.md`` ("BaseTrainer
+    contract" and the v4/v5 impact table) for the full contract.
+
+    Returns the human-readable label (e.g. ``"CrossEntropy (liger_kernel)"``)
+    for logging.
+    """
+    from transformers.loss.loss_utils import LOSS_MAPPING
+
+    if impl == "npu":
+        if not is_torch_npu_available():
+            raise RuntimeError("cross_entropy_loss_implementation='npu' requires torch_npu to be installed.")
+        # NPU chunk-loss is a standalone LOSS_MAPPING entry with its own
+        # chunked autograd function; it handles hidden_states/weights directly
+        # and now also applies the SP reduction internally (see chunk_loss.py),
+        # so both ForCausalLM and ForConditionalGeneration can route through
+        # it safely. ForSequenceClassification stays on the eager wrapper:
+        # chunk_loss hard-codes the causal ``labels[..., 1:]`` shift, which is
+        # incompatible with the token-level (no-shift) labels that
+        # ``ForSequenceClassificationLoss`` expects.
+        #
+        # TODO(unify): chunk_loss_function still breaks the
+        # ``partial(ForCausalLMLoss, cross_entropy_fn=...)`` pattern because it
+        # (a) drives the outer chunk loop via a custom autograd.Function,
+        # (b) operates on ``hidden_states`` not pre-flattened logits, and
+        # (c) does its own label shifting. Unifying it as a standard
+        # ``cross_entropy_fn`` would require letting the wrapper skip its
+        # shift/flatten path when the inner kernel advertises ``owns_chunking=True``.
+        LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
+        LOSS_MAPPING["ForConditionalGeneration"] = chunk_loss_function
+        LOSS_MAPPING["ForSequenceClassification"] = partial(
+            ForSequenceClassificationLoss, cross_entropy_fn=eager_cross_entropy
+        )
+        logger.warning_rank0(
+            "cross_entropy_loss_implementation='npu' routes ForCausalLM and "
+            "ForConditionalGeneration through chunk_loss; ForSequenceClassification "
+            "falls back to the eager wrapper because chunk_loss hard-codes the causal "
+            "label shift."
+        )
+        return "CrossEntropy (npu chunk_loss)"
+
+    ce_fn = _resolve_cross_entropy_fn(impl)
+    LOSS_MAPPING["ForCausalLM"] = partial(ForCausalLMLoss, cross_entropy_fn=ce_fn)
+    LOSS_MAPPING["ForConditionalGeneration"] = partial(ForCausalLMLoss, cross_entropy_fn=ce_fn)
+    LOSS_MAPPING["ForSequenceClassification"] = partial(ForSequenceClassificationLoss, cross_entropy_fn=ce_fn)
+    return f"CrossEntropy ({impl})"
+
+
+# ── OpSlot kernel registration ───────────────────────────────────────────────
+
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+def _liger_fused_ce_causal_factory():
+    """ForCausalLMLoss bound to the Liger fused CE kernel.
+
+    Used for causal-LM heads (label shifting + SP reduction).
+    """
+    from .liger import fused_liger_kernel_cross_entropy
+
+    return partial(ForCausalLMLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
+def _liger_fused_ce_seq_cls_factory():
+    """ForSequenceClassificationLoss bound to the Liger fused CE kernel.
+
+    Used for sequence-classification heads (no label shifting; token-level labels).
+    """
+    from .liger import fused_liger_kernel_cross_entropy
+
+    return partial(ForSequenceClassificationLoss, cross_entropy_fn=fused_liger_kernel_cross_entropy)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="cross_entropy_loss",
+        variant="causal",
+        factory=_liger_fused_ce_causal_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Liger fused linear cross-entropy loss for causal LM (shifts labels, SP reduction)",
+    )
+)
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="cross_entropy_loss",
+        variant="seq_cls",
+        factory=_liger_fused_ce_seq_cls_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Liger fused linear cross-entropy loss for sequence classification (no shift)",
     )
 )
 
 
-def install_loss_mapping() -> None:
-    """Install VeOmni's loss wrappers in HuggingFace's ``LOSS_MAPPING``.
+def _npu_chunk_loss_causal_factory():
+    """NPU chunked cross-entropy for causal LM.
 
-    Called from ``apply_ops_config`` before the GLOBAL registry is walked, so
-    that the NPU backend's side-effect (which overrides
-    ``LOSS_MAPPING["ForCausalLM"]``) runs last.
+    Unlike the Liger factory above, ``chunk_loss_function`` is itself the
+    full loss wrapper: it drives its own chunked autograd ``Function``,
+    does its own label shift, and projects ``hidden_states`` through
+    ``weights`` internally. No ``partial(ForCausalLMLoss, ...)`` wrapping
+    is needed — returning it bare matches how ``install_loss_mapping("npu")``
+    installs it into ``LOSS_MAPPING["ForCausalLM"]``.
     """
-    from transformers.loss.loss_utils import LOSS_MAPPING
+    from .chunk_loss import chunk_loss_function
 
-    LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
-    LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
-    LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
+    return chunk_loss_function
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="cross_entropy_loss",
+        variant="causal",
+        factory=_npu_chunk_loss_causal_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU chunked cross-entropy loss for causal LM (no SP reduction)",
+    )
+)
+# No ``seq_cls`` variant: ``chunk_loss_function`` hard-codes causal label
+# shifting. Sequence-classification heads on NPU stay on eager via the
+# LOSS_MAPPING branch in ``install_loss_mapping("npu")``.

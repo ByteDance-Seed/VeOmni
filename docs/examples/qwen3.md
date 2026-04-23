@@ -53,7 +53,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
     --model.model_path ./Qwen3-30B-A3B-Instruct-2507-merge \
-    --model.ops_implementation.moe_implementation fused \
+    --model.ops_implementation.moe_implementation fused_triton \
     --data.train_path ./tulu-first2000.parquet \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \

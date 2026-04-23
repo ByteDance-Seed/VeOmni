@@ -39,6 +39,15 @@ config = PatchConfig(
     description="Qwen2 with LigerKernel GPU replacements",
 )
 
+config.add_post_import_block(
+    """
+    # ── OpSlot declarations ──────────────────────────────────────────────────
+    # Bound at model-build time by _bind_veomni_ops() in auto.py.
+    from veomni.ops.dispatch import OpSlot
+    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    """
+)
+
 
 config.patches.append(
     create_patch_from_external(
@@ -182,14 +191,19 @@ def qwen2forcausallm_forward_patched(
     loss = None
     logits = None
     if labels is not None:
-        loss, logits = self.loss_function(
-            logits=logits,
-            labels=labels,
-            vocab_size=self.config.vocab_size,
-            hidden_states=hidden_states,
-            weights=self.lm_head.weight,
-            **kwargs,
-        )
+        # Modification: OpSlot guard for cross-entropy loss.
+        if veomni_causal_lm_loss.use_non_eager_impl:
+            loss, logits = veomni_causal_lm_loss(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states)
+            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 

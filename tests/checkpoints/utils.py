@@ -3,7 +3,14 @@
 
 import os
 
+from veomni.utils.import_utils import is_torch_npu_available
+
 from ..tools.launch_utils import find_free_port
+
+
+# Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
+# kernel is the only option; on GPU default to Triton (SM70+).
+_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
 
 
 MODEL_CONFIGS = {
@@ -51,7 +58,7 @@ def get_checkpoint_test_command(
         "tests/checkpoints/test_trainer_saveload.py",
         f"--model.config_path {config_path}",
         f"--model.tokenizer_path {tokenizer_path}",
-        "--model.ops_implementation.moe_implementation fused",
+        f"--model.ops_implementation.moe_implementation {_FUSED_MOE_IMPL}",
         "--model.ops_implementation.attn_implementation flash_attention_2",
         "--data.train_path dummy",
         "--data.max_seq_len 128",

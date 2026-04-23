@@ -1,9 +1,14 @@
 import os
 import re
 from dataclasses import dataclass
+from typing import Dict
 
 import numpy as np
 import pandas as pd
+import torch
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 from ..tools import DummyDataset as DummyDataset
 from ..tools import ParallelConfig
@@ -72,7 +77,7 @@ class ParallelMode:
     ep_size: int
 
     def __str__(self):
-        return f"_[sp-{self.sp_size}]_[ep-{self.ep_size}]"
+        return f"sp{self.sp_size}_ep{self.ep_size}"
 
 
 _SP_SIZE = [1, 2]
@@ -145,3 +150,49 @@ def prepare_exec_cmd(
             command_list.append((task_name, cmd_kwargs))
 
     return command_list
+
+
+def print_all_values(output_dict, value_key: str, model_type: str = ""):
+    console = Console(width=200)
+    table = Table(title=f"Alignment Result: [bold magenta]{model_type} {value_key}[/bold magenta]")
+
+    table.add_column("Task", style="cyan", justify="left", no_wrap=True)
+
+    table.add_column(value_key.upper(), style="bold green", justify="right")
+
+    for task_name, output in output_dict.items():
+        row_cells = []
+        row_cells.append(Text(task_name))
+
+        val_list = output.get(value_key)
+        row_cells.append(", ".join([f"{v:.8f}" for v in val_list]))
+
+        table.add_row(*row_cells)
+
+    console.print(table)
+
+
+def compare_multi_items(model_name: str, outputs_dict: Dict, rtol=0.01, atol=0.01):
+    base_task = next(iter(outputs_dict))
+    base_output = outputs_dict[base_task]
+
+    base_keys = set(base_output.keys())
+    for task, output in outputs_dict.items():
+        if task == base_task:
+            continue
+        if set(output.keys()) != base_keys:
+            raise AssertionError(
+                f"Output keys for task '{task}' do not match base task '{base_task}': "
+                f"missing={base_keys - output.keys()}, extra={output.keys() - base_keys}"
+            )
+        for key in base_keys:
+            try:
+                torch.testing.assert_close(
+                    output[key],
+                    base_output[key],
+                    rtol=rtol,
+                    atol=atol,
+                )
+            except AssertionError as e:
+                print_all_values(outputs_dict, key, model_name)
+                raise AssertionError(f"{key} not match") from e

@@ -652,12 +652,15 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
-    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = field(
-        default=None,
+    moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = field(
+        default="eager",
         metadata={
-            "help": "MoE implementation to use. "
-            "'eager' for reference loop, 'fused' for Triton group-gemm, "
-            "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
+            "help": "MoE experts forward implementation. "
+            "'fused_triton' uses the Triton group-gemm kernel (GPU, SM70+). "
+            "'fused_quack' uses the Quack CUTLASS/CuTe kernel (GPU, SM90+). "
+            "'fused_npu' uses the NPU group-gemm kernel (requires torch_npu). "
+            "'eager' (default) runs the reference loop. "
+            "The backend must match the hardware — no silent fallback."
         },
     )
     cross_entropy_loss_implementation: str = field(

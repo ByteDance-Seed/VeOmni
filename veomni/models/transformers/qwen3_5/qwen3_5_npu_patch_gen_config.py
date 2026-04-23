@@ -86,6 +86,15 @@ config.add_post_import_block(
     """
 )
 
+config.add_post_import_block(
+    """
+    # ── OpSlot declarations ──────────────────────────────────────────────────
+    # Bound at model-build time by _bind_veomni_ops() in auto.py.
+    from veomni.ops.dispatch import OpSlot
+    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    """
+)
+
 
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.

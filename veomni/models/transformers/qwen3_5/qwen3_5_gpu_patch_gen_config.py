@@ -112,6 +112,15 @@ config.add_post_import_block(
     """
 )
 
+config.add_post_import_block(
+    """
+    # ── OpSlot declarations ──────────────────────────────────────────────────
+    # Bound at model-build time by _bind_veomni_ops() in auto.py.
+    from veomni.ops.dispatch import OpSlot
+    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    """
+)
+
 
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
@@ -978,14 +987,19 @@ def qwen3_5_forcausallm_forward_patched(
     loss = None
     logits = None
     if labels is not None:
-        loss, logits = self.loss_function(
-            logits=logits,
-            labels=labels,
-            vocab_size=self.config.vocab_size,
-            hidden_states=hidden_states,
-            weights=self.lm_head.weight,
-            **kwargs,
-        )
+        # Modification: OpSlot guard for cross-entropy loss.
+        if veomni_causal_lm_loss.use_non_eager_impl:
+            loss, logits = veomni_causal_lm_loss(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states)
+            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
     else:
         logits = self.lm_head(hidden_states)
 
@@ -1059,14 +1073,21 @@ def qwen3_5_forconditional_generation_forward_patched(
     loss = None
     logits = None
     if labels is not None:
-        loss, logits = self.loss_function(
-            logits=logits,
-            labels=labels,
-            vocab_size=self.config.text_config.vocab_size,
-            hidden_states=hidden_states,
-            weights=self.lm_head.weight,
-            **kwargs,
-        )
+        # Modification: OpSlot guard for cross-entropy loss.
+        if veomni_causal_lm_loss.use_non_eager_impl:
+            loss, logits = veomni_causal_lm_loss(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states)
+            loss, _ = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
     else:
         logits = self.lm_head(hidden_states)
 

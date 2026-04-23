@@ -62,34 +62,136 @@ def fused_moe_forward(
 
 
 def apply_veomni_fused_moe_patch(
-    moe_implementation: Literal["fused", "fused_quack"] = "fused",
+    fused_moe_kernel: Literal["triton", "quack", "npu"] = "triton",
 ):
     """Bind the global ``_fused_moe_forward`` function pointer.
 
     Args:
-        moe_implementation: Which fused MoE kernel to activate.
-            ``"fused"`` uses the Triton group-gemm kernels (default).
-            ``"fused_quack"`` uses the Quack CUTLASS/CuTe kernels (SM90+).
-            On NPU devices the parameter is ignored and the NPU kernel is
-            always selected.
+        fused_moe_kernel: Which fused MoE kernel to activate.
+            ``"triton"`` uses the Triton group-gemm kernels (GPU, SM70+).
+            ``"quack"`` uses the Quack CUTLASS/CuTe kernels (GPU, SM90+).
+            ``"npu"`` uses the NPU group-gemm kernel (requires torch_npu).
+            The kernel must match the hardware; mismatches raise here rather
+            than silently falling back to a different backend.
     """
     global _fused_moe_forward
-    if is_torch_npu_available():
+    if fused_moe_kernel == "npu":
+        if not is_torch_npu_available():
+            raise RuntimeError(
+                "fused_moe_kernel='npu' requires torch_npu and an NPU device. On GPU, use 'triton' or 'quack' instead."
+            )
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
-    elif moe_implementation == "fused_quack":
+    elif fused_moe_kernel == "quack":
+        if is_torch_npu_available():
+            raise RuntimeError("fused_moe_kernel='quack' is GPU-only. Use 'npu' on NPU devices.")
         if not is_quack_gemm_available():
             raise RuntimeError(
-                "moe_implementation='fused_quack' requires the quack package and an SM90+ GPU. "
-                "Please install quack or use moe_implementation='fused'."
+                "fused_moe_kernel='quack' requires the quack package and an SM90+ GPU. "
+                "Please install quack or use fused_moe_kernel='triton'."
             )
         from .quack_gemm import quack_gemm_fused_moe_forward
 
         _fused_moe_forward = quack_gemm_fused_moe_forward
-    elif moe_implementation == "fused" and is_fused_moe_available():
+    elif fused_moe_kernel == "triton":
+        if is_torch_npu_available():
+            raise RuntimeError("fused_moe_kernel='triton' is GPU-only. Use 'npu' on NPU devices.")
+        if not is_fused_moe_available():
+            raise RuntimeError("fused_moe_kernel='triton' requires triton to be installed and a supported GPU.")
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
-        _fused_moe_forward = None
+        raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
+
+
+# ── OpSlot kernel registrations ──────────────────────────────────────────────
+
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+def _make_moe_experts_adapter(raw_forward):
+    """Adapt the raw fused MoE kernel to the OpSlot call signature.
+
+    The generated modeling code calls the slot as a bound method of the
+    HF experts module::
+
+        veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+
+    The raw kernels (``group_gemm_fused_moe_forward`` /
+    ``quack_gemm_fused_moe_forward``) instead take the flat tensor-level
+    signature ``(num_experts, routing_weights, selected_experts,
+    hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight,
+    fc1_1_2_weight)``. This adapter pulls ``num_experts``/``gate_up_proj``/
+    ``down_proj`` off ``self`` and forwards everything else positionally so
+    the OpSlot stays a drop-in replacement for the HF ``forward``.
+    """
+
+    def adapter(self, hidden_states, top_k_index, top_k_weights):
+        return raw_forward(
+            num_experts=self.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_weight=None,
+            fc1_2_weight=None,
+            fc2_weight=self.down_proj,
+            fc1_1_2_weight=self.gate_up_proj,
+        )
+
+    return adapter
+
+
+def _triton_kernel_factory():
+    from .group_gemm import group_gemm_fused_moe_forward
+
+    return _make_moe_experts_adapter(group_gemm_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="triton",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_triton_kernel_factory,
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
+        description="Triton group-gemm fused MoE forward",
+    )
+)
+
+
+def _quack_kernel_factory():
+    from .quack_gemm import quack_gemm_fused_moe_forward
+
+    return _make_moe_experts_adapter(quack_gemm_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="quack",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_quack_kernel_factory,
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
+        description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
+    )
+)
+
+
+def _npu_kernel_factory():
+    from .npu_group_gemm import npu_fused_moe_forward
+
+    return _make_moe_experts_adapter(npu_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_npu_kernel_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU group-gemm fused MoE forward",
+    )
+)

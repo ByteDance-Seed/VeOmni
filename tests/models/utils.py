@@ -24,6 +24,9 @@ _USE_LIGER_KERNEL = [True, False] if is_liger_kernel_available() else [False]
 # imports ``triton`` unconditionally, so fall back to the pure-PyTorch backend
 # when the mainline package is missing.
 _LOAD_BALANCING_LOSS_IMPL = "triton" if is_package_available("triton") else "eager"
+# Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
+# kernel is the only option; on GPU default to Triton (SM70+).
+_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
 
 
 @dataclass(frozen=True)
@@ -85,12 +88,12 @@ def _base_model_modes():
 
 
 def _moe_model_modes():
-    """MoE model modes: same attn variants with moe_implementation=fused."""
+    """MoE model modes: same attn variants with a fused MoE backend matching the hardware."""
     modes = []
     for hf_attn in _HF_ATTN:
         if _skip_fa3_npu(hf_attn):
             continue
-    _append_veomni_modes(modes, moe_implementation="fused")
+    _append_veomni_modes(modes, moe_implementation=_FUSED_MOE_IMPL)
     return modes
 
 
@@ -348,14 +351,15 @@ def apply_veomni_hf_unpatch():
 
 
 def apply_veomni_loss_unpatch():
-    from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
-
-    from veomni.ops.kernels import cross_entropy
-
-    cross_entropy._cross_entropy = None
+    from transformers.loss.loss_utils import (
+        LOSS_MAPPING,
+        ForCausalLMLoss,
+        ForSequenceClassificationLoss,
+    )
 
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
+    LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
 
 
 def apply_veomni_moe_unpatch():
@@ -369,7 +373,7 @@ def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig
     liger_impl = _LIGER_KERNEL if model_mode.use_liger_kernel else _EAGER
     return OpsImplementationConfig(
         attn_implementation=model_mode.attn_implementation,
-        moe_implementation=model_mode.moe_implementation if model_mode.moe_implementation != "eager" else None,
+        moe_implementation=model_mode.moe_implementation,
         cross_entropy_loss_implementation=liger_impl,
         rms_norm_implementation=liger_impl,
         swiglu_mlp_implementation=liger_impl,

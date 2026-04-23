@@ -69,7 +69,6 @@ def test_seqcls_loss_hidden_states_weights_path_build_logits_and_loss(monkeypatc
         sp_enabled = False
     """
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
-    monkeypatch.setattr(m, "_cross_entropy", m.eager_cross_entropy)
 
     ignore = -100
     num_labels = 4
@@ -126,10 +125,7 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
       - out_logits is the flattened *input* logits, because fused_liger_kernel_cross_entropy
         returns `(loss, logits)` without materializing projected logits.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.ops import apply_ops_config
-
-    apply_ops_config(OpsImplementationConfig(cross_entropy_loss_implementation="liger_kernel"))
+    from veomni.ops.kernels.cross_entropy.liger import fused_liger_kernel_cross_entropy
 
     dev_api = get_torch_device()
     local_rank = 0
@@ -162,6 +158,7 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
         ignore_index=ignore,
         hidden_states=hidden_states,
         weights=weights,
+        cross_entropy_fn=fused_liger_kernel_cross_entropy,
     )
 
     proj = hidden_states.reshape(-1, H) @ weights.t()  # [B*T, C]

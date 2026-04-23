@@ -297,7 +297,11 @@ select = ["B", "C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
+# Patch gen configs reference names from add_post_import_block (e.g. OpSlot
+# instances, rotate_half) that ruff can't resolve because they only exist as
+# string literals until patchgen materializes them into the generated file.
 "veomni/models/transformers/**/generated/*.py" = ["E402", "B007"]
+"veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
