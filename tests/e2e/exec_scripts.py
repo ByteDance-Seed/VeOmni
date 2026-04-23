@@ -1,7 +1,7 @@
 import os
 
 
-CI_MODEL_DIR = os.getenv("CI_MODEL_DIR", ".")
+CI_HF_MODELS_DIR = os.getenv("CI_HF_MODELS_DIR", ".")
 CI_DATASET_DIR = os.getenv("CI_DATASET_DIR", ".")
 
 
@@ -10,7 +10,7 @@ def qwen3_0p6b_base_tulu_sft_script():
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4321",
         "tasks/train_text.py",
         "configs/text/qwen3.yaml",
-        f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
+        f"--model.model_path {os.path.join(CI_HF_MODELS_DIR, 'Qwen', 'Qwen3-0.6B-Base')}",
         f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
         "--train.checkpoint.output_dir Qwen3-0.6B-Base-sft",
         "--train.enable_full_determinism true",
@@ -29,7 +29,7 @@ def qwen3_0p6b_base_tulu_sft_no_reshard_script():
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4321",
         "tasks/train_text.py",
         "configs/text/qwen3.yaml",
-        f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
+        f"--model.model_path {os.path.join(CI_HF_MODELS_DIR, 'Qwen', 'Qwen3-0.6B-Base')}",
         f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
         "--train.checkpoint.output_dir Qwen3-0.6B-Base-sft-no-reshard",
         "--train.enable_full_determinism true",
@@ -50,7 +50,7 @@ def qwen3_0p6b_base_tulu_sft_padded_script():
         "torchrun --nnodes=1 --nproc_per_node=8 --master-port=4322",
         "tasks/train_text.py",
         "configs/text/qwen3.yaml",
-        f"--model.model_path {os.path.join(CI_MODEL_DIR, 'Qwen3-0.6B-Base')}",
+        f"--model.model_path {os.path.join(CI_HF_MODELS_DIR, 'Qwen', 'Qwen3-0.6B-Base')}",
         f"--data.train_path {os.path.join(CI_DATASET_DIR, 'tulu-3-sft-mixture/data')}",
         "--train.checkpoint.output_dir Qwen3-0.6B-Base-sft-padded",
         "--train.enable_full_determinism true",

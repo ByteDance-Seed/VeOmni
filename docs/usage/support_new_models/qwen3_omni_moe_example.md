@@ -480,7 +480,7 @@ Requires a real checkpoint and dataset. Add an entry to `E2E_TEST_SCRIPT` in [te
 Run:
 ```bash
 source .venv/bin/activate
-CI_MODEL_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
+CI_HF_MODELS_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
 pytest -s tests/e2e/test_e2e_training.py -k your_model
 ```
 
