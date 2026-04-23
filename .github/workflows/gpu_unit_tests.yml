@@ -121,7 +121,7 @@ jobs:
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
       - name: Run data tests
         run: |
-          uv run --froze
+          uv run --frozen pytest -s -x tests/data
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
