@@ -652,15 +652,20 @@ class OpsImplementationConfig:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use."},
     )
-    moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = field(
+    moe_implementation: str = field(
         default="eager",
         metadata={
             "help": "MoE experts forward implementation. "
-            "'fused_triton' uses the Triton group-gemm kernel (GPU, SM70+). "
-            "'fused_quack' uses the Quack CUTLASS/CuTe kernel (GPU, SM90+). "
-            "'fused_npu' uses the NPU group-gemm kernel (requires torch_npu). "
-            "'eager' (default) runs the reference loop. "
-            "The backend must match the hardware — no silent fallback."
+            "OSS backends: 'fused_triton' (Triton group-gemm, GPU, SM70+), "
+            "'fused_quack' (Quack CUTLASS/CuTe, GPU, SM90+), "
+            "'fused_npu' (NPU group-gemm, requires torch_npu), "
+            "'eager' (default, reference loop). "
+            "The backend must match the hardware — no silent fallback. "
+            "Typed as plain str (not Literal) so third-party backends can be "
+            "plugged in via `apply_veomni_fused_moe_patch` (legacy-dispatch "
+            "models) or `KERNEL_REGISTRY.register(op_name='moe_experts', ...)` "
+            "(OpSlot-dispatch models), matching the extensibility of the "
+            "other *_implementation fields."
         },
     )
     cross_entropy_loss_implementation: str = field(

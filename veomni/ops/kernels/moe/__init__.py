@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal
-
 import torch
 
 from ....utils import logging
@@ -61,18 +59,22 @@ def fused_moe_forward(
     )
 
 
-def apply_veomni_fused_moe_patch(
-    fused_moe_kernel: Literal["triton", "quack", "npu"] = "triton",
-):
+def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
     """Bind the global ``_fused_moe_forward`` function pointer.
 
     Args:
-        fused_moe_kernel: Which fused MoE kernel to activate.
-            ``"triton"`` uses the Triton group-gemm kernels (GPU, SM70+).
-            ``"quack"`` uses the Quack CUTLASS/CuTe kernels (GPU, SM90+).
-            ``"npu"`` uses the NPU group-gemm kernel (requires torch_npu).
+        fused_moe_kernel: Which fused MoE kernel to activate. OSS values:
+            ``"triton"`` (Triton group-gemm, GPU, SM70+),
+            ``"quack"`` (Quack CUTLASS/CuTe, GPU, SM90+),
+            ``"npu"`` (NPU group-gemm, requires torch_npu).
             The kernel must match the hardware; mismatches raise here rather
             than silently falling back to a different backend.
+
+            Typed as plain ``str`` (not ``Literal``) so third-party backends
+            (e.g. seed-kernels) can monkey-patch this function to intercept
+            their own name and delegate unknown names to the OSS dispatch
+            below. Unknown names that reach the OSS dispatch raise
+            ``ValueError``.
     """
     global _fused_moe_forward
     if fused_moe_kernel == "npu":
