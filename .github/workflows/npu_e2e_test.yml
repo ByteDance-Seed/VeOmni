@@ -82,7 +82,6 @@ jobs:
       # github_runner/group_vars/all.yml::veomni_ci_nfs_*).
       CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
       CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
-      CI_MODEL_DIR: "/mnt/veomni_ci/models/Qwen"
       CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
 
     steps:

@@ -73,7 +73,6 @@ jobs:
       # Shared NFS paths (see workflow container.volumes above).
       CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
       CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
-      CI_MODEL_DIR: "/mnt/veomni_ci/models/Qwen"
       CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
 
     steps:
@@ -122,7 +121,7 @@ jobs:
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
       - name: Run data tests
         run: |
-          uv run --frozen pytest -s -x tests/data
+          uv run --froze
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
