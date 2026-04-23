@@ -1,0 +1,96 @@
+# Lightweight repo-level static checks.
+#
+# Groups three jobs that each take a few seconds on ubuntu-latest and
+# don't need GPU/NPU hardware:
+#
+#   - doc_task_paths : verify that every `tasks/*.py` mention in the
+#     docs points at a file that actually exists.
+#   - device_api    : reject raw `.cuda` / "cuda" / "nccl" references
+#     outside the whitelist (tasks/ + veomni/ + tests/).
+#   - patchgen      : re-run the transformers patch generator and fail
+#     if the checked-in generated modeling drifts from the source.
+#     Path-gated so we don't pay the `uv sync` cost on every PR.
+#
+# Code-format lint (`ruff check` + `ruff format --check`) lives in
+# check_pr_lint.yml because the four GPU/NPU test workflows `uses:` it
+# as a gating dependency — keeping it as a standalone reusable avoids
+# forcing those workflows to also depend on the heavier patchgen job.
+#
+# PR title format lives in check_pr_title.yml because it's scoped to
+# `pull_request.types: [opened, edited, reopened, synchronize]` and
+# would re-run the other checks unnecessarily on every title edit.
+
+name: Static checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  doc_task_paths:
+    name: Verify tasks/*.py paths in docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/ci/check_doc_task_paths.py
+
+  device_api:
+    name: Device API usage normativity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: tasks/
+        run: python3 scripts/ci/check_device_api_usage.py -d tasks
+      - name: veomni/
+        run: python3 scripts/ci/check_device_api_usage.py -d veomni
+      - name: tests/
+        run: python3 scripts/ci/check_device_api_usage.py -d tests
+
+  patchgen:
+    name: Patchgen drift
+    runs-on: ubuntu-latest
+    # Only trigger this (heavier) job when patchgen sources or generated
+    # code could have changed. We can't use path filters at the job
+    # level, so approximate via changed-files detection. On pushes where
+    # no patchgen-relevant file changed, the job short-circuits as a
+    # no-op success.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect patchgen-relevant changes
+        id: changes
+        shell: bash
+        run: |
+          base_sha="${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}"
+          if git diff --name-only "$base_sha" HEAD -- \
+                 'veomni/patchgen/' \
+                 'veomni/models/transformers/' \
+                 'pyproject.toml' \
+                 'uv.lock' | grep -q .; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No patchgen-relevant files changed, skipping."
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.changes.outputs.run == 'true'
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        if: steps.changes.outputs.run == 'true'
+      - name: Check patchgen drift
+        if: steps.changes.outputs.run == 'true'
+        run: >-
+          uv run --no-group transformers-stable --extra transformers5-exp
+          --extra gpu --dev python -m veomni.patchgen.check_patchgen

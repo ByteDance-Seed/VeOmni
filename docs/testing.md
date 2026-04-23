@@ -83,10 +83,10 @@ tests/
 │   ├── test_npu_setup.py                          # NPU environment validation
 │   ├── test_rank0_load_and_broadcast_weights.py   # Rank-0 load & broadcast (2+ GPUs)
 │   └── test_save_safetensor_utils.py              # Safetensor save utilities (CPU)
-│
-└── special_sanity/
-    └── check_device_api_usage.py    # CI lint: no direct .cuda / "cuda" calls
 ```
+
+Device-API lint (`scripts/ci/check_device_api_usage.py`) lives under
+`scripts/ci/` since it's a standalone CI script, not a pytest test.
 
 ---
 
@@ -102,7 +102,7 @@ tests/
 | **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
-| **Sanity** | `tests/special_sanity/` | 0 | script | Device API lint |
+| **Sanity** | `scripts/ci/` | 0 | script | Device API lint, doc-path check (CI-only) |
 
 ---
 
