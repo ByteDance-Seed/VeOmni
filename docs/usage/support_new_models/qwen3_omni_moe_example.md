@@ -349,15 +349,14 @@ class YourModel(hf_your_model.YourModel):
 
 ## Testing
 
-### Three-Level Strategy
+### Two-Level Strategy
 
 ```
 Level 1 — Unit (single GPU, no real weights)   → tests/models/
 Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel.py
-Level 3 — End-to-end training (real data/ckpt)  → tests/e2e/test_e2e_training.py
 ```
 
-Pass Level 1 before running Level 2, and Level 2 before Level 3.
+Pass Level 1 before running Level 2.
 
 ### Level 1 — Unit Tests
 
@@ -473,17 +472,6 @@ pytest -s tests/e2e/test_e2e_parallel.py -k your_model_type
 
 Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py).
 
-### Level 3 — End-to-End Training Test
-
-Requires a real checkpoint and dataset. Add an entry to `E2E_TEST_SCRIPT` in [tests/e2e/exec_scripts.py](../../../tests/e2e/exec_scripts.py) and a `pytest.param` in `test_e2e_training.py`.
-
-Run:
-```bash
-source .venv/bin/activate
-CI_HF_MODELS_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
-pytest -s tests/e2e/test_e2e_training.py -k your_model
-```
-
 ### What to Add Per Test Level
 
 | What to add | Location | Required for |
@@ -498,8 +486,6 @@ pytest -s tests/e2e/test_e2e_training.py -k your_model
 | `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |
-| Entry in `E2E_TEST_SCRIPT` | `tests/e2e/exec_scripts.py` | Level 3 |
-| `pytest.param` in training test | `tests/e2e/test_e2e_training.py` | Level 3 |
 
 ---
 

@@ -182,7 +182,6 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
-        if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
       - name: Run utils tests [transformers-v5]

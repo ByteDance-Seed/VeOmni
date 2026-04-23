@@ -1,4 +1,4 @@
-# Checkpoint trainer save/load test scripts (exec_scripts style).
+# Checkpoint trainer save/load test scripts.
 # One base_config; per-model only config_path/tokenizer_path; each model tests 3 EP cases.
 
 import os

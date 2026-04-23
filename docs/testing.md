@@ -62,9 +62,6 @@ tests/
 │
 ├── e2e/                            # End-to-end training integration
 │   ├── test_e2e_parallel.py             # SP/EP parallel alignment across models
-│   ├── test_e2e_training.py             # Real-model SFT smoke test (8 GPUs)
-│   ├── test_e2e_training_no_reshard.py  # FSDP2 no-reshard mode
-│   ├── exec_scripts.py                  # Shell command generators for real models
 │   └── utils.py                         # prepare_exec_cmd, parse_training_log, ParallelMode
 │
 ├── train_scripts/                  # Standalone trainer scripts (invoked via torchrun, not pytest)
@@ -230,16 +227,7 @@ Additional per-directory helpers:
 
 ---
 
-### 9. E2E Training Smoke Tests (`tests/e2e/test_e2e_training*.py`)
-
-**Purpose**: Smoke tests with real model weights (qwen3_0p6b_base + Tulu-3 SFT dataset). Validates that training completes without errors.
-
-- `test_e2e_training.py` — standard FSDP2 training (8 GPUs)
-- `test_e2e_training_no_reshard.py` — FSDP2 no-reshard mode (8 GPUs)
-
----
-
-### 10. Checkpoint Save/Load (`tests/checkpoints/`)
+### 9. Checkpoint Save/Load (`tests/checkpoints/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
@@ -248,7 +236,7 @@ Additional per-directory helpers:
 
 ---
 
-### 11. Ops / Kernel Tests (`tests/ops/`)
+### 10. Ops / Kernel Tests (`tests/ops/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
@@ -261,7 +249,7 @@ Additional per-directory helpers:
 
 ---
 
-### 12. Parallelism Primitive Tests (`tests/parallel/`)
+### 11. Parallelism Primitive Tests (`tests/parallel/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
@@ -394,7 +382,3 @@ The following redundancies have been addressed:
 - **`tests/models/utils.py`** has its own `compare_multi_items` / `print_all_values`
   with custom table formatting based on `ModelMode` fields. These are not simple
   wrappers and serve a different purpose from `tests.tools.compare_metrics`.
-
-- **`tests/e2e/test_e2e_training.py`** uses real model weights and `exec_scripts.py`,
-  while `test_e2e_parallel.py` uses toy configs and `prepare_exec_cmd`. These serve
-  different purposes (smoke test vs equivalence) but the naming doesn't reflect this.
