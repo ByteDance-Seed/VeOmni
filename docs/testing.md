@@ -61,7 +61,11 @@ tests/
 │   └── test_dummy_forward.py            # Asymmetric multimodal forward (NCCL hang prevention)
 │
 ├── e2e/                            # End-to-end training integration
-│   ├── test_e2e_parallel.py             # SP/EP parallel alignment across models
+│   ├── _harness.py                      # Shared torchrun+compare harness (main, tolerances, v4/v5 marks)
+│   ├── test_e2e_parallel_text.py        # SP/EP alignment for text LLMs
+│   ├── test_e2e_parallel_vlm.py         # SP/EP alignment for Qwen2-VL / Qwen3-VL / Qwen3.5(-MoE)
+│   ├── test_e2e_parallel_omni.py        # SP/EP alignment for Qwen2.5-Omni / Qwen3-Omni-MoE
+│   ├── test_e2e_parallel_dit.py         # SP alignment for Wan DiT (gated by pytest.mark.dit)
 │   └── utils.py                         # prepare_exec_cmd, parse_training_log, ParallelMode
 │
 ├── train_scripts/                  # Standalone trainer scripts (invoked via torchrun, not pytest)
@@ -212,9 +216,15 @@ Additional per-directory helpers:
 
 ---
 
-### 8. E2E Parallel Alignment (`tests/e2e/test_e2e_parallel.py`)
+### 8. E2E Parallel Alignment (`tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py`)
 
 **Purpose**: Full torchrun training runs across SP/EP configurations. Asserts that loss and grad_norm match regardless of parallelism settings.
+
+The harness (`main()`, tolerances, v4/v5 version gates) lives in
+`tests/e2e/_harness.py`; each per-modality file only declares its
+parametrize list and test function. The DiT file additionally carries
+`pytest.mark.dit` so the GPU e2e workflow can run it in a separate step
+after `uv sync ... --extra dit`.
 
 **Configurations tested**:
 - `sp_size` in [1, 2], `ep_size` in [1] (base) or [1, 2] (MoE)
@@ -275,7 +285,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 |---|---|---|
 | 1. **Create toy config** | `tests/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
 | 2. **Model patch (fwd/bwd)** | `tests/models/test_models_patch.py` | Add entry to `_TEST_CASES_TRANSFORMERS_V5` (or v4 list). Filter unsupported attn/MoE modes if needed. |
-| 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel.py` | Add entry to `text_test_cases` (text) or the appropriate VLM/omni list. Set `max_sp_size=1` if SP not yet supported. |
+| 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py` | Add entry to `text_test_cases` (text) or the matching `*_test_cases` list in the VLM / omni / dit file. Set `max_sp_size=1` if SP not yet supported. |
 | 4. **FSDP equivalence** | `tests/distributed/test_fsdp_equivalence.py` | Add entry to verify single-GPU vs FSDP2 grad_norm matches. |
 
 ### Conditional Tests (depending on model type)
@@ -285,7 +295,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **VLM model** | `tests/models/test_vlm_trainer.py` | Add toy config to `_FREEZE_VIT_VLM_CASES_*`. |
 | **VLM model** | `tests/distributed/test_dummy_forward.py` | Add test case for asymmetric multimodal batches. |
 | **MoE model** | `tests/models/test_models_patch.py` | Set `is_moe=True` to test `eager` vs `fused` MoE backends. |
-| **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
+| **MoE model** | `tests/e2e/test_e2e_parallel_{text,vlm,omni}.py` | Set `is_moe=True` to include `ep_size` iteration. |
 | **MoE with fused experts** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
 | **Custom weight layout** | `tests/models/weight_sync_adapters.py` | Add sync function if HF↔VeOmni state-dict keys differ. |
 | **Custom fused kernels** | `tests/ops/` | Add kernel-specific correctness tests. |
@@ -306,8 +316,11 @@ pytest tests/models/test_vlm_trainer.py -k <model_name>
 # Run FSDP equivalence (2+ GPUs)
 pytest tests/distributed/test_fsdp_equivalence.py -k <model_name>
 
-# Run E2E parallel alignment (4+ GPUs)
-pytest tests/e2e/test_e2e_parallel.py -k <model_name>
+# Run E2E parallel alignment (4+ GPUs).
+# Pick the file matching the model family; for a new model,
+# `-k <model_name>` works across all four since parametrize IDs embed
+# the short model name.
+pytest tests/e2e/ -k <model_name>
 ```
 
 ---

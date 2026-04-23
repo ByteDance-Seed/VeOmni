@@ -7,7 +7,7 @@ This section documents VeOmni's compatibility work for HuggingFace `transformers
 - [Flash Attention custom-name handling](veomni_flash_attention_kernel_adapter.md): explains why `_lazy_imports` failed for VeOmni custom attention names and how the local hub-kernel loader adapter resolves it.
 - [Qwen3 patchgen workflow](patchgen.md): explains the modeling code generation workflow used for Qwen3 GPU patches and regeneration.
 - [Transformers v5 MoE weight loading](transformers_v5_moe_weight_loading.md): explains how VeOmni expects MoE expert weights for v5 and documents qwen3_moe handling.
-- [Testing a new model](testing_new_model.md): SOP for adding test cases in `test_models_patch.py` and `test_e2e_parallel.py` when onboarding a new v5 model.
+- [Testing a new model](testing_new_model.md): SOP for adding test cases in `test_models_patch.py` and the per-modality `test_e2e_parallel_*.py` files when onboarding a new v5 model.
 
 ```{toctree}
 :maxdepth: 1

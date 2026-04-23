@@ -3,7 +3,7 @@
 When adding a new model with `transformers>=5.0.0` support, two test suites need updating:
 
 1. **`tests/models/test_models_patch.py`** — single-GPU forward/backward correctness across attention and MoE backends
-2. **`tests/e2e/test_e2e_parallel.py`** — multi-GPU e2e training with FSDP2, sequence parallelism (SP), and expert parallelism (EP)
+2. **`tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py`** — multi-GPU e2e training with FSDP2, sequence parallelism (SP), and expert parallelism (EP). Shared harness lives in `tests/e2e/_harness.py`.
 
 Both files gate v5-only cases so they are skipped on v4 environments.
 
@@ -74,7 +74,18 @@ Create a minimal config under `tests/toy_config/<new_model>_toy/config.json` wit
 1. Where the original config is from
 2. What changes are made from the original config
 
-## 2. `tests/e2e/test_e2e_parallel.py`
+## 2. `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py`
+
+The e2e parallel-alignment suite is split by modality; each file
+declares its own `*_test_cases` list and `test_*_parallel_align`
+function, and all four delegate to the harness in
+`tests/e2e/_harness.py` (where `main()`, `DEFAULT_RTOL` / `DEFAULT_ATOL`,
+and the `v4_only` / `v5_only` / `dit_only` marks live). Import names
+at the top of each file are the canonical entry point:
+
+```python
+from ._harness import DEFAULT_ATOL, DEFAULT_RTOL, main, v4_only, v5_only
+```
 
 ### What it tests
 
@@ -89,7 +100,9 @@ Each run produces a `log_dict.json`. The test asserts that loss and grad norm ma
 
 ### How to add a case
 
-Add an entry to `text_test_cases` (for text-only models) with `marks=_v5_only`:
+For a text-only model, add an entry to `text_test_cases` in
+[tests/e2e/test_e2e_parallel_text.py](../../tests/e2e/test_e2e_parallel_text.py)
+with `marks=v5_only`:
 
 ```python
 text_test_cases = [
@@ -98,13 +111,18 @@ text_test_cases = [
         "<new_model>",
         "./tests/toy_config/<new_model>_toy/config.json",
         False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
+        DEFAULT_RTOL,
+        DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_v5_only,
+        marks=v5_only,
     ),
 ]
 ```
+
+For a VLM, use `tests/e2e/test_e2e_parallel_vlm.py`; for Omni,
+`tests/e2e/test_e2e_parallel_omni.py`; for DiT (diffusion),
+`tests/e2e/test_e2e_parallel_dit.py` (carries `pytest.mark.dit` so
+the GPU e2e workflow runs it in a separate `--extra dit` step).
 
 ### Parametrize fields
 
@@ -131,16 +149,20 @@ pytest.param(
     "qwen3_5",
     "./tests/toy_config/qwen3_5_toy/config.json",
     False,  # is_moe
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
+    DEFAULT_RTOL,
+    DEFAULT_ATOL,
     1,  # max_sp_size — remove once SP is supported
-    marks=_v5_only,
+    marks=v5_only,
 ),
 ```
 
 ### VLM / multimodal models
 
-For vision-language or multimodal models, add to the appropriate test case list (`qwen2vl_test_cases`, `qwen3vl_test_cases`, etc.) and pair with the matching fixture and test function. The same `max_sp_size` field is available.
+For vision-language or multimodal models, add to the appropriate test
+case list (`qwen2vl_test_cases`, `qwen3vl_test_cases`, etc.) in the
+matching per-modality file and pair with the matching fixture (defined
+in `tests/e2e/conftest.py`) and test function. The same `max_sp_size`
+field is available.
 
 ## 3. `tests/models/test_vlm_trainer.py`
 
@@ -209,11 +231,11 @@ When adding a new v5 model, verify:
 - [ ] Toy config created under `tests/toy_config/<model>_toy/`
 - [ ] Entry added to `_TEST_CASES_TRANSFORMERS_V5` in `test_models_patch.py`
 - [ ] Unsupported attention/MoE modes filtered in `test_models_patch_fwd_bwd` if needed
-- [ ] Entry added to `text_test_cases` (or VLM equivalent) in `test_e2e_parallel.py` with `marks=_v5_only`
+- [ ] Entry added to `text_test_cases` (or the matching VLM/omni/dit list) in the corresponding `test_e2e_parallel_*.py` with `marks=v5_only`
 - [ ] For VLM models, toy config added to `_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5` in `tests/models/test_vlm_trainer.py`
 - [ ] `max_sp_size` set appropriately (use `1` if SP not supported, `None` otherwise)
 - [ ] `pytest --collect-only -k <model>` shows expected test cases
-- [ ] Tests pass: `pytest tests/models/test_models_patch.py -k <model>` and `pytest tests/e2e/test_e2e_parallel.py -k <model>`
+- [ ] Tests pass: `pytest tests/models/test_models_patch.py -k <model>` and `pytest tests/e2e/ -k <model>`
 - [ ] For VLM models, `pytest tests/models/test_vlm_trainer.py -k <model>` passes
 - [ ] For VLM / Omni models, a `_v5_only` sibling added to `_vlm_cases` / `_omni_cases` in `tests/distributed/test_dummy_forward.py` (required on any model that overrides `dummy_forward`)
 - [ ] `pytest tests/distributed/test_dummy_forward.py -k <model>_v5` passes on 2 GPUs

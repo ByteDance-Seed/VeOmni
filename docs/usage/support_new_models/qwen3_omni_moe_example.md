@@ -353,7 +353,7 @@ class YourModel(hf_your_model.YourModel):
 
 ```
 Level 1 — Unit (single GPU, no real weights)   → tests/models/
-Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel.py
+Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py
 ```
 
 Pass Level 1 before running Level 2.
@@ -429,26 +429,47 @@ pytest -s tests/models/test_models_patch.py -k your_model_type
 
 ### Level 2 — Parallel Alignment Test
 
-Add to [tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py):
+Pick the modality file that matches your model:
+
+- Pure text LLM → [tests/e2e/test_e2e_parallel_text.py](../../../tests/e2e/test_e2e_parallel_text.py)
+- Vision-language → [tests/e2e/test_e2e_parallel_vlm.py](../../../tests/e2e/test_e2e_parallel_vlm.py)
+- Omni (text + vision + audio) → [tests/e2e/test_e2e_parallel_omni.py](../../../tests/e2e/test_e2e_parallel_omni.py)
+- Diffusion transformer → [tests/e2e/test_e2e_parallel_dit.py](../../../tests/e2e/test_e2e_parallel_dit.py)
+
+Add the new entry to an existing `*_test_cases` list in that file (or
+create a new one if none of the existing test functions fit), using
+`DEFAULT_RTOL` / `DEFAULT_ATOL` from `tests/e2e/_harness.py`:
 
 ```python
+# tests/e2e/test_e2e_parallel_omni.py
+from ._harness import DEFAULT_ATOL, DEFAULT_RTOL, main
+
 your_model_test_cases = [
     pytest.param(
         "your_model_type",
         "./tests/toy_config/your_model_toy",
         is_moe,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
+        DEFAULT_RTOL,
+        DEFAULT_ATOL,
     ),
 ]
+```
 
+Dataset fixtures are defined once in [tests/e2e/conftest.py](../../../tests/e2e/conftest.py) so any
+`test_e2e_parallel_*` file can request them. Add a new session fixture there if the dataset shape is new:
+
+```python
+# tests/e2e/conftest.py
 @pytest.fixture(scope="session")
 def dummy_your_model_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="your_dataset_key")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
+    dummy = _make("your_dataset_key")
+    yield dummy.save_path
+    del dummy
+```
 
+And the test function next to its sibling test cases:
+
+```python
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", your_model_test_cases)
 def test_your_model_parallel_align(
     model_name, config_path, is_moe, rtol, atol, dummy_your_model_dataset
@@ -467,10 +488,10 @@ def test_your_model_parallel_align(
 Run:
 ```bash
 source .venv/bin/activate
-pytest -s tests/e2e/test_e2e_parallel.py -k your_model_type
+pytest -s tests/e2e/ -k your_model_type
 ```
 
-Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py).
+Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel_omni.py](../../../tests/e2e/test_e2e_parallel_omni.py).
 
 ### What to Add Per Test Level
 
@@ -483,9 +504,9 @@ Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/
 | `MODEL_TO_DATASET` entry | `tests/models/utils.py` | Level 1 |
 | `parse_token_id_from_config` branch | `tests/models/utils.py` | Omni-modal |
 | `pytest.param` in `test_cases` | `tests/models/test_models_patch.py` | Level 1 |
-| `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
-| Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
-| Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |
+| `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py` | Level 2 |
+| Dataset fixture | `tests/e2e/conftest.py` | Level 2 |
+| Test function | `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py` | Level 2 |
 
 ---
 

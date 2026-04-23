@@ -4,9 +4,8 @@ Each `test_*_parallel_align` parametrizes over `DummyDataset(seq_len=2048,
 dataset_type=...)`. The session-scoped fixtures below wrap that so the
 dataset files are only materialized once per pytest invocation.
 
-Fixture names are kept stable so the previously-monolithic
-`test_e2e_parallel.py` (and its future per-modality splits) can reference
-them without extra plumbing.
+Shared by the per-modality `test_e2e_parallel_{text,vlm,omni,dit}.py`
+files so the dataset materialization cost is paid once per session.
 """
 
 from __future__ import annotations

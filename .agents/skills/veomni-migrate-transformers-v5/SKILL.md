@@ -636,8 +636,11 @@ Follow `docs/transformers_v5/testing_new_model.md`. Minimum coverage:
    `_TEST_CASES_TRANSFORMERS_V5` with `id="<m>"` and `is_moe=<bool>`. If the
    model lacks certain attention/MoE backends, add a `case_id == "<m>"` filter
    block in `test_models_patch_fwd_bwd`.
-3. **`tests/e2e/test_e2e_parallel.py`**: append a `pytest.param(...)` with
-   `marks=_v5_only`. Use `max_sp_size=1` if SP not yet supported, else `None`.
+3. **`tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py`**: append a
+   `pytest.param(...)` to the list in the file matching the model's
+   modality (import `DEFAULT_RTOL` / `DEFAULT_ATOL` / `v5_only` from
+   `tests/e2e/_harness.py`). Use `marks=v5_only`, and `max_sp_size=1`
+   if SP not yet supported, else `None`.
 4. **VLM only** — `tests/models/test_vlm_trainer.py`: add to
    `_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5`.
 5. **VLM / Omni only** — `tests/distributed/test_dummy_forward.py`: add a
@@ -683,7 +686,7 @@ Run (v5 presence is auto-detected by the test suite):
 
 ```bash
 pytest tests/models/test_models_patch.py -k <m> -v
-pytest tests/e2e/test_e2e_parallel.py::<test_fn> -k <model_name> -v   # see note below; needs multi-GPU worker
+pytest tests/e2e/test_e2e_parallel_<modality>.py::<test_fn> -k <model_name> -v   # see note below; needs multi-GPU worker
 # VLM only:
 pytest tests/models/test_vlm_trainer.py -k <m> -v
 ```
@@ -695,16 +698,17 @@ getting this wrong silently produces `0 selected / N deselected`:**
 |---|---|---|
 | `test_models_patch.py` | explicit `pytest.param(..., id="<m>")` | model id as registered (e.g. `qwen2_5_vl`, `qwen3_5_moe`) |
 | `test_vlm_trainer.py` | explicit `id="<m>"` | same as above |
-| `test_e2e_parallel.py` | **first positional arg (`model_name`)**, *no explicit id* | the HF-style short name (e.g. `qwen25vl`, `qwen2vl`, `qwen3vl`, `qwen3vlmoe`) — **no underscores for VL series** |
+| `test_e2e_parallel_{text,vlm,omni,dit}.py` | **first positional arg (`model_name`)**, *no explicit id* | the HF-style short name (e.g. `qwen25vl`, `qwen2vl`, `qwen3vl`, `qwen3vlmoe`) — **no underscores for VL series** |
 
 Extra e2e gotchas:
 - VL-family params piggyback on shared functions (`test_qwen2vl_parallel_align`
-  hosts both `qwen2vl` and `qwen25vl`; `test_qwen3vl_parallel_align` hosts
-  `qwen3vl`, `qwen3vlmoe`, `qwen3_5`, `qwen3_5_moe`). Qualify with
-  `::<test_fn>` to avoid sweeping unrelated siblings.
+  in `test_e2e_parallel_vlm.py` hosts both `qwen2vl` and `qwen25vl`;
+  `test_qwen3vl_parallel_align` in the same file hosts `qwen3vl`,
+  `qwen3vlmoe`, `qwen3_5`, `qwen3_5_moe`). Qualify with `::<test_fn>`
+  to avoid sweeping unrelated siblings.
 - When in doubt, list actual ids before running:
   ```bash
-  pytest tests/e2e/test_e2e_parallel.py --collect-only -q | grep -i <m>
+  pytest tests/e2e/ --collect-only -q | grep -i <m>
   ```
 - If `pytest -k <m>` reports `0 selected`, the id almost certainly disagrees
   with `<m>` — do NOT assume the test doesn't exist; re-check with
@@ -918,8 +922,9 @@ Extra e2e gotchas:
   `(bs, seq_len, head_dim)` → `gather_dim=1`. Don't blindly copy `gather_dim`
   from a sibling model; read the upstream RoPE path first.
 - **Skipping `check_patchgen`** → CI will fail on PR. Always run it locally.
-- **`pytest -k` mismatch on e2e** — `test_e2e_parallel.py` uses the first
-  positional arg (`model_name`) as id, not the registry `<m>` id. For VL
+- **`pytest -k` mismatch on e2e** — the per-modality `test_e2e_parallel_*.py`
+  files use the first positional arg (`model_name`) as id, not the registry
+  `<m>` id. For VL
   models that's the HF short name (`qwen25vl`, `qwen3vl`, `qwen3vlmoe`, …),
   which has no underscores and does NOT match `-k qwen2_5_vl`. See Phase 7
   keyword-rules table.
