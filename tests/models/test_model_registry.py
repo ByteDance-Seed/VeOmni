@@ -7,8 +7,8 @@ from veomni.utils.helper import get_cache_dir
 pytestmark = pytest.mark.unit
 
 local_test_cases = [
-    pytest.param("./tests/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
-    pytest.param("./tests/toy_config/janus_siglip_toy", False, True, [], ["config", "model", "processor"]),
+    pytest.param("./tests/fixtures/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
+    pytest.param("./tests/fixtures/toy_config/janus_siglip_toy", False, True, [], ["config", "model", "processor"]),
 ]
 
 

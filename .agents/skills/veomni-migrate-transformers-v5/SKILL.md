@@ -629,7 +629,7 @@ and regenerate. This is a hard rule called out in `AGENTS.md`.
 
 Follow `docs/transformers_v5/testing_new_model.md`. Minimum coverage:
 
-1. **Toy config**: create `tests/toy_config/<m>_toy/config.json` (few layers,
+1. **Toy config**: create `tests/fixtures/toy_config/<m>_toy/config.json` (few layers,
    small hidden/intermediate, tiny vocab). Add a `README.md` next to it noting
    source config + changes.
 2. **`tests/models/test_models_patch.py`**: append an entry to

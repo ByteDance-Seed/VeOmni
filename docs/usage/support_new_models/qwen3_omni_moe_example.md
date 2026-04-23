@@ -362,7 +362,7 @@ Pass Level 1 before running Level 2.
 
 #### Toy Config
 
-Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `tests/toy_config/your_model_toy/` with drastically reduced sizes:
+Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `tests/fixtures/toy_config/your_model_toy/` with drastically reduced sizes:
 
 | Field | Real Qwen3-Omni-MoE | Toy version |
 |---|---|---|
@@ -373,7 +373,7 @@ Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `test
 
 For omni-modal models, copy `preprocessor_config.json` from the real model as-is — feature extractor parameters (mel bins, sample rate, patch size) are not reducible.
 
-Reference: [tests/toy_config/qwen3omni_toy/](../../../tests/toy_config/qwen3omni_toy/)
+Reference: [tests/fixtures/toy_config/qwen3omni_toy/](../../../tests/fixtures/toy_config/qwen3omni_toy/)
 
 #### Dummy Dataset
 
@@ -398,7 +398,7 @@ Add to `test_cases` in [tests/models/test_models_patch.py](../../../tests/models
 
 ```python
 pytest.param(
-    "./tests/toy_config/your_model_toy",
+    "./tests/fixtures/toy_config/your_model_toy",
     is_moe,
     _DEFAULT_RTOL,
     _DEFAULT_ATOL,
@@ -447,7 +447,7 @@ from ._harness import DEFAULT_ATOL, DEFAULT_RTOL, main
 your_model_test_cases = [
     pytest.param(
         "your_model_type",
-        "./tests/toy_config/your_model_toy",
+        "./tests/fixtures/toy_config/your_model_toy",
         is_moe,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -497,8 +497,8 @@ Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/
 
 | What to add | Location | Required for |
 |---|---|---|
-| Toy `config.json` | `tests/toy_config/your_model_toy/` | All levels |
-| `preprocessor_config.json` | `tests/toy_config/your_model_toy/` | Multimodal |
+| Toy `config.json` | `tests/fixtures/toy_config/your_model_toy/` | All levels |
+| `preprocessor_config.json` | `tests/fixtures/toy_config/your_model_toy/` | Multimodal |
 | `DummyYourModelDataset` | `veomni/data/dummy_dataset.py` | Multimodal |
 | `build_dummy_dataset` entry | `veomni/data/dummy_dataset.py` | Multimodal |
 | `MODEL_TO_DATASET` entry | `tests/models/utils.py` | Level 1 |

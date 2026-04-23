@@ -17,7 +17,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.dit]
 wan_dit_test_cases = [
     pytest.param(
         "wan_t2v",
-        "./tests/toy_config/wan_t2v_toy",
+        "./tests/fixtures/toy_config/wan_t2v_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,

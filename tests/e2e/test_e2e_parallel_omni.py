@@ -15,7 +15,7 @@ pytestmark = pytest.mark.e2e
 qwen2omni_test_cases = [
     pytest.param(
         "qwen25_omni",
-        "./tests/toy_config/qwen25omni_toy",
+        "./tests/fixtures/toy_config/qwen25omni_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -27,7 +27,7 @@ qwen2omni_test_cases = [
 qwen3omni_test_cases = [
     pytest.param(
         "qwen3_omni_moe",
-        "./tests/toy_config/qwen3omni_toy",
+        "./tests/fixtures/toy_config/qwen3omni_toy",
         True,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -35,7 +35,7 @@ qwen3omni_test_cases = [
     ),
     pytest.param(
         "qwen3_omni_moe",
-        "./tests/toy_config/qwen3omni_toy",
+        "./tests/fixtures/toy_config/qwen3omni_toy",
         True,
         DEFAULT_RTOL,
         DEFAULT_ATOL,

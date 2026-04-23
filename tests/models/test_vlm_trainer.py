@@ -16,17 +16,17 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 pytestmark = [pytest.mark.unit, pytest.mark.v5_only]
 
 _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4 = [
-    pytest.param("./tests/toy_config/qwen2vl_toy", id="qwen2_vl"),
-    pytest.param("./tests/toy_config/qwen25vl_toy", id="qwen2_5_vl"),
-    pytest.param("./tests/toy_config/qwen3vl_toy", id="qwen3_vl"),
+    pytest.param("./tests/fixtures/toy_config/qwen2vl_toy", id="qwen2_vl"),
+    pytest.param("./tests/fixtures/toy_config/qwen25vl_toy", id="qwen2_5_vl"),
+    pytest.param("./tests/fixtures/toy_config/qwen3vl_toy", id="qwen3_vl"),
 ]
 
 _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5 = [
-    pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
-    pytest.param("./tests/toy_config/qwen3_5_moe_toy/config.json", id="qwen3_5_moe"),
-    pytest.param("./tests/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl"),
-    pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
-    pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
+    pytest.param("./tests/fixtures/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
+    pytest.param("./tests/fixtures/toy_config/qwen3_5_moe_toy/config.json", id="qwen3_5_moe"),
+    pytest.param("./tests/fixtures/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl"),
+    pytest.param("./tests/fixtures/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
+    pytest.param("./tests/fixtures/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
 ]
 
 _FREEZE_VIT_VLM_CASES = (

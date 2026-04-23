@@ -16,7 +16,7 @@ pytestmark = pytest.mark.e2e
 qwen2vl_test_cases = [
     pytest.param(
         "qwen2vl",
-        "./tests/toy_config/qwen2vl_toy",
+        "./tests/fixtures/toy_config/qwen2vl_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -24,7 +24,7 @@ qwen2vl_test_cases = [
     ),
     pytest.param(
         "qwen2vl",
-        "./tests/toy_config/qwen2vl_toy",
+        "./tests/fixtures/toy_config/qwen2vl_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -32,7 +32,7 @@ qwen2vl_test_cases = [
     ),
     pytest.param(
         "qwen25vl",
-        "./tests/toy_config/qwen25vl_toy",
+        "./tests/fixtures/toy_config/qwen25vl_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -40,7 +40,7 @@ qwen2vl_test_cases = [
     ),
     pytest.param(
         "qwen25vl",
-        "./tests/toy_config/qwen25vl_toy",
+        "./tests/fixtures/toy_config/qwen25vl_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -52,7 +52,7 @@ qwen2vl_test_cases = [
 qwen3vl_test_cases = [
     pytest.param(
         "qwen3vl",
-        "./tests/toy_config/qwen3vl_toy",
+        "./tests/fixtures/toy_config/qwen3vl_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -61,7 +61,7 @@ qwen3vl_test_cases = [
     ),
     pytest.param(
         "qwen3vl",
-        "./tests/toy_config/qwen3vl_toy",
+        "./tests/fixtures/toy_config/qwen3vl_toy",
         False,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -70,7 +70,7 @@ qwen3vl_test_cases = [
     ),
     pytest.param(
         "qwen3vlmoe",
-        "./tests/toy_config/qwen3vlmoe_toy",
+        "./tests/fixtures/toy_config/qwen3vlmoe_toy",
         True,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -79,7 +79,7 @@ qwen3vl_test_cases = [
     ),
     pytest.param(
         "qwen3vlmoe",
-        "./tests/toy_config/qwen3vlmoe_toy",
+        "./tests/fixtures/toy_config/qwen3vlmoe_toy",
         True,
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -88,7 +88,7 @@ qwen3vl_test_cases = [
     ),
     pytest.param(
         "qwen3_5_moe",
-        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        "./tests/fixtures/toy_config/qwen3_5_moe_toy/config.json",
         True,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -97,7 +97,7 @@ qwen3vl_test_cases = [
     ),
     pytest.param(
         "qwen3_5",
-        "./tests/toy_config/qwen3_5_toy/config.json",
+        "./tests/fixtures/toy_config/qwen3_5_toy/config.json",
         False,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,

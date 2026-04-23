@@ -10,8 +10,9 @@ and provides guidance on which tests to add when onboarding a new model.
 ```
 tests/
 ├── tools/                          # Shared test infrastructure (comparison, data gen, launch)
-├── toy_config/                     # Minimal model configs for fast CI testing
-├── testdata/                       # Sample images, audio, etc.
+├── fixtures/                       # Static test data (not regenerated per run)
+│   ├── toy_config/                     # Minimal model configs for fast CI testing
+│   └── testdata/                       # Sample images, audio, etc.
 │
 ├── models/                         # Single-GPU model correctness
 │   ├── test_models_patch.py        # Fwd/bwd across attention & MoE backends
@@ -283,7 +284,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 
 | Step | Test File | What to Do |
 |---|---|---|
-| 1. **Create toy config** | `tests/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
+| 1. **Create toy config** | `tests/fixtures/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
 | 2. **Model patch (fwd/bwd)** | `tests/models/test_models_patch.py` | Add entry to `_TEST_CASES_TRANSFORMERS_V5` (or v4 list). Filter unsupported attn/MoE modes if needed. |
 | 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py` | Add entry to `text_test_cases` (text) or the matching `*_test_cases` list in the VLM / omni / dit file. Set `max_sp_size=1` if SP not yet supported. |
 | 4. **FSDP equivalence** | `tests/distributed/test_fsdp_equivalence.py` | Add entry to verify single-GPU vs FSDP2 grad_norm matches. |

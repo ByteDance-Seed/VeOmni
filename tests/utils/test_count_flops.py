@@ -31,13 +31,13 @@ def mock_device_flops():
 
 @pytest.fixture
 def qwen3_5_counter():
-    config = AutoConfig.from_pretrained("tests/toy_config/qwen3_5_toy")
+    config = AutoConfig.from_pretrained("tests/fixtures/toy_config/qwen3_5_toy")
     return VeomniFlopsCounter(config)
 
 
 @pytest.fixture
 def qwen3_5_moe_counter():
-    config = AutoConfig.from_pretrained("tests/toy_config/qwen3_5_moe_toy")
+    config = AutoConfig.from_pretrained("tests/fixtures/toy_config/qwen3_5_moe_toy")
     return VeomniFlopsCounter(config)
 
 

@@ -34,7 +34,7 @@ Add an entry to `_TEST_CASES_TRANSFORMERS_V5`:
 ```python
 _TEST_CASES_TRANSFORMERS_V5 = [
     pytest.param(
-        "./tests/toy_config/qwen3_5_toy/config.json",
+        "./tests/fixtures/toy_config/qwen3_5_toy/config.json",
         False,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
@@ -42,7 +42,7 @@ _TEST_CASES_TRANSFORMERS_V5 = [
     ),
     # ← add your new model here
     pytest.param(
-        "./tests/toy_config/<new_model>_toy/config.json",
+        "./tests/fixtures/toy_config/<new_model>_toy/config.json",
         False,  # is_moe — set True for MoE models
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
@@ -69,7 +69,7 @@ if case_id == "<new_model>":
 
 ### Toy config
 
-Create a minimal config under `tests/toy_config/<new_model>_toy/config.json` with few layers. Add a README.md under the same folder to indicate:
+Create a minimal config under `tests/fixtures/toy_config/<new_model>_toy/config.json` with few layers. Add a README.md under the same folder to indicate:
 
 1. Where the original config is from
 2. What changes are made from the original config
@@ -109,7 +109,7 @@ text_test_cases = [
     # ... existing v4 cases ...
     pytest.param(
         "<new_model>",
-        "./tests/toy_config/<new_model>_toy/config.json",
+        "./tests/fixtures/toy_config/<new_model>_toy/config.json",
         False,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -147,7 +147,7 @@ If the model does not support SP yet, set `max_sp_size=1` to only run with `sp_s
 ```python
 pytest.param(
     "qwen3_5",
-    "./tests/toy_config/qwen3_5_toy/config.json",
+    "./tests/fixtures/toy_config/qwen3_5_toy/config.json",
     False,  # is_moe
     DEFAULT_RTOL,
     DEFAULT_ATOL,
@@ -181,8 +181,8 @@ Add your toy config to the matching case list:
 
 ```python
 _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5 = [
-    pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
-    pytest.param("./tests/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),
+    pytest.param("./tests/fixtures/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
+    pytest.param("./tests/fixtures/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),
 ]
 ```
 
@@ -212,7 +212,7 @@ _vlm_cases = [
     # ... existing v4 cases ...
     pytest.param(
         "<new_vlm_model>",
-        "./tests/toy_config/<new_vlm_model>_toy",
+        "./tests/fixtures/toy_config/<new_vlm_model>_toy",
         partial(_vlm_batch, patch_size=<P>),
         id="<new_vlm_model>_v5",
         marks=_v5_only,
@@ -228,7 +228,7 @@ on a 2-GPU host.
 
 When adding a new v5 model, verify:
 
-- [ ] Toy config created under `tests/toy_config/<model>_toy/`
+- [ ] Toy config created under `tests/fixtures/toy_config/<model>_toy/`
 - [ ] Entry added to `_TEST_CASES_TRANSFORMERS_V5` in `test_models_patch.py`
 - [ ] Unsupported attention/MoE modes filtered in `test_models_patch_fwd_bwd` if needed
 - [ ] Entry added to `text_test_cases` (or the matching VLM/omni/dit list) in the corresponding `test_e2e_parallel_*.py` with `marks=v5_only`

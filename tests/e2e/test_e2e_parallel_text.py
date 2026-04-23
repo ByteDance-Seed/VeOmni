@@ -17,7 +17,7 @@ pytestmark = pytest.mark.e2e
 text_test_cases = [
     pytest.param(
         "llama3.1",
-        "./tests/toy_config/llama31_toy",
+        "./tests/fixtures/toy_config/llama31_toy",
         False,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -26,7 +26,7 @@ text_test_cases = [
     ),
     pytest.param(
         "qwen2",
-        "./tests/toy_config/qwen2_toy/config.json",
+        "./tests/fixtures/toy_config/qwen2_toy/config.json",
         False,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -35,7 +35,7 @@ text_test_cases = [
     ),
     pytest.param(
         "qwen2.5",
-        "./tests/toy_config/qwen25_toy",
+        "./tests/fixtures/toy_config/qwen25_toy",
         False,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -44,7 +44,7 @@ text_test_cases = [
     ),
     pytest.param(
         "qwen3",
-        "./tests/toy_config/qwen3_toy",
+        "./tests/fixtures/toy_config/qwen3_toy",
         False,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -53,7 +53,7 @@ text_test_cases = [
     ),
     pytest.param(
         "qwen3_moe",
-        "./tests/toy_config/qwen3_moe_toy",
+        "./tests/fixtures/toy_config/qwen3_moe_toy",
         True,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -62,7 +62,7 @@ text_test_cases = [
     ),
     pytest.param(
         "qwen3_moe",
-        "./tests/toy_config/qwen3_moe_toy",
+        "./tests/fixtures/toy_config/qwen3_moe_toy",
         True,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -72,7 +72,7 @@ text_test_cases = [
     ),
     pytest.param(
         "seed_oss",
-        "./tests/toy_config/seed_oss_toy",
+        "./tests/fixtures/toy_config/seed_oss_toy",
         False,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,
@@ -81,7 +81,7 @@ text_test_cases = [
     ),
     pytest.param(
         "deepseek_v3",
-        "./tests/toy_config/deepseek_v3_toy",
+        "./tests/fixtures/toy_config/deepseek_v3_toy",
         True,  # is_moe
         DEFAULT_RTOL,
         DEFAULT_ATOL,

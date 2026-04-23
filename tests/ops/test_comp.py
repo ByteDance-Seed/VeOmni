@@ -196,6 +196,6 @@ test_cases = [
 def test_comp(args: dict):
     args = argparse.Namespace(**args)
     args.device = get_device_type()
-    args.config_path = os.path.dirname(os.path.abspath(__file__)) + "/../toy_config/qwen3vl_toy"
+    args.config_path = os.path.dirname(os.path.abspath(__file__)) + "/../fixtures/toy_config/qwen3vl_toy"
     print(f"{args=}")
     main(args)

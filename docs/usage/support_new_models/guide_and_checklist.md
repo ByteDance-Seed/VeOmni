@@ -205,7 +205,7 @@ For implementation details of each patch, refer to the example docs.
 
 ### Testing (all models)
 
-- [ ] Toy config in `tests/toy_config/your_model_toy/`
+- [ ] Toy config in `tests/fixtures/toy_config/your_model_toy/`
 - [ ] `DummyYourModelDataset` in `veomni/data/dummy_dataset.py` (multimodal)
 - [ ] `MODEL_TO_DATASET` entry in `tests/models/utils.py`
 - [ ] `pytest.param` in `test_cases` in `tests/models/test_models_patch.py` (Level 1)

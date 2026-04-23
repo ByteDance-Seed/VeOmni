@@ -43,7 +43,7 @@ PROCESS_SAMPLE_FUNCTION_MAP = {
 device = get_device_type()
 
 # Test data directory (relative to this file)
-TEST_DATA_DIR = Path(__file__).resolve().parents[2] / "testdata"
+TEST_DATA_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "testdata"
 
 
 @dataclass
@@ -205,7 +205,7 @@ def veomni_process_sample(
         pytest.param(
             ModelTestConfig(
                 model_id="Qwen/Qwen2.5-VL-3B-Instruct",
-                config_path="./tests/toy_config/qwen25vl_toy/config.json",
+                config_path="./tests/fixtures/toy_config/qwen25vl_toy/config.json",
                 process_sample_func_name="process_sample_qwen_vl",
                 chat_template_name="qwen2_5vl",
             ),
@@ -216,7 +216,7 @@ def veomni_process_sample(
         pytest.param(
             ModelTestConfig(
                 model_id="Qwen/Qwen3-VL-2B-Instruct",
-                config_path="./tests/toy_config/qwen3vl_toy/config.json",
+                config_path="./tests/fixtures/toy_config/qwen3vl_toy/config.json",
                 process_sample_func_name="process_sample_qwen_vl",
                 chat_template_name="qwen3vl",
             ),
@@ -227,7 +227,7 @@ def veomni_process_sample(
         pytest.param(
             ModelTestConfig(
                 model_id="Qwen/Qwen3.5-0.8B",
-                config_path="./tests/toy_config/qwen3_5_toy/config.json",
+                config_path="./tests/fixtures/toy_config/qwen3_5_toy/config.json",
                 process_sample_func_name="process_sample_qwen_vl",
                 chat_template_name="qwen3vl",
             ),

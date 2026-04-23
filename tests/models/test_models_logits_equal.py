@@ -63,7 +63,7 @@ class Case:
 
 
 def _toy(name: str) -> str:
-    return os.path.join(REPO_ROOT, "tests", "toy_config", name)
+    return os.path.join(REPO_ROOT, "tests", "fixtures", "toy_config", name)
 
 
 CASES = [
