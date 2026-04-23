@@ -262,7 +262,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
             init_device=args.train.init_device,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=False,
-            basic_modules=rank0_load_model._no_split_modules,
+            basic_modules=[],
             broadcast_model_weights_from_rank0=True,
         )
 
