@@ -146,6 +146,10 @@ class TextDPOTrainer:
 
         self.reference_model.requires_grad_(False)
 
+        cpu_load_param_name = None
+        if hasattr(self.model, "get_parallel_plan"):
+            cpu_load_param_name = getattr(self.model.get_parallel_plan(), "cpu_load_param_name", None)
+
         self.reference_model = build_parallelize_model(
             self.reference_model,
             init_device=args.train.init_device,
@@ -160,6 +164,9 @@ class TextDPOTrainer:
             ),
             enable_reentrant=False,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+            broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+            cpu_load_param_name=cpu_load_param_name,
+            max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")

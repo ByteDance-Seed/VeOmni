@@ -138,6 +138,8 @@ def main():
         basic_modules=[],
         enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
         enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+        broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+        max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
     )
 
     from veomni.distributed.parallel_state import get_parallel_state

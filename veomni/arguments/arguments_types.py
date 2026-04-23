@@ -247,6 +247,10 @@ class FSDPConfig:
         default=False,
         metadata={"help": "Enable CPU offload for FSDP1."},
     )
+    max_load_broadcast_size: float = field(
+        default=20.0,
+        metadata={"help": "Max parameter load and broadcast size (GB) for FSDP2."},
+    )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
 

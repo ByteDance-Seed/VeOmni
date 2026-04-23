@@ -565,7 +565,14 @@ def parallelize_model_fsdp2(
         logger.info_rank0("starting to load model weights...")
         if kwargs.get("broadcast_model_weights_from_rank0"):
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            rank0_load_and_broadcast_weights(
+                model,
+                weights_path,
+                get_device_type(),
+                dtensor_factory=distribute_tensor,
+                cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+                max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+            )
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
             load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)

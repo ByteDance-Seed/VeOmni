@@ -364,6 +364,8 @@ model = build_parallelize_model(
     basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
     enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
     enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+    broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0, # load model weights
+    max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
 )
 ```
 

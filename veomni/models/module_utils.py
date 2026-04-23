@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
+import itertools
 import json
+import math
 import os
 import re
 import time
@@ -270,6 +272,16 @@ def _convert_weight_key(key: str, model: "PreTrainedModel") -> str:
     return key
 
 
+def _param_larger_than(shape: Tuple[int, ...], dtype: torch.dtype, max_load_broadcast_size: float = 20.0) -> bool:
+    """
+    Check if a parameter is large enough to be sharded.
+    """
+    num_elem = math.prod(shape)
+    elem_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else torch.iinfo(dtype).bits // 8
+    param_size = num_elem * elem_size
+    return param_size >= max_load_broadcast_size * (1024**3)
+
+
 @torch.no_grad()
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
@@ -327,6 +339,8 @@ def rank0_load_and_broadcast_weights(
     weights_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    cpu_load_param_name: list[str] = None,
+    max_load_broadcast_size: float = 20.0,  # in GB
 ):
     """
     This functions serves as the same purpose as `load_model_weights`
@@ -372,6 +386,175 @@ def rank0_load_and_broadcast_weights(
         else:
             if global_rank == 0:
                 logger.info_rank0(f"Unexpected key in state dict: {name}.")
+        del tensor
+
+    # P2P chunk transfer parameter
+    extra_parallel_shard_dst_cache: Dict[str, List[List[int]]] = {}
+    p2p_chunk_tag_counter = 0
+
+    def _next_chunk_p2p_tag() -> int:
+        nonlocal p2p_chunk_tag_counter
+        p2p_chunk_tag_counter += 1
+        return p2p_chunk_tag_counter
+
+    def _get_extra_parallel_shard_dst_ranks(
+        parallel_state: Any,
+        para_group_name: str,
+        para_size: int,
+        device: torch.device,
+    ) -> List[List[int]]:
+        """
+        Build chunk_id -> [global ranks] table via one all_gather (cached for this load).
+
+        Each global rank reports its extra_parallel_rank for `para_group_name`; ranks whose
+        rank is in [0, para_size) are grouped by shard index.
+        """
+        if para_group_name in extra_parallel_shard_dst_cache:
+            return extra_parallel_shard_dst_cache[para_group_name]
+        if not dist.is_initialized():
+            raise RuntimeError("_get_extra_parallel_shard_dst_ranks requires initialized process group")
+        world_size = dist.get_world_size()
+        mine = torch.tensor(
+            [parallel_state.extra_parallel_rank(para_group_name)],
+            dtype=torch.long,
+            device=device,
+        )
+
+        gathered = [torch.empty_like(mine) for _ in range(world_size)]
+        dist.all_gather(gathered, mine)
+        table: List[List[int]] = [[] for _ in range(para_size)]
+        for r in range(world_size):
+            epr = int(gathered[r].item())
+            assert 0 <= epr < para_size, (
+                f"Global rank {r} reports extra_parallel_rank {epr} for parallel group {para_group_name}, which is out of range [0, {para_size})."
+            )
+            table[epr].append(r)
+        extra_parallel_shard_dst_cache[para_group_name] = table
+        return table
+
+    def _chunk_and_broadcast_and_dispatch(name, shape, dtype, tensor):
+        """Broadcast a single (name, tensor) from rank0 and dispatch it."""
+        logger.info_rank0(f"rank0_load_and_broadcast_weights: chunking and broadcasting {name=}")
+
+        assert name not in buffer_dict, f"Buffer {name} should not be chunked."
+        assert name in parameter_names_to_load, f"Unexpected key in state dict: {name}."
+
+        if global_rank == 0:
+            assert tensor.device == torch.device("cpu"), "Large parameter should be loaded to CPU first."
+
+        start_time = time.perf_counter()
+
+        para_group_name = parallel_plan._get_shard_parameter_groupname(name)
+        assert para_group_name is not None, (
+            f"Parameter {name} can not be chunked as it is not part of any parallel group."
+        )
+
+        parallel_state = get_parallel_state()
+        assert parallel_state.extra_parallel_enabled(para_group_name), (
+            f"Parallel group {para_group_name} is not enabled for extra parallel."
+        )
+
+        module, local_name = _find_submodule(model, name)
+        shard_tensor = module._parameters[local_name].data
+        target_shape = shard_tensor.shape
+
+        para_size = parallel_state.extra_parallel_sizes[para_group_name]
+        assert len(shape) >= 1, f"Original parameter {name} to be chunked has shape {shape}, which is 0-dim."
+        assert len(target_shape) >= 1, f"Shard parameter {name} to get chunk has shape {target_shape}, which is 0-dim."
+
+        if global_rank == 0:
+            if shape[0] % para_size != 0:
+                logger.info_rank0(
+                    f"Parallel group {para_group_name} size {para_size} does not divide original parameter shape {shape} at dim 0."
+                )
+
+                target_size = list(shard_tensor.size())
+                target_size[0] *= para_size
+                target_size = torch.Size(target_size)
+                loaded_size = tensor.size()
+                pad_size = tuple(
+                    (0, target_dim - loaded_dim) for target_dim, loaded_dim in zip(target_size, loaded_size)
+                )
+                pad_size = tuple(itertools.chain(*(pad_size[::-1])))
+
+                logger.info_rank0(
+                    f"Shard parameter shape = {target_shape}, Loaded parameter shape = {tensor.shape}, pad_size = {pad_size}"
+                )
+
+                tensor = torch.nn.functional.pad(tensor, pad_size, value=0.0)
+
+            assert tensor.shape[0] // para_size == target_shape[0], (
+                f"Parallel {para_group_name}: padded shape {shape} at dim 0 // {para_size} == {tensor.shape[0] // para_size}, not equal to {target_shape[0]}"
+            )
+
+            chunk_loaded_data = list(tensor.chunk(para_size, dim=0))
+
+        assert shard_tensor.is_cuda, "Shard parameter should be on CUDA."
+        is_shard_tensor_dtensor = hasattr(shard_tensor, "device_mesh")
+        if is_shard_tensor_dtensor:
+            device_mesh = shard_tensor.device_mesh
+            placements = shard_tensor.placements
+        else:
+            device_mesh = None
+            placements = None
+
+        broadcast_buffer = torch.empty(
+            shard_tensor.shape,
+            dtype=shard_tensor.dtype,
+            device=shard_tensor.device,
+        )
+        shard_dst_ranks = _get_extra_parallel_shard_dst_ranks(
+            parallel_state, para_group_name, para_size, shard_tensor.device
+        )
+        for chunk_id in range(para_size):
+            # For example:
+            #   if we have two params, ranks = [0, 1, 2, 3, 4, 5, 6, 7], then
+            #   at extra_parallel_1 with para_size = 2,
+            #     when chunk_id = 0, send_seq = [2, 4, 6], p2p tag = [1, 1, 1]
+            #     when chunk_id = 1, send_seq = [1, 3, 5, 7], p2p tag = [2, 2, 2, 2]
+            #   at extra_parallel_2 with para_size = 4,
+            #     when chunk_id = 0, send_seq = [4], p2p tag = [3]
+            #     when chunk_id = 1, send_seq = [1, 5], p2p tag = [4, 4]
+            #     when chunk_id = 2, send_seq = [2, 6], p2p tag = [5, 5]
+            #     when chunk_id = 3, send_seq = [3, 7], p2p tag = [6, 6]
+
+            if dist.get_rank() == 0:
+                broadcast_buffer.copy_(chunk_loaded_data[chunk_id].contiguous())
+            dst_ranks = sorted(shard_dst_ranks[chunk_id])
+            # One tag increment per chunk_id on every rank so the counter stays aligned.
+            tag = _next_chunk_p2p_tag()
+            send_seq = [d for d in dst_ranks if d != 0]
+            extra_para_local_rank = parallel_state.extra_parallel_rank(para_group_name)
+
+            if global_rank == 0:
+                for dst in send_seq:
+                    dist.send(broadcast_buffer, dst=dst, tag=tag)
+
+                if global_rank in dst_ranks:
+                    if is_shard_tensor_dtensor:
+                        shard_tensor.copy_(dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous())
+                    else:
+                        shard_tensor.copy_(broadcast_buffer.contiguous())
+
+            elif global_rank in send_seq:
+                if is_shard_tensor_dtensor:
+                    assert device_mesh.mesh.tolist() == dst_ranks, (
+                        f"Device mesh {device_mesh.mesh.tolist()} does not match dst ranks {dst_ranks}."
+                    )
+
+                assert extra_para_local_rank == chunk_id, f"Rank {global_rank} is not the shard {chunk_id} rank."
+                dist.recv(broadcast_buffer, src=0, tag=tag)
+
+                if is_shard_tensor_dtensor:
+                    shard_tensor.copy_(dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous())
+                else:
+                    shard_tensor.copy_(broadcast_buffer.contiguous())
+
+        logger.info_rank0(
+            f"{name=}, {shape=}, {dtype=}, chunk and broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
+        )
+
+        parameter_names_to_load.discard(name)
         del tensor
 
     # --- Broadcast shard count ---
@@ -441,9 +624,20 @@ def rank0_load_and_broadcast_weights(
             name = metadata.name
             shape = metadata.shape
             dtype = metadata.dtype
+
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata.")
-            _broadcast_and_dispatch(name, shape, dtype, tensor)
+            if (
+                (
+                    (cpu_load_param_name and name in cpu_load_param_name)
+                    or _param_larger_than(shape, dtype, max_load_broadcast_size=max_load_broadcast_size)
+                )
+                and name in parameter_names_to_load
+                and parallel_plan._get_shard_parameter_groupname(name) is not None
+            ):
+                _chunk_and_broadcast_and_dispatch(name, shape, dtype, tensor)
+            else:
+                _broadcast_and_dispatch(name, shape, dtype, tensor)
 
         if global_rank == 0:
             del state_dict_iterator
