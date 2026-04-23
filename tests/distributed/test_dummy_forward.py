@@ -21,6 +21,8 @@ from veomni.utils.device import empty_cache
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
+pytestmark = pytest.mark.unit
+
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.2.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.2.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.2.0")
@@ -205,42 +207,42 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
 _vlm_cases = [
     pytest.param(
         "qwen3_vl",
-        "./tests/toy_config/qwen3vl_toy",
+        "./tests/fixtures/toy_config/qwen3vl_toy",
         partial(_vlm_batch, patch_size=16),
         id="qwen3_vl",
         marks=_v4_only,
     ),
     pytest.param(
         "qwen2_vl",
-        "./tests/toy_config/qwen2vl_toy",
+        "./tests/fixtures/toy_config/qwen2vl_toy",
         partial(_vlm_batch, patch_size=14),
         id="qwen2_vl",
         marks=_v4_only,
     ),
     pytest.param(
         "qwen2_5_vl",
-        "./tests/toy_config/qwen25vl_toy",
+        "./tests/fixtures/toy_config/qwen25vl_toy",
         partial(_vlm_batch, patch_size=14),
         id="qwen2_5_vl",
         marks=_v4_only,
     ),
     pytest.param(
         "qwen2_5_vl",
-        "./tests/toy_config/qwen25vl_toy",
+        "./tests/fixtures/toy_config/qwen25vl_toy",
         partial(_vlm_batch, patch_size=14),
         id="qwen2_5_vl_v5",
         marks=_v5_only,
     ),
     pytest.param(
         "qwen3_vl",
-        "./tests/toy_config/qwen3vl_toy",
+        "./tests/fixtures/toy_config/qwen3vl_toy",
         partial(_vlm_batch, patch_size=16),
         id="qwen3_vl_v5",
         marks=_v5_only,
     ),
     pytest.param(
         "qwen3_vl_moe",
-        "./tests/toy_config/qwen3vlmoe_toy",
+        "./tests/fixtures/toy_config/qwen3vlmoe_toy",
         partial(_vlm_batch, patch_size=16),
         id="qwen3_vl_moe_v5",
         marks=_v5_only,
@@ -266,21 +268,21 @@ def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn):
 _omni_cases = [
     pytest.param(
         "qwen2_5_omni",
-        "./tests/toy_config/qwen25omni_toy",
+        "./tests/fixtures/toy_config/qwen25omni_toy",
         partial(_omni_batch, patch_size=14, is_qwen3_omni=False),
         id="qwen2_5_omni",
         marks=_v4_only,
     ),
     pytest.param(
         "qwen3_omni_moe",
-        "./tests/toy_config/qwen3omni_toy",
+        "./tests/fixtures/toy_config/qwen3omni_toy",
         partial(_omni_batch, patch_size=16, is_qwen3_omni=True),
         id="qwen3_omni_moe",
         marks=_v4_only,
     ),
     pytest.param(
         "qwen3_omni_moe",
-        "./tests/toy_config/qwen3omni_toy",
+        "./tests/fixtures/toy_config/qwen3omni_toy",
         partial(_omni_batch, patch_size=16, is_qwen3_omni=True),
         id="qwen3_omni_moe_v5",
         marks=_v5_only,

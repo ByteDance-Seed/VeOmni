@@ -1,10 +1,13 @@
 import random
 
+import pytest
 import torch
 
 from veomni.utils.data_balance.balance_sorting_algo import SORTING_ALGO_FUNC
 from veomni.utils.device import get_device_type
 
+
+pytestmark = pytest.mark.unit
 
 FAKE_WORLD_SIZE = 8
 WORKLOAD_CAL_RULE = {"s2": lambda x: x**2}

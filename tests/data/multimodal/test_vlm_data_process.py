@@ -7,11 +7,17 @@
 # - Qwen3-VL: Qwen/Qwen3-VL-2B-Instruct (uses process_sample_qwen3_vl)
 # - Qwen3.5: Qwen/Qwen3.5-0.8B (uses process_sample_qwen3_vl_transformers_v5)
 
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
 import pytest
 import torch
+from tools import hf_local_or_remote
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from veomni.data import build_multimodal_chat_template
@@ -22,6 +28,8 @@ from veomni.models import build_foundation_model, build_processor
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
+
+pytestmark = pytest.mark.unit
 
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
@@ -35,7 +43,7 @@ PROCESS_SAMPLE_FUNCTION_MAP = {
 device = get_device_type()
 
 # Test data directory (relative to this file)
-TEST_DATA_DIR = Path(__file__).resolve().parents[2] / "testdata"
+TEST_DATA_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "testdata"
 
 
 @dataclass
@@ -62,14 +70,16 @@ class ModelTestConfig:
 
 def load_hf_processor(model_path):
     """Load HuggingFace processor from model path."""
-    print(f"\n[Setup] Loading HF processor from path: {model_path}")
-    return AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    resolved = hf_local_or_remote(model_path)
+    print(f"\n[Setup] Loading HF processor from path: {resolved}")
+    return AutoProcessor.from_pretrained(resolved, trust_remote_code=True)
 
 
 def load_hf_model(model_path):
     """Load HuggingFace model from model path."""
-    print(f"\n[Setup] Loading HF model from path: {model_path}")
-    return AutoModelForImageTextToText.from_pretrained(model_path, trust_remote_code=True)
+    resolved = hf_local_or_remote(model_path)
+    print(f"\n[Setup] Loading HF model from path: {resolved}")
+    return AutoModelForImageTextToText.from_pretrained(resolved, trust_remote_code=True)
 
 
 def hf_process_sample(config: ModelTestConfig, hf_processor, hf_model):
@@ -124,8 +134,9 @@ def hf_process_sample(config: ModelTestConfig, hf_processor, hf_model):
 
 def load_veomni_processor(model_path):
     """Load VeOmni processor from model path."""
-    print(f"\n[Setup] Loading VeOmni processor from path: {model_path}")
-    return build_processor(model_path)
+    resolved = hf_local_or_remote(model_path)
+    print(f"\n[Setup] Loading VeOmni processor from path: {resolved}")
+    return build_processor(resolved)
 
 
 def load_veomni_model(config_path, device):
@@ -194,7 +205,7 @@ def veomni_process_sample(
         pytest.param(
             ModelTestConfig(
                 model_id="Qwen/Qwen2.5-VL-3B-Instruct",
-                config_path="./tests/toy_config/qwen25vl_toy/config.json",
+                config_path="./tests/fixtures/toy_config/qwen25vl_toy/config.json",
                 process_sample_func_name="process_sample_qwen_vl",
                 chat_template_name="qwen2_5vl",
             ),
@@ -205,7 +216,7 @@ def veomni_process_sample(
         pytest.param(
             ModelTestConfig(
                 model_id="Qwen/Qwen3-VL-2B-Instruct",
-                config_path="./tests/toy_config/qwen3vl_toy/config.json",
+                config_path="./tests/fixtures/toy_config/qwen3vl_toy/config.json",
                 process_sample_func_name="process_sample_qwen_vl",
                 chat_template_name="qwen3vl",
             ),
@@ -216,7 +227,7 @@ def veomni_process_sample(
         pytest.param(
             ModelTestConfig(
                 model_id="Qwen/Qwen3.5-0.8B",
-                config_path="./tests/toy_config/qwen3_5_toy/config.json",
+                config_path="./tests/fixtures/toy_config/qwen3_5_toy/config.json",
                 process_sample_func_name="process_sample_qwen_vl",
                 chat_template_name="qwen3vl",
             ),

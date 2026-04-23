@@ -15,14 +15,17 @@
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/tests/special_sanity/check_device_api_usage.py
 
 """
-This CI test is used for checking whether device api usage is irregular, suggest using api in `veomni/utils/device.py`.
-Search targets include .py files in VeOmni/tasks and VeOmni/veomni.
-Some files that must contain ".cuda", "cuda" or "nccl" keyword is pre-defined in whitelist below.
+This CI script checks for irregular device API usage; code should prefer
+the wrappers in `veomni/utils/device.py` over raw `.cuda` / "cuda" /
+"nccl" references. Search targets include .py files under `tasks/`,
+`veomni/`, and `tests/`. A small whitelist of files that legitimately
+reference the keywords is pre-defined below.
 
-Should be run as follows:
+Invoked by `.github/workflows/static_checks.yml`. Run locally via:
 
-python3 tests/special_sanity/check_device_api_usage.py --directory ./tasks
-python3 tests/special_sanity/check_device_api_usage.py --directory ./veomni
+    python3 scripts/ci/check_device_api_usage.py --directory ./tasks
+    python3 scripts/ci/check_device_api_usage.py --directory ./veomni
+    python3 scripts/ci/check_device_api_usage.py --directory ./tests
 """
 
 import os
@@ -51,7 +54,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py",
     "veomni/arguments/arguments_types.py",
     "veomni/ops/kernels/moe/_kernels/utils/device.py",
-    "tests/special_sanity/check_device_api_usage.py",
+    "scripts/ci/check_device_api_usage.py",
     "tests/tools/common_utils.py",
 ]
 

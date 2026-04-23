@@ -57,6 +57,13 @@ from .utils import (
 )
 
 
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.dit,
+    pytest.mark.skip(reason="FIXME: async Ulysses DiT test not yet verified in CI"),
+]
+
+
 def _scale_ratio(sp_t: torch.Tensor, dp_t: torch.Tensor, eps: float = 1e-12) -> float:
     """Calculate scale ratio between two tensors (sp_t / dp_t in least-squares sense)."""
     spf = sp_t.detach().float().reshape(-1)

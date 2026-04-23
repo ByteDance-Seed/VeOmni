@@ -18,6 +18,8 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type,
 from .utils import apply_veomni_hf_unpatch  # noqa: E402
 
 
+pytestmark = [pytest.mark.unit, pytest.mark.gpu_only]
+
 # Must be set before `import veomni` so GPU kernel patches remain gated off.
 # VEOMNI_USE_LIGER_KERNEL=0 disables Liger substitutions in qwen3 / qwen3_moe
 # / deepseek_v3 gpu_patch.py. VEOMNI_USE_FUSED_KERNELS=0 additionally disables
@@ -61,7 +63,7 @@ class Case:
 
 
 def _toy(name: str) -> str:
-    return os.path.join(REPO_ROOT, "tests", "toy_config", name)
+    return os.path.join(REPO_ROOT, "tests", "fixtures", "toy_config", name)
 
 
 CASES = [

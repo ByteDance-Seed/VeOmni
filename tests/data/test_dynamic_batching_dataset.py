@@ -67,6 +67,8 @@ from veomni.utils import helper
 from veomni.utils.device import get_device_type
 
 
+pytestmark = pytest.mark.unit
+
 logger = helper.create_logger(__name__)
 
 

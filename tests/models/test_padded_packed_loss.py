@@ -8,6 +8,9 @@ from veomni.ops import apply_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
+pytestmark = pytest.mark.unit
+
+
 def _skip_if_no_flash_attn():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA is required for flash-attn.")
@@ -30,7 +33,7 @@ def test_qwen3_loss_match_with_padded_packed_input(monkeypatch, pad_to_length):
     torch.manual_seed(0)
 
     model = build_foundation_model(
-        config_path="./tests/toy_config/qwen3_toy",
+        config_path="./tests/fixtures/toy_config/qwen3_toy",
         weights_path=None,
         torch_dtype="float16",
         attn_implementation="veomni_flash_attention_2_with_sp",

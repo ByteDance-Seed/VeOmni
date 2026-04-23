@@ -150,7 +150,7 @@ tests/
 ├── checkpoints/    Checkpoint save/load tests
 ├── utils/          Utility function tests
 ├── e2e/            End-to-end training tests (require GPU)
-├── toy_config/     Minimal model configs for fast testing
+├── fixtures/       Static data (toy_config/, testdata/)
 └── tools/          Test utilities (launch_utils, common_utils)
 ```
 

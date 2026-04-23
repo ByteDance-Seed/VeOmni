@@ -1,9 +1,19 @@
+import os
+import sys
+
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import pytest
 import torch
+from tools import hf_local_or_remote
 from transformers import AutoTokenizer
 
 from veomni.data.data_transform import process_classification_example
 from veomni.utils.constants import IGNORE_INDEX
+
+
+pytestmark = pytest.mark.unit
 
 
 class DummyTokenizer:
@@ -172,7 +182,7 @@ def test_tokens_length_equals_max_seq_len_no_truncation():
 
 def test_process_classification_example_whitespace_with_real_qwen3_tokenizer():
     tok = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-Embedding-0.6B",
+        hf_local_or_remote("Qwen/Qwen3-Embedding-0.6B"),
         trust_remote_code=False,
     )
 

@@ -24,6 +24,8 @@ from veomni.utils.device import get_device_type
 from veomni.utils.helper import get_cache_dir
 
 
+pytestmark = pytest.mark.unit
+
 logger = helper.create_logger(__name__)
 os.environ["NCCL_DEBUG"] = "OFF"
 

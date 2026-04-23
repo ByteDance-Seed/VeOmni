@@ -10,8 +10,9 @@ and provides guidance on which tests to add when onboarding a new model.
 ```
 tests/
 ├── tools/                          # Shared test infrastructure (comparison, data gen, launch)
-├── toy_config/                     # Minimal model configs for fast CI testing
-├── testdata/                       # Sample images, audio, etc.
+├── fixtures/                       # Static test data (not regenerated per run)
+│   ├── toy_config/                     # Minimal model configs for fast CI testing
+│   └── testdata/                       # Sample images, audio, etc.
 │
 ├── models/                         # Single-GPU model correctness
 │   ├── test_models_patch.py        # Fwd/bwd across attention & MoE backends
@@ -61,10 +62,11 @@ tests/
 │   └── test_dummy_forward.py            # Asymmetric multimodal forward (NCCL hang prevention)
 │
 ├── e2e/                            # End-to-end training integration
-│   ├── test_e2e_parallel.py             # SP/EP parallel alignment across models
-│   ├── test_e2e_training.py             # Real-model SFT smoke test (8 GPUs)
-│   ├── test_e2e_training_no_reshard.py  # FSDP2 no-reshard mode
-│   ├── exec_scripts.py                  # Shell command generators for real models
+│   ├── _harness.py                      # Shared torchrun+compare harness (main, tolerances, v4/v5 marks)
+│   ├── test_e2e_parallel_text.py        # SP/EP alignment for text LLMs
+│   ├── test_e2e_parallel_vlm.py         # SP/EP alignment for Qwen2-VL / Qwen3-VL / Qwen3.5(-MoE)
+│   ├── test_e2e_parallel_omni.py        # SP/EP alignment for Qwen2.5-Omni / Qwen3-Omni-MoE
+│   ├── test_e2e_parallel_dit.py         # SP alignment for Wan DiT (gated by pytest.mark.dit)
 │   └── utils.py                         # prepare_exec_cmd, parse_training_log, ParallelMode
 │
 ├── train_scripts/                  # Standalone trainer scripts (invoked via torchrun, not pytest)
@@ -86,10 +88,10 @@ tests/
 │   ├── test_npu_setup.py                          # NPU environment validation
 │   ├── test_rank0_load_and_broadcast_weights.py   # Rank-0 load & broadcast (2+ GPUs)
 │   └── test_save_safetensor_utils.py              # Safetensor save utilities (CPU)
-│
-└── special_sanity/
-    └── check_device_api_usage.py    # CI lint: no direct .cuda / "cuda" calls
 ```
+
+Device-API lint (`scripts/ci/check_device_api_usage.py`) lives under
+`scripts/ci/` since it's a standalone CI script, not a pytest test.
 
 ---
 
@@ -105,7 +107,7 @@ tests/
 | **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
-| **Sanity** | `tests/special_sanity/` | 0 | script | Device API lint |
+| **Sanity** | `scripts/ci/` | 0 | script | Device API lint, doc-path check (CI-only) |
 
 ---
 
@@ -215,9 +217,15 @@ Additional per-directory helpers:
 
 ---
 
-### 8. E2E Parallel Alignment (`tests/e2e/test_e2e_parallel.py`)
+### 8. E2E Parallel Alignment (`tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py`)
 
 **Purpose**: Full torchrun training runs across SP/EP configurations. Asserts that loss and grad_norm match regardless of parallelism settings.
+
+The harness (`main()`, tolerances, v4/v5 version gates) lives in
+`tests/e2e/_harness.py`; each per-modality file only declares its
+parametrize list and test function. The DiT file additionally carries
+`pytest.mark.dit` so the GPU e2e workflow can run it in a separate step
+after `uv sync ... --extra dit`.
 
 **Configurations tested**:
 - `sp_size` in [1, 2], `ep_size` in [1] (base) or [1, 2] (MoE)
@@ -230,16 +238,7 @@ Additional per-directory helpers:
 
 ---
 
-### 9. E2E Training Smoke Tests (`tests/e2e/test_e2e_training*.py`)
-
-**Purpose**: Smoke tests with real model weights (qwen3_0p6b_base + Tulu-3 SFT dataset). Validates that training completes without errors.
-
-- `test_e2e_training.py` — standard FSDP2 training (8 GPUs)
-- `test_e2e_training_no_reshard.py` — FSDP2 no-reshard mode (8 GPUs)
-
----
-
-### 10. Checkpoint Save/Load (`tests/checkpoints/`)
+### 9. Checkpoint Save/Load (`tests/checkpoints/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
@@ -248,7 +247,7 @@ Additional per-directory helpers:
 
 ---
 
-### 11. Ops / Kernel Tests (`tests/ops/`)
+### 10. Ops / Kernel Tests (`tests/ops/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
@@ -261,7 +260,7 @@ Additional per-directory helpers:
 
 ---
 
-### 12. Parallelism Primitive Tests (`tests/parallel/`)
+### 11. Parallelism Primitive Tests (`tests/parallel/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
@@ -285,9 +284,9 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 
 | Step | Test File | What to Do |
 |---|---|---|
-| 1. **Create toy config** | `tests/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
+| 1. **Create toy config** | `tests/fixtures/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
 | 2. **Model patch (fwd/bwd)** | `tests/models/test_models_patch.py` | Add entry to `_TEST_CASES_TRANSFORMERS_V5` (or v4 list). Filter unsupported attn/MoE modes if needed. |
-| 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel.py` | Add entry to `text_test_cases` (text) or the appropriate VLM/omni list. Set `max_sp_size=1` if SP not yet supported. |
+| 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py` | Add entry to `text_test_cases` (text) or the matching `*_test_cases` list in the VLM / omni / dit file. Set `max_sp_size=1` if SP not yet supported. |
 | 4. **FSDP equivalence** | `tests/distributed/test_fsdp_equivalence.py` | Add entry to verify single-GPU vs FSDP2 grad_norm matches. |
 
 ### Conditional Tests (depending on model type)
@@ -297,7 +296,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **VLM model** | `tests/models/test_vlm_trainer.py` | Add toy config to `_FREEZE_VIT_VLM_CASES_*`. |
 | **VLM model** | `tests/distributed/test_dummy_forward.py` | Add test case for asymmetric multimodal batches. |
 | **MoE model** | `tests/models/test_models_patch.py` | Set `is_moe=True` to test `eager` vs `fused` MoE backends. |
-| **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
+| **MoE model** | `tests/e2e/test_e2e_parallel_{text,vlm,omni}.py` | Set `is_moe=True` to include `ep_size` iteration. |
 | **MoE with fused experts** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
 | **Custom weight layout** | `tests/models/weight_sync_adapters.py` | Add sync function if HF↔VeOmni state-dict keys differ. |
 | **Custom fused kernels** | `tests/ops/` | Add kernel-specific correctness tests. |
@@ -318,8 +317,11 @@ pytest tests/models/test_vlm_trainer.py -k <model_name>
 # Run FSDP equivalence (2+ GPUs)
 pytest tests/distributed/test_fsdp_equivalence.py -k <model_name>
 
-# Run E2E parallel alignment (4+ GPUs)
-pytest tests/e2e/test_e2e_parallel.py -k <model_name>
+# Run E2E parallel alignment (4+ GPUs).
+# Pick the file matching the model family; for a new model,
+# `-k <model_name>` works across all four since parametrize IDs embed
+# the short model name.
+pytest tests/e2e/ -k <model_name>
 ```
 
 ---
@@ -394,7 +396,3 @@ The following redundancies have been addressed:
 - **`tests/models/utils.py`** has its own `compare_multi_items` / `print_all_values`
   with custom table formatting based on `ModelMode` fields. These are not simple
   wrappers and serve a different purpose from `tests.tools.compare_metrics`.
-
-- **`tests/e2e/test_e2e_training.py`** uses real model weights and `exec_scripts.py`,
-  while `test_e2e_parallel.py` uses toy configs and `prepare_exec_cmd`. These serve
-  different purposes (smoke test vs equivalence) but the naming doesn't reflect this.

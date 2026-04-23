@@ -1,0 +1,113 @@
+# Reusable workflow: run `pytest -m <marker>` on the GPU (L20-8) fleet.
+#
+# Called by the top-level GPU workflows (gpu_unit_tests.yml,
+# gpu_e2e_test.yml) so each caller is a thin wrapper that only declares
+# WHAT to run, not HOW. The container configuration, runner selection,
+# dependency sync and transformers-version matrix logic all live here.
+#
+# Inputs
+# ------
+# marker:
+#   Pytest marker expression, e.g. `unit` or `e2e`. Passed to pytest as
+#   `-m <marker>`. Must match a marker registered in pyproject.toml.
+# transformers_variant:
+#   One of `stable` (only transformers v4), `v5` (only transformers v5),
+#   or `both` (run the test selection twice — first under v4, then
+#   under v5). During the v4 deprecation transition the typical choice
+#   is `both`; once v4 is removed, callers switch to `v5` and the v4
+#   branch below becomes dead code that can be deleted in one commit.
+# run_dit_step:
+#   When true, after the main run, re-syncs with `--extra dit`
+#   (diffusers) and runs the Wan DiT parallel-alignment test. Only
+#   gpu_e2e_test uses this; unit workflows leave it false.
+
+name: _test_runner_gpu
+
+on:
+  workflow_call:
+    inputs:
+      marker:
+        required: true
+        type: string
+      transformers_variant:
+        required: false
+        type: string
+        default: both
+      run_dit_step:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.repository_owner == 'ByteDance-Seed'
+    # Self-hosted L20-8 fleet managed by github_runner/ (ansible). Any free
+    # `l20-8` runner is picked; use `[self-hosted, l20-N]` to pin to a
+    # specific box. See github_runner/README.md for the full label scheme.
+    runs-on: [self-hosted, l20-8]
+    timeout-minutes: 60
+    # The self-hosted runner is a minimal myoung34/github-runner container
+    # with just the runner + docker CLI; real CI work runs inside the
+    # VeOmni GPU image as a sibling container via the host docker socket.
+    container:
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
+      volumes:
+        # Shared CI asset NFS. Mounted on every runner host by
+        # github_runner/setup.yml (veomni_ci_nfs_* in group_vars/all.yml).
+        # Layout: /mnt/veomni_ci/{models/<org>/<name>,datasets,
+        #                        datasets/custom_data/samples/sample.mp4}
+        - /mnt/veomni_ci:/mnt/veomni_ci:ro
+      options: >-
+        --gpus all
+        --ipc host
+        --shm-size 32g
+    env:
+      # hf-mirror is a safety net; actual model data should come from NFS
+      # via CI_HF_MODELS_DIR (see tests/tools/__init__::hf_local_or_remote).
+      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
+      HF_ENDPOINT: "https://hf-mirror.com"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      NCCL_DEBUG: "WARN"
+      # Shared NFS paths (read by tests/conftest.py fixtures).
+      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
+      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
+      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
+      VEOMNI_TEST_DEVICE: gpu
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      # -- transformers stable (v4) ---------------------------------
+      - name: Sync dependencies [transformers-stable]
+        if: inputs.transformers_variant == 'stable' || inputs.transformers_variant == 'both'
+        run: |
+          uv sync --frozen --extra gpu --extra audio --group dev
+      - name: Run tests [transformers-stable]
+        if: inputs.transformers_variant == 'stable' || inputs.transformers_variant == 'both'
+        run: |
+          uv run --frozen pytest -v -s -x -m ${{ inputs.marker }} tests/
+
+      # -- transformers v5 ------------------------------------------
+      - name: Sync dependencies [transformers-v5]
+        if: inputs.transformers_variant == 'v5' || inputs.transformers_variant == 'both'
+        run: |
+          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
+      - name: Run tests [transformers-v5]
+        if: inputs.transformers_variant == 'v5' || inputs.transformers_variant == 'both'
+        run: |
+          uv run --frozen pytest -v -s -x -m ${{ inputs.marker }} tests/
+
+      # -- optional diffusers (DiT) step ----------------------------
+      - name: Sync dependencies [diffusers]
+        if: inputs.run_dit_step
+        run: |
+          uv sync --frozen --extra gpu --extra dit --group dev
+      - name: Run DiT tests [diffusers]
+        if: inputs.run_dit_step
+        run: |
+          uv run --frozen pytest -v -s -x -m "${{ inputs.marker }} and dit" tests/

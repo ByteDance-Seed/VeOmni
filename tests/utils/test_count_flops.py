@@ -20,6 +20,9 @@ from transformers import AutoConfig
 from veomni.utils.count_flops import VeomniFlopsCounter
 
 
+pytestmark = [pytest.mark.unit, pytest.mark.v5_only]
+
+
 @pytest.fixture(autouse=True)
 def mock_device_flops():
     with patch("veomni.utils.count_flops.get_device_flops", return_value=1000.0):
@@ -28,13 +31,13 @@ def mock_device_flops():
 
 @pytest.fixture
 def qwen3_5_counter():
-    config = AutoConfig.from_pretrained("tests/toy_config/qwen3_5_toy")
+    config = AutoConfig.from_pretrained("tests/fixtures/toy_config/qwen3_5_toy")
     return VeomniFlopsCounter(config)
 
 
 @pytest.fixture
 def qwen3_5_moe_counter():
-    config = AutoConfig.from_pretrained("tests/toy_config/qwen3_5_moe_toy")
+    config = AutoConfig.from_pretrained("tests/fixtures/toy_config/qwen3_5_moe_toy")
     return VeomniFlopsCounter(config)
 
 

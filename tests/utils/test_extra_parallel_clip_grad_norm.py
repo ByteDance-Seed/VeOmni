@@ -2,6 +2,7 @@ import math
 import subprocess
 from dataclasses import dataclass, field
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor, Shard
@@ -20,6 +21,8 @@ from veomni.utils.device import (
     get_torch_device,
 )
 
+
+pytestmark = pytest.mark.unit
 
 # from veomni.optim.optimizer import build_optimizer
 

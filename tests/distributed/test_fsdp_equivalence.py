@@ -34,6 +34,8 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 from ..tools import ParallelConfig
 
 
+pytestmark = pytest.mark.e2e
+
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
@@ -180,7 +182,7 @@ def _run_fsdp_equivalence(
 _text_test_cases_v4 = [
     pytest.param(
         "qwen3",
-        "./tests/toy_config/qwen3_toy",
+        "./tests/fixtures/toy_config/qwen3_toy",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
@@ -189,7 +191,7 @@ _text_test_cases_v4 = [
     ),
     pytest.param(
         "qwen3_moe",
-        "./tests/toy_config/qwen3_moe_toy",
+        "./tests/fixtures/toy_config/qwen3_moe_toy",
         True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
@@ -198,7 +200,7 @@ _text_test_cases_v4 = [
     ),
     pytest.param(
         "llama3.1",
-        "./tests/toy_config/llama31_toy",
+        "./tests/fixtures/toy_config/llama31_toy",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
@@ -210,7 +212,7 @@ _text_test_cases_v4 = [
 _text_test_cases_v5 = [
     pytest.param(
         "qwen3_5",
-        "./tests/toy_config/qwen3_5_toy/config.json",
+        "./tests/fixtures/toy_config/qwen3_5_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
@@ -219,7 +221,7 @@ _text_test_cases_v5 = [
     ),
     pytest.param(
         "qwen3_5_moe",
-        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        "./tests/fixtures/toy_config/qwen3_5_moe_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,

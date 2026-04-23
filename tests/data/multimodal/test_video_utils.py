@@ -21,11 +21,17 @@ from veomni.data.multimodal.video_utils import (
 from veomni.utils.import_utils import is_ffmpeg_available
 
 
-# Make sure to place a sample.mp4 file in tests/data/assets
-VIDEO_PATH = os.path.join(os.environ["CI_SAMPLES_DIR"], "sample.mp4")
+# Sample video is pre-downloaded on CI NFS (see CI_SAMPLES_DIR in the
+# workflow definitions). Locally, tests are skipped when it's missing.
+VIDEO_PATH = os.path.join(os.environ.get("CI_SAMPLES_DIR", ""), "sample.mp4")
 
-# Skip tests if the sample video file doesn't exist
-pytestmark = pytest.mark.skipif(not os.path.exists(VIDEO_PATH), reason=f"Test video not found at {VIDEO_PATH}")
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skipif(
+        not os.path.exists(VIDEO_PATH),
+        reason=f"Test video not found at {VIDEO_PATH}",
+    ),
+]
 
 
 def assert_video_output_valid(video: torch.Tensor, audio: np.ndarray = None, **kwargs):

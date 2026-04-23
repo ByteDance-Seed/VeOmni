@@ -349,21 +349,20 @@ class YourModel(hf_your_model.YourModel):
 
 ## Testing
 
-### Three-Level Strategy
+### Two-Level Strategy
 
 ```
 Level 1 — Unit (single GPU, no real weights)   → tests/models/
-Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel.py
-Level 3 — End-to-end training (real data/ckpt)  → tests/e2e/test_e2e_training.py
+Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py
 ```
 
-Pass Level 1 before running Level 2, and Level 2 before Level 3.
+Pass Level 1 before running Level 2.
 
 ### Level 1 — Unit Tests
 
 #### Toy Config
 
-Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `tests/toy_config/your_model_toy/` with drastically reduced sizes:
+Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `tests/fixtures/toy_config/your_model_toy/` with drastically reduced sizes:
 
 | Field | Real Qwen3-Omni-MoE | Toy version |
 |---|---|---|
@@ -374,7 +373,7 @@ Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `test
 
 For omni-modal models, copy `preprocessor_config.json` from the real model as-is — feature extractor parameters (mel bins, sample rate, patch size) are not reducible.
 
-Reference: [tests/toy_config/qwen3omni_toy/](../../../tests/toy_config/qwen3omni_toy/)
+Reference: [tests/fixtures/toy_config/qwen3omni_toy/](../../../tests/fixtures/toy_config/qwen3omni_toy/)
 
 #### Dummy Dataset
 
@@ -399,7 +398,7 @@ Add to `test_cases` in [tests/models/test_models_patch.py](../../../tests/models
 
 ```python
 pytest.param(
-    "./tests/toy_config/your_model_toy",
+    "./tests/fixtures/toy_config/your_model_toy",
     is_moe,
     _DEFAULT_RTOL,
     _DEFAULT_ATOL,
@@ -430,26 +429,47 @@ pytest -s tests/models/test_models_patch.py -k your_model_type
 
 ### Level 2 — Parallel Alignment Test
 
-Add to [tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py):
+Pick the modality file that matches your model:
+
+- Pure text LLM → [tests/e2e/test_e2e_parallel_text.py](../../../tests/e2e/test_e2e_parallel_text.py)
+- Vision-language → [tests/e2e/test_e2e_parallel_vlm.py](../../../tests/e2e/test_e2e_parallel_vlm.py)
+- Omni (text + vision + audio) → [tests/e2e/test_e2e_parallel_omni.py](../../../tests/e2e/test_e2e_parallel_omni.py)
+- Diffusion transformer → [tests/e2e/test_e2e_parallel_dit.py](../../../tests/e2e/test_e2e_parallel_dit.py)
+
+Add the new entry to an existing `*_test_cases` list in that file (or
+create a new one if none of the existing test functions fit), using
+`DEFAULT_RTOL` / `DEFAULT_ATOL` from `tests/e2e/_harness.py`:
 
 ```python
+# tests/e2e/test_e2e_parallel_omni.py
+from ._harness import DEFAULT_ATOL, DEFAULT_RTOL, main
+
 your_model_test_cases = [
     pytest.param(
         "your_model_type",
-        "./tests/toy_config/your_model_toy",
+        "./tests/fixtures/toy_config/your_model_toy",
         is_moe,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
+        DEFAULT_RTOL,
+        DEFAULT_ATOL,
     ),
 ]
+```
 
+Dataset fixtures are defined once in [tests/e2e/conftest.py](../../../tests/e2e/conftest.py) so any
+`test_e2e_parallel_*` file can request them. Add a new session fixture there if the dataset shape is new:
+
+```python
+# tests/e2e/conftest.py
 @pytest.fixture(scope="session")
 def dummy_your_model_dataset():
-    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="your_dataset_key")
-    train_path = dummy_dataset.save_path
-    yield train_path
-    del dummy_dataset
+    dummy = _make("your_dataset_key")
+    yield dummy.save_path
+    del dummy
+```
 
+And the test function next to its sibling test cases:
+
+```python
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", your_model_test_cases)
 def test_your_model_parallel_align(
     model_name, config_path, is_moe, rtol, atol, dummy_your_model_dataset
@@ -468,38 +488,25 @@ def test_your_model_parallel_align(
 Run:
 ```bash
 source .venv/bin/activate
-pytest -s tests/e2e/test_e2e_parallel.py -k your_model_type
+pytest -s tests/e2e/ -k your_model_type
 ```
 
-Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py).
-
-### Level 3 — End-to-End Training Test
-
-Requires a real checkpoint and dataset. Add an entry to `E2E_TEST_SCRIPT` in [tests/e2e/exec_scripts.py](../../../tests/e2e/exec_scripts.py) and a `pytest.param` in `test_e2e_training.py`.
-
-Run:
-```bash
-source .venv/bin/activate
-CI_MODEL_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
-pytest -s tests/e2e/test_e2e_training.py -k your_model
-```
+Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel_omni.py](../../../tests/e2e/test_e2e_parallel_omni.py).
 
 ### What to Add Per Test Level
 
 | What to add | Location | Required for |
 |---|---|---|
-| Toy `config.json` | `tests/toy_config/your_model_toy/` | All levels |
-| `preprocessor_config.json` | `tests/toy_config/your_model_toy/` | Multimodal |
+| Toy `config.json` | `tests/fixtures/toy_config/your_model_toy/` | All levels |
+| `preprocessor_config.json` | `tests/fixtures/toy_config/your_model_toy/` | Multimodal |
 | `DummyYourModelDataset` | `veomni/data/dummy_dataset.py` | Multimodal |
 | `build_dummy_dataset` entry | `veomni/data/dummy_dataset.py` | Multimodal |
 | `MODEL_TO_DATASET` entry | `tests/models/utils.py` | Level 1 |
 | `parse_token_id_from_config` branch | `tests/models/utils.py` | Omni-modal |
 | `pytest.param` in `test_cases` | `tests/models/test_models_patch.py` | Level 1 |
-| `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
-| Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
-| Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |
-| Entry in `E2E_TEST_SCRIPT` | `tests/e2e/exec_scripts.py` | Level 3 |
-| `pytest.param` in training test | `tests/e2e/test_e2e_training.py` | Level 3 |
+| `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py` | Level 2 |
+| Dataset fixture | `tests/e2e/conftest.py` | Level 2 |
+| Test function | `tests/e2e/test_e2e_parallel_{text,vlm,omni,dit}.py` | Level 2 |
 
 ---
 

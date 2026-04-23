@@ -326,7 +326,7 @@ class WanT2VDataset(Dataset):
     Generates ready-to-use WAN T2V transformer inputs for CI/SP-alignment testing.
 
     Dimensions are hard-coded to match the toy config
-    (``tests/toy_config/wan_t2v_toy/config.json``):
+    (``tests/fixtures/toy_config/wan_t2v_toy/config.json``):
 
     * ``in_channels = 16``, ``patch_size = (1, 2, 2)``
     * ``text_dim = 512``

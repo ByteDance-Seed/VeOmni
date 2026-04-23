@@ -90,7 +90,7 @@ Phase 6: Test                          -> pending
 
 ## Phase 6: Test
 
-1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
+1. **Create toy config**: Add `tests/fixtures/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
 2. **Unit tests**: Add tests in `tests/models/` to verify:
    - Model loads correctly via `veomni.models.auto`

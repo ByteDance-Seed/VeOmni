@@ -16,6 +16,9 @@ from veomni.trainer.callbacks.checkpoint_callback import (
 )
 
 
+pytestmark = pytest.mark.unit
+
+
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     """Build a minimal mock trainer for CheckpointerCallback tests."""
     checkpoint_cfg = SimpleNamespace(

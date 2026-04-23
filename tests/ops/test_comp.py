@@ -9,6 +9,9 @@ from veomni.models import build_foundation_model
 from veomni.utils.device import get_device_type, synchronize
 
 
+pytestmark = pytest.mark.unit
+
+
 def generate_grid_thw(batch: int, spatial_merge_size: int, min_t=1, max_t=4, min_hw=14, max_hw=56, device="cpu"):
     grid_thw = torch.zeros((batch, 3), dtype=torch.long, device=device)
 
@@ -193,6 +196,6 @@ test_cases = [
 def test_comp(args: dict):
     args = argparse.Namespace(**args)
     args.device = get_device_type()
-    args.config_path = os.path.dirname(os.path.abspath(__file__)) + "/../toy_config/qwen3vl_toy"
+    args.config_path = os.path.dirname(os.path.abspath(__file__)) + "/../fixtures/toy_config/qwen3vl_toy"
     print(f"{args=}")
     main(args)
