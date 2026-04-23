@@ -1,10 +1,6 @@
-# # Tests layout
-
 name: GPU e2e tests
 
 on:
-  # Trigger the workflow on push or pull request,
-  # but only for the main branch
   push:
     branches:
       - main
@@ -12,6 +8,7 @@ on:
     paths:
       - "**/*.py"
       - .github/workflows/gpu_e2e_test.yml
+      - .github/workflows/_test_runner_gpu.yml
       - "pyproject.toml"
       - "uv.lock"
   pull_request:
@@ -20,82 +17,27 @@ on:
     paths:
       - "**/*.py"
       - .github/workflows/gpu_e2e_test.yml
+      - .github/workflows/_test_runner_gpu.yml
       - "pyproject.toml"
       - "uv.lock"
 
-# Cancel jobs on the same ref if a new one is triggered
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Declare permissions just read content.
 permissions:
   contents: read
-
-env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
-  NCCL_DEBUG: "WARN"
 
 jobs:
   lint:
     uses: ./.github/workflows/check_pr_lint.yml
 
-  gpu_e2e_tests:
-    if: github.repository_owner == 'ByteDance-Seed'
+  e2e:
     needs: lint
-    # Self-hosted L20-8 fleet managed by github_runner/ (ansible). See
-    # github_runner/README.md for the full label scheme.
-    runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60 # Increase this timeout value as needed
-    container:
-      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
-      volumes:
-        # Shared CI asset NFS (see gpu_unit_tests.yml for details).
-        - /mnt/veomni_ci:/mnt/veomni_ci:ro
-      options: >-
-        --gpus all
-        --ipc host
-        --shm-size 32g
-    env:
-      # hf-mirror is a safety net; actual model data should come from the NFS
-      # share via CI_HF_MODELS_DIR (see tests/tools/__init__::hf_local_or_remote).
-      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      HF_ENDPOINT: "https://hf-mirror.com"
-      HF_HUB_ENABLE_HF_TRANSFER: "0" # hf-mirror does not support hf_transfer
-      NCCL_DEBUG: "WARN"
-      # Shared NFS paths (see workflow container.volumes above).
-      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
-      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
-      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
-
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      - name: Sync dependencies
-        run: |
-          uv sync --frozen --extra gpu --extra audio --group dev
-      - name: Run e2e training test
-        run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
-      - name: Run FSDP equivalence tests
-        run: |
-          uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
-      - name: Sync dependencies [transformers-v5]
-        run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
-      - name: Run e2e tests [transformers-v5]
-        # TODO: Run the following tests with proper `--no-group transformers-stable --extra transformers5-exp` to enable transformers v5.
-        # Currently those tests are effectively skipped (but it's not straightforward to enable due to L20 OOM).
-        run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
-      - name: Run FSDP equivalence tests [transformers-v5]
-        run: |
-          uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
-      - name: Sync dependencies [diffusers]
-        run: |
-          uv sync --frozen --extra gpu --extra dit --group dev
-      - name: Run tests [diffusers]
-        run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
-        # TODO: Run other tests in transformers v5 env as well.
+    uses: ./.github/workflows/_test_runner_gpu.yml
+    with:
+      marker: e2e
+      transformers_variant: both
+      # Extra leg that re-syncs with `--extra dit` and runs the DiT-only
+      # parallel-alignment test. Only gpu_e2e needs this today.
+      run_dit_step: true
