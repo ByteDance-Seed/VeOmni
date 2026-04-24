@@ -40,7 +40,7 @@ jobs:
     needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
-    runs-on: [self-hosted, npu-0]
+    runs-on: [self-hosted, npu]
     timeout-minutes: 60 # Increase this timeout value as needed
     container:
       image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
@@ -56,7 +56,6 @@ jobs:
         # Use self-host cache speed up pip and model download
         # - /home/action/actions-runner/_work/cache:/github/home/.cache/
       options: >-
-        --device /dev/davinci0
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
@@ -70,6 +69,12 @@ jobs:
       CI_SAMPLES_DIR: "/data00/assets/samples"
 
     steps:
+      - name: Set NPU visible devices
+        run: |
+          case "$RUNNER_NAME" in
+            *npu0*) echo "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" >> $GITHUB_ENV ;;
+            *npu1*) echo "ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15" >> $GITHUB_ENV ;;
+          esac
       - name: Set up proxy
         run: |
           CURRENT_PROXY=$(cat /tmp/latest_proxy)
