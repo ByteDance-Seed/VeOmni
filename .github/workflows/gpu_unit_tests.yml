@@ -98,9 +98,12 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
-      - name: Run utils tests
+      - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, emb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
-          uv run --frozen pytest -s -x tests/utils
+          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+      - name: Run fsdp2 all ranks or rank0 load model weights
+        run: |
+          uv run --frozen pytest -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
       - name: Run checkpoint callback unit tests
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py

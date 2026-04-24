@@ -339,7 +339,7 @@ def rank0_load_and_broadcast_weights(
     weights_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
-    cpu_load_param_name: list[str] = None,
+    cpu_load_param_name: List[str] = None,
     max_load_broadcast_size: float = 20.0,  # in GB
 ):
     """
@@ -629,11 +629,11 @@ def rank0_load_and_broadcast_weights(
                 raise RuntimeError("Received incomplete broadcast metadata.")
             if (
                 (
-                    (cpu_load_param_name and name in cpu_load_param_name)
+                    (cpu_load_param_name is not None and name in cpu_load_param_name)
                     or _param_larger_than(shape, dtype, max_load_broadcast_size=max_load_broadcast_size)
                 )
                 and name in parameter_names_to_load
-                and parallel_plan._get_shard_parameter_groupname(name) is not None
+                and (parallel_plan is not None and parallel_plan._get_shard_parameter_groupname(name) is not None)
             ):
                 _chunk_and_broadcast_and_dispatch(name, shape, dtype, tensor)
             else:
