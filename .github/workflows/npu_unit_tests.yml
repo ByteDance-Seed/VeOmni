@@ -40,43 +40,91 @@ jobs:
     needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
-    runs-on: [self-hosted, npu-0]
+    # Pick any free 8-card 910B slice (910b-0..5). See
+    # github_runner/README.md for the full label scheme. Use
+    # `[self-hosted, 910b-N]` if you need to pin to a specific runner, or
+    # `[self-hosted, 910b-host-N]` to pin to a specific physical machine.
+    runs-on: [self-hosted, 910b-8]
     timeout-minutes: 60 # Increase this timeout value as needed
     container:
       image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
-        - /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/
-        - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
-        - /etc/ascend_install.info:/etc/ascend_install.info
+        # Whole driver tree so CANN can find all .so's (libc_sec.so, ...).
+        - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+        - /etc/ascend_install.info:/etc/ascend_install.info:ro
         - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
-        # - /data00/dataset:/github/home/dataset
-        # - /data00/models:/github/home/models
-        # Use self-host cache speed up pip and model download
-        # - /home/action/actions-runner/_work/cache:/github/home/.cache/
+        # Shared CI asset NFS. Mounted on every runner host by
+        # github_runner/setup.yml (see veomni_ci_nfs_* in group_vars/all.yml).
+        # Layout: /mnt/veomni_ci/{models/<org>/<name>,datasets,
+        #                        datasets/custom_data/samples/sample.mp4}
+        - /mnt/veomni_ci:/mnt/veomni_ci:ro
+      # --cap-add=ALL is required: Ascend's dcmi library (used by npu-smi,
+      # torch_npu, CANN) fails in a non-privileged container with only the
+      # default cap set:
+      #   "dcmi model initialized failed, because the device is used. ret -8020"
+      # Empirically `--cap-add=ALL` is the minimum that makes dcmi init work
+      # without going full `--privileged` (which also mounts host /dev and
+      # defeats our device-list isolation). Trusted CI, acceptable trade-off.
       options: >-
-        --device /dev/davinci0
+        --cap-add=ALL
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
-        --network host
-        --privileged
+        --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+        --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+        --device /dev/davinci8 --device /dev/davinci9 --device /dev/davinci10 --device /dev/davinci11
+        --device /dev/davinci12 --device /dev/davinci13 --device /dev/davinci14 --device /dev/davinci15
         --shm-size 16g
     env:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-      CI_SAMPLES_DIR: "/data00/assets/samples"
+      # Shared NFS paths (see workflow container.volumes and
+      # github_runner/group_vars/all.yml::veomni_ci_nfs_*).
+      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
+      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
+      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
 
     steps:
-      - name: Set up proxy
+      - name: Set ASCEND_VISIBLE_DEVICES from runner slice
+        # Runner name is either:
+        #   - exposed as $RUNNER_NAME by the GitHub Actions runner directly (same
+        #     value as the `npu_runner_specs[*].name` from the ansible deploy:
+        #     910b-0 .. 910b-5), OR
+        #   - propagated into the job container via /etc/hostname which the
+        #     myoung34/github-runner image sets to RUNNER_NAME, OR
+        #   - derivable from the ASCEND_VISIBLE_DEVICES env the ansible role
+        #     set on the RUNNER container (not the sibling, but we read it via
+        #     a bind-mounted file written by the role, see below fallback).
+        # Even-suffix slices own cards 0-7, odd-suffix own 8-15.
+        # See github_runner/README.md.
+        shell: bash
         run: |
-          CURRENT_PROXY=$(cat /tmp/latest_proxy)
-          echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+          set -u
+          echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+          echo "HOSTNAME=${HOSTNAME:-<unset>}"
+          name="${RUNNER_NAME:-${HOSTNAME:-}}"
+          cards="0,1,2,3,4,5,6,7"   # safe default (low slice)
+          if [[ "$name" =~ ^910b-([0-9]+)$ ]]; then
+            slice_num="${BASH_REMATCH[1]}"
+            if (( slice_num % 2 != 0 )); then
+              cards="8,9,10,11,12,13,14,15"
+            fi
+            echo "Detected slice $slice_num -> cards $cards"
+          else
+            echo "WARN: could not parse 910b-N from '$name'; defaulting to $cards" >&2
+          fi
+          echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+          echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+      # - name: Set up proxy
+      #   run: |
+      #     CURRENT_PROXY=$(cat /tmp/latest_proxy)
+      #     echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
       - name: Check npu and CANN info
         run: |
           cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info

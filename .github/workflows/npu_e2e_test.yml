@@ -40,45 +40,80 @@ jobs:
     needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
-    runs-on: [self-hosted, npu-0]
+    runs-on: [self-hosted, 910b-8]
     timeout-minutes: 60 # Increase this timeout value as needed
     container:
       image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
-        - /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/
-        - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
-        - /etc/ascend_install.info:/etc/ascend_install.info
+        # Whole driver tree so CANN can find all .so's (libc_sec.so, ...).
+        - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+        - /etc/ascend_install.info:/etc/ascend_install.info:ro
         - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
-        - /data00/assets/dataset:/github/home/dataset
-        - /data00/assets/models:/github/home/models
-        # Use self-host cache speed up pip and model download
-        # - /home/action/actions-runner/_work/cache:/github/home/.cache/
+        # Shared CI asset NFS (see npu_unit_tests.yml for details).
+        - /mnt/veomni_ci:/mnt/veomni_ci:ro
+      # See npu_unit_tests.yml for the full rationale: `container:` starts a
+      # sibling container via the host docker socket, so the runner container's
+      # 8-card isolation does NOT carry over. GHA's container.options can't read
+      # `runner.*` to emit a per-slice --device list, so we mount all 16 and pin
+      # CANN via ASCEND_VISIBLE_DEVICES (derived from $RUNNER_NAME below).
+      #
+      # --cap-add=ALL is required: Ascend's dcmi library fails to init in a
+      # plain non-privileged container ("dcmi model initialized failed ... -8020").
+      # `--cap-add=ALL` is the minimum that makes dcmi work without going full
+      # `--privileged` (which would also mount host /dev and break the device
+      # list above). Trusted CI, acceptable trade-off.
       options: >-
-        --device /dev/davinci0
+        --cap-add=ALL
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
-        --network host
-        --privileged
+        --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+        --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+        --device /dev/davinci8 --device /dev/davinci9 --device /dev/davinci10 --device /dev/davinci11
+        --device /dev/davinci12 --device /dev/davinci13 --device /dev/davinci14 --device /dev/davinci15
         --shm-size 16g
     env:
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_ENABLE_HF_TRANSFER: "0" # This is more stable
-      CI_SAMPLES_DIR: "/data00/assets/samples"
-      CI_MODEL_DIR: "/github/home/models/Qwen"
-      CI_DATASET_DIR: "/github/home/dataset"
+      # Shared NFS paths (see workflow container.volumes and
+      # github_runner/group_vars/all.yml::veomni_ci_nfs_*).
+      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
+      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
+      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
 
     steps:
-      - name: Set up proxy
+      - name: Set ASCEND_VISIBLE_DEVICES from runner slice
+        # See npu_unit_tests.yml for the full rationale. We match the runner
+        # name (910b-0 .. 910b-5) and map even slices to cards 0-7, odd slices
+        # to 8-15. Fall back to the low slice if the name can't be parsed.
+        shell: bash
         run: |
-          CURRENT_PROXY=$(cat /tmp/latest_proxy)
-          echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
-          echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+          set -u
+          echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+          echo "HOSTNAME=${HOSTNAME:-<unset>}"
+          name="${RUNNER_NAME:-${HOSTNAME:-}}"
+          cards="0,1,2,3,4,5,6,7"
+          if [[ "$name" =~ ^910b-([0-9]+)$ ]]; then
+            slice_num="${BASH_REMATCH[1]}"
+            if (( slice_num % 2 != 0 )); then
+              cards="8,9,10,11,12,13,14,15"
+            fi
+            echo "Detected slice $slice_num -> cards $cards"
+          else
+            echo "WARN: could not parse 910b-N from '$name'; defaulting to $cards" >&2
+          fi
+          echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+          echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+      # - name: Set up proxy
+      #   run: |
+      #     CURRENT_PROXY=$(cat /tmp/latest_proxy)
+      #     echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
+      #     echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
       - name: Check npu and CANN info
         run: |
           cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info

@@ -2,10 +2,15 @@
 # One base_config; per-model only config_path/tokenizer_path; each model tests 3 EP cases.
 
 import os
+import sys
+
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from tools import hf_local_or_remote
+from tools.launch_utils import find_free_port
 
 from veomni.utils.import_utils import is_torch_npu_available
-
-from ..tools.launch_utils import find_free_port
 
 
 # Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
@@ -49,7 +54,7 @@ def get_checkpoint_test_command(
     save_hf_weights=False,
 ):
     config_path = MODEL_CONFIGS[model_name]["config_path"]
-    tokenizer_path = MODEL_CONFIGS[model_name]["tokenizer_path"]
+    tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
     output_dir = get_output_dir(model_name, ep_size)
     port = find_free_port()
 
