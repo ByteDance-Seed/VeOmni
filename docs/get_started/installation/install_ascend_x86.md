@@ -54,6 +54,7 @@ cd VeOmni
 # Choose one of the following installation options based on your needs:
 # Option 1: Stable version (transformers < 5.0)
 pip install -e .[npu,transformers-stable]
+pip install datasets==2.21.0
 
 # Option 2: Experimental version for new models (transformers ≥ 5.0)
 # Note: This uses the transformers5-exp extra which includes transformers 5.0+ support
