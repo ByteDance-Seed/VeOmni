@@ -2,6 +2,8 @@ import copy
 import gc
 import importlib.util
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -212,6 +214,117 @@ def test_logits_bitwise_equal(case: Case):
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
             f"[{case.case_id}] logits not bitwise equal: "
+            f"{n_mis}/{total} mismatched, max_abs_diff={max_abs:.3e}, "
+            f"first_mismatch_indices={first_idx}"
+        )
+
+
+# Subset of CASES exercised through the runtime converter — only the MoE
+# models, since the converter only fires for them. Eager + fp32 only: this
+# test is about the converter's correctness on the load path, not about
+# attention-kernel parity (already covered by the case above).
+_RUNTIME_CONVERTER_CASES = [
+    Case("qwen3_moe-toy-runtime-converter", _toy("qwen3_moe_toy"), sync_weight_key="qwen3_moe"),
+    Case("deepseek_v3-toy-runtime-converter", _toy("deepseek_v3_toy"), sync_weight_key="deepseek_v3"),
+]
+
+
+def _save_hf_checkpoint(state_dict: dict, config, dst_dir: str) -> None:
+    """Write an HF-format per-expert checkpoint that build_foundation_model can read."""
+    from safetensors.torch import save_file
+
+    config.save_pretrained(dst_dir)
+    save_file(
+        {k: v.detach().contiguous().cpu() for k, v in state_dict.items()},
+        os.path.join(dst_dir, "model.safetensors"),
+    )
+
+
+def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, config, weights_dir: str):
+    """Build VeOmni model by going through `build_foundation_model(weights_path=...)`.
+
+    This is the path real users hit after this PR: pass the original HF checkpoint
+    directly, let the v4 converter stack per-expert keys at load time. No manual
+    sync adapter, no offline merge.
+    """
+    from veomni.models.auto import build_foundation_model
+
+    _save_hf_checkpoint(hf_state_dict, config, weights_dir)
+
+    model = build_foundation_model(
+        config_path=weights_dir,
+        weights_path=weights_dir,
+        torch_dtype=case.dtype,
+        attn_implementation=case.attn_implementation,
+        init_device=get_device_type(),
+    )
+    return model.eval()
+
+
+@pytest.mark.parametrize("case", _RUNTIME_CONVERTER_CASES, ids=[c.case_id for c in _RUNTIME_CONVERTER_CASES])
+def test_logits_bitwise_equal_via_runtime_converter(case: Case):
+    """Smoke test: per-expert HF checkpoint -> on-the-fly converter -> bitwise-equal forward.
+
+    Complements ``test_logits_bitwise_equal``: that one syncs HF weights into the
+    VeOmni model via the manual adapter in ``weight_sync_adapters.py``. This one
+    saves the HF state dict to disk as a real HF checkpoint and routes loading
+    through ``load_model_weights`` -> ``MoEV4StackingConverter``, exercising the
+    same code path users hit when pointing training at a vanilla HF model dir.
+    Bitwise-equal logits prove the runtime converter produces the exact same
+    stacked tensors the manual adapter does.
+    """
+    from transformers import AutoConfig
+
+    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        pytest.skip("Scope is transformers v4 model definition only.")
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    if not os.path.isdir(case.path):
+        pytest.skip(f"Path not found: {case.path}")
+
+    _apply_determinism()
+
+    device_type = get_device_type()
+    gen = torch.Generator(device=device_type).manual_seed(0)
+    input_ids = torch.randint(0, 32000, (1, 32), device=device_type, dtype=torch.long, generator=gen)
+
+    # --- HF phase (must precede any veomni model build, same as the sibling test) ---
+    model_hf = _build_hf_model(case)
+    with torch.no_grad():
+        logits_hf = model_hf(input_ids=input_ids, use_cache=False).logits.detach().clone()
+    hf_state_dict = copy.deepcopy(model_hf.state_dict())
+    hf_config = AutoConfig.from_pretrained(case.path)
+    del model_hf
+    _release()
+
+    # --- veomni phase: load the HF checkpoint through build_foundation_model ---
+    tmp_dir = tempfile.mkdtemp(prefix="veomni_v4_converter_test_")
+    try:
+        model_ve = _build_veomni_model_via_runtime_converter(case, hf_state_dict, hf_config, tmp_dir)
+        with torch.no_grad():
+            logits_ve = model_ve(input_ids=input_ids, use_cache=False).logits.detach().clone()
+        del model_ve
+        _release()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        del hf_state_dict
+        _release()
+
+    assert logits_hf.shape == logits_ve.shape, (
+        f"[{case.case_id}] shape mismatch: hf={tuple(logits_hf.shape)} ve={tuple(logits_ve.shape)}"
+    )
+
+    if not torch.equal(logits_hf, logits_ve):
+        diff = (logits_hf.float() - logits_ve.float()).abs()
+        ne = logits_hf != logits_ve
+        n_mis = int(ne.sum().item())
+        total = logits_hf.numel()
+        max_abs = float(diff.max().item())
+        first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
+        raise AssertionError(
+            f"[{case.case_id}] logits not bitwise equal via runtime converter: "
             f"{n_mis}/{total} mismatched, max_abs_diff={max_abs:.3e}, "
             f"first_mismatch_indices={first_idx}"
         )
