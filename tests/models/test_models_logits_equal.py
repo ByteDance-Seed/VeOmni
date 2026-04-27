@@ -247,14 +247,57 @@ def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buff
     directly, let the v4 converter stack per-expert keys at load time. No manual
     sync adapter, no offline merge.
 
-    HF's non-persistent buffers (e.g. `model.rotary_emb.inv_freq`) are not in the
-    state dict and so do not round-trip through safetensors. The
-    ``init_empty_weights() + to_empty(cuda)`` path used here computes them with a
-    different floating-point op order than HF's direct `with torch.device('cuda')`
-    construction (CPU vs CUDA, ULP-level fp32 difference). To keep the smoke test
-    a true bitwise check on the converter's *parameter* loading rather than a
-    fight with init-time fp jitter, we copy HF's non-persistent buffers in after
-    load. The converter's correctness on stacked expert params is unchanged.
+    Why we patch non-persistent buffers below
+    -----------------------------------------
+
+    The HF rotary `inv_freq` buffer is registered with ``persistent=False`` in
+    upstream transformers, so it is **not** in ``model.state_dict()`` and therefore
+    does not round-trip through safetensors. Whatever values end up in
+    ``model.rotary_emb.inv_freq`` after load come entirely from VeOmni's loader
+    init flow, not from the checkpoint.
+
+    VeOmni's loader has two construction paths in
+    ``CustomizedModelingLoader.load_model``:
+
+    1. ``weights_path is None`` (random-init build, used by the sibling
+       ``test_logits_bitwise_equal``): the model is constructed under
+       ``with torch.device(init_device)``. The rotary embedding's
+       ``inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))``
+       executes directly on CUDA, bit-matching the HF reference build which
+       does the same.
+
+    2. ``weights_path != None`` (every real training run, including offline-
+       merged MoE checkpoints from the pre-PR world): the model is
+       constructed under ``init_empty_weights() + no_init_weights()``. Note
+       that accelerate's ``init_empty_weights()`` patches ``register_parameter``
+       to use the meta device, but by default does **not** patch
+       ``register_buffer`` — so the rotary embedding's ``inv_freq`` math runs
+       as a regular **CPU** tensor during ``__init__``. ``load_model_weights``
+       then snapshots ``buffer_dict = {n: b.clone() for n, b in named_buffers()}``
+       (CPU values), runs ``model.to_empty(device=init_device)`` (which wipes
+       buffer storage to uninitialized memory on CUDA), and finally
+       ``post_process_after_weight_loading`` calls ``_dispatch_buffer`` which
+       does ``buf.to(device, dtype)`` — a bit-exact CPU→CUDA copy. So
+       ``inv_freq`` ends up as **CPU-computed** ``1.0 / (base ** ...)`` moved
+       to CUDA, which differs from CUDA-computed ``1.0 / (base ** ...)`` by
+       one ULP per element.
+
+    That 1-ULP gap propagates through attention into a small but non-zero
+    logits delta — enough to fail ``torch.equal`` (we observed ~1e-6 for
+    qwen3_moe and ~3e-3 for deepseek_v3). It is a **pre-existing property of
+    path 2**, not something this PR's converter introduced: every offline-
+    merged MoE checkpoint loaded through ``weights_path=<merged_dir>`` had
+    the same CPU→CUDA ``inv_freq`` move. The sibling test simply never tripped
+    on it because it uses path 1.
+
+    To keep this smoke test a true bitwise check on the converter's
+    *parameter* loading — and not a regression test for a separate loader-
+    level fp jitter that would belong in its own fix — we copy HF's
+    non-persistent buffers into the model after load.
+
+    A proper loader-level fix would be to call ``init_empty_weights(
+    include_buffers=True)`` and recompute buffers on ``init_device`` after
+    ``to_empty``. That is out of scope here; tracked separately.
     """
     from veomni.models.auto import build_foundation_model
 
@@ -269,7 +312,8 @@ def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buff
     )
 
     # Restore non-persistent buffers (e.g. rotary inv_freq) that aren't in the
-    # state dict. Walking by FQN keeps this independent of how nested they are.
+    # state dict. See the docstring above for the full background. Walking by
+    # FQN keeps this independent of how nested they are.
     persistent_keys = set(hf_state_dict.keys())
     for name, buf in hf_buffers.items():
         if name in persistent_keys:
@@ -288,13 +332,20 @@ def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buff
 def test_logits_bitwise_equal_via_runtime_converter(case: Case):
     """Smoke test: per-expert HF checkpoint -> on-the-fly converter -> bitwise-equal forward.
 
-    Complements ``test_logits_bitwise_equal``: that one syncs HF weights into the
-    VeOmni model via the manual adapter in ``weight_sync_adapters.py``. This one
-    saves the HF state dict to disk as a real HF checkpoint and routes loading
-    through ``load_model_weights`` -> ``MoEV4StackingConverter``, exercising the
-    same code path users hit when pointing training at a vanilla HF model dir.
-    Bitwise-equal logits prove the runtime converter produces the exact same
-    stacked tensors the manual adapter does.
+    Complements ``test_logits_bitwise_equal``: that one syncs HF weights into
+    the VeOmni model via the manual adapter in ``weight_sync_adapters.py``.
+    This one saves the HF state dict to disk as a real HF checkpoint and
+    routes loading through ``load_model_weights`` -> ``MoEV4StackingConverter``,
+    exercising the same code path users hit when pointing training at a vanilla
+    HF model dir. Bitwise-equal logits prove the runtime converter produces
+    the exact same stacked parameter tensors the manual adapter does.
+
+    Note on non-persistent buffers: ``_build_veomni_model_via_runtime_converter``
+    copies HF's ``inv_freq`` (and any other ``persistent=False`` buffers) into
+    the loaded model before the forward. That step works around a separate,
+    pre-existing loader quirk on the ``weights_path != None`` path that has
+    nothing to do with this PR's converter — see the helper's docstring for
+    the full explanation.
     """
     from transformers import AutoConfig
 
