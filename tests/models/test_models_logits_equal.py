@@ -220,12 +220,26 @@ def test_logits_bitwise_equal(case: Case):
 
 
 # Subset of CASES exercised through the runtime converter — only the MoE
-# models, since the converter only fires for them. Eager + fp32 only: this
-# test is about the converter's correctness on the load path, not about
-# attention-kernel parity (already covered by the case above).
+# models, since the converter only fires for them. Mirrors the eager+fp32
+# and fa2+bf16 split of CASES so the converter path gets exercised against
+# both the attention kernels and the dtypes that real users hit.
 _RUNTIME_CONVERTER_CASES = [
     Case("qwen3_moe-toy-runtime-converter", _toy("qwen3_moe_toy"), sync_weight_key="qwen3_moe"),
     Case("deepseek_v3-toy-runtime-converter", _toy("deepseek_v3_toy"), sync_weight_key="deepseek_v3"),
+    Case(
+        "qwen3_moe-toy-runtime-converter-fa2",
+        _toy("qwen3_moe_toy"),
+        sync_weight_key="qwen3_moe",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    Case(
+        "deepseek_v3-toy-runtime-converter-fa2",
+        _toy("deepseek_v3_toy"),
+        sync_weight_key="deepseek_v3",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
 ]
 
 
@@ -357,6 +371,8 @@ def test_logits_bitwise_equal_via_runtime_converter(case: Case):
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.path):
         pytest.skip(f"Path not found: {case.path}")
+    if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        pytest.skip("flash_attn package not installed.")
 
     _apply_determinism()
 
