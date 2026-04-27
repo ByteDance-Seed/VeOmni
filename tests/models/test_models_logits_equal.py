@@ -240,12 +240,21 @@ def _save_hf_checkpoint(state_dict: dict, config, dst_dir: str) -> None:
     )
 
 
-def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, config, weights_dir: str):
+def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buffers, config, weights_dir: str):
     """Build VeOmni model by going through `build_foundation_model(weights_path=...)`.
 
     This is the path real users hit after this PR: pass the original HF checkpoint
     directly, let the v4 converter stack per-expert keys at load time. No manual
     sync adapter, no offline merge.
+
+    HF's non-persistent buffers (e.g. `model.rotary_emb.inv_freq`) are not in the
+    state dict and so do not round-trip through safetensors. The
+    ``init_empty_weights() + to_empty(cuda)`` path used here computes them with a
+    different floating-point op order than HF's direct `with torch.device('cuda')`
+    construction (CPU vs CUDA, ULP-level fp32 difference). To keep the smoke test
+    a true bitwise check on the converter's *parameter* loading rather than a
+    fight with init-time fp jitter, we copy HF's non-persistent buffers in after
+    load. The converter's correctness on stacked expert params is unchanged.
     """
     from veomni.models.auto import build_foundation_model
 
@@ -258,6 +267,20 @@ def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, config,
         attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
     )
+
+    # Restore non-persistent buffers (e.g. rotary inv_freq) that aren't in the
+    # state dict. Walking by FQN keeps this independent of how nested they are.
+    persistent_keys = set(hf_state_dict.keys())
+    for name, buf in hf_buffers.items():
+        if name in persistent_keys:
+            continue
+        parts = name.split(".")
+        target_module = model
+        for p in parts[:-1]:
+            target_module = getattr(target_module, p)
+        target = target_module._buffers[parts[-1]]
+        target.copy_(buf.to(target.device, dtype=target.dtype))
+
     return model.eval()
 
 
@@ -295,6 +318,7 @@ def test_logits_bitwise_equal_via_runtime_converter(case: Case):
     with torch.no_grad():
         logits_hf = model_hf(input_ids=input_ids, use_cache=False).logits.detach().clone()
     hf_state_dict = copy.deepcopy(model_hf.state_dict())
+    hf_buffers = {n: b.detach().clone() for n, b in model_hf.named_buffers()}
     hf_config = AutoConfig.from_pretrained(case.path)
     del model_hf
     _release()
@@ -302,7 +326,7 @@ def test_logits_bitwise_equal_via_runtime_converter(case: Case):
     # --- veomni phase: load the HF checkpoint through build_foundation_model ---
     tmp_dir = tempfile.mkdtemp(prefix="veomni_v4_converter_test_")
     try:
-        model_ve = _build_veomni_model_via_runtime_converter(case, hf_state_dict, hf_config, tmp_dir)
+        model_ve = _build_veomni_model_via_runtime_converter(case, hf_state_dict, hf_buffers, hf_config, tmp_dir)
         with torch.no_grad():
             logits_ve = model_ve(input_ids=input_ids, use_cache=False).logits.detach().clone()
         del model_ve
