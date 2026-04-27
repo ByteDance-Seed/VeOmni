@@ -37,9 +37,18 @@ def register_qwen3_moe_modeling(architecture: str):
             Qwen3MoeModel,
         )
 
+        from .checkpoint_tensor_converter_v4 import create_qwen3_moe_v4_checkpoint_tensor_converter
         from .modeling_qwen3_moe import apply_veomni_qwen3_moe_patch
 
         apply_veomni_qwen3_moe_patch()
+
+        # Stack per-expert HF weights into v4's three 3-D nn.Parameters at load time
+        # (PatchQwen3MoeExperts.gate_proj/up_proj/down_proj). Without this, users had
+        # to pre-merge with scripts/moe_ckpt_merge/moe_merge.py before training.
+        for model_cls in (Qwen3MoeForCausalLM, Qwen3MoeForQuestionAnswering, Qwen3MoeModel):
+            model_cls._create_checkpoint_tensor_converter = staticmethod(
+                create_qwen3_moe_v4_checkpoint_tensor_converter
+            )
 
     if "ForCausalLM" in architecture:
         return Qwen3MoeForCausalLM

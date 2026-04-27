@@ -95,11 +95,28 @@ VeOmni keeps split expert tensors in patched modeling:
 This differs from native Transformers v5 `gate_up_proj` layout.
 
 Checkpoint loading behavior:
-- VeOmni does not do runtime remapping from legacy per-expert keys;
-- HuggingFace safetensor checkpoints commonly store expert weights in per-expert form.
+- HuggingFace safetensor checkpoints store expert weights in per-expert form
+  (`experts.{j}.gate_proj.weight`, etc.).
+- A runtime `CheckpointTensorConverter` is now registered on each v4 MoE model
+  class (`qwen3_moe`, `deepseek_v3`, and `qwen3_omni_moe` in fused mode), so
+  HF checkpoints load directly into VeOmni's three stacked nn.Parameters
+  without offline preprocessing. The shared converter lives at
+  `veomni/models/transformers/_moe_v4_converter.py`; per-model factories sit
+  alongside their v5 counterparts as `checkpoint_tensor_converter_v4.py`.
+- Output keys mirror what the offline merge script produces:
+  - `experts.gate_proj` `[E, I, H]`
+  - `experts.up_proj` `[E, I, H]`
+  - `experts.down_proj` `[E, H, I]`
+  Unlike the v5 converter, the v4 converter does **not** cat gate+up — v4
+  modeling holds them as separate parameters.
+- For Qwen3-Omni-MoE the converter only fires for the **thinker** tower and
+  only when `_moe_implementation == "fused"`. The talker tower (and the
+  thinker in eager mode) keep `nn.ModuleList` experts and load HF per-expert
+  keys natively.
 
-To avoid loading/mapping issues, merge weights offline before training:
-- `scripts/moe_ckpt_merge/moe_merge.py`
+The offline `scripts/moe_ckpt_merge/moe_merge.py` script is **deprecated** but
+retained for cases where you want to amortize the stacking cost across many
+runs (e.g. very large checkpoints).
 
 ### Transformers v5 (`transformers>=5.0.0`)
 
@@ -187,6 +204,6 @@ Expected tensor interface:
 
 | Checkpoint Format | v4 VeOmni Load | v5 VeOmni Load | HF `from_pretrained()` | vLLM/SGLang |
 |---|---|---|---|---|
-| HF per-expert (original) | needs `moe_merge.py` | runtime converter | direct | direct |
+| HF per-expert (original) | runtime converter | runtime converter | direct | direct |
 | v4 merged (gate/up/down separate) | direct | needs re-merge with v5 format | needs `moe_split.py` | needs `moe_split.py` |
 | v5 fused (gate_up_proj) | incompatible | direct | needs `moe_split.py` | needs `moe_split.py` |

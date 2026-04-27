@@ -1,5 +1,6 @@
 import os
 import shutil
+import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from glob import glob
@@ -11,6 +12,15 @@ from tqdm import tqdm
 from transformers import AutoConfig
 
 from veomni.models import save_model_weights
+
+
+_DEPRECATION_MESSAGE = (
+    "scripts/moe_ckpt_merge/moe_merge.py is deprecated: VeOmni now stacks per-expert "
+    "weights on-the-fly at model load time for both transformers v4 and v5, so you can "
+    "pass the original HuggingFace checkpoint directly to training. This script will be "
+    "removed in a future release. Pre-merging is still useful for very large checkpoints "
+    "(e.g. Qwen3-235B) when you want to amortize the stacking cost across many runs."
+)
 
 
 @dataclass
@@ -147,6 +157,8 @@ def _copy_non_weight_files(src_dir: str, dst_dir: str):
 
 
 def main(raw_hf_path, merge_hf_path):
+    warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+    print(f"DeprecationWarning: {_DEPRECATION_MESSAGE}")
     torch.set_default_dtype(torch.bfloat16)
     os.makedirs(merge_hf_path, exist_ok=True)
 
