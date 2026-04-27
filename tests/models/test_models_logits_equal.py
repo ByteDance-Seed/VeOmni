@@ -12,12 +12,12 @@ import torch
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type, get_torch_device
 
-# Importing `utils` now captures pristine HF class attributes (in its
-# `_PRISTINE_HF_CLASSES` snapshot) before any veomni import has a chance to
-# monkey-patch them. `apply_veomni_hf_unpatch()` restores them; we call it
-# before every HF build so leaks from the previous test do not poison the
-# current one.
-from .utils import apply_veomni_hf_unpatch  # noqa: E402
+# Importing `hf_unpatch` here (rather than from `utils`) captures pristine HF
+# class attributes before any veomni import has a chance to monkey-patch them,
+# without dragging in the heavy `veomni.data` import chain (av/torchcodec).
+# `apply_veomni_hf_unpatch()` restores them; we call it before every HF build
+# so leaks from the previous test do not poison the current one.
+from .hf_unpatch import apply_veomni_hf_unpatch  # noqa: E402
 
 
 # Must be set before `import veomni` so GPU kernel patches remain gated off.
