@@ -9,7 +9,7 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - method_override: Qwen3_5MoeRMSNorm.forward
+#    - method_override: Qwen3_5RMSNorm.forward
 #      Use eager Qwen3Next-style RMSNorm (1+weight centered formulation) for NPU patchgen
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
 #      Use device-agnostic get_device_id() for FusedRMSNormGated init
@@ -944,6 +944,12 @@ class Qwen3_5MLP(nn.Module):
         return down_proj
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5RMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3_5RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -954,6 +960,10 @@ class Qwen3_5RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.has_kernel:
+            return veomni_rms_norm(x, self.weight, self.eps)
+        # Original HF code below, unchanged.
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402

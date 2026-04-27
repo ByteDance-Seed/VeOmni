@@ -28,7 +28,7 @@
 -# See the License for the specific language governing permissions and
 -# limitations under the License.
 +#  Patches applied:
-+#    - method_override: Qwen3_5MoeRMSNorm.forward
++#    - method_override: Qwen3_5RMSNorm.forward
 +#      Use eager Qwen3Next-style RMSNorm (1+weight centered formulation) for NPU patchgen
 +#    - method_override: Qwen3_5GatedDeltaNet.__init__
 +#      Use device-agnostic get_device_id() for FusedRMSNormGated init
@@ -538,15 +538,31 @@
  class Qwen3_5MLP(nn.Module):
      def __init__(self, config: Qwen3_5Config, intermediate_size: int):
          super().__init__()
-@@ -804,6 +947,7 @@
+@@ -804,6 +947,12 @@
          return down_proj
 
 
++# ======================================================================
++# [MODIFIED CLASS] Qwen3_5RMSNorm
++# Methods patched: forward
++# ======================================================================
++
 +
  class Qwen3_5RMSNorm(nn.Module):
      def __init__(self, dim: int, eps: float = 1e-6):
          super().__init__()
-@@ -822,6 +966,12 @@
+@@ -814,6 +963,10 @@
+         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+     def forward(self, x):
++        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
++        if veomni_rms_norm.has_kernel:
++            return veomni_rms_norm(x, self.weight, self.eps)
++        # Original HF code below, unchanged.
+         output = self._norm(x.float())
+         # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+         # See https://github.com/huggingface/transformers/pull/29402
+@@ -822,6 +975,12 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -559,7 +575,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -851,13 +1001,22 @@
+@@ -851,13 +1010,22 @@
 
          hidden_states = self.input_layernorm(hidden_states)
 
@@ -582,7 +598,7 @@
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -878,8 +1037,8 @@
+@@ -878,8 +1046,8 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -592,7 +608,7 @@
 
 
  class Qwen3_5PreTrainedModel(PreTrainedModel):
-@@ -911,6 +1070,7 @@
+@@ -911,6 +1079,7 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -600,7 +616,7 @@
  class Qwen3_5VisionMLP(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -924,6 +1084,7 @@
+@@ -924,6 +1093,7 @@
          return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
@@ -608,7 +624,7 @@
  class Qwen3_5VisionPatchEmbed(nn.Module):
      def __init__(self, config) -> None:
          super().__init__()
-@@ -942,6 +1103,7 @@
+@@ -942,6 +1112,7 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -616,7 +632,7 @@
 
 
  class Qwen3_5VisionPatchMerger(nn.Module):
-@@ -958,6 +1120,7 @@
+@@ -958,6 +1129,7 @@
          x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
          x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
          return x
@@ -624,7 +640,7 @@
 
 
  def apply_rotary_pos_emb_vision(
-@@ -972,6 +1135,7 @@
+@@ -972,6 +1144,7 @@
      q_embed = q_embed.to(orig_q_dtype)
      k_embed = k_embed.to(orig_k_dtype)
      return q_embed, k_embed
@@ -632,7 +648,7 @@
 
 
  class Qwen3_5VisionAttention(nn.Module):
-@@ -1057,6 +1221,7 @@
+@@ -1057,6 +1230,7 @@
          return attn_output
 
 
@@ -640,7 +656,7 @@
  class Qwen3_5VisionBlock(GradientCheckpointingLayer):
      def __init__(self, config, attn_implementation: str = "sdpa") -> None:
          super().__init__()
-@@ -1084,6 +1249,12 @@
+@@ -1084,6 +1258,12 @@
          return hidden_states
 
 
@@ -653,7 +669,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      _no_split_modules = ["Qwen3_5VisionBlock"]
-@@ -1159,67 +1330,71 @@
+@@ -1159,67 +1339,71 @@
          return embeddings
 
      def fast_pos_embed_interpolate(self, grid_thw):
@@ -786,7 +802,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1237,15 +1412,20 @@
+@@ -1237,15 +1421,20 @@
          hidden_states = self.patch_embed(hidden_states)
 
          pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -815,7 +831,7 @@
 
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
-@@ -1257,6 +1437,50 @@
+@@ -1257,6 +1446,50 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -866,7 +882,7 @@
          for blk in self.blocks:
              hidden_states = blk(
                  hidden_states,
-@@ -1271,6 +1495,35 @@
+@@ -1271,6 +1504,35 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -902,7 +918,7 @@
 
 
  @dataclass
-@@ -1295,6 +1548,7 @@
+@@ -1295,6 +1557,7 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -910,7 +926,7 @@
 
 
  class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
-@@ -1396,6 +1650,12 @@
+@@ -1396,6 +1659,12 @@
          if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
              linear_attn_mask = None
          return linear_attn_mask
@@ -923,7 +939,7 @@
 
 
  @auto_docstring
-@@ -1531,67 +1791,34 @@
+@@ -1531,67 +1800,34 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
@@ -1012,7 +1028,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1644,6 +1871,7 @@
+@@ -1644,6 +1880,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1020,7 +1036,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5ModelOutputWithPast:
-@@ -1652,34 +1880,144 @@
+@@ -1652,34 +1889,144 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1173,7 +1189,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1689,7 +2027,20 @@
+@@ -1689,7 +2036,20 @@
                  inputs_embeds=inputs_embeds,
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
@@ -1194,7 +1210,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1705,6 +2056,7 @@
+@@ -1705,6 +2065,7 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1202,7 +1218,7 @@
 
 
  @auto_docstring
-@@ -1790,6 +2142,7 @@
+@@ -1790,6 +2151,7 @@
          )
 
 
@@ -1210,7 +1226,7 @@
  @dataclass
  @auto_docstring(
      custom_intro="""
-@@ -1817,6 +2170,12 @@
+@@ -1817,6 +2179,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1223,7 +1239,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1888,53 +2247,6 @@
+@@ -1888,53 +2256,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5CausalLMOutputWithPast:
@@ -1277,7 +1293,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,14 +2262,23 @@
+@@ -1950,14 +2271,23 @@
          )
 
          hidden_states = outputs[0]
@@ -1304,7 +1320,7 @@
 
          return Qwen3_5CausalLMOutputWithPast(
              loss=loss,
-@@ -2192,6 +2513,14 @@
+@@ -2192,6 +2522,14 @@
 
          return input_ids, model_kwargs
 

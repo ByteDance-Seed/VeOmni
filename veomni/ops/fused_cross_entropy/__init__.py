@@ -304,7 +304,6 @@ def apply_veomni_loss_patch():
         if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1":
             LOSS_MAPPING["ForCausalLM"] = chunk_loss_function
         _cross_entropy = eager_cross_entropy
-        register_npu_kernel_cross_entropy(eager_cross_entropy)
     elif is_liger_kernel_available() and get_env("VEOMNI_USE_LIGER_KERNEL") == "1":
         from .liger_kernel import fused_liger_kernel_cross_entropy
 
@@ -343,24 +342,27 @@ KERNEL_REGISTRY.register(
 )
 
 
-def register_npu_kernel_cross_entropy(cross_entropy):
-    def _npu_fused_ce_factory():
-        """Return ForCausalLMLoss with the NPU fused CE kernel bound via partial.
+def _npu_fused_ce_factory():
+    """Return ForCausalLMLoss with the NPU fused CE kernel bound via partial.
 
-        This ensures the OpSlot path gets the full preprocessing (label shifting,
-        flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
-        """
-        from functools import partial
+    This ensures the OpSlot path gets the full preprocessing (label shifting,
+    flattening, SP reduction) that ForCausalLMLoss provides, not just the raw kernel.
+    """
+    from functools import partial
 
-        return partial(ForCausalLMLoss, cross_entropy_fn=cross_entropy)
-
-    KERNEL_REGISTRY.register(
-        KernelSpec(
-            name="npu_fused",
-            op_name="cross_entropy_loss",
-            variant="standard",
-            factory=_npu_fused_ce_factory,
-            hardware=HardwareRequirement(device_type="npu"),
-            description="NPU fused linear cross-entropy loss (with label shifting and SP reduction)",
-        )
+    return partial(
+        chunk_loss_function if os.environ.get("VEOMNI_ENABLE_CHUNK_LOSS", "0") == "1" else ForCausalLMLoss,
+        cross_entropy_fn=eager_cross_entropy,
     )
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu_fused",
+        op_name="cross_entropy_loss",
+        variant="standard",
+        factory=_npu_fused_ce_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU fused linear cross-entropy loss (with label shifting and SP reduction)",
+    )
+)

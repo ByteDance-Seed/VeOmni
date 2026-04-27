@@ -55,7 +55,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
-    qwen3_5_moe_rmsnorm_forward_patched,
+    qwen3_5_rmsnorm_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
@@ -124,7 +124,7 @@ gather_heads_scatter_seq = None
 
 config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
-    replacement=qwen3_5_moe_rmsnorm_forward_patched,
+    replacement=qwen3_5_rmsnorm_forward_patched,
     description="Use eager Qwen3Next-style RMSNorm (1+weight centered formulation) for NPU patchgen",
 )
 
@@ -491,7 +491,7 @@ class PatchedQwen3_5MoeExperts(nn.Module):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=1)
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]

@@ -76,10 +76,10 @@ config.add_import(
 
 
 @config.override_method(
-    "Qwen3_5MoeRMSNorm.forward",
+    "Qwen3_5RMSNorm.forward",
     description="Use eager Qwen3Next-style RMSNorm (1+weight centered formulation) for NPU patchgen",
 )
-def qwen3_5_moe_rmsnorm_forward_patched(self, x):
+def qwen3_5_rmsnorm_forward_patched(self, x):
     # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
     if veomni_rms_norm.has_kernel:
         return veomni_rms_norm(x, self.weight, self.eps)
