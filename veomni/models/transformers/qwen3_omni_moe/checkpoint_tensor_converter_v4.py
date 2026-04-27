@@ -15,11 +15,21 @@
 """
 Runtime per-expert -> stacked converter for transformers v4 Qwen3-Omni-MoE.
 
-Only fired for the thinker tower's experts. The talker tower in v4 always runs
-in eager mode (`nn.ModuleList`) and consumes per-expert HF keys natively, so
-the converter intentionally does not match talker prefixes. The converter is
-also a no-op when `_moe_implementation != "fused"` because eager mode also
-uses `nn.ModuleList` for the thinker; the factory returns `None` in that case.
+The converter is registered on three classes that can each be the load entry,
+and they expose different parameter prefixes:
+
+    Qwen3OmniMoeForConditionalGeneration          → ``thinker.model.layers.*``
+    Qwen3OmniMoeThinkerForConditionalGeneration   → ``model.layers.*``
+    Qwen3OmniMoeThinkerTextModel                  → ``layers.*``
+
+We pick the pattern at factory time from config introspection so each load
+target only matches its own keys. The top-level pattern intentionally excludes
+the talker tower: in v4 the talker keeps ``nn.ModuleList`` experts and consumes
+HF per-expert keys natively, so passing them through unchanged is required.
+
+The converter is also a no-op when ``_moe_implementation != "fused"`` because
+the thinker uses ``nn.ModuleList`` in eager mode too — the factory returns
+``None`` in that case.
 """
 
 import re
@@ -27,10 +37,14 @@ import re
 from .._moe_v4_converter import MoEV4StackingConverter
 
 
-# Match thinker-tower per-expert keys only; talker stays in nn.ModuleList format on v4.
-_EXPERT_PATTERN = re.compile(
-    r"^(thinker\.model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
-)
+_PROJ_SUFFIX = r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+
+# Top-level Qwen3OmniMoeForConditionalGeneration: thinker only, talker is nn.ModuleList in v4.
+_TOP_LEVEL_PATTERN = re.compile(r"^(thinker\.model\.layers\.\d+\.mlp)" + _PROJ_SUFFIX)
+# Standalone Qwen3OmniMoeThinkerForConditionalGeneration: experts under `model.*`.
+_THINKER_PATTERN = re.compile(r"^(model\.layers\.\d+\.mlp)" + _PROJ_SUFFIX)
+# Standalone Qwen3OmniMoeThinkerTextModel: experts under `layers.*` (the model class IS the root).
+_TEXT_MODEL_PATTERN = re.compile(r"^(layers\.\d+\.mlp)" + _PROJ_SUFFIX)
 
 
 def create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model):
@@ -40,15 +54,20 @@ def create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model):
     ``nn.ModuleList`` whose per-expert FQNs already match the HF checkpoint.
     """
     config = model.config
-    # The factory may be attached to either the top-level conditional-generation class
-    # or to the inner thinker text model loaded standalone. Resolve the text config that
-    # carries `num_experts` accordingly.
+    # Resolve text config and the matching key-prefix pattern from whichever
+    # config shape the model carries.
     if hasattr(config, "thinker_config"):
+        # Top-level Qwen3OmniMoeConfig.
         text_config = config.thinker_config.text_config
+        pattern = _TOP_LEVEL_PATTERN
     elif hasattr(config, "text_config"):
+        # Qwen3OmniMoeThinkerConfig — standalone thinker.
         text_config = config.text_config
+        pattern = _THINKER_PATTERN
     else:
+        # Qwen3OmniMoeThinkerTextConfig — text model is the root.
         text_config = config
+        pattern = _TEXT_MODEL_PATTERN
 
     moe_implementation = getattr(text_config, "_moe_implementation", None) or getattr(
         config, "_moe_implementation", "eager"
@@ -58,6 +77,6 @@ def create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model):
 
     num_experts = text_config.num_experts
     return MoEV4StackingConverter(
-        pattern=_EXPERT_PATTERN,
+        pattern=pattern,
         num_experts_for=lambda _prefix: num_experts,
     )

@@ -344,13 +344,30 @@ class TestDeepseekV3V4Factory:
 # ---------------------------------------------------------------------------
 
 
-class TestQwen3OmniMoeV4Factory:
+def _omni_top_level_model(moe_implementation: str = "fused"):
+    """SimpleNamespace mimicking Qwen3OmniMoeForConditionalGeneration's config shape."""
+    text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation=moe_implementation)
+    thinker_config = SimpleNamespace(text_config=text_config)
+    return SimpleNamespace(
+        config=SimpleNamespace(thinker_config=thinker_config, _moe_implementation=moe_implementation)
+    )
+
+
+def _omni_thinker_standalone_model(moe_implementation: str = "fused"):
+    """SimpleNamespace mimicking Qwen3OmniMoeThinkerForConditionalGeneration's config shape."""
+    text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation=moe_implementation)
+    return SimpleNamespace(config=SimpleNamespace(text_config=text_config, _moe_implementation=moe_implementation))
+
+
+def _omni_text_model_standalone(moe_implementation: str = "fused"):
+    """SimpleNamespace mimicking Qwen3OmniMoeThinkerTextModel's config shape."""
+    return SimpleNamespace(config=SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation=moe_implementation))
+
+
+class TestQwen3OmniMoeV4FactoryFusedGate:
     def test_returns_none_in_eager_mode(self):
         """In eager mode the thinker uses nn.ModuleList and HF per-expert keys map directly."""
-        text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation="eager")
-        thinker_config = SimpleNamespace(text_config=text_config)
-        model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config, _moe_implementation="eager"))
-        assert create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model) is None
+        assert create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("eager")) is None
 
     def test_returns_none_when_implementation_unset(self):
         """No `_moe_implementation` set → fallback is eager (per modeling code)."""
@@ -360,42 +377,93 @@ class TestQwen3OmniMoeV4Factory:
         assert create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model) is None
 
     def test_returns_converter_in_fused_mode(self):
-        text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation="fused")
-        thinker_config = SimpleNamespace(text_config=text_config)
-        model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config, _moe_implementation="fused"))
-        converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model)
-        assert isinstance(converter, MoEV4StackingConverter)
+        assert isinstance(
+            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("fused")),
+            MoEV4StackingConverter,
+        )
 
-    def test_fused_converter_handles_thinker_prefix(self):
-        text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation="fused")
-        thinker_config = SimpleNamespace(text_config=text_config)
-        model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config, _moe_implementation="fused"))
-        converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model)
 
+class TestQwen3OmniMoeV4FactoryTopLevel:
+    """Top-level Qwen3OmniMoeForConditionalGeneration: thinker prefix only, talker keys pass through."""
+
+    def setup_method(self):
+        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("fused"))
+
+    def test_handles_thinker_prefix(self):
+        assert self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
         last = None
         for e in range(NUM_EXPERTS):
-            last = converter.convert(
+            last = self.converter.convert(
                 f"thinker.model.layers.0.mlp.experts.{e}.gate_proj.weight",
                 _hf_expert_tensor("gate_proj", e),
             )
         assert last is not None
         assert last.name == "thinker.model.layers.0.mlp.experts.gate_proj"
 
-    def test_fused_converter_does_not_match_talker_prefix(self):
+    def test_does_not_match_talker_prefix(self):
         """Talker tower runs in eager (nn.ModuleList) on v4; converter must leave its keys alone."""
-        text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation="fused")
-        thinker_config = SimpleNamespace(text_config=text_config)
-        model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config, _moe_implementation="fused"))
-        converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model)
-
         talker_key = "talker.model.layers.0.mlp.experts.0.gate_proj.weight"
-        assert not converter.can_handle(talker_key)
+        assert not self.converter.can_handle(talker_key)
 
         # Pass-through via maybe_convert_checkpoint_tensor:
         t = torch.randn(INTERMEDIATE_DIM, HIDDEN_DIM)
-        result = maybe_convert_checkpoint_tensor(talker_key, t, converter)
+        result = maybe_convert_checkpoint_tensor(talker_key, t, self.converter)
         assert result is not None and result.name == talker_key
         assert torch.equal(result.tensor, t)
+
+    def test_does_not_match_unprefixed_keys(self):
+        """When loading the top-level container, expert keys without `thinker.` prefix
+        are unexpected — pass them through so the dispatcher can flag them."""
+        assert not self.converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
+
+
+class TestQwen3OmniMoeV4FactoryThinkerStandalone:
+    """Standalone Qwen3OmniMoeThinkerForConditionalGeneration: experts under `model.layers.*`."""
+
+    def setup_method(self):
+        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_thinker_standalone_model("fused"))
+
+    def test_handles_model_prefix(self):
+        # The standalone thinker class wraps a `.model = Qwen3OmniMoeThinkerTextModel`,
+        # so its parameter FQNs (and the matching HF checkpoint keys) start with `model.`.
+        assert self.converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
+
+        last = None
+        for e in range(NUM_EXPERTS):
+            last = self.converter.convert(
+                f"model.layers.0.mlp.experts.{e}.gate_proj.weight",
+                _hf_expert_tensor("gate_proj", e),
+            )
+        assert last is not None
+        assert last.name == "model.layers.0.mlp.experts.gate_proj"
+
+    def test_does_not_match_thinker_or_talker_prefixes(self):
+        # The standalone thinker never sees `thinker.*` or `talker.*` keys.
+        assert not self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
+        assert not self.converter.can_handle("talker.model.layers.0.mlp.experts.0.gate_proj.weight")
+
+
+class TestQwen3OmniMoeV4FactoryTextModelStandalone:
+    """Standalone Qwen3OmniMoeThinkerTextModel: experts under `layers.*` (the model class IS the root)."""
+
+    def setup_method(self):
+        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_text_model_standalone("fused"))
+
+    def test_handles_bare_layers_prefix(self):
+        assert self.converter.can_handle("layers.0.mlp.experts.0.gate_proj.weight")
+
+        last = None
+        for e in range(NUM_EXPERTS):
+            last = self.converter.convert(
+                f"layers.0.mlp.experts.{e}.gate_proj.weight",
+                _hf_expert_tensor("gate_proj", e),
+            )
+        assert last is not None
+        assert last.name == "layers.0.mlp.experts.gate_proj"
+
+    def test_does_not_match_wrapped_prefixes(self):
+        assert not self.converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
+        assert not self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
 
 
 # ---------------------------------------------------------------------------
