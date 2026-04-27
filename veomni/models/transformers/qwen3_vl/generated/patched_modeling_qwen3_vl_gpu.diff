@@ -712,7 +712,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -812,11 +1075,60 @@
+@@ -812,11 +1075,77 @@
 
          merged_hidden_states = self.merger(hidden_states)
 
@@ -729,10 +729,15 @@
 +    # 1. add dummy_forward so ranks without pixel_values can still run the
 +    #    visual encoder under FSDP — otherwise reduce-scatter hangs when
 +    #    some ranks get None pixel_values while others have real images
-+    # 2. SP-aware shape: grid_thw height is scaled by sp_size so the dummy
-+    #    batch stays a clean multiple after sequence slicing. Shapes are
-+    #    derived from the vision config (patch_size / temporal_patch_size /
-+    #    in_channels / spatial_merge_size) so model variants don't break
++    # 2. SP-aware shape: grid_thw is built at the FULL un-sliced size (height
++    #    scaled by sp_size) and pixel_values are then SP-pre-sliced with
++    #    pad_scale=4, mirroring what MainCollator does for real pixel_values
++    #    via DataCollateInfo(0, True, 0, 4). This keeps hidden_states (after
++    #    patch_embed) and pos_embeds (which fast_pos_embed_interpolate computes
++    #    from the FULL grid_thw and forward.sp_pad_and_slice's down to per-rank)
++    #    at the same dim-0 size for the `hidden_states + pos_embeds` add. Shapes
++    #    are derived from the vision config (patch_size / temporal_patch_size /
++    #    in_channels / spatial_merge_size) so model variants don't break.
 +    # ================================================================
 +    def dummy_forward(self):
 +        # --- Patch.1 ---
@@ -762,6 +767,18 @@
 +        pixel_row_size = in_channels * temporal_patch_size * patch_size * patch_size
 +        pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=self.dtype, device=self.device)
 +        grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
++
++        # --- Patch.3 ---
++        # Match MainCollator's per-rank slicing of `pixel_values` (DataCollateInfo
++        # pack_dim=0, sp_slice=True, sp_pad_value=0, sp_pad_scale=4) so that the
++        # synthesized batch enters forward at the same per-rank size the real
++        # data path produces. Otherwise hidden_states keeps the full size while
++        # pos_embeds gets sp_pad_and_slice'd inside forward, and
++        # `hidden_states + pos_embeds` mismatches at dim 0 by sp_size.
++        if get_parallel_state().sp_enabled:
++            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
++        # --- Patch.3 ---
++
 +        return self(hidden_states=pixel_values, grid_thw=grid_thw)
 +        # --- Patch.1 ---
 +
@@ -773,7 +790,7 @@
 
 
  @auto_docstring(
-@@ -940,15 +1252,35 @@
+@@ -940,15 +1269,35 @@
              past_key_values=past_key_values,
          )
 
@@ -809,7 +826,7 @@
 
 
  @auto_docstring
-@@ -1081,6 +1413,13 @@
+@@ -1081,6 +1430,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -823,7 +840,7 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
-@@ -1088,63 +1427,36 @@
+@@ -1088,63 +1444,36 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -905,7 +922,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1184,6 +1496,24 @@
+@@ -1184,6 +1513,24 @@
              position_ids = None
          return position_ids
 
@@ -930,7 +947,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1200,20 +1530,40 @@
+@@ -1200,20 +1547,40 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3VLModelOutputWithPast:
@@ -979,7 +996,7 @@
 
          if pixel_values is not None:
              image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-@@ -1221,11 +1571,51 @@
+@@ -1221,11 +1588,51 @@
              )
              image_embeds = image_outputs.pooler_output
              deepstack_image_embeds = image_outputs.deepstack_features
@@ -1035,7 +1052,7 @@
 
          if pixel_values_videos is not None:
              video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-@@ -1233,18 +1623,63 @@
+@@ -1233,18 +1640,63 @@
              )
              video_embeds = video_outputs.pooler_output
              deepstack_video_embeds = video_outputs.deepstack_features
@@ -1107,7 +1124,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1254,24 +1689,56 @@
+@@ -1254,24 +1706,56 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1169,7 +1186,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1286,7 +1753,10 @@
+@@ -1286,7 +1770,10 @@
          )
 
          return Qwen3VLModelOutputWithPast(
@@ -1181,7 +1198,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1318,6 +1788,12 @@
+@@ -1318,6 +1805,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1194,7 +1211,7 @@
 
 
  class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
-@@ -1372,6 +1848,16 @@
+@@ -1372,6 +1865,16 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1211,7 +1228,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1389,53 +1875,6 @@
+@@ -1389,53 +1892,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3VLCausalLMOutputWithPast:
@@ -1265,7 +1282,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1451,14 +1890,31 @@
+@@ -1451,14 +1907,31 @@
          )
 
          hidden_states = outputs[0]
@@ -1302,7 +1319,7 @@
 
          return Qwen3VLCausalLMOutputWithPast(
              loss=loss,
-@@ -1693,6 +2149,25 @@
+@@ -1693,6 +2166,25 @@
 
          return input_ids, model_kwargs
 
