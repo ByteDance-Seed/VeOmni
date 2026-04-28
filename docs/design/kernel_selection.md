@@ -14,16 +14,32 @@ selection knob.
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | `"eager"` | `apply_ops_config()` (before model build) |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"eager"` | Model registration via ops config singleton |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"eager"` | `apply_ops_config()` (before model build) |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"eager"` | `build_foundation_model` |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | `"liger_kernel"` | `apply_ops_config()` (before model build) |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` | Model registration via ops config singleton |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` | Model registration via ops config singleton |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` | Model registration via ops config singleton |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"triton"` | `apply_ops_config()` (before model build) |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` | `build_foundation_model` |
 
 The per-op fields are typed as plain `str` (not `Literal`), so third-party
 backends can be registered via `extra_backends` in a model's `device_patch.py`
 without modifying `OpsImplementationConfig`.
+
+**Defaults are GPU-reasonable.** Every default targets a fast, well-tested
+kernel that runs out of the box on a GPU host with the standard
+`--extra gpu` install (Liger fused ops + Triton MoE + FA2). On Ascend NPU,
+fields whose default has no NPU implementation raise a clear error in
+`OpsImplementationConfig.__post_init__` pointing the user at the suggested
+NPU value (`npu` / `fused_npu` / `eager`) — there is no silent hardware
+fallback. NPU users must opt in explicitly per field; the only
+universal-on-NPU default is `load_balancing_loss_implementation: triton`,
+which works on NPU via `triton-ascend`. To get a portable, no-deps config
+in code (e.g. tests, standalone scripts), use
+`OpsImplementationConfig.eager_defaults()`.
+
+**Backwards compatibility.** `moe_implementation: fused` (the pre-#678
+auto-pick value) is rewritten to `fused_triton` with a deprecation warning,
+so old YAML configs keep working. Update configs to the explicit value.
 
 ---
 

@@ -619,24 +619,91 @@ class TrainingArguments:
 #
 
 
+# Legacy values that have been renamed; rewritten in ``__post_init__`` with a
+# deprecation warning so old YAML configs keep working for one release.
+_LEGACY_ALIASES: Dict[str, Dict[str, str]] = {
+    "moe_implementation": {
+        # Removed in #678 in favour of explicit ``fused_triton`` (GPU) and
+        # ``fused_npu`` (NPU). The pre-#678 ``fused`` value silently auto-picked
+        # by hardware; we collapse it to the GPU pick here so old configs do not
+        # silently change behaviour on NPU — NPU users now have to opt in to
+        # ``fused_npu`` explicitly.
+        "fused": "fused_triton",
+    },
+}
+
+# Values that are GPU-only (the GPU-reasonable defaults below) but have a
+# direct NPU equivalent. Used by ``_validate_device_compatibility`` to give a
+# clear, actionable error on NPU when a GPU value would otherwise reach
+# bind-time and fail with a less helpful message.
+#
+# ``"eager"`` and load-balancing-loss ``"triton"`` (which works on NPU via
+# ``triton-ascend``) are universal — not listed here.
+_NPU_INCOMPATIBLE: Dict[str, Dict[str, str]] = {
+    # ``attn_implementation`` is checked after the SP rewrite, so both the
+    # user-facing names and the rewritten ``veomni_flash_attention_*_with_sp``
+    # names need to be listed here. Suggested NPU equivalent is ``sdpa``,
+    # which is what NPU users typically pick.
+    "attn_implementation": {
+        "flash_attention_2": "sdpa",
+        "flash_attention_3": "sdpa",
+        "flash_attention_4": "sdpa",
+        "veomni_flash_attention_2_with_sp": "sdpa",
+        "veomni_flash_attention_3_with_sp": "sdpa",
+        "veomni_flash_attention_4_with_sp": "sdpa",
+    },
+    "moe_implementation": {
+        "fused_triton": "fused_npu",
+        "fused_quack": "fused_npu",
+    },
+    "cross_entropy_loss_implementation": {
+        "liger_kernel": "npu",
+    },
+    "rms_norm_implementation": {
+        "liger_kernel": "npu",
+        # Per-model triton (DeepSeek-V3 batch-invariant) is GPU-only.
+        "triton": "npu",
+    },
+    "rotary_pos_emb_implementation": {
+        "liger_kernel": "npu",
+        "triton": "npu",
+    },
+    "swiglu_mlp_implementation": {
+        # No NPU fused SwiGLU exists; NPU users must explicitly fall back.
+        "liger_kernel": "eager",
+    },
+}
+
+
 @dataclass
 class OpsImplementationConfig:
     """model.ops_implementation.* — Attention, MoE, and fused kernel implementation.
 
-    Each ``*_implementation`` field selects the kernel backend for that operation.
-    The type is ``str`` (not ``Literal``) so that third-party backends can be
-    registered without modifying this class.
+    Each ``*_implementation`` field selects the kernel backend for that
+    operation. The type is ``str`` (not ``Literal``) so third-party backends
+    can be registered without modifying this class.
+
+    **Defaults are GPU-reasonable.** Every field defaults to a fast,
+    well-tested kernel that runs on GPU with the standard ``--extra gpu``
+    install (``liger_kernel`` / ``triton`` / ``fused_triton`` / FA2). On
+    Ascend NPU, fields whose default has no NPU implementation raise a clear
+    error in ``__post_init__`` pointing the user at the suggested NPU value
+    (``npu`` / ``fused_npu`` / ``eager``) — there is no silent hardware
+    fallback. Switch a field to ``"eager"`` for portable behaviour on hosts
+    without the GPU dependency.
 
     Well-known values:
 
-    - ``"eager"`` (default): PyTorch / HuggingFace reference implementation.
-    - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
+    - ``"eager"``: PyTorch / HuggingFace reference implementation. Universal
+      (runs on any device).
+    - ``"liger_kernel"``: LigerKernel fused implementation (GPU only, requires
       ``liger-kernel``).
     - ``"npu"``: Ascend NPU fused implementation (requires ``torch_npu``).
       Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from
-      ``veomni.ops.kernels.{rms_norm,rotary}.npu``.
-    - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
-      NPU with ``triton-ascend``).
+      ``veomni.ops.kernels.{rms_norm,rotary}.npu``, or the chunked loss for
+      cross-entropy.
+    - ``"triton"``: Triton fused implementation (GPU with ``triton`` package,
+      or NPU with ``triton-ascend`` for the load-balancing loss).
     """
 
     attn_implementation: Optional[
@@ -650,72 +717,94 @@ class OpsImplementationConfig:
         ]
     ] = field(
         default="flash_attention_2",
-        metadata={"help": "Attention implementation to use."},
+        metadata={"help": "Attention implementation to use. Default targets GPU; NPU users must override."},
     )
     moe_implementation: str = field(
-        default="eager",
+        default="fused_triton",
         metadata={
             "help": "MoE experts forward implementation. "
-            "OSS backends: 'fused_triton' (Triton group-gemm, GPU, SM70+), "
+            "OSS backends: 'fused_triton' (default, Triton group-gemm, GPU, SM70+), "
             "'fused_quack' (Quack CUTLASS/CuTe, GPU, SM90+), "
             "'fused_npu' (NPU group-gemm, requires torch_npu), "
-            "'eager' (default, reference loop). "
+            "'eager' (reference loop). "
             "The backend must match the hardware — no silent fallback. "
-            "Typed as plain str (not Literal) so third-party backends can be "
-            "plugged in via `apply_veomni_fused_moe_patch` (legacy-dispatch "
+            "Legacy 'fused' is rewritten to 'fused_triton' with a deprecation "
+            "warning. Typed as plain str (not Literal) so third-party backends "
+            "can be plugged in via `apply_veomni_fused_moe_patch` (legacy-dispatch "
             "models) or `KERNEL_REGISTRY.register(op_name='moe_experts', ...)` "
             "(OpSlot-dispatch models), matching the extensibility of the "
             "other *_implementation fields."
         },
     )
     cross_entropy_loss_implementation: str = field(
-        default="eager",
+        default="liger_kernel",
         metadata={
             "help": "Cross-entropy loss implementation. "
-            "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
-            "'npu' enables chunked loss computation for CausalLM on NPU "
-            "(requires torch_npu). "
-            "'eager' (default) uses PyTorch F.cross_entropy."
+            "'liger_kernel' (default) uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel; GPU). "
+            "'npu' enables chunked loss computation for CausalLM on NPU (requires torch_npu). "
+            "'eager' uses PyTorch F.cross_entropy."
         },
     )
     rms_norm_implementation: str = field(
-        default="eager",
+        default="liger_kernel",
         metadata={
             "help": "RMSNorm implementation. "
-            "'liger_kernel' uses LigerRMSNorm. "
+            "'liger_kernel' (default) uses LigerRMSNorm (GPU). "
             "'npu' uses torch_npu.npu_rms_norm (requires torch_npu). "
             "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3). "
-            "'eager' (default) uses the HuggingFace default."
+            "'eager' uses the HuggingFace default."
         },
     )
     swiglu_mlp_implementation: str = field(
-        default="eager",
+        default="liger_kernel",
         metadata={
             "help": "SwiGLU MLP implementation. "
-            "'liger_kernel' uses LigerSwiGLUMLP. "
-            "'eager' (default) uses the HuggingFace default."
+            "'liger_kernel' (default) uses LigerSwiGLUMLP (GPU). "
+            "'eager' uses the HuggingFace default. No NPU fused kernel exists; "
+            "NPU users must set this to 'eager' explicitly."
         },
     )
     rotary_pos_emb_implementation: str = field(
-        default="eager",
+        default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding implementation. "
-            "'liger_kernel' uses liger_rotary_pos_emb. "
+            "'liger_kernel' (default) uses liger_rotary_pos_emb (GPU). "
             "'npu' uses torch_npu.npu_rotary_mul (requires torch_npu). "
             "'triton' uses deterministic Triton bmm kernel (DeepSeek V3). "
-            "'eager' (default) uses the HuggingFace default."
+            "'eager' uses the HuggingFace default."
         },
     )
     load_balancing_loss_implementation: str = field(
-        default="eager",
+        default="triton",
         metadata={
             "help": "MoE load-balancing loss implementation. "
-            "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
-            "'eager' (default) uses PyTorch reference."
+            "'triton' (default) uses a fused Triton kernel — works on GPU "
+            "(``triton``) and on NPU (``triton-ascend``). "
+            "'eager' uses PyTorch reference."
         },
     )
 
+    @classmethod
+    def eager_defaults(cls) -> "OpsImplementationConfig":
+        """Return an instance with every kernel field set to ``"eager"``.
+
+        Used by fallback paths (``build_foundation_model`` standalone-script
+        warning, tests that only care about the loss-mapping plumbing) where
+        GPU dependencies cannot be assumed. Equivalent to passing every
+        ``*_implementation`` field explicitly as ``"eager"``.
+        """
+        return cls(
+            moe_implementation="eager",
+            cross_entropy_loss_implementation="eager",
+            rms_norm_implementation="eager",
+            swiglu_mlp_implementation="eager",
+            rotary_pos_emb_implementation="eager",
+            load_balancing_loss_implementation="eager",
+        )
+
     def __post_init__(self):
+        self._rewrite_legacy_aliases()
+
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
@@ -727,7 +816,57 @@ class OpsImplementationConfig:
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
+        self._validate_device_compatibility()
         self._validate_implementations()
+
+    def _rewrite_legacy_aliases(self):
+        """Rewrite deprecated values to their current equivalents with a warning.
+
+        The mapping lives in the module-level ``_LEGACY_ALIASES`` table so new
+        renames can be added without touching this method.
+        """
+        for field_name, mapping in _LEGACY_ALIASES.items():
+            value = getattr(self, field_name)
+            if value in mapping:
+                replacement = mapping[value]
+                logger.warning_rank0(
+                    f"{field_name}='{value}' is deprecated; auto-converting to '{replacement}'. "
+                    f"Update your config to use the new value explicitly."
+                )
+                setattr(self, field_name, replacement)
+
+    def _validate_device_compatibility(self):
+        """Raise on (field, value) combinations that don't run on the current device.
+
+        Defaults are picked for GPU. On Ascend NPU, a value that has no NPU
+        implementation raises here so the user is told to override
+        explicitly. The error includes the suggested NPU equivalent for that
+        field. No GPU-side check is needed: GPU-only kernels live in the
+        existing package/hardware checks (Liger requires ``liger_kernel``;
+        ``apply_veomni_fused_moe_patch`` rejects ``fused_npu`` on GPU; etc.).
+        """
+        from ..utils.device import IS_NPU_AVAILABLE
+
+        if not IS_NPU_AVAILABLE:
+            return
+
+        for field_name, mapping in _NPU_INCOMPATIBLE.items():
+            value = getattr(self, field_name)
+            if value in mapping:
+                suggested = mapping[value]
+                # When ``suggested == "eager"`` the trailing "(or 'eager')" hint
+                # would be a tautology, so drop it.
+                hint = (
+                    f"Set {field_name}='{suggested}' explicitly"
+                    if suggested == "eager"
+                    else f"Set {field_name}='{suggested}' (or 'eager') in your config explicitly"
+                )
+                raise ValueError(
+                    f"{field_name}='{value}' is GPU-only but the current device is NPU. "
+                    f"{hint}. "
+                    f"Defaults in OpsImplementationConfig target GPU; on NPU every kernel "
+                    f"that does not have a portable implementation must be opted into."
+                )
 
     def _validate_implementations(self):
         """Validate that requested backends are actually available.

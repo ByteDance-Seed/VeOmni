@@ -133,15 +133,25 @@ Each `*_implementation` field selects the kernel backend for that operation.
 The type is `str` (not `Literal`) so third-party backends can be registered
 without modifying the config class.
 
+**Defaults are GPU-reasonable.** Every default below targets a fast kernel
+that runs on a GPU host with the standard `--extra gpu` install. On Ascend
+NPU, fields whose default has no NPU implementation raise a clear error in
+`__post_init__` pointing at the suggested NPU value (`npu` / `fused_npu` /
+`eager`) — there is no silent hardware fallback. NPU users must override
+per field explicitly; the only universal-on-NPU default is
+`load_balancing_loss_implementation: triton` (works on NPU via
+`triton-ascend`). For a portable, no-deps config in code, call
+`OpsImplementationConfig.eager_defaults()`.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
-| moe_implementation | `Literal["eager", "fused_triton", "fused_quack", "fused_npu"]` | `"eager"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel. Mismatches (e.g. `fused_triton` on NPU) raise at patch time — no silent fallback. |
-| cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss; backs `ForCausalLM` + `ForConditionalGeneration`, `ForSequenceClassification` stays on eager). |
-| rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
-| swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
-| rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
-| load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton`. |
+| moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is a debug-only reference loop. Legacy `fused` is rewritten to `fused_triton` with a deprecation warning. Mismatches (e.g. `fused_triton` on NPU) raise at config-parse / patch time — no silent fallback. |
+| cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss; backs `ForCausalLM` + `ForConditionalGeneration`, `ForSequenceClassification` stays on eager). |
+| rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton` (per-model). |
+| swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. No NPU fused kernel; NPU users must set `eager`. |
+| rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton` (per-model). |
+| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. Known values: `eager`, `triton`. The `triton` backend is universal: `triton` (GPU) or `triton-ascend` (NPU). |
 
 ### DataArguments
 

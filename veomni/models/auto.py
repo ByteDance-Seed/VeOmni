@@ -175,12 +175,13 @@ def build_foundation_model(
         logger.warning_rank0(
             "build_foundation_model was called before apply_ops_config. VeOmni "
             "assumes training goes through BaseTrainer, which installs the ops "
-            "config for you. Installing OpsImplementationConfig() defaults now "
-            "so self.loss_function() does not trip on missing kwargs. If you "
-            "are running a standalone script, call apply_ops_config(...) "
+            "config for you. Installing OpsImplementationConfig.eager_defaults() "
+            "now so self.loss_function() does not trip on missing kwargs and "
+            "the build does not require liger-kernel / triton / fused MoE. If "
+            "you are running a standalone script, call apply_ops_config(...) "
             "yourself before build_foundation_model to pick kernel backends."
         )
-        apply_ops_config(OpsImplementationConfig())
+        apply_ops_config(OpsImplementationConfig.eager_defaults())
 
     if config_kwargs is None:
         config_kwargs = {}

@@ -150,7 +150,10 @@ def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc):
     from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.models.auto import _bind_veomni_ops
 
-    ops_config = OpsImplementationConfig(moe_implementation="fused_quack")
+    # Build the config from ``eager_defaults`` so non-MoE fields don't pull
+    # liger-kernel into the test (the test only exercises the MoE bind path).
+    ops_config = OpsImplementationConfig.eager_defaults()
+    ops_config.moe_implementation = "fused_quack"
     # Simulate a patchgen'd modeling module with a moe_experts OpSlot.
     fake_module = SimpleNamespace(veomni_moe_experts_forward=OpSlot("moe_experts", "standard"))
 
