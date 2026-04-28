@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import torch
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import get_device_type
@@ -22,6 +23,13 @@ _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires di
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
+    # Seed before random weight init so the materialized checkpoint is identical
+    # across pytest invocations. Without this, the four sub-runs (sp/ep grid)
+    # share weights *within* one pytest run but differ between runs, which made
+    # SP/EP-vs-no-EP grad-norm comparisons flaky at the small toy-config scale.
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
