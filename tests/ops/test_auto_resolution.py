@@ -290,6 +290,26 @@ def test_install_loss_mapping_npu_alias_emits_warning(veomni_log):
 # ---------------------------------------------------------------------------
 
 
+def test_register_op_rejects_duplicate_config_field():
+    """``_backend_requirements_met`` and other consumers stop at the first
+    OpSpec whose ``config_field`` matches, so two ops sharing one would
+    create non-deterministic resolution. ``register_op`` must surface that
+    misregistration at import time."""
+    from veomni.ops.config.registry import BackendSpec, OpScope, OpSpec, register_op
+
+    bogus = OpSpec(
+        name="__test_dup_rms_norm__",
+        # Already used by the real ``rms_norm`` OpSpec registered at import time.
+        config_field="rms_norm_implementation",
+        label="Dup",
+        scope=OpScope.PER_MODEL,
+        default="eager",
+        backends={"eager": BackendSpec(entry="builtins:object")},
+    )
+    with pytest.raises(ValueError, match="config_field 'rms_norm_implementation' is already used"):
+        register_op(bogus)
+
+
 def test_load_balancing_loss_kernelspec_runs_on_npu():
     """Regression: the OpSlot KernelSpec for load_balancing_loss/triton must
     accept NPU devices.

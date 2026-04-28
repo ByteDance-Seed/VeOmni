@@ -126,12 +126,28 @@ _OPS_REGISTRY: dict[str, OpSpec] = {}
 
 
 def register_op(spec: OpSpec) -> None:
-    """Register an ``OpSpec``. Re-registration with an identical spec is a
-    no-op (safe under repeated ``importlib.reload`` during tests); a
-    re-registration with a different spec raises ``ValueError``."""
+    """Register an ``OpSpec``.
+
+    Re-registration with an identical spec is a no-op (safe under repeated
+    ``importlib.reload`` during tests); a re-registration with a different
+    spec raises ``ValueError``.
+
+    Also enforces ``config_field`` uniqueness across all registered ops:
+    ``_backend_requirements_met`` and other consumers iterate ``list_ops()``
+    and stop at the first match for a given ``config_field``, so two ops
+    sharing one would create non-deterministic resolution. The check here
+    surfaces such a misregistration at import time rather than at
+    config-parse time.
+    """
     existing = _OPS_REGISTRY.get(spec.name)
     if existing is not None and existing != spec:
         raise ValueError(f"Op {spec.name!r} is already registered with a different spec.")
+    for other in _OPS_REGISTRY.values():
+        if other.name != spec.name and other.config_field == spec.config_field:
+            raise ValueError(
+                f"OpSpec.config_field {spec.config_field!r} is already used by op "
+                f"{other.name!r}; cannot register {spec.name!r} with the same field."
+            )
     _OPS_REGISTRY[spec.name] = spec
 
 
