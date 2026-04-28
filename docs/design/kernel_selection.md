@@ -40,10 +40,10 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
   └─ set_ops_config(self)                     # populate singleton
 
 BaseTrainer._build_model()                    # (3) model build time
-  ├─ apply_ops_config(ops_implementation)     # install LOSS_MAPPING + GLOBAL patches
-  │    ├─ install_loss_mapping(ce_impl)       # partial(ForCausalLMLoss, cross_entropy_fn=<impl>)
-  │    └─ apply_global_ops(config)            # load_balancing_loss, etc.
-  └─ build_foundation_model(...)
+  └─ build_foundation_model(..., ops_implementation=ops)
+       ├─ apply_ops_config(ops)               # install LOSS_MAPPING + GLOBAL patches
+       │    ├─ install_loss_mapping(ce_impl)  # partial(ForCausalLMLoss, cross_entropy_fn=<impl>)
+       │    └─ apply_global_ops(config)       # load_balancing_loss, etc.
        ├─ apply_veomni_fused_moe_patch(...)   # bind MoE kernel
        ├─ device_patch.py reads ops config     # RMSNorm/RoPE/SwiGLU
        ├─ OpSlot.bind(impl_name)              # per-model OpSlot dispatch
@@ -63,13 +63,18 @@ inner CE kernel (eager / liger / npu) is pre-bound onto the wrapper via
 `functools.partial`, so runtime dispatch is just a function call and there
 is no per-forward "which impl?" lookup.
 
-**BaseTrainer contract.** Training is expected to go through `BaseTrainer`,
-which calls `apply_ops_config` before `build_foundation_model`. Standalone
-scripts (tests, eval harnesses) that call `build_foundation_model` directly
-must call `apply_ops_config` themselves; if they forget, the model build
-emits a warning and installs `OpsImplementationConfig()` defaults so
-`self.loss_function` does not trip on VeOmni's extra `hidden_states=` /
-`weights=` kwargs.
+**Ownership.** `build_foundation_model` owns the call to `apply_ops_config`:
+when callers pass `ops_implementation=ops` (trainers do this), it runs
+`apply_ops_config(ops)` before constructing the model and reads
+`attn_implementation` from `ops`. Callers that pass neither
+`ops_implementation` nor a prior `apply_ops_config` get
+`OpsImplementationConfig()` defaults installed silently, so
+`self.loss_function` never trips on VeOmni's extra `hidden_states=` /
+`weights=` kwargs. (The DiT trainer is the one exception that still calls
+`apply_ops_config` manually — it has to populate the singleton before
+building the condition model, which uses `model_class._from_config(...)`
+rather than `build_foundation_model`. The subsequent
+`build_foundation_model` call is idempotent.)
 
 ---
 
@@ -394,10 +399,11 @@ VeOmni replaces this at model-build time via `apply_ops_config(...)` →
 cross-entropy computes the loss without materializing the full logits
 tensor, which significantly reduces memory for large-vocabulary models.
 
-**Implication:** When using VeOmni's trainer, the fused loss is transparent.
-When using a standalone Transformers training loop, users would need to
-call `apply_ops_config(OpsImplementationConfig(...))` themselves before
-model construction (or directly monkey-patch `LOSS_MAPPING`).
+**Implication:** When using VeOmni's trainer or `build_foundation_model`
+with `ops_implementation=...`, the fused loss is transparent. A standalone
+Transformers training loop that doesn't go through `build_foundation_model`
+would need to call `apply_ops_config(OpsImplementationConfig(...))`
+itself before model construction (or directly monkey-patch `LOSS_MAPPING`).
 
 #### 2. MoE Load-Balancing Auxiliary Loss
 

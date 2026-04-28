@@ -125,32 +125,29 @@ def build_foundation_model(
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
+    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> "PreTrainedModel":
     """
     Builds the foundation model.
 
     If weights_path is provided, it loads the pre-trained weights, otherwise it initializes weights.
 
-    Contract: ``apply_ops_config(ops_implementation)`` must run before this
-    function so that ``LOSS_MAPPING`` contains VeOmni's loss wrappers.
-    ``BaseTrainer`` does this automatically; standalone scripts (tests, eval
-    harnesses) that call ``build_foundation_model`` directly should call
-    ``apply_ops_config`` themselves. If we detect that nobody did, we install
-    defaults with a warning rather than letting the model fail later with a
-    cryptic kwargs mismatch inside HuggingFace's stock loss wrapper.
+    Ops dispatch is owned by this function: when ``ops_implementation`` is
+    provided we run ``apply_ops_config`` before constructing the model, and the
+    resolved ``attn_implementation`` is read from it (the explicit
+    ``attn_implementation`` kwarg is ignored in that case). Trainers always
+    pass ``ops_implementation``; standalone scripts that omit it get a default
+    ``OpsImplementationConfig()`` installed automatically — unless something
+    earlier (e.g. a ``DiTTrainer`` building a condition model first) already
+    installed one, in which case we leave it alone.
     """
     from ..ops import apply_ops_config
     from ..ops.config.singleton import get_ops_config
 
-    if get_ops_config() is None:
-        logger.warning_rank0(
-            "build_foundation_model was called before apply_ops_config. VeOmni "
-            "assumes training goes through BaseTrainer, which installs the ops "
-            "config for you. Installing OpsImplementationConfig() defaults now "
-            "so self.loss_function() does not trip on missing kwargs. If you "
-            "are running a standalone script, call apply_ops_config(...) "
-            "yourself before build_foundation_model to pick kernel backends."
-        )
+    if ops_implementation is not None:
+        apply_ops_config(ops_implementation)
+        attn_implementation = ops_implementation.attn_implementation
+    elif get_ops_config() is None:
         apply_ops_config(OpsImplementationConfig())
 
     if config_kwargs is None:

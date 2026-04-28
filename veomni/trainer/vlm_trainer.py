@@ -22,7 +22,6 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..models import build_foundation_model, build_processor
-from ..ops import apply_ops_config
 from ..optim import build_optimizer
 from ..utils import helper
 from ..utils.device import synchronize
@@ -134,15 +133,14 @@ class VLMTrainer:
     def _build_model(self):
         args: VeOmniVLMArguments = self.base.args
         logger.info_rank0("Build model")
-        apply_ops_config(args.model.ops_implementation)
         self.base.model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
             torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            attn_implementation=args.model.ops_implementation.attn_implementation,
             init_device=args.train.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+            ops_implementation=args.model.ops_implementation,
         )
         self.base.model_config = self.base.model.config
 

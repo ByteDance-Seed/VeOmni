@@ -35,9 +35,10 @@ Two dispatch paths reach these wrappers:
 
 Contract: ``apply_ops_config(ops_config)`` must run before any model is built,
 otherwise ``LOSS_MAPPING`` contains HuggingFace's stock wrapper which does not
-understand ``hidden_states=``/``weights=`` kwargs. ``BaseTrainer`` arranges
-this; standalone scripts must call ``apply_ops_config`` themselves (and
-``build_foundation_model`` emits a warning + installs defaults if they don't).
+understand ``hidden_states=``/``weights=`` kwargs. ``build_foundation_model``
+owns this — pass ``ops_implementation=...`` (trainers do this) and it will
+install the config; otherwise it falls back to ``OpsImplementationConfig()``
+defaults.
 """
 
 from functools import partial
@@ -248,9 +249,11 @@ def install_loss_mapping(impl: str = "eager") -> str:
     pre-bound to the cross-entropy kernel selected by *impl*.
 
     This is the single entry point for loss dispatch and is called by
-    ``apply_ops_config``. Must run before ``build_foundation_model``: VeOmni
-    modeling code calls ``self.loss_function(hidden_states=..., logits=None,
-    ...)`` which HF's stock ``ForCausalLMLoss`` cannot handle.
+    ``apply_ops_config``, which in turn is invoked from
+    ``build_foundation_model`` before the model is constructed (so VeOmni
+    modeling code that calls ``self.loss_function(hidden_states=...,
+    logits=None, ...)`` finds the wrapper installed and not HF's stock
+    ``ForCausalLMLoss``).
 
     Contract — return type: **VeOmni's wrappers return ``(loss, logits)``**,
     not a bare ``torch.Tensor``. The tuple is load-bearing: fused kernels
