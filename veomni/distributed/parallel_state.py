@@ -339,6 +339,10 @@ class ParallelState:
         return self.extra_parallel_enabled("ep")
 
     @property
+    def ep_size(self) -> int:
+        return self.extra_parallel_sizes["ep"]
+
+    @property
     def ep_rank(self) -> int:
         return self.extra_parallel_rank("ep")
 
