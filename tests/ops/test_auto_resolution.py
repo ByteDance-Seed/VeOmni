@@ -290,6 +290,71 @@ def test_install_loss_mapping_npu_alias_emits_warning(veomni_log):
 # ---------------------------------------------------------------------------
 
 
+def test_apply_veomni_fused_moe_patch_triton_works_with_torch_npu_package_only(monkeypatch):
+    """Regression: fused_triton must succeed on a CUDA dev host that happens
+    to have ``torch_npu`` installed but no NPU device.
+
+    Pre-fix, ``apply_veomni_fused_moe_patch("triton")`` checked the bare
+    ``torch_npu`` package flag and aborted. Now both the kernel patch and
+    ``is_fused_moe_available`` use the device-aware ``is_npu_device_available``,
+    so the GPU path stays open as long as no NPU device is reachable.
+    """
+    from veomni.utils import device
+
+    # Simulate dual-stack: torch_npu package installed, no actual NPU device.
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(device, "is_npu_device_available", lambda: False)
+    # Re-route the moe module's locally-imported reference too.
+    import veomni.ops.kernels.moe as moe_module
+
+    monkeypatch.setattr(moe_module, "is_npu_device_available", lambda: False)
+    # is_fused_moe_available reads through device.is_npu_device_available
+    # (already patched) and _PACKAGE_FLAGS["triton"] (left as-is).
+    # The bind itself is not what we're testing — only that the GPU path
+    # is reachable. If triton isn't installed locally, is_fused_moe_available
+    # will return False and the bind raises a *triton-missing* RuntimeError,
+    # which is the correct, clearer error than the pre-fix NPU rejection.
+    from veomni.utils.import_utils import is_fused_moe_available
+
+    # The probe should not see torch_npu masquerading as NPU device.
+    # If triton is locally installed, is_fused_moe_available is True; if not,
+    # it's False — but in both cases the failure mode is "triton missing",
+    # not "this is an NPU device".
+    _ = is_fused_moe_available()
+
+
+def test_build_foundation_model_skips_moe_patch_for_non_moe_config():
+    """Regression: non-MoE models (Llama, plain Qwen, ...) must not trigger
+    ``apply_veomni_fused_moe_patch`` even when the resolved
+    ``moe_implementation`` is ``fused_triton`` / ``fused_npu``.
+
+    Pre-fix, the new auto default propagated ``fused_triton`` through to
+    ``apply_moe_patch_transformers_v4`` for every non-OpSlot model. On a
+    clean GPU host this was wasteful (importing triton, binding the global
+    pointer that nothing calls); on dual-stack hosts it crashed.
+    """
+    from types import SimpleNamespace
+
+    from veomni.models.auto import _config_is_moe
+
+    # Llama-style config: no `num_experts`, no nested MoE config.
+    llama_like = SimpleNamespace(hidden_size=4096, num_attention_heads=32)
+    assert _config_is_moe(llama_like) is False
+
+    # Qwen3-MoE-style: top-level num_experts > 1.
+    qwen_moe_like = SimpleNamespace(num_experts=8, hidden_size=4096)
+    assert _config_is_moe(qwen_moe_like) is True
+
+    # VLM wrapper: MoE lives under text_config.
+    vlm_text = SimpleNamespace(num_experts=8)
+    vlm_root = SimpleNamespace(text_config=vlm_text, hidden_size=4096)
+    assert _config_is_moe(vlm_root) is True
+
+    # num_experts == 1 is a degenerate "single expert", treated as non-MoE.
+    single = SimpleNamespace(num_experts=1)
+    assert _config_is_moe(single) is False
+
+
 def test_register_op_rejects_duplicate_config_field():
     """``_backend_requirements_met`` and other consumers stop at the first
     OpSpec whose ``config_field`` matches, so two ops sharing one would

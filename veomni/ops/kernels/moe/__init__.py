@@ -15,10 +15,10 @@
 import torch
 
 from ....utils import logging
+from ....utils.device import is_npu_device_available
 from ....utils.import_utils import (
     is_fused_moe_available,
     is_quack_gemm_available,
-    is_torch_npu_available,
 )
 
 
@@ -77,8 +77,12 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
             ``ValueError``.
     """
     global _fused_moe_forward
+    # All NPU/GPU branching uses the device-aware ``is_npu_device_available``
+    # rather than the package-only ``is_torch_npu_available`` so dual-stack
+    # hosts (CUDA boxes that merely have ``torch_npu`` installed) don't get
+    # mis-routed onto the NPU rejection path and lose the GPU fused kernels.
     if fused_moe_kernel == "npu":
-        if not is_torch_npu_available():
+        if not is_npu_device_available():
             raise RuntimeError(
                 "fused_moe_kernel='npu' requires torch_npu and an NPU device. On GPU, use 'triton' or 'quack' instead."
             )
@@ -86,7 +90,7 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 
         _fused_moe_forward = npu_fused_moe_forward
     elif fused_moe_kernel == "quack":
-        if is_torch_npu_available():
+        if is_npu_device_available():
             raise RuntimeError("fused_moe_kernel='quack' is GPU-only. Use 'npu' on NPU devices.")
         if not is_quack_gemm_available():
             raise RuntimeError(
@@ -97,7 +101,7 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 
         _fused_moe_forward = quack_gemm_fused_moe_forward
     elif fused_moe_kernel == "triton":
-        if is_torch_npu_available():
+        if is_npu_device_available():
             raise RuntimeError("fused_moe_kernel='triton' is GPU-only. Use 'npu' on NPU devices.")
         if not is_fused_moe_available():
             raise RuntimeError("fused_moe_kernel='triton' requires triton to be installed and a supported GPU.")

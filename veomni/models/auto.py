@@ -132,6 +132,32 @@ def _module_has_opslot(modeling_module, op_name: str) -> bool:
     return False
 
 
+def _config_is_moe(config) -> bool:
+    """Heuristic: model has MoE if any nested config exposes >1 experts.
+
+    HF MoE configs use a few different attribute names depending on lineage
+    (``num_experts``, ``num_local_experts``, ``moe_num_experts``); VLM wrapper
+    configs nest the language/text config under ``text_config`` /
+    ``language_config``. Returns True if any of those positions look MoE.
+    """
+    candidate_attrs = ("num_experts", "num_local_experts", "moe_num_experts")
+    nested_attrs = ("text_config", "language_config")
+
+    def _check(cfg) -> bool:
+        if cfg is None:
+            return False
+        for attr in candidate_attrs:
+            value = getattr(cfg, attr, None)
+            if isinstance(value, int) and value > 1:
+                return True
+        for attr in nested_attrs:
+            if _check(getattr(cfg, attr, None)):
+                return True
+        return False
+
+    return _check(config)
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
@@ -248,6 +274,16 @@ def build_foundation_model(
     # so we can skip the legacy patch for models that own a ``moe_experts``
     # OpSlot (qwen3_5_moe and friends).
     #
+    # We also skip the patch entirely for non-MoE architectures (Llama, plain
+    # Qwen, etc.). Pre-PR #699 the default was ``"eager"`` so this was a no-op,
+    # but with the new ``"auto"`` default the resolved value is ``"fused_*"``,
+    # which would otherwise trigger ``apply_veomni_fused_moe_patch`` —
+    # importing triton and binding the global pointer for models that never
+    # call it. Worse, on dual-stack hosts (CUDA + ``torch_npu`` package) the
+    # bind itself would fail. ``_config_is_moe`` walks the config (and any
+    # ``text_config``/``language_config`` sub-configs for VLM wrappers) and
+    # only returns True when an MoE expert dimension is actually present.
+    #
     # TODO(kernel-registry): migrate the remaining legacy ``_moe_implementation``
     # users to the OpSlot("moe_experts", …) + KERNEL_REGISTRY pattern that
     # qwen3_5_moe already uses; once they do, drop this whole pre-load block.
@@ -257,6 +293,10 @@ def build_foundation_model(
         if _module_has_opslot(pre_load_modeling_module, "moe_experts"):
             logger.info_rank0(
                 f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
+            )
+        elif not _config_is_moe(config):
+            logger.debug_rank0(
+                f"Model has no MoE experts; skipping legacy moe_implementation={moe_implementation!r} patch."
             )
         else:
             apply_moe_patch_transformers_v4(config, moe_implementation)

@@ -44,13 +44,19 @@ from veomni.ops.kernels.moe import apply_veomni_fused_moe_patch
 _MOE_MODULE = "veomni.ops.kernels.moe"
 
 
-@patch(f"{_MOE_MODULE}.is_torch_npu_available", return_value=True)
+# The MoE patch routes NPU/GPU branching through the device-aware
+# ``is_npu_device_available`` (not the bare ``torch_npu`` package check), so
+# dual-stack hosts that merely have ``torch_npu`` installed don't get
+# mis-classified as NPU. Tests patch the device probe accordingly.
+
+
+@patch(f"{_MOE_MODULE}.is_npu_device_available", return_value=True)
 def test_legacy_fused_quack_on_npu_raises(_mock_npu):
     with pytest.raises(RuntimeError, match="quack.*GPU-only"):
         apply_veomni_fused_moe_patch(fused_moe_kernel="quack")
 
 
-@patch(f"{_MOE_MODULE}.is_torch_npu_available", return_value=False)
+@patch(f"{_MOE_MODULE}.is_npu_device_available", return_value=False)
 @patch(f"{_MOE_MODULE}.is_quack_gemm_available", return_value=False)
 def test_legacy_fused_quack_without_sm90_raises(_mock_quack, _mock_npu):
     """``is_quack_gemm_available()`` returns False on sub-SM90 GPUs (e.g. A100)."""
@@ -58,13 +64,13 @@ def test_legacy_fused_quack_without_sm90_raises(_mock_quack, _mock_npu):
         apply_veomni_fused_moe_patch(fused_moe_kernel="quack")
 
 
-@patch(f"{_MOE_MODULE}.is_torch_npu_available", return_value=True)
+@patch(f"{_MOE_MODULE}.is_npu_device_available", return_value=True)
 def test_legacy_fused_triton_on_npu_raises(_mock_npu):
     with pytest.raises(RuntimeError, match="triton.*GPU-only"):
         apply_veomni_fused_moe_patch(fused_moe_kernel="triton")
 
 
-@patch(f"{_MOE_MODULE}.is_torch_npu_available", return_value=False)
+@patch(f"{_MOE_MODULE}.is_npu_device_available", return_value=False)
 def test_legacy_fused_npu_on_gpu_raises(_mock_npu):
     with pytest.raises(RuntimeError, match="npu.*requires torch_npu"):
         apply_veomni_fused_moe_patch(fused_moe_kernel="npu")

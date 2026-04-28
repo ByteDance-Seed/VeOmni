@@ -84,9 +84,18 @@ def is_triton_available() -> bool:
 
 
 def is_fused_moe_available() -> bool:
+    """Triton fused MoE is callable: CUDA device present, no NPU device, ``triton`` importable.
+
+    Uses the device-aware ``is_npu_device_available`` rather than the bare
+    package check ``_PACKAGE_FLAGS["torch_npu"]`` so dual-stack hosts (CUDA
+    machines that merely have ``torch_npu`` installed for cross-platform dev)
+    don't get mis-classified as NPU and lose the GPU fused path.
+    """
     import torch
 
-    return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
+    from .device import is_npu_device_available
+
+    return torch.cuda.is_available() and not is_npu_device_available() and _PACKAGE_FLAGS["triton"]
 
 
 def is_quack_package_available() -> bool:
@@ -95,10 +104,14 @@ def is_quack_package_available() -> bool:
 
 
 def is_quack_gemm_available() -> bool:
-    """Check if quack GEMM kernels can run (package installed + SM90+ GPU)."""
-    from .device import is_sm90_or_above
+    """Check if quack GEMM kernels can run (package installed + SM90+ GPU + no NPU device).
 
-    return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and is_sm90_or_above()
+    Same dual-stack rationale as ``is_fused_moe_available``: gate on actual
+    NPU device presence, not just the ``torch_npu`` package.
+    """
+    from .device import is_npu_device_available, is_sm90_or_above
+
+    return is_quack_package_available() and not is_npu_device_available() and is_sm90_or_above()
 
 
 def is_video_audio_available() -> bool:
