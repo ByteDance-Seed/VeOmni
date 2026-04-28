@@ -29,7 +29,16 @@ _HAS_LIGER = is_liger_kernel_available()
 # standard ``--extra npu`` install does NOT ship triton-ascend.
 _HAS_TRITON = is_package_available("triton")
 _FUSED_MOE_IMPL = "fused_npu" if _IS_NPU else "fused_triton"
-_ATTN_IMPL = "sdpa" if _IS_NPU else "flash_attention_2"
+# Attention: keep ``flash_attention_2`` on both GPU and NPU. The Ulysses-SP
+# rewrite in ``OpsImplementationConfig.__post_init__`` only kicks in for
+# ``flash_attention_*`` names → ``veomni_flash_attention_*_with_sp`` (which
+# does the cross-rank Q/K/V gather/scatter). ``sdpa`` is not in the rewrite
+# map, so picking it on NPU with ``ulysses_size>1`` enables SP in
+# ``parallel_state`` but leaves attention running locally per rank — the
+# sp1/sp2 e2e alignment test (``test_text_parallel_align``) catches that
+# regression. NPU + FA2 is supported by the OSS NPU CI image and by
+# downstream third-party FA-on-Ascend providers.
+_ATTN_IMPL = "flash_attention_2"
 # RMSNorm / RoPE: NPU has its own fused kernel; GPU uses Liger if available.
 _RMS_NORM_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
 _ROTARY_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
