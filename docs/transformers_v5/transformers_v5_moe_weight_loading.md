@@ -9,7 +9,7 @@ Transformers v5 introduced expert-dispatch integration points (`use_experts_impl
 For VeOmni qwen3_moe transformers v5 path, we use a simpler path:
 - patch experts behavior in generated modeling;
 - call `veomni.ops.fused_moe_forward(...)` explicitly in the patched forward;
-- keep `_moe_implementation` (`eager` or `fused`) as runtime selection.
+- gate the call on a module-level `OpSlot("moe_experts", "standard")` whose `use_non_eager_impl` flag is bound from `OpsImplementationConfig.moe_implementation` by `_bind_veomni_ops` at model-build time.
 
 ## Survey: Qwen MoE Weight Formats
 
@@ -109,9 +109,12 @@ Checkpoint loading behavior:
   - `experts.down_proj` `[E, H, I]`
   Unlike the v5 converter, the v4 converter does **not** cat gate+up — v4
   modeling holds them as separate parameters.
-- For Qwen3-Omni-MoE the converter only fires for the **thinker** tower and
-  only when `_moe_implementation == "fused"`. The talker tower (and the
-  thinker in eager mode) keep `nn.ModuleList` experts and load HF per-expert
+- For Qwen3-Omni-MoE the converter only fires for the **thinker** tower.
+  Both eager and fused modes share the same stacked-parameter storage now
+  (the eager path runs the standard expert loop over the stacked tensors
+  via `F.linear`), so the converter always fires for thinker keys regardless
+  of the runtime `ops_implementation.moe_implementation` selection. The
+  talker tower keeps `nn.ModuleList` experts and consumes HF per-expert
   keys natively.
 
 The offline `scripts/moe_ckpt_merge/moe_merge.py` script is **deprecated** but

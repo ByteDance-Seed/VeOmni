@@ -365,16 +365,22 @@ def _omni_text_model_standalone(moe_implementation: str = "fused"):
 
 
 class TestQwen3OmniMoeV4FactoryFusedGate:
-    def test_returns_none_in_eager_mode(self):
-        """In eager mode the thinker uses nn.ModuleList and HF per-expert keys map directly."""
-        assert create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("eager")) is None
+    """After the OpSlot migration the thinker uses stacked-parameter storage in
+    both eager and fused modes (the eager path runs the standard expert loop
+    over the stacked tensors), so the converter always fires for thinker keys.
+    """
 
-    def test_returns_none_when_implementation_unset(self):
-        """No `_moe_implementation` set → fallback is eager (per modeling code)."""
+    def test_returns_converter_in_eager_mode(self):
+        assert isinstance(
+            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("eager")),
+            MoEV4StackingConverter,
+        )
+
+    def test_returns_converter_when_implementation_unset(self):
         text_config = SimpleNamespace(num_experts=NUM_EXPERTS)
         thinker_config = SimpleNamespace(text_config=text_config)
         model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config))
-        assert create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model) is None
+        assert isinstance(create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model), MoEV4StackingConverter)
 
     def test_returns_converter_in_fused_mode(self):
         assert isinstance(

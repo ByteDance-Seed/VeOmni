@@ -24,7 +24,7 @@ Covers the thinker training path (text + vision + audio + MoE):
   - Thinker ForConditionalGeneration: pre-computed image/video/audio masks,
     async-Ulysses-aware embed gather+scatter, deepstack SP selection, fused
     loss via self.loss_function, precomputed multimodal position-ids
-  - Qwen3OmniMoeForConditionalGeneration: propagate _moe_implementation
+  - Qwen3OmniMoeForConditionalGeneration: skip talker, pin _no_split_modules
     down to thinker.text_config, forward-to-thinker only (skip talker),
     VeOmni parallel plan.
 
@@ -118,6 +118,7 @@ config.add_post_import_block(
     # Only the Thinker forward is in VeOmni's training path (Talker/CodePredictor
     # are inference-only speech paths excluded from the generated file).
     from veomni.ops.dispatch import OpSlot
+    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     """
@@ -909,9 +910,9 @@ def qwen3_omni_moe_thinker_text_deepstack_process_patched(
 # Patch: Qwen3OmniMoeThinkerTextExperts (replace_class)
 # 1. Drop the upstream `@use_experts_implementation` decorator — routing
 #    through ALL_EXPERTS_FUNCTIONS bypasses our fused MoE kernel.
-# 2. Add VeOmni fused-MoE dispatch via the `_moe_implementation` flag; pass
-#    `gate_up_proj` directly as `fc1_1_2_weight` (v5 already stores it in
-#    the fused `[E, 2*I, H]` layout).
+# 2. Add VeOmni fused-MoE dispatch via the module-level
+#    ``veomni_moe_experts_forward`` OpSlot; pass `gate_up_proj` directly as
+#    `fc1_1_2_weight` (v5 already stores it in the fused `[E, 2*I, H]` layout).
 # ================================================================
 @config.replace_class(
     "Qwen3OmniMoeThinkerTextExperts",
@@ -928,12 +929,6 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        # --- Patch.2 ---
-        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
-        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
-        # apply_moe_patch_transformers_v4 *before* loader.load_model.
-        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
-        # --- Patch.2 ---
 
     def forward(
         self,
@@ -943,8 +938,8 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         # --- Patch.2 ---
-        if self._moe_implementation == "fused":
-            final_hidden_states = fused_moe_forward(
+        if veomni_moe_experts_forward.use_non_eager_impl:
+            return fused_moe_forward(
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
@@ -954,26 +949,24 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
                 fc2_weight=self.down_proj,
                 fc1_1_2_weight=self.gate_up_proj,
             )
-        elif self._moe_implementation == "eager":
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-            for expert_idx in expert_hit:
-                expert_idx = expert_idx[0]
-                if expert_idx == self.num_experts:
-                    continue
-                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-                current_state = hidden_states[token_idx]
-                gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-                current_hidden_states = self.act_fn(gate) * up
-                current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-        else:
-            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
         # --- Patch.2 ---
+
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
 
@@ -1391,10 +1384,7 @@ def qwen3_omni_moe_thinker_forward_patched(
 
 # ================================================================
 # Patch: Qwen3OmniMoeForConditionalGeneration.__init__
-# 1. [MoE] Propagate `_moe_implementation` down to `config.thinker_config`
-#    and `config.thinker_config.text_config` so the fused SparseMoeBlock
-#    picks up the correct mode before sub-module construction.
-# 2. [Talker] Force `has_talker=False` — VeOmni's training path only
+# 1. [Talker] Force `has_talker=False` — VeOmni's training path only
 #    forwards through `thinker` (see the patched `forward` below), so
 #    constructing the talker and code2wav would only add unused
 #    parameters and drag `Qwen3OmniMoeTalker*Layer` into the FSDP
@@ -1403,39 +1393,35 @@ def qwen3_omni_moe_thinker_forward_patched(
 #    `modeling_utils.PreTrainedModel.post_init`). Unused talker layers
 #    FSDP-wrapped but never forwarded cause a rank-desync hang during
 #    asymmetric-modality forward.
-# 3. [FSDP] After `post_init`, replace the aggregated
+# 2. [FSDP] After `post_init`, replace the aggregated
 #    `self._no_split_modules` with the exact VeOmni target set. The
 #    upstream top-level `Qwen3OmniMoePreTrainedModel._no_split_modules`
 #    lists `Qwen3OmniMoeDecoderLayer` (a typo — no such class exists),
 #    which `post_init` seeds into the aggregation. Resetting here
 #    removes the phantom entry and pins the set to the three real
 #    training targets.
+# 3. [State-dict] Drop talker/code2wav keys on state-dict load.
 # ================================================================
 @config.override_method(
     "Qwen3OmniMoeForConditionalGeneration.__init__",
-    description="Propagate _moe_implementation, skip talker, pin _no_split_modules, drop talker/code2wav keys on state-dict load",
+    description="Skip talker, pin _no_split_modules, drop talker/code2wav keys on state-dict load",
 )
 def qwen3_omni_moe_for_conditional_generation_init_patched(self, config):
-    # --- Patch.1 ---
-    moe_implementation = getattr(config, "_moe_implementation", "eager")
-    config.thinker_config._moe_implementation = moe_implementation
-    config.thinker_config.text_config._moe_implementation = moe_implementation
-    # --- Patch.1 ---
     super().__init__(config)
     self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration._from_config(config.thinker_config)
-    # --- Patch.2 ---
+    # --- Patch.1 ---
     self.has_talker = False
-    # --- Patch.2 ---
+    # --- Patch.1 ---
     self.post_init()
-    # --- Patch.3 ---
+    # --- Patch.2 ---
     self._no_split_modules = {
         "Qwen3OmniMoeThinkerTextDecoderLayer",
         "Qwen3OmniMoeVisionBlock",
         "Qwen3OmniMoeAudioEncoderLayer",
     }
-    # --- Patch.3 ---
+    # --- Patch.2 ---
 
-    # --- Patch.4 ---
+    # --- Patch.3 ---
     # Training builds the model with ``has_talker=False`` and excludes
     # ``Qwen3OmniMoeTalker*`` / ``Qwen3OmniMoeCode2Wav*`` classes from the
     # generated module entirely. Full pretrained checkpoints and HF-backend
@@ -1455,7 +1441,7 @@ def qwen3_omni_moe_for_conditional_generation_init_patched(self, config):
                 del state_dict[k]
 
     self.register_load_state_dict_pre_hook(_drop_talker_and_code2wav_keys)
-    # --- Patch.4 ---
+    # --- Patch.3 ---
 
 
 # ================================================================

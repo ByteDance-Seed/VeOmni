@@ -30,7 +30,7 @@ from ..ops.dispatch import OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from ..utils.import_utils import is_transformers_version_greater_or_equal_to
-from .loader import BaseModelLoader, get_loader, get_model_class, get_model_config, get_model_processor
+from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
 
 
 if TYPE_CHECKING:
@@ -61,44 +61,13 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
-def apply_moe_patch_transformers_v4(config, moe_implementation: str):
-    """Legacy MoE dispatch path for models that don't use OpSlot.
-
-    User-facing ``moe_implementation`` is a single field with values
-    ``"eager"``/``"fused_triton"``/``"fused_quack"``. Legacy modeling code
-    (qwen3_moe, deepseek_v3, etc.) only checks ``config._moe_implementation``
-    for the coarse ``"eager"``/``"fused"`` distinction, so we split the user
-    value into (mode, kernel) here and bind the fused kernel separately.
-    """
-    if moe_implementation == "eager":
-        logger.warning_rank0("You are using eager moe implementation, expect this to be VERY SLOW!")
-        config._moe_implementation = "eager"
-        return
-
-    if not moe_implementation.startswith("fused_"):
-        raise ValueError(
-            f"Invalid moe_implementation: {moe_implementation!r}. "
-            "Expected 'eager' or a 'fused_<kernel>' name. OSS kernels: "
-            "'fused_triton', 'fused_quack', 'fused_npu'. Third-party backends "
-            "may register additional 'fused_<name>' values; if you set one, "
-            "make sure the corresponding kernel is installed and registered."
-        )
-
-    fused_moe_kernel = moe_implementation.removeprefix("fused_")
-    logger.info_rank0(f"MoE implementation: fused (kernel={fused_moe_kernel})")
-    config._moe_implementation = "fused"
-
-    from ..ops.kernels.moe import apply_veomni_fused_moe_patch
-
-    apply_veomni_fused_moe_patch(fused_moe_kernel=fused_moe_kernel)
-
-
 def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
     """Bind all OpSlot instances found in *modeling_module*.
 
     Returns ``True`` if at least one OpSlot was found (and bound).
     """
     found = False
+    moe_experts_kernel: Optional[str] = None
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
         if isinstance(obj, OpSlot):
@@ -113,23 +82,26 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
                     if ops_config.moe_implementation == "eager"
                     else ops_config.moe_implementation.removeprefix("fused_")
                 )
+                if impl_name != "eager":
+                    moe_experts_kernel = impl_name
             else:
                 impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
             obj.bind(impl_name)
             logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
             found = True
+
+    # When a model owns a ``moe_experts`` OpSlot, we install the global
+    # ``_fused_moe_forward`` function pointer here as well — modeling code
+    # (both v4 monkey-patched and v5 patchgen) calls
+    # ``veomni.ops.fused_moe_forward(...)`` directly inside the OpSlot guard
+    # rather than going through the slot's ``__call__``. Eager bindings leave
+    # the pointer untouched.
+    if moe_experts_kernel is not None:
+        from ..ops.kernels.moe import apply_veomni_fused_moe_patch
+
+        apply_veomni_fused_moe_patch(fused_moe_kernel=moe_experts_kernel)
+
     return found
-
-
-def _module_has_opslot(modeling_module, op_name: str) -> bool:
-    """Return True if *modeling_module* declares an OpSlot for *op_name*."""
-    if modeling_module is None:
-        return False
-    for name in dir(modeling_module):
-        obj = getattr(modeling_module, name, None)
-        if isinstance(obj, OpSlot) and obj.op_name == op_name:
-            return True
-    return False
 
 
 def build_foundation_model(
@@ -149,7 +121,6 @@ def build_foundation_model(
             "native-sparse",
         ]
     ] = "veomni_flash_attention_2_with_sp",
-    moe_implementation: Optional[str] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
@@ -239,27 +210,6 @@ def build_foundation_model(
         empty_init = True
     else:
         empty_init = False
-
-    # ── Pre-load: legacy MoE config patch ─────────────────────────────────
-    # Models like qwen3_moe capture ``config._moe_implementation`` inside
-    # ``PatchQwen3MoeExperts.__init__``, so the legacy patch has to land on
-    # *config* before ``loader.load_model`` instantiates the experts.
-    # We look up the modeling module via ``get_model_class`` (config → class)
-    # so we can skip the legacy patch for models that own a ``moe_experts``
-    # OpSlot (qwen3_5_moe and friends).
-    #
-    # TODO(kernel-registry): migrate the remaining legacy ``_moe_implementation``
-    # users to the OpSlot("moe_experts", …) + KERNEL_REGISTRY pattern that
-    # qwen3_5_moe already uses; once they do, drop this whole pre-load block.
-    # Current holdouts: qwen3_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3.
-    if moe_implementation is not None:
-        pre_load_modeling_module = sys.modules.get(get_model_class(config).__module__)
-        if _module_has_opslot(pre_load_modeling_module, "moe_experts"):
-            logger.info_rank0(
-                f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
-            )
-        else:
-            apply_moe_patch_transformers_v4(config, moe_implementation)
 
     model = loader.load_model(
         init_kwargs=init_kwargs,

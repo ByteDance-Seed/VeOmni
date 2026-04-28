@@ -244,7 +244,6 @@ class BaseTrainer(Stateful, ABC):
             weights_path=self.args.model.model_path,
             torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
             attn_implementation=self.args.model.ops_implementation.attn_implementation,
-            moe_implementation=self.args.model.ops_implementation.moe_implementation,
             init_device=self.args.train.init_device,
         )
         self.model_config = self.model.config

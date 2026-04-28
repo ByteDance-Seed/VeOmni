@@ -76,8 +76,10 @@ def register_qwen3_omni_moe_modeling(architecture: str):
 
         # Stack per-expert HF weights into the thinker's three 3-D nn.Parameters at
         # load time (Qwen3OmniMoeThinkerExperts.gate_proj/up_proj/down_proj). The
-        # factory returns None when `_moe_implementation != "fused"`, so eager-mode
-        # loads (which use nn.ModuleList for the thinker too) are unaffected.
+        # thinker uses the same stacked layout in both eager and fused modes
+        # (the eager path runs the standard expert loop over the stacked tensors),
+        # so the converter always fires for thinker keys regardless of the runtime
+        # ops_implementation.moe_implementation selection.
         for model_cls in (
             Qwen3OmniMoeForConditionalGeneration,
             Qwen3OmniMoeThinkerForConditionalGeneration,

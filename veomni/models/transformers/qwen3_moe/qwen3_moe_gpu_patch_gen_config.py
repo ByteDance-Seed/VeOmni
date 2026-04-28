@@ -51,6 +51,7 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # These are bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     """
@@ -89,10 +90,6 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         )
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
-        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
-        # apply_moe_patch_transformers_v4 *before* loader.load_model.
-        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
     def forward(
         self,
@@ -101,29 +98,10 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
-        if self._moe_implementation == "eager":
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-            for expert_idx in expert_hit:
-                expert_idx = expert_idx[0]
-                if expert_idx == self.num_experts:
-                    continue
-                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-                current_state = hidden_states[token_idx]
-                gate_up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx])
-                gate, up = gate_up.chunk(2, dim=-1)
-                current_hidden_states = self.act_fn(gate) * up
-                current_hidden_states = torch.nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-        elif self._moe_implementation == "fused":
-            top_k_weights = top_k_weights.to(final_hidden_states.dtype)
-            final_hidden_states = fused_moe_forward(
+        if veomni_moe_experts_forward.use_non_eager_impl:
+            return fused_moe_forward(
                 num_experts=self.num_experts,
-                routing_weights=top_k_weights,
+                routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
                 hidden_states=hidden_states,
                 fc1_1_weight=None,
@@ -131,8 +109,24 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
                 fc2_weight=self.down_proj,
                 fc1_1_2_weight=self.gate_up_proj,
             )
-        else:
-            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
+
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate_up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = torch.nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
 

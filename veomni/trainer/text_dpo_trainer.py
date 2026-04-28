@@ -140,7 +140,6 @@ class TextDPOTrainer:
             weights_path=args.model.model_path,
             torch_dtype=args.dpo_config.refer_model_precision,
             attn_implementation=args.model.ops_implementation.attn_implementation,
-            moe_implementation=args.model.ops_implementation.moe_implementation,
             init_device=args.train.init_device,
         )
 

@@ -27,9 +27,11 @@ target only matches its own keys. The top-level pattern intentionally excludes
 the talker tower: in v4 the talker keeps ``nn.ModuleList`` experts and consumes
 HF per-expert keys natively, so passing them through unchanged is required.
 
-The converter is also a no-op when ``_moe_implementation != "fused"`` because
-the thinker uses ``nn.ModuleList`` in eager mode too — the factory returns
-``None`` in that case.
+After the OpSlot migration, the thinker uses stacked-parameter storage in
+both eager and fused modes (the eager path runs the standard expert loop
+over the stacked tensors via ``F.linear``), so the converter always fires
+for thinker keys regardless of the runtime ``ops_implementation.moe_implementation``
+selection.
 """
 
 import re
@@ -48,11 +50,7 @@ _TEXT_MODEL_PATTERN = re.compile(r"^(layers\.\d+\.mlp)" + _PROJ_SUFFIX)
 
 
 def create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model):
-    """Factory registered on v4 Qwen3-Omni-MoE classes via `_create_checkpoint_tensor_converter`.
-
-    Returns ``None`` outside fused mode: in eager mode the thinker uses
-    ``nn.ModuleList`` whose per-expert FQNs already match the HF checkpoint.
-    """
+    """Factory registered on v4 Qwen3-Omni-MoE classes via `_create_checkpoint_tensor_converter`."""
     config = model.config
     # Resolve text config and the matching key-prefix pattern from whichever
     # config shape the model carries.
@@ -68,12 +66,6 @@ def create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model):
         # Qwen3OmniMoeThinkerTextConfig — text model is the root.
         text_config = config
         pattern = _TEXT_MODEL_PATTERN
-
-    moe_implementation = getattr(text_config, "_moe_implementation", None) or getattr(
-        config, "_moe_implementation", "eager"
-    )
-    if moe_implementation != "fused":
-        return None
 
     num_experts = text_config.num_experts
     return MoEV4StackingConverter(

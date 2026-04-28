@@ -271,7 +271,6 @@ class DiTTrainer:
                 weights_path=args.model.model_path,
                 torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 attn_implementation=args.model.ops_implementation.attn_implementation,
-                moe_implementation=args.model.ops_implementation.moe_implementation,
                 init_device=args.train.init_device,
             )
             self.base.model_config = getattr(self.base.model, "config", None)

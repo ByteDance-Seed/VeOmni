@@ -24,6 +24,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from ....ops import fused_moe_forward
+from ....ops.dispatch import OpSlot
 from ....utils import logging
 
 
@@ -40,13 +41,19 @@ FA_NEED_V_PADDING = (
 logger = logging.get_logger(__name__)
 
 
+# Module-level OpSlot bound by `_bind_veomni_ops` in `auto.py` after the model
+# is constructed. `use_non_eager_impl` flips to True when the user selects a
+# fused MoE backend in `OpsImplementationConfig.moe_implementation`.
+veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
+
+
 # ================================================================
 # Patch: DeepseekV3TopkRouter, DeepseekV3NaiveMoe
 # 1. Patch to merge ckpt and align with transformers v5, in case upgrade to v5.0.0 later.
 #    https://github.com/huggingface/transformers/blob/v5.0.0/src/transformers/models/deepseek_v3/modeling_deepseek_v3.py
 # 2. Support init weight function for experts and gate. Also will be
 #    align with transformers v5.0.0, just temporary in transformers v4.57.3.
-# 3. Add fused moe implementation with triton.
+# 3. Add fused moe implementation via OpSlot dispatch.
 # ================================================================
 def _init_weight(
     tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0, generator: torch.Generator | None = None
@@ -87,10 +94,6 @@ class PatchDeepseekV3NaiveMoe(nn.Module):
         self.up_proj = nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
-        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
-        # apply_moe_patch_transformers_v4 *before* loader.load_model.
-        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 
     def forward(
         self,
@@ -98,49 +101,41 @@ class PatchDeepseekV3NaiveMoe(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        if self._moe_implementation == "eager":
-            # Accumulate in top_k_weights dtype (fp32) to match HF's
-            # DeepseekV3MoE.moe, which allocates final_hidden_states with
-            # `dtype=topk_weights.dtype` and casts to input dtype only at
-            # return. Accumulating in bf16 per-expert introduces extra
-            # rounding that breaks bitwise parity with HF.
-            final_hidden_states = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-            for expert_idx in expert_hit:
-                expert_idx = expert_idx[0]
-                if expert_idx == self.num_experts:
-                    continue
-                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-                current_state = hidden_states[token_idx]
-                gate = nn.functional.linear(current_state, self.gate_proj[expert_idx])
-                up = nn.functional.linear(current_state, self.up_proj[expert_idx])
-                current_hidden_states = self.act_fn(gate) * up
-                current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states)
-            final_hidden_states = final_hidden_states.to(hidden_states.dtype)
-        elif self._moe_implementation == "fused":
-            # cast top_k_weights to dtype of hidden_states to satisfy the
-            # fused MoE kernel's half-precision requirement
-            top_k_weights = top_k_weights.to(hidden_states.dtype)
-
-            final_hidden_states = fused_moe_forward(
+        if veomni_moe_experts_forward.use_non_eager_impl:
+            return fused_moe_forward(
                 num_experts=self.num_experts,
-                routing_weights=top_k_weights,
+                routing_weights=top_k_weights.to(hidden_states.dtype),
                 selected_experts=top_k_index,
                 hidden_states=hidden_states,
                 fc1_1_weight=self.gate_proj,
                 fc1_2_weight=self.up_proj,
                 fc2_weight=self.down_proj,
             )
-        else:
-            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
 
-        return final_hidden_states
+        # Accumulate in top_k_weights dtype (fp32) to match HF's
+        # DeepseekV3MoE.moe, which allocates final_hidden_states with
+        # `dtype=topk_weights.dtype` and casts to input dtype only at
+        # return. Accumulating in bf16 per-expert introduces extra
+        # rounding that breaks bitwise parity with HF.
+        final_hidden_states = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate = nn.functional.linear(current_state, self.gate_proj[expert_idx])
+            up = nn.functional.linear(current_state, self.up_proj[expert_idx])
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states)
+        return final_hidden_states.to(hidden_states.dtype)
 
 
 class PatchDeepseekV3MoE(nn.Module):
@@ -381,6 +376,14 @@ def apply_veomni_deepseek_v3_patch():
     hf_deepseek_v3.DeepseekV3Attention.forward = deepseek_v3_attention_forward
     hf_deepseek_v3.DeepseekV3ForCausalLM.forward = deepseek_v3_forcausal_lm_forward
     hf_deepseek_v3.DeepseekV3PreTrainedModel._init_weights = deepseek_v3_pretrained_model_init_weights
+
+    # Mirror the OpSlot onto the HF module so `_bind_veomni_ops` (which walks
+    # `sys.modules[model.__class__.__module__]`) finds it. On v4 the model
+    # class still resolves to the upstream HF module even though its
+    # DeepseekV3MoE has been monkey-patched to PatchDeepseekV3MoE. The
+    # mirrored attribute is the same Python object — binding mutates state
+    # seen by the closure inside PatchDeepseekV3NaiveMoe.forward.
+    hf_deepseek_v3.veomni_moe_experts_forward = veomni_moe_experts_forward
 
     from .device_patch import apply_veomni_deepseek_v3_device_patch
 
