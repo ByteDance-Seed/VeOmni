@@ -292,7 +292,7 @@ without modifying the config class.
 | full_shard | `bool` | `True` | Enable full sharding — equivalent to ZeRO-3. |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload (FSDP1 only). |
-| max_load_broadcast_size | `float` | `20.0` | Maximum load broadcast size (FSDP2). |
+| max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
 ### MixedPrecisionConfig

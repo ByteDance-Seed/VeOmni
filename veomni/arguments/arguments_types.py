@@ -249,7 +249,9 @@ class FSDPConfig:
     )
     max_load_broadcast_size: float = field(
         default=20.0,
-        metadata={"help": "Max parameter load and broadcast size (GB) for FSDP2."},
+        metadata={
+            "help": "Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting."
+        },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
