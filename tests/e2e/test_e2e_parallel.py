@@ -27,7 +27,6 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         weights_path=None,
         torch_dtype="float32",
         attn_implementation="eager",
-        moe_implementation="eager",
         init_device=get_device_type(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)

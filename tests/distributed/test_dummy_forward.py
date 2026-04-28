@@ -161,7 +161,6 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
         weights_path=None,
         torch_dtype="float32",
         attn_implementation="eager",
-        moe_implementation="eager",
         init_device="meta",
     )
     model.train()

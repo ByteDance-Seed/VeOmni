@@ -340,51 +340,50 @@ class TestDeepseekV3V4Factory:
 
 
 # ---------------------------------------------------------------------------
-# qwen3_omni_moe v4 factory — conditional on _moe_implementation
+# qwen3_omni_moe v4 factory — always fires after OpSlot migration
 # ---------------------------------------------------------------------------
 
 
-def _omni_top_level_model(moe_implementation: str = "fused"):
+def _omni_top_level_model():
     """SimpleNamespace mimicking Qwen3OmniMoeForConditionalGeneration's config shape."""
-    text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation=moe_implementation)
+    text_config = SimpleNamespace(num_experts=NUM_EXPERTS)
     thinker_config = SimpleNamespace(text_config=text_config)
-    return SimpleNamespace(
-        config=SimpleNamespace(thinker_config=thinker_config, _moe_implementation=moe_implementation)
-    )
+    return SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config))
 
 
-def _omni_thinker_standalone_model(moe_implementation: str = "fused"):
+def _omni_thinker_standalone_model():
     """SimpleNamespace mimicking Qwen3OmniMoeThinkerForConditionalGeneration's config shape."""
-    text_config = SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation=moe_implementation)
-    return SimpleNamespace(config=SimpleNamespace(text_config=text_config, _moe_implementation=moe_implementation))
+    text_config = SimpleNamespace(num_experts=NUM_EXPERTS)
+    return SimpleNamespace(config=SimpleNamespace(text_config=text_config))
 
 
-def _omni_text_model_standalone(moe_implementation: str = "fused"):
+def _omni_text_model_standalone():
     """SimpleNamespace mimicking Qwen3OmniMoeThinkerTextModel's config shape."""
-    return SimpleNamespace(config=SimpleNamespace(num_experts=NUM_EXPERTS, _moe_implementation=moe_implementation))
+    return SimpleNamespace(config=SimpleNamespace(num_experts=NUM_EXPERTS))
 
 
-class TestQwen3OmniMoeV4FactoryFusedGate:
+class TestQwen3OmniMoeV4FactoryFiresUnconditionally:
     """After the OpSlot migration the thinker uses stacked-parameter storage in
     both eager and fused modes (the eager path runs the standard expert loop
-    over the stacked tensors), so the converter always fires for thinker keys.
+    over the stacked tensors), so the converter always fires for thinker keys
+    regardless of the runtime ``ops_implementation.moe_implementation`` selection.
     """
 
-    def test_returns_converter_in_eager_mode(self):
+    def test_top_level(self):
         assert isinstance(
-            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("eager")),
+            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model()),
             MoEV4StackingConverter,
         )
 
-    def test_returns_converter_when_implementation_unset(self):
-        text_config = SimpleNamespace(num_experts=NUM_EXPERTS)
-        thinker_config = SimpleNamespace(text_config=text_config)
-        model = SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config))
-        assert isinstance(create_qwen3_omni_moe_v4_checkpoint_tensor_converter(model), MoEV4StackingConverter)
-
-    def test_returns_converter_in_fused_mode(self):
+    def test_thinker_standalone(self):
         assert isinstance(
-            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("fused")),
+            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_thinker_standalone_model()),
+            MoEV4StackingConverter,
+        )
+
+    def test_text_model_standalone(self):
+        assert isinstance(
+            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_text_model_standalone()),
             MoEV4StackingConverter,
         )
 
@@ -393,7 +392,7 @@ class TestQwen3OmniMoeV4FactoryTopLevel:
     """Top-level Qwen3OmniMoeForConditionalGeneration: thinker prefix only, talker keys pass through."""
 
     def setup_method(self):
-        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model("fused"))
+        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model())
 
     def test_handles_thinker_prefix(self):
         assert self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
@@ -427,7 +426,7 @@ class TestQwen3OmniMoeV4FactoryThinkerStandalone:
     """Standalone Qwen3OmniMoeThinkerForConditionalGeneration: experts under `model.layers.*`."""
 
     def setup_method(self):
-        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_thinker_standalone_model("fused"))
+        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_thinker_standalone_model())
 
     def test_handles_model_prefix(self):
         # The standalone thinker class wraps a `.model = Qwen3OmniMoeThinkerTextModel`,
@@ -453,7 +452,7 @@ class TestQwen3OmniMoeV4FactoryTextModelStandalone:
     """Standalone Qwen3OmniMoeThinkerTextModel: experts under `layers.*` (the model class IS the root)."""
 
     def setup_method(self):
-        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_text_model_standalone("fused"))
+        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_text_model_standalone())
 
     def test_handles_bare_layers_prefix(self):
         assert self.converter.can_handle("layers.0.mlp.experts.0.gate_proj.weight")
