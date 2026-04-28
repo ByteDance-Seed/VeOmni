@@ -16,39 +16,45 @@ from veomni.utils.import_utils import is_liger_kernel_available, is_package_avai
 from .launch_utils import find_free_port
 
 
-# Pick host-appropriate ops_implementation values. NPU users must opt in
-# explicitly for every GPU-only kernel; without these, the e2e tests would
-# trip ``OpsImplementationConfig._validate_device_compatibility`` (added in
-# the kernel-defaults refactor). Hosts without ``liger-kernel`` installed
-# (e.g. NPU CI) need ``eager`` for the Liger fields too.
-_IS_NPU = is_torch_npu_available()
-_HAS_LIGER = is_liger_kernel_available()
-# ``triton`` (CUDA) and ``triton-ascend`` (NPU) both expose the same import
-# name. Treat ``triton`` as available iff we can import it, regardless of
-# device — the load-balancing-loss kernel works on both stacks but the
-# standard ``--extra npu`` install does NOT ship triton-ascend.
-_HAS_TRITON = is_package_available("triton")
-_FUSED_MOE_IMPL = "fused_npu" if _IS_NPU else "fused_triton"
-# Attention: keep ``flash_attention_2`` on both GPU and NPU. The Ulysses-SP
-# rewrite in ``OpsImplementationConfig.__post_init__`` only kicks in for
-# ``flash_attention_*`` names → ``veomni_flash_attention_*_with_sp`` (which
-# does the cross-rank Q/K/V gather/scatter). ``sdpa`` is not in the rewrite
-# map, so picking it on NPU with ``ulysses_size>1`` enables SP in
-# ``parallel_state`` but leaves attention running locally per rank — the
-# sp1/sp2 e2e alignment test (``test_text_parallel_align``) catches that
-# regression. NPU + FA2 is supported by the OSS NPU CI image and by
-# downstream third-party FA-on-Ascend providers.
-_ATTN_IMPL = "flash_attention_2"
-# RMSNorm / RoPE: NPU has its own fused kernel; GPU uses Liger if available.
-_RMS_NORM_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
-_ROTARY_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
-# SwiGLU has no NPU fused kernel; CE on NPU goes through chunk_loss.
-_SWIGLU_IMPL = "eager" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
-_CE_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
-# Load-balancing-loss: triton-ascend is not in the standard ``--extra npu``
-# install, so we can't unconditionally pick triton on NPU. Fall back to
-# eager whenever the triton import would fail.
-_LB_LOSS_IMPL = "triton" if _HAS_TRITON else "eager"
+# Per-host ops_implementation values for tests that subprocess into a
+# training script. The new GPU-reasonable defaults raise on NPU for any
+# GPU-only field, so we spell each one out explicitly.
+_OPS_FIELDS = (
+    "attn_implementation",
+    "moe_implementation",
+    "rms_norm_implementation",
+    "rotary_pos_emb_implementation",
+    "swiglu_mlp_implementation",
+    "cross_entropy_loss_implementation",
+    "load_balancing_loss_implementation",
+)
+
+
+def _host_appropriate_impls() -> Dict[str, str]:
+    # triton-ascend is not in the standard --extra npu install, so the
+    # load-balancing-loss triton kernel must be gated on import availability
+    # regardless of device.
+    lb_loss = "triton" if is_package_available("triton") else "eager"
+    if is_torch_npu_available():
+        return {
+            "attn_implementation": "flash_attention_2",
+            "moe_implementation": "fused_npu",
+            "rms_norm_implementation": "npu",
+            "rotary_pos_emb_implementation": "npu",
+            "swiglu_mlp_implementation": "eager",  # no NPU fused SwiGLU
+            "cross_entropy_loss_implementation": "npu",
+            "load_balancing_loss_implementation": lb_loss,
+        }
+    liger = "liger_kernel" if is_liger_kernel_available() else "eager"
+    return {
+        "attn_implementation": "flash_attention_2",
+        "moe_implementation": "fused_triton",
+        "rms_norm_implementation": liger,
+        "rotary_pos_emb_implementation": liger,
+        "swiglu_mlp_implementation": liger,
+        "cross_entropy_loss_implementation": liger,
+        "load_balancing_loss_implementation": lb_loss,
+    }
 
 
 def host_appropriate_ops_cli_args(
@@ -59,50 +65,21 @@ def host_appropriate_ops_cli_args(
 ) -> List[str]:
     """Return ``--model.ops_implementation.*`` CLI args that work on this host.
 
-    The new GPU-reasonable defaults on ``OpsImplementationConfig`` raise on
-    NPU for any field whose default is GPU-only (Liger / fused_triton /
-    flash_attention_2). Tests that subprocess into a training script via
-    torchrun therefore need to spell out the per-host values explicitly so
-    ``OpsImplementationConfig.__post_init__`` does not blow up inside the
-    child process.
-
     Args:
         separator: ``"="`` for ``--key=value`` form (used by build_torchrun_cmd /
             most train scripts), or ``" "`` for the ``--key value`` form used
             by ``tests/checkpoints/utils.py``.
         attn_implementation: Override for the attention impl. When ``None``
-            (default) the helper picks a host-appropriate value (``sdpa`` on
-            NPU, ``flash_attention_2`` on GPU). Pass an explicit value to
-            keep the existing-test behaviour where attention mode is
-            chosen by the test.
-        eager_only: If True, every kernel field is set to ``"eager"`` —
-            universal and has zero runtime dependencies. Suitable for tests
-            that don't actually exercise model kernels (data-pipeline tests,
-            arg-parsing tests). Equivalent to passing
-            ``OpsImplementationConfig.eager_defaults()`` via CLI.
+            the helper picks a host-appropriate value.
+        eager_only: If True, every kernel field is set to ``"eager"`` (zero
+            runtime dependencies — for tests that don't exercise kernels).
+            Equivalent to passing ``OpsImplementationConfig.eager_defaults()``
+            via CLI.
     """
-    if eager_only:
-        attn = attn_implementation if attn_implementation is not None else "eager"
-        return [
-            f"--model.ops_implementation.attn_implementation{separator}{attn}",
-            f"--model.ops_implementation.moe_implementation{separator}eager",
-            f"--model.ops_implementation.rms_norm_implementation{separator}eager",
-            f"--model.ops_implementation.rotary_pos_emb_implementation{separator}eager",
-            f"--model.ops_implementation.swiglu_mlp_implementation{separator}eager",
-            f"--model.ops_implementation.cross_entropy_loss_implementation{separator}eager",
-            f"--model.ops_implementation.load_balancing_loss_implementation{separator}eager",
-        ]
-
-    attn = attn_implementation if attn_implementation is not None else _ATTN_IMPL
-    return [
-        f"--model.ops_implementation.attn_implementation{separator}{attn}",
-        f"--model.ops_implementation.moe_implementation{separator}{_FUSED_MOE_IMPL}",
-        f"--model.ops_implementation.rms_norm_implementation{separator}{_RMS_NORM_IMPL}",
-        f"--model.ops_implementation.rotary_pos_emb_implementation{separator}{_ROTARY_IMPL}",
-        f"--model.ops_implementation.swiglu_mlp_implementation{separator}{_SWIGLU_IMPL}",
-        f"--model.ops_implementation.cross_entropy_loss_implementation{separator}{_CE_IMPL}",
-        f"--model.ops_implementation.load_balancing_loss_implementation{separator}{_LB_LOSS_IMPL}",
-    ]
+    impls = dict.fromkeys(_OPS_FIELDS, "eager") if eager_only else _host_appropriate_impls()
+    if attn_implementation is not None:
+        impls["attn_implementation"] = attn_implementation
+    return [f"--model.ops_implementation.{k}{separator}{v}" for k, v in impls.items()]
 
 
 def release_device_memory():
