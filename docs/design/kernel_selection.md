@@ -19,11 +19,11 @@ selection knob.
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"eager"` | Model registration via ops config singleton |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"eager"` | `apply_ops_config()` (before model build) |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"eager"` | `build_foundation_model` |
+| MoE experts | `moe_implementation` | `eager`, `fused`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused"` | `build_foundation_model` |
 
-The per-op fields are typed as plain `str` (not `Literal`), so third-party
-backends can be registered via `extra_backends` in a model's `device_patch.py`
-without modifying `OpsImplementationConfig`.
+The per-op fields are typed as plain `str` (not `Literal`) so validation can
+live at each dispatch boundary. Some per-model ops still support third-party
+or model-local backends through `extra_backends` in a model's `device_patch.py`.
 
 ---
 
@@ -269,21 +269,30 @@ selected backend automatically — no per-model patching needed.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused_triton   # Triton group-gemm (GPU, SM70+)
+    moe_implementation: fused          # Auto: NPU -> fused_npu, SM100+ -> fused_quack, other GPUs -> fused_triton
+    # moe_implementation: fused_triton # Triton group-gemm (GPU, SM70+)
     # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (GPU, SM90+)
     # moe_implementation: fused_npu    # NPU group-gemm (Ascend)
     # moe_implementation: eager        # Reference PyTorch loop (very slow, debug only)
 ```
 
 **Field:** `OpsImplementationConfig.moe_implementation`
-**Default:** `"eager"`
+**Default:** `"fused"`
 
-The mode and kernel backend are expressed as a single field. Mismatches raise
-at ``apply_veomni_fused_moe_patch`` time — no silent hardware fallback.
+The mode and kernel backend are expressed as a single field. ``fused`` resolves
+to one concrete backend before model construction. Mismatches raise at
+``apply_veomni_fused_moe_patch`` / OpSlot bind time — no silent hardware
+fallback.
+
+Transformers v4 MoE models always use the legacy ``_moe_implementation`` +
+global ``fused_moe_forward`` path. Transformers v5 MoE models use OpSlot only
+when their generated modeling module declares ``OpSlot("moe_experts", ...)``;
+otherwise they remain on the same legacy global-pointer path.
 
 | Value | Kernel | Hardware | EP support |
 |-------|--------|----------|:----------:|
 | `eager` | PyTorch expert loop | Any | No |
+| `fused` | Auto: NPU, Quack on SM100+, otherwise Triton | NPU or CUDA GPU | Backend-dependent |
 | `fused_triton` | Triton group-gemm | GPU, SM70+ (V100+) | Yes |
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
@@ -368,7 +377,7 @@ All four are defined in `transformers.integrations`:
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
 | **Mechanism** | `apply_veomni_fused_moe_patch()` replaces the global `fused_moe_forward` function pointer. Internally `config._moe_implementation ∈ {"eager", "fused"}` flags whether the patched experts should call the pointer at all; the actual kernel (Triton / Quack / NPU) is selected by `OpsImplementationConfig.moe_implementation`. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"fused_npu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused"` / `"fused_triton"` / `"fused_quack"` / `"fused_npu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
 | **EP support** | `fused_triton` and `fused_npu` paths support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Deferred to `build_foundation_model()` | Decorator at class definition time; dispatch at forward time |
 

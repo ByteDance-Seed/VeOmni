@@ -51,7 +51,7 @@ depending on when and where the kernel is bound:
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
-| Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
+| Fused MoE | `moe_implementation` | build-time | `fused` | `eager`, `fused` (auto), `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
 
 \* The `triton` backend is registered per-model via `extra_backends`: DeepSeek
 V3 exposes a batch-invariant RMSNorm + deterministic RoPE, and Wan exposes its
@@ -69,6 +69,7 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `moe_implementation=fused_triton` | Triton, SM70+ | `is_fused_moe_available()` |
 | `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
 | `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
+| `moe_implementation=fused` | NPU, or CUDA GPU | auto-resolves to `fused_npu`, `fused_quack` on SM100+, otherwise `fused_triton` |
 
 ### Per-model PER_MODEL coverage
 

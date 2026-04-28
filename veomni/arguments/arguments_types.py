@@ -624,8 +624,8 @@ class OpsImplementationConfig:
     """model.ops_implementation.* — Attention, MoE, and fused kernel implementation.
 
     Each ``*_implementation`` field selects the kernel backend for that operation.
-    The type is ``str`` (not ``Literal``) so that third-party backends can be
-    registered without modifying this class.
+    The fields are typed as ``str`` (not ``Literal``) so backend validation can
+    live at the dispatch boundary instead of in the dataclass.
 
     Well-known values:
 
@@ -653,19 +653,18 @@ class OpsImplementationConfig:
         metadata={"help": "Attention implementation to use."},
     )
     moe_implementation: str = field(
-        default="eager",
+        default="fused",
         metadata={
             "help": "MoE experts forward implementation. "
+            "'fused' auto-selects 'fused_npu' on NPU, 'fused_quack' on SM100+ GPUs, "
+            "and 'fused_triton' on other GPUs. "
             "OSS backends: 'fused_triton' (Triton group-gemm, GPU, SM70+), "
             "'fused_quack' (Quack CUTLASS/CuTe, GPU, SM90+), "
             "'fused_npu' (NPU group-gemm, requires torch_npu), "
-            "'eager' (default, reference loop). "
+            "'eager' (reference loop). "
             "The backend must match the hardware — no silent fallback. "
-            "Typed as plain str (not Literal) so third-party backends can be "
-            "plugged in via `apply_veomni_fused_moe_patch` (legacy-dispatch "
-            "models) or `KERNEL_REGISTRY.register(op_name='moe_experts', ...)` "
-            "(OpSlot-dispatch models), matching the extensibility of the "
-            "other *_implementation fields."
+            "Typed as plain str so the CLI/dataclass layer stays simple; "
+            "validation and auto-resolution happen in build_foundation_model."
         },
     )
     cross_entropy_loss_implementation: str = field(

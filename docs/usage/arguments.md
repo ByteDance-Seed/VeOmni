@@ -130,13 +130,13 @@ Root config — assembles `model`, `data`, and `train`.
 `model.ops_implementation.*` — Attention, MoE, and fused kernel implementation.
 
 Each `*_implementation` field selects the kernel backend for that operation.
-The type is `str` (not `Literal`) so third-party backends can be registered
-without modifying the config class.
+The fields are typed as `str` so backend validation can live at the dispatch
+boundary instead of in the dataclass.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
-| moe_implementation | `Literal["eager", "fused_triton", "fused_quack", "fused_npu"]` | `"eager"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel. Mismatches (e.g. `fused_triton` on NPU) raise at patch time — no silent fallback. |
+| moe_implementation | `str` | `"fused"` | MoE experts forward implementation. `fused` auto-selects `fused_npu` on NPU, `fused_quack` on SM100+ GPUs, and `fused_triton` on other GPUs. Explicit values are `eager`, `fused_triton`, `fused_quack`, and `fused_npu`. Mismatches raise at patch time; there is no silent fallback. |
 | cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss; backs `ForCausalLM` + `ForConditionalGeneration`, `ForSequenceClassification` stays on eager). |
 | rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
 | swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
