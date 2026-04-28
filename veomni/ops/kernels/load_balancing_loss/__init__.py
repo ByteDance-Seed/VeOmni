@@ -75,7 +75,14 @@ register_op(
         global_slot="veomni.ops.kernels.load_balancing_loss:_load_balancing_loss",
         backends={
             "eager": BackendSpec(entry="veomni.ops.kernels.load_balancing_loss.eager:load_balancing_loss_pytorch"),
-            "triton": BackendSpec(entry="veomni.ops.kernels.load_balancing_loss.triton:load_balancing_loss_triton"),
+            # The triton kernel module does ``import triton`` at top level, so
+            # we need the package to be importable. On Ascend, ``triton-ascend``
+            # provides the ``triton`` namespace; if neither is installed the
+            # auto resolver downgrades to eager and explicit selections raise.
+            "triton": BackendSpec(
+                entry="veomni.ops.kernels.load_balancing_loss.triton:load_balancing_loss_triton",
+                requires=("triton",),
+            ),
         },
     )
 )
@@ -88,9 +95,9 @@ register_op_policy(
     OpPolicy(
         config_field="load_balancing_loss_implementation",
         # The triton backend works on both CUDA (`triton`) and NPU
-        # (`triton-ascend`), so auto picks it on either device. The OpSpec has
-        # no `requires=` clause for triton, so the auto resolver will trust
-        # the user; if triton is missing, the kernel raises at load time.
+        # (`triton-ascend`); both expose the same `triton` import name. The
+        # OpSpec declares `requires=("triton",)` so the auto resolver
+        # degrades to eager (with a warning) on hosts without it.
         auto_backends={"gpu": "triton", "npu": "triton"},
         label="LoadBalancingLoss",
     )

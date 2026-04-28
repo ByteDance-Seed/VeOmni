@@ -174,6 +174,14 @@ def _check_requires(requires: tuple[str, ...]) -> None:
 
             if not is_torch_npu_available():
                 raise RuntimeError("npu backend requested but torch_npu is not installed.")
+        elif pkg == "triton":
+            # Both `triton` (CUDA) and `triton-ascend` (NPU) expose the same
+            # `triton` import name; the package flag is set if either is
+            # importable.
+            from ...utils.import_utils import is_triton_available
+
+            if not is_triton_available():
+                raise RuntimeError("triton backend requested but neither triton nor triton-ascend is installed.")
         else:
             raise ValueError(f"Unsupported 'requires' token: {pkg!r}")
 

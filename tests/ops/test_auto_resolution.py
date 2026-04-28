@@ -171,6 +171,32 @@ def test_auto_on_cpu_host_falls_back_to_eager_everywhere():
 # ---------------------------------------------------------------------------
 
 
+def test_auto_degrades_to_eager_when_triton_missing_on_npu(veomni_log):
+    """NPU host without triton/triton-ascend -> load_balancing_loss falls back to eager.
+
+    Regression for the NPU CI failure where the default config picked
+    ``load_balancing_loss_implementation='triton'`` and crashed with
+    ``ModuleNotFoundError: No module named 'triton'`` at apply time.
+    """
+    flags = _all_packages_available()
+    flags["triton"] = False
+    with _force_device("npu"), mock.patch("veomni.utils.import_utils._PACKAGE_FLAGS", flags):
+        cfg = OpsImplementationConfig()
+    assert cfg.load_balancing_loss_implementation == "eager"
+    text = "\n".join(veomni_log)
+    assert "load_balancing_loss_implementation" in text
+    assert "falling back to 'eager'" in text
+
+
+def test_explicit_triton_raises_when_unavailable():
+    """Explicit values do NOT auto-degrade — they raise on misconfiguration."""
+    flags = _all_packages_available()
+    flags["triton"] = False
+    with _force_device("npu"), mock.patch("veomni.utils.import_utils._PACKAGE_FLAGS", flags):
+        with pytest.raises(ValueError, match="requires triton"):
+            OpsImplementationConfig(load_balancing_loss_implementation="triton")
+
+
 def test_auto_degrades_to_eager_when_liger_missing(veomni_log):
     """GPU host without liger-kernel -> liger picks degrade to eager + warning."""
     flags = _all_packages_available()

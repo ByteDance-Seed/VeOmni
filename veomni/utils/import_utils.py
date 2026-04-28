@@ -73,6 +73,16 @@ def is_diffusers_available() -> bool:
     return _PACKAGE_FLAGS["diffusers"]
 
 
+def is_triton_available() -> bool:
+    """Check if a Triton-like package is importable as ``triton``.
+
+    Both the CUDA ``triton`` package and the Ascend ``triton-ascend`` package
+    expose the same ``triton`` import name, so this single check covers both
+    accelerators.
+    """
+    return _PACKAGE_FLAGS["triton"]
+
+
 def is_fused_moe_available() -> bool:
     import torch
 

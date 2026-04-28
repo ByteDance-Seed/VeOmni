@@ -876,7 +876,7 @@ class OpsImplementationConfig:
         itself raise at apply time if something is missing.
         """
         from ..ops.config.registry import list_ops
-        from ..utils.import_utils import is_torch_npu_available
+        from ..utils.import_utils import is_torch_npu_available, is_triton_available
 
         for op in list_ops():
             if op.config_field != config_field:
@@ -888,6 +888,8 @@ class OpsImplementationConfig:
                 if pkg == "liger_kernel" and not is_liger_kernel_available():
                     return False
                 if pkg == "torch_npu" and not is_torch_npu_available():
+                    return False
+                if pkg == "triton" and not is_triton_available():
                     return False
             return True
         return True
@@ -915,6 +917,14 @@ class OpsImplementationConfig:
 
                     if not is_torch_npu_available():
                         raise ValueError(f"{op.config_field}='{value}' requires torch_npu to be installed.")
+                if pkg == "triton":
+                    from ..utils.import_utils import is_triton_available
+
+                    if not is_triton_available():
+                        raise ValueError(
+                            f"{op.config_field}='{value}' requires triton (CUDA) or "
+                            "triton-ascend (NPU) to be installed."
+                        )
 
 
 @dataclass
