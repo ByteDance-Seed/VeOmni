@@ -135,19 +135,23 @@ without modifying the config class.
 
 **Defaults are GPU-reasonable.** Every default below targets a fast kernel
 that runs on a GPU host with the standard `--extra gpu` install. On Ascend
-NPU, fields whose default has no NPU implementation raise a clear error in
-`__post_init__` pointing at the suggested NPU value (`npu` / `fused_npu` /
-`eager`) — there is no silent hardware fallback. NPU users must override
-per field explicitly. The one exception is
-`load_balancing_loss_implementation`, which keeps an eager default because
-it is GLOBAL-scoped and resolved eagerly for every model — a fused default
-would force every dense run to depend on triton (or triton-ascend on NPU,
-which is not in the standard `--extra npu` install). For a portable,
-no-deps config in code, call `OpsImplementationConfig.eager_defaults()`.
+NPU, the kernel-registry fields whose default has no NPU implementation
+raise a clear error in `__post_init__` pointing at the suggested NPU value
+(`npu` / `fused_npu` / `eager`) — there is no silent hardware fallback. NPU
+users must override those fields explicitly. Two exceptions:
+`attn_implementation` is dispatched via transformers' pluggable
+`ALL_ATTENTION_FUNCTIONS` registry (any backend that registers an FA
+kernel works on any device, so device-availability is gated at the FA
+import site rather than at config-parse time); and
+`load_balancing_loss_implementation` keeps an eager default because it is
+GLOBAL-scoped and resolved eagerly for every model — a fused default would
+force every dense run to depend on triton (or triton-ascend on NPU, which
+is not in the standard `--extra npu` install). For a portable, no-deps
+config in code, call `OpsImplementationConfig.eager_defaults()`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Dispatched via `ALL_ATTENTION_FUNCTIONS` (pluggable), so device-availability is checked at the FA-import site rather than in `__post_init__`. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is a debug-only reference loop. Legacy `fused` is rewritten to `fused_triton` with a deprecation warning. Mismatches (e.g. `fused_triton` on NPU) raise at config-parse / patch time — no silent fallback. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss; backs `ForCausalLM` + `ForConditionalGeneration`, `ForSequenceClassification` stays on eager). |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton` (per-model). |

@@ -98,12 +98,12 @@ def test_eager_defaults_classmethod_returns_eager_everywhere():
 def test_eager_defaults_classmethod_constructs_cleanly_on_npu():
     """``eager_defaults()`` must not raise on an NPU host.
 
-    Regression test for the bug Gemini flagged in PR review: previously the
-    classmethod inherited the dataclass default ``attn_implementation =
-    "flash_attention_2"``, which (after the SP rewrite) is in
-    ``_NPU_INCOMPATIBLE`` and would make ``__post_init__`` raise on NPU.
-    The whole point of ``eager_defaults()`` is to be a portable escape
-    hatch, so this path must construct without error on every device."""
+    The classmethod is the documented portable / no-deps escape hatch
+    (used by the ``build_foundation_model`` standalone-script fallback and
+    by tests that don't need fused kernels), so it has to construct on
+    every device without raising. Setting every field explicitly to
+    ``"eager"`` — including ``attn_implementation`` — also avoids the FA
+    import path on hosts that don't have ``flash_attn`` installed."""
     from veomni.arguments.arguments_types import OpsImplementationConfig
 
     with patch("veomni.utils.device.IS_NPU_AVAILABLE", True):
@@ -157,11 +157,14 @@ def test_legacy_moe_fused_alias_is_rewritten():
 # ---------------------------------------------------------------------------
 
 
-# (field, GPU-only value, expected suggestion in the error message)
+# (field, GPU-only value, expected suggestion in the error message).
+#
+# ``attn_implementation`` is intentionally absent — attention is dispatched
+# via transformers' pluggable ``ALL_ATTENTION_FUNCTIONS`` registry, so
+# device-availability for the attention backend is gated at the FA import
+# site rather than at config-parse time. See the comment on
+# ``_NPU_INCOMPATIBLE`` in ``veomni/arguments/arguments_types.py``.
 _NPU_INCOMPATIBLE_CASES = [
-    ("attn_implementation", "flash_attention_2", "sdpa"),
-    ("attn_implementation", "flash_attention_3", "sdpa"),
-    ("attn_implementation", "veomni_flash_attention_2_with_sp", "sdpa"),
     ("moe_implementation", "fused_triton", "fused_npu"),
     ("moe_implementation", "fused_quack", "fused_npu"),
     ("cross_entropy_loss_implementation", "liger_kernel", "npu"),
@@ -185,12 +188,9 @@ def test_npu_default_raises_with_clear_suggestion(field_name, gpu_value, suggest
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
 
-    # Start every field on a NPU-friendly value so the parametrized field is
-    # the only one that can trip the validator. ``attn_implementation`` is
-    # also in ``_NPU_INCOMPATIBLE`` (default ``flash_attention_2`` is GPU-only)
-    # so it has to be explicitly set to a portable value here too.
+    # Start every field on an NPU-compatible value so the parametrized
+    # field is the only one that can trip the validator.
     overrides = dict.fromkeys(_EXPECTED_DEFAULTS, "eager")
-    overrides["attn_implementation"] = "sdpa"
     overrides[field_name] = gpu_value
 
     with patch("veomni.utils.device.IS_NPU_AVAILABLE", True):

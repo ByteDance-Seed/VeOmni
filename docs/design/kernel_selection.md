@@ -28,20 +28,30 @@ without modifying `OpsImplementationConfig`.
 **Defaults are GPU-reasonable.** Every default targets a fast, well-tested
 kernel that runs out of the box on a GPU host with the standard
 `--extra gpu` install (Liger fused ops + Triton MoE + FA2). On Ascend NPU,
-fields whose default has no NPU implementation raise a clear error in
-`OpsImplementationConfig.__post_init__` pointing the user at the suggested
-NPU value (`npu` / `fused_npu` / `eager`) — there is no silent hardware
-fallback. NPU users must opt in explicitly per field. To get a portable,
-no-deps config in code (e.g. tests, standalone scripts), use
-`OpsImplementationConfig.eager_defaults()`.
+the kernel-registry fields whose default has no NPU implementation raise a
+clear error in `OpsImplementationConfig.__post_init__` pointing the user at
+the suggested NPU value (`npu` / `fused_npu` / `eager`) — there is no
+silent hardware fallback. NPU users must opt in explicitly for those
+fields. To get a portable, no-deps config in code (e.g. tests, standalone
+scripts), use `OpsImplementationConfig.eager_defaults()`.
 
-**Exception:** `load_balancing_loss_implementation` defaults to `"eager"`,
-not `"triton"`. The op is GLOBAL-scoped — `apply_ops_config` resolves it
-eagerly for every model, including dense models that never call the loss —
-so a fused default would force every dense run on every host to depend on
-triton (or triton-ascend on NPU, which is not in the standard `--extra npu`
-install). MoE configs that want the speedup opt in explicitly with
-`load_balancing_loss_implementation: triton`.
+**Two exceptions** to the kernel-registry NPU validation:
+
+1. `attn_implementation` is **not** validated here. Attention is
+   dispatched via transformers' pluggable `ALL_ATTENTION_FUNCTIONS`
+   registry (see §5.2), so third-party backends can register kernels for
+   any name (including FA2/FA3/FA4 on Ascend) at runtime. A pre-flight
+   check at config-parse time can't see those registrations, so we leave
+   attention compatibility to the FA-import site, which raises a clear
+   `ImportError` when the requested backend is not available.
+
+2. `load_balancing_loss_implementation` defaults to `"eager"`, not
+   `"triton"`. The op is GLOBAL-scoped — `apply_ops_config` resolves it
+   eagerly for every model, including dense models that never call the
+   loss — so a fused default would force every dense run on every host to
+   depend on triton (or triton-ascend on NPU, which is not in the standard
+   `--extra npu` install). MoE configs that want the speedup opt in
+   explicitly with `load_balancing_loss_implementation: triton`.
 
 **Backwards compatibility.** `moe_implementation: fused` (the pre-#678
 auto-pick value) is rewritten to `fused_triton` with a deprecation warning,

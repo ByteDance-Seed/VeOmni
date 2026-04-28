@@ -661,25 +661,18 @@ _LEGACY_ALIASES: Dict[str, Dict[str, str]] = {
 #     (same import name), and the package availability gate lives in
 #     ``_validate_implementations`` via the BackendSpec ``requires=("triton",)``
 #     declaration — not here.
-#   - ``attn_implementation`` is the one field validated *after* the SP
-#     rewrite, so its entry has to list both the user-facing names
-#     (``flash_attention_2``) and the rewritten ones
-#     (``veomni_flash_attention_2_with_sp``); both forms reach this
-#     validator depending on whether the user already passed the
-#     pre-rewrite or post-rewrite value.
+#   - ``attn_implementation`` is intentionally NOT validated here. Attention
+#     is dispatched via transformers' ``ALL_ATTENTION_FUNCTIONS`` registry
+#     (see ``kernel_selection.md`` §5.2), which is pluggable: third-party
+#     backends can register kernels for any name (including FA2/FA3/FA4 on
+#     Ascend) at runtime. A pre-flight check at config-parse time cannot
+#     know which providers will be installed, so we leave attention
+#     compatibility to runtime: the FA imports in
+#     ``veomni/ops/kernels/attention/__init__.py`` raise a clear
+#     ``ImportError`` when the requested backend is not available, and
+#     ``ALL_ATTENTION_FUNCTIONS`` falls through to whichever provider is
+#     registered.
 _NPU_INCOMPATIBLE: Dict[str, Dict[str, str]] = {
-    # ``attn_implementation`` is checked after the SP rewrite, so both the
-    # user-facing names and the rewritten ``veomni_flash_attention_*_with_sp``
-    # names need to be listed here. Suggested NPU equivalent is ``sdpa``,
-    # which is what NPU users typically pick.
-    "attn_implementation": {
-        "flash_attention_2": "sdpa",
-        "flash_attention_3": "sdpa",
-        "flash_attention_4": "sdpa",
-        "veomni_flash_attention_2_with_sp": "sdpa",
-        "veomni_flash_attention_3_with_sp": "sdpa",
-        "veomni_flash_attention_4_with_sp": "sdpa",
-    },
     "moe_implementation": {
         "fused_triton": "fused_npu",
         "fused_quack": "fused_npu",
@@ -745,7 +738,12 @@ class OpsImplementationConfig:
         ]
     ] = field(
         default="flash_attention_2",
-        metadata={"help": "Attention implementation to use. Default targets GPU; NPU users must override."},
+        metadata={
+            "help": "Attention implementation to use. Dispatched via "
+            "``ALL_ATTENTION_FUNCTIONS`` (transformers' registry) and is "
+            "pluggable, so device-availability is checked at the FA-import "
+            "site rather than here."
+        },
     )
     moe_implementation: str = field(
         default="fused_triton",
