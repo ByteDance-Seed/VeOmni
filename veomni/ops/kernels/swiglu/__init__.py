@@ -18,6 +18,7 @@ Default per-model backend:
     - ``liger_kernel``: ``liger_kernel.transformers.swiglu.LigerSwiGLUMLP``
 """
 
+from ...config.auto_policy import OpPolicy, register_op_policy
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
 
 
@@ -34,5 +35,15 @@ register_op(
                 requires=("liger_kernel",),
             ),
         },
+    )
+)
+
+register_op_policy(
+    OpPolicy(
+        config_field="swiglu_mlp_implementation",
+        # No NPU entry: only liger_kernel and eager exist for SwiGLU MLP, so on
+        # NPU "auto" naturally degrades to eager via the missing-key path.
+        auto_backends={"gpu": "liger_kernel"},
+        label="SwiGLU",
     )
 )

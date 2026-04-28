@@ -629,14 +629,28 @@ class OpsImplementationConfig:
 
     Well-known values:
 
-    - ``"eager"`` (default): PyTorch / HuggingFace reference implementation.
-    - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
-      ``liger-kernel``).
+    - ``"auto"`` (default for non-attention fields): pick the best backend for
+      the current accelerator, falling back to ``"eager"`` (with a warning) when
+      the chosen backend's software / hardware requirements are not met. The
+      per-field auto policy lives next to each kernel registration via
+      ``register_op_policy`` (see ``veomni/ops/config/auto_policy.py``).
+      The downgrade-to-eager safety net only runs for ops that declare their
+      backend requirements in the per-model ``OpSpec`` registry (RMSNorm,
+      RoPE, SwiGLU, load-balancing loss). For ops that live only in
+      ``KERNEL_REGISTRY`` (cross-entropy, MoE), the resolver picks the
+      device-appropriate backend and trusts it — if the backend's runtime
+      requirements are not met, the kernel itself raises with a clear error
+      at apply time (e.g. ``apply_veomni_fused_moe_patch``).
+    - ``"eager"``: PyTorch / HuggingFace reference implementation.
+    - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU,
+      requires ``liger-kernel``).
     - ``"npu"``: Ascend NPU fused implementation (requires ``torch_npu``).
       Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from
       ``veomni.ops.kernels.{rms_norm,rotary}.npu``.
     - ``"triton"``: Triton fused implementation (GPU with ``triton`` package, or
       NPU with ``triton-ascend``).
+    - ``"chunk_loss"`` (cross-entropy only): chunked CE wrapper that folds the
+      ``lm_head`` projection into the loss; works on both GPU and NPU.
     """
 
     attn_implementation: Optional[
@@ -653,14 +667,16 @@ class OpsImplementationConfig:
         metadata={"help": "Attention implementation to use."},
     )
     moe_implementation: str = field(
-        default="eager",
+        default="auto",
         metadata={
             "help": "MoE experts forward implementation. "
+            "'auto' (default) picks 'fused_triton' on GPU and 'fused_npu' on NPU. "
             "OSS backends: 'fused_triton' (Triton group-gemm, GPU, SM70+), "
             "'fused_quack' (Quack CUTLASS/CuTe, GPU, SM90+), "
             "'fused_npu' (NPU group-gemm, requires torch_npu), "
-            "'eager' (default, reference loop). "
-            "The backend must match the hardware — no silent fallback. "
+            "'eager' (reference loop). "
+            "The pre-#678 value 'fused' is accepted as a deprecated alias for 'auto'. "
+            "Explicit backends must match the hardware — no silent fallback. "
             "Typed as plain str (not Literal) so third-party backends can be "
             "plugged in via `apply_veomni_fused_moe_patch` (legacy-dispatch "
             "models) or `KERNEL_REGISTRY.register(op_name='moe_experts', ...)` "
@@ -669,53 +685,65 @@ class OpsImplementationConfig:
         },
     )
     cross_entropy_loss_implementation: str = field(
-        default="eager",
+        default="auto",
         metadata={
             "help": "Cross-entropy loss implementation. "
+            "'auto' (default) picks 'chunk_loss' on both GPU and NPU. "
+            "'chunk_loss' uses the device-agnostic chunked loss wrapper that folds the "
+            "lm_head projection into the loss. "
             "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
-            "'npu' enables chunked loss computation for CausalLM on NPU "
-            "(requires torch_npu). "
-            "'eager' (default) uses PyTorch F.cross_entropy."
+            "'npu' is a deprecated alias for 'chunk_loss'. "
+            "'eager' uses PyTorch F.cross_entropy."
         },
     )
     rms_norm_implementation: str = field(
-        default="eager",
+        default="auto",
         metadata={
             "help": "RMSNorm implementation. "
+            "'auto' (default) picks 'liger_kernel' on GPU and 'npu' on NPU. "
             "'liger_kernel' uses LigerRMSNorm. "
             "'npu' uses torch_npu.npu_rms_norm (requires torch_npu). "
             "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3). "
-            "'eager' (default) uses the HuggingFace default."
+            "'eager' uses the HuggingFace default."
         },
     )
     swiglu_mlp_implementation: str = field(
-        default="eager",
+        default="auto",
         metadata={
             "help": "SwiGLU MLP implementation. "
+            "'auto' (default) picks 'liger_kernel' on GPU; on NPU it falls back to 'eager' "
+            "because no fused SwiGLU kernel exists for NPU. "
             "'liger_kernel' uses LigerSwiGLUMLP. "
-            "'eager' (default) uses the HuggingFace default."
+            "'eager' uses the HuggingFace default."
         },
     )
     rotary_pos_emb_implementation: str = field(
-        default="eager",
+        default="auto",
         metadata={
             "help": "Rotary positional embedding implementation. "
+            "'auto' (default) picks 'liger_kernel' on GPU and 'npu' on NPU. "
             "'liger_kernel' uses liger_rotary_pos_emb. "
             "'npu' uses torch_npu.npu_rotary_mul (requires torch_npu). "
             "'triton' uses deterministic Triton bmm kernel (DeepSeek V3). "
-            "'eager' (default) uses the HuggingFace default."
+            "'eager' uses the HuggingFace default."
         },
     )
     load_balancing_loss_implementation: str = field(
-        default="eager",
+        default="auto",
         metadata={
             "help": "MoE load-balancing loss implementation. "
+            "'auto' (default) picks 'triton' on both GPU and NPU. "
             "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
-            "'eager' (default) uses PyTorch reference."
+            "'eager' uses PyTorch reference."
         },
     )
 
     def __post_init__(self):
+        # Track which fields were resolved from "auto" so the summary log can
+        # mark them. Populated by `_resolve_auto`; reset on every __post_init__
+        # so re-instantiation does not carry stale state.
+        self._auto_resolved_fields: set[str] = set()
+
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
@@ -724,10 +752,145 @@ class OpsImplementationConfig:
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
-                logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
 
+        self._resolve_auto()
         self._validate_implementations()
+        self._log_resolved_summary()
+
+    # -- auto resolution ----------------------------------------------------
+
+    def _resolve_auto(self):
+        """Rewrite ``"auto"`` (and registered legacy aliases) to concrete
+        backend names by walking ``list_op_policies()``.
+
+        Resolution order per field:
+
+        1. If the current value is in ``policy.legacy_aliases``, swap it for
+           the replacement and emit a deprecation warning. The replacement may
+           itself be ``"auto"`` (e.g. ``moe_implementation="fused"`` →
+           ``"auto"``), so the auto step below still runs.
+        2. If the (possibly rewritten) value is ``"auto"``:
+           - Pick ``policy.auto_backends[device_type]``; missing entry → ``"eager"``.
+           - For backends declared in the per-model ``OpSpec`` registry (RMSNorm,
+             RoPE, SwiGLU, load-balancing loss), call ``_backend_requirements_met``
+             — if Liger / torch_npu requirements are missing, warn and fall back
+             to ``"eager"``. For ops that live only in ``KERNEL_REGISTRY``
+             (cross-entropy, MoE), the resolver trusts the device-keyed pick;
+             a mismatched runtime environment raises later at apply time
+             (consistent with the project's "no silent fallback for explicit
+             selections" rule).
+
+        Only the legacy-alias and best-effort-fallback branches log inline
+        (they are surprises the user should see immediately). The successful
+        per-field auto picks are aggregated into a single summary block by
+        ``_log_resolved_summary``.
+        """
+        from ..ops import config as ops_config_pkg  # noqa: F401  import side-effect: triggers registrations
+        from ..ops.config.auto_policy import list_op_policies
+
+        device_type = self._current_device_type()
+
+        for policy in list_op_policies():
+            value = getattr(self, policy.config_field)
+
+            # 1. Legacy alias rewrite (always warn).
+            if value in policy.legacy_aliases:
+                replacement = policy.legacy_aliases[value]
+                logger.warning_rank0(
+                    f"{policy.config_field}={value!r} is deprecated; use {replacement!r} instead. Auto-converting."
+                )
+                value = replacement
+
+            # 2. Auto resolution.
+            if value == "auto":
+                picked = policy.auto_backends.get(device_type, "eager")
+                if picked != "eager" and not self._backend_requirements_met(policy.config_field, picked):
+                    logger.warning_rank0(
+                        f"{policy.config_field}: auto-selected {picked!r} for device "
+                        f"{device_type!r} but its requirements are not met; "
+                        f"falling back to 'eager'."
+                    )
+                    picked = "eager"
+                value = picked
+                self._auto_resolved_fields.add(policy.config_field)
+
+            setattr(self, policy.config_field, value)
+
+    def _log_resolved_summary(self) -> None:
+        """Emit a single multi-line summary of every ``*_implementation`` field's
+        resolved value.
+
+        This runs once at the end of ``__post_init__`` so the user gets a
+        consolidated picture of "what kernel are we actually using for X?"
+        without having to scan a stream of per-field log lines. Fields that
+        came from ``"auto"`` are marked so explicit overrides stand out.
+        """
+        from ..ops.config.auto_policy import list_op_policies
+
+        # Stable display order: attention first (it lives outside the policy
+        # registry), then policy fields in the order they were registered.
+        # Skip any policy whose config_field is not actually on this dataclass
+        # — keeps the summary safe to call even if a future OpPolicy is
+        # registered before its corresponding field is added.
+        candidates: list[str] = ["attn_implementation"]
+        candidates += [p.config_field for p in list_op_policies()]
+        rows = [(f, getattr(self, f)) for f in candidates if hasattr(self, f) and getattr(self, f) is not None]
+        if not rows:
+            return
+
+        device_type = self._current_device_type()
+        width = max(len(field_name) for field_name, _ in rows)
+        lines = [f"Resolved ops implementation (device={device_type}):"]
+        for field_name, value in rows:
+            origin = " (auto)" if field_name in self._auto_resolved_fields else ""
+            lines.append(f"  {field_name:<{width}} = {value}{origin}")
+        logger.info_rank0("\n".join(lines))
+
+    @staticmethod
+    def _current_device_type() -> str:
+        """Return ``"npu"`` if an NPU is present, ``"gpu"`` if CUDA is, else ``"cpu"``.
+
+        NPU takes precedence over CUDA in the rare case where both are
+        reachable from the same process (`IS_NPU_AVAILABLE` already gates on
+        an actual device, not just the package). On a host with neither, auto
+        resolves to ``"eager"`` for every op.
+        """
+        from ..utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+        if IS_NPU_AVAILABLE:
+            return "npu"
+        if IS_CUDA_AVAILABLE:
+            return "gpu"
+        return "cpu"
+
+    @staticmethod
+    def _backend_requirements_met(config_field: str, backend_name: str) -> bool:
+        """Best-effort availability check for an auto-picked backend.
+
+        Looks up ``backend_name`` in the per-model OpSpec registry; if the
+        backend declares ``requires=("liger_kernel",)`` / ``("torch_npu",)``,
+        verify the package is installed. Ops that are not in the OpSpec
+        registry (``cross_entropy_loss``, ``moe_experts``) — or backends
+        without a ``requires`` clause — return ``True`` and let the kernel
+        itself raise at apply time if something is missing.
+        """
+        from ..ops.config.registry import list_ops
+        from ..utils.import_utils import is_torch_npu_available
+
+        for op in list_ops():
+            if op.config_field != config_field:
+                continue
+            backend = op.backends.get(backend_name)
+            if backend is None:
+                return True
+            for pkg in backend.requires:
+                if pkg == "liger_kernel" and not is_liger_kernel_available():
+                    return False
+                if pkg == "torch_npu" and not is_torch_npu_available():
+                    return False
+            return True
+        return True
 
     def _validate_implementations(self):
         """Validate that requested backends are actually available.

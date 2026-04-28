@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked cross-entropy loss for causal LM heads on NPU.
+"""Chunked cross-entropy loss for causal LM heads (device-agnostic).
 
-Used when ``OpsImplementationConfig.cross_entropy_loss_implementation == "npu"``.
-The outer ``chunk_loss_function`` splits the sequence into chunks and calls the
-eager cross-entropy on each chunk, accumulating gradients via a custom autograd
-``Function``. The chunked path always uses eager — it is installed directly into
-``LOSS_MAPPING["ForCausalLM"]`` / ``LOSS_MAPPING["ForConditionalGeneration"]``
-by ``install_loss_mapping("npu")`` and never reaches ``ForCausalLMLoss``.
+Used when ``OpsImplementationConfig.cross_entropy_loss_implementation == "chunk_loss"``
+(also reached via the legacy ``"npu"`` value, which is rewritten with a
+deprecation warning). The outer ``chunk_loss_function`` splits the sequence
+into chunks and calls the eager cross-entropy on each chunk, accumulating
+gradients via a custom autograd ``Function``. The chunked path always uses
+eager — it is installed directly into ``LOSS_MAPPING["ForCausalLM"]`` /
+``LOSS_MAPPING["ForConditionalGeneration"]`` by
+``install_loss_mapping("chunk_loss")`` and never reaches ``ForCausalLMLoss``.
+
+The kernel is pure ``torch.func.grad_and_value`` over the eager CE kernel and
+does not depend on any device-specific extensions, so it runs on both GPU and
+NPU. It is the default cross-entropy backend resolved by ``"auto"``.
 
 Causal-only: the function hard-codes a causal label shift, so it cannot back
 ``ForSequenceClassification`` (token-level labels, no shift). SP reduction is

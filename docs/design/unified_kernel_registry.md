@@ -254,29 +254,30 @@ class OpsImplementationConfig:
         "native-sparse",
     ] = "flash_attention_2"
 
-    # Per-op implementation selection (all default to "eager" = original HF code)
-    rms_norm_implementation: str = "eager"
-    rms_norm_gated_implementation: str = "eager"   # (proposed — not yet shipped)
-    rotary_pos_emb_implementation: str = "eager"
-    swiglu_mlp_implementation: str = "eager"
-    # MoE: single-field backend selection — no silent hardware fallback.
-    moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = "eager"
-    cross_entropy_loss_implementation: str = "eager"
-    load_balancing_loss_implementation: str = "eager"
+    # Per-op implementation selection — all default to "auto" (resolved per
+    # device via OpPolicy at __post_init__ time; falls back to "eager" with a
+    # warning if the chosen backend's requirements are not met).
+    rms_norm_implementation: str = "auto"
+    rms_norm_gated_implementation: str = "auto"   # (proposed — not yet shipped)
+    rotary_pos_emb_implementation: str = "auto"
+    swiglu_mlp_implementation: str = "auto"
+    moe_implementation: str = "auto"
+    cross_entropy_loss_implementation: str = "auto"
+    load_balancing_loss_implementation: str = "auto"
 ```
 
 **Shipped today** (what is actually on `OpsImplementationConfig` as of this
 PR — see `veomni/arguments/arguments_types.py`):
 
-| Field | Available values | Notes |
-|-------|------------------|-------|
-| `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | VeOmni rewrites FA2/3/4 to SP-aware variants under `MODELING_BACKEND=veomni` |
-| `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
-| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
-| `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
-| `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field; mismatches (e.g. `fused_triton` on NPU) raise in `apply_veomni_fused_moe_patch` rather than silently falling back |
-| `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | |
-| `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
+| Field | Default | Available values | Notes |
+|-------|---------|------------------|-------|
+| `attn_implementation` | `flash_attention_2` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | VeOmni rewrites FA2/3/4 to SP-aware variants under `MODELING_BACKEND=veomni`; no `auto` (the explicit FA2 default already covers the common case) |
+| `rms_norm_implementation` | `auto` | `auto`, `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `auto` → `liger_kernel` (GPU) / `npu` (NPU) |
+| `rotary_pos_emb_implementation` | `auto` | `auto`, `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `auto` → `liger_kernel` (GPU) / `npu` (NPU) |
+| `swiglu_mlp_implementation` | `auto` | `auto`, `eager`, `liger_kernel` | `auto` → `liger_kernel` (GPU); on NPU degrades to `eager` (no fused kernel exists) |
+| `moe_implementation` | `auto` | `auto`, `eager`, `fused_triton`, `fused_quack`, `fused_npu` | `auto` → `fused_triton` (GPU) / `fused_npu` (NPU). Pre-#678 value `fused` is a deprecated alias for `auto`. Explicit `fused_*` mismatches still raise in `apply_veomni_fused_moe_patch` — no silent hardware fallback. |
+| `cross_entropy_loss_implementation` | `auto` | `auto`, `eager`, `liger_kernel`, `chunk_loss` | `auto` → `chunk_loss` (GPU+NPU). The `chunk_loss` kernel is device-agnostic; the previous backend name `npu` is a deprecated alias retained for backward compatibility. |
+| `load_balancing_loss_implementation` | `auto` | `auto`, `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`). |
 
 `rms_norm_gated_implementation` is listed above because it is called out in
 the op taxonomy (§1) as a replaceable variant for Qwen3.5 MoE's
@@ -284,6 +285,40 @@ the op taxonomy (§1) as a replaceable variant for Qwen3.5 MoE's
 `OpsImplementationConfig` and the op has no non-eager backend registered.
 It is tracked here so the design stays coherent; when a fused kernel lands
 the field will be added alongside.
+
+#### `OpPolicy`: per-field auto policy
+
+Auto resolution is driven by a small declarative table keyed by config field
+name (`veomni/ops/config/auto_policy.py`):
+
+```python
+@dataclass(frozen=True)
+class OpPolicy:
+    config_field: str                        # e.g. "rms_norm_implementation"
+    auto_backends: dict[str, str]            # {"gpu": "liger_kernel", "npu": "npu"}
+    legacy_aliases: dict[str, str] = ...     # {"fused": "auto"}
+    label: str = ""                          # for log lines
+```
+
+Each kernel's `__init__.py` calls `register_op_policy(OpPolicy(...))` next to
+its existing `register_op` / `KERNEL_REGISTRY.register` calls. Keeping the
+policy table separate from both `_OPS_REGISTRY` (per-model patches) and
+`KERNEL_REGISTRY` (OpSlot dispatch) lets ops that live in only one of them
+(`cross_entropy_loss`, `moe_experts`) participate in auto-resolution without
+forcing a fake entry into the other registry.
+
+`OpsImplementationConfig.__post_init__` runs a single `_resolve_auto()` pass:
+
+1. Apply `legacy_aliases` (warning) so deprecated values like
+   `moe_implementation="fused"` keep working.
+2. If the value is `"auto"`, pick `auto_backends[device_type]`
+   (missing → `"eager"`).
+3. Best-effort availability check: if the picked backend declares
+   `requires=("liger_kernel",)` / `("torch_npu",)` and the package is
+   missing, log a warning and degrade to `"eager"`. Explicit values are
+   never auto-degraded — they go through `_validate_implementations` and
+   raise on misconfiguration (consistent with the "no silent fallback" rule
+   for explicit selections).
 
 Convenience preset:
 
@@ -770,7 +805,9 @@ model.forward()                                    # (5) runtime
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
 | `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | Kept for legacy-dispatch models (qwen3_moe etc.) until they adopt OpSlot |
-| `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: fused_triton` or `fused_npu` | Breaking change — `"fused"` renamed to `"fused_triton"` and the silent NPU auto-pick replaced by explicit `"fused_npu"`. `fused_quack` is unchanged. |
+| `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: auto` (or explicit `fused_triton` / `fused_npu`) | `"fused"` is now a deprecated alias for `"auto"` (logs a warning and picks `fused_triton` on GPU, `fused_npu` on NPU). Old yaml configs keep working through the rename. Explicit `fused_*` values still raise on hardware mismatch — only `auto` adapts silently. |
+| `cross_entropy_loss_implementation: npu` (NPU chunked CE) | `cross_entropy_loss_implementation: chunk_loss` | The chunk-loss kernel is in fact device-agnostic; renamed to `chunk_loss` and made the auto default on both GPU and NPU. `npu` is a deprecated alias (warning). |
+| Per-op `*_implementation: eager` defaults from #678 | Per-op `*_implementation: auto` defaults | Restores pre-#678 "pick fast kernel for me" behaviour without bringing back the `VEOMNI_USE_LIGER_KERNEL` env var. Explicit `eager` still works. |
 
 ---
 

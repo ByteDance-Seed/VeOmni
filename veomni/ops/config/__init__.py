@@ -19,6 +19,7 @@ Modules:
 - ``registry``: declarative op/backend registry + dispatch engine.
 """
 
+from .auto_policy import OpPolicy, get_op_policy, list_op_policies, register_op_policy
 from .registry import (
     BackendSpec,
     OpScope,
@@ -33,12 +34,16 @@ from .singleton import get_ops_config, set_ops_config
 
 __all__ = [
     "BackendSpec",
+    "OpPolicy",
     "OpScope",
     "OpSpec",
     "apply_per_model_patches",
     "get_op",
+    "get_op_policy",
     "get_ops_config",
+    "list_op_policies",
     "list_ops",
     "register_op",
+    "register_op_policy",
     "set_ops_config",
 ]

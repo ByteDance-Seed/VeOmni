@@ -21,6 +21,7 @@ Models can register a ``triton`` backend via ``extra_backends`` in their
 ``device_patch.py`` (e.g. DeepSeek V3 batch-invariant kernel).
 """
 
+from ...config.auto_policy import OpPolicy, register_op_policy
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
 
 
@@ -42,5 +43,13 @@ register_op(
                 replace_forward=True,
             ),
         },
+    )
+)
+
+register_op_policy(
+    OpPolicy(
+        config_field="rms_norm_implementation",
+        auto_backends={"gpu": "liger_kernel", "npu": "npu"},
+        label="RMSNorm",
     )
 )

@@ -197,3 +197,26 @@ KERNEL_REGISTRY.register(
         description="NPU group-gemm fused MoE forward",
     )
 )
+
+
+# ── OpPolicy: defaults & legacy aliases ──────────────────────────────────────
+
+from ...config.auto_policy import OpPolicy, register_op_policy
+
+
+register_op_policy(
+    OpPolicy(
+        config_field="moe_implementation",
+        # User-facing values carry a `fused_` prefix that the registry entries
+        # don't (the prefix is stripped by `_bind_veomni_ops` /
+        # `apply_moe_patch_transformers_v4`). The auto policy returns the
+        # user-facing name so it round-trips cleanly through that translation.
+        auto_backends={"gpu": "fused_triton", "npu": "fused_npu"},
+        # `fused` was the pre-#678 value that auto-picked Triton on GPU and the
+        # NPU group-gemm on NPU. We restore the same behaviour by routing it
+        # through the new `auto` value, so old yaml configs keep working with
+        # only a deprecation warning.
+        legacy_aliases={"fused": "auto"},
+        label="MoE",
+    )
+)

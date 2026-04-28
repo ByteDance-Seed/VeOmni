@@ -33,12 +33,20 @@ logger = logging.get_logger(__name__)
 
 @dataclass(frozen=True)
 class HardwareRequirement:
-    """Describes hardware constraints for a kernel."""
+    """Describes hardware constraints for a kernel.
 
-    device_type: str  # "gpu" | "npu"
+    ``device_type=None`` marks a device-agnostic kernel (e.g. the chunked
+    cross-entropy loss, which is pure ``torch.func`` on top of the eager CE
+    kernel and runs on either accelerator). It still requires *some*
+    accelerator to be present.
+    """
+
+    device_type: str | None  # "gpu" | "npu" | None (any accelerator)
     min_compute_capability: int | None = None  # e.g. 70, 80, 90
 
     def is_satisfied(self) -> bool:
+        if self.device_type is None:
+            return IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE
         if self.device_type == "gpu":
             if not IS_CUDA_AVAILABLE:
                 return False
@@ -51,7 +59,7 @@ class HardwareRequirement:
             # torch_npu package AND an actual NPU device (unlike a bare import
             # check, which passes on dev boxes that merely have the library).
             return IS_NPU_AVAILABLE
-        raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu' or 'npu')")
+        raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu', 'npu', or None)")
 
 
 @dataclass(frozen=True)

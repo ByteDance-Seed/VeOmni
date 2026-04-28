@@ -21,6 +21,7 @@ Models can register a ``triton`` (deterministic bmm / Wan DiT) backend via
 ``extra_backends`` in their ``device_patch.py``.
 """
 
+from ...config.auto_policy import OpPolicy, register_op_policy
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
 
 
@@ -41,5 +42,13 @@ register_op(
                 requires=("torch_npu",),
             ),
         },
+    )
+)
+
+register_op_policy(
+    OpPolicy(
+        config_field="rotary_pos_emb_implementation",
+        auto_backends={"gpu": "liger_kernel", "npu": "npu"},
+        label="RoPE",
     )
 )

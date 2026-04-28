@@ -133,15 +133,22 @@ Each `*_implementation` field selects the kernel backend for that operation.
 The type is `str` (not `Literal`) so third-party backends can be registered
 without modifying the config class.
 
+**`"auto"` is the default** for every field other than `attn_implementation`. It
+resolves at config-parse time to the per-device backend declared in
+`veomni/ops/config/auto_policy.py` (e.g. `liger_kernel` on GPU, `npu` on NPU)
+and falls back to `"eager"` with a warning when the chosen backend's
+software / hardware requirements are not met. Explicit values are honoured
+verbatim and validated.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
-| moe_implementation | `Literal["eager", "fused_triton", "fused_quack", "fused_npu"]` | `"eager"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel. Mismatches (e.g. `fused_triton` on NPU) raise at patch time — no silent fallback. |
-| cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss; backs `ForCausalLM` + `ForConditionalGeneration`, `ForSequenceClassification` stays on eager). |
-| rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
-| swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
-| rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
-| load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton`. |
+| moe_implementation | `str` | `"auto"` | MoE experts forward implementation. `"auto"` picks `fused_triton` on GPU and `fused_npu` on NPU. Explicit values: `eager`, `fused_triton` (Triton group-gemm, GPU SM70+), `fused_quack` (Quack CUTLASS/CuTe, GPU SM90+), `fused_npu` (NPU group-gemm, requires torch_npu). The pre-#678 value `fused` is accepted as a deprecated alias for `auto` (logs a warning). Explicit backends must match the hardware — no silent fallback. |
+| cross_entropy_loss_implementation | `str` | `"auto"` | Cross-entropy loss. `"auto"` picks `chunk_loss` on both GPU and NPU. Explicit values: `eager`, `liger_kernel`, `chunk_loss` (device-agnostic chunked CE wrapper that folds the lm_head projection into the loss; backs `ForCausalLM` + `ForConditionalGeneration`, `ForSequenceClassification` stays on eager). The pre-rename value `npu` is accepted as a deprecated alias for `chunk_loss` (logs a warning). |
+| rms_norm_implementation | `str` | `"auto"` | RMSNorm. `"auto"` picks `liger_kernel` on GPU, `npu` on NPU. Explicit values: `eager`, `liger_kernel`, `npu`, `triton` (per-model — DeepSeek-V3). |
+| swiglu_mlp_implementation | `str` | `"auto"` | SwiGLU MLP. `"auto"` picks `liger_kernel` on GPU; on NPU it falls back to `eager` because no fused kernel exists. Explicit values: `eager`, `liger_kernel`. |
+| rotary_pos_emb_implementation | `str` | `"auto"` | Rotary pos emb. `"auto"` picks `liger_kernel` on GPU, `npu` on NPU. Explicit values: `eager`, `liger_kernel`, `npu`, `triton` (per-model — DeepSeek-V3). |
+| load_balancing_loss_implementation | `str` | `"auto"` | MoE load-balancing loss. `"auto"` picks `triton` on both GPU (`triton`) and NPU (`triton-ascend`). Explicit values: `eager`, `triton`. |
 
 ### DataArguments
 

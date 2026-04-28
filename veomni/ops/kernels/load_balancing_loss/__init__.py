@@ -81,6 +81,22 @@ register_op(
 )
 
 
+from ...config.auto_policy import OpPolicy, register_op_policy
+
+
+register_op_policy(
+    OpPolicy(
+        config_field="load_balancing_loss_implementation",
+        # The triton backend works on both CUDA (`triton`) and NPU
+        # (`triton-ascend`), so auto picks it on either device. The OpSpec has
+        # no `requires=` clause for triton, so the auto resolver will trust
+        # the user; if triton is missing, the kernel raises at load time.
+        auto_backends={"gpu": "triton", "npu": "triton"},
+        label="LoadBalancingLoss",
+    )
+)
+
+
 # ── OpSlot kernel registration ───────────────────────────────────────────────
 
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec

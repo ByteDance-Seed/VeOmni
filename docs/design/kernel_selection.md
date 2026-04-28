@@ -14,16 +14,52 @@ selection knob.
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | `"eager"` | `apply_ops_config()` (before model build) |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"eager"` | Model registration via ops config singleton |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"eager"` | `apply_ops_config()` (before model build) |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"eager"` | `build_foundation_model` |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `auto`, `eager`, `liger_kernel`, `chunk_loss` (device-agnostic; legacy alias `npu`) | `"auto"` → `chunk_loss` (GPU+NPU) | `apply_ops_config()` (before model build) |
+| RMSNorm | `rms_norm_implementation` | `auto`, `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"auto"` → `liger_kernel` (GPU) / `npu` (NPU) | Model registration via ops config singleton |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `auto`, `eager`, `liger_kernel` | `"auto"` → `liger_kernel` (GPU) / `eager` (NPU) | Model registration via ops config singleton |
+| Rotary embedding | `rotary_pos_emb_implementation` | `auto`, `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"auto"` → `liger_kernel` (GPU) / `npu` (NPU) | Model registration via ops config singleton |
+| Load-balancing loss | `load_balancing_loss_implementation` | `auto`, `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"auto"` → `triton` (GPU+NPU) | `apply_ops_config()` (before model build) |
+| MoE experts | `moe_implementation` | `auto`, `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` (legacy alias `fused`) | `"auto"` → `fused_triton` (GPU) / `fused_npu` (NPU) | `build_foundation_model` |
 
 The per-op fields are typed as plain `str` (not `Literal`), so third-party
 backends can be registered via `extra_backends` in a model's `device_patch.py`
 without modifying `OpsImplementationConfig`.
+
+### Auto resolution
+
+`"auto"` is the default for every field except `attn_implementation`. It is
+rewritten to a concrete backend in `OpsImplementationConfig.__post_init__` by
+walking the `OpPolicy` registrations declared in each kernel's `__init__.py`
+(see `veomni/ops/config/auto_policy.py`). Per-device picks live in
+`OpPolicy.auto_backends`. Two extra rules apply:
+
+- **Legacy aliases.** `OpPolicy.legacy_aliases` rewrites pre-rename values
+  (e.g. `moe_implementation="fused"` → `"auto"`,
+  `cross_entropy_loss_implementation="npu"` → `"chunk_loss"`) with a
+  `WARNING` log so old yaml configs keep working through the migration.
+- **Best-effort fallback.** If the auto-picked backend's software requirements
+  are not met (e.g. `liger_kernel` selected on a GPU host without
+  `liger-kernel` installed), the resolver logs a `WARNING` and falls back to
+  `"eager"`. This is the documented contract of `"auto"` — best effort, with
+  a loud log when downgraded. Explicit values do not auto-degrade and still
+  raise on misconfiguration.
+
+After resolution, `OpsImplementationConfig` emits a single multi-line
+`Resolved ops implementation (device=...)` summary so users get a
+one-glance view of every `*_implementation` field's final value. Fields
+that came from `"auto"` carry an `(auto)` marker; explicit overrides are
+unmarked, which makes them stand out:
+
+```
+Resolved ops implementation (device=gpu):
+  attn_implementation                = veomni_flash_attention_2_with_sp
+  cross_entropy_loss_implementation  = chunk_loss (auto)
+  load_balancing_loss_implementation = triton (auto)
+  moe_implementation                 = eager
+  rms_norm_implementation            = liger_kernel (auto)
+  rotary_pos_emb_implementation      = liger_kernel (auto)
+  swiglu_mlp_implementation          = liger_kernel (auto)
+```
 
 ---
 
@@ -116,7 +152,7 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 ```yaml
 model:
   ops_implementation:
-    cross_entropy_loss_implementation: eager   # or "liger_kernel", or custom str
+    cross_entropy_loss_implementation: auto   # or "liger_kernel", "chunk_loss", "eager", or custom str
 ```
 
 **Field:** `OpsImplementationConfig.cross_entropy_loss_implementation`
@@ -125,15 +161,24 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | `fused_liger_kernel_cross_entropy` | `liger-kernel` package |
-| `npu` | `chunk_loss_function` (chunked loss for `ForCausalLM` and `ForConditionalGeneration`; SP reduction handled internally) | `torch_npu` |
+| `auto` (default) | Resolves to `chunk_loss` on both GPU and NPU. | — |
+| `chunk_loss` | `chunk_loss_function` (device-agnostic chunked loss for `ForCausalLM` and `ForConditionalGeneration`; SP reduction handled internally) | An accelerator (GPU or NPU) |
+| `liger_kernel` | `fused_liger_kernel_cross_entropy` | `liger-kernel` package, GPU |
 | `eager` | `eager_cross_entropy` (PyTorch `F.cross_entropy`) | — |
+| `npu` | Deprecated alias for `chunk_loss` (kept for backward compatibility — emits a warning) | — |
 
-The `npu` chunk-loss binds only to `ForCausalLM` and
+The `chunk_loss` wrapper binds only to `ForCausalLM` and
 `ForConditionalGeneration`; `ForSequenceClassification` stays on
 `eager_cross_entropy` because chunk_loss hard-codes the causal
 `labels[..., 1:]` shift (incompatible with token-level classification
 labels).
+
+`chunk_loss` is the same kernel that the pre-rename `npu` value installed —
+it is pure `torch.func.grad_and_value` over the eager CE kernel and runs on
+both GPU and NPU, which is why `auto` picks it on either accelerator. It
+folds the `lm_head` projection into the loss (no full-vocab logits tensor),
+giving a memory-friendly default for large-vocabulary models without
+requiring any third-party package.
 
 Selecting `liger_kernel` requires that the model's forward pass pass
 `hidden_states=` and `weights=self.lm_head.weight` through
