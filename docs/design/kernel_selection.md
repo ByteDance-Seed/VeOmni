@@ -18,7 +18,7 @@ selection knob.
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` | Model registration via ops config singleton |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` | Model registration via ops config singleton |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"triton"` | `apply_ops_config()` (before model build) |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"eager"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` | `build_foundation_model` |
 
 The per-op fields are typed as plain `str` (not `Literal`), so third-party
@@ -31,11 +31,17 @@ kernel that runs out of the box on a GPU host with the standard
 fields whose default has no NPU implementation raise a clear error in
 `OpsImplementationConfig.__post_init__` pointing the user at the suggested
 NPU value (`npu` / `fused_npu` / `eager`) — there is no silent hardware
-fallback. NPU users must opt in explicitly per field; the only
-universal-on-NPU default is `load_balancing_loss_implementation: triton`,
-which works on NPU via `triton-ascend`. To get a portable, no-deps config
-in code (e.g. tests, standalone scripts), use
+fallback. NPU users must opt in explicitly per field. To get a portable,
+no-deps config in code (e.g. tests, standalone scripts), use
 `OpsImplementationConfig.eager_defaults()`.
+
+**Exception:** `load_balancing_loss_implementation` defaults to `"eager"`,
+not `"triton"`. The op is GLOBAL-scoped — `apply_ops_config` resolves it
+eagerly for every model, including dense models that never call the loss —
+so a fused default would force every dense run on every host to depend on
+triton (or triton-ascend on NPU, which is not in the standard `--extra npu`
+install). MoE configs that want the speedup opt in explicitly with
+`load_balancing_loss_implementation: triton`.
 
 **Backwards compatibility.** `moe_implementation: fused` (the pre-#678
 auto-pick value) is rewritten to `fused_triton` with a deprecation warning,

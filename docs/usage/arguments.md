@@ -138,10 +138,12 @@ that runs on a GPU host with the standard `--extra gpu` install. On Ascend
 NPU, fields whose default has no NPU implementation raise a clear error in
 `__post_init__` pointing at the suggested NPU value (`npu` / `fused_npu` /
 `eager`) — there is no silent hardware fallback. NPU users must override
-per field explicitly; the only universal-on-NPU default is
-`load_balancing_loss_implementation: triton` (works on NPU via
-`triton-ascend`). For a portable, no-deps config in code, call
-`OpsImplementationConfig.eager_defaults()`.
+per field explicitly. The one exception is
+`load_balancing_loss_implementation`, which keeps an eager default because
+it is GLOBAL-scoped and resolved eagerly for every model — a fused default
+would force every dense run to depend on triton (or triton-ascend on NPU,
+which is not in the standard `--extra npu` install). For a portable,
+no-deps config in code, call `OpsImplementationConfig.eager_defaults()`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -151,7 +153,7 @@ per field explicitly; the only universal-on-NPU default is
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton` (per-model). |
 | swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. No NPU fused kernel; NPU users must set `eager`. |
 | rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton` (per-model). |
-| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. Known values: `eager`, `triton`. The `triton` backend is universal: `triton` (GPU) or `triton-ascend` (NPU). |
+| load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`). Default stays eager because this op is GLOBAL-scoped and would otherwise force every dense run to depend on the triton package; MoE configs that want the speedup set `triton` explicitly. |
 
 ### DataArguments
 

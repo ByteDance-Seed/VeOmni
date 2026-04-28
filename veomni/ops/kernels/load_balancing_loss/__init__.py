@@ -71,7 +71,13 @@ register_op(
         config_field="load_balancing_loss_implementation",
         label="LoadBalancingLoss",
         scope=OpScope.GLOBAL,
-        default="triton",
+        # Default kept at ``eager`` (not GPU-reasonable like the other ops)
+        # because this op is GLOBAL-scoped: ``apply_ops_config`` resolves it
+        # eagerly for every model, including dense models that never call
+        # this loss. A non-eager default would force every dense run to
+        # depend on the fused kernel package — see the ``help`` string on
+        # ``OpsImplementationConfig.load_balancing_loss_implementation``.
+        default="eager",
         global_slot="veomni.ops.kernels.load_balancing_loss:_load_balancing_loss",
         backends={
             "eager": BackendSpec(entry="veomni.ops.kernels.load_balancing_loss.eager:load_balancing_loss_pytorch"),

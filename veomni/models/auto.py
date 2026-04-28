@@ -61,6 +61,44 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
+_MOE_EXPERT_COUNT_FIELDS = (
+    # Names used by HF MoE configs for the routed-experts dimension. Any one
+    # of these being present (and > 0) means the model has MoE experts.
+    "num_experts",
+    "num_local_experts",
+    "moe_num_experts",
+    "n_routed_experts",
+)
+
+
+def _config_is_moe(config) -> bool:
+    """Return True if *config* declares any MoE expert dimension.
+
+    The legacy MoE patch (``apply_moe_patch_transformers_v4``) binds a fused
+    MoE kernel via ``apply_veomni_fused_moe_patch``. With the GPU-reasonable
+    ``moe_implementation`` default flipped from ``"eager"`` to
+    ``"fused_triton"``, that patch would otherwise fire for *every* model
+    (Llama / plain Qwen / etc.) and crash on hosts without triton (or NPU
+    where ``fused_triton`` is GPU-only). We short-circuit it for non-MoE
+    configs so dense models pay no cost from the new default.
+
+    Walks the top-level config plus any ``text_config`` / ``language_config``
+    sub-config (used by VLM wrappers like Qwen2-VL / Qwen3-VL) since those
+    place the MoE fields on the language sub-config rather than the wrapper.
+    """
+    candidates = [config]
+    for sub_attr in ("text_config", "language_config"):
+        sub = getattr(config, sub_attr, None)
+        if sub is not None:
+            candidates.append(sub)
+    for cand in candidates:
+        for field_name in _MOE_EXPERT_COUNT_FIELDS:
+            value = getattr(cand, field_name, None)
+            if value is not None and value > 0:
+                return True
+    return False
+
+
 def apply_moe_patch_transformers_v4(config, moe_implementation: str):
     """Legacy MoE dispatch path for models that don't use OpSlot.
 
@@ -258,6 +296,17 @@ def build_foundation_model(
         if _module_has_opslot(pre_load_modeling_module, "moe_experts"):
             logger.info_rank0(
                 f"Model has a 'moe_experts' OpSlot; ignoring legacy moe_implementation={moe_implementation!r}."
+            )
+        elif not _config_is_moe(config):
+            # Dense models (Llama, plain Qwen, etc.) don't have experts. With
+            # the new ``moe_implementation`` default of ``"fused_triton"``,
+            # falling through to the legacy patch would import / bind a fused
+            # MoE kernel that the model never uses, and would outright crash on
+            # hosts without triton (or on NPU where ``fused_triton`` is
+            # GPU-only). Skip the patch so dense models pay zero cost from the
+            # new default.
+            logger.info_rank0(
+                f"Config has no MoE expert dimension; skipping legacy MoE patch (moe_implementation={moe_implementation!r})."
             )
         else:
             apply_moe_patch_transformers_v4(config, moe_implementation)

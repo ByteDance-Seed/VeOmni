@@ -44,7 +44,10 @@ _EXPECTED_DEFAULTS = {
     "rms_norm_implementation": "liger_kernel",
     "swiglu_mlp_implementation": "liger_kernel",
     "rotary_pos_emb_implementation": "liger_kernel",
-    "load_balancing_loss_implementation": "triton",
+    # Stays eager — see the dataclass docstring. ``apply_ops_config`` resolves
+    # GLOBAL ops eagerly for every model, so a triton default would force
+    # every dense run to depend on triton.
+    "load_balancing_loss_implementation": "eager",
 }
 
 
@@ -310,4 +313,5 @@ def test_gpu_host_skips_npu_validation():
     assert cfg.rms_norm_implementation == "liger_kernel"
     assert cfg.rotary_pos_emb_implementation == "liger_kernel"
     assert cfg.swiglu_mlp_implementation == "liger_kernel"
-    assert cfg.load_balancing_loss_implementation == "triton"
+    # load_balancing_loss stays eager — see the dataclass docstring.
+    assert cfg.load_balancing_loss_implementation == "eager"

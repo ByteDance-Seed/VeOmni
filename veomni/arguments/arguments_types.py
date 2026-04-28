@@ -632,13 +632,41 @@ _LEGACY_ALIASES: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Values that are GPU-only (the GPU-reasonable defaults below) but have a
-# direct NPU equivalent. Used by ``_validate_device_compatibility`` to give a
-# clear, actionable error on NPU when a GPU value would otherwise reach
-# bind-time and fail with a less helpful message.
+# Active validation rule (NOT just documentation). Read by
+# ``_validate_device_compatibility`` at ``__post_init__`` time:
+# when ``IS_NPU_AVAILABLE`` is true, the validator iterates this table and
+# RAISES ``ValueError`` for any field whose current value is listed here.
 #
-# ``"eager"`` and load-balancing-loss ``"triton"`` (which works on NPU via
-# ``triton-ascend``) are universal — not listed here.
+# Schema:
+#     {
+#       <ops_implementation field name>: {
+#         <gpu-only value that is NOT supported on NPU>: <suggested NPU replacement>,
+#         ...
+#       },
+#       ...
+#     }
+#
+# The inner mapping serves two roles at once:
+#   1. **Membership check** — `value in mapping` is the gate that triggers
+#      the error.  Adding a new (field, value) entry is what *makes* it
+#      forbidden on NPU; removing the entry makes it allowed.
+#   2. **Error-message hint** — the inner value is interpolated into the
+#      raised message so the user sees a concrete copy-pasteable
+#      replacement (``Set rms_norm_implementation='npu' (or 'eager')``).
+#
+# Anything *not* listed here is implicitly allowed on NPU. In particular:
+#   - ``"eager"`` is universal across every field, so it never appears here.
+#   - ``load_balancing_loss_implementation`` has no entry: its ``triton``
+#     value is portable across CUDA ``triton`` and NPU ``triton-ascend``
+#     (same import name), and the package availability gate lives in
+#     ``_validate_implementations`` via the BackendSpec ``requires=("triton",)``
+#     declaration — not here.
+#   - ``attn_implementation`` is the one field validated *after* the SP
+#     rewrite, so its entry has to list both the user-facing names
+#     (``flash_attention_2``) and the rewritten ones
+#     (``veomni_flash_attention_2_with_sp``); both forms reach this
+#     validator depending on whether the user already passed the
+#     pre-rewrite or post-rewrite value.
 _NPU_INCOMPATIBLE: Dict[str, Dict[str, str]] = {
     # ``attn_implementation`` is checked after the SP rewrite, so both the
     # user-facing names and the rewritten ``veomni_flash_attention_*_with_sp``
@@ -775,12 +803,20 @@ class OpsImplementationConfig:
         },
     )
     load_balancing_loss_implementation: str = field(
-        default="triton",
+        default="eager",
         metadata={
             "help": "MoE load-balancing loss implementation. "
-            "'triton' (default) uses a fused Triton kernel — works on GPU "
-            "(``triton``) and on NPU (``triton-ascend``). "
-            "'eager' uses PyTorch reference."
+            "'eager' (default) uses the PyTorch reference. The default stays "
+            "eager (not GPU-reasonable) because this op is GLOBAL-scoped: "
+            "``apply_ops_config`` resolves it eagerly for *every* model — "
+            "including dense models that never call this loss — so a "
+            "non-eager default would force every dense run to depend on the "
+            "fused kernel package, even on hosts (e.g. the standard "
+            "``--extra npu`` install) that don't ship triton-ascend. "
+            "MoE configs that want the speedup can opt in to "
+            "``load_balancing_loss_implementation: triton`` explicitly. "
+            "The triton kernel is portable across CUDA ``triton`` and NPU "
+            "``triton-ascend`` (both expose the same import name)."
         },
     )
 

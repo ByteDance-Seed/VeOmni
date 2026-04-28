@@ -11,7 +11,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from veomni.utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from veomni.utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
 
 from .launch_utils import find_free_port
 
@@ -23,6 +23,11 @@ from .launch_utils import find_free_port
 # (e.g. NPU CI) need ``eager`` for the Liger fields too.
 _IS_NPU = is_torch_npu_available()
 _HAS_LIGER = is_liger_kernel_available()
+# ``triton`` (CUDA) and ``triton-ascend`` (NPU) both expose the same import
+# name. Treat ``triton`` as available iff we can import it, regardless of
+# device — the load-balancing-loss kernel works on both stacks but the
+# standard ``--extra npu`` install does NOT ship triton-ascend.
+_HAS_TRITON = is_package_available("triton")
 _FUSED_MOE_IMPL = "fused_npu" if _IS_NPU else "fused_triton"
 _ATTN_IMPL = "sdpa" if _IS_NPU else "flash_attention_2"
 # RMSNorm / RoPE: NPU has its own fused kernel; GPU uses Liger if available.
@@ -31,8 +36,10 @@ _ROTARY_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
 # SwiGLU has no NPU fused kernel; CE on NPU goes through chunk_loss.
 _SWIGLU_IMPL = "eager" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
 _CE_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
-# Load-balancing-loss ``triton`` is universal (works on NPU via triton-ascend).
-_LB_LOSS_IMPL = "triton"
+# Load-balancing-loss: triton-ascend is not in the standard ``--extra npu``
+# install, so we can't unconditionally pick triton on NPU. Fall back to
+# eager whenever the triton import would fail.
+_LB_LOSS_IMPL = "triton" if _HAS_TRITON else "eager"
 
 
 def host_appropriate_ops_cli_args(
