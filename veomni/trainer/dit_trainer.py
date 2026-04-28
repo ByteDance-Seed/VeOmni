@@ -257,6 +257,10 @@ class DiTTrainer:
     def _build_model(self):
         logger.info_rank0("Build model")
         args: VeOmniDiTArguments = self.base.args
+        # Apply ops config eagerly so the condition model (built below via
+        # ``model_class._from_config``, not ``build_foundation_model``) sees a
+        # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
+        # below will re-apply the same config — that call is idempotent.
         apply_ops_config(args.model.ops_implementation)
         dit_config = build_config(args.model.config_path)
         self.base.model_config = dit_config
@@ -270,9 +274,8 @@ class DiTTrainer:
                 config_path=args.model.config_path,
                 weights_path=args.model.model_path,
                 torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-                attn_implementation=args.model.ops_implementation.attn_implementation,
-                moe_implementation=args.model.ops_implementation.moe_implementation,
                 init_device=args.train.init_device,
+                ops_implementation=args.model.ops_implementation,
             )
             self.base.model_config = getattr(self.base.model, "config", None)
         else:

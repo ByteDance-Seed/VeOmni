@@ -33,8 +33,6 @@
 #      VeOmni SP + precomputed position-id + dummy-forward + deepstack; preserve MoE router_logits
 #    - method_override: Qwen3VLMoeForConditionalGeneration.get_position_id_func
 #      Use VeOmni precomputed position-id function and unified multimodal token ids
-#    - method_override: Qwen3VLMoeModel.__init__
-#      Propagate _moe_implementation from top-level config to text_config
 #    - class_replacement: Qwen3VLMoeTextExperts
 #      Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 #    - method_override: Qwen3VLMoeForConditionalGeneration.forward
@@ -123,6 +121,7 @@ veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 from veomni.ops.dispatch import OpSlot
 
 
+veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 
@@ -297,17 +296,19 @@ class Qwen3VLMoeTextRMSNorm(nn.Module):
 # Patch: Qwen3VLMoeTextExperts
 # 1. drop the upstream `@use_experts_implementation` decorator — routing
 #    through `ALL_EXPERTS_FUNCTIONS` bypasses our fused kernel
-# 2. add VeOmni fused MoE dispatch via `_moe_implementation` config flag;
-#    pass `gate_up_proj` directly as `fc1_1_2_weight` (the v5 modeling
-#    already stores it in the `[E, 2*I, H]` fused layout, so no chunk +
-#    contiguous overhead is needed)
+# 2. add VeOmni fused MoE dispatch via the module-level
+#    ``veomni_moe_experts_forward`` OpSlot; pass `gate_up_proj` directly
+#    as `fc1_1_2_weight` (the v5 modeling already stores it in the
+#    `[E, 2*I, H]` fused layout, so no chunk + contiguous overhead is needed)
 # ================================================================
 class Qwen3VLMoeTextExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors.
 
     Replaces the HF class to remove the `@use_experts_implementation` decorator
     (which routes to grouped_mm and bypasses our fused MoE path) and to add
-    VeOmni fused MoE dispatch via the `_moe_implementation` config flag.
+    VeOmni fused MoE dispatch via the OpSlot guard. The OpSlot is bound by
+    ``_bind_veomni_ops`` after model construction; eager mode falls through
+    to the standard expert loop below.
     """
 
     def __init__(self, config):
@@ -318,12 +319,6 @@ class Qwen3VLMoeTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        # --- Patch.2 ---
-        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
-        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
-        # apply_moe_patch_transformers_v4 *before* loader.load_model.
-        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
-        # --- Patch.2 ---
 
     def forward(
         self,
@@ -333,8 +328,8 @@ class Qwen3VLMoeTextExperts(nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         # --- Patch.2 ---
-        if self._moe_implementation == "fused":
-            final_hidden_states = fused_moe_forward(
+        if veomni_moe_experts_forward.use_non_eager_impl:
+            return fused_moe_forward(
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
@@ -344,26 +339,24 @@ class Qwen3VLMoeTextExperts(nn.Module):
                 fc2_weight=self.down_proj,
                 fc1_1_2_weight=self.gate_up_proj,
             )
-        elif self._moe_implementation == "eager":
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-            for expert_idx in expert_hit:
-                expert_idx = expert_idx[0]
-                if expert_idx == self.num_experts:
-                    continue
-                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-                current_state = hidden_states[token_idx]
-                gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-                current_hidden_states = self.act_fn(gate) * up
-                current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-        else:
-            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
         # --- Patch.2 ---
+
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
 
@@ -1516,7 +1509,7 @@ class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLMoeModel
-# Methods patched: get_image_features, get_placeholder_mask, forward, __init__
+# Methods patched: get_image_features, get_placeholder_mask, forward
 # ======================================================================
 
 
@@ -1529,19 +1522,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
     config: Qwen3VLMoeConfig
     _no_split_modules = ["Qwen3VLMoeTextDecoderLayer", "Qwen3VLMoeVisionBlock"]
 
-    # ================================================================
-    # Patch: Qwen3VLMoeModel.__init__
-    # 1. propagate `_moe_implementation` from the top-level `Qwen3VLMoeConfig`
-    #    down to `config.text_config` so `Qwen3VLMoeTextSparseMoeBlock.experts`
-    #    picks up the correct mode (v5 upstream does not propagate it — the
-    #    inner MoE classes are built from `config.text_config`)
-    # ================================================================
     def __init__(self, config):
-        # --- Patch.1 ---
-        moe_implementation = getattr(config, "_moe_implementation", "eager")
-        config.text_config._moe_implementation = moe_implementation
-        # --- Patch.1 ---
-
         super().__init__(config)
         self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)

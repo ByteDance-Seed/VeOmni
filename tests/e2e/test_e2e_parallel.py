@@ -5,9 +5,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import torch
 
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
@@ -22,13 +22,19 @@ _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires di
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
+    # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
+    # across pytest invocations *and* across GPU architectures (L20 in CI vs A100
+    # locally). Without this, the four sub-runs (sp/ep grid) shared weights within
+    # one pytest run but differed between runs, making SP/EP-vs-no-EP grad-norm
+    # comparisons flaky at the toy-config scale (CI hit a seed where the EP=2 vs
+    # EP=1 step-2 grad_norm diff was 0.69, blowing past the 0.1 atol+rtol envelope).
+    torch.manual_seed(0)
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
         attn_implementation="eager",
-        moe_implementation="eager",
-        init_device=get_device_type(),
+        init_device="cpu",
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
 

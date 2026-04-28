@@ -97,6 +97,53 @@ def sync_weight_deepseek_v3(config, state_dict_source, veomni_model):
     return veomni_model
 
 
+def sync_weight_qwen3_omni_moe(config, state_dict_source, veomni_model):
+    """
+    Align HF state dict to VeOmni Qwen3-Omni-MoE thinker layout (experts stacked per module).
+
+    On transformers v4, upstream HF stores thinker experts as ``nn.ModuleList`` with
+    per-expert keys (``thinker.model.layers.{i}.mlp.experts.{j}.{proj}.weight``). After the
+    OpSlot migration, VeOmni's v4 thinker uses the same stacked-parameter layout in both
+    eager and fused modes (``thinker.model.layers.{i}.mlp.experts.{gate_proj,up_proj,
+    down_proj}``). We stack here so the test can copy the HF state dict over.
+
+    Visual / audio / talker keys pass through unchanged — the talker tower keeps
+    ``nn.ModuleList`` experts on v4 so the per-expert format already matches.
+    """
+    text_config = config.thinker_config.text_config
+    layer_num = text_config.num_hidden_layers
+    expert_num = text_config.num_experts
+
+    hf_model_state_dict = state_dict_source
+    veomni_model_state_dict = veomni_model.state_dict()
+    # copy weights
+    for i in hf_model_state_dict.keys():
+        if i in veomni_model_state_dict.keys():
+            veomni_model_state_dict[i] = hf_model_state_dict[i]
+
+    # Stack thinker experts.
+    for layer_id in range(layer_num):
+        for module_name in ["gate_proj", "up_proj", "down_proj"]:
+            expert_weights = []
+            for expert_id in range(expert_num):
+                key = f"thinker.model.layers.{layer_id}.mlp.experts.{expert_id}.{module_name}.weight"
+                expert_weights.append(hf_model_state_dict[key])
+
+            veomni_module_name = f"thinker.model.layers.{layer_id}.mlp.experts.{module_name}"
+            veomni_model_state_dict[veomni_module_name] = torch.stack(expert_weights, dim=0)
+
+    veomni_model.load_state_dict(veomni_model_state_dict)
+
+    for i in hf_model_state_dict.keys():
+        if i in veomni_model_state_dict.keys():
+            try:
+                assert veomni_model_state_dict[i].equal(hf_model_state_dict[i])
+            except AssertionError as e:
+                raise AssertionError(f"tensor is not the same after init. key={i}") from e
+    return veomni_model
+
+
 # Register adapters (remove entry when adapter is no longer needed)
 SYNC_WEIGHT_REGISTRY["qwen3_moe"] = sync_weight_qwen3moe
 SYNC_WEIGHT_REGISTRY["deepseek_v3"] = sync_weight_deepseek_v3
+SYNC_WEIGHT_REGISTRY["qwen3_omni_moe"] = sync_weight_qwen3_omni_moe

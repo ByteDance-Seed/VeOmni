@@ -661,6 +661,8 @@ class OpsImplementationConfig:
             "'fused_npu' (NPU group-gemm, requires torch_npu), "
             "'eager' (default, reference loop). "
             "The backend must match the hardware — no silent fallback. "
+            "Legacy alias: 'fused' is auto-resolved to 'fused_quack' on GPU "
+            "and 'fused_npu' on NPU (deprecated; emit a migration warning). "
             "Typed as plain str (not Literal) so third-party backends can be "
             "plugged in via `apply_veomni_fused_moe_patch` (legacy-dispatch "
             "models) or `KERNEL_REGISTRY.register(op_name='moe_experts', ...)` "
@@ -669,13 +671,15 @@ class OpsImplementationConfig:
         },
     )
     cross_entropy_loss_implementation: str = field(
-        default="eager",
+        default="chunk_loss",
         metadata={
             "help": "Cross-entropy loss implementation. "
-            "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
-            "'npu' enables chunked loss computation for CausalLM on NPU "
-            "(requires torch_npu). "
-            "'eager' (default) uses PyTorch F.cross_entropy."
+            "'chunk_loss' (default) computes the loss in chunks via "
+            "F.linear + eager CE; works on both CUDA and Ascend NPU. "
+            "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel, GPU). "
+            "'npu' is a back-compat alias for 'chunk_loss' that additionally "
+            "asserts torch_npu is installed. "
+            "'eager' uses PyTorch F.cross_entropy without chunking."
         },
     )
     rms_norm_implementation: str = field(
@@ -726,6 +730,20 @@ class OpsImplementationConfig:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
+
+        # Legacy alias: ``moe_implementation='fused'`` resolves to a
+        # hardware-appropriate fused kernel — Quack on GPU, NPU group-gemm on
+        # Ascend. Kept for back-compat with pre-#678 YAMLs; warn so users
+        # migrate to the explicit name.
+        if self.moe_implementation == "fused":
+            from ..utils.import_utils import is_torch_npu_available
+
+            resolved = "fused_npu" if is_torch_npu_available() else "fused_quack"
+            logger.warning_rank0(
+                f"moe_implementation='fused' is a deprecated alias; resolving to '{resolved}' on this host. "
+                f"Set moe_implementation='{resolved}' explicitly to silence this warning."
+            )
+            self.moe_implementation = resolved
 
         self._validate_implementations()
 

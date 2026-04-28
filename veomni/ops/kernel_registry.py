@@ -51,7 +51,14 @@ class HardwareRequirement:
             # torch_npu package AND an actual NPU device (unlike a bare import
             # check, which passes on dev boxes that merely have the library).
             return IS_NPU_AVAILABLE
-        raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu' or 'npu')")
+        if self.device_type == "any":
+            # Hardware-agnostic kernel (pure PyTorch). Used e.g. by chunk_loss
+            # (F.linear + eager_cross_entropy in a chunked autograd Function),
+            # which has no device-specific calls. Always satisfied — including
+            # on CPU-only hosts (unit tests, weight materialization, dev boxes
+            # without an accelerator).
+            return True
+        raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu' | 'npu' | 'any')")
 
 
 @dataclass(frozen=True)

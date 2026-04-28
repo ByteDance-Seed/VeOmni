@@ -145,7 +145,6 @@ def load_veomni_model(config_path, device):
         weights_path=None,
         torch_dtype="bfloat16",
         attn_implementation="flash_attention_2",
-        moe_implementation="eager",
         init_device=device,
     )
     model.eval()

@@ -56,8 +56,9 @@ def apply_ops_patch():
     Registers VeOmni's SP-aware attention variants into the shared
     ``ALL_ATTENTION_FUNCTIONS`` registry. Loss dispatch (``LOSS_MAPPING``) is
     deferred to ``apply_ops_config`` so there is a single binding point that
-    consumes ``OpsImplementationConfig``; ``build_foundation_model`` guards
-    against callers that forget to call ``apply_ops_config`` first.
+    consumes ``OpsImplementationConfig``; ``build_foundation_model`` invokes
+    it automatically when callers pass ``ops_implementation=...`` (and
+    installs defaults otherwise).
     """
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":

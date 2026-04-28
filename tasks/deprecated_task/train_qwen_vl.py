@@ -137,10 +137,9 @@ def main():
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
-        moe_implementation=args.model.ops_implementation.moe_implementation,
-        attn_implementation=args.model.ops_implementation.attn_implementation,
         encoder_data_balance=args.model.encoder_data_balance,
         encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+        ops_implementation=args.model.ops_implementation,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")

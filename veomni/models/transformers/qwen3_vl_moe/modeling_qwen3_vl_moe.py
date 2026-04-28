@@ -57,6 +57,7 @@ from ....distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from ....ops import fused_moe_forward
+from ....ops.dispatch import OpSlot
 from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
@@ -67,18 +68,17 @@ from ..attention_utils import VARLEN_ATTENTION_TYPES
 logger = logging.get_logger(__name__)
 
 
+# Module-level OpSlot bound by `_bind_veomni_ops` in `auto.py` after the model
+# is constructed. `use_non_eager_impl` flips to True when the user selects a
+# fused MoE backend in `OpsImplementationConfig.moe_implementation`.
+veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
+
+
 # ================================================================
 # Patch: Qwen3VLMoeTextExperts
-# 1. add fused MoE forward for better performance and enable EP
+# 1. add fused MoE forward for better performance and enable EP via OpSlot dispatch
 # ================================================================
 class Qwen3VLMoeTextExperts(_Qwen3VLMoeTextExperts):
-    def __init__(self, config):
-        super().__init__(config)
-        # TODO(kernel-registry): migrate to OpSlot("moe_experts", …) like
-        # qwen3_5_moe; reading config at __init__ time forces auto.py to run
-        # apply_moe_patch_transformers_v4 *before* loader.load_model.
-        self.moe_implementation = getattr(config, "_moe_implementation", "eager")
-
     # --- Patch.1 ---
     def fused_moe_forward(
         self,
@@ -126,10 +126,9 @@ class Qwen3VLMoeTextExperts(_Qwen3VLMoeTextExperts):
         router_indices: torch.Tensor,
         routing_weights: torch.Tensor = None,
     ) -> torch.Tensor:
-        if self.training and self.moe_implementation == "fused":
+        if self.training and veomni_moe_experts_forward.use_non_eager_impl:
             return self.fused_moe_forward(hidden_states, router_weights, router_indices, routing_weights)
-        else:
-            return super().forward(hidden_states, router_weights, router_indices)
+        return super().forward(hidden_states, router_weights, router_indices)
 
 
 # ================================================================
@@ -402,22 +401,17 @@ def Qwen3VLMoeTextModel__deepstack_process(
 
 # ================================================================
 # Patch: Qwen3VLMoeModel
-# 1. set moe_implementation
-# 2. skip torch.split in get_image_features
-# 3. patch get_placeholder_mask for veomni usage
-# 4. sequence parallel forward for sp sliced input_embeds & image_mask
+# 1. skip torch.split in get_image_features
+# 2. patch get_placeholder_mask for veomni usage
+# 3. sequence parallel forward for sp sliced input_embeds & image_mask
 # & video_mask $ deepstack embeds
-# 5. dummy forward patch
-# 6. handle precomputed position_ids with shape (bs, dim, seq_len)
-# 7. Use precomputed flash attention kwargs to avoid CPU-GPU sync
+# 4. dummy forward patch
+# 5. handle precomputed position_ids with shape (bs, dim, seq_len)
+# 6. Use precomputed flash attention kwargs to avoid CPU-GPU sync
 # ================================================================
 @auto_docstring
 class Qwen3VLMoeModel(_Qwen3VLMoeModel):
     def __init__(self, config):
-        # --- Patch.1 ---
-        moe_implementation = getattr(config, "_moe_implementation", "eager")
-        config.text_config._moe_implementation = moe_implementation
-        # --- Patch.1 ---
         super().__init__(config)
 
         if config.encoder_data_balance:

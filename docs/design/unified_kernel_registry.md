@@ -769,7 +769,7 @@ model.forward()                                    # (5) runtime
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | `rms_norm_implementation: liger` etc. | Deprecate env var; keep compat for 1 release |
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
-| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | Kept for legacy-dispatch models (qwen3_moe etc.) until they adopt OpSlot |
+| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3) now bind through OpSlot; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer used inside the OpSlot guards. |
 | `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: fused_triton` or `fused_npu` | Breaking change — `"fused"` renamed to `"fused_triton"` and the silent NPU auto-pick replaced by explicit `"fused_npu"`. `fused_quack` is unchanged. |
 
 ---

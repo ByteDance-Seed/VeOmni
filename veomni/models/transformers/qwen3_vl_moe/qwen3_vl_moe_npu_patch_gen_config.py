@@ -42,7 +42,6 @@ from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config i
     qwen3_vl_moe_for_conditional_generation_forward_patched,
     qwen3_vl_moe_get_parallel_plan_patched,
     qwen3_vl_moe_model_forward_patched,
-    qwen3_vl_moe_model_init_patched,
 )
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     config as gpu_config,
@@ -143,11 +142,6 @@ config.override_method(
 )
 
 # MoE-specific patches reused verbatim from the GPU config.
-config.override_method(
-    "Qwen3VLMoeModel.__init__",
-    replacement=qwen3_vl_moe_model_init_patched,
-    description="Propagate _moe_implementation from top-level config to text_config",
-)
 config.replace_class(
     "Qwen3VLMoeTextExperts",
     replacement=PatchedQwen3VLMoeTextExperts,

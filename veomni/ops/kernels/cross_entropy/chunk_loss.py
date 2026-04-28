@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked cross-entropy loss for causal LM heads on NPU.
+"""Chunked cross-entropy loss for causal LM heads.
 
-Used when ``OpsImplementationConfig.cross_entropy_loss_implementation == "npu"``.
-The outer ``chunk_loss_function`` splits the sequence into chunks and calls the
-eager cross-entropy on each chunk, accumulating gradients via a custom autograd
-``Function``. The chunked path always uses eager — it is installed directly into
-``LOSS_MAPPING["ForCausalLM"]`` / ``LOSS_MAPPING["ForConditionalGeneration"]``
-by ``install_loss_mapping("npu")`` and never reaches ``ForCausalLMLoss``.
+Hardware-agnostic: composes ``F.linear`` and ``eager_cross_entropy`` and runs
+on both CUDA and Ascend NPU without any device-specific calls. Selected via
+``OpsImplementationConfig.cross_entropy_loss_implementation == "chunk_loss"``
+(the default); ``"npu"`` is kept as a back-compat alias for the same kernel.
+
+The outer ``chunk_loss_function`` splits the sequence into chunks and calls
+eager CE on each chunk, accumulating gradients via a custom autograd
+``Function``. It is installed directly into ``LOSS_MAPPING["ForCausalLM"]`` /
+``LOSS_MAPPING["ForConditionalGeneration"]`` by
+``install_loss_mapping("chunk_loss")`` and never reaches ``ForCausalLMLoss``.
 
 Causal-only: the function hard-codes a causal label shift, so it cannot back
 ``ForSequenceClassification`` (token-level labels, no shift). SP reduction is

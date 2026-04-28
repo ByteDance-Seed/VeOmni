@@ -139,9 +139,8 @@ class TextDPOTrainer:
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
             torch_dtype=args.dpo_config.refer_model_precision,
-            attn_implementation=args.model.ops_implementation.attn_implementation,
-            moe_implementation=args.model.ops_implementation.moe_implementation,
             init_device=args.train.init_device,
+            ops_implementation=args.model.ops_implementation,
         )
 
         self.reference_model.requires_grad_(False)
