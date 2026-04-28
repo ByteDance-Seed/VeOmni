@@ -22,6 +22,8 @@ rather than silently falling back to another backend.
 Two paths:
 1. Legacy: ``apply_veomni_fused_moe_patch`` (qwen3_moe, deepseek_v3, etc.)
 2. OpSlot: ``KERNEL_REGISTRY.resolve`` via ``HardwareRequirement`` (qwen3_5_moe)
+3. Auto: ``moe_implementation='fused'`` resolves to the accelerator-specific
+   concrete fused backend before either path binds a kernel.
 
 We mock the hardware-detection helpers so the same test suite runs on any
 CI host.
@@ -138,7 +140,7 @@ def test_opslot_unknown_kernel_name_raises():
 @patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
 @patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
 @patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc):
+def test_bind_veomni_ops_translates_moe_kernel_and_checks_hw(_mock_cc):
     """Reproducer for the silent-fallback regression:
 
     User sets ``moe_implementation='fused_quack'`` on an A100. The binding
@@ -156,6 +158,73 @@ def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc):
 
     with pytest.raises(RuntimeError, match="compute_capability>=90"):
         _bind_veomni_ops(fake_module, ops_config)
+
+
+@patch("veomni.models.auto.IS_NPU_AVAILABLE", True)
+@patch("veomni.models.auto.IS_CUDA_AVAILABLE", False)
+def test_select_moe_kernel_fused_auto_selects_npu():
+    from veomni.models.auto import _select_moe_kernel_by_device
+
+    resolved = _select_moe_kernel_by_device("fused")
+    assert resolved.config_value == "fused"
+    assert resolved.kernel_name == "npu"
+
+
+@patch("veomni.models.auto.IS_NPU_AVAILABLE", False)
+@patch("veomni.models.auto.IS_CUDA_AVAILABLE", True)
+@patch("veomni.models.auto.get_gpu_compute_capability", return_value=100)
+def test_select_moe_kernel_fused_auto_selects_quack_on_sm100(_mock_cc):
+    from veomni.models.auto import _select_moe_kernel_by_device
+
+    resolved = _select_moe_kernel_by_device("fused")
+    assert resolved.kernel_name == "quack"
+
+
+@patch("veomni.models.auto.IS_NPU_AVAILABLE", False)
+@patch("veomni.models.auto.IS_CUDA_AVAILABLE", True)
+@patch("veomni.models.auto.get_gpu_compute_capability", return_value=90)
+def test_select_moe_kernel_fused_auto_selects_triton_below_sm100(_mock_cc):
+    from veomni.models.auto import _select_moe_kernel_by_device
+
+    resolved = _select_moe_kernel_by_device("fused")
+    assert resolved.kernel_name == "triton"
+
+
+@patch("veomni.models.auto.IS_NPU_AVAILABLE", False)
+@patch("veomni.models.auto.IS_CUDA_AVAILABLE", False)
+def test_select_moe_kernel_fused_auto_requires_accelerator():
+    from veomni.models.auto import _select_moe_kernel_by_device
+
+    with pytest.raises(RuntimeError, match="requires a CUDA GPU or NPU"):
+        _select_moe_kernel_by_device("fused")
+
+
+def test_select_moe_kernel_rejects_unknown_fused_backend():
+    from veomni.models.auto import _select_moe_kernel_by_device
+
+    with pytest.raises(ValueError, match="Expected one of"):
+        _select_moe_kernel_by_device("fused_unit_test_custom")
+
+
+@patch("veomni.models.auto.is_transformers_version_greater_or_equal_to", return_value=False)
+def test_opslot_moe_dispatch_ignores_transformers_v4(_mock_tf_version):
+    from types import SimpleNamespace
+
+    from veomni.models.auto import _module_uses_opslot_moe_dispatch
+
+    fake_module = SimpleNamespace(veomni_moe_experts_forward=OpSlot("moe_experts", "standard"))
+    assert not _module_uses_opslot_moe_dispatch(fake_module)
+
+
+@patch("veomni.models.auto.is_transformers_version_greater_or_equal_to", return_value=True)
+def test_opslot_moe_dispatch_requires_moe_experts_slot(_mock_tf_version):
+    from types import SimpleNamespace
+
+    from veomni.models.auto import _module_uses_opslot_moe_dispatch
+
+    assert not _module_uses_opslot_moe_dispatch(SimpleNamespace())
+    fake_module = SimpleNamespace(veomni_moe_experts_forward=OpSlot("moe_experts", "standard"))
+    assert _module_uses_opslot_moe_dispatch(fake_module)
 
 
 # KERNEL_REGISTRY is a module-level singleton. Assert the registrations the

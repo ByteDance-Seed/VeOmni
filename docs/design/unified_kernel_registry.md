@@ -254,13 +254,13 @@ class OpsImplementationConfig:
         "native-sparse",
     ] = "flash_attention_2"
 
-    # Per-op implementation selection (all default to "eager" = original HF code)
+    # Per-op implementation selection.
     rms_norm_implementation: str = "eager"
     rms_norm_gated_implementation: str = "eager"   # (proposed — not yet shipped)
     rotary_pos_emb_implementation: str = "eager"
     swiglu_mlp_implementation: str = "eager"
     # MoE: single-field backend selection — no silent hardware fallback.
-    moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = "eager"
+    moe_implementation: str = "fused"
     cross_entropy_loss_implementation: str = "eager"
     load_balancing_loss_implementation: str = "eager"
 ```
@@ -274,7 +274,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
-| `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field; mismatches (e.g. `fused_triton` on NPU) raise in `apply_veomni_fused_moe_patch` rather than silently falling back |
+| `moe_implementation` | `eager`, `fused`, `fused_triton`, `fused_quack`, `fused_npu` | Single field; `fused` resolves to `fused_npu` on NPU, `fused_quack` on SM100+ GPUs, and `fused_triton` on other GPUs. Mismatches raise in `apply_veomni_fused_moe_patch` / OpSlot bind rather than silently falling back |
 | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | |
 | `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
 
@@ -346,8 +346,8 @@ User YAML                    OpsImplementationConfig              OpSlot.bind()
 ─────────                    ───────────────────────              ─────────────
 model:                       @dataclass
   ops_implementation:  ───→  class OpsImplementationConfig:
-    moe_implementation:          moe_implementation: Literal[...]
-      fused_triton                         │
+    moe_implementation:          moe_implementation: str
+      fused                               │
                                            ▼
                              build_foundation_model(config)
                                ├─ import patched_modeling_qwen3_5_moe_gpu
@@ -357,10 +357,11 @@ model:                       @dataclass
                                │         veomni_load_balancing_loss   = OpSlot(...)
                                │    (all start with _kernel = None)
                                │
-                               ├─ _bind_veomni_ops(module, ops_config):
-                               │    for name, obj in vars(module).items():
-                               │        if isinstance(obj, OpSlot):
-                               │            impl = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
+                              ├─ resolve fused -> concrete backend
+                              ├─ _bind_veomni_ops(module, ops_config, moe_implementation):
+                              │    for name, obj in vars(module).items():
+                              │        if isinstance(obj, OpSlot):
+                              │            impl = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
                                │            obj.bind(impl)     ← resolves via KERNEL_REGISTRY
                                │
                                └─ model init + weight loading
@@ -374,18 +375,15 @@ module-global lookup does the work.
 ```python
 # veomni/models/auto.py
 
-def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig):
+def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig, moe_implementation: str):
     """Find all OpSlot instances in the module and bind them."""
     for name, obj in vars(modeling_module).items():
         if isinstance(obj, OpSlot):
             # `moe_experts` is the one op whose config field is `moe_implementation`
-            # (not `moe_experts_implementation`) and whose values carry a `fused_`
-            # prefix that registry entries don't — translate here.
+            # (not `moe_experts_implementation`) and whose values may be auto
+            # mode (`fused`) or carry a `fused_` prefix — resolve/translate here.
             if obj.op_name == "moe_experts":
-                impl_name = (
-                    "eager" if ops_config.moe_implementation == "eager"
-                    else ops_config.moe_implementation.removeprefix("fused_")
-                )
+                impl_name = _select_moe_kernel_by_device(moe_implementation).kernel_name or "eager"
             else:
                 impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
             obj.bind(impl_name)  # validates variant + hardware
@@ -738,9 +736,9 @@ build_foundation_model(config)                     # (4) model build time
   │         veomni_causal_lm_loss        = OpSlot("cross_entropy_loss", "causal")
   │         (all start with _kernel = None)
   │
-  ├─ _bind_veomni_ops(module, ops_config):          #     bind from config
+  ├─ _bind_veomni_ops(module, ops_config, moe_implementation):
   │    for each OpSlot in vars(module):
-  │        impl = ops_config.moe_implementation.removeprefix("fused_")   # if moe_experts
+  │        impl = resolved_moe.kernel_name or "eager"      # if moe_experts
   │              or getattr(ops_config, f"{slot.op_name}_implementation", "eager")
   │        slot.bind(impl)                                    # KERNEL_REGISTRY.resolve()
   │
@@ -770,7 +768,7 @@ model.forward()                                    # (5) runtime
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
 | `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | Kept for legacy-dispatch models (qwen3_moe etc.) until they adopt OpSlot |
-| `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: fused_triton` or `fused_npu` | Breaking change — `"fused"` renamed to `"fused_triton"` and the silent NPU auto-pick replaced by explicit `"fused_npu"`. `fused_quack` is unchanged. |
+| `moe_implementation: fused` | shared resolver in `build_foundation_model` | Auto-picks `fused_npu` on NPU, `fused_quack` on SM100+ GPUs, and `fused_triton` on other GPUs. Explicit `fused_triton` / `fused_quack` / `fused_npu` pins a backend. |
 
 ---
 
@@ -781,9 +779,9 @@ model.forward()                                    # (5) runtime
 2. **Attention:** Keep in `ALL_ATTENTION_FUNCTIONS` (shared with HF) or unify
    under `KERNEL_REGISTRY`?
 3. ~~**NPU auto-selection:** Should NPU be an explicit `npu_group_gemm`
-   implementation name, or remain automatic?~~ **Resolved:** NPU is now opted
-   into explicitly via `moe_implementation: fused_npu`; the previous silent
-   auto-pick was removed so mismatched selections raise at patch/bind time.
+   implementation name, or remain automatic?~~ **Resolved:** `fused` remains
+   the portable auto mode, while explicit `fused_npu` / `fused_triton` /
+   `fused_quack` pin a backend and raise on hardware mismatch.
 4. **Multi-model processes:** Each generated module has its own `OpSlot`
    instances, so different models work independently. But two instances of the
    same model with different ops configs share the same `OpSlot` objects.
