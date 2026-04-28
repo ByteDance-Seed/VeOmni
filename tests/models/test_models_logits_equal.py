@@ -2,6 +2,8 @@ import copy
 import gc
 import importlib.util
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,12 +12,12 @@ import torch
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type, get_torch_device
 
-# Importing `utils` now captures pristine HF class attributes (in its
-# `_PRISTINE_HF_CLASSES` snapshot) before any veomni import has a chance to
-# monkey-patch them. `apply_veomni_hf_unpatch()` restores them; we call it
-# before every HF build so leaks from the previous test do not poison the
-# current one.
-from .utils import apply_veomni_hf_unpatch  # noqa: E402
+# Importing `hf_unpatch` here (rather than from `utils`) captures pristine HF
+# class attributes before any veomni import has a chance to monkey-patch them,
+# without dragging in the heavy `veomni.data` import chain (av/torchcodec).
+# `apply_veomni_hf_unpatch()` restores them; we call it before every HF build
+# so leaks from the previous test do not poison the current one.
+from .hf_unpatch import apply_veomni_hf_unpatch  # noqa: E402
 
 
 # Must be set before `import veomni` so GPU kernel patches remain gated off.
@@ -212,6 +214,208 @@ def test_logits_bitwise_equal(case: Case):
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
             f"[{case.case_id}] logits not bitwise equal: "
+            f"{n_mis}/{total} mismatched, max_abs_diff={max_abs:.3e}, "
+            f"first_mismatch_indices={first_idx}"
+        )
+
+
+# Subset of CASES exercised through the runtime converter — only the MoE
+# models, since the converter only fires for them. Mirrors the eager+fp32
+# and fa2+bf16 split of CASES so the converter path gets exercised against
+# both the attention kernels and the dtypes that real users hit.
+_RUNTIME_CONVERTER_CASES = [
+    Case("qwen3_moe-toy-runtime-converter", _toy("qwen3_moe_toy"), sync_weight_key="qwen3_moe"),
+    Case("deepseek_v3-toy-runtime-converter", _toy("deepseek_v3_toy"), sync_weight_key="deepseek_v3"),
+    Case(
+        "qwen3_moe-toy-runtime-converter-fa2",
+        _toy("qwen3_moe_toy"),
+        sync_weight_key="qwen3_moe",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    Case(
+        "deepseek_v3-toy-runtime-converter-fa2",
+        _toy("deepseek_v3_toy"),
+        sync_weight_key="deepseek_v3",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+]
+
+
+def _save_hf_checkpoint(state_dict: dict, config, dst_dir: str) -> None:
+    """Write an HF-format per-expert checkpoint that build_foundation_model can read."""
+    from safetensors.torch import save_file
+
+    config.save_pretrained(dst_dir)
+    save_file(
+        {k: v.detach().contiguous().cpu() for k, v in state_dict.items()},
+        os.path.join(dst_dir, "model.safetensors"),
+    )
+
+
+def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buffers, config, weights_dir: str):
+    """Build VeOmni model by going through `build_foundation_model(weights_path=...)`.
+
+    This is the path real users hit after this PR: pass the original HF checkpoint
+    directly, let the v4 converter stack per-expert keys at load time. No manual
+    sync adapter, no offline merge.
+
+    Why we patch non-persistent buffers below
+    -----------------------------------------
+
+    The HF rotary `inv_freq` buffer is registered with ``persistent=False`` in
+    upstream transformers, so it is **not** in ``model.state_dict()`` and therefore
+    does not round-trip through safetensors. Whatever values end up in
+    ``model.rotary_emb.inv_freq`` after load come entirely from VeOmni's loader
+    init flow, not from the checkpoint.
+
+    VeOmni's loader has two construction paths in
+    ``CustomizedModelingLoader.load_model``:
+
+    1. ``weights_path is None`` (random-init build, used by the sibling
+       ``test_logits_bitwise_equal``): the model is constructed under
+       ``with torch.device(init_device)``. The rotary embedding's
+       ``inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))``
+       executes directly on CUDA, bit-matching the HF reference build which
+       does the same.
+
+    2. ``weights_path != None`` (every real training run, including offline-
+       merged MoE checkpoints from the pre-PR world): the model is
+       constructed under ``init_empty_weights() + no_init_weights()``. Note
+       that accelerate's ``init_empty_weights()`` patches ``register_parameter``
+       to use the meta device, but by default does **not** patch
+       ``register_buffer`` — so the rotary embedding's ``inv_freq`` math runs
+       as a regular **CPU** tensor during ``__init__``. ``load_model_weights``
+       then snapshots ``buffer_dict = {n: b.clone() for n, b in named_buffers()}``
+       (CPU values), runs ``model.to_empty(device=init_device)`` (which wipes
+       buffer storage to uninitialized memory on CUDA), and finally
+       ``post_process_after_weight_loading`` calls ``_dispatch_buffer`` which
+       does ``buf.to(device, dtype)`` — a bit-exact CPU→CUDA copy. So
+       ``inv_freq`` ends up as **CPU-computed** ``1.0 / (base ** ...)`` moved
+       to CUDA, which differs from CUDA-computed ``1.0 / (base ** ...)`` by
+       one ULP per element.
+
+    That 1-ULP gap propagates through attention into a small but non-zero
+    logits delta — enough to fail ``torch.equal`` (we observed ~1e-6 for
+    qwen3_moe and ~3e-3 for deepseek_v3). It is a **pre-existing property of
+    path 2**, not something this PR's converter introduced: every offline-
+    merged MoE checkpoint loaded through ``weights_path=<merged_dir>`` had
+    the same CPU→CUDA ``inv_freq`` move. The sibling test simply never tripped
+    on it because it uses path 1.
+
+    To keep this smoke test a true bitwise check on the converter's
+    *parameter* loading — and not a regression test for a separate loader-
+    level fp jitter that would belong in its own fix — we copy HF's
+    non-persistent buffers into the model after load.
+
+    A proper loader-level fix would be to call ``init_empty_weights(
+    include_buffers=True)`` and recompute buffers on ``init_device`` after
+    ``to_empty``. That is out of scope here; tracked separately.
+    """
+    from veomni.models.auto import build_foundation_model
+
+    _save_hf_checkpoint(hf_state_dict, config, weights_dir)
+
+    model = build_foundation_model(
+        config_path=weights_dir,
+        weights_path=weights_dir,
+        torch_dtype=case.dtype,
+        attn_implementation=case.attn_implementation,
+        init_device=get_device_type(),
+    )
+
+    # Restore non-persistent buffers (e.g. rotary inv_freq) that aren't in the
+    # state dict. See the docstring above for the full background. Walking by
+    # FQN keeps this independent of how nested they are.
+    persistent_keys = set(hf_state_dict.keys())
+    for name, buf in hf_buffers.items():
+        if name in persistent_keys:
+            continue
+        parts = name.split(".")
+        target_module = model
+        for p in parts[:-1]:
+            target_module = getattr(target_module, p)
+        target = target_module._buffers[parts[-1]]
+        target.copy_(buf.to(target.device, dtype=target.dtype))
+
+    return model.eval()
+
+
+@pytest.mark.parametrize("case", _RUNTIME_CONVERTER_CASES, ids=[c.case_id for c in _RUNTIME_CONVERTER_CASES])
+def test_logits_bitwise_equal_via_runtime_converter(case: Case):
+    """Smoke test: per-expert HF checkpoint -> on-the-fly converter -> bitwise-equal forward.
+
+    Complements ``test_logits_bitwise_equal``: that one syncs HF weights into
+    the VeOmni model via the manual adapter in ``weight_sync_adapters.py``.
+    This one saves the HF state dict to disk as a real HF checkpoint and
+    routes loading through ``load_model_weights`` -> ``MoEV4StackingConverter``,
+    exercising the same code path users hit when pointing training at a vanilla
+    HF model dir. Bitwise-equal logits prove the runtime converter produces
+    the exact same stacked parameter tensors the manual adapter does.
+
+    Note on non-persistent buffers: ``_build_veomni_model_via_runtime_converter``
+    copies HF's ``inv_freq`` (and any other ``persistent=False`` buffers) into
+    the loaded model before the forward. That step works around a separate,
+    pre-existing loader quirk on the ``weights_path != None`` path that has
+    nothing to do with this PR's converter — see the helper's docstring for
+    the full explanation.
+    """
+    from transformers import AutoConfig
+
+    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+    if is_transformers_version_greater_or_equal_to("5.0.0"):
+        pytest.skip("Scope is transformers v4 model definition only.")
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    if not os.path.isdir(case.path):
+        pytest.skip(f"Path not found: {case.path}")
+    if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        pytest.skip("flash_attn package not installed.")
+
+    _apply_determinism()
+
+    device_type = get_device_type()
+    gen = torch.Generator(device=device_type).manual_seed(0)
+    input_ids = torch.randint(0, 32000, (1, 32), device=device_type, dtype=torch.long, generator=gen)
+
+    # --- HF phase (must precede any veomni model build, same as the sibling test) ---
+    model_hf = _build_hf_model(case)
+    with torch.no_grad():
+        logits_hf = model_hf(input_ids=input_ids, use_cache=False).logits.detach().clone()
+    hf_state_dict = copy.deepcopy(model_hf.state_dict())
+    hf_buffers = {n: b.detach().clone() for n, b in model_hf.named_buffers()}
+    hf_config = AutoConfig.from_pretrained(case.path)
+    del model_hf
+    _release()
+
+    # --- veomni phase: load the HF checkpoint through build_foundation_model ---
+    tmp_dir = tempfile.mkdtemp(prefix="veomni_v4_converter_test_")
+    try:
+        model_ve = _build_veomni_model_via_runtime_converter(case, hf_state_dict, hf_buffers, hf_config, tmp_dir)
+        with torch.no_grad():
+            logits_ve = model_ve(input_ids=input_ids, use_cache=False).logits.detach().clone()
+        del model_ve
+        _release()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        del hf_state_dict
+        _release()
+
+    assert logits_hf.shape == logits_ve.shape, (
+        f"[{case.case_id}] shape mismatch: hf={tuple(logits_hf.shape)} ve={tuple(logits_ve.shape)}"
+    )
+
+    if not torch.equal(logits_hf, logits_ve):
+        diff = (logits_hf.float() - logits_ve.float()).abs()
+        ne = logits_hf != logits_ve
+        n_mis = int(ne.sum().item())
+        total = logits_hf.numel()
+        max_abs = float(diff.max().item())
+        first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
+        raise AssertionError(
+            f"[{case.case_id}] logits not bitwise equal via runtime converter: "
             f"{n_mis}/{total} mismatched, max_abs_diff={max_abs:.3e}, "
             f"first_mismatch_indices={first_idx}"
         )

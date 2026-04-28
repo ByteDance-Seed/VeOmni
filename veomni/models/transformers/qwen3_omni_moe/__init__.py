@@ -64,6 +64,7 @@ def register_qwen3_omni_moe_modeling(architecture: str):
             Qwen3OmniMoeTalkerModel,
         )
 
+        from .checkpoint_tensor_converter_v4 import create_qwen3_omni_moe_v4_checkpoint_tensor_converter
         from .modeling_qwen3_omni_moe import (
             Qwen3OmniMoeForConditionalGeneration,
             Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -72,6 +73,19 @@ def register_qwen3_omni_moe_modeling(architecture: str):
         )
 
         apply_veomni_qwen3_omni_moe_patch()
+
+        # Stack per-expert HF weights into the thinker's three 3-D nn.Parameters at
+        # load time (Qwen3OmniMoeThinkerExperts.gate_proj/up_proj/down_proj). The
+        # factory returns None when `_moe_implementation != "fused"`, so eager-mode
+        # loads (which use nn.ModuleList for the thinker too) are unaffected.
+        for model_cls in (
+            Qwen3OmniMoeForConditionalGeneration,
+            Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerTextModel,
+        ):
+            model_cls._create_checkpoint_tensor_converter = staticmethod(
+                create_qwen3_omni_moe_v4_checkpoint_tensor_converter
+            )
 
     if "ThinkerTextModel" in architecture:
         return Qwen3OmniMoeThinkerTextModel
