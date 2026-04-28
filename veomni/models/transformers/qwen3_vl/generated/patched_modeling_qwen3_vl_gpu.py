@@ -1088,10 +1088,15 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
     # 1. add dummy_forward so ranks without pixel_values can still run the
     #    visual encoder under FSDP — otherwise reduce-scatter hangs when
     #    some ranks get None pixel_values while others have real images
-    # 2. SP-aware shape: grid_thw height is scaled by sp_size so the dummy
-    #    batch stays a clean multiple after sequence slicing. Shapes are
-    #    derived from the vision config (patch_size / temporal_patch_size /
-    #    in_channels / spatial_merge_size) so model variants don't break
+    # 2. SP-aware shape: grid_thw is built at the FULL un-sliced size (height
+    #    scaled by sp_size) and pixel_values are then SP-pre-sliced with
+    #    pad_scale=4, mirroring what MainCollator does for real pixel_values
+    #    via DataCollateInfo(0, True, 0, 4). This keeps hidden_states (after
+    #    patch_embed) and pos_embeds (which fast_pos_embed_interpolate computes
+    #    from the FULL grid_thw and forward.sp_pad_and_slice's down to per-rank)
+    #    at the same dim-0 size for the `hidden_states + pos_embeds` add. Shapes
+    #    are derived from the vision config (patch_size / temporal_patch_size /
+    #    in_channels / spatial_merge_size) so model variants don't break.
     # ================================================================
     def dummy_forward(self):
         # --- Patch.1 ---
@@ -1121,6 +1126,18 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         pixel_row_size = in_channels * temporal_patch_size * patch_size * patch_size
         pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=self.dtype, device=self.device)
         grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
+
+        # --- Patch.3 ---
+        # Match MainCollator's per-rank slicing of `pixel_values` (DataCollateInfo
+        # pack_dim=0, sp_slice=True, sp_pad_value=0, sp_pad_scale=4) so that the
+        # synthesized batch enters forward at the same per-rank size the real
+        # data path produces. Otherwise hidden_states keeps the full size while
+        # pos_embeds gets sp_pad_and_slice'd inside forward, and
+        # `hidden_states + pos_embeds` mismatches at dim 0 by sp_size.
+        if get_parallel_state().sp_enabled:
+            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
+        # --- Patch.3 ---
+
         return self(hidden_states=pixel_values, grid_thw=grid_thw)
         # --- Patch.1 ---
 
