@@ -71,6 +71,15 @@ _MOE_EXPERT_COUNT_FIELDS = (
 )
 
 
+# Sub-config attribute names that may contain (or themselves contain) the
+# MoE expert dimension. Walked recursively by ``_config_is_moe`` so models
+# with nested config layouts are picked up. The inclusion of
+# ``thinker_config`` covers the Qwen Omni family
+# (``Qwen3OmniMoeConfig.thinker_config.text_config.num_experts``); the
+# others cover VLM wrappers that place language-model fields on a sub-config.
+_MOE_NESTED_CONFIG_ATTRS = ("text_config", "language_config", "thinker_config")
+
+
 def _config_is_moe(config) -> bool:
     """Return True if *config* declares any MoE expert dimension.
 
@@ -82,21 +91,30 @@ def _config_is_moe(config) -> bool:
     where ``fused_triton`` is GPU-only). We short-circuit it for non-MoE
     configs so dense models pay no cost from the new default.
 
-    Walks the top-level config plus any ``text_config`` / ``language_config``
-    sub-config (used by VLM wrappers like Qwen2-VL / Qwen3-VL) since those
-    place the MoE fields on the language sub-config rather than the wrapper.
+    Walks the top-level config plus any sub-config in ``_MOE_NESTED_CONFIG_ATTRS``
+    *recursively*, so deeply nested layouts are covered too — notably
+    ``Qwen3OmniMoeConfig.thinker_config.text_config.num_experts``.
     """
-    candidates = [config]
-    for sub_attr in ("text_config", "language_config"):
-        sub = getattr(config, sub_attr, None)
-        if sub is not None:
-            candidates.append(sub)
-    for cand in candidates:
+    seen: set[int] = set()
+
+    def _walk(cand) -> bool:
+        if cand is None or id(cand) in seen:
+            return False
+        seen.add(id(cand))
+
         for field_name in _MOE_EXPERT_COUNT_FIELDS:
             value = getattr(cand, field_name, None)
             if value is not None and value > 0:
                 return True
-    return False
+
+        for sub_attr in _MOE_NESTED_CONFIG_ATTRS:
+            sub = getattr(cand, sub_attr, None)
+            if sub is not None and _walk(sub):
+                return True
+
+        return False
+
+    return _walk(config)
 
 
 def apply_moe_patch_transformers_v4(config, moe_implementation: str):
