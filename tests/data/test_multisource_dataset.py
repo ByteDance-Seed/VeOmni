@@ -828,6 +828,10 @@ class TestLoadStateDictBoundary:
 
 
 def build_command():
+    # See note in tests/data/test_datasets.py — kernel fields forced to eager
+    # so the subprocess'd parse_args doesn't trip the NPU validator.
+    from tests.tools.training_utils import host_appropriate_ops_cli_args
+
     port = find_free_port()
     command = [
         "torchrun",
@@ -836,6 +840,7 @@ def build_command():
         f"--master_port={port}",
         "tests/data/test_multisource_dataset.py",
         "--model.config_path=test",
+        *host_appropriate_ops_cli_args(eager_only=True),
         "--data.train_path=None",
         "--data.train_size=1000",
         "--data.max_seq_len=32",

@@ -29,6 +29,17 @@ except ImportError:  # pragma: no cover - torch < 2.2 fallback
 logger = helper.create_logger(__name__)
 
 
+def _ops_eager_cli_args():
+    """Force every kernel field to ``eager`` for the subprocess'd parse_args.
+
+    See note in tests/data/test_datasets.py — without this the new
+    GPU-reasonable defaults trip the NPU device-compatibility validator.
+    Tiny-model tests don't exercise any kernel anyway."""
+    from tests.tools.training_utils import host_appropriate_ops_cli_args
+
+    return host_appropriate_ops_cli_args(eager_only=True)
+
+
 @dataclass
 class BroadcastTestArguments:
     weights_path: str = ""
@@ -213,6 +224,7 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
         f"--master_port={port}",
         "tests/utils/test_rank0_load_and_broadcast_weights.py",
         "--model.config_path=test",
+        *_ops_eager_cli_args(),
         "--data.train_path=tests",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
@@ -345,6 +357,7 @@ def test_load_weights_no_scatter(tmp_path: Path) -> None:
         f"--master_port={port}",
         "tests/utils/test_rank0_load_and_broadcast_weights.py",
         "--model.config_path=test",
+        *_ops_eager_cli_args(),
         "--data.train_path=tests",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",

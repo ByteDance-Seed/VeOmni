@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from veomni.arguments import OpsImplementationConfig
 from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
@@ -53,8 +54,15 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     visual = _get_vlm_visual_module(model)
     assert visual is not None
 
+    # ``eager_defaults()`` keeps the placeholder ops_implementation portable
+    # — without it the new GPU-reasonable defaults trip the NPU
+    # device-compatibility validator on Ascend hosts. This test never
+    # exercises kernel selection (it only checks the freeze-ViT plumbing).
     args = VeOmniVLMArguments(
-        model=VLMMModelArguments(config_path=config_path),
+        model=VLMMModelArguments(
+            config_path=config_path,
+            ops_implementation=OpsImplementationConfig.eager_defaults(),
+        ),
         data=VLMMDataArguments(train_path="dummy"),
     )
     args.train.freeze_vit = freeze_vit

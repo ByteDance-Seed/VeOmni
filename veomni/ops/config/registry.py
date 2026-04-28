@@ -69,7 +69,9 @@ class BackendSpec:
     Attributes:
         entry: ``"module:attr"`` - lazily imported to resolve the replacement.
         requires: Package names that must be available, checked before
-            resolution. Supported values: ``"liger_kernel"``, ``"torch_npu"``.
+            resolution. Supported values: ``"liger_kernel"``, ``"torch_npu"``,
+            ``"triton"`` (covers both CUDA ``triton`` and NPU ``triton-ascend``
+            since both expose the same import name).
         side_effect: GLOBAL ops only. ``"module:callable"`` invoked after
             ``entry`` is bound to ``global_slot`` (e.g. installing additional
             ``LOSS_MAPPING`` entries).
@@ -174,6 +176,14 @@ def _check_requires(requires: tuple[str, ...]) -> None:
 
             if not is_torch_npu_available():
                 raise RuntimeError("npu backend requested but torch_npu is not installed.")
+        elif pkg == "triton":
+            # ``triton`` (CUDA) and ``triton-ascend`` (NPU) both expose the
+            # same ``triton`` import name, so a single package check covers
+            # both stacks.
+            from ...utils.import_utils import is_package_available
+
+            if not is_package_available("triton"):
+                raise RuntimeError("triton backend requested but neither triton nor triton-ascend is installed.")
         else:
             raise ValueError(f"Unsupported 'requires' token: {pkg!r}")
 

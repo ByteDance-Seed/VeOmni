@@ -11,14 +11,82 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from veomni.utils.import_utils import is_torch_npu_available
+from veomni.utils.import_utils import is_liger_kernel_available, is_torch_npu_available
 
 from .launch_utils import find_free_port
 
 
-# Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
-# kernel is the only option; on GPU default to Triton (SM70+).
-_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
+# Pick host-appropriate ops_implementation values. NPU users must opt in
+# explicitly for every GPU-only kernel; without these, the e2e tests would
+# trip ``OpsImplementationConfig._validate_device_compatibility`` (added in
+# the kernel-defaults refactor). Hosts without ``liger-kernel`` installed
+# (e.g. NPU CI) need ``eager`` for the Liger fields too.
+_IS_NPU = is_torch_npu_available()
+_HAS_LIGER = is_liger_kernel_available()
+_FUSED_MOE_IMPL = "fused_npu" if _IS_NPU else "fused_triton"
+_ATTN_IMPL = "sdpa" if _IS_NPU else "flash_attention_2"
+# RMSNorm / RoPE: NPU has its own fused kernel; GPU uses Liger if available.
+_RMS_NORM_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
+_ROTARY_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
+# SwiGLU has no NPU fused kernel; CE on NPU goes through chunk_loss.
+_SWIGLU_IMPL = "eager" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
+_CE_IMPL = "npu" if _IS_NPU else ("liger_kernel" if _HAS_LIGER else "eager")
+# Load-balancing-loss ``triton`` is universal (works on NPU via triton-ascend).
+_LB_LOSS_IMPL = "triton"
+
+
+def host_appropriate_ops_cli_args(
+    *,
+    separator: str = "=",
+    attn_implementation: Optional[str] = None,
+    eager_only: bool = False,
+) -> List[str]:
+    """Return ``--model.ops_implementation.*`` CLI args that work on this host.
+
+    The new GPU-reasonable defaults on ``OpsImplementationConfig`` raise on
+    NPU for any field whose default is GPU-only (Liger / fused_triton /
+    flash_attention_2). Tests that subprocess into a training script via
+    torchrun therefore need to spell out the per-host values explicitly so
+    ``OpsImplementationConfig.__post_init__`` does not blow up inside the
+    child process.
+
+    Args:
+        separator: ``"="`` for ``--key=value`` form (used by build_torchrun_cmd /
+            most train scripts), or ``" "`` for the ``--key value`` form used
+            by ``tests/checkpoints/utils.py``.
+        attn_implementation: Override for the attention impl. When ``None``
+            (default) the helper picks a host-appropriate value (``sdpa`` on
+            NPU, ``flash_attention_2`` on GPU). Pass an explicit value to
+            keep the existing-test behaviour where attention mode is
+            chosen by the test.
+        eager_only: If True, every kernel field is set to ``"eager"`` —
+            universal and has zero runtime dependencies. Suitable for tests
+            that don't actually exercise model kernels (data-pipeline tests,
+            arg-parsing tests). Equivalent to passing
+            ``OpsImplementationConfig.eager_defaults()`` via CLI.
+    """
+    if eager_only:
+        attn = attn_implementation if attn_implementation is not None else "eager"
+        return [
+            f"--model.ops_implementation.attn_implementation{separator}{attn}",
+            f"--model.ops_implementation.moe_implementation{separator}eager",
+            f"--model.ops_implementation.rms_norm_implementation{separator}eager",
+            f"--model.ops_implementation.rotary_pos_emb_implementation{separator}eager",
+            f"--model.ops_implementation.swiglu_mlp_implementation{separator}eager",
+            f"--model.ops_implementation.cross_entropy_loss_implementation{separator}eager",
+            f"--model.ops_implementation.load_balancing_loss_implementation{separator}eager",
+        ]
+
+    attn = attn_implementation if attn_implementation is not None else _ATTN_IMPL
+    return [
+        f"--model.ops_implementation.attn_implementation{separator}{attn}",
+        f"--model.ops_implementation.moe_implementation{separator}{_FUSED_MOE_IMPL}",
+        f"--model.ops_implementation.rms_norm_implementation{separator}{_RMS_NORM_IMPL}",
+        f"--model.ops_implementation.rotary_pos_emb_implementation{separator}{_ROTARY_IMPL}",
+        f"--model.ops_implementation.swiglu_mlp_implementation{separator}{_SWIGLU_IMPL}",
+        f"--model.ops_implementation.cross_entropy_loss_implementation{separator}{_CE_IMPL}",
+        f"--model.ops_implementation.load_balancing_loss_implementation{separator}{_LB_LOSS_IMPL}",
+    ]
 
 
 def release_device_memory():
@@ -85,8 +153,7 @@ def build_torchrun_cmd(
         "--data.dyn_bsz_buffer_size=1",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=1",
-        "--model.ops_implementation.attn_implementation=flash_attention_2",
-        f"--model.ops_implementation.moe_implementation={_FUSED_MOE_IMPL}",
+        *host_appropriate_ops_cli_args(),
         f"--train.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",

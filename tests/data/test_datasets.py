@@ -217,6 +217,14 @@ if __name__ == "__main__":
 def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
     port = 12345 + random.randint(0, 100)
 
+    # The new GPU-reasonable defaults on ``OpsImplementationConfig`` would
+    # trip the NPU device-compatibility validator inside the subprocess'd
+    # ``parse_args(VeOmniArguments)`` call. These tests don't exercise any
+    # kernel — just the data pipeline — so force every kernel field to
+    # ``eager`` (universal, zero runtime deps). Imported lazily so the
+    # subprocess script itself doesn't need ``tests.tools`` on its sys.path.
+    from tests.tools.training_utils import host_appropriate_ops_cli_args
+
     command = [
         "torchrun",
         "--nnodes=1",
@@ -224,6 +232,7 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         f"--master_port={port}",
         "tests/data/test_datasets.py",
         "--model.config_path=test",
+        *host_appropriate_ops_cli_args(eager_only=True),
         f"--data.train_path={data_path}",
         "--data.train_size=1000",
         "--data.train_sample=4",  # iterable & not dyn_bsz

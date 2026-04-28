@@ -15,6 +15,7 @@ from veomni.arguments import (
     FSDPConfig,
     MixedPrecisionConfig,
     ModelArguments,
+    OpsImplementationConfig,
     TrainingArguments,
 )
 from veomni.data.data_collator import MainCollator
@@ -386,7 +387,15 @@ def test_models_patch_fwd_bwd(
             mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
         ]
 
-    model_config = ModelArguments(config_path=config_path)
+    # Per-mode ops are installed via ``set_environ_param(mode)`` inside the
+    # mode loop below, so the placeholder ops_implementation here just needs
+    # to construct cleanly on every device. ``eager_defaults()`` is portable;
+    # without it, the new GPU-reasonable defaults would trip the NPU
+    # device-compatibility validator on Ascend hosts.
+    model_config = ModelArguments(
+        config_path=config_path,
+        ops_implementation=OpsImplementationConfig.eager_defaults(),
+    )
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),

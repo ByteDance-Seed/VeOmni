@@ -83,12 +83,29 @@ def test_eager_defaults_classmethod_returns_eager_everywhere():
     from veomni.arguments.arguments_types import OpsImplementationConfig
 
     cfg = OpsImplementationConfig.eager_defaults()
+    assert cfg.attn_implementation == "eager"
     assert cfg.moe_implementation == "eager"
     assert cfg.cross_entropy_loss_implementation == "eager"
     assert cfg.rms_norm_implementation == "eager"
     assert cfg.swiglu_mlp_implementation == "eager"
     assert cfg.rotary_pos_emb_implementation == "eager"
     assert cfg.load_balancing_loss_implementation == "eager"
+
+
+def test_eager_defaults_classmethod_constructs_cleanly_on_npu():
+    """``eager_defaults()`` must not raise on an NPU host.
+
+    Regression test for the bug Gemini flagged in PR review: previously the
+    classmethod inherited the dataclass default ``attn_implementation =
+    "flash_attention_2"``, which (after the SP rewrite) is in
+    ``_NPU_INCOMPATIBLE`` and would make ``__post_init__`` raise on NPU.
+    The whole point of ``eager_defaults()`` is to be a portable escape
+    hatch, so this path must construct without error on every device."""
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    with patch("veomni.utils.device.IS_NPU_AVAILABLE", True):
+        cfg = OpsImplementationConfig.eager_defaults()
+    assert cfg.attn_implementation == "eager"
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +263,30 @@ def test_load_balancing_triton_is_universal_on_npu():
                 load_balancing_loss_implementation="triton",  # universal
             )
     assert cfg.load_balancing_loss_implementation == "triton"
+
+
+def test_load_balancing_loss_triton_default_requires_triton_package():
+    """``load_balancing_loss_implementation: triton`` is the new default.
+
+    ``apply_global_ops`` resolves GLOBAL ops eagerly for *every* model
+    (including dense models that never call this loss), so the backend
+    declares ``requires=("triton",)``. On a host without triton (or
+    triton-ascend), the validator must raise at config-parse time with a
+    clear message — not crash later inside ``apply_global_ops`` when it
+    imports the kernel module.
+
+    Regression test for the second issue Codex flagged in PR review.
+    """
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    # GPU host so the device-compatibility check is skipped.
+    with patch("veomni.utils.device.IS_NPU_AVAILABLE", False):
+        with patch("veomni.utils.import_utils.is_package_available", return_value=False):
+            with pytest.raises(ValueError, match="triton.*triton-ascend"):
+                # Have to bypass the liger validator too, otherwise the test
+                # would fail there first on hosts without liger-kernel.
+                with patch("veomni.arguments.arguments_types.is_liger_kernel_available", return_value=True):
+                    OpsImplementationConfig(load_balancing_loss_implementation="triton")
 
 
 def test_gpu_host_skips_npu_validation():

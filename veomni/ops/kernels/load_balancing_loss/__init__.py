@@ -75,7 +75,17 @@ register_op(
         global_slot="veomni.ops.kernels.load_balancing_loss:_load_balancing_loss",
         backends={
             "eager": BackendSpec(entry="veomni.ops.kernels.load_balancing_loss.eager:load_balancing_loss_pytorch"),
-            "triton": BackendSpec(entry="veomni.ops.kernels.load_balancing_loss.triton:load_balancing_loss_triton"),
+            # ``apply_global_ops`` resolves GLOBAL ops eagerly for every model
+            # — including dense models that never call this loss. Declare the
+            # triton dependency on the BackendSpec so the availability check
+            # fires at ``__post_init__`` time with an actionable error rather
+            # than crashing later when ``apply_global_ops`` imports the
+            # ``triton`` kernel module on a host that doesn't have triton /
+            # triton-ascend installed.
+            "triton": BackendSpec(
+                entry="veomni.ops.kernels.load_balancing_loss.triton:load_balancing_loss_triton",
+                requires=("triton",),
+            ),
         },
     )
 )

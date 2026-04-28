@@ -67,6 +67,10 @@ def run_environ_meter(args: Arguments):
     ],
 )
 def test_model_loader(model_path):
+    # See note in tests/data/test_datasets.py — kernel fields forced to eager
+    # so the subprocess'd parse_args doesn't trip the NPU validator.
+    from tests.tools.training_utils import host_appropriate_ops_cli_args
+
     port = 12345 + random.randint(0, 100)
 
     command = [
@@ -75,6 +79,7 @@ def test_model_loader(model_path):
         f"--master_port={port}",
         "tests/utils/test_model_loader.py",
         f"--model.config_path={model_path}",
+        *host_appropriate_ops_cli_args(eager_only=True),
         "--data.train_path=tests",
         "--train.checkpoint.output_dir=.tests/cache",
         f"--train.init_device={get_device_type()}",

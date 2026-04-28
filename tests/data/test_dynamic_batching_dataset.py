@@ -391,6 +391,10 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
     Returns:
         list: Command arguments for subprocess.run().
     """
+    # See note in tests/data/test_datasets.py — kernel fields forced to eager
+    # so the subprocess'd parse_args doesn't trip the NPU validator.
+    from tests.tools.training_utils import host_appropriate_ops_cli_args
+
     port = find_free_port()
 
     command = [
@@ -400,6 +404,7 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         f"--master_port={port}",
         "tests/data/test_dynamic_batching_dataset.py",
         "--model.config_path=test",
+        *host_appropriate_ops_cli_args(eager_only=True),
         "--data.train_path=None",
         "--data.train_size=2000",
         f"--data.dyn_bsz_buffer_size={READY_FOR_MICRO_BATCH_THRESHOLD}",

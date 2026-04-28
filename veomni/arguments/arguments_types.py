@@ -790,10 +790,14 @@ class OpsImplementationConfig:
 
         Used by fallback paths (``build_foundation_model`` standalone-script
         warning, tests that only care about the loss-mapping plumbing) where
-        GPU dependencies cannot be assumed. Equivalent to passing every
-        ``*_implementation`` field explicitly as ``"eager"``.
+        GPU dependencies cannot be assumed. Every ``*_implementation`` field
+        — including ``attn_implementation`` — is set explicitly to
+        ``"eager"``; this matters on NPU, where the dataclass default
+        ``"flash_attention_2"`` is in ``_NPU_INCOMPATIBLE`` and would
+        otherwise make this constructor raise.
         """
         return cls(
+            attn_implementation="eager",
             moe_implementation="eager",
             cross_entropy_loss_implementation="eager",
             rms_norm_implementation="eager",
@@ -891,6 +895,17 @@ class OpsImplementationConfig:
 
                     if not is_torch_npu_available():
                         raise ValueError(f"{op.config_field}='{value}' requires torch_npu to be installed.")
+                if pkg == "triton":
+                    from ..utils.import_utils import is_package_available
+
+                    if not is_package_available("triton"):
+                        # ``triton-ascend`` exposes the ``triton`` import name on NPU,
+                        # so a single check covers both stacks; mention both in the hint
+                        # so the user knows which package to install for their device.
+                        raise ValueError(
+                            f"{op.config_field}='{value}' requires triton (GPU) or "
+                            f"triton-ascend (NPU) to be installed."
+                        )
 
 
 @dataclass
