@@ -52,10 +52,12 @@ class HardwareRequirement:
             # check, which passes on dev boxes that merely have the library).
             return IS_NPU_AVAILABLE
         if self.device_type == "any":
-            # Hardware-agnostic kernel (pure PyTorch). Used by chunk_loss
-            # which composes F.linear + eager_cross_entropy and runs on both
-            # CUDA and Ascend NPU without device-specific calls.
-            return IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE
+            # Hardware-agnostic kernel (pure PyTorch). Used e.g. by chunk_loss
+            # (F.linear + eager_cross_entropy in a chunked autograd Function),
+            # which has no device-specific calls. Always satisfied — including
+            # on CPU-only hosts (unit tests, weight materialization, dev boxes
+            # without an accelerator).
+            return True
         raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu' | 'npu' | 'any')")
 
 

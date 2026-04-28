@@ -137,8 +137,8 @@ def main():
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-        attn_implementation=args.model.ops_implementation.attn_implementation,
         init_device=args.train.init_device,
+        ops_implementation=args.model.ops_implementation,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
