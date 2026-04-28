@@ -90,12 +90,12 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
             logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
             found = True
 
-    # When a model owns a ``moe_experts`` OpSlot, we install the global
-    # ``_fused_moe_forward`` function pointer here as well — modeling code
-    # (both v4 monkey-patched and v5 patchgen) calls
-    # ``veomni.ops.fused_moe_forward(...)`` directly inside the OpSlot guard
-    # rather than going through the slot's ``__call__``. Eager bindings leave
-    # the pointer untouched.
+    # The OpSlot only acts as an eager-vs-fused guard
+    # (``slot.use_non_eager_impl``). Inside the fused branch, modeling code
+    # calls ``veomni.ops.fused_moe_forward(...)``, which dispatches through
+    # the module-level pointer ``veomni.ops.kernels.moe._fused_moe_forward``.
+    # Bind that pointer here to the kernel matching the slot so the two stay
+    # in sync. Eager bindings leave the pointer untouched.
     if moe_experts_kernel is not None:
         from ..ops.kernels.moe import apply_veomni_fused_moe_patch
 
