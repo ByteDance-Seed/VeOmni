@@ -121,7 +121,13 @@ KERNEL_REGISTRY.register(
         op_name="load_balancing_loss",
         variant="standard",
         factory=_triton_load_balancing_loss_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
-        description="Fused Triton load-balancing loss for MoE",
+        # Device-agnostic: the kernel imports `triton`, which exists as both
+        # the CUDA `triton` and Ascend `triton-ascend` packages under the same
+        # import name. Triton-package availability is gated by the
+        # `requires=("triton",)` clause on the matching OpSpec backend, so
+        # auto downgrades to eager when neither is installed; the hardware
+        # check here only enforces "some accelerator is present".
+        hardware=HardwareRequirement(device_type=None),
+        description="Fused Triton load-balancing loss for MoE (GPU + NPU via triton-ascend)",
     )
 )

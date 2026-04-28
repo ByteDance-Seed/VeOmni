@@ -55,9 +55,11 @@ class HardwareRequirement:
                     return False
             return True
         if self.device_type == "npu":
-            # IS_NPU_AVAILABLE == is_torch_npu_available(): requires both the
-            # torch_npu package AND an actual NPU device (unlike a bare import
-            # check, which passes on dev boxes that merely have the library).
+            # IS_NPU_AVAILABLE here is the device-presence check from
+            # veomni.utils.device — torch_npu installed AND an Ascend NPU is
+            # actually reachable. ``is_torch_npu_available()`` alone only
+            # checks the package, which would pass on dev hosts that merely
+            # have the library and let the resolver pick NPU kernels in error.
             return IS_NPU_AVAILABLE
         raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu', 'npu', or None)")
 

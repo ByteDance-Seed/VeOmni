@@ -290,6 +290,48 @@ def test_install_loss_mapping_npu_alias_emits_warning(veomni_log):
 # ---------------------------------------------------------------------------
 
 
+def test_load_balancing_loss_kernelspec_runs_on_npu():
+    """Regression: the OpSlot KernelSpec for load_balancing_loss/triton must
+    accept NPU devices.
+
+    NPU patchgen models (qwen3_5_moe, qwen3_omni_moe) declare
+    ``OpSlot("load_balancing_loss", "standard")`` which calls
+    ``KERNEL_REGISTRY.resolve("load_balancing_loss", "standard", "triton")``
+    at model-build time. Before the device-agnostic fix the spec was
+    GPU-only, so binding crashed on NPU even when triton-ascend was present.
+    """
+    from veomni.ops.kernel_registry import KERNEL_REGISTRY
+
+    spec = KERNEL_REGISTRY._specs[("load_balancing_loss", "standard")]["triton"]
+    # device_type=None means "any accelerator"; the actual triton package
+    # check happens via the OpSpec `requires=("triton",)` clause + the auto
+    # resolver's fallback to eager.
+    assert spec.hardware.device_type is None
+
+
+def test_npu_device_check_uses_real_device_not_just_package(monkeypatch):
+    """Regression: ``IS_NPU_AVAILABLE`` must reflect actual NPU presence,
+    not just ``find_spec("torch_npu")``.
+
+    Before the fix, a CUDA dev host with ``torch_npu`` installed would
+    report ``IS_NPU_AVAILABLE = True`` and the auto resolver would pick
+    NPU backends. Now the helper imports ``torch_npu`` and consults
+    ``torch.npu.is_available()``.
+    """
+    from veomni.utils import device
+
+    # Simulate "package installed but no NPU device".
+    monkeypatch.setattr(device, "is_torch_npu_available", lambda: True)
+
+    class _FakeNpu:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    monkeypatch.setattr(device.torch, "npu", _FakeNpu, raising=False)
+    assert device._detect_npu_device() is False
+
+
 def test_resolved_summary_marks_auto_fields_only(veomni_log):
     """The summary tags fields resolved from auto, and leaves explicit ones unmarked."""
     with _force_device("gpu"), mock.patch("veomni.utils.import_utils._PACKAGE_FLAGS", _all_packages_available()):

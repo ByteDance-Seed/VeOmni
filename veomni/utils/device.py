@@ -26,7 +26,34 @@ logger = logging.get_logger(__name__)
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
-IS_NPU_AVAILABLE = is_torch_npu_available()
+
+
+def _detect_npu_device() -> bool:
+    """torch_npu package installed *and* an Ascend NPU is reachable.
+
+    ``is_torch_npu_available()`` only checks the package (find_spec), so it
+    returns True on dev hosts that merely have the library installed.
+    Importing ``torch_npu`` registers the ``torch.npu`` backend; from there
+    ``torch.npu.is_available()`` answers the actual device-present question.
+    Any failure along that path is treated as "no NPU".
+    """
+    if not is_torch_npu_available():
+        return False
+    try:
+        import torch_npu  # noqa: F401  side-effect: registers torch.npu backend
+
+        return bool(torch.npu.is_available())
+    except Exception:
+        return False
+
+
+IS_NPU_AVAILABLE = _detect_npu_device()
+
+
+def is_npu_device_available() -> bool:
+    """Public wrapper around the device-presence check used by ``IS_NPU_AVAILABLE``."""
+    return IS_NPU_AVAILABLE
+
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
