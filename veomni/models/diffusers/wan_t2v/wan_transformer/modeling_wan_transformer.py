@@ -23,7 +23,7 @@ from .....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_outputs,
     gather_seq_scatter_heads,
-    slice_input_tensor_scale_grad,
+    slice_input_tensor,
 )
 from .....utils import logging
 from .configuration_wan_transformer import WanTransformer3DModelConfig
@@ -208,7 +208,7 @@ def WanTransformer3DModel_forward(
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
     if get_parallel_state().sp_enabled:
-        hidden_states = slice_input_tensor_scale_grad(hidden_states, dim=1)
+        hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
 
         # Slice rotary embeddings to the local rank's positions (no gradient).
         freqs_cos, freqs_sin = rotary_emb
@@ -232,7 +232,7 @@ def WanTransformer3DModel_forward(
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
     if get_parallel_state().sp_enabled:
-        hidden_states = gather_outputs(hidden_states, gather_dim=1, scale_grad=True)
+        hidden_states = gather_outputs(hidden_states, gather_dim=1)
 
     # 5. Output: norm → projection → unpatchify
     if temb.ndim == 3:
