@@ -51,6 +51,7 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from .chunk_logprobs import chunk_logprobs_function  # noqa: F401 re-export
 from .chunk_loss import chunk_loss_function  # noqa: F401 re-export for legacy callers
 from .eager import eager_cross_entropy
 

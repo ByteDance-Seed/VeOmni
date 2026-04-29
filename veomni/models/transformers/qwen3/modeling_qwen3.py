@@ -32,7 +32,9 @@ from transformers.utils import (
     can_return_tuple,
 )
 
+from ....ops.kernels.cross_entropy.chunk_logprobs import chunk_logprobs_function
 from ....utils import logging
+from ....utils.model_outputs import CausalLMOutputWithLogProbs
 
 
 logger = logging.get_logger(__name__)
@@ -94,6 +96,27 @@ def qwen3forcausallm_forward(
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
     # --- Patch.1 ---
+    # PPO-style per-token log-probs path: short-circuit before
+    # ``self.loss_function`` so the chunked CE kernel writes directly
+    # to a typed ``log_probs`` field. Avoids overloading the ``logits``
+    # slot with a shape ``[B, L]`` tensor that the rest of the pipeline
+    # would mistake for vocab logits.
+    if labels is not None and kwargs.pop("return_log_probs", False):
+        log_probs = chunk_logprobs_function(
+            hidden_states,
+            self.lm_head.weight,
+            labels,
+            ignore_index=-100,
+        )
+        return CausalLMOutputWithLogProbs(
+            loss=None,
+            logits=None,
+            log_probs=log_probs,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
     loss = None
     logits = None
     if labels is not None:

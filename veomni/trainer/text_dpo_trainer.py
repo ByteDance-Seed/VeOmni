@@ -209,32 +209,45 @@ class TextDPOTrainer:
     def concatenated_forward(self, model: nn.Module, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run a single forward pass on the packed batch containing chosen+rejected pairs.
 
-        Each DPO sample contributes two consecutive sequences (chosen then
-        rejected) to the packed sequence.  ``PostCollator`` gathers SP outputs and
-        splits logits per-sequence; even-indexed sequences are chosen and
-        odd-indexed are rejected.
+        Each DPO sample contributes two consecutive sequences (chosen
+        then rejected) to the packed sequence. Activates VeOmni's
+        chunked CE log-probs path by passing ``return_log_probs=True``
+        to the model — the wrapper installed by
+        ``build_foundation_model`` promotes per-token NLL into
+        ``output.log_probs`` (actual log-probabilities, non-positive)
+        without materializing the ``[B, L, V]`` logits tensor that
+        the previous gather-on-logits path OOMed on at long context.
+        This is the same entry point external integrators (verl) and
+        the future PPO trainer use. Even-indexed sequences are
+        chosen; odd are rejected.
 
         Returns:
             (chosen_logps, rejected_logps) each of shape ``(B,)``.
         """
         model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
-        outputs = model(**model_inputs, use_cache=False)
+        outputs = model(**model_inputs, return_log_probs=True, use_cache=False)
 
-        # PackingPostCollator.split expects 2-D logits [packed_L, V];
-        # the model returns [1, packed_L, V] so squeeze the batch dim.
-        outputs.logits = outputs.logits.squeeze(0)
-        outputs = self.post_forward(outputs, micro_batch)
-        logits_list = outputs.logits  # list of 2*B tensors, each [L_i, V]
-        seq_lens = [lg.shape[0] for lg in logits_list]
-
+        # ``outputs.log_probs`` is shape [1, packed_L] (actual
+        # log-probabilities; sign already flipped). PostCollator only
+        # knows about ``outputs.logits``, so we replicate its
+        # SP-gather + per-seq split inline against the log_probs field.
+        log_probs_packed = outputs.log_probs.squeeze(0)  # [packed_L]
+        seq_lens = self.post_forward.compute_seqlens_func(micro_batch)
         if self.sp_enabled:
-            # Labels already globally shifted by SequenceParallelCollator;
-            # gather back and split by sequence lengths directly.
+            log_probs_packed = gather_outputs(log_probs_packed, gather_dim=0, group=get_parallel_state().sp_group)
+            log_probs_packed = log_probs_packed[: sum(seq_lens)]
+        log_probs_list = list(log_probs_packed.split(seq_lens, dim=0))
+
+        # Reuse the same SP-on / SP-off label mask construction as
+        # before — the kernel's per-token output is aligned to the
+        # original label positions (zero at the trailing pad), so
+        # masking with the per-sequence shifted IGNORE_INDEX boundary
+        # is correct.
+        if self.sp_enabled:
             all_labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=get_parallel_state().sp_group)
             all_labels = all_labels.view(-1)[: sum(seq_lens)]
             labels_list = list(all_labels.split(seq_lens))
         else:
-            # Shift labels per-sequence
             all_labels = micro_batch["labels"].view(-1)
             offset = 0
             labels_list = []
@@ -245,12 +258,9 @@ class TextDPOTrainer:
 
         average_log_prob = getattr(self.base.args, "dpo_config", None) and self.base.args.dpo_config.average_log_prob
         all_logps: List[torch.Tensor] = []
-        for seq_logits, seq_labels in zip(logits_list, labels_list):
+        for seq_log_probs, seq_labels in zip(log_probs_list, labels_list):
             loss_mask = seq_labels != IGNORE_INDEX
-            safe_labels = seq_labels.clamp(min=0)
-            per_token_logps = torch.gather(
-                seq_logits.float().log_softmax(-1), dim=1, index=safe_labels.unsqueeze(1)
-            ).squeeze(1)
+            per_token_logps = seq_log_probs.float()  # already true log p; no negation
             if average_log_prob:
                 logp = (per_token_logps * loss_mask).sum() / loss_mask.sum().clamp(min=1)
             else:
