@@ -22,8 +22,6 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
 """
 
-import torch
-
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
@@ -37,6 +35,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
+from veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config import qwen3_vl_text_rmsnorm_forward_npu_patched
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     PatchedQwen3VLMoeTextExperts,
     qwen3_vl_moe_for_conditional_generation_forward_patched,
@@ -61,6 +60,11 @@ config = PatchConfig(
 # async ulysses / get_position_id helpers, fused_moe_forward import).
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
+config.add_post_import_block(
+    """
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
+    """
+)
 config.helpers.extend(gpu_config.helpers)
 config.add_import("torch_npu", is_from_import=False)
 
@@ -212,17 +216,10 @@ def apply_rotary_pos_emb_vision_npu_patched(q, k, cos, sin, position_ids=None, u
 
 
 # ================================================================
-# Patch: Qwen3VLMoeTextRMSNorm.forward -> NPU fused npu_rms_norm
-# 1. swap the full-fp32 variance path for `torch_npu.npu_rms_norm`
-#    which stays in the weight dtype and is significantly faster on NPU
+# Patch: OpSlot guard for NPU fused RMSNorm (standard formulation)
 # ================================================================
-@config.override_method(
-    "Qwen3VLMoeTextRMSNorm.forward",
-    description="NPU fused RMSNorm (torch_npu.npu_rms_norm)",
+config.override_method(
+    "Qwen3MoeRMSNorm.forward",
+    replacement=qwen3_vl_text_rmsnorm_forward_npu_patched,
+    description="Use standard RMSNorm for NPU patchgen",
 )
-def qwen3_vl_moe_text_rmsnorm_forward_npu_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    # --- Patch.1 ---
-    if hidden_states.dtype != self.weight.dtype:
-        hidden_states = hidden_states.to(self.weight.dtype)
-    return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]  # noqa: F821 imported via add_import
-    # --- Patch.1 ---
