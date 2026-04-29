@@ -604,7 +604,7 @@ def build_parallelize_model(
     parallel_state = get_parallel_state()
 
     if not parallel_state.fsdp_enabled:
-        if kwargs.get("init_device") not in ["cuda", "npu"]:
+        if kwargs.get("init_device") not in ["cuda", "npu", "xpu"]:
             raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
         if kwargs.pop("enable_fsdp_offload", False):
             raise ValueError("Only FSDP training supports `enable_fsdp_offload`.")
