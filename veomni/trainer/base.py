@@ -444,6 +444,36 @@ class BaseTrainer(Stateful, ABC):
         self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
+    # Sub-step lifecycle hooks. Defaults are no-ops — built-in callbacks don't
+    # subscribe yet, so there's nothing to dispatch. Trainer subclasses override
+    # these to wire in their own callbacks (e.g. modelchef DiagnosticsCallback).
+    # When a built-in callback eventually overrides one of the matching hooks
+    # on Callback, add the hand-listed dispatch body here (mirroring on_step_*).
+
+    def on_data_load_begin(self):
+        pass
+
+    def on_data_load_end(self, micro_batches=None):
+        pass
+
+    def on_forward_begin(self):
+        pass
+
+    def on_forward_end(self):
+        pass
+
+    def on_backward_begin(self):
+        pass
+
+    def on_backward_end(self):
+        pass
+
+    def on_optimizer_step_begin(self):
+        pass
+
+    def on_optimizer_step_end(self, grad_norm=None):
+        pass
+
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
         micro_batch = {
@@ -470,16 +500,20 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
+        self.on_forward_begin()
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
         loss, loss_dict = self.postforward(outputs, micro_batch)
+        self.on_forward_end()
 
         # Backward pass
+        self.on_backward_begin()
         with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             loss.backward()
+        self.on_backward_end()
 
         del micro_batch
         return loss, loss_dict
@@ -504,7 +538,9 @@ class BaseTrainer(Stateful, ABC):
         args = self.args
         self.state.global_step += 1
 
+        self.on_data_load_begin()
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.on_data_load_end(micro_batches=micro_batches)
 
         self.on_step_begin(micro_batches=micro_batches)
 
@@ -530,6 +566,7 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
+        self.on_optimizer_step_begin()
         # Gradient clipping
         grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
@@ -537,6 +574,7 @@ class BaseTrainer(Stateful, ABC):
         self.optimizer.step()
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
+        self.on_optimizer_step_end(grad_norm=grad_norm)
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 

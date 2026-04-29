@@ -49,3 +49,30 @@ class Callback:
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         pass
+
+    # Sub-step lifecycle hooks. Defaults are no-ops so existing callbacks
+    # do not need to be updated; consumers (e.g. DiagnosticsCallback) opt in.
+
+    def on_data_load_begin(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_data_load_end(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        pass
+
+    def on_forward_begin(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_forward_end(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_backward_begin(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_backward_end(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_optimizer_step_begin(self, state: TrainerState, **kwargs) -> None:
+        pass
+
+    def on_optimizer_step_end(self, state: TrainerState, grad_norm: float = None, **kwargs) -> None:
+        pass
