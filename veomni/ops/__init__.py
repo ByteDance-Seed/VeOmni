@@ -121,86 +121,83 @@ def format_kernel_functions() -> str:
     return "\n".join(lines)
 
 
+_ATTN_SUB_CONFIGS = ("text_config", "vision_config", "audio_config", "thinker_config", "talker_config")
+
+
 def format_kernel_selection_summary(model=None, modeling_module=None) -> str:
     """Final kernel-selection summary, intended to be logged after model build.
 
     Unlike :func:`format_kernel_functions` (which runs at ``apply_ops_config``
-    time and only sees GLOBAL pointers), this summary includes:
-
-    - the attention implementation actually wired onto ``model.config``,
-    - the cross-entropy kernel installed into ``LOSS_MAPPING``,
-    - all GLOBAL function pointers (``_fused_moe_forward``,
-      ``_flash_attention_forward``, ``_load_balancing_loss``) — bound by
-      ``apply_ops_config`` and ``_bind_veomni_ops``,
-    - every :class:`OpSlot` declared on the model's generated modeling module
-      (RMSNorm / RoPE / SwiGLU / MoE experts / per-task loss slots).
+    time and only sees GLOBAL pointers), this includes the attn implementation
+    wired onto ``model.config``, the cross-entropy installed into
+    ``LOSS_MAPPING``, every GLOBAL ops pointer, and every :class:`OpSlot`
+    declared on the model's generated modeling module.
     """
-    lines = ["", "============= Kernel selection summary ============="]
-
+    rows: list[tuple[str, str]] = []
     if model is not None:
-        cfg = getattr(model, "config", None)
-        cls = model.__class__
-        model_type = getattr(cfg, "model_type", None) if cfg is not None else None
-        model_label = f"{cls.__module__}.{cls.__name__}"
-        if model_type:
-            model_label = f"{model_label} (model_type={model_type})"
-        lines.append(f"  model                     = {model_label}")
-        for attn_label, attn_value in _collect_attn_implementations(cfg):
-            lines.append(f"  {attn_label:<25} = {attn_value}")
+        rows.append(("model", _model_label(model)))
+        rows.extend(_collect_attn_implementations(getattr(model, "config", None)))
+    rows.append(("cross_entropy", _current_cross_entropy_name()))
+    rows.extend((alias, _kernel_name(func, none="None (eager / unbound)")) for alias, func in build_ALL_OPS())
 
-    lines.append(f"  cross_entropy             = {_current_cross_entropy_name()}")
-
-    for alias, func in build_ALL_OPS():
-        impl = getattr(func, "__name__", repr(func)) if func is not None else "None (eager / unbound)"
-        lines.append(f"  {alias:<25} = {impl}")
-
-    if modeling_module is not None:
-        slot_entries: list[tuple[str, OpSlot]] = []
-        for attr_name in dir(modeling_module):
-            obj = getattr(modeling_module, attr_name, None)
-            if isinstance(obj, OpSlot):
-                slot_entries.append((attr_name, obj))
-        if slot_entries:
-            module_label = modeling_module.__name__.rsplit(".", 1)[-1]
-            lines.append(f"  -- OpSlot bindings ({module_label}) --")
-            for attr_name, slot in sorted(slot_entries):
-                impl_label = slot.impl_name if slot.impl_name is not None else "<unbound>"
-                kernel_label = (
-                    getattr(slot.kernel, "__name__", repr(slot.kernel)) if slot.kernel is not None else "eager"
-                )
-                lines.append(f"  {attr_name:<35} = {impl_label} -> {kernel_label}")
-
+    lines = ["", "============= Kernel selection summary ============="]
+    lines.extend(f"  {k:<25} = {v}" for k, v in rows)
+    lines.extend(_format_opslot_bindings(modeling_module))
     lines.append("=====================================================")
     return "\n".join(lines)
+
+
+def _model_label(model) -> str:
+    cls = model.__class__
+    label = f"{cls.__module__}.{cls.__name__}"
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    return f"{label} (model_type={model_type})" if model_type else label
+
+
+def _format_opslot_bindings(modeling_module) -> list[str]:
+    if modeling_module is None:
+        return []
+    slots = sorted(
+        (name, obj) for name in dir(modeling_module) if isinstance(obj := getattr(modeling_module, name, None), OpSlot)
+    )
+    if not slots:
+        return []
+    module_label = modeling_module.__name__.rsplit(".", 1)[-1]
+    out = [f"  -- OpSlot bindings ({module_label}) --"]
+    for name, slot in slots:
+        impl = slot.impl_name or "<unbound>"
+        kernel = _kernel_name(slot.kernel, none="eager")
+        out.append(f"  {name:<35} = {impl} -> {kernel}")
+    return out
+
+
+def _kernel_name(obj, none: str = "None") -> str:
+    """Render a callable for the summary: ``__name__`` if available, else ``repr``."""
+    if obj is None:
+        return none
+    return getattr(obj, "__name__", repr(obj))
 
 
 def _collect_attn_implementations(cfg) -> list[tuple[str, str]]:
     """Return ``[(label, value), ...]`` for every attn impl reachable from ``cfg``.
 
-    Handles three shapes:
-    - flat ``cfg._attn_implementation`` (string),
-    - HF v5 dict form ``cfg._attn_implementation = {"text_config": ..., ...}``,
-    - composite multimodal configs whose sub-configs (``text_config``,
-      ``vision_config``, ``audio_config``) each carry their own
-      ``_attn_implementation``.
+    Handles flat ``cfg._attn_implementation`` (string), HF v5 dict form
+    (``{"text_config": ..., ...}``), and composite multimodal configs whose
+    sub-configs each carry their own ``_attn_implementation``.
     """
     if cfg is None:
         return []
-
-    out: list[tuple[str, str]] = []
     top = getattr(cfg, "_attn_implementation", None)
     if isinstance(top, dict):
-        for k, v in top.items():
-            out.append((f"attn_implementation[{k}]", str(v)))
+        out = [(f"attn_implementation[{k}]", str(v)) for k, v in top.items()]
     elif top is not None:
-        out.append(("attn_implementation", str(top)))
-
-    for sub_attr in ("text_config", "vision_config", "audio_config", "thinker_config", "talker_config"):
-        sub = getattr(cfg, sub_attr, None)
-        sub_attn = getattr(sub, "_attn_implementation", None) if sub is not None else None
+        out = [("attn_implementation", str(top))]
+    else:
+        out = []
+    for sub_attr in _ATTN_SUB_CONFIGS:
+        sub_attn = getattr(getattr(cfg, sub_attr, None), "_attn_implementation", None)
         if sub_attn is not None and not isinstance(sub_attn, dict):
             out.append((f"attn_implementation[{sub_attr}]", str(sub_attn)))
-
     return out
 
 
