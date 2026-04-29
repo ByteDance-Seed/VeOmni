@@ -107,8 +107,11 @@ def chunk_loss_function(
         hidden_states = hidden_states[..., :-1, :].contiguous()
 
     def ce_loss_func(hidden_states, weight, bias, labels, num_items_in_batch, ignore_index=-100, **kwargs):
-        labels = labels.view(-1)
-        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        # Use ``reshape`` instead of ``view`` because the per-chunk tensors come
+        # from ``torch.split(..., dim=1)`` on contiguous parents, which yields
+        # non-contiguous views (parent stride is preserved on dim 0).
+        labels = labels.reshape(-1)
+        hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
         logits = F.linear(hidden_states, weight).float()
         loss, logits = eager_cross_entropy(
             logits,
