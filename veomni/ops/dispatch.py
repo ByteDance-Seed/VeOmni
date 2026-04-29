@@ -73,6 +73,16 @@ class OpSlot:
         """
         return self._kernel is not None
 
+    @property
+    def impl_name(self) -> str | None:
+        """Implementation name passed to :meth:`bind`, or ``None`` if unbound."""
+        return self._impl_name
+
+    @property
+    def kernel(self) -> Callable | None:
+        """The bound kernel callable, or ``None`` for eager / unbound."""
+        return self._kernel
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self._kernel is None:
             raise RuntimeError(

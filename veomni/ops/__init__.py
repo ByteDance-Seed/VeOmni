@@ -37,6 +37,8 @@ __all__ = [
     "fused_moe_forward",
     "OpSlot",
     "load_balancing_loss_func",
+    "format_kernel_functions",
+    "format_kernel_selection_summary",
 ]
 
 logger = logging.get_logger(__name__)
@@ -117,6 +119,87 @@ def format_kernel_functions() -> str:
 
     lines.append("==============================")
     return "\n".join(lines)
+
+
+def format_kernel_selection_summary(model=None, modeling_module=None) -> str:
+    """Final kernel-selection summary, intended to be logged after model build.
+
+    Unlike :func:`format_kernel_functions` (which runs at ``apply_ops_config``
+    time and only sees GLOBAL pointers), this summary includes:
+
+    - the attention implementation actually wired onto ``model.config``,
+    - the cross-entropy kernel installed into ``LOSS_MAPPING``,
+    - all GLOBAL function pointers (``_fused_moe_forward``,
+      ``_flash_attention_forward``, ``_load_balancing_loss``) — bound by
+      ``apply_ops_config`` and ``_bind_veomni_ops``,
+    - every :class:`OpSlot` declared on the model's generated modeling module
+      (RMSNorm / RoPE / SwiGLU / MoE experts / per-task loss slots).
+    """
+    lines = ["", "============= Kernel selection summary ============="]
+
+    if model is not None:
+        cfg = getattr(model, "config", None)
+        cls = model.__class__
+        model_type = getattr(cfg, "model_type", None) if cfg is not None else None
+        model_label = f"{cls.__module__}.{cls.__name__}"
+        if model_type:
+            model_label = f"{model_label} (model_type={model_type})"
+        lines.append(f"  model                     = {model_label}")
+        for attn_label, attn_value in _collect_attn_implementations(cfg):
+            lines.append(f"  {attn_label:<25} = {attn_value}")
+
+    lines.append(f"  cross_entropy             = {_current_cross_entropy_name()}")
+
+    for alias, func in build_ALL_OPS():
+        impl = func.__name__ if func is not None else "None (eager / unbound)"
+        lines.append(f"  {alias:<25} = {impl}")
+
+    if modeling_module is not None:
+        slot_entries: list[tuple[str, OpSlot]] = []
+        for attr_name in dir(modeling_module):
+            obj = getattr(modeling_module, attr_name, None)
+            if isinstance(obj, OpSlot):
+                slot_entries.append((attr_name, obj))
+        if slot_entries:
+            module_label = modeling_module.__name__.rsplit(".", 1)[-1]
+            lines.append(f"  -- OpSlot bindings ({module_label}) --")
+            for attr_name, slot in sorted(slot_entries):
+                impl_label = slot.impl_name if slot.impl_name is not None else "<unbound>"
+                kernel_label = slot.kernel.__name__ if slot.kernel is not None else "eager"
+                lines.append(f"  {attr_name:<35} = {impl_label} -> {kernel_label}")
+
+    lines.append("=====================================================")
+    return "\n".join(lines)
+
+
+def _collect_attn_implementations(cfg) -> list[tuple[str, str]]:
+    """Return ``[(label, value), ...]`` for every attn impl reachable from ``cfg``.
+
+    Handles three shapes:
+    - flat ``cfg._attn_implementation`` (string),
+    - HF v5 dict form ``cfg._attn_implementation = {"text_config": ..., ...}``,
+    - composite multimodal configs whose sub-configs (``text_config``,
+      ``vision_config``, ``audio_config``) each carry their own
+      ``_attn_implementation``.
+    """
+    if cfg is None:
+        return []
+
+    out: list[tuple[str, str]] = []
+    top = getattr(cfg, "_attn_implementation", None)
+    if isinstance(top, dict):
+        for k, v in top.items():
+            out.append((f"attn_implementation[{k}]", str(v)))
+    elif top is not None:
+        out.append(("attn_implementation", str(top)))
+
+    for sub_attr in ("text_config", "vision_config", "audio_config", "thinker_config", "talker_config"):
+        sub = getattr(cfg, sub_attr, None)
+        sub_attn = getattr(sub, "_attn_implementation", None) if sub is not None else None
+        if sub_attn is not None and not isinstance(sub_attn, dict):
+            out.append((f"attn_implementation[{sub_attr}]", str(sub_attn)))
+
+    return out
 
 
 def _current_cross_entropy_name() -> str:

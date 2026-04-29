@@ -225,6 +225,15 @@ def build_foundation_model(
         if _bind_veomni_ops(modeling_module, get_ops_config()):
             logger.info_rank0("OpSlot-based kernel dispatch active.")
 
+    # Final summary of which kernel won the dispatch for each op.  Emitted
+    # post-build so it reflects the *resolved* state (attn_implementation on
+    # model.config, GLOBAL pointers bound by apply_global_ops /
+    # apply_veomni_fused_moe_patch, and per-OpSlot bindings on the modeling
+    # module).
+    from ..ops import format_kernel_selection_summary
+
+    logger.info_rank0(format_kernel_selection_summary(model, modeling_module))
+
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
         # due to the behavior in https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/fsdp/_fully_shard/_fsdp_state.py#L130
