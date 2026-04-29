@@ -151,7 +151,7 @@ def format_kernel_selection_summary(model=None, modeling_module=None) -> str:
     lines.append(f"  cross_entropy             = {_current_cross_entropy_name()}")
 
     for alias, func in build_ALL_OPS():
-        impl = func.__name__ if func is not None else "None (eager / unbound)"
+        impl = getattr(func, "__name__", repr(func)) if func is not None else "None (eager / unbound)"
         lines.append(f"  {alias:<25} = {impl}")
 
     if modeling_module is not None:
@@ -165,7 +165,9 @@ def format_kernel_selection_summary(model=None, modeling_module=None) -> str:
             lines.append(f"  -- OpSlot bindings ({module_label}) --")
             for attr_name, slot in sorted(slot_entries):
                 impl_label = slot.impl_name if slot.impl_name is not None else "<unbound>"
-                kernel_label = slot.kernel.__name__ if slot.kernel is not None else "eager"
+                kernel_label = (
+                    getattr(slot.kernel, "__name__", repr(slot.kernel)) if slot.kernel is not None else "eager"
+                )
                 lines.append(f"  {attr_name:<35} = {impl_label} -> {kernel_label}")
 
     lines.append("=====================================================")
