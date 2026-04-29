@@ -456,16 +456,16 @@ class BaseTrainer(Stateful, ABC):
     def on_data_load_end(self, micro_batches=None):
         pass
 
-    def on_forward_begin(self):
+    def on_forward_begin(self, micro_batch=None):
         pass
 
-    def on_forward_end(self):
+    def on_forward_end(self, micro_batch=None):
         pass
 
-    def on_backward_begin(self):
+    def on_backward_begin(self, micro_batch=None):
         pass
 
-    def on_backward_end(self):
+    def on_backward_end(self, micro_batch=None):
         pass
 
     def on_optimizer_step_begin(self):
@@ -500,20 +500,20 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
-        self.on_forward_begin()
+        self.on_forward_begin(micro_batch=micro_batch)
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
         loss, loss_dict = self.postforward(outputs, micro_batch)
-        self.on_forward_end()
+        self.on_forward_end(micro_batch=micro_batch)
 
         # Backward pass
-        self.on_backward_begin()
+        self.on_backward_begin(micro_batch=micro_batch)
         with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             loss.backward()
-        self.on_backward_end()
+        self.on_backward_end(micro_batch=micro_batch)
 
         del micro_batch
         return loss, loss_dict

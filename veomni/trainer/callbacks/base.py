@@ -59,16 +59,16 @@ class Callback:
     def on_data_load_end(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         pass
 
-    def on_forward_begin(self, state: TrainerState, **kwargs) -> None:
+    def on_forward_begin(self, state: TrainerState, micro_batch: Dict[str, Any] = None, **kwargs) -> None:
         pass
 
-    def on_forward_end(self, state: TrainerState, **kwargs) -> None:
+    def on_forward_end(self, state: TrainerState, micro_batch: Dict[str, Any] = None, **kwargs) -> None:
         pass
 
-    def on_backward_begin(self, state: TrainerState, **kwargs) -> None:
+    def on_backward_begin(self, state: TrainerState, micro_batch: Dict[str, Any] = None, **kwargs) -> None:
         pass
 
-    def on_backward_end(self, state: TrainerState, **kwargs) -> None:
+    def on_backward_end(self, state: TrainerState, micro_batch: Dict[str, Any] = None, **kwargs) -> None:
         pass
 
     def on_optimizer_step_begin(self, state: TrainerState, **kwargs) -> None:
