@@ -415,6 +415,7 @@ class BaseTrainer(Stateful, ABC):
         self.checkpointer_callback.on_epoch_begin(self.state)
         self.hf_ckpt_callback.on_epoch_begin(self.state)
         self.evaluate_callback.on_epoch_begin(self.state)
+        self.moe_monitor_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
@@ -424,6 +425,7 @@ class BaseTrainer(Stateful, ABC):
         self.checkpointer_callback.on_epoch_end(self.state)
         self.hf_ckpt_callback.on_epoch_end(self.state)
         self.evaluate_callback.on_epoch_end(self.state)
+        self.moe_monitor_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None):
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
@@ -433,6 +435,7 @@ class BaseTrainer(Stateful, ABC):
         self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.evaluate_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.moe_monitor_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
