@@ -695,6 +695,23 @@ class OpsImplementationConfig:
             "'liger_kernel' uses LigerRMSNorm. "
             "'npu' uses torch_npu.npu_rms_norm (requires torch_npu). "
             "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3). "
+            "'mojo' uses MojoRMSNormFunction from mojo_opset. "
+            "'eager' (default) uses the HuggingFace default."
+        },
+    )
+    causal_conv1d_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "causal_conv1d implementation. "
+            "'mojo' uses ausal_conv1d from mojo_opset. "
+            "'eager' (default) uses the HuggingFace default."
+        },
+    )
+    chunk_gated_delta_rule_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "chunk_gated_delta_rule implementation. "
+            "'mojo' uses chunk_gated_delta_rule from mojo_opset. "
             "'eager' (default) uses the HuggingFace default."
         },
     )
@@ -713,6 +730,7 @@ class OpsImplementationConfig:
             "'liger_kernel' uses liger_rotary_pos_emb. "
             "'npu' uses torch_npu.npu_rotary_mul (requires torch_npu). "
             "'triton' uses deterministic Triton bmm kernel (DeepSeek V3). "
+            "'mojo' uses mojo_rope from mojo_opset. "
             "'eager' (default) uses the HuggingFace default."
         },
     )
