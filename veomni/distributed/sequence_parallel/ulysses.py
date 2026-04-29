@@ -206,6 +206,9 @@ class _Gather(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
         if ctx.grad_scale:
             grad_output = grad_output * ctx.seq_world_size
+
+        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
+
         return (
             None,
             grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous(),
