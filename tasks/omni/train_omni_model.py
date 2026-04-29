@@ -249,6 +249,10 @@ def main():
         dist.barrier()
         return
 
+    cpu_load_param_name = None
+    if hasattr(model, "get_parallel_plan"):
+        cpu_load_param_name = getattr(model.get_parallel_plan(), "cpu_load_param_name", None)
+
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
@@ -262,6 +266,9 @@ def main():
         basic_modules=model._no_split_modules,
         enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
         enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+        broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+        cpu_load_param_name=cpu_load_param_name,
+        max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
     )
     optimizer = build_optimizer(
         model,

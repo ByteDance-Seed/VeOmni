@@ -312,6 +312,10 @@ class BaseTrainer(Stateful, ABC):
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
 
+        cpu_load_param_name = None
+        if hasattr(self.model, "get_parallel_plan"):
+            cpu_load_param_name = getattr(self.model.get_parallel_plan(), "cpu_load_param_name", None)
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
@@ -328,6 +332,8 @@ class BaseTrainer(Stateful, ABC):
             enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+            cpu_load_param_name=cpu_load_param_name,
+            max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
         )
         self.model.train()
 
