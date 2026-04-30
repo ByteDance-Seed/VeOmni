@@ -100,13 +100,18 @@ class KernelRegistry:
     def __init__(self):
         self._specs: dict[tuple[str, str], dict[str, KernelSpec]] = {}
 
-    def register(self, spec: KernelSpec) -> None:
+    def register(self, spec: KernelSpec, force=False) -> None:
         key = (spec.op_name, spec.variant)
         bucket = self._specs.setdefault(key, {})
         if spec.name in bucket:
-            raise ValueError(
-                f"Duplicate kernel registration: op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}'"
-            )
+            if force:
+                logger.info(
+                    f"Kernel(op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}') is replaced with new one from {spec.factory}"
+                )
+            else:
+                raise ValueError(
+                    f"Duplicate kernel registration: op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}'"
+                )
         bucket[spec.name] = spec
 
     def resolve(self, op_name: str, variant: str, impl_name: str) -> Callable | None:

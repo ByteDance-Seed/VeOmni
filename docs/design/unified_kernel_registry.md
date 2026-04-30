@@ -98,12 +98,17 @@ class KernelRegistry:
     def __init__(self):
         self._specs: dict[tuple[str, str], dict[str, KernelSpec]] = {}
 
-    def register(self, spec: KernelSpec):
+    def register(self, spec: KernelSpec, force=False) -> None:
         key = (spec.op_name, spec.variant)
-        self._specs.setdefault(key, {})
-        if spec.name in self._specs[key]:
-            raise ValueError(f"Duplicate kernel: {spec.name} for {key}")
-        self._specs[key][spec.name] = spec
+        bucket = self._specs.setdefault(key, {})
+        if spec.name in bucket:
+            if force:
+                logger.info(f"Kernel(op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}') is replaced with new one from {spec.factory}")
+            else:
+                raise ValueError(
+                    f"Duplicate kernel registration: op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}'"
+                )
+        bucket[spec.name] = spec
 
     def resolve(self, op_name: str, variant: str, impl_name: str) -> callable | None:
         """Resolve an implementation. Returns None for "eager".
