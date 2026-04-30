@@ -21,8 +21,6 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
 """
 
-import torch
-
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     config as gpu_config,
 )
@@ -34,6 +32,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
+    qwen3_vl_text_rmsnorm_forward_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
     qwen3_vl_vision_dummy_forward_patched,
@@ -62,6 +61,11 @@ config.add_import("torch_npu", is_from_import=False)
 # ================================================================
 # Shared GPU patches (SP / deepstack / fused-CE / async Ulysses / ...)
 # ================================================================
+config.override_method(
+    "Qwen3VLTextRMSNorm.forward",
+    replacement=qwen3_vl_text_rmsnorm_forward_patched,
+    description="OpSlot guard for fused RMSNorm (standard formulation)",
+)
 config.override_method(
     "Qwen3VLVisionAttention.forward",
     replacement=qwen3_vl_vision_attention_forward_patched,
@@ -172,21 +176,4 @@ def apply_rotary_pos_emb_vision_npu_patched(q, k, cos, sin, position_ids=None, u
     q_embed = q_embed_4d.squeeze(0).to(orig_q_dtype).reshape(orig_q_shape)
     k_embed = k_embed_4d.squeeze(0).to(orig_k_dtype).reshape(orig_k_shape)
     return q_embed, k_embed
-    # --- Patch.1 ---
-
-
-# ================================================================
-# Patch: Qwen3VLTextRMSNorm.forward -> NPU fused npu_rms_norm
-# 1. swap the full-fp32 variance path for `torch_npu.npu_rms_norm`
-#    which stays in the weight dtype and is significantly faster on NPU
-# ================================================================
-@config.override_method(
-    "Qwen3VLTextRMSNorm.forward",
-    description="NPU fused RMSNorm (torch_npu.npu_rms_norm)",
-)
-def qwen3_vl_text_rmsnorm_forward_npu_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    # --- Patch.1 ---
-    if hidden_states.dtype != self.weight.dtype:
-        hidden_states = hidden_states.to(self.weight.dtype)
-    return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]  # noqa: F821 imported via add_import
     # --- Patch.1 ---

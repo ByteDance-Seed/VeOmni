@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3VLMoeTextRMSNorm.forward
+#      OpSlot guard for fused RMSNorm (standard formulation)
 #    - method_override: Qwen3VLMoeVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen3VLMoeVisionBlock.forward
@@ -43,8 +45,6 @@
 #      NPU fused rotary pos emb (torch_npu.npu_rotary_mul)
 #    - function_replacement: apply_rotary_pos_emb_vision
 #      NPU fused vision rotary pos emb (torch_npu.npu_rotary_mul with 4D reshape)
-#    - method_override: Qwen3VLMoeTextRMSNorm.forward
-#      NPU fused RMSNorm (torch_npu.npu_rms_norm)
 #
 # ==============================================================================
 
@@ -61,6 +61,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Additional imports for patches
 import torch_npu
 from transformers import initialization as init
 from transformers.activations import ACT2FN
@@ -104,9 +106,6 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
     async_ulysses_qkv_projection,
 )
 
-# Additional imports for patches
-from veomni.ops import fused_moe_forward
-
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
@@ -114,16 +113,13 @@ from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
+veomni_rms_norm = OpSlot("rms_norm", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-
-# ── OpSlot declarations ──────────────────────────────────────────────────
-# These are bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
-
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+
+veomni_rms_norm = OpSlot("rms_norm", "standard")
 
 
 # ======================================================================
@@ -271,16 +267,18 @@ class Qwen3VLMoeTextRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     # ================================================================
-    # Patch: Qwen3VLMoeTextRMSNorm.forward -> NPU fused npu_rms_norm
-    # 1. swap the full-fp32 variance path for `torch_npu.npu_rms_norm`
-    #    which stays in the weight dtype and is significantly faster on NPU
+    # Patch: OpSlot guard for fused RMSNorm (standard formulation)
     # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # --- Patch.1 ---
-        if hidden_states.dtype != self.weight.dtype:
-            hidden_states = hidden_states.to(self.weight.dtype)
-        return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]  # noqa: F821 imported via add_import
-        # --- Patch.1 ---
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        # Original HF code below, unchanged.
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -329,16 +327,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states)
         # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.2 ---
 
         with torch.no_grad():
