@@ -151,6 +151,13 @@ class EPGroupGemm(torch.autograd.Function):
     ):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
+        
+        if group_gemm_same_nk is None:
+            raise RuntimeError(
+                "MoE fused group_gemm kernels are not available on this device. "
+                "This typically means you're using Intel XPU or another non-CUDA device. "
+                "Please use moe_implementation='eager' instead of 'fused'."
+            )
 
         # compute linear layer fc1-1
         fc1_1_output = group_gemm_same_nk(
@@ -322,6 +329,14 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
     ):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
+        
+        if group_gemm_same_nk is None:
+            raise RuntimeError(
+                "MoE fused group_gemm kernels are not available on this device. "
+                "This typically means you're using Intel XPU or another non-CUDA device. "
+                "Please use moe_implementation='eager' instead of 'fused'."
+            )
+        
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
             f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
         )

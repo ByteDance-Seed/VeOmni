@@ -29,7 +29,8 @@ def get_device_key() -> str:
             return "H100"
 
     name = get_device_name()
-    if name.startswith("NVIDIA "):
+    if name and name.startswith("NVIDIA "):
         name = name[len("NVIDIA ") :]
 
-    return name
+    # Fallback for non-NVIDIA devices (e.g., Intel XPU, AMD)
+    return name if name else "unknown"
