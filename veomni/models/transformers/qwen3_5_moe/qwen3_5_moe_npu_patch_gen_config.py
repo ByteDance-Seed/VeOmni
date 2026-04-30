@@ -87,22 +87,30 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # TODO: Add torch npu ops chunk_gated_delta_rule and causal_conv1d_fn in the future.
-    chunk_gated_delta_rule = None
-    causal_conv1d_fn = None
+    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
+    # linear-attention impl raises at OpSlot.bind() time. These None
+    # placeholders preserve the upstream HF top-level
+    # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
+    # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
+    # assignments in __init__ resolve to torch.
     FusedRMSNormGated = None
-    fused_recurrent_gated_delta_rule = None
+    causal_conv1d_fn = None
     causal_conv1d_update = None
+    chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
     """
 )
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
-    # These are bound at model-build time by _bind_veomni_ops() in auto.py.
+    # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
 
@@ -110,6 +118,9 @@ config.add_post_import_block(
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
+veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 
 
 config.override_method(

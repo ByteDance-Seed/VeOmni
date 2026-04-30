@@ -114,6 +114,15 @@ fa4 = [
   "nvidia-cutlass-dsl>=4.4.2"
 ]
 
+# Optional alternative chunk_gated_delta_rule kernel for Qwen3.5 linear attention.
+# Opt in by selecting `chunk_gated_delta_rule_implementation: flash_qla` in
+# OpsImplementationConfig — the default `eager` and the `fla` backend
+# (shipped under the `gpu` extra via `flash-linear-attention`) work without
+# this extra. Source: https://github.com/QwenLM/FlashQLA
+flash-qla = [
+  "flash-qla"
+]
+
 # Experimental dep to install transformers 5.x.
 # Note that transformers 5.x support is experimental and WIP.
 # See https://github.com/ByteDance-Seed/VeOmni/issues/468 for the progress.
@@ -252,6 +261,9 @@ flash-attn-3 = [
 # FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
 # Pinned to 03/18/2026 latest main commit.
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
+# FlashQLA — alternative chunk_gated_delta_rule implementation for Qwen3.5 linear attention.
+# Pinned to 04/29/2026 latest main commit.
+flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "c9b9827036ffe8731e99bab65c51f86320767b33" }
 
 # Download av wheels directly to avoid FFmpeg build dependency issues in CI.
 # 3.11 uses av 14.4.0 (latest 14.x with cp311 wheel). 3.12 falls back to av 14.2.0 — the

@@ -2,6 +2,11 @@ model:
   model_path: Qwen/Qwen3.5-0.8B
   ops_implementation:
     attn_implementation: flash_attention_2
+    # GatedDeltaNet linear-attention kernels: opt into FLA so varlen training
+    # works (the `eager` default raises in the patched forward).
+    rms_norm_gated_implementation: fla
+    causal_conv1d_implementation: fla
+    chunk_gated_delta_rule_implementation: fla
 
 data:
   train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml

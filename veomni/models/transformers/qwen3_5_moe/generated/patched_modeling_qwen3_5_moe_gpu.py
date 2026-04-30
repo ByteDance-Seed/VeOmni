@@ -96,25 +96,25 @@ from veomni.utils.device import get_device_id
 
 
 # Additional import blocks for patches
-# Modification: We are not using https://github.com/Dao-AILab/causal-conv1d now
-# we are using the triton impl of causal_conv1d from fla.
-# TODO: Evaluate Tridao's impl in the future.
-try:
-    from fla.modules import FusedRMSNormGated
-    from fla.modules.convolution import causal_conv1d as causal_conv1d_fn
-    from fla.modules.convolution import causal_conv1d_update
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-except ImportError:
-    chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
-    FusedRMSNormGated = None
-    causal_conv1d_update, causal_conv1d_fn = None, None
-    logging.get_logger(__name__).warning(
-        "Failed to import FLA modules: fallback to eager implementation."
-        "This case can't support dynamic batching packing!"
-    )
+# Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
+# has moved into OpSlot guards below (driven by OpsImplementationConfig).
+# These None placeholders preserve two pieces of the original module:
+#   (1) the upstream HF top-level
+#       `is_fast_path_available = all((causal_conv1d_fn, ...))` resolves
+#       to False, keeping the legacy warning behaviour; and
+#   (2) the decode-only `*_update` / `fused_recurrent_*` aliases satisfy
+#       the `<fla_name> or <torch_fallback>` assignments in __init__
+#       (the precomputed-state path raises NotImplementedError anyway).
+FusedRMSNormGated = None
+causal_conv1d_fn = None
+causal_conv1d_update = None
+chunk_gated_delta_rule = None
+fused_recurrent_gated_delta_rule = None
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
-# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+# Bound at model-build time by _bind_veomni_ops() in auto.py. The three
+# linear-attention slots replace the previous import-time fla/torch
+# selection inside Qwen3_5MoeGatedDeltaNet.__init__ /forward.
 from veomni.ops.dispatch import OpSlot
 
 
@@ -122,6 +122,9 @@ veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
 
 
 # ======================================================================
@@ -556,24 +559,35 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
-        self.norm = (
-            Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-            if FusedRMSNormGated is None
-            else FusedRMSNormGated(
+        # Modification: OpSlot dispatch for fused gated RMSNorm. The slot stores
+        # the FusedRMSNormGated *class* (see veomni.ops.kernels.linear_attention),
+        # so calling it constructs a module with the fused kernel; eager falls
+        # through to upstream Qwen3_5MoeRMSNormGated.
+        if veomni_rms_norm_gated.use_non_eager_impl:
+            self.norm = veomni_rms_norm_gated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
                 activation=self.activation,
-                # Modification: use device-agnostic get_device_id() instead of hardcoded device
                 device=get_device_id(),
                 dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
             )
-        )
+        else:
+            self.norm = Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-        self.causal_conv1d_fn = causal_conv1d_fn
+        # Modification: OpSlot dispatch for causal conv1d / chunk gated delta-rule.
+        # `eager` leaves causal_conv1d_fn = None (the varlen path then raises) and
+        # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
+        # for varlen training; the decode-only `*_update` aliases are kept None
+        # because the precomputed-state path raises NotImplementedError anyway.
+        self.causal_conv1d_fn = veomni_causal_conv1d if veomni_causal_conv1d.use_non_eager_impl else None
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+        self.chunk_gated_delta_rule = (
+            veomni_chunk_gated_delta_rule
+            if veomni_chunk_gated_delta_rule.use_non_eager_impl
+            else torch_chunk_gated_delta_rule
+        )
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:
@@ -725,10 +739,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
+            if not veomni_chunk_gated_delta_rule.use_non_eager_impl:
                 raise RuntimeError(
-                    "Varlen training requires FLA. Install flash-linear-attention so "
-                    "chunk_gated_delta_rule supports cu_seqlens."
+                    "Varlen training requires a non-eager chunk_gated_delta_rule kernel. "
+                    "Set chunk_gated_delta_rule_implementation='fla' (and install flash-linear-attention) "
+                    "or 'flash_qla' (with the optional flash-qla extra) in OpsImplementationConfig."
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
