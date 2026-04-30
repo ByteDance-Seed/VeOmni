@@ -254,6 +254,7 @@ Additional per-directory helpers:
 |---|---|---|
 | `test_fused_moe_split_vs_merged.py` | Split vs merged fc1 in fused MoE | 1 GPU |
 | `test_quack_fused_moe.py` | Quack GEMM MoE backend | SM90+ |
+| `test_kernel_registry_numerical.py` | Numerical alignment per (op, variant, impl) | CUDA; the FlashQLA `chunk_gated_delta_rule` case skips unless on SM90+ with `--extra flash-qla` |
 | `test_fused_load_balancing_loss.py` | Triton load-balancing loss | CUDA |
 | `test_flash_attn_varlen_padding.py` | Flash-attn variable-length padding | CUDA |
 | `test_seqcls_loss.py` | Sequence classification loss | CUDA (optional) |
