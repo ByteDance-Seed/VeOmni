@@ -23,7 +23,7 @@ them.
 from . import (  # noqa: F401
     attention,
     cross_entropy,
-    linear_attention,
+    gated_delta_rule,
     load_balancing_loss,
     moe,
     rms_norm,

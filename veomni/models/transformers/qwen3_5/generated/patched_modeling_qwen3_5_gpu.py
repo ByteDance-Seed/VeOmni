@@ -550,7 +550,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
 
         # Modification: OpSlot dispatch for fused gated RMSNorm. The slot stores
-        # the FusedRMSNormGated *class* (see veomni.ops.kernels.linear_attention),
+        # the FusedRMSNormGated *class* (see veomni.ops.kernels.gated_delta_rule),
         # so calling it constructs a module with the fused kernel; eager falls
         # through to upstream Qwen3_5RMSNormGated.
         if veomni_rms_norm_gated.use_non_eager_impl:

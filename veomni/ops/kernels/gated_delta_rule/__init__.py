@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Linear-attention kernels: gated RMSNorm, causal conv1d, chunk gated delta rule.
+"""Gated delta-rule kernels: gated RMSNorm, causal conv1d, chunk gated delta rule.
 
-These three ops back Qwen3.5's ``GatedDeltaNet`` linear-attention layer. Unlike
-the kernel families in sibling sub-packages, none of them have a torch eager
-fallback that supports varlen training: HF's "eager" path here is essentially
-"raise at the first packed-sequence step". The non-eager backends come from
-the ``flash-linear-attention`` (``fla``) library, plus an alternative
+These three ops back Qwen3.5's ``GatedDeltaNet`` linear-attention layer.
+Linear attention has many variants; this sub-package is scoped to the
+gated delta-rule family that Qwen3.5 uses. Unlike the kernel families in
+sibling sub-packages, none of them have a torch eager fallback that
+supports varlen training: HF's "eager" path here is essentially "raise at
+the first packed-sequence step". The non-eager backends come from the
+``flash-linear-attention`` (``fla``) library, plus an alternative
 ``flash_qla`` implementation of ``chunk_gated_delta_rule`` from QwenLM.
 
 Selection is driven by three fields on ``OpsImplementationConfig``:
