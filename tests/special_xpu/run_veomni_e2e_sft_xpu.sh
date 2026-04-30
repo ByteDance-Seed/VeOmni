@@ -24,7 +24,7 @@ echo "VeOmni e2e SFT Test on Intel XPU"
 echo "=========================================="
 echo "Model: Qwen2.5-0.5B-Instruct"
 echo "GPUs: 2 (XPU devices 0,1 via ZE_AFFINITY_MASK)"
-echo "Config: qwen2_5_xpu.yaml (sdpa attention, fsdp1 trainer smoke)"
+echo "Config: configs/xpu/text/qwen2_5_xpu.yaml (sdpa attention, fsdp1 trainer smoke)"
 echo ""
 
 # Run torchrun with 2 XPU GPUs
@@ -33,7 +33,7 @@ torchrun \
     --nproc_per_node=2 \
     --master-port=4321 \
     tasks/train_text.py \
-    configs/text/qwen2_5_xpu.yaml \
+    configs/xpu/text/qwen2_5_xpu.yaml \
     --model.model_path "$MODEL_PATH" \
     --data.train_path "$DATASET_DIR/fineweb" \
     --train.checkpoint.output_dir "Qwen2.5-0.5B-Instruct-sft-xpu" \
