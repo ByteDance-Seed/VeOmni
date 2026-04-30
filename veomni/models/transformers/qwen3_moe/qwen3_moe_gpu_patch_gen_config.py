@@ -134,6 +134,31 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         return final_hidden_states
 
 
+@config.override_method(
+    "Qwen3MoeTopKRouter.forward",
+    description=(
+        "Return raw pre-softmax logits as `router_logits` so HF's "
+        "`load_balancing_loss_func` (which applies softmax internally) "
+        "stays consistent with the HF aux-loss baseline."
+    ),
+)
+def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    # Return raw pre-softmax logits as `router_logits`; HF's
+    # `load_balancing_loss_func` applies softmax internally. The post-softmax
+    # tensor is kept locally as `routing_weights` for top-k selection only.
+    router_logits = torch.nn.functional.linear(hidden_states, self.weight)
+    routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+    router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+    if self.norm_topk_prob:
+        router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+    # Cast top-k weights back to input dtype so the downstream expert
+    # multiplication runs in bf16/fp16 rather than fp32.
+    router_top_value = router_top_value.to(input_dtype)
+    return router_logits, router_top_value, router_indices
+
+
 @config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
 def apply_rotary_pos_emb_liger(
     q: torch.Tensor,

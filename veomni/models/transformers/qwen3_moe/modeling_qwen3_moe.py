@@ -132,19 +132,16 @@ class PatchQwen3MoeTopKRouter(nn.Module):
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        # Keep raw pre-softmax logits to return: HF's Qwen3MoeSparseMoeBlock
-        # returns raw router_logits, and `load_balancing_loss_func` applies
-        # softmax to them. Reusing the `router_logits` name for the softmax
-        # output (as the previous version did) caused a double-softmax in the
-        # aux-loss path and shifted gate gradients vs HF baseline.
+        # Return raw pre-softmax logits as `router_logits`; HF's
+        # `load_balancing_loss_func` applies softmax internally. The post-softmax
+        # tensor is kept locally as `routing_weights` for top-k selection only.
         router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
         routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
         router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (seq_len, top_k)
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        # Cast back to input dtype — matches HF's Qwen3MoeSparseMoeBlock semantics
-        # so the expert multiplication `expert_output * routing_weights` is done
-        # in input dtype rather than promoted to fp32 (which drops bf16 rounding).
+        # Cast top-k weights back to input dtype so the downstream expert
+        # multiplication runs in bf16/fp16 rather than fp32.
         router_top_value = router_top_value.to(input_dtype)
         return router_logits, router_top_value, router_indices
 
@@ -272,11 +269,9 @@ def qwen3_moe_forcausal_lm_forward(
 # RMSNorm modules keep HF's init, and PatchQwen3MoeExperts / PatchQwen3MoeTopKRouter
 # (whose params are not handled by HF's _init_weights) get N(0, initializer_range).
 # ================================================================
-# Capture HF's `_init_weights` at module import (before any patching) so repeated
-# `apply_veomni_qwen3_moe_patch()` calls — e.g. multiple `get_model_class()` in one
-# process — re-wrap the original instead of nesting wrappers. Nested wrappers would
-# re-sample Patch* expert/router params per layer and advance the RNG, breaking
-# init reproducibility.
+# Snapshot HF's `_init_weights` at module import; the wrapper always wraps this
+# fixed reference so repeated `apply_veomni_qwen3_moe_patch()` calls (e.g.
+# multiple `get_model_class()` in one process) stay idempotent.
 _HF_QWEN3_MOE_INIT_WEIGHTS = hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights
 
 
@@ -303,8 +298,7 @@ def apply_veomni_qwen3_moe_patch():
     hf_qwen3_moe.Qwen3MoeForCausalLM.get_parallel_plan = lambda self: get_parallel_plan(use_gate_up_proj=False)
 
     hf_qwen3_moe.Qwen3MoeForCausalLM.forward = qwen3_moe_forcausal_lm_forward
-    # Always wrap the captured original (not the live attribute) so repeated
-    # patch calls don't nest — see `_HF_QWEN3_MOE_INIT_WEIGHTS`.
+    # Wrap the import-time snapshot, not the live attribute, so this is idempotent.
     hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = _make_qwen3_moe_init_weights(_HF_QWEN3_MOE_INIT_WEIGHTS)
 
     # Mirror the OpSlot onto the HF module so `_bind_veomni_ops` (which walks
