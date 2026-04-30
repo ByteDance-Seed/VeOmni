@@ -232,18 +232,18 @@
 
 -        self.causal_conv1d_fn = causal_conv1d_fn
 +        # Modification: OpSlot dispatch for causal conv1d / chunk gated delta-rule.
++        # We freeze the resolved kernel (or None for eager) on the instance via
++        # `.bound_kernel()`; storing the OpSlot itself would couple the instance to
++        # the module-global slot, and a second model rebinding the slot with a
++        # different impl would silently switch this instance's kernel too.
 +        # `eager` leaves causal_conv1d_fn = None (the varlen path then raises) and
 +        # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
 +        # for varlen training; the decode-only `*_update` aliases are kept None
 +        # because the precomputed-state path raises NotImplementedError anyway.
-+        self.causal_conv1d_fn = veomni_causal_conv1d if veomni_causal_conv1d.use_non_eager_impl else None
++        self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
          self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
 -        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
-+        self.chunk_gated_delta_rule = (
-+            veomni_chunk_gated_delta_rule
-+            if veomni_chunk_gated_delta_rule.use_non_eager_impl
-+            else torch_chunk_gated_delta_rule
-+        )
++        self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
          self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
          if not is_fast_path_available:
