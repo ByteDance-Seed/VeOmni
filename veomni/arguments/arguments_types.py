@@ -748,7 +748,7 @@ class OpsImplementationConfig:
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
-            "'flash_qla' uses QwenLM FlashQLA (requires the optional flash-qla extra, GPU). "
+            "'flash_qla' uses QwenLM FlashQLA (requires the optional flash-qla extra, Hopper SM90+ only). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
