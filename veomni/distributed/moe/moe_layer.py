@@ -154,8 +154,7 @@ class EPGroupGemm(torch.autograd.Function):
         
         if group_gemm_same_nk is None:
             raise RuntimeError(
-                "MoE fused group_gemm kernels are not available on this device. "
-                "This typically means you're using Intel XPU or another non-CUDA device. "
+                "MoE fused group_gemm kernels are not available for the current device/backend. "
                 "Please use moe_implementation='eager' instead of 'fused'."
             )
 
@@ -332,8 +331,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         
         if group_gemm_same_nk is None:
             raise RuntimeError(
-                "MoE fused group_gemm kernels are not available on this device. "
-                "This typically means you're using Intel XPU or another non-CUDA device. "
+                "MoE fused group_gemm kernels are not available for the current device/backend. "
                 "Please use moe_implementation='eager' instead of 'fused'."
             )
         

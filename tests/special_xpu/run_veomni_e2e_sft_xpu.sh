@@ -1,7 +1,5 @@
 #!/bin/bash
 # VeOmni trainer e2e SFT smoke test on Intel XPU (2 GPUs)
-# Note: This path currently runs fsdp1 from config. FSDP2 coverage is in
-# tests/special_xpu/test_fsdp2_simple_xpu.py
 
 set -e
 
