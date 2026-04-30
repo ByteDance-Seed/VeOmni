@@ -140,18 +140,22 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 
 ### Selecting linear-attention kernels
 
-GatedDeltaNet ships three opt-in kernels (default `eager` raises on varlen training).
-The example configs already select `fla` for all three; switch
-`chunk_gated_delta_rule_implementation` to `flash_qla` if you've installed the optional
-[`flash-qla`](https://github.com/QwenLM/FlashQLA) extra
-(`uv sync --extra flash-qla ...`):
+GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`, and
+`chunk_gated_delta_rule`. Each defaults to `auto`, which resolves to:
+
+- **GPU** — `fla` (the FLA Triton kernels shipped under the `gpu` extra; required for
+  varlen training).
+- **NPU** — `eager` (no FLA / FlashQLA backend is registered for Ascend today; varlen
+  training raises at runtime).
+
+To switch `chunk_gated_delta_rule` to QwenLM's [`flash-qla`](https://github.com/QwenLM/FlashQLA)
+kernel, install the optional extra (`uv sync --extra flash-qla ...`) and set the field
+explicitly:
 
 ```yaml
 model:
   ops_implementation:
-    rms_norm_gated_implementation: fla            # only `fla` is registered today
-    causal_conv1d_implementation: fla             # only `fla` is registered today
-    chunk_gated_delta_rule_implementation: fla    # or `flash_qla` for the QwenLM kernel
+    chunk_gated_delta_rule_implementation: flash_qla
 ```
 
 ### How It Works

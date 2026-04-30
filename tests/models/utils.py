@@ -276,10 +276,10 @@ def apply_veomni_moe_unpatch():
 def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig:
     """Build an OpsImplementationConfig from a ModelMode for testing."""
     liger_impl = _LIGER_KERNEL if model_mode.use_liger_kernel else _EAGER
-    # The qwen3_5 / qwen3_5_moe linear-attention path can't run varlen training
-    # under the `eager` default (the patched forward raises). Opt into the FLA
-    # backend so the test exercises a real kernel; for models without these
-    # OpSlots, the fields are ignored at bind time.
+    # Linear-attention fields (rms_norm_gated/causal_conv1d/chunk_gated_delta_rule)
+    # are intentionally left at their default ``"auto"`` so __post_init__ resolves
+    # them to ``fla`` on GPU and ``eager`` on NPU — matching the platform-aware
+    # default users will see in production.
     return OpsImplementationConfig(
         attn_implementation=model_mode.attn_implementation,
         moe_implementation=model_mode.moe_implementation,
@@ -288,9 +288,6 @@ def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig
         swiglu_mlp_implementation=liger_impl,
         rotary_pos_emb_implementation=liger_impl,
         load_balancing_loss_implementation=_LOAD_BALANCING_LOSS_IMPL,
-        rms_norm_gated_implementation="fla",
-        causal_conv1d_implementation="fla",
-        chunk_gated_delta_rule_implementation="fla",
     )
 
 

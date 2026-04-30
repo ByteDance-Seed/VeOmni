@@ -390,7 +390,12 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
-        if not veomni_chunk_gated_delta_rule.use_non_eager_impl:
+        # Modification: instance-local guard. The kernel was selected at
+        # ``__init__`` time and cached on ``self.chunk_gated_delta_rule``;
+        # reading the module-global OpSlot here would diverge if a second
+        # model rebinds it with a different config (the OpSlot is a process-
+        # wide singleton).
+        if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
             raise RuntimeError(
                 "Varlen training requires a non-eager chunk_gated_delta_rule kernel. "
                 "Set chunk_gated_delta_rule_implementation='fla' (and install flash-linear-attention) "

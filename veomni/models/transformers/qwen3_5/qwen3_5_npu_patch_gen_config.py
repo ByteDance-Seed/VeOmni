@@ -329,7 +329,8 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
-        if not veomni_chunk_gated_delta_rule.use_non_eager_impl:
+        # Modification: instance-local guard (see GPU patch comment).
+        if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
             raise RuntimeError(
                 "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
                 "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
