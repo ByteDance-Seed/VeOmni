@@ -104,8 +104,9 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
-    else:
-        raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
+    # to allow other kernel type
+    # else:
+    #    raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
 
 
 # ── OpSlot kernel registrations ──────────────────────────────────────────────

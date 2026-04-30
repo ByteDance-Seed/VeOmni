@@ -21,8 +21,6 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
 """
 
-import torch
-
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     config as gpu_config,
 )
@@ -34,6 +32,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
+    qwen3_vl_text_rmsnorm_forward_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
     qwen3_vl_vision_dummy_forward_patched,
@@ -55,11 +54,6 @@ config = PatchConfig(
 # async ulysses / get_position_id helpers).
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
-config.add_post_import_block(
-    """
-    veomni_rms_norm = OpSlot("rms_norm", "standard")
-    """
-)
 config.helpers.extend(gpu_config.helpers)
 config.add_import("torch_npu", is_from_import=False)
 
@@ -67,6 +61,11 @@ config.add_import("torch_npu", is_from_import=False)
 # ================================================================
 # Shared GPU patches (SP / deepstack / fused-CE / async Ulysses / ...)
 # ================================================================
+config.override_method(
+    "Qwen3VLTextRMSNorm.forward",
+    replacement=qwen3_vl_text_rmsnorm_forward_patched,
+    description="OpSlot guard for fused RMSNorm (standard formulation)",
+)
 config.override_method(
     "Qwen3VLVisionAttention.forward",
     replacement=qwen3_vl_vision_attention_forward_patched,
@@ -178,22 +177,3 @@ def apply_rotary_pos_emb_vision_npu_patched(q, k, cos, sin, position_ids=None, u
     k_embed = k_embed_4d.squeeze(0).to(orig_k_dtype).reshape(orig_k_shape)
     return q_embed, k_embed
     # --- Patch.1 ---
-
-
-# ================================================================
-# Patch: OpSlot guard for NPU fused RMSNorm (standard formulation)
-# ================================================================
-@config.override_method(
-    "Qwen3VLTextRMSNorm.forward",
-    description="OpSlot guard for NPU fused RMSNorm (standard formulation)",
-)
-def qwen3_vl_text_rmsnorm_forward_npu_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
-    if veomni_rms_norm.use_non_eager_impl:
-        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
-    # Original HF code below, unchanged.
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-    return self.weight * hidden_states.to(input_dtype)

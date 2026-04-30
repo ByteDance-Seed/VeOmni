@@ -35,12 +35,12 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
-from veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config import qwen3_vl_text_rmsnorm_forward_npu_patched
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     PatchedQwen3VLMoeTextExperts,
     qwen3_vl_moe_for_conditional_generation_forward_patched,
     qwen3_vl_moe_get_parallel_plan_patched,
     qwen3_vl_moe_model_forward_patched,
+    qwen3_vl_text_rmsnorm_forward_patched,
 )
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     config as gpu_config,
@@ -56,7 +56,7 @@ config = PatchConfig(
 
 # Mirror additional imports + post-import helpers from the GPU config so the
 # generated file is self-contained (same SP helpers, same rot_pos_ids /
-# async ulysses / get_position_id helpers, fused_moe_forward import).
+# async ulysses / get_position_id helpers.
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.add_post_import_block(
@@ -73,6 +73,12 @@ config.add_import("torch_npu", is_from_import=False)
 # ================================================================
 _NAME_MAP = {"Qwen3VL": "Qwen3VLMoe"}
 
+config.override_method(
+    "Qwen3VLMoeTextRMSNorm.forward",
+    replacement=qwen3_vl_text_rmsnorm_forward_patched,
+    name_map=_NAME_MAP,
+    description="OpSlot guard for fused RMSNorm (standard formulation)",
+)
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
     replacement=qwen3_vl_vision_attention_forward_patched,
@@ -207,13 +213,3 @@ def apply_rotary_pos_emb_vision_npu_patched(q, k, cos, sin, position_ids=None, u
     k_embed = k_embed_4d.squeeze(0).to(orig_k_dtype).reshape(orig_k_shape)
     return q_embed, k_embed
     # --- Patch.1 ---
-
-
-# ================================================================
-# Patch: OpSlot guard for NPU fused RMSNorm (standard formulation)
-# ================================================================
-config.override_method(
-    "Qwen3MoeRMSNorm.forward",
-    replacement=qwen3_vl_text_rmsnorm_forward_npu_patched,
-    description="Use standard RMSNorm for NPU patchgen",
-)

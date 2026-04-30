@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3VLTextRMSNorm.forward
+#      OpSlot guard for fused RMSNorm (standard formulation)
 #    - method_override: Qwen3VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen3VLVisionBlock.forward
@@ -39,8 +41,6 @@
 #      NPU fused rotary pos emb (torch_npu.npu_rotary_mul)
 #    - function_replacement: apply_rotary_pos_emb_vision
 #      NPU fused vision rotary pos emb (torch_npu.npu_rotary_mul with 4D reshape)
-#    - method_override: Qwen3VLTextRMSNorm.forward
-#      OpSlot guard for NPU fused RMSNorm (standard formulation)
 #
 # ==============================================================================
 
@@ -97,9 +97,8 @@ from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-
 veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
 
 # ======================================================================
@@ -625,7 +624,7 @@ class Qwen3VLTextRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     # ================================================================
-    # Patch: OpSlot guard for NPU fused RMSNorm (standard formulation)
+    # Patch: OpSlot guard for fused RMSNorm (standard formulation)
     # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
