@@ -34,7 +34,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import load_balancing_loss
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -46,7 +45,6 @@ config = PatchConfig(
     description="Qwen3Moe with LigerKernel GPU replacements and VeOmni SP/fused loss patches",
 )
 
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched ``forward`` can return
 # per-token log-probs / entropy as constructor fields. Mutating ``output.log_probs``
 # / ``output.entropy`` after constructing ``MoeCausalLMOutputWithPast`` would
@@ -133,16 +131,7 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
 
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)

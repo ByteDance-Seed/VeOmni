@@ -112,9 +112,74 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
     """
 )
+
+
+# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+
+
+@config.override_method(
+    "Qwen3VLTextRMSNorm.forward",
+    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
+)
+def qwen3_vl_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+    # Original HF code below, unchanged.
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states.to(input_dtype)
+
+
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+
+
+@config.replace_function("apply_rotary_pos_emb", description="OpSlot guard for Liger fused RoPE")
+def apply_rotary_pos_emb_patched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+# ── Vision Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+
+
+@config.replace_function(
+    "apply_rotary_pos_emb_vision",
+    description="OpSlot guard for Liger fused vision RoPE",
+)
+def apply_rotary_pos_emb_vision_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed
 
 
 # ================================================================

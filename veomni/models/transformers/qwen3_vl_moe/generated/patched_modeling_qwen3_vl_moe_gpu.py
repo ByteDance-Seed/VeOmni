@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3VLMoeTextRMSNorm.forward
+#      OpSlot guard for Liger fused RMSNorm (standard formulation)
 #    - method_override: Qwen3VLMoeVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen3VLMoeVisionBlock.forward
@@ -33,6 +35,10 @@
 #      Use VeOmni precomputed position-id function and unified multimodal token ids
 #    - method_override: Qwen3VLMoeForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
+#    - function_replacement: apply_rotary_pos_emb
+#      OpSlot guard for Liger fused RoPE
+#    - function_replacement: apply_rotary_pos_emb_vision
+#      OpSlot guard for Liger fused vision RoPE
 #    - class_replacement: Qwen3VLMoeTextExperts
 #      Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 #    - method_override: Qwen3VLMoeModel.forward
@@ -63,7 +69,6 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import (
     use_kernel_forward_from_hub,
-    use_kernel_func_from_hub,
     use_kernelized_func,
 )
 from transformers.masking_utils import create_causal_mask
@@ -99,14 +104,13 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
     async_ulysses_qkv_projection,
 )
 
-# Additional imports for patches
-from veomni.ops import fused_moe_forward
-
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+
+# Additional imports for patches
 from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log_probs path
     FusedLinearAuxOutput,
     FusedLinearAuxOutputMixin,
@@ -115,7 +119,10 @@ from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log
 )
 
 
+veomni_rms_norm = OpSlot("rms_norm", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # These are bound at model-build time by _bind_veomni_ops() in auto.py.
@@ -310,6 +317,12 @@ def collate_multimodal_metadata(batch, sp_pad):
         batch["multimodal_metadata"] = md
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3VLMoeTextRMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3VLMoeTextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -320,7 +333,12 @@ class Qwen3VLMoeTextRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        # Original HF code below, unchanged.
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -374,16 +392,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states)
         # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.2 ---
 
         with torch.no_grad():
@@ -483,25 +492,23 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-@use_kernel_func_from_hub("rotary_pos_emb")
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb
+# Reason: OpSlot guard for Liger fused RoPE
+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
+# ======================================================================
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -728,9 +735,15 @@ class Qwen3VLMoeVisionRotaryEmbedding(nn.Module):
         return freqs
 
 
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
+# Reason: OpSlot guard for Liger fused vision RoPE
+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
+# ======================================================================
+# ── Vision Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()

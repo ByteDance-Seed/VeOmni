@@ -40,6 +40,34 @@ from __future__ import annotations
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
+# ── rms_norm_gated (Torch_npu FusedRMSNormGated) ───────────────────────────────────
+
+
+def _npu_fused_rms_norm_gated_factory():
+    """Return the ``NPUFusedRMSNormGated`` *class*.
+
+    The kernel is consumed inside ``Qwen3_5GatedDeltaNet.__init__`` like a
+    constructor — ``self.norm = veomni_rms_norm_gated(dim, eps=..., ...)``
+    — so the slot stores the class itself, not an instance. Lazily imported
+    via the factory so hosts without torch_npu can still load the module.
+    """
+    from .npu_rms_norm_gated import NPUFusedRMSNormGated
+
+    return NPUFusedRMSNormGated
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rms_norm_gated",
+        variant="standard",
+        factory=_npu_fused_rms_norm_gated_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPUFusedRMSNormGated (RMSNorm + SiLU gate fused)",
+    )
+)
+
+
 # ── rms_norm_gated (FLA FusedRMSNormGated) ───────────────────────────────────
 
 

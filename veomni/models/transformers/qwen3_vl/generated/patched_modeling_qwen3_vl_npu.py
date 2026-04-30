@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3VLTextRMSNorm.forward
+#      OpSlot guard for NPU fused RMSNorm (standard formulation)
 #    - method_override: Qwen3VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen3VLVisionBlock.forward
@@ -38,11 +40,9 @@
 #    - method_override: Qwen3VLForConditionalGeneration.forward
 #      Use VeOmni unified fused loss_function path
 #    - function_replacement: apply_rotary_pos_emb
-#      NPU fused rotary pos emb (torch_npu.npu_rotary_mul)
+#      OpSlot guard for NPU fused RoPE
 #    - function_replacement: apply_rotary_pos_emb_vision
-#      NPU fused vision rotary pos emb (torch_npu.npu_rotary_mul with 4D reshape)
-#    - method_override: Qwen3VLTextRMSNorm.forward
-#      NPU fused RMSNorm (torch_npu.npu_rms_norm)
+#      OpSlot guard for NPU fused vision RoPE
 #
 # ==============================================================================
 
@@ -58,9 +58,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
-# Additional imports for patches
-import torch_npu
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -102,7 +99,10 @@ from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log
 )
 
 
+veomni_rms_norm = OpSlot("rms_norm", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 
 
 # ======================================================================
@@ -373,30 +373,22 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: NPU fused vision rotary pos emb (torch_npu.npu_rotary_mul with 4D reshape)
-# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config
+# Reason: OpSlot guard for NPU fused vision RoPE
+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
 # ======================================================================
-# ================================================================
-# Patch: apply_rotary_pos_emb_vision -> NPU fused npu_rotary_mul
-# 1. the vision-side RoPE kernel; reshapes to 4D before the NPU call
-#    to satisfy the kernel's rank expectation
-# ================================================================
+# ── Vision Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    # --- Patch.1 ---
-    orig_q_shape = q.shape
-    orig_k_shape = k.shape
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
-    q_4d = q.unsqueeze(0).float().contiguous()
-    k_4d = k.unsqueeze(0).float().contiguous()
-    cos_4d = cos.unsqueeze(0).unsqueeze(2).float()
-    sin_4d = sin.unsqueeze(0).unsqueeze(2).float()
-    q_embed_4d = torch_npu.npu_rotary_mul(q_4d, cos_4d, sin_4d)  # noqa: F821 imported via add_import
-    k_embed_4d = torch_npu.npu_rotary_mul(k_4d, cos_4d, sin_4d)  # noqa: F821 imported via add_import
-    q_embed = q_embed_4d.squeeze(0).to(orig_q_dtype).reshape(orig_q_shape)
-    k_embed = k_embed_4d.squeeze(0).to(orig_k_dtype).reshape(orig_k_shape)
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
-    # --- Patch.1 ---
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -682,17 +674,17 @@ class Qwen3VLTextRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    # ================================================================
-    # Patch: Qwen3VLTextRMSNorm.forward -> NPU fused npu_rms_norm
-    # 1. swap the full-fp32 variance path for `torch_npu.npu_rms_norm`
-    #    which stays in the weight dtype and is significantly faster on NPU
-    # ================================================================
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # --- Patch.1 ---
-        if hidden_states.dtype != self.weight.dtype:
-            hidden_states = hidden_states.to(self.weight.dtype)
-        return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]  # noqa: F821 imported via add_import
-        # --- Patch.1 ---
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        # Original HF code below, unchanged.
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -700,22 +692,26 @@ class Qwen3VLTextRMSNorm(nn.Module):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: NPU fused rotary pos emb (torch_npu.npu_rotary_mul)
-# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config
+# Reason: OpSlot guard for NPU fused RoPE
+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
 # ======================================================================
-# ================================================================
-# Patch: apply_rotary_pos_emb -> NPU fused npu_rotary_mul
-# 1. the text-side RoPE kernel; identical signature to the upstream
-#    `apply_rotary_pos_emb`, internally uses `torch_npu.npu_rotary_mul`
-# ================================================================
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    # --- Patch.1 ---
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)  # noqa: F821 imported via add_import
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)  # noqa: F821 imported via add_import
-    return q_embed.to(q.dtype), k_embed.to(k.dtype)
-    # --- Patch.1 ---
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 # ======================================================================

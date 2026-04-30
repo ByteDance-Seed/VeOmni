@@ -29,6 +29,8 @@
 -# limitations under the License.
 -
 +#  Patches applied:
++#    - method_override: Qwen3VLTextRMSNorm.forward
++#      OpSlot guard for NPU fused RMSNorm (standard formulation)
 +#    - method_override: Qwen3VLVisionAttention.forward
 +#      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 +#    - method_override: Qwen3VLVisionBlock.forward
@@ -58,11 +60,9 @@
 +#    - method_override: Qwen3VLForConditionalGeneration.forward
 +#      Use VeOmni unified fused loss_function path
 +#    - function_replacement: apply_rotary_pos_emb
-+#      NPU fused rotary pos emb (torch_npu.npu_rotary_mul)
++#      OpSlot guard for NPU fused RoPE
 +#    - function_replacement: apply_rotary_pos_emb_vision
-+#      NPU fused vision rotary pos emb (torch_npu.npu_rotary_mul with 4D reshape)
-+#    - method_override: Qwen3VLTextRMSNorm.forward
-+#      NPU fused RMSNorm (torch_npu.npu_rms_norm)
++#      OpSlot guard for NPU fused vision RoPE
 +#
 +# ==============================================================================
 +
@@ -96,9 +96,6 @@
 -from ...utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 -from ...utils.output_capturing import capture_outputs
 -from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
-+
-+# Additional imports for patches
-+import torch_npu
 +from transformers import initialization as init
 +from transformers.activations import ACT2FN
 +from transformers.cache_utils import Cache, DynamicCache
@@ -140,7 +137,10 @@
 +)
 +
 +
++veomni_rms_norm = OpSlot("rms_norm", "standard")
 +veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
++veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
++veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 +
 +
 +# ======================================================================
@@ -327,7 +327,7 @@
 
 
  @dataclass
-@@ -127,18 +371,32 @@
+@@ -127,9 +371,15 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -336,40 +336,17 @@
 -) -> tuple[torch.Tensor, torch.Tensor]:
 +# ======================================================================
 +# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-+# Reason: NPU fused vision rotary pos emb (torch_npu.npu_rotary_mul with 4D reshape)
-+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config
++# Reason: OpSlot guard for NPU fused vision RoPE
++# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
 +# ======================================================================
-+# ================================================================
-+# Patch: apply_rotary_pos_emb_vision -> NPU fused npu_rotary_mul
-+# 1. the vision-side RoPE kernel; reshapes to 4D before the NPU call
-+#    to satisfy the kernel's rank expectation
-+# ================================================================
++# ── Vision Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 +def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-+    # --- Patch.1 ---
-+    orig_q_shape = q.shape
-+    orig_k_shape = k.shape
++    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
++        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
      orig_q_dtype = q.dtype
      orig_k_dtype = k.dtype
--    q, k = q.float(), k.float()
--    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
--    q_embed = (q * cos) + (rotate_half(q) * sin)
--    k_embed = (k * cos) + (rotate_half(k) * sin)
--    q_embed = q_embed.to(orig_q_dtype)
--    k_embed = k_embed.to(orig_k_dtype)
-+    q_4d = q.unsqueeze(0).float().contiguous()
-+    k_4d = k.unsqueeze(0).float().contiguous()
-+    cos_4d = cos.unsqueeze(0).unsqueeze(2).float()
-+    sin_4d = sin.unsqueeze(0).unsqueeze(2).float()
-+    q_embed_4d = torch_npu.npu_rotary_mul(q_4d, cos_4d, sin_4d)  # noqa: F821 imported via add_import
-+    k_embed_4d = torch_npu.npu_rotary_mul(k_4d, cos_4d, sin_4d)  # noqa: F821 imported via add_import
-+    q_embed = q_embed_4d.squeeze(0).to(orig_q_dtype).reshape(orig_q_shape)
-+    k_embed = k_embed_4d.squeeze(0).to(orig_k_dtype).reshape(orig_k_shape)
-     return q_embed, k_embed
-+    # --- Patch.1 ---
-
-
- def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -176,6 +434,12 @@
+     q, k = q.float(), k.float()
+@@ -176,6 +426,12 @@
      attn_output = attn_output.transpose(1, 2).contiguous()
 
      return attn_output, attn_weights
@@ -382,7 +359,7 @@
 
 
  class Qwen3VLVisionAttention(nn.Module):
-@@ -192,10 +456,19 @@
+@@ -192,10 +448,19 @@
          self.attention_dropout = 0.0
          self.is_causal = False
 
@@ -402,7 +379,7 @@
          rotary_pos_emb: torch.Tensor | None = None,
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
-@@ -216,8 +489,9 @@
+@@ -216,8 +481,9 @@
          )
 
          if is_flash_attention_requested(self.config):
@@ -414,7 +391,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -234,12 +508,10 @@
+@@ -234,12 +500,10 @@
                  **kwargs,
              )
          else:
@@ -427,7 +404,7 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -261,6 +533,12 @@
+@@ -261,6 +525,12 @@
          return attn_output
 
 
@@ -440,7 +417,7 @@
  class Qwen3VLVisionBlock(GradientCheckpointingLayer):
      def __init__(self, config, attn_implementation: str = "sdpa") -> None:
          super().__init__()
-@@ -269,10 +547,18 @@
+@@ -269,10 +539,18 @@
          self.attn = Qwen3VLVisionAttention(config=config)
          self.mlp = Qwen3VLVisionMLP(config=config)
 
@@ -459,7 +436,7 @@
          rotary_pos_emb: torch.Tensor | None = None,
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
-@@ -280,6 +566,9 @@
+@@ -280,6 +558,9 @@
          hidden_states = hidden_states + self.attn(
              self.norm1(hidden_states),
              cu_seqlens=cu_seqlens,
@@ -469,7 +446,7 @@
              rotary_pos_emb=rotary_pos_emb,
              position_embeddings=position_embeddings,
              **kwargs,
-@@ -377,6 +666,12 @@
+@@ -377,6 +658,12 @@
          return freqs_t
 
 
@@ -482,28 +459,20 @@
  @use_kernel_forward_from_hub("RMSNorm")
  class Qwen3VLTextRMSNorm(nn.Module):
      def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-@@ -387,41 +682,46 @@
+@@ -387,7 +674,12 @@
          self.weight = nn.Parameter(torch.ones(hidden_size))
          self.variance_epsilon = eps
 
-+    # ================================================================
-+    # Patch: Qwen3VLTextRMSNorm.forward -> NPU fused npu_rms_norm
-+    # 1. swap the full-fp32 variance path for `torch_npu.npu_rms_norm`
-+    #    which stays in the weight dtype and is significantly faster on NPU
-+    # ================================================================
++    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
--        input_dtype = hidden_states.dtype
--        hidden_states = hidden_states.to(torch.float32)
--        variance = hidden_states.pow(2).mean(-1, keepdim=True)
--        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
--        return self.weight * hidden_states.to(input_dtype)
-+        # --- Patch.1 ---
-+        if hidden_states.dtype != self.weight.dtype:
-+            hidden_states = hidden_states.to(self.weight.dtype)
-+        return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]  # noqa: F821 imported via add_import
-+        # --- Patch.1 ---
-
-     def extra_repr(self):
++        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
++        if veomni_rms_norm.use_non_eager_impl:
++            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
++        # Original HF code below, unchanged.
+         input_dtype = hidden_states.dtype
+         hidden_states = hidden_states.to(torch.float32)
+         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+@@ -398,30 +690,34 @@
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
@@ -528,25 +497,26 @@
 -    """
 +# ======================================================================
 +# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: NPU fused rotary pos emb (torch_npu.npu_rotary_mul)
-+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config
++# Reason: OpSlot guard for NPU fused RoPE
++# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
 +# ======================================================================
-+# ================================================================
-+# Patch: apply_rotary_pos_emb -> NPU fused npu_rotary_mul
-+# 1. the text-side RoPE kernel; identical signature to the upstream
-+#    `apply_rotary_pos_emb`, internally uses `torch_npu.npu_rotary_mul`
-+# ================================================================
-+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-+    # --- Patch.1 ---
++# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
++def apply_rotary_pos_emb(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    cos: torch.Tensor,
++    sin: torch.Tensor,
++    unsqueeze_dim: int = 1,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    # Modification: OpSlot guard — use fused RoPE kernel when bound.
++    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
++        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
++    # Original HF code below, unchanged.
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
--    q_embed = (q * cos) + (rotate_half(q) * sin)
--    k_embed = (k * cos) + (rotate_half(k) * sin)
--    return q_embed, k_embed
-+    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)  # noqa: F821 imported via add_import
-+    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)  # noqa: F821 imported via add_import
-+    return q_embed.to(q.dtype), k_embed.to(k.dtype)
-+    # --- Patch.1 ---
+     q_embed = (q * cos) + (rotate_half(q) * sin)
+     k_embed = (k * cos) + (rotate_half(k) * sin)
+     return q_embed, k_embed
 +
 +
 +# ======================================================================
@@ -556,7 +526,7 @@
 
 
  @use_kernelized_func(apply_rotary_pos_emb)
-@@ -456,6 +756,13 @@
+@@ -456,6 +752,13 @@
              self.head_dim, eps=config.rms_norm_eps
          )  # thus post q_norm does not need reshape
 
@@ -570,7 +540,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -465,6 +772,17 @@
+@@ -465,6 +768,17 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -588,7 +558,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -476,7 +794,6 @@
+@@ -476,7 +790,6 @@
          query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
          if past_key_values is not None:
@@ -596,7 +566,7 @@
              cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-@@ -610,6 +927,12 @@
+@@ -610,6 +923,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -609,7 +579,7 @@
  class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
      config: Qwen3VLVisionConfig
      _no_split_modules = ["Qwen3VLVisionBlock"]
-@@ -655,10 +978,26 @@
+@@ -655,10 +974,26 @@
 
          self.post_init()
 
@@ -639,7 +609,7 @@
          max_hw = max(max(h, w) for _, h, w in grid_thw_list)
          freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
          device = freq_table.device
-@@ -668,139 +1007,216 @@
+@@ -668,139 +1003,216 @@
 
          offset = 0
          for num_frames, height, width in grid_thw_list:
@@ -960,7 +930,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -812,11 +1228,94 @@
+@@ -812,11 +1224,94 @@
 
          merged_hidden_states = self.merger(hidden_states)
 
@@ -1055,7 +1025,7 @@
 
 
  @auto_docstring(
-@@ -940,15 +1439,35 @@
+@@ -940,15 +1435,35 @@
              past_key_values=past_key_values,
          )
 
@@ -1091,7 +1061,7 @@
 
 
  @auto_docstring
-@@ -1081,6 +1600,13 @@
+@@ -1081,6 +1596,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1105,7 +1075,7 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
-@@ -1088,10 +1614,8 @@
+@@ -1088,10 +1610,8 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1117,7 +1087,7 @@
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          """
-@@ -1099,52 +1623,31 @@
+@@ -1099,52 +1619,31 @@
          vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
              pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
          )
@@ -1187,7 +1157,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1184,6 +1687,24 @@
+@@ -1184,6 +1683,24 @@
              position_ids = None
          return position_ids
 
@@ -1212,7 +1182,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1212,39 +1733,169 @@
+@@ -1212,39 +1729,169 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1398,7 +1368,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1254,24 +1905,56 @@
+@@ -1254,24 +1901,56 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1460,7 +1430,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1286,7 +1969,10 @@
+@@ -1286,7 +1965,10 @@
          )
 
          return Qwen3VLModelOutputWithPast(
@@ -1472,7 +1442,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1318,6 +2004,12 @@
+@@ -1318,6 +2000,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1485,7 +1455,7 @@
 
 
  class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
-@@ -1372,6 +2064,16 @@
+@@ -1372,6 +2060,16 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1502,7 +1472,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1388,54 +2090,7 @@
+@@ -1388,54 +2086,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1558,7 +1528,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1451,22 +2106,50 @@
+@@ -1451,22 +2102,50 @@
          )
 
          hidden_states = outputs[0]
@@ -1616,7 +1586,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1693,6 +2376,39 @@
+@@ -1693,6 +2372,39 @@
 
          return input_ids, model_kwargs
 
