@@ -142,6 +142,9 @@ without modifying the config class.
 | swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
 | rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
 | load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton`. |
+| rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, requires `flash-linear-attention`, GPU). No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time. |
+| causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (FLA `causal_conv1d`, requires `flash-linear-attention`, GPU). `eager` raises at forward time for varlen training (no torch fallback handles `cu_seqlens`). No NPU backend. |
+| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (FLA `chunk_gated_delta_rule`, GPU), `flash_qla` (QwenLM FlashQLA, requires the optional `flash-qla` extra, GPU). `eager` falls back to transformers' `torch_chunk_gated_delta_rule`, which raises at forward time for varlen training. No NPU backend. |
 
 ### DataArguments
 

@@ -277,9 +277,10 @@ def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig
     """Build an OpsImplementationConfig from a ModelMode for testing."""
     liger_impl = _LIGER_KERNEL if model_mode.use_liger_kernel else _EAGER
     # Linear-attention fields (rms_norm_gated/causal_conv1d/chunk_gated_delta_rule)
-    # are intentionally left at their default ``"auto"`` so __post_init__ resolves
-    # them to ``fla`` on GPU and ``eager`` on NPU — matching the platform-aware
-    # default users will see in production.
+    # are intentionally left at their production default ``"fla"``. Qwen3.5
+    # has no NPU backend for these ops, so the qwen3_5 / qwen3_5_moe
+    # parametrize cases in test_models_patch.py skip on NPU at the test
+    # level.
     return OpsImplementationConfig(
         attn_implementation=model_mode.attn_implementation,
         moe_implementation=model_mode.moe_implementation,

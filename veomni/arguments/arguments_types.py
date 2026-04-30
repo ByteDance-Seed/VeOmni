@@ -725,33 +725,33 @@ class OpsImplementationConfig:
         },
     )
     rms_norm_gated_implementation: str = field(
-        default="auto",
+        default="fla",
         metadata={
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
-            "'fla' uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
+            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
-            "'auto' (default) resolves to 'fla' on GPU and 'eager' on NPU."
+            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
         },
     )
     causal_conv1d_implementation: str = field(
-        default="auto",
+        default="fla",
         metadata={
             "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
-            "'fla' uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
+            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
-            "'auto' (default) resolves to 'fla' on GPU and 'eager' on NPU."
+            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
-        default="auto",
+        default="fla",
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
-            "'fla' uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
             "'flash_qla' uses QwenLM FlashQLA (requires the optional flash-qla extra, GPU). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
-            "'auto' (default) resolves to 'fla' on GPU and 'eager' on NPU."
+            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
         },
     )
 
@@ -780,22 +780,6 @@ class OpsImplementationConfig:
                 f"Set moe_implementation='{resolved}' explicitly to silence this warning."
             )
             self.moe_implementation = resolved
-
-        # Linear-attention defaults: 'auto' picks the FLA Triton kernel on GPU
-        # (the documented Qwen3.5 setup, shipped under the `gpu` extra), and
-        # falls through to 'eager' on NPU since no FLA / FlashQLA backend is
-        # registered for Ascend. Users who want to disable the fused path can
-        # always set the field to 'eager' explicitly.
-        from ..utils.import_utils import is_torch_npu_available
-
-        linear_attention_auto_default = "eager" if is_torch_npu_available() else "fla"
-        for field_name in (
-            "rms_norm_gated_implementation",
-            "causal_conv1d_implementation",
-            "chunk_gated_delta_rule_implementation",
-        ):
-            if getattr(self, field_name) == "auto":
-                setattr(self, field_name, linear_attention_auto_default)
 
         self._validate_implementations()
 
