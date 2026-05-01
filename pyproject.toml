@@ -262,8 +262,10 @@ flash-attn-3 = [
 # Pinned to 03/18/2026 latest main commit.
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 # FlashQLA — alternative chunk_gated_delta_rule implementation for Qwen3.5 linear attention.
-# Pinned to 04/29/2026 latest main commit.
-flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "c9b9827036ffe8731e99bab65c51f86320767b33" }
+# Pinned to 04/30/2026 PR #1 ("Fix: delete redundant arg") — strictly newer than v0.1.0,
+# which shipped a chunk_gated_delta_rule wrapper that passed an extra positional arg to
+# ChunkGatedDeltaRuleFunction.apply() and broke Qwen3.5 GatedDeltaNet training.
+flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6f79cdc3c0d34cf0f28473846bdee0997c37a22a" }
 
 # Download av wheels directly to avoid FFmpeg build dependency issues in CI.
 # 3.11 uses av 14.4.0 (latest 14.x with cp311 wheel). 3.12 falls back to av 14.2.0 — the

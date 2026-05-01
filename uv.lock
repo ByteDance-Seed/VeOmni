@@ -911,8 +911,8 @@ wheels = [
 
 [[package]]
 name = "flash-qla"
-version = "0.1.0+c9b9827"
-source = { git = "https://github.com/QwenLM/FlashQLA?rev=c9b9827036ffe8731e99bab65c51f86320767b33#c9b9827036ffe8731e99bab65c51f86320767b33" }
+version = "0.1.0+6f79cdc"
+source = { git = "https://github.com/QwenLM/FlashQLA?rev=6f79cdc3c0d34cf0f28473846bdee0997c37a22a#6f79cdc3c0d34cf0f28473846bdee0997c37a22a" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "tilelang" },
@@ -3906,7 +3906,7 @@ requires-dist = [
     { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl" },
     { name = "flash-attn-4", marker = "extra == 'fa4'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
-    { name = "flash-qla", marker = "extra == 'flash-qla'", git = "https://github.com/QwenLM/FlashQLA?rev=c9b9827036ffe8731e99bab65c51f86320767b33" },
+    { name = "flash-qla", marker = "extra == 'flash-qla'", git = "https://github.com/QwenLM/FlashQLA?rev=6f79cdc3c0d34cf0f28473846bdee0997c37a22a" },
     { name = "ftfy", marker = "extra == 'dit'" },
     { name = "hf-transfer", marker = "extra == 'gpu'" },
     { name = "librosa", marker = "extra == 'audio'", specifier = ">=0.11.0,<0.12" },
