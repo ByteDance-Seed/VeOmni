@@ -14,8 +14,19 @@
 """
 Patch configuration for Qwen3_5Moe NPU/SP patched modeling generation.
 
-Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_5_moe/generated --diff
+Regen command (preferred): `make patchgen` — runs all gen_configs together.
+
+Do NOT regenerate this file in isolation via
+``python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config ...``
+This gen_config imports helpers from
+``qwen3_5_moe_gpu_patch_gen_config``; when patchgen runs it alone without
+first running the GPU config, the generated file drops several imports
+(``copy``, ``functools.partial``, ``types.SimpleNamespace``,
+``torch.distributed`` alias, etc.) that are still referenced by the code
+body, producing a NameError at import time. Joint regen via
+``make patchgen`` (which runs ``--all`` in one Python process) populates
+the shared PatchConfig state correctly. This is a pre-existing quirk of
+VeOmni patchgen, not specific to router-replay patches.
 
 Patches applied:
 1. Fused MoE expert replacement (merged gate_up_proj layout).
@@ -78,6 +89,7 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 # from the GPU config) can return per-token log-probs in the unified output
 # dataclass via dynamic attribute set.
 config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
