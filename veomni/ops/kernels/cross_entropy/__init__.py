@@ -46,15 +46,11 @@ Two dispatch paths reach these wrappers:
    already knows it wants a fused kernel calls the ``OpSlot`` directly.
 
 Contract: ``apply_ops_config(ops_config)`` must run before any model is built,
-otherwise ``LOSS_MAPPING`` contains HuggingFace's stock wrapper which does not
-understand ``hidden_states=``/``weights=`` kwargs. ``build_foundation_model``
-owns this — pass ``ops_implementation=...`` (trainers do this) and it will
-install the config; otherwise it falls back to an all-eager safe configuration
-via ``_build_safe_fallback_ops_config()`` in ``veomni/models/auto.py``. The
-public ``OpsImplementationConfig()`` defaults are GPU-optimal (``liger_kernel``
-fused linear+CE) and would raise on hosts without ``liger-kernel`` installed,
-which is why the standalone-script fallback uses an all-eager config rather
-than the public defaults.
+otherwise ``LOSS_MAPPING`` contains HF's stock wrapper which doesn't understand
+``hidden_states=``/``weights=`` kwargs. ``build_foundation_model`` owns this:
+pass ``ops_implementation=...`` (trainers do) and it installs the config;
+otherwise it falls back to ``OpsImplementationConfig.all_eager()`` so
+standalone scripts work on any accelerator without requiring liger / triton.
 """
 
 from functools import partial

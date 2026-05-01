@@ -62,46 +62,46 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
 
 
 def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
-    """Bind all OpSlot instances found in *modeling_module*.
+    """Bind every OpSlot in *modeling_module* from *ops_config*.
 
     Returns ``True`` if at least one OpSlot was found (and bound).
     """
-    found = False
+    bound: list[str] = []
     moe_experts_kernel: Optional[str] = None
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
-        if isinstance(obj, OpSlot):
-            # `moe_experts` is the one op whose user-facing config field is not
-            # `moe_experts_implementation` but `moe_implementation`, and its
-            # values carry a `fused_` prefix (e.g. `fused_triton`) that the
-            # KERNEL_REGISTRY entries don't. Translate here so the registry
-            # lookup finds the kernel and the HardwareRequirement check fires.
-            if obj.op_name == "moe_experts":
-                impl_name = (
-                    "eager"
-                    if ops_config.moe_implementation == "eager"
-                    else ops_config.moe_implementation.removeprefix("fused_")
-                )
-                if impl_name != "eager":
-                    moe_experts_kernel = impl_name
-            else:
-                impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
-            obj.bind(impl_name)
-            logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
-            found = True
+        if not isinstance(obj, OpSlot):
+            continue
+        # ``moe_experts`` reads ``moe_implementation`` (not the
+        # ``{op}_implementation`` convention) and its values carry a
+        # ``fused_`` prefix the registry entries don't. Translate so the
+        # registry lookup finds the kernel and the HardwareRequirement
+        # check fires.
+        if obj.op_name == "moe_experts":
+            impl_name = (
+                "eager"
+                if ops_config.moe_implementation == "eager"
+                else ops_config.moe_implementation.removeprefix("fused_")
+            )
+            if impl_name != "eager":
+                moe_experts_kernel = impl_name
+        else:
+            impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
+        obj.bind(impl_name)
+        bound.append(f"{obj.op_name} ({impl_name})")
 
-    # The OpSlot only acts as an eager-vs-fused guard
-    # (``slot.use_non_eager_impl``). Inside the fused branch, modeling code
-    # calls ``veomni.ops.fused_moe_forward(...)``, which dispatches through
-    # the module-level pointer ``veomni.ops.kernels.moe._fused_moe_forward``.
-    # Bind that pointer here to the kernel matching the slot so the two stay
-    # in sync. Eager bindings leave the pointer untouched.
+    # OpSlot is just an eager-vs-fused guard; inside the fused branch the
+    # generated modeling code dispatches through the module-level pointer
+    # ``veomni.ops.kernels.moe._fused_moe_forward``. Keep the pointer in
+    # sync with the slot's bound kernel; eager leaves it untouched.
     if moe_experts_kernel is not None:
         from ..ops.kernels.moe import apply_veomni_fused_moe_patch
 
         apply_veomni_fused_moe_patch(fused_moe_kernel=moe_experts_kernel)
 
-    return found
+    if bound:
+        logger.info_rank0(f"OpSlot dispatch bound: {', '.join(bound)}.")
+    return bool(bound)
 
 
 def build_foundation_model(
@@ -132,16 +132,14 @@ def build_foundation_model(
 
     If weights_path is provided, it loads the pre-trained weights, otherwise it initializes weights.
 
-    Ops dispatch is owned by this function: when ``ops_implementation`` is
-    provided we run ``apply_ops_config`` before constructing the model, and
-    the resolved ``attn_implementation`` is read from it (the explicit
-    ``attn_implementation`` kwarg is ignored in that case). Trainers always
-    pass ``ops_implementation``; standalone scripts that omit it (e.g.
-    ``tasks/infer/*``, weight-materialization helpers, dummy-forward tests)
-    get ``OpsImplementationConfig.all_eager()`` installed automatically so
-    they work on every accelerator without depending on liger / triton —
-    unless something earlier (e.g. a ``DiTTrainer`` building a condition
-    model first) already installed one, in which case we leave it alone.
+    Ops dispatch: if ``ops_implementation`` is given we run ``apply_ops_config``
+    before constructing the model and the resolved ``attn_implementation`` is
+    read from it (the kwarg is ignored). Trainers always pass it. Standalone
+    scripts (``tasks/infer/*``, weight-materialization, dummy-forward tests)
+    get an ``all_eager()`` config installed automatically — works on every
+    accelerator without requiring liger / triton. If something earlier already
+    installed an ops config (e.g. ``DiTTrainer`` building a condition model
+    first), we leave it alone.
     """
     from ..ops import apply_ops_config
     from ..ops.config.singleton import get_ops_config

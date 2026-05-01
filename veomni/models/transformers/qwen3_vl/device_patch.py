@@ -35,10 +35,9 @@ def apply_veomni_qwen3vl_device_patch():
             "rotary_pos_emb": "apply_rotary_pos_emb",
             "rms_norm": "Qwen3VLTextRMSNorm",
         },
-        # Qwen3-VL's RMSNorm and RoPE follow the standard HF shapes
-        # (Qwen3VLTextRMSNorm = T5LayerNorm form `weight * x / rms`;
-        # apply_rotary_pos_emb signature `(q, k, cos, sin, unsqueeze_dim=1)`),
-        # so the registry's default `liger_kernel` backends drop in cleanly —
-        # no model-specific overrides needed.
+        # Qwen3-VL's RMSNorm/RoPE follow standard HF shapes (T5-form
+        # ``weight * x / rms``; ``apply_rotary_pos_emb(q, k, cos, sin, ...)``),
+        # so the registry's default Liger backends drop in cleanly — no
+        # per-model overrides needed.
         custom_patches=_custom_qwen3vl,
     )

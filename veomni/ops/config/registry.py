@@ -223,12 +223,11 @@ def _resolve_backend(
     value: str,
     op_overrides: dict[str, BackendSpec | None],
 ) -> BackendSpec | None:
-    """Pick the BackendSpec for *value*, preferring the model-specific override.
+    """Pick the BackendSpec for *value*, preferring the per-model override.
 
-    Returns ``None`` when there is no backend to apply — either ``value == "eager"``
-    (HF default stays in place), the model explicitly opted out via
-    ``op_overrides[value] = None``, or *value* is unknown. The caller is
-    responsible for distinguishing these cases.
+    Returns ``None`` when there's nothing to bind: ``value == "eager"`` (keep
+    HF default), the model explicitly opted out (``op_overrides[value] = None``),
+    or *value* is unknown. The caller distinguishes these cases.
     """
     if value in op_overrides:
         return op_overrides[value]
@@ -241,10 +240,10 @@ def _raise_no_backend(
     value: str,
     op_overrides: dict[str, BackendSpec | None],
 ) -> None:
-    """Raise ``ValueError`` for a non-eager value with no resolvable backend.
+    """Raise on a non-eager value with no resolvable backend.
 
     Distinguishes "explicitly disabled" (``op_overrides[value] is None``) from
-    "unknown name" so the user gets a clear pointer at what to fix in the YAML.
+    "unknown backend" so the user knows whether to switch to eager or fix a typo.
     """
     explicitly_disabled = value in op_overrides and op_overrides[value] is None
     disabled_names = {k for k, v in op_overrides.items() if v is None}
@@ -262,7 +261,7 @@ def _raise_no_backend(
 
 
 def _patch_target(hf_module: ModuleType, target_attr: str, backend: BackendSpec) -> None:
-    """Apply the resolved BackendSpec to ``hf_module.<target>``."""
+    """Bind *backend* onto ``hf_module.<target_attr>``."""
     entry_obj = _import_entry(backend.entry)
     if backend.entry_is_factory:
         entry_obj = entry_obj()
@@ -285,16 +284,16 @@ def apply_per_model_patches(
 
     Args:
         hf_module: HuggingFace modeling module whose attributes get replaced.
-        model_name: Display name used in log lines and error messages.
+        model_name: Display name for log lines and error messages.
         targets: ``{op_name: hf_module_attr}`` — e.g. ``{"rms_norm": "LlamaRMSNorm"}``.
-        extra_backends: Per-model overrides keyed ``{op_name: {backend_name: spec}}``.
-            A ``BackendSpec`` adds or replaces a backend. A ``None`` value is an
-            **explicit opt-out** for cases where the registry default cannot
-            drop into the model's target symbol (e.g. Wan ``rope_apply(x, **kw)``
-            vs. Liger's ``(q, k, cos, sin)``); the user then sees a clear
-            "explicitly disabled" error instead of a runtime kernel crash.
-        custom_patches: Optional ``(ops_config, applied_list) -> None`` escape
-            hatch for one-off model behavior that does not fit ``BackendSpec``.
+        extra_backends: Per-model overrides ``{op_name: {backend_name: spec}}``.
+            ``BackendSpec`` adds/replaces a backend; ``None`` is an **explicit
+            opt-out** for cases where the registry default doesn't fit the
+            model's target signature (e.g. Wan ``rope_apply(x, **kw)`` vs.
+            Liger ``(q, k, cos, sin)``). Users then get a clean "explicitly
+            disabled" error instead of a runtime crash.
+        custom_patches: ``(ops_config, applied_list) -> None`` escape hatch for
+            one-off behavior that doesn't fit ``BackendSpec``.
     """
     ops_config = get_ops_config()
     if ops_config is None:
@@ -316,10 +315,10 @@ def apply_per_model_patches(
         backend = _resolve_backend(op, value, op_overrides)
 
         if backend is None:
-            # ``eager`` is the only no-backend case that's by-design (HF
-            # default stays). Everything else is a misconfiguration; raise
-            # rather than silently downgrading to eager, which would let the
-            # user think they got the fast kernel they asked for.
+            # ``eager`` is the only intentional no-backend case (HF default
+            # stays). Anything else is a misconfiguration — raise instead of
+            # silently downgrading, otherwise users think they got the fast
+            # kernel they asked for.
             if value == "eager":
                 continue
             _raise_no_backend(model_name, op, value, op_overrides)

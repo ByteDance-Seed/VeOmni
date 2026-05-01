@@ -67,16 +67,12 @@ def apply_veomni_wan_device_patch():
                 ),
             },
             "rotary_pos_emb": {
-                # Wan's RoPE is a module-level ``rope_apply(x, **kwargs)`` with
-                # a non-standard signature (single tensor + freqs/head_dim
-                # kwargs), so the registry-default ``liger_kernel`` backend
-                # — which expects ``(q, k, cos, sin)`` — cannot drop in.
-                # ``None`` here marks the backend as *explicitly disabled* so
-                # ``apply_per_model_patches`` raises with a model-specific
-                # "explicitly disabled for Wan" message rather than silently
-                # binding the wrong-signature kernel and crashing at runtime.
-                # Wan YAMLs pin ``rotary_pos_emb_implementation: eager`` to
-                # avoid the raise.
+                # Wan's ``rope_apply(x, **kwargs)`` has a non-standard
+                # signature (single tensor + freqs/head_dim kwargs), so the
+                # registry-default Liger backend — expecting ``(q, k, cos, sin)``
+                # — cannot drop in. ``None`` = explicitly disabled, so we
+                # raise cleanly instead of crashing inside the wrong-signature
+                # kernel at runtime. Wan YAMLs pin ``rotary_pos_emb_implementation: eager``.
                 "liger_kernel": None,
                 "npu": BackendSpec(
                     entry="veomni.models.transformers.wan.npu_patch:rope_apply_fused",
