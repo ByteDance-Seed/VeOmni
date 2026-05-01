@@ -714,6 +714,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
         value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
 
+        # Modification: contiguous-ify q/k/v before chunk_gated_delta_rule.
+        # After torch.split + reshape above, query/key/value are views over mixed_qkv whose
+        # stride[1] equals the full QKV-pack width (2*key_dim + value_dim), not the per-tensor
+        # dim. The FLA kernel tolerates this stride layout, but FlashQLA's TileLang
+        # `tilelang_prepare_h_kernel` asserts `v.stride[1] == num_v_heads * head_v_dim` and
+        # raises (`expected 4096, but got 8192` for a Qwen3.5-4B-style config).
+        # Forcing contiguous here is a no-op when the layout already matches (so it stays
+        # cheap for FLA / eager paths) and unblocks the FlashQLA backend without bloating
+        # OpSlot factory wrappers. Fix all three for symmetry — q/k usually become contiguous
+        # via repeat_interleave below in GQA configs, but non-GQA models would otherwise hit
+        # the same stride mismatch on q/k from a stricter kernel.
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         # Modification: slice A_log/dt_bias for local V-heads under Ulysses SP.

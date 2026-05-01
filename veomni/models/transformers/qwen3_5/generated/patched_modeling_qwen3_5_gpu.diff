@@ -254,7 +254,7 @@
 
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-@@ -541,65 +625,133 @@
+@@ -541,65 +625,148 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
 
@@ -366,6 +366,21 @@
 +        query = query.reshape(query.shape[0], query.shape[1], local_num_k_heads, self.head_k_dim)
 +        key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
 +        value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
++
++        # Modification: contiguous-ify q/k/v before chunk_gated_delta_rule.
++        # After torch.split + reshape above, query/key/value are views over mixed_qkv whose
++        # stride[1] equals the full QKV-pack width (2*key_dim + value_dim), not the per-tensor
++        # dim. The FLA kernel tolerates this stride layout, but FlashQLA's TileLang
++        # `tilelang_prepare_h_kernel` asserts `v.stride[1] == num_v_heads * head_v_dim` and
++        # raises (`expected 4096, but got 8192` for a Qwen3.5-4B-style config).
++        # Forcing contiguous here is a no-op when the layout already matches (so it stays
++        # cheap for FLA / eager paths) and unblocks the FlashQLA backend without bloating
++        # OpSlot factory wrappers. Fix all three for symmetry — q/k usually become contiguous
++        # via repeat_interleave below in GQA configs, but non-GQA models would otherwise hit
++        # the same stride mismatch on q/k from a stricter kernel.
++        query = query.contiguous()
++        key = key.contiguous()
++        value = value.contiguous()
 
          beta = b.sigmoid()
          # If the model is loaded in fp16, without the .float() here, A might be -inf
@@ -421,7 +436,7 @@
          else:
              core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                  query,
-@@ -616,6 +768,12 @@
+@@ -616,6 +783,12 @@
          if cache_params is not None:
              cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
@@ -434,7 +449,7 @@
          # reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
          z = z.reshape(-1, self.head_v_dim)
-@@ -624,6 +782,20 @@
+@@ -624,6 +797,20 @@
 
          output = self.out_proj(core_attn_out)
          return output
@@ -455,7 +470,7 @@
 
 
  def rotate_half(x):
-@@ -804,24 +976,20 @@
+@@ -804,24 +991,20 @@
          return down_proj
 
 
@@ -494,7 +509,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -851,13 +1019,22 @@
+@@ -851,13 +1034,22 @@
 
          hidden_states = self.input_layernorm(hidden_states)
 
@@ -517,7 +532,7 @@
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -878,7 +1055,6 @@
+@@ -878,7 +1070,6 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -525,7 +540,7 @@
          return hidden_states
 
 
-@@ -1084,6 +1260,12 @@
+@@ -1084,6 +1275,12 @@
          return hidden_states
 
 
@@ -538,7 +553,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      _no_split_modules = ["Qwen3_5VisionBlock"]
-@@ -1159,67 +1341,71 @@
+@@ -1159,67 +1356,71 @@
          return embeddings
 
      def fast_pos_embed_interpolate(self, grid_thw):
@@ -671,7 +686,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1237,15 +1423,20 @@
+@@ -1237,15 +1438,20 @@
          hidden_states = self.patch_embed(hidden_states)
 
          pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -700,7 +715,7 @@
 
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
-@@ -1257,6 +1448,50 @@
+@@ -1257,6 +1463,50 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -751,7 +766,7 @@
          for blk in self.blocks:
              hidden_states = blk(
                  hidden_states,
-@@ -1271,6 +1506,34 @@
+@@ -1271,6 +1521,34 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -786,7 +801,7 @@
 
 
  @dataclass
-@@ -1396,6 +1659,12 @@
+@@ -1396,6 +1674,12 @@
          if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
              linear_attn_mask = None
          return linear_attn_mask
@@ -799,7 +814,7 @@
 
 
  @auto_docstring
-@@ -1530,68 +1799,35 @@
+@@ -1530,68 +1814,35 @@
 
      @can_return_tuple
      @auto_docstring
@@ -889,7 +904,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1644,6 +1880,7 @@
+@@ -1644,6 +1895,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -897,7 +912,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5ModelOutputWithPast:
-@@ -1652,34 +1889,144 @@
+@@ -1652,34 +1904,144 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1050,7 +1065,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1689,7 +2036,20 @@
+@@ -1689,7 +2051,20 @@
                  inputs_embeds=inputs_embeds,
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
@@ -1071,7 +1086,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1705,6 +2065,12 @@
+@@ -1705,6 +2080,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1084,7 +1099,7 @@
 
 
  @auto_docstring
-@@ -1775,11 +2141,26 @@
+@@ -1775,11 +2156,26 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1118,7 +1133,7 @@
 +
 +        return CausalLMOutputWithLogProbs(
              loss=loss,
-@@ -1817,6 +2198,12 @@
+@@ -1817,6 +2213,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1131,7 +1146,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1888,53 +2275,6 @@
+@@ -1888,53 +2290,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5CausalLMOutputWithPast:
@@ -1185,7 +1200,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,14 +2290,30 @@
+@@ -1950,14 +2305,30 @@
          )
 
          hidden_states = outputs[0]
@@ -1222,7 +1237,7 @@
 +
 +        output = Qwen3_5CausalLMOutputWithPast(
              loss=loss,
-@@ -2192,6 +2548,13 @@
+@@ -2192,6 +2563,13 @@
 
          return input_ids, model_kwargs
 
