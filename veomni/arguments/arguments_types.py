@@ -758,20 +758,29 @@ class OpsImplementationConfig:
         """Hardware-agnostic config (every per-op field = ``"eager"``).
 
         For tests / standalone scripts that don't need fused kernels and shouldn't
-        depend on liger / triton or the active accelerator. ``attn_implementation``
-        keeps its dataclass default (HF handles eager fallback there).
+        depend on liger / triton or the active accelerator. ``**overrides`` flips
+        specific fields (e.g. ``all_eager(moe_implementation="fused_quack")``)
+        without enumerating the rest.
 
-        ``**overrides`` flips specific fields (e.g.
-        ``all_eager(moe_implementation="fused_quack")``) without enumerating the rest.
+        ``attn_implementation`` keeps the dataclass default (``flash_attention_2``)
+        when flash-attn is importable — production GPU hosts usually have it.
+        Falls back to ``"eager"`` when it isn't, so CPU / minimal-deps
+        environments don't crash on import-time FA loading.
         """
+        from ..utils.import_utils import is_flash_attn_2_available
+
+        attn = overrides.pop("attn_implementation", None)
+        if attn is None:
+            attn = "flash_attention_2" if is_flash_attn_2_available() else "eager"
         return cls(
+            attn_implementation=attn,
             moe_implementation=overrides.pop("moe_implementation", "eager"),
             cross_entropy_loss_implementation=overrides.pop("cross_entropy_loss_implementation", "eager"),
             rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
             swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
             rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
             load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
-            **overrides,  # any remaining (e.g. attn_implementation) flow through
+            **overrides,
         )
 
     def __post_init__(self):
@@ -811,7 +820,18 @@ class OpsImplementationConfig:
         ``apply_global_ops`` / ``install_loss_mapping`` /
         ``KERNEL_REGISTRY.resolve``) — not duplicated here.
         """
+        from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
+        from ..ops.config.registry import list_ops
         from ..utils.import_utils import is_package_available, is_torch_npu_available
+
+        # Coverage check: every registered op must appear in ``_NPU_ALLOWED``,
+        # otherwise a future op addition silently bypasses NPU validation.
+        registered_fields = {op.config_field for op in list_ops()}
+        missing = registered_fields - _NPU_ALLOWED.keys()
+        assert not missing, (
+            f"NPU allow-list missing entries for registered ops: {sorted(missing)}. "
+            f"Add them to _NPU_ALLOWED in arguments_types.py."
+        )
 
         on_npu = is_torch_npu_available()
 

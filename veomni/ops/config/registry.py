@@ -163,17 +163,21 @@ def _import_entry(entry: str) -> object:
 
 def _check_requires(requires: tuple[str, ...]) -> None:
     """Validate that the listed packages are importable."""
+    from ...utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
+
     for pkg in requires:
         if pkg == "liger_kernel":
-            from ...utils.import_utils import is_liger_kernel_available
-
             if not is_liger_kernel_available():
                 raise RuntimeError("liger_kernel backend requested but liger-kernel is not installed.")
         elif pkg == "torch_npu":
-            from ...utils.import_utils import is_torch_npu_available
-
             if not is_torch_npu_available():
                 raise RuntimeError("npu backend requested but torch_npu is not installed.")
+        elif pkg == "triton":
+            if not is_package_available("triton"):
+                raise RuntimeError(
+                    "triton backend requested but the 'triton' package is not installed "
+                    "(or 'triton-ascend' on NPU). Install it or set the field to 'eager'."
+                )
         else:
             raise ValueError(f"Unsupported 'requires' token: {pkg!r}")
 

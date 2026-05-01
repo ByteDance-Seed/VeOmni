@@ -14,25 +14,6 @@
 # limitations under the License.
 
 from ....ops.config.registry import BackendSpec, apply_per_model_patches
-from ....utils import logging
-
-
-logger = logging.get_logger(__name__)
-
-
-def _custom_wan(ops_config, applied):
-    # Wan's Triton RoPE lives in ``veomni.ops.kernels.rotary.triton_wan`` and
-    # depends on Triton being importable; fall back silently if unavailable.
-    if ops_config.rotary_pos_emb_implementation == "triton":
-        try:
-            from veomni.ops.kernels.rotary.triton_wan import apply_rotary_emb
-
-            from . import modeling_wan
-
-            modeling_wan.rope_apply = apply_rotary_emb
-            applied.append("RoPE (triton)")
-        except ImportError:
-            logger.warning_rank0("Triton RoPE for Wan requested but not available, using eager.")
 
 
 def apply_veomni_wan_device_patch():
@@ -78,7 +59,14 @@ def apply_veomni_wan_device_patch():
                     entry="veomni.models.transformers.wan.npu_patch:rope_apply_fused",
                     requires=("torch_npu",),
                 ),
+                # Wan's own Triton RoPE (matches the model-specific
+                # ``rope_apply`` signature). Registered here rather than in a
+                # ``custom_patches`` callback so the strict-raise contract in
+                # ``apply_per_model_patches`` accepts it.
+                "triton": BackendSpec(
+                    entry="veomni.ops.kernels.rotary.triton_wan:apply_rotary_emb",
+                    requires=("triton",),
+                ),
             },
         },
-        custom_patches=_custom_wan,
     )
