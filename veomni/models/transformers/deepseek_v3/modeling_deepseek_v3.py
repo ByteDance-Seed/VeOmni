@@ -26,6 +26,7 @@ from transformers.utils import TransformersKwargs
 from ....ops import fused_moe_forward
 from ....ops.dispatch import OpSlot
 from ....utils import logging
+from ....utils.model_outputs import CausalLMOutputWithLogProbs
 
 
 # Flash Attention 2/3 require Q/K and V to have the same head dimension.
@@ -326,8 +327,9 @@ def deepseek_v3_forcausal_lm_forward(
     # --- Patch.1 ---
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
-        loss, logits = self.loss_function(
+        loss, logits, log_probs = self.loss_function(
             logits=logits,
             labels=labels,
             vocab_size=self.config.vocab_size,
@@ -339,9 +341,10 @@ def deepseek_v3_forcausal_lm_forward(
         logits = self.lm_head(hidden_states[:, slice_indices, :])
     # --- Patch.1 ---
 
-    return CausalLMOutputWithPast(
+    return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
+        log_probs=log_probs,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

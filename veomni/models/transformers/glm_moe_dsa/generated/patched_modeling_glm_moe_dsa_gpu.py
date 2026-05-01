@@ -42,6 +42,9 @@ from transformers.utils.output_capturing import capture_outputs
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
 
+# Additional imports for patches
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
@@ -868,10 +871,11 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits = veomni_causal_lm_loss(
+                loss, logits, log_probs = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -881,13 +885,16 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+                loss, _, log_probs = self.loss_function(
+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                )
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        return CausalLMOutputWithPast(
+        return CausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
+            log_probs=log_probs,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,

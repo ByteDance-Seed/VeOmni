@@ -857,8 +857,9 @@ class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
         hidden_states = hidden_states[:, slice_indices, :]
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
-            loss, logits = self.loss_function(
+            loss, logits, log_probs = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -883,13 +884,15 @@ class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
                     loss.device
                 )  # make sure to reside in the same device
 
-        return Qwen3VLMoeCausalLMOutputWithPast(
+        output = Qwen3VLMoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
         )
+        output.log_probs = log_probs
+        return output
 
 
 def apply_veomni_qwen3vlmoe_patch():

@@ -87,6 +87,7 @@ from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
 # Additional import blocks for patches
@@ -2113,10 +2114,11 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits = veomni_causal_lm_loss(
+                loss, logits, log_probs = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -2126,13 +2128,16 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+                loss, _, log_probs = self.loss_function(
+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                )
         else:
             logits = self.lm_head(hidden_states)
 
-        return CausalLMOutputWithPast(
+        return CausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
+            log_probs=log_probs,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -2264,10 +2269,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits = veomni_causal_lm_loss(
+                loss, logits, log_probs = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2277,13 +2283,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _ = self.loss_function(
+                loss, _, log_probs = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
                 )
         else:
             logits = self.lm_head(hidden_states)
 
-        return Qwen3_5CausalLMOutputWithPast(
+        output = Qwen3_5CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -2291,6 +2297,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
         )
+        output.log_probs = log_probs
+        return output
 
     def prepare_inputs_for_generation(
         self,

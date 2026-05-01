@@ -704,10 +704,11 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits = veomni_causal_lm_loss(
+                loss, logits, log_probs = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -718,8 +719,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits); unpack to match the OpSlot branch above.
-                loss, logits = self.loss_function(
+                # returns (loss, logits, log_probs); unpack to match the OpSlot
+                # branch above.
+                loss, logits, log_probs = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
                 )
         else:
@@ -745,7 +747,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-        return MoeCausalLMOutputWithPast(
+        output = MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -754,6 +756,8 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
         )
+        output.log_probs = log_probs
+        return output
 
     def get_parallel_plan(self):
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan

@@ -1774,10 +1774,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         # --- Patch.1 ---
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits = veomni_causal_lm_loss(
+                loss, logits, log_probs = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -1787,14 +1788,14 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _ = self.loss_function(
+                loss, _, log_probs = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
                 )
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.1 ---
 
-        return Qwen2_5_VLCausalLMOutputWithPast(
+        output = Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -1802,6 +1803,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
         )
+        output.log_probs = log_probs
+        return output
 
     def prepare_inputs_for_generation(
         self,

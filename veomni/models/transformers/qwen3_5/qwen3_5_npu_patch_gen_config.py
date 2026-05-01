@@ -68,6 +68,10 @@ config.add_import(
 
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
+# from the GPU config) can return per-token log-probs in the unified output
+# dataclass.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",

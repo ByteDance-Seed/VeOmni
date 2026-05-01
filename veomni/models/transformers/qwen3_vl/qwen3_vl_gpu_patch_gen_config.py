@@ -95,6 +95,7 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
 )
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs  # noqa: F401  surfaced for forward log_probs path
 """)
 
 config.add_post_import_block(
@@ -1106,10 +1107,11 @@ def qwen3_vl_for_conditional_generation_forward_patched(
     # --- Patch.1 ---
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1119,14 +1121,14 @@ def qwen3_vl_for_conditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(
+            loss, _, log_probs = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
 
-    return Qwen3VLCausalLMOutputWithPast(
+    output = Qwen3VLCausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
@@ -1134,3 +1136,5 @@ def qwen3_vl_for_conditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
     )
+    output.log_probs = log_probs
+    return output

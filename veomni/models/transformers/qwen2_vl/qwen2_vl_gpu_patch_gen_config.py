@@ -466,10 +466,11 @@ def qwen2vl_for_conditional_generation_forward_patched(
     hidden_states = outputs.last_hidden_state
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -479,7 +480,7 @@ def qwen2vl_for_conditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(
+            loss, _, log_probs = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:
@@ -487,7 +488,7 @@ def qwen2vl_for_conditional_generation_forward_patched(
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-    return Qwen2VLCausalLMOutputWithPast(
+    output = Qwen2VLCausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
@@ -495,3 +496,5 @@ def qwen2vl_for_conditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
     )
+    output.log_probs = log_probs
+    return output

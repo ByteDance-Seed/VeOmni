@@ -916,9 +916,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
         # --- Patch.7 ---
         loss = None
         logits = None
+        log_probs = None
 
         if labels is not None:
-            loss, logits = self.loss_function(
+            loss, logits, log_probs = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.get_text_config().vocab_size,
@@ -934,7 +935,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
             output = (logits,) + outputs
             return (loss,) + output if loss is not None else output
 
-        return Qwen2_5OmniThinkerCausalLMOutputWithPast(
+        out = Qwen2_5OmniThinkerCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -942,6 +943,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
+        out.log_probs = log_probs
+        return out
 
 
 # ================================================================

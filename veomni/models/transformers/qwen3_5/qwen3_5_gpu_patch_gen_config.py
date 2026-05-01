@@ -83,6 +83,9 @@ config.patches.append(
 )
 
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+# Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
+# ``forward`` can return per-token log-probs in the unified output dataclass.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.drop_import_names(
     "FusedRMSNormGated",
@@ -986,10 +989,11 @@ def qwen3_5_forcausallm_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -999,13 +1003,16 @@ def qwen3_5_forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss, _, log_probs = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+            )
     else:
         logits = self.lm_head(hidden_states)
 
-    return CausalLMOutputWithPast(
+    return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
+        log_probs=log_probs,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
@@ -1072,10 +1079,11 @@ def qwen3_5_forconditional_generation_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1085,13 +1093,13 @@ def qwen3_5_forconditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(
+            loss, _, log_probs = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:
         logits = self.lm_head(hidden_states)
 
-    return Qwen3_5CausalLMOutputWithPast(
+    output = Qwen3_5CausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
@@ -1099,3 +1107,5 @@ def qwen3_5_forconditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
     )
+    output.log_probs = log_probs
+    return output

@@ -111,6 +111,9 @@ config.add_import(
 config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gather"])
 config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["fused_moe_forward"])
+# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can return
+# per-token log-probs in the unified output dataclass via dynamic attribute set.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
 
 config.add_post_import_block(
     """
@@ -1323,10 +1326,11 @@ def qwen3_omni_moe_thinker_forward_patched(
     # --- Patch.8 ---
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1338,8 +1342,9 @@ def qwen3_omni_moe_thinker_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits); unpack to match the OpSlot branch above.
-            loss, logits = self.loss_function(
+            # returns (loss, logits, log_probs); unpack to match the OpSlot
+            # branch above.
+            loss, logits, log_probs = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1370,7 +1375,7 @@ def qwen3_omni_moe_thinker_forward_patched(
         if labels is not None and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-    return Qwen3OmniMoeThinkerCausalLMOutputWithPast(
+    output = Qwen3OmniMoeThinkerCausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         aux_loss=aux_loss,
@@ -1380,6 +1385,8 @@ def qwen3_omni_moe_thinker_forward_patched(
         router_logits=getattr(outputs, "router_logits", None),
         rope_deltas=self.rope_deltas,
     )
+    output.log_probs = log_probs
+    return output
 
 
 # ================================================================
