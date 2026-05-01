@@ -49,8 +49,12 @@ Contract: ``apply_ops_config(ops_config)`` must run before any model is built,
 otherwise ``LOSS_MAPPING`` contains HuggingFace's stock wrapper which does not
 understand ``hidden_states=``/``weights=`` kwargs. ``build_foundation_model``
 owns this — pass ``ops_implementation=...`` (trainers do this) and it will
-install the config; otherwise it falls back to ``OpsImplementationConfig()``
-defaults.
+install the config; otherwise it falls back to an all-eager safe configuration
+via ``_build_safe_fallback_ops_config()`` in ``veomni/models/auto.py``. The
+public ``OpsImplementationConfig()`` defaults are GPU-optimal (``liger_kernel``
+fused linear+CE) and would raise on hosts without ``liger-kernel`` installed,
+which is why the standalone-script fallback uses an all-eager config rather
+than the public defaults.
 """
 
 from functools import partial

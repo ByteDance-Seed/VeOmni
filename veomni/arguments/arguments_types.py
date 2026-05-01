@@ -625,6 +625,28 @@ class TrainingArguments:
 #
 
 
+# Explicit allow-list of backend names that work on Ascend NPU per
+# ``*_implementation`` field. ``"eager"`` is always implicitly compatible
+# (no entry needed). Used by ``OpsImplementationConfig._validate_implementations``
+# to raise a clear error when the GPU-optimal defaults are kept on an NPU host.
+#
+# Why an explicit list (rather than inferring from ``BackendSpec.requires``):
+# - ``triton`` for ``load_balancing_loss`` runs on NPU via the ``triton-ascend``
+#   wheel and is hardware-agnostic. Inferring "GPU-only" from "no torch_npu in
+#   requires" would wrongly reject it.
+# - DeepSeek-V3's ``triton`` backends for ``rms_norm`` / ``rotary_pos_emb`` use
+#   mainline-CUDA-only kernels (batch-invariant RMSNorm, deterministic RoPE)
+#   despite the same ``"triton"`` name. Those must NOT be allowed on NPU.
+#
+# Update this map whenever a new NPU-compatible backend is registered.
+_NPU_COMPATIBLE_BACKENDS_PER_OP: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "swiglu_mlp_implementation": frozenset(),  # eager-only on NPU.
+    "load_balancing_loss_implementation": frozenset({"triton"}),  # triton-ascend on NPU.
+}
+
+
 @dataclass
 class OpsImplementationConfig:
     """model.ops_implementation.* — Attention, MoE, and fused kernel implementation.
@@ -633,11 +655,19 @@ class OpsImplementationConfig:
     The type is ``str`` (not ``Literal``) so that third-party backends can be
     registered without modifying this class.
 
+    Defaults are GPU-optimal (Liger / Triton / fused_triton). On Ascend NPU
+    these defaults raise at validation time — NPU users must explicitly set
+    each field to an NPU-supported value (see the per-field help text for the
+    allowed NPU values, and use ``"eager"`` when no NPU backend exists for a
+    given op such as ``swiglu_mlp_implementation`` or DeepSeek-V3 RMSNorm/RoPE).
+
     Well-known values:
 
-    - ``"eager"`` (default): PyTorch / HuggingFace reference implementation.
-    - ``"liger_kernel"``: LigerKernel fused implementation (GPU and NPU, requires
-      ``liger-kernel``).
+    - ``"eager"``: PyTorch / HuggingFace reference implementation. Always
+      available (no kernel dependency); use this on NPU when the op has no
+      native NPU backend.
+    - ``"liger_kernel"``: LigerKernel fused implementation (GPU only — requires
+      ``liger-kernel``; not supported on NPU).
     - ``"npu"``: Ascend NPU fused implementation (requires ``torch_npu``).
       Applies ``npu_rms_norm`` / ``npu_rotary_mul`` from
       ``veomni.ops.kernels.{rms_norm,rotary}.npu``.
@@ -659,14 +689,17 @@ class OpsImplementationConfig:
         metadata={"help": "Attention implementation to use."},
     )
     moe_implementation: str = field(
-        default="eager",
+        default="fused_triton",
         metadata={
             "help": "MoE experts forward implementation. "
-            "OSS backends: 'fused_triton' (Triton group-gemm, GPU, SM70+), "
+            "OSS backends: 'fused_triton' (default, Triton group-gemm, GPU, SM70+), "
             "'fused_quack' (Quack CUTLASS/CuTe, GPU, SM90+), "
             "'fused_npu' (NPU group-gemm, requires torch_npu), "
-            "'eager' (default, reference loop). "
+            "'eager' (reference loop). "
             "The backend must match the hardware — no silent fallback. "
+            "On NPU you MUST set this to 'fused_npu' or 'eager'; the GPU "
+            "defaults ('fused_triton', 'fused_quack') will raise at config "
+            "validation time. "
             "Legacy alias: 'fused' is auto-resolved to 'fused_quack' on GPU "
             "and 'fused_npu' on NPU (deprecated; emit a migration warning). "
             "Typed as plain str (not Literal) so third-party backends can be "
@@ -677,51 +710,71 @@ class OpsImplementationConfig:
         },
     )
     cross_entropy_loss_implementation: str = field(
-        default="chunk_loss",
+        default="liger_kernel",
         metadata={
             "help": "Cross-entropy loss implementation. "
-            "'chunk_loss' (default) computes the loss in chunks via "
-            "F.linear + eager CE; works on both CUDA and Ascend NPU. "
-            "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel, GPU). "
+            "'liger_kernel' (default, GPU only) uses LigerFusedLinearCrossEntropyLoss; "
+            "this fuses the lm_head linear with CE and never materializes the "
+            "full logits tensor, which is the lowest-memory path for large "
+            "vocabularies. It REQUIRES that the model's forward pass through "
+            "`hidden_states=` and `weights=self.lm_head.weight` to "
+            "`self.loss_function(...)` (every VeOmni-patched modeling file "
+            "does this). Unpatched HF models that still pass logits will hit "
+            "RuntimeError — switch to 'chunk_loss' or 'eager' in that case. "
+            "'chunk_loss' computes the loss in chunks via F.linear + eager CE; "
+            "hardware-agnostic (CUDA + NPU). "
             "'npu' is a back-compat alias for 'chunk_loss' that additionally "
             "asserts torch_npu is installed. "
-            "'eager' uses PyTorch F.cross_entropy without chunking."
+            "'eager' uses PyTorch F.cross_entropy without chunking. "
+            "On NPU set this to 'chunk_loss' / 'npu' / 'eager'; 'liger_kernel' "
+            "raises at config validation time."
         },
     )
     rms_norm_implementation: str = field(
-        default="eager",
+        default="liger_kernel",
         metadata={
             "help": "RMSNorm implementation. "
-            "'liger_kernel' uses LigerRMSNorm. "
+            "'liger_kernel' (default, GPU only) uses LigerRMSNorm. "
             "'npu' uses torch_npu.npu_rms_norm (requires torch_npu). "
-            "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3). "
-            "'eager' (default) uses the HuggingFace default."
+            "'triton' uses batch-invariant fused Triton kernel (DeepSeek V3 only; GPU only). "
+            "'eager' uses the HuggingFace default. "
+            "On NPU set this to 'npu' (or 'eager' for models without an NPU "
+            "RMSNorm backend, e.g. DeepSeek-V3); 'liger_kernel' / 'triton' "
+            "raise at config validation time."
         },
     )
     swiglu_mlp_implementation: str = field(
-        default="eager",
+        default="liger_kernel",
         metadata={
             "help": "SwiGLU MLP implementation. "
-            "'liger_kernel' uses LigerSwiGLUMLP. "
-            "'eager' (default) uses the HuggingFace default."
+            "'liger_kernel' (default, GPU only) uses LigerSwiGLUMLP. "
+            "'eager' uses the HuggingFace default. "
+            "There is no NPU backend for this op — on NPU you MUST set this "
+            "to 'eager'."
         },
     )
     rotary_pos_emb_implementation: str = field(
-        default="eager",
+        default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding implementation. "
-            "'liger_kernel' uses liger_rotary_pos_emb. "
+            "'liger_kernel' (default, GPU only) uses liger_rotary_pos_emb. "
             "'npu' uses torch_npu.npu_rotary_mul (requires torch_npu). "
-            "'triton' uses deterministic Triton bmm kernel (DeepSeek V3). "
-            "'eager' (default) uses the HuggingFace default."
+            "'triton' uses deterministic Triton bmm kernel (DeepSeek V3 only; GPU only). "
+            "'eager' uses the HuggingFace default. "
+            "On NPU set this to 'npu' (or 'eager' for models without an NPU "
+            "RoPE backend, e.g. DeepSeek-V3 and Qwen2-VL multimodal RoPE); "
+            "'liger_kernel' / 'triton' raise at config validation time."
         },
     )
     load_balancing_loss_implementation: str = field(
-        default="eager",
+        default="triton",
         metadata={
             "help": "MoE load-balancing loss implementation. "
-            "'triton' uses a fused Triton kernel (requires triton or triton-ascend). "
-            "'eager' (default) uses PyTorch reference."
+            "'triton' (default) uses a fused Triton kernel; this is strict — "
+            "if the 'triton' Python package is not installed (or 'triton-ascend' "
+            "on NPU) it raises at config validation time. Set to 'eager' to "
+            "fall back to the pure-PyTorch reference. "
+            "'eager' uses the PyTorch reference."
         },
     )
     rms_norm_gated_implementation: str = field(
@@ -788,25 +841,149 @@ class OpsImplementationConfig:
         """Validate that requested backends are actually available.
 
         Walks the kernel registry so new ops/backends are discovered
-        automatically.  Importing ``veomni.ops`` here is what triggers every
+        automatically. Importing ``veomni.ops`` here is what triggers every
         op module to call ``register_op``.
+
+        Two classes of error:
+        1. Hardware mismatch — selected backend cannot run on the active
+           accelerator (the typical case is GPU-only ``liger_kernel`` /
+           ``triton`` / ``fused_triton`` / ``fused_quack`` selected on NPU,
+           or an ``npu`` / ``fused_npu`` backend selected on a non-NPU host).
+        2. Package missing — ``liger-kernel`` / ``torch_npu`` / ``triton``
+           is requested but not installed.
+
+        Hardware mismatch is checked first because the actionable fix is
+        platform-specific (switch to ``npu`` / ``chunk_loss`` / ``eager``)
+        and that fix doesn't depend on whether a GPU-only package happens
+        to be installed.
+
+        ``_NPU_COMPATIBLE_BACKENDS_PER_OP`` (module-level) is the explicit
+        allow-list of backend names that work on Ascend NPU. ``"eager"`` is
+        always implicitly compatible (no entry in ``op.backends``).
         """
         from ..ops import config as ops_config_pkg  # noqa: F401  import side-effect
         from ..ops.config.registry import list_ops
+        from ..utils.import_utils import is_package_available, is_torch_npu_available
 
+        npu_runtime = is_torch_npu_available()
+
+        # Hard assertion that the NPU allow-list and the registry stay in
+        # sync. If a new ops is registered in ``veomni/ops/kernels/*/__init__.py``
+        # without a matching entry in ``_NPU_COMPATIBLE_BACKENDS_PER_OP`` (even
+        # an empty frozenset), the validator would silently allow only ``eager``
+        # for that op on NPU — which would be a confusing silent regression.
+        # Surface it loudly at config-parse time instead.
+        registered_fields = {op.config_field for op in list_ops()}
+        missing = registered_fields - _NPU_COMPATIBLE_BACKENDS_PER_OP.keys()
+        if missing:
+            raise RuntimeError(
+                f"Op fields {sorted(missing)} are registered in _OPS_REGISTRY but missing from "
+                f"_NPU_COMPATIBLE_BACKENDS_PER_OP in arguments_types.py. Add an entry "
+                f"(empty frozenset for eager-only on NPU) to keep the NPU validator honest."
+            )
+
+        # ── 1. Per-op (rms_norm / rotary_pos_emb / swiglu_mlp / load_balancing_loss) ──
         for op in list_ops():
             value = getattr(self, op.config_field)
+
+            # 1a. Hardware mismatch on NPU. The check is on the explicit
+            # allow-list (not on ``backend.requires``) for two reasons:
+            # - ``triton`` for load-balancing loss runs on NPU via triton-ascend,
+            #   while DeepSeek-V3's batch-invariant RMSNorm / deterministic RoPE
+            #   Triton backends (registered per-model via ``extra_backends``)
+            #   are mainline-CUDA-only despite the same ``"triton"`` name.
+            # - Per-model ``extra_backends`` aren't in ``op.backends``, so a
+            #   value like ``rms_norm_implementation="triton"`` (DeepSeek-V3's
+            #   GPU-only kernel) wouldn't trip a ``backend.requires`` check.
+            if npu_runtime and value != "eager":
+                npu_compat = _NPU_COMPATIBLE_BACKENDS_PER_OP.get(op.config_field, frozenset())
+                if value not in npu_compat:
+                    alternatives = sorted(npu_compat | {"eager"})
+                    raise ValueError(
+                        f"{op.config_field}={value!r} is GPU-only and cannot run on Ascend NPU. "
+                        f"On NPU set {op.config_field} to one of {alternatives}. "
+                        f"Use 'eager' if this op has no native NPU kernel for your model "
+                        f"(e.g. swiglu_mlp_implementation, or DeepSeek-V3 / Qwen2-VL multimodal RoPE)."
+                    )
+
             backend = op.backends.get(value)
             if backend is None:
+                # ``"eager"`` is always implicit (no entry in op.backends);
+                # unknown values may be a third-party registration we cannot
+                # validate from here. Either way, nothing more to check.
                 continue
+
+            # 1b. Package availability.
             for pkg in backend.requires:
                 if pkg == "liger_kernel" and not is_liger_kernel_available():
-                    raise ValueError(f"{op.config_field}='{value}' requires liger-kernel to be installed.")
-                if pkg == "torch_npu":
-                    from ..utils.import_utils import is_torch_npu_available
+                    raise ValueError(
+                        f"{op.config_field}={value!r} requires the 'liger-kernel' Python package, "
+                        f"which is not installed. `pip install liger-kernel`, or set "
+                        f"{op.config_field}='eager' to use the HuggingFace reference."
+                    )
+                if pkg == "torch_npu" and not npu_runtime:
+                    raise ValueError(
+                        f"{op.config_field}={value!r} requires torch_npu and an Ascend NPU, "
+                        f"but neither is available on this host."
+                    )
 
-                    if not is_torch_npu_available():
-                        raise ValueError(f"{op.config_field}='{value}' requires torch_npu to be installed.")
+            # 1c. ``load_balancing_loss_implementation='triton'`` requires the
+            # ``triton`` Python package on CUDA (or ``triton-ascend`` on NPU).
+            # The BackendSpec doesn't list this in ``requires`` because Triton
+            # is a transitive dependency of many things; gate it explicitly so
+            # the error message points users at the fix.
+            if op.config_field == "load_balancing_loss_implementation" and value == "triton":
+                if not is_package_available("triton"):
+                    raise ValueError(
+                        "load_balancing_loss_implementation='triton' requires the 'triton' "
+                        "Python package (or 'triton-ascend' on NPU), which is not installed. "
+                        "Install triton, or set load_balancing_loss_implementation='eager' "
+                        "for the pure-PyTorch reference."
+                    )
+
+        # ── 2. cross_entropy_loss_implementation (not in _OPS_REGISTRY) ──
+        ce_value = self.cross_entropy_loss_implementation
+        if ce_value == "liger_kernel":
+            if npu_runtime:
+                raise ValueError(
+                    "cross_entropy_loss_implementation='liger_kernel' is GPU-only and cannot run "
+                    "on Ascend NPU. On NPU set cross_entropy_loss_implementation to 'chunk_loss' "
+                    "(recommended; same low-memory chunked F.linear+CE), 'npu' (back-compat alias "
+                    "for 'chunk_loss'), or 'eager'."
+                )
+            if not is_liger_kernel_available():
+                raise ValueError(
+                    "cross_entropy_loss_implementation='liger_kernel' requires the 'liger-kernel' "
+                    "Python package, which is not installed. `pip install liger-kernel`, "
+                    "or set cross_entropy_loss_implementation='chunk_loss' (hardware-agnostic, "
+                    "low-memory) / 'eager' (PyTorch F.cross_entropy)."
+                )
+        elif ce_value == "npu" and not npu_runtime:
+            raise ValueError(
+                "cross_entropy_loss_implementation='npu' requires torch_npu and an Ascend NPU. "
+                "Use 'chunk_loss' for the same kernel without the NPU gate."
+            )
+
+        # ── 3. moe_implementation (not in _OPS_REGISTRY) ──
+        # Hardware mismatches for MoE are also caught at apply_veomni_fused_moe_patch /
+        # OpSlot.bind time, but we duplicate the check here so the error fires
+        # at config-parse time with a single, consistent message — before any
+        # model is built.
+        moe_value = self.moe_implementation
+        moe_gpu_only = {"fused_triton", "fused_quack"}
+        moe_npu_only = {"fused_npu"}
+        if npu_runtime and moe_value in moe_gpu_only:
+            raise ValueError(
+                f"moe_implementation={moe_value!r} is GPU-only and cannot run on Ascend NPU. "
+                f"On NPU set moe_implementation to 'fused_npu' (NPU group-gemm) or 'eager' "
+                f"(reference loop)."
+            )
+        if not npu_runtime and moe_value in moe_npu_only:
+            raise ValueError(
+                f"moe_implementation={moe_value!r} requires Ascend NPU. On GPU set "
+                f"moe_implementation to 'fused_triton' (SM70+), 'fused_quack' (SM90+), "
+                f"or 'eager'."
+            )
 
 
 @dataclass

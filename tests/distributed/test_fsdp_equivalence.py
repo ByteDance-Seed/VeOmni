@@ -60,7 +60,7 @@ def _setup_model_and_data(model_name, config_path, dataset_type="text"):
     return test_dir, train_path, dummy_dataset
 
 
-def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
+def _run_single_gpu_training(model_name, config_path, model_path, train_path, output_dir):
     """Run plain single-GPU training (nproc=1, no parallelism).
 
     Uses the same trainer script as the FSDP run, but with nproc=1 and no
@@ -80,6 +80,7 @@ def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
         nproc=1,
         init_device=get_device_type(),
         extra_args=["--train.accelerator.fsdp_config.mixed_precision.enable=False"],
+        model_name=model_name,
     )
 
 
@@ -94,7 +95,7 @@ def _get_nproc():
     return count
 
 
-def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=None):
+def _run_fsdp2_training(model_name, config_path, model_path, train_path, output_dir, nproc=None):
     """Run FSDP2 distributed training and return metrics."""
     from ..tools import run_training_config
 
@@ -116,6 +117,7 @@ def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=N
             "--train.accelerator.ep_size=1",
             "--train.accelerator.fsdp_config.mixed_precision.enable=False",
         ],
+        model_name=model_name,
     )
 
 
@@ -141,6 +143,7 @@ def _run_fsdp_equivalence(
     try:
         # 1. Run single-GPU baseline (nproc=1, no FSDP)
         baseline_results = _run_single_gpu_training(
+            model_name=model_name,
             config_path=config_path,
             model_path=test_dir,
             train_path=train_path,
@@ -149,6 +152,7 @@ def _run_fsdp_equivalence(
 
         # 2. Run FSDP2 with all available GPUs
         fsdp2_results = _run_fsdp2_training(
+            model_name=model_name,
             config_path=config_path,
             model_path=test_dir,
             train_path=train_path,

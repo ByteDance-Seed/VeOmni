@@ -238,9 +238,16 @@ def apply_per_model_patches(
         extra_backends: Model-specific overrides merged on top of the registry
             defaults for each op.  Shape
             ``{op_name: {backend_name: BackendSpec | None}}``.  A ``BackendSpec``
-            value overrides or adds a backend; a ``None`` value disables a
-            registry-default backend for this model (used e.g. by Qwen2-VL
-            which has no NPU backend for multimodal RoPE).
+            value overrides or adds a backend. A ``None`` value is an
+            **explicit-raise opt-out**: the global registry default would
+            otherwise leak through and bind a kernel whose signature does not
+            match this model's target symbol (e.g. Wan's ``rope_apply(x, **kw)``
+            cannot host the standard liger ``(q, k, cos, sin)`` kernel; Qwen2-VL's
+            ``apply_multimodal_rotary_pos_emb`` cannot host the standard NPU
+            rotary kernel). Setting the value to ``None`` makes the validator
+            raise with a model-specific "explicitly disabled" message instead
+            of silently producing a runtime crash. The user then pins the
+            field to ``eager`` (or another supported backend) in their YAML.
         custom_patches: Optional callback invoked with
             ``(ops_config, applied_list)`` for truly one-off behaviour that
             does not fit the ``BackendSpec`` shape.
@@ -268,7 +275,49 @@ def apply_per_model_patches(
         else:
             backend = op.backends.get(value)
         if backend is None:
-            continue
+            # ``"eager"`` is the only legitimate "no backend" outcome —
+            # every op leaves the HF default in place when the user picks
+            # eager. Anything else means the user requested a backend that
+            # this model does not support; raise so the misconfiguration
+            # surfaces instead of silently shipping eager (which would
+            # leave the user thinking they got the fast kernel they asked
+            # for).
+            #
+            # ``extra_backends[value] = None`` is an *explicit-raise* opt-out
+            # for cases where the global registry default cannot drop in to
+            # this model's symbol (e.g. Wan's ``rope_apply(x, **kwargs)``
+            # cannot host the standard ``liger_rotary_pos_emb(q, k, cos, sin)``;
+            # Qwen2-VL's ``apply_multimodal_rotary_pos_emb`` cannot host the
+            # standard NPU rotary kernel). Without the opt-out the global
+            # default would silently bind the wrong kernel and crash at
+            # runtime with a confusing signature error. We raise here with a
+            # model-specific "explicitly disabled" message so the user knows
+            # to set the field to ``eager`` (or pick a backend the model
+            # actually wires up).
+            if value == "eager":
+                continue
+            # ``available`` lists every backend that *can* be selected for
+            # this model: registry defaults that the model did not opt out
+            # of, plus model-specific entries with a real BackendSpec, plus
+            # the implicit ``eager``. Explicitly-disabled entries (those
+            # with a ``None`` value in ``extra_backends``) are filtered
+            # out — listing them would contradict the "is explicitly
+            # disabled" message the user just got.
+            disabled = {k for k, v in op_overrides.items() if v is None}
+            registry_alts = (op.backends.keys() | op_overrides.keys()) - disabled
+            available = sorted(registry_alts | {"eager"})
+            if value in op_overrides and op_overrides[value] is None:
+                raise ValueError(
+                    f"{op.config_field}={value!r} is explicitly disabled for {model_name} — "
+                    f"the model has no kernel matching this backend's signature. "
+                    f"Set {op.config_field} to one of {available}. "
+                    f"Use 'eager' if you want the HuggingFace reference for this op."
+                )
+            raise ValueError(
+                f"{op.config_field}={value!r} is not a registered backend for {model_name}. "
+                f"Set {op.config_field} to one of {available}. "
+                f"Use 'eager' if you want the HuggingFace reference for this op."
+            )
 
         _check_requires(backend.requires)
         entry_obj = _import_entry(backend.entry)

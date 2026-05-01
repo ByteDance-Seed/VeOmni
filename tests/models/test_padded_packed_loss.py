@@ -20,7 +20,21 @@ def _skip_if_no_flash_attn():
 @pytest.mark.parametrize("pad_to_length", [16])
 def test_qwen3_loss_match_with_padded_packed_input(monkeypatch, pad_to_length):
     _skip_if_no_flash_attn()
-    apply_ops_config(OpsImplementationConfig())
+    # Use an explicit all-eager config so the test runs on dev boxes without
+    # liger-kernel / triton — the new OpsImplementationConfig() defaults are
+    # GPU-optimal and require both packages. The CUDA + flash-attn gate above
+    # already filters most environments, but the eager pin keeps this test
+    # decoupled from the framework defaults.
+    apply_ops_config(
+        OpsImplementationConfig(
+            moe_implementation="eager",
+            cross_entropy_loss_implementation="eager",
+            rms_norm_implementation="eager",
+            swiglu_mlp_implementation="eager",
+            rotary_pos_emb_implementation="eager",
+            load_balancing_loss_implementation="eager",
+        )
+    )
     monkeypatch.setattr(
         "veomni.data.data_collator.get_parallel_state",
         lambda: type("PS", (), {"sp_enabled": False, "sp_size": 1, "sp_rank": 0})(),

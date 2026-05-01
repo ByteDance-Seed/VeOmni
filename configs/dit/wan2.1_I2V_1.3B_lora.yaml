@@ -1,6 +1,12 @@
 model:
   model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers/transformer
   condition_model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers
+  ops_implementation:
+    # Wan's RoPE has a non-standard signature (rope_apply takes a single
+    # tensor plus freqs/head_dim kwargs) so the framework's default
+    # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
+    # Wan-specific liger wrapper exists.
+    rotary_pos_emb_implementation: eager
   lora_config:
     rank: 128
     alpha: 64

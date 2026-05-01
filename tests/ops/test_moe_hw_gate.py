@@ -150,7 +150,17 @@ def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc):
     from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.models.auto import _bind_veomni_ops
 
-    ops_config = OpsImplementationConfig(moe_implementation="fused_quack")
+    # Pin every other op to ``eager`` so this test exercises the moe_experts
+    # OpSlot binding without coupling to the global GPU-optimal defaults
+    # (which would require liger-kernel + triton in the test environment).
+    ops_config = OpsImplementationConfig(
+        moe_implementation="fused_quack",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+    )
     # Simulate a patchgen'd modeling module with a moe_experts OpSlot.
     fake_module = SimpleNamespace(veomni_moe_experts_forward=OpSlot("moe_experts", "standard"))
 

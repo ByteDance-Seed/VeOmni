@@ -35,12 +35,10 @@ def apply_veomni_qwen3vl_device_patch():
             "rotary_pos_emb": "apply_rotary_pos_emb",
             "rms_norm": "Qwen3VLTextRMSNorm",
         },
-        # Historically only the NPU backend was wired up for Qwen3-VL; keep
-        # the liger_kernel backends disabled so configs that enable liger for
-        # other models do not silently alter Qwen3-VL semantics.
-        extra_backends={
-            "rotary_pos_emb": {"liger_kernel": None},
-            "rms_norm": {"liger_kernel": None},
-        },
+        # Qwen3-VL's RMSNorm and RoPE follow the standard HF shapes
+        # (Qwen3VLTextRMSNorm = T5LayerNorm form `weight * x / rms`;
+        # apply_rotary_pos_emb signature `(q, k, cos, sin, unsqueeze_dim=1)`),
+        # so the registry's default `liger_kernel` backends drop in cleanly —
+        # no model-specific overrides needed.
         custom_patches=_custom_qwen3vl,
     )

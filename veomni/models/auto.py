@@ -39,6 +39,30 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _build_safe_fallback_ops_config() -> OpsImplementationConfig:
+    """Conservative all-eager OpsImplementationConfig for the silent fallback path.
+
+    Used by ``build_foundation_model`` when the caller passes neither
+    ``ops_implementation`` nor a prior ``apply_ops_config`` call. The public
+    ``OpsImplementationConfig()`` defaults are GPU-optimal (Liger / Triton /
+    fused_triton) and raise on hosts without those packages, but standalone
+    callers (inference scripts, weight-materialization helpers, dummy-forward
+    tests) need a baseline that works everywhere — so we use ``"eager"`` for
+    every per-op field. ``attn_implementation`` keeps the GPU-friendly
+    ``"flash_attention_2"`` default; ``MODELING_BACKEND`` rewrites it to the
+    SP-aware variant in ``__post_init__`` and ``flash_attention_2`` itself
+    has graceful HF fallbacks (sdpa) when the package is missing.
+    """
+    return OpsImplementationConfig(
+        moe_implementation="eager",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+    )
+
+
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     """
     Builds the tokenizer.
@@ -136,10 +160,19 @@ def build_foundation_model(
     provided we run ``apply_ops_config`` before constructing the model, and the
     resolved ``attn_implementation`` is read from it (the explicit
     ``attn_implementation`` kwarg is ignored in that case). Trainers always
-    pass ``ops_implementation``; standalone scripts that omit it get a default
-    ``OpsImplementationConfig()`` installed automatically — unless something
-    earlier (e.g. a ``DiTTrainer`` building a condition model first) already
-    installed one, in which case we leave it alone.
+    pass ``ops_implementation``; standalone scripts that omit it (e.g.
+    ``tasks/infer/*``, ``tests/e2e/test_e2e_parallel._materialize_weights_dir``,
+    ``tests/distributed/test_dummy_forward``) get an *all-eager* fallback
+    config installed automatically — unless something earlier (e.g. a
+    ``DiTTrainer`` building a condition model first) already installed one,
+    in which case we leave it alone.
+
+    The fallback is intentionally conservative (every per-op field set to
+    ``"eager"``, no Liger / Triton / fused kernels) so it works on every
+    accelerator without depending on optional packages. Production training
+    paths route through trainers that pass the user's
+    ``OpsImplementationConfig`` explicitly, which carries the GPU-optimal
+    defaults.
     """
     from ..ops import apply_ops_config
     from ..ops.config.singleton import get_ops_config
@@ -148,7 +181,7 @@ def build_foundation_model(
         apply_ops_config(ops_implementation)
         attn_implementation = ops_implementation.attn_implementation
     elif get_ops_config() is None:
-        apply_ops_config(OpsImplementationConfig())
+        apply_ops_config(_build_safe_fallback_ops_config())
 
     if config_kwargs is None:
         config_kwargs = {}

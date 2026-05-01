@@ -14,12 +14,19 @@ selection knob.
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | `"eager"` | `apply_ops_config()` (before model build) |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"eager"` | Model registration via ops config singleton |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"eager"` | Model registration via ops config singleton |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"eager"` | `apply_ops_config()` (before model build) |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"eager"` | `build_foundation_model` |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA `triton` or NPU `triton-ascend`) | `"triton"` | `apply_ops_config()` (before model build) |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
+
+**Defaults are GPU-optimal.** On Ascend NPU the defaults above raise at
+`OpsImplementationConfig.__post_init__` time — NPU users must set every field
+explicitly to an NPU-supported value (`npu` / `chunk_loss` / `fused_npu` /
+`triton` for load-balancing loss) or to `eager` when the op has no NPU
+backend (`swiglu_mlp_implementation`, DeepSeek-V3 RMSNorm/RoPE, Qwen2-VL
+multimodal RoPE). The error message lists the allowed alternatives per op.
 
 The per-op fields are typed as plain `str` (not `Literal`), so third-party
 backends can be registered via `extra_backends` in a model's `device_patch.py`
@@ -67,10 +74,16 @@ is no per-forward "which impl?" lookup.
 when callers pass `ops_implementation=ops` (trainers do this), it runs
 `apply_ops_config(ops)` before constructing the model and reads
 `attn_implementation` from `ops`. Callers that pass neither
-`ops_implementation` nor a prior `apply_ops_config` get
-`OpsImplementationConfig()` defaults installed silently, so
+`ops_implementation` nor a prior `apply_ops_config` get an *all-eager* safe
+fallback (`_build_safe_fallback_ops_config()` in `veomni/models/auto.py`)
+installed silently — every per-op field set to `"eager"` so the fallback
+works on any accelerator without depending on Liger / Triton. The public
+`OpsImplementationConfig()` defaults are GPU-optimal and would raise on
+hosts without those packages; production training routes through trainers
+that pass that public config explicitly. The fallback exists only so
 `self.loss_function` never trips on VeOmni's extra `hidden_states=` /
-`weights=` kwargs. (The DiT trainer is the one exception that still calls
+`weights=` kwargs in scripts like `tasks/infer/*` that don't construct a
+trainer. (The DiT trainer is the one exception that still calls
 `apply_ops_config` manually — it has to populate the singleton before
 building the condition model, which uses `model_class._from_config(...)`
 rather than `build_foundation_model`. The subsequent
@@ -121,7 +134,7 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 ```yaml
 model:
   ops_implementation:
-    cross_entropy_loss_implementation: eager   # or "liger_kernel", or custom str
+    cross_entropy_loss_implementation: liger_kernel   # default; set to "chunk_loss" / "npu" / "eager" on NPU
 ```
 
 **Field:** `OpsImplementationConfig.cross_entropy_loss_implementation`
@@ -173,9 +186,9 @@ batch-invariant RMSNorm and deterministic RoPE).
 ```yaml
 model:
   ops_implementation:
-    rms_norm_implementation: eager             # eager | liger_kernel | npu | triton
-    swiglu_mlp_implementation: eager           # eager | liger_kernel
-    rotary_pos_emb_implementation: eager       # eager | liger_kernel | npu | triton
+    rms_norm_implementation: liger_kernel       # default; pin to "npu" / "eager" on NPU
+    swiglu_mlp_implementation: liger_kernel     # default; pin to "eager" on NPU (no NPU backend)
+    rotary_pos_emb_implementation: liger_kernel # default; pin to "npu" / "eager" on NPU
 ```
 
 ### Available implementations
@@ -241,7 +254,7 @@ Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
 ```yaml
 model:
   ops_implementation:
-    load_balancing_loss_implementation: eager   # or "triton", or custom str
+    load_balancing_loss_implementation: triton   # default; pin to "eager" on NPU (triton-ascend not exposed as `triton`)
 ```
 
 **Field:** `OpsImplementationConfig.load_balancing_loss_implementation`
@@ -281,7 +294,7 @@ model:
 ```
 
 **Field:** `OpsImplementationConfig.moe_implementation`
-**Default:** `"eager"`
+**Default:** `"fused_triton"` (GPU). On NPU set to `"fused_npu"` or `"eager"` — `fused_triton` / `fused_quack` raise at config validation time.
 
 The mode and kernel backend are expressed as a single field. Mismatches raise
 at ``apply_veomni_fused_moe_patch`` time — no silent hardware fallback.
@@ -345,7 +358,7 @@ All four are defined in `transformers.integrations`:
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
 | **Mechanism** | `gpu_patch.py` replaces `{Model}RMSNorm` class with `LigerRMSNorm` at import time | `@use_kernel_forward_from_hub("RMSNorm")` decorator on `Qwen3MoeRMSNorm`; at `model.kernelize()` time the `kernels` library downloads and swaps in `LigerRMSNorm` from `kernels-community/liger_kernels` |
-| **Config** | `VEOMNI_USE_LIGER_KERNEL` env var | `USE_HUB_KERNELS` env var + `model.kernelize()` call |
+| **Config** | `OpsImplementationConfig.rms_norm_implementation` field (default `"liger_kernel"` on GPU) | `USE_HUB_KERNELS` env var + `model.kernelize()` call |
 | **When** | Model registration (import time) | Deferred — `kernelize()` after model init |
 | **SP support** | N/A (norm is local) | N/A |
 | **Qwen3.5 MoE gap** | Same as Qwen3 — Liger swap works | **Not annotated.** `Qwen3_5MoeRMSNorm` uses `weight * (1.0 + self.weight)` (offset-by-1 convention, weight init to zeros) instead of the standard `self.weight * x` (weight init to ones). No `@use_kernel_forward_from_hub("RMSNorm")` decorator. Standard `LigerRMSNorm` cannot replace it without accounting for the `+1.0` offset. |
@@ -355,7 +368,7 @@ All four are defined in `transformers.integrations`:
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
 | **Mechanism** | `gpu_patch.py` replaces `apply_rotary_pos_emb` function with `liger_rotary_pos_emb` at import time | `@use_kernel_func_from_hub("rotary_pos_emb")` on the `apply_rotary_pos_emb` function; `kernels` library downloads `apply_rotary_transformers` from `kernels-community/rotary`. The function is also attached to the Attention module via `@use_kernelized_func(apply_rotary_pos_emb)` so `kernelize()` can find it. |
-| **Config** | `VEOMNI_USE_LIGER_KERNEL` env var | `USE_HUB_KERNELS` env var |
+| **Config** | `OpsImplementationConfig.rotary_pos_emb_implementation` field (default `"liger_kernel"` on GPU) | `USE_HUB_KERNELS` env var |
 | **When** | Model registration (import time) | Import time (decorator) + `kernelize()` |
 | **Qwen3.5 MoE gap** | N/A — VeOmni does not yet support Qwen3.5 MoE | **Partially annotated.** `apply_rotary_pos_emb` in `Qwen3_5MoeAttention` is annotated with `@use_kernelized_func` but **not** with `@use_kernel_func_from_hub("rotary_pos_emb")`. This is because Qwen3.5 MoE uses *partial RoPE* (`partial_rotary_factor < 1.0`): it splits Q/K into rotary and pass-through parts, applies RoPE only to the rotary part, then concatenates. The standard hub kernel `apply_rotary_transformers` does not handle this split-and-concat pattern. A dedicated partial-RoPE kernel could still be used. |
 

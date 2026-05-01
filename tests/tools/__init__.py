@@ -12,6 +12,8 @@ from .training_utils import (
     ParallelConfig,
     build_torchrun_cmd,
     materialize_weights,
+    npu_skip_marker,
     release_device_memory,
+    resolve_ops_overrides,
     run_training_config,
 )

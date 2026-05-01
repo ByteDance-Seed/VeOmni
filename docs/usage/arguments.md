@@ -133,15 +133,22 @@ Each `*_implementation` field selects the kernel backend for that operation.
 The type is `str` (not `Literal`) so third-party backends can be registered
 without modifying the config class.
 
+**Defaults are GPU-optimal** (Liger / Triton / fused_triton). On Ascend NPU
+these defaults raise at validation time (`OpsImplementationConfig.__post_init__`);
+NPU users must set every field explicitly to an NPU-supported value (`"npu"`,
+`"chunk_loss"`, `"fused_npu"`, `"triton"` for load-balancing loss via
+`triton-ascend`) or to `"eager"` when the op has no NPU backend (e.g.
+`swiglu_mlp_implementation`, DeepSeek-V3 / Qwen2-VL multimodal RoPE).
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
-| moe_implementation | `Literal["eager", "fused_triton", "fused_quack", "fused_npu"]` | `"eager"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel. Mismatches (e.g. `fused_triton` on NPU) raise at patch time — no silent fallback. |
-| cross_entropy_loss_implementation | `str` | `"eager"` | Cross-entropy loss. Known values: `eager`, `liger_kernel`, `npu` (NPU chunked loss; backs `ForCausalLM` + `ForConditionalGeneration`, `ForSequenceClassification` stays on eager). |
-| rms_norm_implementation | `str` | `"eager"` | RMSNorm. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
-| swiglu_mlp_implementation | `str` | `"eager"` | SwiGLU MLP. Known values: `eager`, `liger_kernel`. |
-| rotary_pos_emb_implementation | `str` | `"eager"` | Rotary pos emb. Known values: `eager`, `liger_kernel`, `npu`, `triton`. |
-| load_balancing_loss_implementation | `str` | `"eager"` | MoE load-balancing loss. Known values: `eager`, `triton`. |
+| moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. Mismatches (e.g. `fused_triton` on NPU) raise at config validation time — no silent fallback. |
+| cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
+| rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend — NPU users must set this to `"eager"`. |
+| rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` (default) requires the `triton` Python package (or `triton-ascend` on NPU); raises at config validation time if the package is missing. `eager` is the pure-PyTorch reference. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, requires `flash-linear-attention`, GPU). No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time. |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (FLA `causal_conv1d`, requires `flash-linear-attention`, GPU). `eager` raises at forward time for varlen training (no torch fallback handles `cu_seqlens`). No NPU backend. |
 | chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (FLA `chunk_gated_delta_rule`, GPU), `flash_qla` (QwenLM FlashQLA, requires the optional `flash-qla` extra, GPU). `eager` falls back to transformers' `torch_chunk_gated_delta_rule`, which raises at forward time for varlen training. No NPU backend. |
