@@ -64,7 +64,6 @@ from ....distributed.sequence_parallel.async_ulysses import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
-from ....ops.kernels.cross_entropy.chunk_logprobs import chunk_logprobs_function
 from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
@@ -949,33 +948,17 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         hidden_states = hidden_states[:, slice_indices, :]
 
         # --- Patch.2 ---
-        # PPO-style per-token log-probs path: short-circuit before
-        # ``self.loss_function`` so the chunked CE kernel writes
-        # directly to a typed ``log_probs`` field. The Qwen3-VL output
-        # dataclass keeps ``rope_deltas`` etc.; ``log_probs`` is set
-        # as an extra attribute (``ModelOutput`` allows arbitrary
-        # attribute setting), so consumers see ``output.log_probs``
-        # naturally without requiring a VL-specific subclass.
-        if labels is not None and kwargs.pop("return_log_probs", False):
-            log_probs = chunk_logprobs_function(
-                hidden_states,
-                self.lm_head.weight,
-                labels,
-                ignore_index=-100,
-            )
-            output = Qwen3VLCausalLMOutputWithPast(
-                loss=None,
-                logits=None,
-                past_key_values=outputs.past_key_values,
-                rope_deltas=outputs.rope_deltas,
-            )
-            output.log_probs = log_probs
-            return output
-
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
-            loss, logits = self.loss_function(
+            # The wrapper inspects ``return_log_probs`` in **kwargs and routes
+            # the call to ``chunk_logprobs_function`` when True; on that path
+            # ``loss``/``logits`` are ``None`` and ``log_probs`` carries the
+            # per-token log-probabilities. ``ModelOutput`` allows arbitrary
+            # attribute setting, so ``output.log_probs`` surfaces on the
+            # existing VL-specific output dataclass without a subclass.
+            loss, logits, log_probs = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -987,12 +970,14 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             logits = self.lm_head(hidden_states)
         # --- Patch.2 ---
 
-        return Qwen3VLCausalLMOutputWithPast(
+        output = Qwen3VLCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
         )
+        output.log_probs = log_probs
+        return output
 
 
 def apply_veomni_qwen3vl_patch():

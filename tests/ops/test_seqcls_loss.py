@@ -47,7 +47,7 @@ def test_seqcls_loss_logits_path_manual_handcalc(monkeypatch):
     labels = torch.tensor([[ignore, ignore, 2]])
 
     expected = _manual_ce_one_token(logits[0, 2], target=2)
-    loss, out_logits = m.ForSequenceClassificationLoss(
+    loss, out_logits, _log_probs = m.ForSequenceClassificationLoss(
         logits=logits,
         labels=labels,
         num_labels=num_labels,
@@ -94,7 +94,7 @@ def test_seqcls_loss_hidden_states_weights_path_build_logits_and_loss(monkeypatc
     supervised_logits = torch.tensor([1.0, 1.0, 2.0, -1.0])
     expected = _manual_ce_one_token(supervised_logits, target=2)
 
-    loss, out_logits = m.ForSequenceClassificationLoss(
+    loss, out_logits, _log_probs = m.ForSequenceClassificationLoss(
         logits=None,
         labels=labels,
         num_labels=num_labels,
@@ -123,7 +123,7 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
       - loss is computed from (hidden_states, weights, labels) via fused linear cross-entropy.
         The passed-in `logits` is NOT used for loss computation in this fused path.
       - out_logits is the flattened *input* logits, because fused_liger_kernel_cross_entropy
-        returns `(loss, logits)` without materializing projected logits.
+        returns `(loss, logits, log_probs=None)` without materializing projected logits.
     """
     from veomni.ops.kernels.cross_entropy.liger import fused_liger_kernel_cross_entropy
 
@@ -151,7 +151,7 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
     logits = torch.randn((B, T, C), device=device, dtype=torch.float32)
     labels = torch.tensor([[ignore, 1]], device=device, dtype=torch.long)
 
-    loss, out_logits = m.ForSequenceClassificationLoss(
+    loss, out_logits, _log_probs = m.ForSequenceClassificationLoss(
         logits=logits,
         labels=labels,
         num_labels=C,
@@ -215,7 +215,7 @@ def test_seqcls_loss_sp_enabled_calls_reduce_with_correct_num_valid_tokens(monke
     e1 = _manual_ce_one_token(logits[0, 2], target=1)
     expected = (e0 + e1) / 2.0
 
-    loss, _ = m.ForSequenceClassificationLoss(
+    loss, _, _ = m.ForSequenceClassificationLoss(
         logits=logits,
         labels=labels,
         num_labels=num_labels,

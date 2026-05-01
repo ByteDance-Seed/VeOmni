@@ -488,8 +488,9 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
         # --- Patch.2 ---
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
-            loss, logits = self.loss_function(
+            loss, logits, log_probs = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -501,7 +502,7 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
             logits = self.lm_head(hidden_states)
         # --- Patch.2 ---
 
-        return Qwen2VLCausalLMOutputWithPast(
+        output = Qwen2VLCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -509,6 +510,8 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
         )
+        output.log_probs = log_probs
+        return output
 
 
 def apply_veomni_qwen2vl_patch():

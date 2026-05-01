@@ -31,6 +31,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs  # noqa: F401  re-emitted into generated file
 
 
 config = PatchConfig(
@@ -38,6 +39,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen2_gpu.py",
     description="Qwen2 with LigerKernel GPU replacements",
 )
+
+# Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
+# ``forward`` can return per-token log-probs in the unified output dataclass.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
 
 config.add_post_import_block(
     """
@@ -190,10 +195,11 @@ def qwen2forcausallm_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -203,13 +209,16 @@ def qwen2forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss, _, log_probs = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+            )
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-    return CausalLMOutputWithPast(
+    return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
+        log_probs=log_probs,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

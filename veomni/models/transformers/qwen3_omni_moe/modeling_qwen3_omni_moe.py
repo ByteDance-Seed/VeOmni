@@ -1228,8 +1228,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
         # NOTE: ForCausalLMLoss pads labels to (S+1) then slices [..., 1:] back to length S, so
         # shift_labels stays at length S — matching the full, unsliced hidden_states. Do NOT
         # pre-slice hidden_states[..., :-1, :] here or the shapes will mismatch.
+        log_probs = None
         if labels is not None:
-            loss, logits = ForCausalLMLoss(
+            # Direct ForCausalLMLoss call (no `**kwargs` passthrough), so the
+            # log-probs dispatch is unreachable here today; the third tuple
+            # slot stays ``None`` and we just unpack to keep the contract
+            # uniform with the other modelings.
+            loss, logits, log_probs = ForCausalLMLoss(
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
@@ -1251,7 +1256,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-        return hf_qwen3_omni_moe.Qwen3OmniMoeThinkerCausalLMOutputWithPast(
+        output = hf_qwen3_omni_moe.Qwen3OmniMoeThinkerCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             aux_loss=aux_loss,
@@ -1260,6 +1265,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             past_key_values=outputs.past_key_values,
             rope_deltas=self.rope_deltas,
         )
+        output.log_probs = log_probs
+        return output
 
 
 # ================================================================

@@ -32,7 +32,6 @@ from transformers.utils import (
     can_return_tuple,
 )
 
-from ....ops.kernels.cross_entropy.chunk_logprobs import chunk_logprobs_function
 from ....utils import logging
 from ....utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -96,31 +95,15 @@ def qwen3forcausallm_forward(
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
     # --- Patch.1 ---
-    # PPO-style per-token log-probs path: short-circuit before
-    # ``self.loss_function`` so the chunked CE kernel writes directly
-    # to a typed ``log_probs`` field. Avoids overloading the ``logits``
-    # slot with a shape ``[B, L]`` tensor that the rest of the pipeline
-    # would mistake for vocab logits.
-    if labels is not None and kwargs.pop("return_log_probs", False):
-        log_probs = chunk_logprobs_function(
-            hidden_states,
-            self.lm_head.weight,
-            labels,
-            ignore_index=-100,
-        )
-        return CausalLMOutputWithLogProbs(
-            loss=None,
-            logits=None,
-            log_probs=log_probs,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
-        loss, logits = self.loss_function(
+        # The wrapper inspects ``return_log_probs`` in **kwargs and routes the
+        # call to ``chunk_logprobs_function`` when True; on that path
+        # ``loss``/``logits`` are ``None`` and ``log_probs`` carries the
+        # per-token log-probabilities.
+        loss, logits, log_probs = self.loss_function(
             logits=logits,
             labels=labels,
             vocab_size=self.config.vocab_size,
@@ -132,9 +115,10 @@ def qwen3forcausallm_forward(
         logits = self.lm_head(hidden_states[:, slice_indices, :])
     # --- Patch.1 ---
 
-    return CausalLMOutputWithPast(
+    return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
+        log_probs=log_probs,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
@@ -187,7 +171,9 @@ def qwen3forSequenceClassification_forward(
     loss = None
     logits = None
     if labels is not None:
-        loss, logits = self.loss_function(
+        # Seq-cls heads have no log-probs path; the third tuple slot is
+        # always None.
+        loss, logits, _ = self.loss_function(
             logits=logits,
             labels=labels,
             num_labels=self.num_labels,

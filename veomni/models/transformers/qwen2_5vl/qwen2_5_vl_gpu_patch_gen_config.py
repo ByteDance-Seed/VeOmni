@@ -70,6 +70,9 @@ config.add_import(
     names=["gather_heads_scatter_seq", "gather_seq_scatter_heads", "pad_tensor", "sp_pad_and_slice", "unpad_tensor"],
 )
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can return
+# per-token log-probs in the unified output dataclass via dynamic attribute set.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
 
 config.add_post_import_block(
     """
@@ -660,10 +663,11 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
     # --- Patch.1 ---
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -673,14 +677,14 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(
+            loss, _, log_probs = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
 
-    return Qwen2_5_VLCausalLMOutputWithPast(
+    output = Qwen2_5_VLCausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
@@ -688,3 +692,5 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
     )
+    output.log_probs = log_probs
+    return output

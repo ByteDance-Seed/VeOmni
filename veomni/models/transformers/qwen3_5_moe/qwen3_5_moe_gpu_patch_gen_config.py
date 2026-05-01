@@ -85,6 +85,9 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can return
+# per-token log-probs in the unified output dataclass via dynamic attribute set.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -673,10 +676,11 @@ def qwen3_5_moe_forcausallm_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -687,8 +691,9 @@ def qwen3_5_moe_forcausallm_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits); unpack to match the OpSlot branch above.
-            loss, logits = self.loss_function(
+            # returns (loss, logits, log_probs); unpack to match the OpSlot
+            # branch above.
+            loss, logits, log_probs = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
             )
     else:
@@ -714,7 +719,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
         if labels is not None:
             loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
 
-    return MoeCausalLMOutputWithPast(
+    output = MoeCausalLMOutputWithPast(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
@@ -723,6 +728,8 @@ def qwen3_5_moe_forcausallm_forward_patched(
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
     )
+    output.log_probs = log_probs
+    return output
 
 
 # ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
@@ -769,10 +776,11 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -783,8 +791,9 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits); unpack to match the OpSlot branch above.
-            loss, logits = self.loss_function(
+            # returns (loss, logits, log_probs); unpack to match the OpSlot
+            # branch above.
+            loss, logits, log_probs = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:
@@ -810,7 +819,7 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         if labels is not None:
             loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
 
-    return Qwen3_5MoeCausalLMOutputWithPast(
+    output = Qwen3_5MoeCausalLMOutputWithPast(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
@@ -820,6 +829,8 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         router_logits=outputs.router_logits,
     )
+    output.log_probs = log_probs
+    return output
 
 
 # ── Expert parallel plan ─────────────────────────────────────────────────────
