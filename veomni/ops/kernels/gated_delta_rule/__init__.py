@@ -128,16 +128,18 @@ def _flash_qla_chunk_gated_delta_rule_factory():
     return chunk_gated_delta_rule
 
 
-# FlashQLA only ships SM90 kernels today (Hopper); selecting it on Ampere or
-# older raises early at OpSlot.bind() time with the standard registry message.
-# Tracking upstream: https://github.com/QwenLM/FlashQLA/issues/2
+# FlashQLA today only ships SM90 kernels — neither older arches (Ampere, Ada)
+# nor newer ones (Blackwell SM100/SM120) work; the SM10x wheels are WIP per
+# https://github.com/QwenLM/FlashQLA/issues/2. Pin exactly SM90 so the
+# registry rejects the kernel early at OpSlot.bind() time on every other arch
+# (and we drop max_compute_capability once upstream adds support).
 KERNEL_REGISTRY.register(
     KernelSpec(
         name="flash_qla",
         op_name="chunk_gated_delta_rule",
         variant="standard",
         factory=_flash_qla_chunk_gated_delta_rule_factory,
-        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
-        description="QwenLM FlashQLA chunk gated delta rule (Hopper SM90, alternative Triton implementation)",
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90, max_compute_capability=90),
+        description="QwenLM FlashQLA chunk gated delta rule (Hopper SM90 only, alternative TileLang implementation)",
     )
 )

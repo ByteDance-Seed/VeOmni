@@ -28,7 +28,7 @@ import torch
 
 import veomni.ops  # noqa: F401 - trigger kernel registrations
 from veomni.ops.dispatch import OpSlot
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, is_sm90_or_above
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 pytestmark = pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="kernels require CUDA")
@@ -137,9 +137,11 @@ def test_swiglu_mlp_liger_matches_eager():
 
 
 @pytest.mark.skipif(
-    not is_sm90_or_above() or importlib.util.find_spec("flash_qla") is None,
-    reason="flash_qla requires Hopper SM90+ and the optional `flash-qla` extra "
-    "(`uv sync --extra gpu --extra flash-qla`); skipped on Ampere/L20 CI runners.",
+    get_gpu_compute_capability() != 90 or importlib.util.find_spec("flash_qla") is None,
+    reason="flash_qla today only ships Hopper SM90 kernels (SM10x WIP upstream — "
+    "https://github.com/QwenLM/FlashQLA/issues/2) and needs the optional `flash-qla` "
+    "extra (`uv sync --extra gpu --extra flash-qla`). Skipped on Ampere/L20 CI runners "
+    "and on Blackwell.",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_fla():
     # Both `fla` and `flash_qla` are non-eager Triton implementations of the
