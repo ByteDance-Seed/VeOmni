@@ -110,7 +110,25 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 
 # ── OpSlot kernel registrations ──────────────────────────────────────────────
 
+from ...config.registry import OpScope, OpSpec, register_op
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+
+# Metadata-only registration so ``_bind_veomni_ops`` can resolve
+# ``moe_experts`` -> ``moe_implementation`` and strip the ``fused_`` prefix
+# generically (no special-case branch). Backends actually live in
+# ``KERNEL_REGISTRY`` (see registrations below); ``OpSpec.backends`` stays
+# empty for ``OPSLOT`` ops.
+register_op(
+    OpSpec(
+        name="moe_experts",
+        config_field="moe_implementation",
+        label="MoE",
+        scope=OpScope.OPSLOT,
+        default="fused_triton",
+        value_alias_strip="fused_",
+    )
+)
 
 
 def _make_moe_experts_adapter(raw_forward):

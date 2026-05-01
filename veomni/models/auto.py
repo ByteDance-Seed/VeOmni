@@ -66,29 +66,31 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
 
     Returns ``True`` if at least one OpSlot was found (and bound).
     """
-    found = False
+    from ..ops.config.registry import _OPS_REGISTRY
+
+    bound: list[str] = []
     moe_experts_kernel: Optional[str] = None
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
-        if isinstance(obj, OpSlot):
-            # `moe_experts` is the one op whose user-facing config field is not
-            # `moe_experts_implementation` but `moe_implementation`, and its
-            # values carry a `fused_` prefix (e.g. `fused_triton`) that the
-            # KERNEL_REGISTRY entries don't. Translate here so the registry
-            # lookup finds the kernel and the HardwareRequirement check fires.
-            if obj.op_name == "moe_experts":
-                impl_name = (
-                    "eager"
-                    if ops_config.moe_implementation == "eager"
-                    else ops_config.moe_implementation.removeprefix("fused_")
-                )
-                if impl_name != "eager":
-                    moe_experts_kernel = impl_name
-            else:
-                impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
-            obj.bind(impl_name)
-            logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
-            found = True
+        if not isinstance(obj, OpSlot):
+            continue
+        # Resolve the user's selection through the OpSpec metadata:
+        # ``config_field`` handles the field-name convention (``moe_experts``
+        # → ``moe_implementation``, others → ``{op}_implementation``);
+        # ``value_alias_strip`` handles user-facing-vs-registry-key naming
+        # (e.g. ``fused_triton`` → ``triton``). Falls back to the
+        # ``{op}_implementation`` convention when the op isn't registered
+        # (defensive — every shipping OpSlot op should be in ``_OPS_REGISTRY``).
+        spec = _OPS_REGISTRY.get(obj.op_name)
+        field = spec.config_field if spec else f"{obj.op_name}_implementation"
+        raw = getattr(ops_config, field, "eager")
+        prefix = spec.value_alias_strip if spec else None
+        impl_name = raw.removeprefix(prefix) if (prefix and raw.startswith(prefix)) else raw
+
+        obj.bind(impl_name)
+        bound.append(f"{obj.op_name} ({impl_name})")
+        if obj.op_name == "moe_experts" and impl_name != "eager":
+            moe_experts_kernel = impl_name
 
     # The OpSlot only acts as an eager-vs-fused guard
     # (``slot.use_non_eager_impl``). Inside the fused branch, modeling code
@@ -101,7 +103,9 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
 
         apply_veomni_fused_moe_patch(fused_moe_kernel=moe_experts_kernel)
 
-    return found
+    if bound:
+        logger.info_rank0(f"OpSlot dispatch bound: {', '.join(bound)}.")
+    return bool(bound)
 
 
 def build_foundation_model(

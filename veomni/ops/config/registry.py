@@ -60,6 +60,12 @@ logger = logging.get_logger(__name__)
 class OpScope(str, Enum):
     GLOBAL = "global"
     PER_MODEL = "per_model"
+    # Dispatched via module-level ``OpSlot`` instances in patchgen'd modeling
+    # files; backends live in ``KERNEL_REGISTRY`` (not ``OpSpec.backends``).
+    # Registered in ``_OPS_REGISTRY`` only for ``config_field`` /
+    # ``value_alias_strip`` metadata so ``_bind_veomni_ops`` can do the
+    # config-to-registry translation generically.
+    OPSLOT = "opslot"
 
 
 @dataclass(frozen=True)
@@ -102,11 +108,16 @@ class OpSpec:
         name: Machine identifier, e.g. ``"rms_norm"``.
         config_field: Matching field name on ``OpsImplementationConfig``.
         label: Human-readable label used in log lines, e.g. ``"RMSNorm"``.
-        scope: ``GLOBAL`` or ``PER_MODEL``.
+        scope: ``GLOBAL``, ``PER_MODEL``, or ``OPSLOT`` (see ``OpScope``).
         default: Default backend name; must equal the dataclass default.
         backends: Mapping from backend name to ``BackendSpec``.
         global_slot: GLOBAL ops only. ``"module:attr"`` holding the function
             pointer; the engine performs ``setattr(module, attr, entry)``.
+        value_alias_strip: Optional prefix stripped from ``config_field``
+            values before registry lookup. Used by ``moe_experts`` so the
+            user-facing ``fused_triton`` / ``fused_quack`` / ``fused_npu``
+            names map to the registry's bare ``triton`` / ``quack`` / ``npu``
+            keys without a special-case in ``_bind_veomni_ops``.
     """
 
     name: str
@@ -116,6 +127,7 @@ class OpSpec:
     default: str
     backends: dict[str, BackendSpec] = field(default_factory=dict)
     global_slot: str | None = None
+    value_alias_strip: str | None = None
 
 
 # ---------------------------------------------------------------------------
