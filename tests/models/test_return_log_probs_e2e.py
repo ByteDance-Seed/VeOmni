@@ -87,22 +87,22 @@ def _reference_log_probs_from_logits(
 ) -> torch.Tensor:
     """Reference per-token actual log-probabilities (non-positive).
 
-    Matches the kernel's arithmetic path exactly: ``log_softmax + gather``
-    on the model's full-logits forward, with the kernel's
-    ``labels[..., 1:]`` / ``hidden[..., :-1]`` shift and a trailing pad
-    of 0.0 to match input shape. The only remaining numerical
-    difference between this path and the chunked-fused-linear path is
-    the lm_head matmul boundary — identical when chunk_size covers the
-    whole seq.
+    Routes the per-token NLL through the same
+    ``_per_token_log_probs_from_logits`` helper the kernel uses (which
+    prefers ``flash_attn``'s triton ``cross_entropy_loss`` — same op
+    verl's ``FusedLinearForPPOFunction`` calls — falling back to
+    ``log_softmax + gather`` when flash_attn isn't importable). The
+    only remaining numerical difference between this path and the
+    chunked-fused-linear path is the lm_head matmul boundary —
+    identical when ``chunk_size`` covers the whole seq, so the kernel
+    output stays bitwise equal.
     """
+    from veomni.ops.kernels.cross_entropy.chunk_logprobs import _per_token_log_probs_from_logits
+
     shifted = labels[..., 1:].contiguous()
     sliced = logits[..., :-1, :].contiguous()
     flat = sliced.reshape(-1, sliced.size(-1)).float()
-    log_softmax = flat.log_softmax(dim=-1)
-    safe = shifted.reshape(-1).clamp(min=0).unsqueeze(-1)
-    log_probs_flat = log_softmax.gather(-1, safe).squeeze(-1)
-    mask = shifted.reshape(-1) != ignore_index
-    log_probs_flat = torch.where(mask, log_probs_flat, torch.zeros_like(log_probs_flat))
+    log_probs_flat = _per_token_log_probs_from_logits(flat, shifted.reshape(-1), ignore_index)
     log_probs = log_probs_flat.view_as(shifted)
     return F.pad(log_probs, (0, 1), value=0.0)  # non-positive: actual log p(y_t)
 

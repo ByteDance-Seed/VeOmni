@@ -120,20 +120,20 @@ def _reference_per_token_log_probs(
 ) -> torch.Tensor:
     """Reference impl: full-logits gather. Used as ground truth.
 
-    Returns per-token actual log-probabilities (non-positive). Performs
-    the same causal shift the kernel does (predict y_{t+1} from h_t)
-    and pads the trailing seq position with 0.0 so the result has the
-    same shape as ``labels``.
+    Routes the per-token NLL through the same
+    ``_per_token_log_probs_from_logits`` helper the kernel uses (which
+    prefers ``flash_attn``'s triton ``cross_entropy_loss``, falling
+    back to ``log_softmax + gather``), so the kernel-vs-reference
+    comparison stays bitwise regardless of which path is active.
+    Performs the same causal shift the kernel does (predict y_{t+1}
+    from h_t) and pads the trailing seq position with 0.0 so the
+    result has the same shape as ``labels``.
     """
     shifted = labels[..., 1:].contiguous()
     h = hidden_states[..., :-1, :].contiguous()
     flat = h.reshape(-1, h.size(-1))
     logits = F.linear(flat, weights).float()
-    log_softmax = logits.log_softmax(dim=-1)
-    safe = shifted.reshape(-1).clamp(min=0).unsqueeze(-1)
-    log_probs_flat = log_softmax.gather(-1, safe).squeeze(-1)
-    mask = shifted.reshape(-1) != ignore_index
-    log_probs_flat = torch.where(mask, log_probs_flat, torch.zeros_like(log_probs_flat))
+    log_probs_flat = cl._per_token_log_probs_from_logits(logits, shifted.reshape(-1), ignore_index)
     log_probs = log_probs_flat.view_as(shifted)
     return F.pad(log_probs, (0, 1), value=0.0)
 
@@ -317,12 +317,79 @@ def test_sp_enabled_skips_internal_shift(monkeypatch):
 
     flat = hidden.reshape(-1, H)
     logits = F.linear(flat, weights).float()
-    log_softmax = logits.log_softmax(dim=-1)
-    safe = labels.reshape(-1).clamp(min=0).unsqueeze(-1)
-    log_probs = log_softmax.gather(-1, safe).squeeze(-1)
-    mask = labels.reshape(-1) != IGNORE_INDEX
-    expected = torch.where(mask, log_probs, torch.zeros_like(log_probs)).view_as(labels)
+    expected_flat = cl._per_token_log_probs_from_logits(logits, labels.reshape(-1), IGNORE_INDEX)
+    expected = expected_flat.view_as(labels)
     _assert_bitwise_equal(out, expected, "log_probs (sp_enabled)")
+
+
+def _maybe_load_verl_fused_linear_for_ppo():
+    """Import verl's ``FusedLinearForPPOFunction`` without triggering ``verl.__init__``.
+
+    ``verl/__init__.py`` imports ``ray`` (not a VeOmni dep), so a plain
+    ``import verl.utils.experimental.torch_functional`` fails in the
+    test env. Load the submodule's source directly via ``importlib``;
+    returns ``None`` if the verl repo isn't present.
+    """
+    import importlib.util
+
+    verl_root = os.environ.get("VERL_PATH", "/home/ubuntu/verl")
+    src = os.path.join(verl_root, "verl", "utils", "experimental", "torch_functional.py")
+    if not os.path.isfile(src):
+        return None
+    spec = importlib.util.spec_from_file_location("_verl_torch_functional_for_test", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.FusedLinearForPPOFunction
+
+
+def test_bitwise_parity_with_verl_fused_linear_for_ppo():
+    """VeOmni ``chunk_logprobs_function`` is bitwise equal to verl's
+    ``FusedLinearForPPOFunction[0]`` (token_log_probs).
+
+    Both kernels:
+      1. Compute ``logits = (h @ w.t()) / T`` in input dtype, then upcast to fp32.
+      2. Route per-token NLL through ``flash_attn``'s triton CE kernel.
+      3. Negate to get actual log-probabilities.
+      4. Compute backward via explicit ``dlogits = dlp * (one_hot - softmax)``,
+         cast to input dtype, divide by T, then matmul.
+
+    Pinning the parity here keeps the verl ↔ VeOmni integration story
+    "drop-in": a model trained under VeOmni's per-token log-probs path
+    produces the same fp32 numbers as the same model invoked through
+    verl's fused PPO kernel, under deterministic + batch-invariant
+    mode.
+    """
+    verl_fn = _maybe_load_verl_fused_linear_for_ppo()
+    if verl_fn is None:
+        pytest.skip("verl repo not found; set VERL_PATH to enable verl-bitwise comparison.")
+
+    torch.manual_seed(123)
+    B, L, H, V = 2, 32, 16, 256
+    hidden_a = torch.randn(B, L, H, dtype=torch.float32, device=_device(), requires_grad=True)
+    weights_a = torch.randn(V, H, dtype=torch.float32, device=_device(), requires_grad=True)
+    # All-valid labels: verl's kernel has no IGNORE_INDEX masking, so we
+    # match its scope by avoiding IGN labels here.
+    labels = torch.randint(0, V, (B, L), dtype=torch.long, device=_device())
+
+    grad_target = torch.randn(B, L, dtype=torch.float32, device=_device())
+    chunk_size = B * L + 1  # single-chunk boundary for both kernels
+
+    # VeOmni — pass ``shift_labels=labels`` so the wrapper treats them
+    # as already-aligned (verl's kernel never applies a causal shift,
+    # mirroring that here keeps the per-token output aligned for a
+    # bit-for-bit comparison).
+    out_a = cl.chunk_logprobs_function(hidden_a, weights_a, labels, chunk_size=chunk_size, shift_labels=labels)
+    (out_a * grad_target).sum().backward()
+
+    # verl — same inputs cloned, no causal shift inside
+    hidden_b = hidden_a.detach().clone().requires_grad_(True)
+    weights_b = weights_a.detach().clone().requires_grad_(True)
+    out_b, _entropy_b = verl_fn.apply(hidden_b, weights_b, labels, 1.0, chunk_size)
+    (out_b * grad_target).sum().backward()
+
+    _assert_bitwise_equal(out_a, out_b, "log_probs vs verl")
+    _assert_bitwise_equal(hidden_a.grad, hidden_b.grad, "dhidden vs verl")
+    _assert_bitwise_equal(weights_a.grad, weights_b.grad, "dweight vs verl")
 
 
 def test_explicit_shift_labels_overrides_internal_shift():
@@ -348,9 +415,6 @@ def test_explicit_shift_labels_overrides_internal_shift():
 
     flat = hidden.reshape(-1, H)
     logits = F.linear(flat, weights).float()
-    log_softmax = logits.log_softmax(dim=-1)
-    safe = shift_labels.reshape(-1).clamp(min=0).unsqueeze(-1)
-    log_probs = log_softmax.gather(-1, safe).squeeze(-1)
-    mask = shift_labels.reshape(-1) != IGNORE_INDEX
-    expected = torch.where(mask, log_probs, torch.zeros_like(log_probs)).view_as(shift_labels)
+    expected_flat = cl._per_token_log_probs_from_logits(logits, shift_labels.reshape(-1), IGNORE_INDEX)
+    expected = expected_flat.view_as(shift_labels)
     _assert_bitwise_equal(out, expected, "log_probs (explicit shift_labels)")

@@ -61,6 +61,14 @@ VeOmni-specific extensions on top of verl's pattern:
   of the sibling ``chunk_loss_function``. SP-enabled callers pass
   pre-shifted labels via the dataloader and the shift here is
   skipped.
+
+When ``flash_attn.ops.triton.cross_entropy.cross_entropy_loss`` is
+importable we route the per-token NLL through it (verl's preferred
+path); without flash_attn we fall back to ``log_softmax + gather``.
+The fa_ce path is what makes per-token log-probs **bitwise** identical
+to verl's ``FusedLinearForPPOFunction`` under deterministic + batch-
+invariant mode — both stacks call the same triton kernel on the same
+fp32 logits.
 """
 
 from typing import Optional
@@ -68,6 +76,40 @@ from typing import Optional
 import torch
 
 from ....distributed.parallel_state import get_parallel_state
+
+
+try:
+    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss as _fa_cross_entropy_loss
+
+    _FA_CE_AVAILABLE = True
+except ImportError:
+    _FA_CE_AVAILABLE = False
+
+
+def _per_token_log_probs_from_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Per-token ``log p(y_t)`` from fp32 logits.
+
+    Uses ``flash_attn.ops.triton.cross_entropy.cross_entropy_loss`` when
+    available — same op verl's ``FusedLinearForPPOFunction`` calls, so
+    we inherit the same fp32 rounding and stay bitwise with verl's
+    output. Falls back to ``log_softmax + gather`` with manual
+    ``ignore_index`` masking otherwise. Both paths return zero at
+    ``labels == ignore_index`` (fa_ce sets per-token loss to 0 at IGN
+    positions internally, the negation is then ``-0.0`` which compares
+    equal to ``0.0``).
+    """
+    if _FA_CE_AVAILABLE:
+        per_token_nll = _fa_cross_entropy_loss(logits, labels, ignore_index=ignore_index)[0]
+        return -per_token_nll
+
+    mask = labels != ignore_index
+    safe_labels = labels.clamp(min=0).unsqueeze(-1)
+    log_probs = logits.log_softmax(dim=-1).gather(-1, safe_labels).squeeze(-1)
+    return torch.where(mask, log_probs, torch.zeros_like(log_probs))
 
 
 class _ChunkedLinearLogProbs(torch.autograd.Function):
@@ -104,18 +146,18 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
             h_chunk = h_2d[chunk_start:chunk_end]
             l_chunk = l_1d[chunk_start:chunk_end]
 
-            # ``[chunk, V]`` fp32 — frees after this scope
-            logits = (h_chunk @ weight.t()).float()
+            # Op order mirrors verl's ``_fused_linear_for_ppo_fwd``:
+            # ``(h @ w.t()) / T`` in the input dtype, then upcast to
+            # fp32 before computing log-probs. For bf16 inputs this
+            # rounds the temperature scale at bf16 precision (matches
+            # verl bit-for-bit); for fp32 inputs the cast is a no-op
+            # so behaviour is unchanged.
+            logits = h_chunk @ weight.t()
             if temperature != 1.0:
                 logits = logits / temperature
+            logits = logits.float()
 
-            mask = l_chunk != ignore_index
-            # Clamp out-of-bounds IGN labels (-100) so ``gather`` doesn't
-            # index past the vocab. The gathered value at masked
-            # positions is overwritten with 0 below anyway.
-            safe_labels = l_chunk.clamp(min=0).unsqueeze(-1)
-            log_probs_chunk = logits.log_softmax(dim=-1).gather(-1, safe_labels).squeeze(-1)
-            log_probs[chunk_start:chunk_end] = torch.where(mask, log_probs_chunk, torch.zeros_like(log_probs_chunk))
+            log_probs[chunk_start:chunk_end] = _per_token_log_probs_from_logits(logits, l_chunk, ignore_index)
 
         ctx.save_for_backward(h_2d, weight, l_1d)
         ctx.temperature = temperature
@@ -143,13 +185,14 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
             l_chunk = l_1d[chunk_start:chunk_end]
             dlp_chunk = dlog_probs_1d[chunk_start:chunk_end]
 
-            # Recompute logits — same shape and arithmetic path as
-            # forward so the saved-weight reference (which FSDP2 has
-            # unsharded by now via its pre-backward hook) lands the
-            # same matmul.
-            logits = (h_chunk @ weight.t()).float()
+            # Recompute logits with the same op order as forward so the
+            # saved-weight reference (which FSDP2 has unsharded by now
+            # via its pre-backward hook) lands the same matmul +
+            # rounding boundary as the kernel forward / verl forward.
+            logits = h_chunk @ weight.t()
             if ctx.temperature != 1.0:
                 logits = logits / ctx.temperature
+            logits = logits.float()
 
             probs = logits.softmax(dim=-1)
             mask = (l_chunk != ctx.ignore_index).float()
@@ -161,9 +204,15 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
             one_hot = torch.zeros_like(probs).scatter_(-1, safe_labels, 1.0)
             masked_dlp = (dlp_chunk * mask).unsqueeze(-1)
             dlogits = masked_dlp * (one_hot - probs)
+
+            # Op order mirrors verl's ``_fused_linear_for_ppo_bwd``:
+            # cast back to the input dtype first, then divide by
+            # temperature, *then* matmul. The cast-before-divide order
+            # changes the bf16 rounding, so swapping it is what makes
+            # this kernel's gradients bitwise identical to verl.
+            dlogits = dlogits.to(h_chunk.dtype)
             if ctx.temperature != 1.0:
                 dlogits = dlogits / ctx.temperature
-            dlogits = dlogits.to(h_chunk.dtype)
 
             if dhidden is not None:
                 dhidden[chunk_start:chunk_end] = dlogits @ weight
