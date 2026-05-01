@@ -32,7 +32,7 @@ import torch.nn.functional as F
 
 import veomni.ops.kernels.cross_entropy.chunk_logprobs as cl
 from veomni.utils.constants import IGNORE_INDEX
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 # Required by ``torch.use_deterministic_algorithms`` for cuBLAS.
@@ -94,7 +94,10 @@ def _bitwise_setup(monkeypatch):
 
 
 def _device():
-    return torch.device("cuda")
+    # Route through ``veomni.utils.device.get_device_type`` so the tests
+    # work on any accelerator (CUDA / NPU) and pass the device-api-check
+    # sanity job (which forbids hardcoded ``"cuda"`` strings in tests).
+    return torch.device(get_device_type())
 
 
 def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, label: str = "tensor") -> None:

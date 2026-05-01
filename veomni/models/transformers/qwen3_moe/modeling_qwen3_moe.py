@@ -224,8 +224,9 @@ def qwen3_moe_forcausal_lm_forward(
     # --- Patch.1 ---
     loss = None
     logits = None
+    log_probs = None
     if labels is not None:
-        loss, logits = self.loss_function(
+        loss, logits, log_probs = self.loss_function(
             logits=logits,
             labels=labels,
             vocab_size=self.config.vocab_size,
@@ -248,7 +249,7 @@ def qwen3_moe_forcausal_lm_forward(
         if labels is not None:
             loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-    return MoeCausalLMOutputWithPast(
+    output = MoeCausalLMOutputWithPast(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
@@ -257,6 +258,8 @@ def qwen3_moe_forcausal_lm_forward(
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
     )
+    output.log_probs = log_probs
+    return output
 
 
 # ================================================================

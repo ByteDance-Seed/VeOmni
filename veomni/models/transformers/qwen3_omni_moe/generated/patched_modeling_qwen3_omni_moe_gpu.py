@@ -2566,10 +2566,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # --- Patch.8 ---
         loss = None
         logits = None
+        log_probs = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits = veomni_causal_lm_loss(
+                loss, logits, log_probs = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2581,8 +2582,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits); unpack to match the OpSlot branch above.
-                loss, logits = self.loss_function(
+                # returns (loss, logits, log_probs); unpack to match the OpSlot
+                # branch above.
+                loss, logits, log_probs = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2613,7 +2615,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-        return Qwen3OmniMoeThinkerCausalLMOutputWithPast(
+        output = Qwen3OmniMoeThinkerCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             aux_loss=aux_loss,
@@ -2623,6 +2625,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             router_logits=getattr(outputs, "router_logits", None),
             rope_deltas=self.rope_deltas,
         )
+        output.log_probs = log_probs
+        return output
 
     def prepare_inputs_for_generation(
         self,
