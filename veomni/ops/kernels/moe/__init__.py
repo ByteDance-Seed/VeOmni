@@ -114,11 +114,9 @@ from ...config.registry import OpScope, OpSpec, register_op
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
-# Metadata-only registration so ``_bind_veomni_ops`` can resolve
-# ``moe_experts`` -> ``moe_implementation`` and strip the ``fused_`` prefix
-# generically (no special-case branch). Backends actually live in
-# ``KERNEL_REGISTRY`` (see registrations below); ``OpSpec.backends`` stays
-# empty for ``OPSLOT`` ops.
+# Metadata-only: declares ``moe_experts`` ↔ ``moe_implementation`` and the
+# ``fused_`` value prefix so ``_bind_veomni_ops`` translates generically.
+# Actual kernels live in ``KERNEL_REGISTRY`` below.
 register_op(
     OpSpec(
         name="moe_experts",

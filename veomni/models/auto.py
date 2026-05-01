@@ -74,13 +74,10 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
         obj = getattr(modeling_module, name, None)
         if not isinstance(obj, OpSlot):
             continue
-        # Resolve the user's selection through the OpSpec metadata:
-        # ``config_field`` handles the field-name convention (``moe_experts``
-        # → ``moe_implementation``, others → ``{op}_implementation``);
-        # ``value_alias_strip`` handles user-facing-vs-registry-key naming
-        # (e.g. ``fused_triton`` → ``triton``). Falls back to the
-        # ``{op}_implementation`` convention when the op isn't registered
-        # (defensive — every shipping OpSlot op should be in ``_OPS_REGISTRY``).
+        # OpSpec metadata drives the config-field lookup and value translation
+        # (e.g. ``moe_experts`` → ``moe_implementation`` field, ``fused_triton``
+        # → registry key ``triton``). Unregistered ops fall back to the
+        # ``{op}_implementation`` convention.
         spec = _OPS_REGISTRY.get(obj.op_name)
         field = spec.config_field if spec else f"{obj.op_name}_implementation"
         raw = getattr(ops_config, field, "eager")

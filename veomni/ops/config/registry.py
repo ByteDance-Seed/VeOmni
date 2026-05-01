@@ -60,11 +60,9 @@ logger = logging.get_logger(__name__)
 class OpScope(str, Enum):
     GLOBAL = "global"
     PER_MODEL = "per_model"
-    # Dispatched via module-level ``OpSlot`` instances in patchgen'd modeling
-    # files; backends live in ``KERNEL_REGISTRY`` (not ``OpSpec.backends``).
-    # Registered in ``_OPS_REGISTRY`` only for ``config_field`` /
-    # ``value_alias_strip`` metadata so ``_bind_veomni_ops`` can do the
-    # config-to-registry translation generically.
+    # OpSlot-dispatched ops: backends live in ``KERNEL_REGISTRY``; the
+    # ``OpSpec`` here only carries ``config_field`` / ``value_alias_strip``
+    # metadata for ``_bind_veomni_ops``.
     OPSLOT = "opslot"
 
 
@@ -113,11 +111,9 @@ class OpSpec:
         backends: Mapping from backend name to ``BackendSpec``.
         global_slot: GLOBAL ops only. ``"module:attr"`` holding the function
             pointer; the engine performs ``setattr(module, attr, entry)``.
-        value_alias_strip: Optional prefix stripped from ``config_field``
-            values before registry lookup. Used by ``moe_experts`` so the
-            user-facing ``fused_triton`` / ``fused_quack`` / ``fused_npu``
-            names map to the registry's bare ``triton`` / ``quack`` / ``npu``
-            keys without a special-case in ``_bind_veomni_ops``.
+        value_alias_strip: Optional prefix stripped from the config value
+            before registry lookup (e.g. ``"fused_"`` so ``fused_triton``
+            resolves to registry key ``triton``).
     """
 
     name: str
