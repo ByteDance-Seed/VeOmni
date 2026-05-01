@@ -17,6 +17,7 @@ from veomni.arguments import (
     ModelArguments,
     TrainingArguments,
 )
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -390,7 +391,14 @@ def test_models_patch_fwd_bwd(
             mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
         ]
 
-    model_config = ModelArguments(config_path=config_path)
+    # The actual ops backend used per test case is set by ``set_environ_param``
+    # inside ``TrainerTest`` (which calls ``apply_ops_config`` with a
+    # mode-specific config). The ops_implementation on this ModelArguments is
+    # never consumed at training time, so we pin it to all-eager — without
+    # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
+    # fused_triton / triton) would fail validation on NPU before the test
+    # even runs.
+    model_config = ModelArguments(config_path=config_path, ops_implementation=OpsImplementationConfig.all_eager())
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
