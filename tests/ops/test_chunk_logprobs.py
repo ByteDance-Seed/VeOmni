@@ -95,8 +95,8 @@ def _bitwise_setup(monkeypatch):
 
 def _device():
     # Route through ``veomni.utils.device.get_device_type`` so the tests
-    # work on any accelerator (CUDA / NPU) and pass the device-api-check
-    # sanity job (which forbids hardcoded ``"cuda"`` strings in tests).
+    # work on any accelerator and pass the device-api-check sanity job
+    # (which forbids hardcoded device strings in tests).
     return torch.device(get_device_type())
 
 
