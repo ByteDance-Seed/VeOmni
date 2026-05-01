@@ -77,6 +77,46 @@ def test_numerical_parity_with_reference(monkeypatch):
     assert torch.allclose(out, ref, atol=1e-5, rtol=1e-4)
 
 
+def test_bitwise_parity_with_reference_when_chunk_covers_seq(monkeypatch):
+    """With ``chunk_size >= total tokens`` the kernel is bitwise identical to the reference.
+
+    The chunk loop collapses to a single ``h @ weight.t()`` against the
+    same weight tensor as the reference's ``F.linear``; ``log_softmax``
+    and ``gather`` are row-wise pointwise ops. Both paths execute the
+    same ops on the same data on CPU, so the per-token output must be
+    bitwise equal — same contract that
+    ``tests/models/test_return_log_probs_e2e.py::
+    test_return_log_probs_bitwise_matches_logits_reference`` pins
+    end-to-end on GPU under deterministic + batch-invariant mode.
+    """
+    monkeypatch.setattr(cl, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
+
+    torch.manual_seed(0)
+    B, L, H, V = 2, 64, 32, 256
+    hidden = torch.randn(B, L, H, dtype=torch.float32)
+    weights = torch.randn(V, H, dtype=torch.float32)
+    labels = torch.randint(0, V, (B, L), dtype=torch.long)
+    labels[0, ::7] = IGNORE_INDEX
+    labels[1, 0] = IGNORE_INDEX
+
+    # `chunk_size > B * L` forces a single matmul boundary identical to
+    # the reference's single ``F.linear`` call.
+    out = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=B * L + 1)
+    ref = _reference_per_token_log_probs(hidden, weights, labels)
+
+    assert out.shape == labels.shape
+    assert out.dtype == ref.dtype
+    if not torch.equal(out, ref):
+        ne = out != ref
+        diff = (out - ref).abs()
+        first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
+        raise AssertionError(
+            f"per-token log_probs not bitwise equal: "
+            f"{int(ne.sum().item())}/{out.numel()} mismatched, "
+            f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
+        )
+
+
 def test_ignore_index_zeroes_output_and_grad(monkeypatch):
     monkeypatch.setattr(cl, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
 
