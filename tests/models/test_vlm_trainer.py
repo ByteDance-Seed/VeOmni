@@ -67,7 +67,10 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     assert visual is not None
 
     args = VeOmniVLMArguments(
-        model=VLMMModelArguments(config_path=config_path),
+        model=VLMMModelArguments(
+            config_path=config_path,
+            ops_implementation=OpsImplementationConfig.all_eager(),
+        ),
         data=VLMMDataArguments(train_path="dummy"),
     )
     args.train.freeze_vit = freeze_vit
