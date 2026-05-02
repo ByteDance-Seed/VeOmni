@@ -1294,7 +1294,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1993,22 +2404,50 @@
+@@ -1993,24 +2404,54 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1359,7 +1359,9 @@
 +
 +        output = MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -2019,6 +2458,12 @@
+             aux_loss=aux_loss,
+             logits=logits,
+@@ -2019,6 +2460,14 @@
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
          )
@@ -1374,7 +1376,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2518,7 @@
+@@ -2073,6 +2522,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1382,7 +1384,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2090,57 +2536,6 @@
+@@ -2090,57 +2540,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
@@ -1440,7 +1442,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,27 +2551,52 @@
+@@ -2156,29 +2555,56 @@
          )
 
          hidden_states = outputs[0]
@@ -1509,7 +1511,18 @@
 +
 +        output = Qwen3_5MoeCausalLMOutputWithPast(
              loss=loss,
-@@ -2413,6 +2833,19 @@
+             aux_loss=aux_loss,
+             logits=logits,
+@@ -2188,6 +2614,8 @@
+             rope_deltas=outputs.rope_deltas,
+             router_logits=outputs.router_logits,
+         )
++        output.log_probs = log_probs
++        return output
+
+     def prepare_inputs_for_generation(
+         self,
+@@ -2413,6 +2841,19 @@
 
          return input_ids, model_kwargs
 
