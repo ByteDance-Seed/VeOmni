@@ -15,6 +15,8 @@
 #      Use LigerKernel SwiGLU MLP
 #    - class_replacement: Qwen3MoeExperts
 #      Use v5 gate_up_proj expert weights and explicit VeOmni fused MoE path
+#    - method_override: Qwen3MoeTopKRouter.forward
+#      Return raw pre-softmax logits as `router_logits` so HF's `load_balancing_loss_func` (which applies softmax internally) stays consistent with the HF aux-loss baseline.
 #    - function_replacement: apply_rotary_pos_emb
 #      Use LigerKernel rotary embedding
 #    - method_override: Qwen3MoeModel.forward
@@ -30,7 +32,6 @@ from collections.abc import Callable
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import initialization as init
 from transformers.activations import ACT2FN
@@ -282,6 +283,12 @@ class Qwen3MoeExperts(torch.nn.Module):
         return final_hidden_states
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeTopKRouter
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3MoeTopKRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -291,16 +298,21 @@ class Qwen3MoeTopKRouter(nn.Module):
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor):
+        input_dtype = hidden_states.dtype
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
-        router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        # Return raw pre-softmax logits as `router_logits`; HF's
+        # `load_balancing_loss_func` applies softmax internally. The post-softmax
+        # tensor is kept locally as `routing_weights` for top-k selection only.
+        router_logits = torch.nn.functional.linear(hidden_states, self.weight)
+        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        router_top_value = router_top_value.to(router_logits.dtype)
-        router_scores = router_top_value
-        return router_logits, router_scores, router_indices
+        # Cast top-k weights back to input dtype so the downstream expert
+        # multiplication runs in bf16/fp16 rather than fp32.
+        router_top_value = router_top_value.to(input_dtype)
+        return router_logits, router_top_value, router_indices
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):

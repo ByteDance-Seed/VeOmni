@@ -132,17 +132,18 @@ class PatchQwen3MoeTopKRouter(nn.Module):
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        # Return raw pre-softmax logits as `router_logits`; HF's
+        # `load_balancing_loss_func` applies softmax internally. The post-softmax
+        # tensor is kept locally as `routing_weights` for top-k selection only.
         router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
-        router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (seq_len, top_k)
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        # Cast back to input dtype — matches HF's Qwen3MoeSparseMoeBlock semantics
-        # so the expert multiplication `expert_output * routing_weights` is done
-        # in input dtype rather than promoted to fp32 (which drops bf16 rounding).
+        # Cast top-k weights back to input dtype so the downstream expert
+        # multiplication runs in bf16/fp16 rather than fp32.
         router_top_value = router_top_value.to(input_dtype)
-        router_scores = router_top_value
-        return router_logits, router_scores, router_indices
+        return router_logits, router_top_value, router_indices
 
 
 class PatchQwen3MoeSparseMoeBlock(nn.Module):
@@ -264,20 +265,28 @@ def qwen3_moe_forcausal_lm_forward(
 
 # ================================================================
 # PATCH: Qwen3MoePreTrainedModel._init_weights
-# 1. Support init weights for PatchQwen3MoeExperts and PatchQwen3MoeTopKRouter.
+# Wrap (not replace) HF's _init_weights so standard nn.Linear / nn.Embedding /
+# RMSNorm modules keep HF's init, and PatchQwen3MoeExperts / PatchQwen3MoeTopKRouter
+# (whose params are not handled by HF's _init_weights) get N(0, initializer_range).
 # ================================================================
-@torch.no_grad()
-def qwen3_moe_pretrained_model_init_weights(self: Qwen3MoePreTrainedModel, module):
-    """Custom _init_weights to handle PatchQwen3MoeExperts and PatchQwen3MoeTopKRouter."""
+# Snapshot HF's `_init_weights` at module import; the wrapper always wraps this
+# fixed reference so repeated `apply_veomni_qwen3_moe_patch()` calls (e.g.
+# multiple `get_model_class()` in one process) stay idempotent.
+_HF_QWEN3_MOE_INIT_WEIGHTS = hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights
 
-    super(Qwen3MoePreTrainedModel, self)._init_weights(module)
 
-    if isinstance(module, PatchQwen3MoeExperts):
-        _init_weight(module.gate_proj, mean=0.0, std=self.config.initializer_range)
-        _init_weight(module.up_proj, mean=0.0, std=self.config.initializer_range)
-        _init_weight(module.down_proj, mean=0.0, std=self.config.initializer_range)
-    elif isinstance(module, PatchQwen3MoeTopKRouter):
-        _init_weight(module.weight, mean=0.0, std=self.config.initializer_range)
+def _make_qwen3_moe_init_weights(orig_init_weights):
+    @torch.no_grad()
+    def qwen3_moe_pretrained_model_init_weights(self: Qwen3MoePreTrainedModel, module):
+        orig_init_weights(self, module)
+        if isinstance(module, PatchQwen3MoeExperts):
+            _init_weight(module.gate_proj, mean=0.0, std=self.config.initializer_range)
+            _init_weight(module.up_proj, mean=0.0, std=self.config.initializer_range)
+            _init_weight(module.down_proj, mean=0.0, std=self.config.initializer_range)
+        elif isinstance(module, PatchQwen3MoeTopKRouter):
+            _init_weight(module.weight, mean=0.0, std=self.config.initializer_range)
+
+    return qwen3_moe_pretrained_model_init_weights
 
 
 def apply_veomni_qwen3_moe_patch():
@@ -289,7 +298,8 @@ def apply_veomni_qwen3_moe_patch():
     hf_qwen3_moe.Qwen3MoeForCausalLM.get_parallel_plan = lambda self: get_parallel_plan(use_gate_up_proj=False)
 
     hf_qwen3_moe.Qwen3MoeForCausalLM.forward = qwen3_moe_forcausal_lm_forward
-    hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = qwen3_moe_pretrained_model_init_weights
+    # Wrap the import-time snapshot, not the live attribute, so this is idempotent.
+    hf_qwen3_moe.Qwen3MoePreTrainedModel._init_weights = _make_qwen3_moe_init_weights(_HF_QWEN3_MOE_INIT_WEIGHTS)
 
     # Mirror the OpSlot onto the HF module so `_bind_veomni_ops` (which walks
     # `sys.modules[model.__class__.__module__]`) can find it. On transformers v4
