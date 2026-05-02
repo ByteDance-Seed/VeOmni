@@ -16,10 +16,11 @@
 
 A patched ``*ForCausalLM.forward`` returns this dataclass when called
 with ``return_log_probs=True``: ``log_probs`` carries per-token actual
-log-probabilities (non-positive), ``logits`` and ``loss`` are
-``None``. Imports are kept light (no ``veomni.data`` dependency) so
-external integrators (verl) can pull the dataclass without paying the
-data-pipeline import cost.
+log-probabilities (non-positive), ``entropy`` carries per-token softmax
+entropy (non-negative); ``logits`` and ``loss`` are ``None``. Imports
+are kept light (no ``veomni.data`` dependency) so external integrators
+(verl) can pull the dataclass without paying the data-pipeline import
+cost.
 """
 
 from dataclasses import dataclass
@@ -31,12 +32,19 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 @dataclass
 class CausalLMOutputWithLogProbs(CausalLMOutputWithPast):
-    """``CausalLMOutputWithPast`` extended with a per-token ``log_probs`` field.
+    """``CausalLMOutputWithPast`` extended with per-token ``log_probs`` and ``entropy`` fields.
 
-    ``log_probs`` shape matches the input ``labels`` (``[B, L]`` or
-    packed ``[L]``). Sign: non-positive — actual log-probabilities,
-    matches HF / verl conventions. Zero at IGNORE_INDEX positions and
-    the trailing pad slot.
+    Both tensors share the input ``labels`` shape (``[B, L]`` or packed
+    ``[L]``) and are zero at IGNORE_INDEX positions and the trailing
+    pad slot.
+
+    - ``log_probs``: non-positive — actual log-probabilities ``log p(y_t)``,
+      matches HF / verl conventions.
+    - ``entropy``: non-negative — softmax entropy
+      ``H[p] = -Σ_v p_v log p_v``, matches verl's
+      ``CausalLMOutputForPPO.entropy`` so the dataclass drops directly
+      into verl's ``prepare_model_outputs`` consumer.
     """
 
     log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None

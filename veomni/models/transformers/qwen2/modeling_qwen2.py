@@ -92,8 +92,9 @@ def qwen2_forcausallm_forward(
     loss = None
     logits = None
     log_probs = None
+    entropy = None
     if labels is not None:
-        loss, logits, log_probs = self.loss_function(
+        loss, logits, log_probs, entropy = self.loss_function(
             logits=logits,
             labels=labels,
             vocab_size=self.config.vocab_size,
@@ -109,6 +110,7 @@ def qwen2_forcausallm_forward(
         loss=loss,
         logits=logits,
         log_probs=log_probs,
+        entropy=entropy,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

@@ -20,15 +20,17 @@ cross-entropy computation to ``cross_entropy_fn`` — a single required-style
 keyword argument. The wrapper decides between two paths per call: the loss
 path (delegated to the bound ``cross_entropy_fn``) or — when the caller
 forwards ``return_log_probs=True`` through ``forward`` kwargs — the per-token
-log-probs path (delegated to ``chunk_logprobs_function``). The choice of
-which loss kernel to use is still made once, at ``install_loss_mapping`` /
-``KERNEL_REGISTRY.resolve`` time, and baked in via ``functools.partial``.
+log-probs + entropy path (delegated to ``chunk_logprobs_function``). The
+choice of which loss kernel to use is still made once, at
+``install_loss_mapping`` / ``KERNEL_REGISTRY.resolve`` time, and baked in via
+``functools.partial``.
 
-Wrapper return shape: ``(loss, logits, log_probs)``. The third slot is
-non-``None`` only on the log-probs path; on the loss path it is ``None`` so
-every model `forward` can do ``loss, _, log_probs = self.loss_function(...)``
-followed by ``outputs.log_probs = log_probs`` without a per-model branch on
-``return_log_probs``.
+Wrapper return shape: ``(loss, logits, log_probs, entropy)``. The third and
+fourth slots are non-``None`` only on the log-probs path; on the loss path
+they are ``None`` so every model `forward` can do
+``loss, _, log_probs, entropy = self.loss_function(...)`` followed by
+``outputs.log_probs = log_probs; outputs.entropy = entropy`` without a
+per-model branch on ``return_log_probs``.
 
 Two dispatch paths reach these wrappers:
 
@@ -84,15 +86,21 @@ def ForCausalLMLoss(
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
     # Per-call log-probs dispatch: when the caller passes `return_log_probs=True`
     # (the model `forward` simply forwards it through `**kwargs`), skip the loss
     # path and route hidden_states+weights+labels through the chunked log-probs
-    # kernel. The loss/logits slots are vacated; the third tuple slot carries
-    # the per-token log-probabilities back to the caller.
+    # kernel. The loss/logits slots are vacated; the third and fourth tuple
+    # slots carry the per-token log-probabilities and softmax entropy back to
+    # the caller.
     return_log_probs = kwargs.pop("return_log_probs", False)
+    # ``temperature`` is part of the PPO actor contract — verl divides logits
+    # by it before log_softmax. Pop here so it does not propagate into the
+    # plain loss path (where it would trip the inner CE kernel) and so the
+    # ``return_log_probs`` branch can forward it explicitly to the kernel.
+    temperature = kwargs.pop("temperature", 1.0)
 
     assert hidden_states is not None or logits is not None, "hidden_states or logits must be provided."
 
@@ -104,14 +112,15 @@ def ForCausalLMLoss(
             raise ValueError("return_log_probs=True requires hidden_states (fused-linear path).")
         if weights is None:
             raise ValueError("return_log_probs=True requires weights (lm_head weight).")
-        log_probs = chunk_logprobs_function(
+        log_probs, entropy = chunk_logprobs_function(
             hidden_states,
             weights,
             labels,
             ignore_index=ignore_index,
             shift_labels=shift_labels,
+            temperature=temperature,
         )
-        return None, None, log_probs
+        return None, None, log_probs, entropy
 
     device = logits.device if logits is not None else hidden_states.device
     # Upcast to float if we need to compute the loss to avoid potential precision issues
@@ -155,7 +164,7 @@ def ForCausalLMLoss(
     if sp_enabled:
         num_valid_tokens = (labels != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
-    return loss, logits, None
+    return loss, logits, None, None
 
 
 def ForSequenceClassificationLoss(
@@ -170,7 +179,7 @@ def ForSequenceClassificationLoss(
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor | None, None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, None, None]:
     r"""
     Token-level loss for sequence classification.
 
@@ -209,16 +218,20 @@ def ForSequenceClassificationLoss(
             Always ``None`` for sequence classification — the third tuple slot
             exists to keep the wrapper return shape uniform with
             ``ForCausalLMLoss`` so model `forward` call sites can unpack
-            ``(loss, logits, log_probs)`` regardless of head type.
+            ``(loss, logits, log_probs, entropy)`` regardless of head type.
+        entropy (`None`):
+            Always ``None`` for sequence classification — fourth slot exists
+            for the same uniform-unpack reason as ``log_probs``.
     """
 
     # pop fused loss kwargs
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
-    # Seq-cls heads have no log-probs path. Pop the kwarg defensively so that a
-    # caller that always forwards ``return_log_probs`` doesn't trip the inner
-    # ``cross_entropy_fn`` with an unexpected kwarg.
+    # Seq-cls heads have no log-probs path. Pop these kwargs defensively so
+    # that a caller that always forwards them doesn't trip the inner
+    # ``cross_entropy_fn`` with unexpected kwargs.
     kwargs.pop("return_log_probs", None)
+    kwargs.pop("temperature", None)
 
     if hidden_states is None and logits is None:
         raise ValueError("Either hidden_states or logits must be provided.")
@@ -261,7 +274,7 @@ def ForSequenceClassificationLoss(
     if sp_enabled:
         num_valid_tokens = (target != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
-    return loss, logits, None
+    return loss, logits, None, None
 
 
 # ── LOSS_MAPPING installation ────────────────────────────────────────────────
@@ -288,26 +301,33 @@ def _resolve_cross_entropy_fn(impl: str) -> Callable:
     )
 
 
-def _chunk_loss_dispatch(*args, **kwargs) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """3-tuple shim for the ``chunk_loss`` LOSS_MAPPING entry.
+def _chunk_loss_dispatch(
+    *args, **kwargs
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """4-tuple shim for the ``chunk_loss`` LOSS_MAPPING entry.
 
     ``chunk_loss_function`` historically bypasses the ``ForCausalLMLoss``
     wrapper (it owns its own label shift + SP reduction) and is installed
     bare. To keep the wrapper return contract uniform — every model
-    forward unpacks ``loss, _, log_probs = self.loss_function(...)`` — we
-    wrap it in this shim:
+    forward unpacks ``loss, _, log_probs, entropy = self.loss_function(...)``
+    — we wrap it in this shim:
 
     - ``return_log_probs=True``: route ``hidden_states`` + ``weights`` +
       ``labels`` through ``chunk_logprobs_function``; return
-      ``(None, None, log_probs)``.
-    - otherwise: forward to ``chunk_loss_function`` and append a ``None``
-      log_probs slot to its 2-tuple return.
+      ``(None, None, log_probs, entropy)``. ``temperature`` (defaults to
+      1.0) is forwarded so the PPO actor path can scale logits inside
+      the kernel.
+    - otherwise: forward to ``chunk_loss_function`` and append two
+      ``None`` slots (log_probs, entropy) to its 2-tuple return. Pop
+      ``temperature`` defensively so a caller that always forwards it
+      doesn't trip ``chunk_loss_function``'s signature.
 
     Args/kwargs are forwarded as-is — model `forward` only ever calls this
     via keyword (``self.loss_function(logits=..., labels=..., hidden_states=...,
     weights=..., **kwargs)``), so a single ``**kwargs`` parameter is enough.
     """
     return_log_probs = kwargs.pop("return_log_probs", False)
+    temperature = kwargs.pop("temperature", 1.0)
 
     if return_log_probs:
         hidden_states = kwargs.get("hidden_states")
@@ -315,17 +335,18 @@ def _chunk_loss_dispatch(*args, **kwargs) -> tuple[torch.Tensor | None, torch.Te
         labels = kwargs.get("labels")
         if hidden_states is None or weights is None:
             raise ValueError("return_log_probs=True requires hidden_states and weights (fused-linear path).")
-        log_probs = chunk_logprobs_function(
+        log_probs, entropy = chunk_logprobs_function(
             hidden_states,
             weights,
             labels,
             ignore_index=kwargs.get("ignore_index", -100),
             shift_labels=kwargs.get("shift_labels"),
+            temperature=temperature,
         )
-        return None, None, log_probs
+        return None, None, log_probs, entropy
 
     loss, logits_out = chunk_loss_function(*args, **kwargs)
-    return loss, logits_out, None
+    return loss, logits_out, None, None
 
 
 def install_loss_mapping(impl: str = "eager") -> str:
@@ -340,20 +361,23 @@ def install_loss_mapping(impl: str = "eager") -> str:
     ``ForCausalLMLoss``).
 
     Contract — return type: **VeOmni's wrappers return ``(loss, logits,
-    log_probs)``**, not a bare ``torch.Tensor``. The 3-tuple is
+    log_probs, entropy)``**, not a bare ``torch.Tensor``. The 4-tuple is
     load-bearing: fused kernels (Liger fused linear+CE, NPU
     ``chunk_loss_function``) fold the ``lm_head`` projection into the loss,
     so the kernel — not the caller — is where logits come out. The third
-    slot, ``log_probs``, is non-``None`` only on the per-token log-probs
-    path — when the caller passes ``return_log_probs=True`` through
+    and fourth slots, ``log_probs`` and ``entropy``, are non-``None`` only
+    on the per-token log-probs path — when the caller passes
+    ``return_log_probs=True`` (and optionally ``temperature=...``) through
     ``forward`` kwargs, the wrapper short-circuits to
-    ``chunk_logprobs_function`` and returns ``(None, None, log_probs)``.
-    Every VeOmni-patched v5 modeling file in-tree unpacks as
-    ``loss, _, log_probs = self.loss_function(...)`` (or
-    ``loss, logits, log_probs = ...`` when the caller needs the fused
-    logits). The model `forward` then assigns
-    ``outputs.log_probs = log_probs`` so per-token log-probs surface on the
-    standard ``ModelOutput`` without a per-model early-exit branch.
+    ``chunk_logprobs_function`` and returns
+    ``(None, None, log_probs, entropy)``. Every VeOmni-patched v5 modeling
+    file in-tree unpacks as
+    ``loss, _, log_probs, entropy = self.loss_function(...)`` (or
+    ``loss, logits, log_probs, entropy = ...`` when the caller needs the
+    fused logits). The model `forward` then assigns
+    ``outputs.log_probs = log_probs; outputs.entropy = entropy`` so
+    per-token log-probs and entropy surface on the standard ``ModelOutput``
+    without a per-model early-exit branch.
 
     This diverges from upstream ``transformers.loss.loss_utils.ForCausalLMLoss``
     which returns a bare ``Tensor``. Mixing ``install_loss_mapping`` with

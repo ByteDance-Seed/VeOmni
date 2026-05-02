@@ -1099,7 +1099,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2157,34 @@
+@@ -1775,15 +2157,36 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1109,13 +1109,14 @@
          loss = None
 +        logits = None
 +        log_probs = None
++        entropy = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 -
 -        return CausalLMOutputWithPast(
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs = veomni_causal_lm_loss(
++                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.vocab_size,
@@ -1125,7 +1126,7 @@
 +                )
 +            else:
 +                logits = self.lm_head(hidden_states)
-+                loss, _, log_probs = self.loss_function(
++                loss, _, log_probs, entropy = self.loss_function(
 +                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
 +                )
 +        else:
@@ -1135,10 +1136,11 @@
              loss=loss,
              logits=logits,
 +            log_probs=log_probs,
++            entropy=entropy,
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2218,12 @@
+@@ -1817,6 +2220,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1151,7 +1153,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1888,53 +2295,6 @@
+@@ -1888,53 +2297,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5CausalLMOutputWithPast:
@@ -1205,7 +1207,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,16 +2310,33 @@
+@@ -1950,16 +2312,34 @@
          )
 
          hidden_states = outputs[0]
@@ -1218,13 +1220,14 @@
          loss = None
 +        logits = None
 +        log_probs = None
++        entropy = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 -
 -        return Qwen3_5CausalLMOutputWithPast(
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs = veomni_causal_lm_loss(
++                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -1234,7 +1237,7 @@
 +                )
 +            else:
 +                logits = self.lm_head(hidden_states)
-+                loss, _, log_probs = self.loss_function(
++                loss, _, log_probs, entropy = self.loss_function(
 +                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
 +                )
 +        else:
@@ -1244,16 +1247,17 @@
              loss=loss,
              logits=logits,
              past_key_values=outputs.past_key_values,
-@@ -1967,6 +2344,8 @@
+@@ -1967,6 +2347,9 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
          )
 +        output.log_probs = log_probs
++        output.entropy = entropy
 +        return output
 
      def prepare_inputs_for_generation(
          self,
-@@ -2192,6 +2571,13 @@
+@@ -2192,6 +2575,13 @@
 
          return input_ids, model_kwargs
 

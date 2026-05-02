@@ -2163,10 +2163,11 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         loss = None
         logits = None
         log_probs = None
+        entropy = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs = veomni_causal_lm_loss(
+                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2177,9 +2178,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits, log_probs); unpack to match the OpSlot
-                # branch above.
-                loss, logits, log_probs = self.loss_function(
+                # returns (loss, logits, log_probs, entropy); unpack to match the
+                # OpSlot branch above.
+                loss, logits, log_probs, entropy = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
                 )
         else:
@@ -2219,6 +2220,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
             router_logits=getattr(outputs, "router_logits", None),
         )
         output.log_probs = log_probs
+        output.entropy = entropy
         return output
 
     def prepare_inputs_for_generation(

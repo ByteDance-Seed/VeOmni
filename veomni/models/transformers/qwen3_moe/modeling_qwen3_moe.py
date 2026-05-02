@@ -226,8 +226,9 @@ def qwen3_moe_forcausal_lm_forward(
     loss = None
     logits = None
     log_probs = None
+    entropy = None
     if labels is not None:
-        loss, logits, log_probs = self.loss_function(
+        loss, logits, log_probs, entropy = self.loss_function(
             logits=logits,
             labels=labels,
             vocab_size=self.config.vocab_size,
@@ -260,6 +261,7 @@ def qwen3_moe_forcausal_lm_forward(
         router_logits=outputs.router_logits,
     )
     output.log_probs = log_probs
+    output.entropy = entropy
     return output
 
 

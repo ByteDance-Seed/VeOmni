@@ -80,12 +80,12 @@ def _have_python_dev_headers() -> bool:
     return include is not None and os.path.isfile(os.path.join(include, "Python.h"))
 
 
-def _reference_log_probs_from_logits(
+def _reference_log_probs_and_entropy_from_logits(
     logits: torch.Tensor,
     labels: torch.Tensor,
     ignore_index: int = IGNORE_INDEX,
-) -> torch.Tensor:
-    """Reference per-token actual log-probabilities (non-positive).
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference per-token log-probabilities (non-positive) and entropy (non-negative).
 
     Routes the per-token NLL through the same
     ``_per_token_log_probs_from_logits`` helper the kernel uses (which
@@ -95,16 +95,26 @@ def _reference_log_probs_from_logits(
     only remaining numerical difference between this path and the
     chunked-fused-linear path is the lm_head matmul boundary —
     identical when ``chunk_size`` covers the whole seq, so the kernel
-    output stays bitwise equal.
+    output stays bitwise equal. Entropy is computed via the same
+    ``_per_token_entropy_from_logits`` helper for the same reason.
     """
-    from veomni.ops.kernels.cross_entropy.chunk_logprobs import _per_token_log_probs_from_logits
+    from veomni.ops.kernels.cross_entropy.chunk_logprobs import (
+        _per_token_entropy_from_logits,
+        _per_token_log_probs_from_logits,
+    )
 
     shifted = labels[..., 1:].contiguous()
     sliced = logits[..., :-1, :].contiguous()
     flat = sliced.reshape(-1, sliced.size(-1)).float()
-    log_probs_flat = _per_token_log_probs_from_logits(flat, shifted.reshape(-1), ignore_index)
+    target = shifted.reshape(-1)
+    log_probs_flat = _per_token_log_probs_from_logits(flat, target, ignore_index)
+    entropy_flat = _per_token_entropy_from_logits(flat)
+    mask = target != ignore_index
+    entropy_flat = torch.where(mask, entropy_flat, torch.zeros_like(entropy_flat))
+
     log_probs = log_probs_flat.view_as(shifted)
-    return F.pad(log_probs, (0, 1), value=0.0)  # non-positive: actual log p(y_t)
+    entropy = entropy_flat.view_as(shifted)
+    return F.pad(log_probs, (0, 1), value=0.0), F.pad(entropy, (0, 1), value=0.0)
 
 
 def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
@@ -210,16 +220,17 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
         labels[1, ::5] = IGNORE_INDEX
 
         with torch.no_grad():
-            # Reference path: full-logits forward + reference log-probs.
+            # Reference path: full-logits forward + reference log-probs / entropy.
             ref_logits = model(input_ids=input_ids, use_cache=False).logits
-            ref_log_probs = _reference_log_probs_from_logits(ref_logits, labels)
+            ref_log_probs, ref_entropy = _reference_log_probs_and_entropy_from_logits(ref_logits, labels)
 
             # New path: model wrapper installed by ``build_foundation_model``
             # makes ``model(..., return_log_probs=True)`` return
             # ``output.log_probs`` (actual log-probabilities, sign already
-            # flipped) and clear ``output.logits``. ``chunk_size=L+1``
-            # forces a single chunk so the matmul boundary matches the
-            # reference forward exactly.
+            # flipped) and ``output.entropy`` (per-token softmax entropy)
+            # and clear ``output.logits``. ``chunk_size=L+1`` forces a
+            # single chunk so the matmul boundary matches the reference
+            # forward exactly.
             out = model(
                 input_ids=input_ids,
                 labels=labels,
@@ -251,23 +262,50 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
             f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
         )
 
+    # Entropy contract: same shape as log_probs, populated, bitwise equal
+    # to the reference (same ``_per_token_entropy_from_logits`` helper on
+    # the same fp32 logits).
+    assert out.entropy is not None, f"[{family}/{ce_impl}] entropy must be populated when return_log_probs=True"
+    assert out.entropy.shape == labels.shape, (
+        f"[{family}/{ce_impl}] entropy shape {tuple(out.entropy.shape)} != labels shape {tuple(labels.shape)}"
+    )
+    if not torch.equal(out.entropy, ref_entropy):
+        diff = (out.entropy - ref_entropy).abs()
+        ne = out.entropy != ref_entropy
+        first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
+        raise AssertionError(
+            f"[{family}/{ce_impl}] per-token entropy not bitwise equal: "
+            f"{int(ne.sum().item())}/{out.entropy.numel()} mismatched, "
+            f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
+        )
+
     # IGNORE_INDEX masking contract: the kernel emits exactly 0 wherever
     # the shifted target is IGN (and at the trailing pad position). The
     # kernel predicts ``labels[t+1]`` from ``hidden[t]``, so an IGN at
-    # ``labels[k]`` zeros output position ``k-1``.
+    # ``labels[k]`` zeros output position ``k-1``. Both log_probs and
+    # entropy follow the same masking contract.
     shifted_target_is_ign = F.pad(labels[..., 1:] == IGNORE_INDEX, (0, 1), value=True)
-    masked_vals = out.log_probs[shifted_target_is_ign]
-    valid_vals = out.log_probs[~shifted_target_is_ign]
-    assert torch.all(masked_vals == 0.0), (
-        f"[{family}/{ce_impl}] IGN-target positions must emit 0.0, got max_abs={masked_vals.abs().max().item():.3e}"
+    masked_lp = out.log_probs[shifted_target_is_ign]
+    valid_lp = out.log_probs[~shifted_target_is_ign]
+    masked_ent = out.entropy[shifted_target_is_ign]
+    valid_ent = out.entropy[~shifted_target_is_ign]
+    assert torch.all(masked_lp == 0.0), (
+        f"[{family}/{ce_impl}] IGN-target positions must emit 0.0 log_probs, got max_abs={masked_lp.abs().max().item():.3e}"
+    )
+    assert torch.all(masked_ent == 0.0), (
+        f"[{family}/{ce_impl}] IGN-target positions must emit 0.0 entropy, got max_abs={masked_ent.abs().max().item():.3e}"
     )
     # log p(.) < 0 strictly for any non-degenerate distribution at random
     # init (probability < 1).
-    assert torch.all(valid_vals < 0), (
-        f"[{family}/{ce_impl}] valid-target positions must emit negative log_probs, got max={valid_vals.max().item():.3e}"
+    assert torch.all(valid_lp < 0), (
+        f"[{family}/{ce_impl}] valid-target positions must emit negative log_probs, got max={valid_lp.max().item():.3e}"
+    )
+    # H[p] > 0 strictly for any non-degenerate distribution.
+    assert torch.all(valid_ent > 0), (
+        f"[{family}/{ce_impl}] valid-target positions must emit positive entropy, got min={valid_ent.min().item():.3e}"
     )
 
-    del model, ref_logits, ref_log_probs, out
+    del model, ref_logits, ref_log_probs, ref_entropy, out
     _release()
 
 
@@ -276,20 +314,24 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
     """Pin the verl-consumer contract on the **plain model forward path**.
 
     Verl's ``FSDPEngineWithLMHead.prepare_model_outputs`` does
-    ``log_probs = output.log_probs.squeeze(0)`` in its
+    ``log_probs = output.log_probs.squeeze(0)`` and
+    ``entropy_rmpad = output.entropy.squeeze(0)`` in its
     ``use_fused_kernels=True`` branch and expects actual
-    log-probabilities (non-positive). The integration story is:
-    verl calls ``self.module(..., return_log_probs=True)`` directly —
-    no helper imports, no engine override — and the
+    log-probabilities (non-positive) plus per-token entropy
+    (non-negative). The integration story is: verl calls
+    ``self.module(..., return_log_probs=True)`` directly — no helper
+    imports, no engine override — and the
     ``build_foundation_model``-installed wrapper makes the output's
-    ``log_probs`` field populated automatically.
+    ``log_probs`` and ``entropy`` fields populated automatically.
 
     This test pins exactly that contract:
 
-    1. ``output.log_probs`` is populated, finite, shape matches labels.
+    1. ``output.log_probs`` and ``output.entropy`` are populated, finite,
+       shape matches labels.
     2. ``output.logits`` is None — wrapper cleared it after promotion.
     3. ``output.loss`` is None.
     4. ``output.log_probs <= 0`` everywhere (actual log-probabilities).
+    5. ``output.entropy >= 0`` everywhere (softmax entropy).
     """
     _skip_unless_cuda_v4(toy_path)
     _apply_determinism()
@@ -310,11 +352,17 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
     assert out.loss is None, f"[{family}] loss must be None when return_log_probs=True"
     assert out.logits is None, f"[{family}] logits must be cleared by the build_foundation_model wrapper"
     assert out.log_probs is not None, f"[{family}] log_probs must be populated by the build_foundation_model wrapper"
+    assert out.entropy is not None, f"[{family}] entropy must be populated by the build_foundation_model wrapper"
     assert out.log_probs.shape == labels.shape, (
         f"[{family}] log_probs shape {tuple(out.log_probs.shape)} != labels shape {tuple(labels.shape)}"
     )
+    assert out.entropy.shape == labels.shape, (
+        f"[{family}] entropy shape {tuple(out.entropy.shape)} != labels shape {tuple(labels.shape)}"
+    )
     assert torch.isfinite(out.log_probs).all(), f"[{family}] log_probs has non-finite values"
+    assert torch.isfinite(out.entropy).all(), f"[{family}] entropy has non-finite values"
     assert (out.log_probs <= 0).all(), f"[{family}] log_probs must be <= 0; got max={out.log_probs.max().item():.3e}"
+    assert (out.entropy >= 0).all(), f"[{family}] entropy must be >= 0; got min={out.entropy.min().item():.3e}"
 
     del model, out
     _release()

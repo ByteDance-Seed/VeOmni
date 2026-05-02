@@ -1030,10 +1030,11 @@ def qwen3_5_forcausallm_forward_patched(
     loss = None
     logits = None
     log_probs = None
+    entropy = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -1043,7 +1044,7 @@ def qwen3_5_forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _, log_probs = self.loss_function(
+            loss, _, log_probs, entropy = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
             )
     else:
@@ -1053,6 +1054,7 @@ def qwen3_5_forcausallm_forward_patched(
         loss=loss,
         logits=logits,
         log_probs=log_probs,
+        entropy=entropy,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
@@ -1120,10 +1122,11 @@ def qwen3_5_forconditional_generation_forward_patched(
     loss = None
     logits = None
     log_probs = None
+    entropy = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1133,7 +1136,7 @@ def qwen3_5_forconditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _, log_probs = self.loss_function(
+            loss, _, log_probs, entropy = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:
@@ -1148,4 +1151,5 @@ def qwen3_5_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
     )
     output.log_probs = log_probs
+    output.entropy = entropy
     return output

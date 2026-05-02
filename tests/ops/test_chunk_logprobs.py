@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for chunked fused linear log-probs (PPO-style).
+"""Tests for chunked fused linear log-probs and entropy (PPO-style).
 
 Pin **bitwise** parity vs a reference ``F.linear -> log_softmax ->
 gather`` implementation under deterministic algorithms + batch-invariant
@@ -20,7 +20,8 @@ mode on CUDA. Same contract that
 ``tests/models/test_return_log_probs_e2e.py::
 test_return_log_probs_bitwise_matches_logits_reference`` enforces
 end-to-end. The kernel returns per-token actual log-probabilities
-(non-positive); IGNORE_INDEX positions produce 0.
+(non-positive) **and** softmax entropy (non-negative); IGNORE_INDEX
+positions produce 0 in both outputs.
 """
 
 import os
@@ -115,13 +116,14 @@ def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, label: s
         )
 
 
-def _reference_per_token_log_probs(
+def _reference_per_token(
     hidden_states: torch.Tensor,
     weights: torch.Tensor,
     labels: torch.Tensor,
+    temperature: float = 1.0,
     ignore_index: int = IGNORE_INDEX,
-) -> torch.Tensor:
-    """Reference impl: full-logits gather. Used as ground truth.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference impl: full-logits gather + entropy. Used as ground truth.
 
     Routes the per-token NLL through the same
     ``_per_token_log_probs_from_logits`` helper the kernel uses (which
@@ -135,10 +137,20 @@ def _reference_per_token_log_probs(
     shifted = labels[..., 1:].contiguous()
     h = hidden_states[..., :-1, :].contiguous()
     flat = h.reshape(-1, h.size(-1))
-    logits = F.linear(flat, weights).float()
-    log_probs_flat = cl._per_token_log_probs_from_logits(logits, shifted.reshape(-1), ignore_index)
+    logits = F.linear(flat, weights)
+    if temperature != 1.0:
+        logits = logits / temperature
+    logits = logits.float()
+    target = shifted.reshape(-1)
+    log_probs_flat = cl._per_token_log_probs_from_logits(logits, target, ignore_index)
+    entropy_flat = cl._per_token_entropy_from_logits(logits)
+    # Mask entropy at IGN to mirror kernel.
+    mask = target != ignore_index
+    entropy_flat = torch.where(mask, entropy_flat, torch.zeros_like(entropy_flat))
+
     log_probs = log_probs_flat.view_as(shifted)
-    return F.pad(log_probs, (0, 1), value=0.0)
+    entropy = entropy_flat.view_as(shifted)
+    return F.pad(log_probs, (0, 1), value=0.0), F.pad(entropy, (0, 1), value=0.0)
 
 
 def test_bitwise_parity_with_reference():
@@ -147,7 +159,8 @@ def test_bitwise_parity_with_reference():
     With ``chunk_size`` > total tokens the kernel collapses to one
     ``h @ weight.t()``; under batch-invariant mode that matmul + the
     log_softmax + gather are bitwise identical to the reference's
-    single ``F.linear`` + log_softmax + gather.
+    single ``F.linear`` + log_softmax + gather. Asserts both outputs
+    (log_probs and entropy).
     """
     torch.manual_seed(0)
     B, L, H, V = 2, 64, 32, 256
@@ -157,61 +170,108 @@ def test_bitwise_parity_with_reference():
     labels[0, ::7] = IGNORE_INDEX
     labels[1, 0] = IGNORE_INDEX
 
-    out = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=B * L + 1)
-    ref = _reference_per_token_log_probs(hidden, weights, labels)
+    log_probs, entropy = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=B * L + 1)
+    ref_log_probs, ref_entropy = _reference_per_token(hidden, weights, labels)
 
-    _assert_bitwise_equal(out, ref, "log_probs")
+    _assert_bitwise_equal(log_probs, ref_log_probs, "log_probs")
+    _assert_bitwise_equal(entropy, ref_entropy, "entropy")
+
+
+def test_temperature_scales_logits_bitwise():
+    """``temperature != 1.0`` divides logits before softmax.
+
+    Pin bitwise parity vs the reference path that applies the same
+    ``logits = logits / T`` divide before ``log_softmax + gather`` and
+    entropy. Confirms the wrapper ``temperature`` kwarg threads through
+    the kernel (and not e.g. silently dropped).
+    """
+    torch.manual_seed(0)
+    B, L, H, V = 2, 32, 16, 64
+    hidden = torch.randn(B, L, H, dtype=torch.float32, device=_device())
+    weights = torch.randn(V, H, dtype=torch.float32, device=_device())
+    labels = torch.randint(0, V, (B, L), dtype=torch.long, device=_device())
+
+    T = 2.5
+    log_probs, entropy = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=B * L + 1, temperature=T)
+    ref_log_probs, ref_entropy = _reference_per_token(hidden, weights, labels, temperature=T)
+
+    _assert_bitwise_equal(log_probs, ref_log_probs, "log_probs (T=2.5)")
+    _assert_bitwise_equal(entropy, ref_entropy, "entropy (T=2.5)")
 
 
 def test_ignore_index_zeroes_output_and_grad():
-    """All-IGN labels emit exactly zero output and zero gradient."""
+    """All-IGN labels emit exactly zero outputs and zero gradients.
+
+    Both ``log_probs`` and ``entropy`` are masked to 0 at IGN positions
+    (so summing either over the seq gives "value at supervised slots
+    only"), and no gradient flows through hidden_states / weights.
+    """
     torch.manual_seed(0)
     B, L, H, V = 1, 8, 4, 16
     hidden = torch.randn(B, L, H, dtype=torch.float32, device=_device(), requires_grad=True)
     weights = torch.randn(V, H, dtype=torch.float32, device=_device(), requires_grad=True)
     labels = torch.full((B, L), IGNORE_INDEX, dtype=torch.long, device=_device())
 
-    out = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=4)
-    assert torch.all(out == 0)
+    log_probs, entropy = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=4)
+    assert torch.all(log_probs == 0)
+    assert torch.all(entropy == 0)
 
-    out.sum().backward()
+    (log_probs.sum() + entropy.sum()).backward()
     assert torch.all(hidden.grad == 0)
     assert torch.all(weights.grad == 0)
 
 
-def _manual_backward_per_token_log_probs(
+def _manual_backward_per_token(
     hidden: torch.Tensor,
     weights: torch.Tensor,
     labels: torch.Tensor,
-    grad_target: torch.Tensor,
+    grad_log_probs: torch.Tensor | None,
+    grad_entropy: torch.Tensor | None,
+    temperature: float = 1.0,
     ignore_index: int = IGNORE_INDEX,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Hand-derived backward matching the kernel's explicit op sequence.
 
-    The kernel's backward computes
-    ``dlogits = dlp * (one_hot - softmax(logits))`` then
-    ``dhidden = dlogits @ weight`` and
-    ``dweight = dlogits.t() @ hidden`` (single chunk). PyTorch's stock
-    autograd path through ``log_softmax + gather`` is mathematically
-    equivalent but sequences the fp32 ops differently (scatter-then-
-    subtract vs subtract-then-multiply), so the two paths' grads agree
-    only at fp32 epsilon (~1e-7), not bitwise. To pin **bitwise**
-    parity under batch-invariant ``mm``, we mirror the kernel's
-    op sequence here and use this as the reference instead.
+    Mirrors verl's ``_fused_linear_for_ppo_bwd`` exactly:
+    ``dlogits_lp = dlp * (one_hot - softmax)``,
+    ``dlogits_ent = -dent * softmax * (log_softmax + entropy)``,
+    summed; cast back to input dtype, divide by T, then matmul.
+    PyTorch's stock autograd path through ``log_softmax + gather`` is
+    mathematically equivalent but sequences the fp32 ops differently
+    (scatter-then-subtract vs subtract-then-multiply), so the two paths'
+    grads agree only at fp32 epsilon (~1e-7), not bitwise.
     """
     shifted = labels[..., 1:].contiguous()
     h = hidden[..., :-1, :].contiguous()
     flat = h.reshape(-1, h.size(-1))
     target = shifted.reshape(-1)
-    grad_flat = grad_target[..., :-1].reshape(-1)
 
-    logits = F.linear(flat, weights).float()
+    logits = F.linear(flat, weights)
+    if temperature != 1.0:
+        logits = logits / temperature
+    logits = logits.float()
     probs = logits.softmax(dim=-1)
     mask = (target != ignore_index).float()
-    safe = target.clamp(min=0).unsqueeze(-1)
-    one_hot = torch.zeros_like(probs).scatter_(-1, safe, 1.0)
-    masked_dlp = (grad_flat * mask).unsqueeze(-1)
-    dlogits = masked_dlp * (one_hot - probs)
+
+    dlogits = torch.zeros_like(probs)
+
+    if grad_log_probs is not None:
+        dlp_flat = grad_log_probs[..., :-1].reshape(-1)
+        safe = target.clamp(min=0).unsqueeze(-1)
+        one_hot = torch.zeros_like(probs).scatter_(-1, safe, 1.0)
+        masked_dlp = (dlp_flat * mask).unsqueeze(-1)
+        dlogits = dlogits + masked_dlp * (one_hot - probs)
+
+    if grad_entropy is not None:
+        dent_flat = grad_entropy[..., :-1].reshape(-1)
+        log_probs_full = logits.log_softmax(dim=-1)
+        entropy_full = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+        masked_dent = (dent_flat * mask).unsqueeze(-1)
+        dlogits = dlogits + probs * (log_probs_full + entropy_full.unsqueeze(-1)) * (-masked_dent)
+
+    dlogits = dlogits.to(flat.dtype)
+    if temperature != 1.0:
+        dlogits = dlogits / temperature
 
     dhidden_flat = dlogits @ weights
     dweight = dlogits.t() @ flat
@@ -222,7 +282,7 @@ def _manual_backward_per_token_log_probs(
 
 
 def test_chunk_size_invariance_forward_and_grad():
-    """Output, dhidden and dweight are bitwise invariant to ``chunk_size``.
+    """Outputs and gradients are bitwise invariant to ``chunk_size``.
 
     Under batch-invariant ``mm`` / ``_log_softmax``, every per-row
     forward output is independent of which other rows are in the matmul,
@@ -246,23 +306,27 @@ def test_chunk_size_invariance_forward_and_grad():
     labels[0, 11] = IGNORE_INDEX
     labels[0, 23] = IGNORE_INDEX
 
-    grad_target = torch.randn(B, L, dtype=torch.float32, device=_device())
+    grad_lp = torch.randn(B, L, dtype=torch.float32, device=_device())
+    grad_ent = torch.randn(B, L, dtype=torch.float32, device=_device())
 
     chunk_sizes = (24, 1024)
-    outputs = []
+    log_probs_outs = []
+    entropy_outs = []
     grads_h = []
     grads_w = []
     for chunk_size in chunk_sizes:
         h = hidden0.clone().requires_grad_(True)
         w = weights0.clone().requires_grad_(True)
-        out = cl.chunk_logprobs_function(h, w, labels, chunk_size=chunk_size)
-        (out * grad_target).sum().backward()
-        outputs.append(out.detach())
+        log_probs, entropy = cl.chunk_logprobs_function(h, w, labels, chunk_size=chunk_size)
+        ((log_probs * grad_lp).sum() + (entropy * grad_ent).sum()).backward()
+        log_probs_outs.append(log_probs.detach())
+        entropy_outs.append(entropy.detach())
         grads_h.append(h.grad.detach())
         grads_w.append(w.grad.detach())
 
-    for i in range(1, len(outputs)):
-        _assert_bitwise_equal(outputs[i], outputs[0], f"forward[chunk_size={chunk_sizes[i]}]")
+    for i in range(1, len(chunk_sizes)):
+        _assert_bitwise_equal(log_probs_outs[i], log_probs_outs[0], f"log_probs[chunk_size={chunk_sizes[i]}]")
+        _assert_bitwise_equal(entropy_outs[i], entropy_outs[0], f"entropy[chunk_size={chunk_sizes[i]}]")
         _assert_bitwise_equal(grads_h[i], grads_h[0], f"dhidden[chunk_size={chunk_sizes[i]}]")
         _assert_bitwise_equal(grads_w[i], grads_w[0], f"dweight[chunk_size={chunk_sizes[i]}]")
 
@@ -270,13 +334,14 @@ def test_chunk_size_invariance_forward_and_grad():
 def test_grad_matches_reference():
     """Gradients are bitwise identical to a hand-derived backward reference.
 
-    Uses ``_manual_backward_per_token_log_probs`` (which mirrors the
-    kernel's explicit ``dlogits = dlp * (one_hot - softmax)`` form
-    instead of relying on autograd's ``log_softmax + gather``
-    backward). Forces ``chunk_size > total tokens`` so the kernel's
-    ``dweight = dlogits.t() @ h_chunk`` is a single mm matching the
-    reference's single mm against the same matrices. Under
-    batch-invariant ``mm`` both paths produce bit-identical gradients.
+    Uses ``_manual_backward_per_token`` (which mirrors the kernel's
+    explicit ``dlogits = dlp * (one_hot - softmax) - dent * softmax *
+    (log_softmax + entropy)`` form instead of relying on autograd's
+    ``log_softmax + gather`` backward). Forces ``chunk_size > total
+    tokens`` so the kernel's ``dweight = dlogits.t() @ h_chunk`` is a
+    single mm matching the reference's single mm. Under batch-invariant
+    ``mm`` both paths produce bit-identical gradients across **both**
+    log_probs and entropy upstream gradients.
     """
     torch.manual_seed(42)
     B, L, H, V = 2, 32, 16, 64
@@ -285,17 +350,21 @@ def test_grad_matches_reference():
     labels = torch.randint(0, V, (B, L), dtype=torch.long, device=_device())
     labels[0, ::5] = IGNORE_INDEX
 
-    grad_target = torch.randn(B, L, dtype=torch.float32, device=_device())
+    grad_lp = torch.randn(B, L, dtype=torch.float32, device=_device())
+    grad_ent = torch.randn(B, L, dtype=torch.float32, device=_device())
 
     h_a = hidden0.clone().requires_grad_(True)
     w_a = weights0.clone().requires_grad_(True)
-    out_a = cl.chunk_logprobs_function(h_a, w_a, labels, chunk_size=B * L + 1)
-    (out_a * grad_target).sum().backward()
+    log_probs_a, entropy_a = cl.chunk_logprobs_function(h_a, w_a, labels, chunk_size=B * L + 1)
+    ((log_probs_a * grad_lp).sum() + (entropy_a * grad_ent).sum()).backward()
 
-    out_ref = _reference_per_token_log_probs(hidden0, weights0, labels)
-    dhidden_ref, dweight_ref = _manual_backward_per_token_log_probs(hidden0, weights0, labels, grad_target)
+    ref_log_probs, ref_entropy = _reference_per_token(hidden0, weights0, labels)
+    dhidden_ref, dweight_ref = _manual_backward_per_token(
+        hidden0, weights0, labels, grad_log_probs=grad_lp, grad_entropy=grad_ent
+    )
 
-    _assert_bitwise_equal(out_a.detach(), out_ref, "log_probs")
+    _assert_bitwise_equal(log_probs_a.detach(), ref_log_probs, "log_probs")
+    _assert_bitwise_equal(entropy_a.detach(), ref_entropy, "entropy")
     _assert_bitwise_equal(h_a.grad, dhidden_ref, "dhidden")
     _assert_bitwise_equal(w_a.grad, dweight_ref, "dweight")
 
@@ -305,7 +374,8 @@ def test_sp_enabled_skips_internal_shift(monkeypatch):
 
     Reference computes ``F.linear(hidden) -> log_softmax -> gather``
     against the *un-shifted* labels, and asserts bitwise equality to
-    the kernel under batch-invariant mode.
+    the kernel under batch-invariant mode. Both log_probs and entropy
+    are validated.
     """
     monkeypatch.setattr(cl, "get_parallel_state", lambda: _FakePS(sp_enabled=True))
 
@@ -315,14 +385,20 @@ def test_sp_enabled_skips_internal_shift(monkeypatch):
     weights = torch.randn(V, H, dtype=torch.float32, device=_device())
     labels = torch.randint(0, V, (B, L), dtype=torch.long, device=_device())
 
-    out = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=B * L + 1)
-    assert out.shape == labels.shape
+    log_probs, entropy = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=B * L + 1)
+    assert log_probs.shape == labels.shape
+    assert entropy.shape == labels.shape
 
     flat = hidden.reshape(-1, H)
     logits = F.linear(flat, weights).float()
-    expected_flat = cl._per_token_log_probs_from_logits(logits, labels.reshape(-1), IGNORE_INDEX)
-    expected = expected_flat.view_as(labels)
-    _assert_bitwise_equal(out, expected, "log_probs (sp_enabled)")
+    target = labels.reshape(-1)
+    expected_lp = cl._per_token_log_probs_from_logits(logits, target, IGNORE_INDEX).view_as(labels)
+    expected_ent = cl._per_token_entropy_from_logits(logits)
+    mask = target != IGNORE_INDEX
+    expected_ent = torch.where(mask, expected_ent, torch.zeros_like(expected_ent)).view_as(labels)
+
+    _assert_bitwise_equal(log_probs, expected_lp, "log_probs (sp_enabled)")
+    _assert_bitwise_equal(entropy, expected_ent, "entropy (sp_enabled)")
 
 
 def _maybe_load_verl_fused_linear_for_ppo():
@@ -345,22 +421,26 @@ def _maybe_load_verl_fused_linear_for_ppo():
     return mod.FusedLinearForPPOFunction
 
 
-def test_bitwise_parity_with_verl_fused_linear_for_ppo():
+@pytest.mark.parametrize("temperature", [1.0, 0.7, 2.5])
+def test_bitwise_parity_with_verl_fused_linear_for_ppo(temperature):
     """VeOmni ``chunk_logprobs_function`` is bitwise equal to verl's
-    ``FusedLinearForPPOFunction[0]`` (token_log_probs).
+    ``FusedLinearForPPOFunction`` (token_log_probs **and** entropy).
 
     Both kernels:
       1. Compute ``logits = (h @ w.t()) / T`` in input dtype, then upcast to fp32.
       2. Route per-token NLL through ``flash_attn``'s triton CE kernel.
       3. Negate to get actual log-probabilities.
-      4. Compute backward via explicit ``dlogits = dlp * (one_hot - softmax)``,
-         cast to input dtype, divide by T, then matmul.
+      4. Compute entropy ``H[p] = logsumexp(logits) - sum(p * logits)``.
+      5. Compute backward via explicit ``dlogits = dlp * (one_hot - softmax)
+         + (-dent) * softmax * (log_softmax + entropy)``, cast to input dtype,
+         divide by T, then matmul.
 
     Pinning the parity here keeps the verl ↔ VeOmni integration story
-    "drop-in": a model trained under VeOmni's per-token log-probs path
-    produces the same fp32 numbers as the same model invoked through
-    verl's fused PPO kernel, under deterministic + batch-invariant
-    mode.
+    "drop-in": a model trained under VeOmni's per-token log-probs +
+    entropy path produces the same fp32 numbers as the same model
+    invoked through verl's fused PPO kernel, under deterministic +
+    batch-invariant mode. The parametrize over temperature confirms
+    the temperature passthrough survives the verl↔VeOmni boundary.
     """
     verl_fn = _maybe_load_verl_fused_linear_for_ppo()
     if verl_fn is None:
@@ -374,23 +454,32 @@ def test_bitwise_parity_with_verl_fused_linear_for_ppo():
     # match its scope by avoiding IGN labels here.
     labels = torch.randint(0, V, (B, L), dtype=torch.long, device=_device())
 
-    grad_target = torch.randn(B, L, dtype=torch.float32, device=_device())
+    grad_lp = torch.randn(B, L, dtype=torch.float32, device=_device())
+    grad_ent = torch.randn(B, L, dtype=torch.float32, device=_device())
     chunk_size = B * L + 1  # single-chunk boundary for both kernels
 
     # VeOmni — pass ``shift_labels=labels`` so the wrapper treats them
     # as already-aligned (verl's kernel never applies a causal shift,
     # mirroring that here keeps the per-token output aligned for a
     # bit-for-bit comparison).
-    out_a = cl.chunk_logprobs_function(hidden_a, weights_a, labels, chunk_size=chunk_size, shift_labels=labels)
-    (out_a * grad_target).sum().backward()
+    log_probs_a, entropy_a = cl.chunk_logprobs_function(
+        hidden_a,
+        weights_a,
+        labels,
+        chunk_size=chunk_size,
+        shift_labels=labels,
+        temperature=temperature,
+    )
+    ((log_probs_a * grad_lp).sum() + (entropy_a * grad_ent).sum()).backward()
 
     # verl — same inputs cloned, no causal shift inside
     hidden_b = hidden_a.detach().clone().requires_grad_(True)
     weights_b = weights_a.detach().clone().requires_grad_(True)
-    out_b, _entropy_b = verl_fn.apply(hidden_b, weights_b, labels, 1.0, chunk_size)
-    (out_b * grad_target).sum().backward()
+    log_probs_b, entropy_b = verl_fn.apply(hidden_b, weights_b, labels, temperature, chunk_size)
+    ((log_probs_b * grad_lp).sum() + (entropy_b * grad_ent).sum()).backward()
 
-    _assert_bitwise_equal(out_a, out_b, "log_probs vs verl")
+    _assert_bitwise_equal(log_probs_a, log_probs_b, "log_probs vs verl")
+    _assert_bitwise_equal(entropy_a, entropy_b, "entropy vs verl")
     _assert_bitwise_equal(hidden_a.grad, hidden_b.grad, "dhidden vs verl")
     _assert_bitwise_equal(weights_a.grad, weights_b.grad, "dweight vs verl")
 
@@ -402,7 +491,7 @@ def test_explicit_shift_labels_overrides_internal_shift():
     wrapper builds ``shift_labels = F.pad(labels, (0, 1), IGN)[..., 1:]``
     so each label position is already the next-token target. The kernel
     must consume that directly (no internal shift, no trailing pad) and
-    return a tensor whose seq length matches the *passed* shift_labels.
+    return tensors whose seq length matches the *passed* shift_labels.
     """
     torch.manual_seed(11)
     B, L, H, V = 2, 16, 8, 32
@@ -412,12 +501,20 @@ def test_explicit_shift_labels_overrides_internal_shift():
     labels[0, 3] = IGNORE_INDEX
 
     shift_labels = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
-    out = cl.chunk_logprobs_function(hidden, weights, labels, chunk_size=B * L + 1, shift_labels=shift_labels)
+    log_probs, entropy = cl.chunk_logprobs_function(
+        hidden, weights, labels, chunk_size=B * L + 1, shift_labels=shift_labels
+    )
 
-    assert out.shape == shift_labels.shape
+    assert log_probs.shape == shift_labels.shape
+    assert entropy.shape == shift_labels.shape
 
     flat = hidden.reshape(-1, H)
     logits = F.linear(flat, weights).float()
-    expected_flat = cl._per_token_log_probs_from_logits(logits, shift_labels.reshape(-1), IGNORE_INDEX)
-    expected = expected_flat.view_as(shift_labels)
-    _assert_bitwise_equal(out, expected, "log_probs (explicit shift_labels)")
+    target = shift_labels.reshape(-1)
+    expected_lp = cl._per_token_log_probs_from_logits(logits, target, IGNORE_INDEX).view_as(shift_labels)
+    expected_ent = cl._per_token_entropy_from_logits(logits)
+    mask = target != IGNORE_INDEX
+    expected_ent = torch.where(mask, expected_ent, torch.zeros_like(expected_ent)).view_as(shift_labels)
+
+    _assert_bitwise_equal(log_probs, expected_lp, "log_probs (explicit shift_labels)")
+    _assert_bitwise_equal(entropy, expected_ent, "entropy (explicit shift_labels)")

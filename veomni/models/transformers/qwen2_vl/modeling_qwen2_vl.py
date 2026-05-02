@@ -489,8 +489,9 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
         loss = None
         logits = None
         log_probs = None
+        entropy = None
         if labels is not None:
-            loss, logits, log_probs = self.loss_function(
+            loss, logits, log_probs, entropy = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -511,6 +512,7 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
             rope_deltas=outputs.rope_deltas,
         )
         output.log_probs = log_probs
+        output.entropy = entropy
         return output
 
 

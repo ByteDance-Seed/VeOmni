@@ -2162,10 +2162,11 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         loss = None
         logits = None
         log_probs = None
+        entropy = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs = veomni_causal_lm_loss(
+                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -2175,7 +2176,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _, log_probs = self.loss_function(
+                loss, _, log_probs, entropy = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
                 )
         else:
@@ -2185,6 +2186,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             loss=loss,
             logits=logits,
             log_probs=log_probs,
+            entropy=entropy,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -2317,10 +2319,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         loss = None
         logits = None
         log_probs = None
+        entropy = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs = veomni_causal_lm_loss(
+                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2330,7 +2333,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _, log_probs = self.loss_function(
+                loss, _, log_probs, entropy = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
                 )
         else:
@@ -2345,6 +2348,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             rope_deltas=outputs.rope_deltas,
         )
         output.log_probs = log_probs
+        output.entropy = entropy
         return output
 
     def prepare_inputs_for_generation(
