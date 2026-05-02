@@ -138,6 +138,26 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 - `num_k_heads` and `num_v_heads` (linear attention head counts) must be divisible by
   `ulysses_parallel_size`.
 
+### Selecting linear-attention kernels
+
+GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`, and
+`chunk_gated_delta_rule`. Each defaults to `auto`, which resolves to:
+
+- **GPU** — `fla` (the FLA Triton kernels shipped under the `gpu` extra; required for
+  varlen training).
+- **NPU** — `eager` (no FLA / FlashQLA backend is registered for Ascend today; varlen
+  training raises at runtime).
+
+To switch `chunk_gated_delta_rule` to QwenLM's [`flash-qla`](https://github.com/QwenLM/FlashQLA)
+kernel, install the optional extra (`uv sync --extra flash-qla ...`) and set the field
+explicitly:
+
+```yaml
+model:
+  ops_implementation:
+    chunk_gated_delta_rule_implementation: flash_qla
+```
+
 ### How It Works
 
 Qwen3.5 is a hybrid model alternating between softmax and linear attention layers:

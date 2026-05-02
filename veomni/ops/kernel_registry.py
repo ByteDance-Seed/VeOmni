@@ -37,14 +37,21 @@ class HardwareRequirement:
 
     device_type: str  # "gpu" | "npu"
     min_compute_capability: int | None = None  # e.g. 70, 80, 90
+    # Inclusive upper bound for kernels that don't yet support newer arches
+    # (e.g. FlashQLA today only ships SM90; SM100/SM120 wheels are WIP per
+    # https://github.com/QwenLM/FlashQLA/issues/2). Drop this once the kernel
+    # adds forward-compatibility for higher arches.
+    max_compute_capability: int | None = None
 
     def is_satisfied(self) -> bool:
         if self.device_type == "gpu":
             if not IS_CUDA_AVAILABLE:
                 return False
-            if self.min_compute_capability is not None:
-                if get_gpu_compute_capability() < self.min_compute_capability:
-                    return False
+            cc = get_gpu_compute_capability()
+            if self.min_compute_capability is not None and cc < self.min_compute_capability:
+                return False
+            if self.max_compute_capability is not None and cc > self.max_compute_capability:
+                return False
             return True
         if self.device_type == "npu":
             # IS_NPU_AVAILABLE == is_torch_npu_available(): requires both the
@@ -131,14 +138,22 @@ class KernelRegistry:
 
         spec = bucket[impl_name]
         if not spec.hardware.is_satisfied():
+            cc_min = spec.hardware.min_compute_capability
+            cc_max = spec.hardware.max_compute_capability
+            if cc_min is not None and cc_max is not None and cc_min == cc_max:
+                cc_clause = f", compute_capability=={cc_min}"
+            elif cc_min is not None and cc_max is not None:
+                cc_clause = f", {cc_min}<=compute_capability<={cc_max}"
+            elif cc_min is not None:
+                cc_clause = f", compute_capability>={cc_min}"
+            elif cc_max is not None:
+                cc_clause = f", compute_capability<={cc_max}"
+            else:
+                cc_clause = ""
             raise RuntimeError(
                 f"Kernel '{impl_name}' for op='{op_name}' requires "
                 f"device_type='{spec.hardware.device_type}'"
-                + (
-                    f", compute_capability>={spec.hardware.min_compute_capability}"
-                    if spec.hardware.min_compute_capability
-                    else ""
-                )
+                + cc_clause
                 + ", but the current hardware does not satisfy this."
             )
 

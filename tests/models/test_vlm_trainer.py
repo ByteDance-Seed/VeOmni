@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
@@ -43,12 +44,24 @@ _FREEZE_VIT_VLM_CASES = (
 )
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
+    # This test only constructs the model on `meta` and verifies freeze
+    # behaviour — it never runs forward. Use an explicit eager
+    # OpsImplementationConfig so Qwen3.5 build works on NPU (no FLA backend)
+    # and on GPU hosts that don't have flash-linear-attention installed; the
+    # eager linear-attention path raises at forward-time only, which this
+    # test does not exercise.
+    ops_implementation = OpsImplementationConfig(
+        attn_implementation="eager",
+        rms_norm_gated_implementation="eager",
+        causal_conv1d_implementation="eager",
+        chunk_gated_delta_rule_implementation="eager",
+    )
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
-        attn_implementation="eager",
         init_device="meta",
+        ops_implementation=ops_implementation,
     )
     visual = _get_vlm_visual_module(model)
     assert visual is not None

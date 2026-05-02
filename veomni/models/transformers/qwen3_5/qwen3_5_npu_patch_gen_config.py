@@ -81,12 +81,18 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # TODO: Add torch npu ops chunk_gated_delta_rule and causal_conv1d_fn in the future.
-    chunk_gated_delta_rule = None
-    causal_conv1d_fn = None
+    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
+    # linear-attention impl raises at OpSlot.bind() time, which is desirable —
+    # a silent fallback would mask the misconfiguration. These None
+    # placeholders preserve the upstream HF top-level
+    # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
+    # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
+    # assignments in __init__ resolve to torch.
     FusedRMSNormGated = None
-    fused_recurrent_gated_delta_rule = None
+    causal_conv1d_fn = None
     causal_conv1d_update = None
+    chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
     """
 )
 
@@ -96,6 +102,9 @@ config.add_post_import_block(
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
 
@@ -106,6 +115,9 @@ torch_npu = None
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
+veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 
 
 @config.override_method(
@@ -317,10 +329,13 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
+        # Modification: instance-local guard (see GPU patch comment).
         if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
             raise RuntimeError(
-                "Varlen training requires FLA. Install flash-linear-attention so "
-                "chunk_gated_delta_rule supports cu_seqlens."
+                "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
+                "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
+                "(and install flash-linear-attention) or 'flash_qla' (with the optional flash-qla "
+                "extra) in OpsImplementationConfig."
             )
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.

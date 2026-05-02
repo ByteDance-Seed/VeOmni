@@ -103,21 +103,29 @@ from veomni.utils.device import get_device_id
 
 
 # Additional import blocks for patches
-# TODO: Add torch npu ops chunk_gated_delta_rule and causal_conv1d_fn in the future.
-chunk_gated_delta_rule = None
-causal_conv1d_fn = None
+# NPU has no fla/flash_qla backend registered today; selecting a non-eager
+# linear-attention impl raises at OpSlot.bind() time. These None
+# placeholders preserve the upstream HF top-level
+# `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
+# False — legacy warning) and let the `<fla_name> or <torch_fallback>`
+# assignments in __init__ resolve to torch.
 FusedRMSNormGated = None
-fused_recurrent_gated_delta_rule = None
+causal_conv1d_fn = None
 causal_conv1d_update = None
+chunk_gated_delta_rule = None
+fused_recurrent_gated_delta_rule = None
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
-# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+# Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
 
 
 def get_position_id(main_func, self, **kwargs):
@@ -549,24 +557,35 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
-        self.norm = (
-            Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-            if FusedRMSNormGated is None
-            else FusedRMSNormGated(
+        # Modification: OpSlot dispatch for fused gated RMSNorm. The slot stores
+        # the FusedRMSNormGated *class* (see veomni.ops.kernels.gated_delta_rule),
+        # so calling it constructs a module with the fused kernel; eager falls
+        # through to upstream Qwen3_5MoeRMSNormGated.
+        if veomni_rms_norm_gated.use_non_eager_impl:
+            self.norm = veomni_rms_norm_gated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
                 activation=self.activation,
-                # Modification: use device-agnostic get_device_id() instead of hardcoded device
                 device=get_device_id(),
                 dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
             )
-        )
+        else:
+            self.norm = Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-        self.causal_conv1d_fn = causal_conv1d_fn
+        # Modification: OpSlot dispatch for causal conv1d / chunk gated delta-rule.
+        # We freeze the resolved kernel (or None for eager) on the instance via
+        # `.bound_kernel()`; storing the OpSlot itself would couple the instance to
+        # the module-global slot, and a second model rebinding the slot with a
+        # different impl would silently switch this instance's kernel too.
+        # `eager` leaves causal_conv1d_fn = None (the varlen path then raises) and
+        # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
+        # for varlen training; the decode-only `*_update` aliases are kept None
+        # because the precomputed-state path raises NotImplementedError anyway.
+        self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+        self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:
@@ -718,10 +737,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
+            # Modification: instance-local guard (see GPU patch comment).
             if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
                 raise RuntimeError(
-                    "Varlen training requires FLA. Install flash-linear-attention so "
-                    "chunk_gated_delta_rule supports cu_seqlens."
+                    "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
+                    "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
+                    "(and install flash-linear-attention) or 'flash_qla' (with the optional flash-qla "
+                    "extra) in OpsImplementationConfig."
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.

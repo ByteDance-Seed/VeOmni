@@ -97,33 +97,36 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # Modification: We are not using https://github.com/Dao-AILab/causal-conv1d now
-    # we are using the triton impl of causal_conv1d from fla.
-    # TODO: Evaluate Tridao's impl in the future.
-    try:
-        from fla.modules import FusedRMSNormGated
-        from fla.modules.convolution import causal_conv1d as causal_conv1d_fn
-        from fla.modules.convolution import causal_conv1d_update
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-    except ImportError:
-        chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
-        FusedRMSNormGated = None
-        causal_conv1d_update, causal_conv1d_fn = None, None
-        logging.get_logger(__name__).warning(
-            "Failed to import FLA modules: fallback to eager implementation."
-            "This case can't support dynamic batching packing!"
-        )
+    # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
+    # has moved into OpSlot guards below (driven by OpsImplementationConfig).
+    # These None placeholders preserve two pieces of the original module:
+    #   (1) the upstream HF top-level
+    #       `is_fast_path_available = all((causal_conv1d_fn, ...))` resolves
+    #       to False, keeping the legacy warning behaviour; and
+    #   (2) the decode-only `*_update` / `fused_recurrent_*` aliases satisfy
+    #       the `<fla_name> or <torch_fallback>` assignments in __init__
+    #       (the precomputed-state path raises NotImplementedError anyway).
+    FusedRMSNormGated = None
+    causal_conv1d_fn = None
+    causal_conv1d_update = None
+    chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
     """
 )
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
-    # These are bound at model-build time by _bind_veomni_ops() in auto.py.
+    # Bound at model-build time by _bind_veomni_ops() in auto.py. The three
+    # linear-attention slots replace the previous import-time fla/torch
+    # selection inside Qwen3_5MoeGatedDeltaNet.__init__ /forward.
     from veomni.ops.dispatch import OpSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
 
@@ -131,6 +134,9 @@ config.add_post_import_block(
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
+veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 
 
 # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────

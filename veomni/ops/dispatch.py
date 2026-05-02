@@ -73,6 +73,17 @@ class OpSlot:
         """
         return self._kernel is not None
 
+    def bound_kernel(self) -> Callable | None:
+        """Return the resolved kernel callable, or ``None`` if eager / unbound.
+
+        Use this when a model needs to *cache* the resolved implementation on
+        an instance attribute (e.g. ``self.causal_conv1d_fn = slot.bound_kernel()``).
+        Storing the OpSlot itself would couple the instance to the module-global
+        slot, so a later ``bind()`` from a second model in the same process would
+        silently override the first model's kernel.
+        """
+        return self._kernel
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self._kernel is None:
             raise RuntimeError(

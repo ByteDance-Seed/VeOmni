@@ -724,6 +724,37 @@ class OpsImplementationConfig:
             "'eager' (default) uses PyTorch reference."
         },
     )
+    rms_norm_gated_implementation: str = field(
+        default="fla",
+        metadata={
+            "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
+            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
+            "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
+            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+        },
+    )
+    causal_conv1d_implementation: str = field(
+        default="fla",
+        metadata={
+            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
+            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
+            "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
+            "because no torch fallback handles cu_seqlens. "
+            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+        },
+    )
+    chunk_gated_delta_rule_implementation: str = field(
+        default="fla",
+        metadata={
+            "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
+            "'flash_qla' uses QwenLM FlashQLA (requires the optional flash-qla extra, Hopper SM90 only — "
+            "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
+            "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
+            "cu_seqlens; varlen training therefore raises at runtime. "
+            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":

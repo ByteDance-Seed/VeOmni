@@ -181,6 +181,23 @@ def build_foundation_model(
 
     loader: Optional[BaseModelLoader] = get_loader(config)
 
+    # ── Pre-init: OpSlot binding ──────────────────────────────────────────
+    # ``get_loader`` -> ``get_model_class`` -> ``MODELING_REGISTRY[...]()``
+    # has already imported the patched modeling module, so ``loader.model_cls``
+    # is in ``sys.modules`` and we can resolve OpSlot bindings *before*
+    # the model is constructed. This matters for slots consumed inside
+    # ``__init__`` (e.g. Qwen3.5's GatedDeltaNet picks between
+    # ``Qwen3_5RMSNormGated`` and ``FusedRMSNormGated`` at init time based
+    # on ``veomni_rms_norm_gated.use_non_eager_impl``); slots consumed only
+    # in ``forward`` would also work post-init, but binding once, here, keeps
+    # the timing uniform. Assumes ``loader.model_cls`` is final at this point —
+    # i.e. no loader rewrites it between here and ``loader.load_model()`` below.
+    model_cls = getattr(loader, "model_cls", None) if loader is not None else None
+    modeling_module = sys.modules.get(model_cls.__module__) if model_cls is not None else None
+    if modeling_module is not None:
+        if _bind_veomni_ops(modeling_module, get_ops_config()):
+            logger.info_rank0("OpSlot-based kernel dispatch active.")
+
     init_kwargs = {
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),
@@ -214,16 +231,6 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
-
-    # ── Post-load: OpSlot binding ─────────────────────────────────────────
-    # OpSlots are module-level singletons, so binding them after the model
-    # is constructed is fine (and necessary — the patched modeling module is
-    # only guaranteed to be importable once the loader has instantiated the
-    # model class).
-    modeling_module = sys.modules.get(model.__class__.__module__)
-    if modeling_module is not None:
-        if _bind_veomni_ops(modeling_module, get_ops_config()):
-            logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
