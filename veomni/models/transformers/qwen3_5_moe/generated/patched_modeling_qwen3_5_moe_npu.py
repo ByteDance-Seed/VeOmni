@@ -100,6 +100,7 @@ from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 # Additional import blocks for patches
@@ -1063,7 +1064,34 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
-        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        # MoE router replay: when an RL framework has installed a manager via
+        # ``set_active_replay``, the manager may substitute ``selected_experts``
+        # with previously recorded target indices. The manager's sole
+        # responsibility is choosing indices; all model-specific post-topk
+        # weight math (gather, renorm, dtype cast) is replicated here so the
+        # cross-framework controller stays model-agnostic.
+        #
+        # ASYMMETRY with qwen3_moe: Qwen3.5-MoE's ``TopKRouter.forward``
+        # reassigns its local ``router_logits`` variable to
+        # ``softmax(router_logits)`` before returning (the same latent
+        # double-softmax quirk that upstream fixed in Qwen3-MoE via #715). So
+        # the value bound here is ALREADY the post-softmax probability matrix
+        # required by the RR contract; we pass it through directly as
+        # ``routing_scores``. Recomputing ``softmax`` here would produce
+        # ``softmax(softmax(logits))`` and silently corrupt replay weights.
+        # If Qwen3.5-MoE is ever fixed the same way as qwen3_moe, switch this
+        # to the qwen3_moe form (recompute softmax from raw logits).
+        #
+        # Qwen3.5-MoE's native router always renormalizes top-k probs (see the
+        # ``router_top_value /= router_top_value.sum(...)`` in its TopKRouter),
+        # so we always renorm the gathered weights, no conditional.
+        if get_active_replay() is not None:
+            target_dtype = routing_weights.dtype
+            selected_experts = maybe_replay_indices(self.gate, router_logits, selected_experts)
+            routing_weights = router_logits.gather(1, selected_experts)
+            routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+            routing_weights = routing_weights.to(target_dtype)
         expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
         shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
