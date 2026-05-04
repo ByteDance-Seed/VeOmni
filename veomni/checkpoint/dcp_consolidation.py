@@ -59,13 +59,21 @@ def apply_dcp_consolidation_patch():
     if _dcp_consolidation_patch_applied:
         return
 
-    # Verify torch version matches exactly
+    # Verify torch version is 2.9 or later
     import torch
 
-    if not torch.__version__.startswith(_REQUIRED_TORCH_VERSION):
+    # Parse version to support 2.9, 2.10, 2.11, etc. and variants like 2.11.0+xpu
+    torch_version_parts = torch.__version__.split("+")[0].split(".")
+    try:
+        torch_major, torch_minor = int(torch_version_parts[0]), int(torch_version_parts[1])
+        is_compatible = (torch_major > 2) or (torch_major == 2 and torch_minor >= 9)
+    except (ValueError, IndexError):
+        is_compatible = False
+
+    if not is_compatible:
         raise RuntimeError(
-            f"DCP consolidation patch requires torch {_REQUIRED_TORCH_VERSION}.x, "
-            f"but got {torch.__version__}. Please update the patch or verify compatibility."
+            f"DCP consolidation patch requires torch >= {_REQUIRED_TORCH_VERSION}, "
+            f"but got {torch.__version__}. Please update PyTorch."
         )
 
     import torch.distributed.checkpoint._consolidate_hf_safetensors as hf_module
