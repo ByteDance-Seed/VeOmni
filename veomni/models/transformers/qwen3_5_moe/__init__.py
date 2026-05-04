@@ -16,6 +16,37 @@ from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
+# Qwen3.5 GatedDeltaNet's three fused ops (FusedRMSNormGated, causal_conv1d,
+# chunk_gated_delta_rule) currently only ship GPU backends via FLA / FlashQLA.
+# OpSlot.bind would already raise if a non-eager value is requested on NPU,
+# but the message is generic ("Kernel 'fla' for op='X' requires
+# device_type='gpu'"). We pre-check at NPU registration so the error is
+# Qwen3.5-aware and tells the user what to set, including the varlen caveat.
+_QWEN35_NPU_FIELDS = (
+    "rms_norm_gated_implementation",
+    "causal_conv1d_implementation",
+    "chunk_gated_delta_rule_implementation",
+)
+
+
+def _assert_qwen3_5_npu_supported() -> None:
+    """Raise on NPU when Qwen3.5's GatedDeltaNet ops are not pinned to eager."""
+    from ....ops.config.singleton import get_ops_config
+
+    ops = get_ops_config()
+    if ops is None:
+        return
+    bad = {f: getattr(ops, f) for f in _QWEN35_NPU_FIELDS if getattr(ops, f) != "eager"}
+    if bad:
+        offending = ", ".join(f"{k}={v!r}" for k, v in bad.items())
+        raise RuntimeError(
+            f"Qwen3.5 GatedDeltaNet has no NPU backend today (offending: {offending}). "
+            f"On NPU, pin {list(_QWEN35_NPU_FIELDS)} to 'eager'. "
+            f"Note: 'eager' only supports non-varlen training (set train.dyn_bsz=False); "
+            f"varlen training on NPU is not supported until an NPU kernel lands."
+        )
+
+
 # qwen3_5_moe is added in transformers 5.2.0.
 if is_transformers_version_greater_or_equal_to("5.2.0"):
 
@@ -27,6 +58,7 @@ if is_transformers_version_greater_or_equal_to("5.2.0"):
                 Qwen3_5MoeForConditionalGeneration,
             )
         elif IS_NPU_AVAILABLE:
+            _assert_qwen3_5_npu_supported()
             from .generated.patched_modeling_qwen3_5_moe_npu import (
                 Qwen3_5MoeForCausalLM,
                 Qwen3_5MoeForConditionalGeneration,
@@ -44,6 +76,7 @@ if is_transformers_version_greater_or_equal_to("5.2.0"):
         if IS_CUDA_AVAILABLE:
             from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM
         elif IS_NPU_AVAILABLE:
+            _assert_qwen3_5_npu_supported()
             from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM
 
         return Qwen3_5MoeForCausalLM

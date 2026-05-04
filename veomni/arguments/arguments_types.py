@@ -652,10 +652,24 @@ class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
     Defaults are GPU-optimal (Liger / Triton / fused_triton); they raise on
-    NPU at validation time. NPU users must pin every per-op field to an
-    NPU-supported value, or ``"eager"`` when the op has no NPU kernel.
-    Per-op fields are ``str`` so third-party backends can register without
-    changing this dataclass.
+    NPU. NPU users must pin every per-op field to an NPU-supported value, or
+    ``"eager"`` when the op has no NPU kernel. Per-op fields are ``str`` so
+    third-party backends can register without changing this dataclass.
+
+    NPU validation runs at two times:
+
+    - **Config-parse time** (``__post_init__``) for ops registered in the
+      legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
+      ``swiglu_mlp``, ``load_balancing_loss``, plus ``cross_entropy_loss``
+      and ``moe``. Errors fire immediately with a model-agnostic allow-list.
+    - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
+      for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
+      ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
+      patched modeling module, so config-parse-time validation would force
+      every NPU user to override them even when training non-Qwen3.5 models.
+      Validating at bind time defers the check until Qwen3.5 is actually
+      loaded; ``register_qwen3_5_moe_modeling`` adds an upfront NPU guard
+      with a Qwen3.5-aware error message.
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
@@ -780,6 +794,12 @@ class OpsImplementationConfig:
             swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
             rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
             load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
+            # Qwen3.5 GatedDeltaNet ops — only meaningful for that model, but
+            # listed here so the safe-fallback path doesn't pull in
+            # flash-linear-attention on hosts that don't have it.
+            rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
+            causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),
+            chunk_gated_delta_rule_implementation=overrides.pop("chunk_gated_delta_rule_implementation", "eager"),
             **overrides,
         )
 
