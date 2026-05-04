@@ -1229,12 +1229,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
         # shift_labels stays at length S — matching the full, unsliced hidden_states. Do NOT
         # pre-slice hidden_states[..., :-1, :] here or the shapes will mismatch.
         log_probs = None
+        entropy = None
         if labels is not None:
             # Direct ForCausalLMLoss call (no `**kwargs` passthrough), so the
-            # log-probs dispatch is unreachable here today; the third tuple
-            # slot stays ``None`` and we just unpack to keep the contract
-            # uniform with the other modelings.
-            loss, logits, log_probs = ForCausalLMLoss(
+            # log-probs / entropy dispatch is unreachable here today; the
+            # third and fourth tuple slots stay ``None`` and we just unpack
+            # to keep the contract uniform with the other modelings.
+            loss, logits, log_probs, entropy = ForCausalLMLoss(
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
@@ -1266,6 +1267,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             rope_deltas=self.rope_deltas,
         )
         output.log_probs = log_probs
+        output.entropy = entropy
         return output
 
 

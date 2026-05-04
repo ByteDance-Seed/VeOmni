@@ -1363,7 +1363,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1644,29 +2131,59 @@
+@@ -1644,29 +2131,60 @@
          )
 
          hidden_states = outputs[0]
@@ -1378,12 +1378,13 @@
          loss = None
 +        logits = None
 +        log_probs = None
++        entropy = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 -
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs = veomni_causal_lm_loss(
++                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -1394,9 +1395,9 @@
 +            else:
 +                logits = self.lm_head(hidden_states)
 +                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-+                # returns (loss, logits, log_probs); unpack to match the OpSlot
-+                # branch above.
-+                loss, logits, log_probs = self.loss_function(
++                # returns (loss, logits, log_probs, entropy); unpack to match the
++                # OpSlot branch above.
++                loss, logits, log_probs, entropy = self.loss_function(
 +                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
 +                )
 +        else:
@@ -1441,7 +1442,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1674,8 +2191,10 @@
+@@ -1674,8 +2192,11 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
@@ -1450,11 +1451,12 @@
 +            router_logits=getattr(outputs, "router_logits", None),
 +        )
 +        output.log_probs = log_probs
++        output.entropy = entropy
 +        return output
 
      def prepare_inputs_for_generation(
          self,
-@@ -1901,6 +2420,37 @@
+@@ -1901,6 +2422,37 @@
 
          return input_ids, model_kwargs
 

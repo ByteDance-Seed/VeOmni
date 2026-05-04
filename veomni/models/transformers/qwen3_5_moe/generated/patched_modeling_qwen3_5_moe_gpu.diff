@@ -1213,7 +1213,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1993,24 +2444,54 @@
+@@ -1993,24 +2444,55 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1223,11 +1223,12 @@
          loss = None
 +        logits = None
 +        log_probs = None
++        entropy = None
          if labels is not None:
 -            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs = veomni_causal_lm_loss(
++                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.vocab_size,
@@ -1238,9 +1239,9 @@
 +            else:
 +                logits = self.lm_head(hidden_states)
 +                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-+                # returns (loss, logits, log_probs); unpack to match the OpSlot
-+                # branch above.
-+                loss, logits, log_probs = self.loss_function(
++                # returns (loss, logits, log_probs, entropy); unpack to match the
++                # OpSlot branch above.
++                loss, logits, log_probs, entropy = self.loss_function(
 +                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
 +                )
 +        else:
@@ -1280,11 +1281,12 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2019,6 +2500,14 @@
+@@ -2019,6 +2501,15 @@
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
          )
 +        output.log_probs = log_probs
++        output.entropy = entropy
 +        return output
 +
 +
@@ -1295,7 +1297,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2562,7 @@
+@@ -2073,6 +2564,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1303,7 +1305,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2090,57 +2580,6 @@
+@@ -2090,57 +2582,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
@@ -1361,7 +1363,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,29 +2595,56 @@
+@@ -2156,29 +2597,57 @@
          )
 
          hidden_states = outputs[0]
@@ -1374,11 +1376,12 @@
          loss = None
 +        logits = None
 +        log_probs = None
++        entropy = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs = veomni_causal_lm_loss(
++                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -1389,9 +1392,9 @@
 +            else:
 +                logits = self.lm_head(hidden_states)
 +                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-+                # returns (loss, logits, log_probs); unpack to match the OpSlot
-+                # branch above.
-+                loss, logits, log_probs = self.loss_function(
++                # returns (loss, logits, log_probs, entropy); unpack to match the
++                # OpSlot branch above.
++                loss, logits, log_probs, entropy = self.loss_function(
 +                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
 +                )
 +        else:
@@ -1432,16 +1435,17 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2188,6 +2654,8 @@
+@@ -2188,6 +2657,9 @@
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
          )
 +        output.log_probs = log_probs
++        output.entropy = entropy
 +        return output
 
      def prepare_inputs_for_generation(
          self,
-@@ -2413,6 +2881,19 @@
+@@ -2413,6 +2885,19 @@
 
          return input_ids, model_kwargs
 

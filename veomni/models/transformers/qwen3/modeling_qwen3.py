@@ -98,12 +98,13 @@ def qwen3forcausallm_forward(
     loss = None
     logits = None
     log_probs = None
+    entropy = None
     if labels is not None:
         # The wrapper inspects ``return_log_probs`` in **kwargs and routes the
         # call to ``chunk_logprobs_function`` when True; on that path
-        # ``loss``/``logits`` are ``None`` and ``log_probs`` carries the
-        # per-token log-probabilities.
-        loss, logits, log_probs = self.loss_function(
+        # ``loss``/``logits`` are ``None`` and ``log_probs`` / ``entropy``
+        # carry the per-token log-probabilities and softmax entropy.
+        loss, logits, log_probs, entropy = self.loss_function(
             logits=logits,
             labels=labels,
             vocab_size=self.config.vocab_size,
@@ -119,6 +120,7 @@ def qwen3forcausallm_forward(
         loss=loss,
         logits=logits,
         log_probs=log_probs,
+        entropy=entropy,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
@@ -171,9 +173,9 @@ def qwen3forSequenceClassification_forward(
     loss = None
     logits = None
     if labels is not None:
-        # Seq-cls heads have no log-probs path; the third tuple slot is
-        # always None.
-        loss, logits, _ = self.loss_function(
+        # Seq-cls heads have no log-probs / entropy path; the third and
+        # fourth tuple slots are always None.
+        loss, logits, _, _ = self.loss_function(
             logits=logits,
             labels=labels,
             num_labels=self.num_labels,

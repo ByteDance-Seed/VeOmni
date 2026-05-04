@@ -284,10 +284,11 @@ def qwen3_moe_forcausallm_forward_patched(
     loss = None
     logits = None
     log_probs = None
+    entropy = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -298,9 +299,9 @@ def qwen3_moe_forcausallm_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs); unpack to match the OpSlot
-            # branch above.
-            loss, logits, log_probs = self.loss_function(
+            # returns (loss, logits, log_probs, entropy); unpack to match the
+            # OpSlot branch above.
+            loss, logits, log_probs, entropy = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
             )
     else:
@@ -336,6 +337,7 @@ def qwen3_moe_forcausallm_forward_patched(
         router_logits=outputs.router_logits,
     )
     output.log_probs = log_probs
+    output.entropy = entropy
     return output
 
 

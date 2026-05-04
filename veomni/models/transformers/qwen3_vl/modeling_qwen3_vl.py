@@ -951,14 +951,16 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         loss = None
         logits = None
         log_probs = None
+        entropy = None
         if labels is not None:
             # The wrapper inspects ``return_log_probs`` in **kwargs and routes
             # the call to ``chunk_logprobs_function`` when True; on that path
-            # ``loss``/``logits`` are ``None`` and ``log_probs`` carries the
-            # per-token log-probabilities. ``ModelOutput`` allows arbitrary
-            # attribute setting, so ``output.log_probs`` surfaces on the
+            # ``loss``/``logits`` are ``None`` and ``log_probs`` / ``entropy``
+            # carry the per-token log-probabilities and softmax entropy.
+            # ``ModelOutput`` allows arbitrary attribute setting, so
+            # ``output.log_probs`` and ``output.entropy`` surface on the
             # existing VL-specific output dataclass without a subclass.
-            loss, logits, log_probs = self.loss_function(
+            loss, logits, log_probs, entropy = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -977,6 +979,7 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             rope_deltas=outputs.rope_deltas,
         )
         output.log_probs = log_probs
+        output.entropy = entropy
         return output
 
 

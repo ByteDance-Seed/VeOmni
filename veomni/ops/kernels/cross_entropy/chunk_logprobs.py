@@ -12,19 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked fused linear log-probs for PPO-style RL.
+"""Chunked fused linear log-probs **and** per-token entropy for PPO-style RL.
 
-Returns per-token actual log-probabilities ``log p(y_t | <t)`` while
-streaming the lm_head projection chunk-by-chunk — never materializes
-the full ``[T, V]`` logits tensor. The output is the building block
-PPO needs for policy / reference logprob recompute at long context +
-large vocab.
-
-The ``LAST_LOG_PROBS`` ``ContextVar`` lets the loss-function dispatch
-hand off per-token log-probs to a post-forward hook on the model
-without abusing the ``output.logits`` slot. The kernel sets it; the
-forward hook installed by ``build_foundation_model`` reads it and
-attaches to ``output.log_probs``.
+Returns per-token actual log-probabilities ``log p(y_t | <t)`` and the
+softmax entropy ``H[p(.|<t)] = -Σ_v p_v log p_v`` while streaming the
+lm_head projection chunk-by-chunk — never materializes the full
+``[T, V]`` logits tensor. The output is the building block PPO needs
+for policy / reference logprob recompute and entropy bonus at long
+context + large vocab.
 
 Implementation pattern follows
 ``verl/utils/experimental/torch_functional.py::FusedLinearForPPOFunction``
@@ -40,6 +35,9 @@ without behavioural surprises:
   is reshaped back to the input's leading dims.
 - ``temperature`` is applied as ``logits / T`` (chain rule
   divides ``dlogits`` by ``T`` in backward).
+- Entropy is always computed in forward (negligible vs the matmul);
+  its gradient path is only walked in backward when ``dentropy`` is
+  not ``None`` (mirrors verl, which gates the entropy-grad branch).
 
 FSDP2 contract: the saved ``weight`` reference is the lm_head
 parameter; FSDP2's pre-backward hook (installed by
@@ -51,11 +49,11 @@ contract verl already validates in production with
 
 VeOmni-specific extensions on top of verl's pattern:
 
-- ``ignore_index`` masking: ``log_probs == 0`` and zero gradient at
-  positions where ``labels == ignore_index``. Needed because
-  VeOmni's data pipeline (chat templates, packing) sets
-  IGNORE_INDEX boundaries; verl's data pipeline filters them
-  upstream so its kernel doesn't.
+- ``ignore_index`` masking: ``log_probs == 0`` and entropy ``== 0``
+  with zero gradient at positions where ``labels == ignore_index``.
+  Needed because VeOmni's data pipeline (chat templates, packing) sets
+  IGNORE_INDEX boundaries; verl's data pipeline filters them upstream
+  so its kernel doesn't.
 - Causal label shift (``labels[..., 1:]`` / ``hidden[..., :-1, :]``)
   applied internally when SP is disabled, matching the convention
   of the sibling ``chunk_loss_function``. SP-enabled callers pass
@@ -112,12 +110,27 @@ def _per_token_log_probs_from_logits(
     return torch.where(mask, log_probs, torch.zeros_like(log_probs))
 
 
+def _per_token_entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Softmax entropy ``H[p] = logsumexp(logits) - Σ p · logits``.
+
+    Op order matches verl's ``_fused_linear_for_ppo_fwd`` exactly so the
+    fp32 rounding boundary is identical: ``softmax`` then
+    ``logsumexp(logits) - sum(probs * logits)``. ``probs * logits`` is
+    materialized once (a ``[chunk, V]`` fp32 tensor, same shape as
+    ``logits``); peak chunk memory is unchanged from the log-probs path.
+    """
+    probs = logits.softmax(dim=-1)
+    return torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+
+
 class _ChunkedLinearLogProbs(torch.autograd.Function):
-    """Custom autograd Function: chunked linear projection + log-softmax + gather.
+    """Custom autograd Function: chunked linear projection + log-softmax + gather + entropy.
 
     Mirrors verl's ``FusedLinearForPPOFunction`` (custom autograd
     Function with explicit chunked forward + backward) so the FSDP2
-    correctness story is the same.
+    correctness story is the same. Returns ``(log_probs, entropy)`` as
+    a 2-tuple; the entropy gradient path in backward is only walked
+    when the caller actually backprops through the entropy output.
     """
 
     @staticmethod
@@ -129,7 +142,7 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
         temperature: float,
         chunk_size: int,
         ignore_index: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         ctx.set_materialize_grads(False)
 
         orig_shape = labels.shape
@@ -140,6 +153,11 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
 
         out_requires_grad = h_2d.requires_grad or weight.requires_grad
         log_probs = torch.zeros(T, device=h_2d.device, dtype=torch.float32, requires_grad=out_requires_grad)
+        # Entropy is returned in fp32; verl downcasts to ``hidden_states.dtype``
+        # but downstream RL code reads it in fp32 so we keep the higher
+        # precision here. The mask-to-zero at IGN positions is exact in either
+        # dtype, so this only affects the valid slots.
+        entropy = torch.zeros(T, device=h_2d.device, dtype=torch.float32, requires_grad=out_requires_grad)
 
         for chunk_start in range(0, T, chunk_size):
             chunk_end = min(chunk_start + chunk_size, T)
@@ -158,6 +176,14 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
             logits = logits.float()
 
             log_probs[chunk_start:chunk_end] = _per_token_log_probs_from_logits(logits, l_chunk, ignore_index)
+            chunk_entropy = _per_token_entropy_from_logits(logits)
+            # Mask entropy at IGN positions (mirrors log_probs masking).
+            # Entropy is well-defined at every position (it depends only on
+            # the softmax distribution, not the label), but downstream
+            # consumers expect IGN slots to be exactly 0 so they can sum
+            # without applying a separate mask.
+            mask = l_chunk != ignore_index
+            entropy[chunk_start:chunk_end] = torch.where(mask, chunk_entropy, torch.zeros_like(chunk_entropy))
 
         ctx.save_for_backward(h_2d, weight, l_1d)
         ctx.temperature = temperature
@@ -165,16 +191,17 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.orig_hidden_shape = orig_hidden_shape
 
-        return log_probs.view(orig_shape)
+        return log_probs.view(orig_shape), entropy.view(orig_shape)
 
     @staticmethod
-    def backward(ctx, dlog_probs: Optional[torch.Tensor]):
-        if dlog_probs is None:
+    def backward(ctx, dlog_probs: Optional[torch.Tensor], dentropy: Optional[torch.Tensor]):
+        if dlog_probs is None and dentropy is None:
             return None, None, None, None, None, None
 
         h_2d, weight, l_1d = ctx.saved_tensors
         T = l_1d.shape[0]
-        dlog_probs_1d = dlog_probs.reshape(-1).float()
+        dlog_probs_1d = dlog_probs.reshape(-1).float() if dlog_probs is not None else None
+        dentropy_1d = dentropy.reshape(-1).float() if dentropy is not None else None
 
         dhidden = torch.zeros_like(h_2d) if h_2d.requires_grad else None
         dweight = torch.zeros_like(weight) if weight.requires_grad else None
@@ -183,7 +210,8 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
             chunk_end = min(chunk_start + ctx.chunk_size, T)
             h_chunk = h_2d[chunk_start:chunk_end]
             l_chunk = l_1d[chunk_start:chunk_end]
-            dlp_chunk = dlog_probs_1d[chunk_start:chunk_end]
+            dlp_chunk = dlog_probs_1d[chunk_start:chunk_end] if dlog_probs_1d is not None else None
+            dent_chunk = dentropy_1d[chunk_start:chunk_end] if dentropy_1d is not None else None
 
             # Recompute logits with the same op order as forward so the
             # saved-weight reference (which FSDP2 has unsharded by now
@@ -196,14 +224,29 @@ class _ChunkedLinearLogProbs(torch.autograd.Function):
 
             probs = logits.softmax(dim=-1)
             mask = (l_chunk != ctx.ignore_index).float()
-            safe_labels = l_chunk.clamp(min=0).unsqueeze(-1)
 
+            dlogits = torch.zeros_like(probs)
+
+            # ── log_probs gradient path ──────────────────────────────────
             # ∂(gather(log_softmax(logits), labels)) / ∂logits[i, j] =
             #     δ(j == labels[i]) - softmax(logits)[i, j]
             # so dlogits[i, j] = dlog_probs[i] * (one_hot[i, j] - probs[i, j]).
-            one_hot = torch.zeros_like(probs).scatter_(-1, safe_labels, 1.0)
-            masked_dlp = (dlp_chunk * mask).unsqueeze(-1)
-            dlogits = masked_dlp * (one_hot - probs)
+            if dlp_chunk is not None:
+                safe_labels = l_chunk.clamp(min=0).unsqueeze(-1)
+                one_hot = torch.zeros_like(probs).scatter_(-1, safe_labels, 1.0)
+                masked_dlp = (dlp_chunk * mask).unsqueeze(-1)
+                dlogits = dlogits + masked_dlp * (one_hot - probs)
+
+            # ── entropy gradient path (mirrors verl exactly) ─────────────
+            # ∂H[p]/∂logits[i, j] = p_j (log p_j + H[p]) so
+            # dlogits[i, j] = -dentropy[i] * p_j * (log p_j + H[p_i])
+            # The ``-`` sign is folded into the ``-dentropy.unsqueeze(-1)``
+            # multiplier (matches verl's expression).
+            if dent_chunk is not None:
+                log_probs_full = logits.log_softmax(dim=-1)
+                entropy_full = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+                masked_dent = (dent_chunk * mask).unsqueeze(-1)
+                dlogits = dlogits + probs * (log_probs_full + entropy_full.unsqueeze(-1)) * (-masked_dent)
 
             # Op order mirrors verl's ``_fused_linear_for_ppo_bwd``:
             # cast back to the input dtype first, then divide by
@@ -233,8 +276,8 @@ def chunk_logprobs_function(
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
-) -> torch.Tensor:
-    """Compute per-token actual log-probabilities via a chunked fused linear.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-token log-probabilities and entropy via a chunked fused linear.
 
     Args:
         hidden_states: ``[B, L, H]`` (or ``[L, H]`` for already-packed
@@ -242,7 +285,7 @@ def chunk_logprobs_function(
         weights: lm_head weight, ``[V, H]``. Bias is not supported.
         labels: integer label tensor with shape matching the leading
             dims of ``hidden_states``. Positions equal to
-            ``ignore_index`` produce ``0.0`` in the output (no
+            ``ignore_index`` produce ``0.0`` in both outputs (no
             gradient flows through them either).
         chunk_size: token-dim chunk for the streamed projection.
         ignore_index: label value to mask (default ``-100`` /
@@ -251,7 +294,7 @@ def chunk_logprobs_function(
             kernel uses them as-is and skips the internal causal
             shift, so callers can supply custom alignment (e.g. the
             ``ForCausalLMLoss`` SP path that pre-shifts via padding).
-            The output tensor's seq length matches ``shift_labels``
+            The output tensors' seq length matches ``shift_labels``
             (no trailing pad). When ``None``, this function applies
             the causal ``labels[..., 1:]`` /
             ``hidden_states[..., :-1, :]`` shift internally and pads
@@ -261,9 +304,17 @@ def chunk_logprobs_function(
             path). Defaults to 1.0 (no-op).
 
     Returns:
-        Per-token log-probabilities with the same shape as the input
-        ``labels``. **Sign: non-positive** (``log p(y_t)``), matches
-        HF / verl conventions — no negation needed at the call site.
+        ``(log_probs, entropy)`` — both with the same shape as the
+        input ``labels``.
+
+        - ``log_probs``: per-token ``log p(y_t)`` (non-positive). Zero
+          at IGNORE_INDEX positions and at the trailing pad slot.
+        - ``entropy``: per-token softmax entropy
+          ``H[p] = -Σ_v p_v log p_v`` (non-negative). Zero at
+          IGNORE_INDEX positions and at the trailing pad slot.
+
+        Sign conventions match HF / verl — no negation needed at the
+        call site.
     """
     sp_enabled = get_parallel_state().sp_enabled
 
@@ -286,14 +337,15 @@ def chunk_logprobs_function(
         labels_shifted = labels[..., 1:].contiguous()
         hidden_states = hidden_states[..., :-1, :].contiguous()
 
-    log_probs = _ChunkedLinearLogProbs.apply(
+    log_probs, entropy = _ChunkedLinearLogProbs.apply(
         hidden_states, weights, labels_shifted, float(temperature), int(chunk_size), int(ignore_index)
     )
 
     if not sp_enabled and not used_explicit_shift:
         # Pad with one zero at the right of the (last) seq dim so the
-        # returned tensor matches the input ``labels`` shape. The
+        # returned tensors match the input ``labels`` shape. The
         # padded slot corresponds to the final input token (no
         # next-token target) — a no-op under any sane downstream mask.
         log_probs = torch.nn.functional.pad(log_probs, (0, 1), value=0.0)
-    return log_probs
+        entropy = torch.nn.functional.pad(entropy, (0, 1), value=0.0)
+    return log_probs, entropy
