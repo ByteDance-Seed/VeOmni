@@ -45,17 +45,12 @@ _FREEZE_VIT_VLM_CASES = (
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     # This test only constructs the model on `meta` and verifies freeze
-    # behaviour — it never runs forward. Use an explicit eager
-    # OpsImplementationConfig so Qwen3.5 build works on NPU (no FLA backend)
-    # and on GPU hosts that don't have flash-linear-attention installed; the
-    # eager linear-attention path raises at forward-time only, which this
-    # test does not exercise.
-    ops_implementation = OpsImplementationConfig(
-        attn_implementation="eager",
-        rms_norm_gated_implementation="eager",
-        causal_conv1d_implementation="eager",
-        chunk_gated_delta_rule_implementation="eager",
-    )
+    # behaviour — it never runs forward. Use ``all_eager()`` so the build
+    # works everywhere: it pins every per-op field (including the Qwen3.5
+    # GatedDeltaNet trio that has no FLA backend on NPU and the GPU-only
+    # liger/triton defaults that fail NPU validation). Eager paths that raise
+    # only at forward time are fine because this test never forwards.
+    ops_implementation = OpsImplementationConfig.all_eager(attn_implementation="eager")
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
