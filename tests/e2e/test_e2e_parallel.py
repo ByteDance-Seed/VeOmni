@@ -143,38 +143,53 @@ def _assert_parallel_alignment(
         compare_metrics(res, rtol=rtol, atol=atol)
         return
 
-    ep1_runs = {k: v for k, v in res.items() if "_ep1" in k}
-    ep2_runs = {k: v for k, v in res.items() if "_ep2" in k}
+    # Group runs by EP size parsed from the trailing `_ep<N>` segment of the
+    # task name (set by `prepare_exec_cmd`). `rpartition` plus integer parse
+    # avoids the substring trap of `"_ep1" in k` (which would also match
+    # `_ep10`) and naturally extends to any EP grid larger than {1, 2}.
+    runs_by_ep: dict[int, dict] = {}
+    for k, v in res.items():
+        head, sep, tail = k.rpartition("_ep")
+        if not sep or not tail.isdigit():
+            raise AssertionError(f"MoE run key missing _ep<N> suffix: {k!r}")
+        runs_by_ep.setdefault(int(tail), {})[k] = v
 
-    if not ep1_runs or not ep2_runs:
+    if len(runs_by_ep) < 2:
         # Single-EP slice (e.g. max_sp_size filtered everything down). Fall
         # back to the dense comparison.
         compare_metrics(res, rtol=rtol, atol=atol)
         return
 
-    if len(ep1_runs) >= 2:
-        compare_metrics(ep1_runs, rtol=rtol, atol=atol)
-    if len(ep2_runs) >= 2:
-        compare_metrics(ep2_runs, rtol=rtol, atol=atol)
+    # Same-EP runs (only SP varies) must match within strict tolerance.
+    for ep_runs in runs_by_ep.values():
+        if len(ep_runs) >= 2:
+            compare_metrics(ep_runs, rtol=rtol, atol=atol)
 
-    # One representative per EP for the cross-EP check.
-    ep1_name = next(iter(ep1_runs))
-    ep2_name = next(iter(ep2_runs))
-    cross = {ep1_name: ep1_runs[ep1_name], ep2_name: ep2_runs[ep2_name]}
+    # Cross-EP: pick the smallest EP as the baseline and compare each other
+    # EP value against it. Loss stays close (router output is the same
+    # averaged signal) so it uses the strict tolerance; grad_norm uses the
+    # relaxed tolerance to absorb routing-flip noise.
+    ep_values = sorted(runs_by_ep.keys())
+    base_ep = ep_values[0]
+    base_name = next(iter(runs_by_ep[base_ep]))
+    base_run = runs_by_ep[base_ep][base_name]
 
-    metric_keys = list(cross[ep1_name].keys())
+    metric_keys = list(base_run.keys())
     grad_keys = [k for k in metric_keys if "grad_norm" in k]
     other_keys = [k for k in metric_keys if k not in grad_keys]
 
-    if other_keys:
-        compare_metrics(cross, rtol=rtol, atol=atol, keys=other_keys)
-    if grad_keys:
-        compare_metrics(
-            cross,
-            rtol=_MOE_CROSS_EP_GRAD_NORM_RTOL,
-            atol=_MOE_CROSS_EP_GRAD_NORM_ATOL,
-            keys=grad_keys,
-        )
+    for other_ep in ep_values[1:]:
+        other_name = next(iter(runs_by_ep[other_ep]))
+        cross = {base_name: base_run, other_name: runs_by_ep[other_ep][other_name]}
+        if other_keys:
+            compare_metrics(cross, rtol=rtol, atol=atol, keys=other_keys)
+        if grad_keys:
+            compare_metrics(
+                cross,
+                rtol=_MOE_CROSS_EP_GRAD_NORM_RTOL,
+                atol=_MOE_CROSS_EP_GRAD_NORM_ATOL,
+                keys=grad_keys,
+            )
 
 
 _DEFAULT_RTOL = 1e-1
