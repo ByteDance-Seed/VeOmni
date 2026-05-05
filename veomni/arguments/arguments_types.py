@@ -642,6 +642,8 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_implementation": frozenset({"npu"}),
     "cross_entropy_loss_implementation": frozenset({"npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
