@@ -35,7 +35,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.ops import fused_moe_forward
-from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
 
 
 config = PatchConfig(
@@ -54,29 +54,49 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # These are bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+    veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     """
 )
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3MoeRMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNorm",
-        description="Use LigerKernel RMSNorm",
-    )
-)
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3MoeMLP",
-        replacement_module="liger_kernel.transformers.swiglu",
-        replacement_name="LigerSwiGLUMLP",
-        description="Use LigerKernel SwiGLU MLP",
-    )
+# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+
+
+@config.override_method(
+    "Qwen3MoeRMSNorm.forward",
+    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
 )
+def qwen3_moe_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+    # Original HF code below, unchanged.
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states.to(input_dtype)
+
+
+# ── SwiGLU MLP (OpSlot guard, functional Liger kernel) ───────────────────────
+
+
+@config.override_method(
+    "Qwen3MoeMLP.forward",
+    description="OpSlot guard for Liger fused SwiGLU MLP",
+)
+def qwen3_moe_mlp_forward_patched(self, x):
+    # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
+    if veomni_swiglu_mlp.use_non_eager_impl:
+        return veomni_swiglu_mlp(self, x)
+    # Original HF code below, unchanged.
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return down_proj
 
 
 @config.replace_class(
@@ -143,7 +163,6 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
     ),
 )
 def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
-    input_dtype = hidden_states.dtype
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     # Return raw pre-softmax logits as `router_logits`; HF's
     # `load_balancing_loss_func` applies softmax internally. The post-softmax
@@ -153,14 +172,17 @@ def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
     router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
     if self.norm_topk_prob:
         router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-    # Cast top-k weights back to input dtype so the downstream expert
-    # multiplication runs in bf16/fp16 rather than fp32.
-    router_top_value = router_top_value.to(input_dtype)
+    # Modification: keep ``router_top_value`` in the softmax's fp32 dtype to
+    # match HF's reference path (HF re-binds ``router_logits`` to the post-
+    # softmax fp32 tensor and then casts back to that dtype, which is a
+    # no-op). The fused MoE call site casts to ``final_hidden_states.dtype``
+    # itself, so leaving fp32 here is harmless.
+    router_top_value = router_top_value.to(routing_weights.dtype)
     return router_logits, router_top_value, router_indices
 
 
-@config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
-def apply_rotary_pos_emb_liger(
+@config.replace_function("apply_rotary_pos_emb", description="OpSlot guard for Liger fused RoPE")
+def apply_rotary_pos_emb_patched(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -168,16 +190,19 @@ def apply_rotary_pos_emb_liger(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+
+# Dummy reference resolved at codegen time from the generated module.
+rotate_half = None  # noqa: E305
 
 
 @config.override_method("Qwen3MoeModel.forward", description="Support SP in Qwen3MoeModel.forward")
