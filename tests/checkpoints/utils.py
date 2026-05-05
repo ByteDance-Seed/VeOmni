@@ -83,6 +83,14 @@ def get_checkpoint_test_command(
         "--train.checkpoint.manager dcp",
         "--train.checkpoint.save_async True",
         f"--train.checkpoint.save_hf_weights {save_hf_weights}",
+        # The DCP-then-merge run and the direct-HF run must produce
+        # bit-equivalent weights for `check_state_dict` (default fp32
+        # `torch.testing.assert_close` ~1.3e-6). Best-effort: locks in
+        # cudnn / NCCL / CUBLAS_WORKSPACE_CONFIG seeds and calls
+        # `torch.use_deterministic_algorithms(True, warn_only=True)` —
+        # ops without a deterministic kernel still warn, so residual
+        # nondeterminism is possible but much less likely.
+        "--train.enable_full_determinism True",
     ]
 
     exec_script = " \\\n".join(params)

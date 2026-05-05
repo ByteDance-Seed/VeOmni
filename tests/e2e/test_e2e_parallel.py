@@ -23,11 +23,37 @@ _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires di
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
-    # across pytest invocations *and* across GPU architectures (L20 in CI vs A100
-    # locally). Without this, the four sub-runs (sp/ep grid) shared weights within
-    # one pytest run but differed between runs, making SP/EP-vs-no-EP grad-norm
-    # comparisons flaky at the toy-config scale (CI hit a seed where the EP=2 vs
-    # EP=1 step-2 grad_norm diff was 0.69, blowing past the 0.1 atol+rtol envelope).
+    # across pytest invocations *and* across GPU architectures (L20 in CI vs
+    # H100/A100 locally). Without this, the four sub-runs (sp/ep grid) would
+    # share weights within one pytest run but differ between runs.
+    #
+    # Cross-EP structural spread on H100. EP=1 vs EP=2 paths are structurally
+    # different — different per-rank token composition after `all_to_all`,
+    # and the world is reorganized as `ep × ep_fsdp` so FSDP gradient
+    # reduction occurs over a different rank set in bf16. On 8×H100 we ran
+    # 100 in-process reps under all three determinism flags
+    # (`enable_full_determinism`, `enable_high_precision_for_bf16`,
+    # `enable_batch_invariant_mode`) and observed bit-identical results
+    # across reps with cross-EP step-2 grad_norm spread = 0.0547 — well
+    # inside the 0.1 envelope below.
+    #
+    # CI L20 outlier (unexplained). We have seen one CI run on L20 where the
+    # step-2 cross-EP spread reached ~0.87, which is 16× the deterministic
+    # H100 baseline. The 100-rep H100 result rules out generic bf16 EP-path
+    # noise as the cause: that noise produces a stable 0.055 spread and is
+    # not stochastic across reps. Whatever drives the L20 0.87 number is
+    # therefore something the H100 environment does not see — most likely
+    # CI machine instability (driver / NCCL build, kernel autotune cache,
+    # Ada-vs-Hopper kernel selection, transient host load) rather than a
+    # model-side bug. We do not have L20 access to run the 100-rep
+    # robustness check, so this remains a hypothesis.
+    #
+    # Keep the strict tolerance. Relaxing it globally to absorb a single
+    # unexplained L20 outlier would mask real EP-path regressions on the
+    # hardware where the test is robust. If CI flakes on this assertion,
+    # retry first; if it persists, capture the failing logs and investigate
+    # L20-specific causes (driver, NCCL build, kernel autotune cache) before
+    # widening the bound.
     torch.manual_seed(0)
     model = build_foundation_model(
         config_path=config_path,
