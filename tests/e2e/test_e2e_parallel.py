@@ -27,26 +27,33 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
     # H100/A100 locally). Without this, the four sub-runs (sp/ep grid) would
     # share weights within one pytest run but differ between runs.
     #
-    # Cross-EP grad_norm flake (L20 only). On the CI L20 hardware we have seen
-    # the step-2 EP=1 vs EP=2 grad_norm spread reach ~0.87 on a single seed,
-    # blowing past the 0.1 rtol/atol envelope below. Root cause is bf16 noise
-    # in the MoE all_to_all + group_gemm M-dim reshuffle that drifts the
-    # layer-0 expert output by ~1e-3, which flips ~1% of layer-1 top-k routing
-    # decisions and cascades through layer 3 (~5% flips) into the optimizer
-    # step. Determinism flags (`enable_full_determinism`,
-    # `enable_high_precision_for_bf16`, `enable_batch_invariant_mode`) cannot
-    # close this gap because EP and non-EP paths are structurally different:
-    # different per-rank token composition after `all_to_all`, and the world
-    # is reorganized as `ep × ep_fsdp` so FSDP gradient reduction occurs over
-    # a different rank set in bf16.
+    # Cross-EP structural spread on H100. EP=1 vs EP=2 paths are structurally
+    # different — different per-rank token composition after `all_to_all`,
+    # and the world is reorganized as `ep × ep_fsdp` so FSDP gradient
+    # reduction occurs over a different rank set in bf16. On 8×H100 we ran
+    # 100 in-process reps under all three determinism flags
+    # (`enable_full_determinism`, `enable_high_precision_for_bf16`,
+    # `enable_batch_invariant_mode`) and observed bit-identical results
+    # across reps with cross-EP step-2 grad_norm spread = 0.0547 — well
+    # inside the 0.1 envelope below.
     #
-    # We deliberately keep the strict tolerance. On H100 (8×80GB), 100
-    # in-process reps under all three determinism flags returned bit-identical
-    # results across reps with cross-EP step-2 spread = 0.0547 — well inside
-    # the bound. Relaxing the tolerance globally would mask real regressions
-    # on the hardware that does not exhibit the L20 flake. If CI flakes on
-    # this assertion, retry first; if it persists, investigate the L20
-    # mechanism rather than widening the assertion.
+    # CI L20 outlier (unexplained). We have seen one CI run on L20 where the
+    # step-2 cross-EP spread reached ~0.87, which is 16× the deterministic
+    # H100 baseline. The 100-rep H100 result rules out generic bf16 EP-path
+    # noise as the cause: that noise produces a stable 0.055 spread and is
+    # not stochastic across reps. Whatever drives the L20 0.87 number is
+    # therefore something the H100 environment does not see — most likely
+    # CI machine instability (driver / NCCL build, kernel autotune cache,
+    # Ada-vs-Hopper kernel selection, transient host load) rather than a
+    # model-side bug. We do not have L20 access to run the 100-rep
+    # robustness check, so this remains a hypothesis.
+    #
+    # Keep the strict tolerance. Relaxing it globally to absorb a single
+    # unexplained L20 outlier would mask real EP-path regressions on the
+    # hardware where the test is robust. If CI flakes on this assertion,
+    # retry first; if it persists, capture the failing logs and investigate
+    # L20-specific causes (driver, NCCL build, kernel autotune cache) before
+    # widening the bound.
     torch.manual_seed(0)
     model = build_foundation_model(
         config_path=config_path,
