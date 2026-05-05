@@ -1,34 +1,22 @@
 """Bitwise logits-equal tests for transformers v5 models.
 
-Sibling to ``test_models_logits_equal.py`` (which targets transformers v4 +
-runtime monkey patches). v5 ships generated, self-contained patched modeling
-files under ``veomni/models/transformers/<model>/generated/``; the pristine
-HF classes in ``transformers`` are therefore never mutated, so this test
-needs no ``hf_unpatch.py`` analogue — both ``transformers.Qwen3_5ForCausalLM``
-and the VeOmni ``patched_modeling_qwen3_5_gpu.Qwen3_5ForCausalLM`` are built
-side-by-side.
+Sibling to ``test_models_logits_equal.py`` (v4 scope). v5 ships self-contained
+generated modeling under ``veomni/models/transformers/<model>/generated/``,
+so pristine ``transformers.*`` classes stay untouched and HF + VeOmni can be
+built side-by-side without an unpatch helper.
 
 Scope decisions
 ---------------
-- Text-only forward via ``Qwen3_5ForCausalLM`` / ``Qwen3_5MoeForCausalLM``.
-  The toy configs are full VLMs; we extract ``text_config`` and use the
-  text-only architecture so the comparison is not perturbed by VLM-specific
-  patches (``fast_pos_embed_interpolate``, ``get_image_features``, etc.).
-- ``layer_types`` is overridden to all ``"full_attention"``. Without the
-  ``causal_conv1d`` PyPI package, HF's linear-attention path falls back to
-  ``F.silu(self.conv1d(...))`` while VeOmni's OpSlot dispatches to
-  ``fla.modules.convolution.causal_conv1d`` — different kernels, not bitwise
-  equal. Restricting to full-attention layers exercises the rest of the
-  modeling stack (RMSNorm + RoPE + GQA attention + MoE experts + MTP head)
-  under the same OpSlot-bound kernels on both sides.
-- ``cu_seq_lens_q`` is supplied as a single-segment cumulative tensor.
-  VeOmni's patched ``Qwen3_5DecoderLayer.forward`` ``assert``\\s on it; HF's
-  decoder layer ignores it (consumed via ``**kwargs``).
-- Both ``qwen3_5`` and ``qwen3_5_moe`` patched modeling files gate RMSNorm
-  behind an ``OpSlot("rms_norm", "qwen3_5")`` guard; with
-  ``rms_norm_implementation="eager"`` the slot is unbound and the forward
-  falls through to the HF reference, so no module-level monkey-patching is
-  needed on either side.
+- Text-only forward via ``*ForCausalLM`` so VLM-specific patches
+  (``fast_pos_embed_interpolate``, ``get_image_features``, ...) don't enter
+  the comparison.
+- ``layer_types`` forced to all ``"full_attention"``: without the
+  ``causal_conv1d`` package, HF's linear-attention path falls back to
+  ``F.silu(self.conv1d(...))`` while VeOmni dispatches to fla's Triton
+  ``causal_conv1d`` — different implementations, not bitwise equal.
+- ``cu_seq_lens_q`` supplied as a single segment: VeOmni's patched
+  ``Qwen3_5DecoderLayer.forward`` ``assert``\\s on it; HF ignores it via
+  ``**kwargs``.
 """
 
 import copy
@@ -49,14 +37,13 @@ from veomni.utils.device import (
 )
 
 
-# Must be set before ``import veomni`` so OpSlot defaults that map to "eager"
-# stay as eager and don't try to bind GPU-only kernels at import time.
+# Required by ``dist.init_process_group`` in the module-scoped fixture.
 os.environ.setdefault("RANK", "0")
 os.environ.setdefault("LOCAL_RANK", "0")
 os.environ.setdefault("WORLD_SIZE", "1")
 os.environ.setdefault("MASTER_ADDR", "localhost")
 os.environ.setdefault("MASTER_PORT", "12356")
-# Required by torch.use_deterministic_algorithms for cuBLAS.
+# Required by ``torch.use_deterministic_algorithms`` for cuBLAS.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
@@ -67,16 +54,15 @@ _DTYPE_MAP = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
 @dataclass(frozen=True)
 class Case:
-    """One bitwise-equal comparison between pristine HF and VeOmni-generated.
+    """One HF-vs-VeOmni bitwise comparison.
 
-    ``toy_config_dir`` points at a v5 VLM toy config (Qwen3_5Config or
-    Qwen3_5MoeConfig); the test extracts ``text_config`` and runs forward
-    against the matching ``*ForCausalLM`` text-only architecture.
+    ``toy_config_dir`` points at a full VLM toy config; the test extracts
+    ``text_config`` and runs the matching ``*ForCausalLM`` text architecture.
     """
 
     case_id: str
     toy_config_dir: str
-    text_arch: str  # e.g. "Qwen3_5ForCausalLM"
+    text_arch: str
     attn_implementation: str = "eager"
     dtype: str = "float32"
 
@@ -85,10 +71,7 @@ def _toy(name: str) -> str:
     return os.path.join(REPO_ROOT, "tests", "toy_config", name)
 
 
-# Eager+fp32 covers the determinism / RNG-init parity baseline. fa2+bf16
-# covers the dtype path that real users hit (Qwen3.5 hard-codes bf16 in the
-# toy config). Two attn implementations (eager / FA2) catch divergence inside
-# the attention forward itself.
+# eager+fp32 = RNG-init parity baseline; fa2/sdpa+bf16 = the dtype real users hit.
 CASES = [
     Case(
         "qwen3_5-toy-text-eager",
@@ -107,10 +90,9 @@ CASES = [
         _toy("qwen3_5_moe_toy"),
         text_arch="Qwen3_5MoeForCausalLM",
     ),
-    # Qwen3.5-MoE drops FA2: the toy config (num_kv_heads=2, head_dim=256,
-    # seq_len=32) crashes inside ``flash_attn.flash_attn_interface._flash_attn_varlen_forward``
-    # with an illegal memory access on both pristine HF and VeOmni. Replaced
-    # with SDPA so the bf16 path still gets exercised end-to-end.
+    # FA2 swapped for SDPA on MoE: the toy's (num_kv_heads=2, head_dim=256,
+    # seq_len=32) shape crashes ``_flash_attn_varlen_forward`` upstream on
+    # both HF and VeOmni; SDPA still exercises the bf16 path end-to-end.
     Case(
         "qwen3_5_moe-toy-text-sdpa",
         _toy("qwen3_5_moe_toy"),
@@ -130,12 +112,10 @@ def _apply_determinism():
 
 @pytest.fixture(scope="module", autouse=True)
 def _single_rank_process_group():
-    """Module-scoped 1-rank process group for the SP-aware attention wrappers.
+    """1-rank NCCL group for VeOmni's SP-aware attention wrappers.
 
-    VeOmni's generated modeling reads ``get_parallel_state()`` and the
-    SP-aware FA wrappers expect a default group even at sp_size=1. Mirrors
-    the v4 sibling test's gates so a skip-only environment doesn't pay an
-    init cost.
+    Only init/teardown if we created the group; gated on the same skip
+    conditions as the test bodies so a skip-only run doesn't pay the cost.
     """
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
@@ -147,8 +127,8 @@ def _single_rank_process_group():
 
     we_initialised = False
     if not dist.is_initialized():
-        # Bind the accelerator before init_process_group so multi-GPU CI
-        # hosts don't have NCCL pick the wrong visible device.
+        # Bind the accelerator before init so NCCL doesn't pick the wrong
+        # visible device on multi-GPU CI hosts.
         get_torch_device().set_device(int(os.environ.get("LOCAL_RANK", "0")))
         dist.init_process_group(backend=get_dist_comm_backend(), rank=0, world_size=1)
         we_initialised = True
@@ -166,50 +146,38 @@ def _release():
 
 
 def _make_text_config(toy_config_dir: str, text_arch: str, layer_types_override: str = "full_attention"):
-    """Load the toy VLM config and return a text-only config ready for build.
-
-    Why ``layer_types`` is overridden — see module docstring.
-    Why ``_experts_implementation = "eager"`` is forced — HF's default
-    ``"grouped_mm"`` (resolved by ``get_correct_experts_implementation``)
-    routes ``Qwen3_5MoeExperts.forward`` through ``torch._grouped_mm`` /
-    ``torch.nn.functional.grouped_mm``, which is incompatible with the toy
-    config's tiny expert tensors and crashes with an illegal memory access.
-    Eager runs the original per-expert loop on both sides.
-    """
+    """Extract a text-only sub-config from a v5 VLM toy config."""
     from transformers import AutoConfig
 
     full_config = AutoConfig.from_pretrained(toy_config_dir)
     text_config = copy.deepcopy(full_config.text_config)
 
-    # Strip linear-attention layers — see module docstring for the rationale.
+    # All-full-attention override — see module docstring.
     if hasattr(text_config, "layer_types") and text_config.layer_types is not None:
         text_config.layer_types = [layer_types_override] * len(text_config.layer_types)
 
-    # Force eager MoE experts forward on the HF side; harmless on VeOmni's side
-    # (the class_replacement removes the dispatching decorator entirely).
+    # HF's default ``"grouped_mm"`` routes through ``torch._grouped_mm`` and
+    # crashes on the toy's tiny expert tensors; eager runs the per-expert loop
+    # on both sides. Harmless on the non-MoE qwen3_5 path.
     text_config._experts_implementation = "eager"
 
-    # The HF text-only architecture lookup happens via ``architectures[0]``
-    # on both sides; pristine HF goes through ``getattr(transformers, ...)``
-    # and VeOmni's ``MODELING_REGISTRY`` keys on ``model_type``. The toy's
-    # ``text_config.model_type`` already matches the v5 text-model registry
-    # entry (``qwen3_5_text`` / ``qwen3_5_moe_text``).
+    # HF resolves the class via ``architectures[0]``; VeOmni's MODELING_REGISTRY
+    # keys on ``model_type`` (already correct on the extracted text_config).
     text_config.architectures = [text_arch]
     return text_config
 
 
 def _build_hf_text_model(text_config, attn_implementation: str, dtype: torch.dtype):
-    """Pristine HF text-only model — same RNG seed as VeOmni so weights match."""
+    """Pristine HF text-only model — same seed + init path as VeOmni."""
     import transformers
 
     cls = getattr(transformers, text_config.architectures[0])
     torch.manual_seed(0)
     get_torch_device().manual_seed_all(0)
-    # ``_from_config`` inits weights directly at ``dtype``; ``cls(config).to(bf16)``
-    # would init in fp32 first and produce different random bytes than a
-    # bf16-from-the-start build (RNG output depends on tensor dtype). Allocating
-    # on-device matches VeOmni's path so rotary ``inv_freq`` / friends share
-    # arithmetic.
+    # ``_from_config(..., torch_dtype=...)`` inits at ``dtype`` directly;
+    # ``cls(config).to(dtype)`` would init in fp32 first and produce different
+    # RNG bytes (RNG output is dtype-dependent). On-device init matches
+    # VeOmni's path so rotary ``inv_freq`` shares arithmetic.
     with torch.device(get_device_type()):
         model = cls._from_config(
             text_config,
@@ -222,11 +190,10 @@ def _build_hf_text_model(text_config, attn_implementation: str, dtype: torch.dty
 def _make_eager_ops_config(attn_implementation: str):
     """OpsImplementationConfig that pins every op to its HF-equivalent path.
 
-    With ``layer_types`` forced to ``full_attention`` the GatedDeltaNet
-    OpSlots (rms_norm_gated / causal_conv1d / chunk_gated_delta_rule) never
-    fire, but binding them to ``"eager"`` rather than the default ``"fla"``
-    avoids loading optional kernels and keeps the test runnable on hosts
-    where ``flash-linear-attention`` is missing.
+    The GatedDeltaNet OpSlots (rms_norm_gated / causal_conv1d /
+    chunk_gated_delta_rule) never fire under our full-attention override,
+    but ``"eager"`` instead of the default ``"fla"`` keeps the test
+    runnable without ``flash-linear-attention`` installed.
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
 
@@ -247,16 +214,13 @@ def _make_eager_ops_config(attn_implementation: str):
 def _build_veomni_text_model(text_config, attn_implementation: str, dtype_name: str, hf_state_dict):
     """VeOmni-generated text-only model with HF state_dict loaded."""
     from veomni.models.auto import build_foundation_model
-
-    # ``apply_ops_config`` is normally called *inside* ``build_foundation_model``
-    # when ``ops_implementation`` is supplied. We pre-call it so the config's
-    # ``__post_init__`` SP-rewriting (under ``MODELING_BACKEND=veomni``) runs
-    # before we hand a still-original ``attn_implementation`` to
-    # ``build_foundation_model``. The SP wrappers degrade to the underlying FA
-    # kernel at ``ulysses_enabled=False`` (sp_size=1), so passing
-    # ``flash_attention_2`` directly here is equivalent to the rewritten name.
     from veomni.ops import apply_ops_config
 
+    # Install our eager-everywhere ops config first so ``build_foundation_model``'s
+    # "no config installed → use defaults" branch doesn't overwrite it (the
+    # defaults rebind GatedDeltaNet slots to fla and CE to chunk_loss).
+    # The SP-aware FA wrappers degrade to plain FA at sp_size=1, so passing
+    # ``flash_attention_2`` directly is equivalent to the SP-rewritten name.
     apply_ops_config(_make_eager_ops_config(attn_implementation))
 
     model = build_foundation_model(
@@ -271,12 +235,7 @@ def _build_veomni_text_model(text_config, attn_implementation: str, dtype_name: 
 
 
 def _make_input_ids_and_kwargs(text_config, device) -> tuple[torch.Tensor, dict]:
-    """Text-only input_ids and forward kwargs.
-
-    Vocab floor 32000 dodges multimodal placeholder ids. ``cu_seq_lens_q``
-    is required by VeOmni's patched ``Qwen3_5DecoderLayer.forward``; HF's
-    decoder ignores it via ``**kwargs``.
-    """
+    """Text-only ids + forward kwargs. Vocab floor 32000 dodges MM placeholders."""
     gen = torch.Generator(device=device).manual_seed(0)
     vocab = max(min(text_config.vocab_size, 200000), 32000)
     seq_len = 32
@@ -289,10 +248,8 @@ def _make_input_ids_and_kwargs(text_config, device) -> tuple[torch.Tensor, dict]
 def test_logits_bitwise_equal_v5(case: Case):
     """Bitwise-equal forward: pristine HF vs VeOmni patched modeling.
 
-    Scope: transformers v5 (>=5.0.0). Single GPU. No GPU kernel patching.
-    ``layer_types`` forced to ``full_attention`` to avoid the
-    ``causal_conv1d`` kernel divergence between HF (Dao-AILab / pure-PyTorch
-    fallback) and VeOmni (fla Triton). See module docstring.
+    transformers v5, single GPU, no GPU kernel patching. See module docstring
+    for the ``layer_types`` and ``cu_seq_lens_q`` constraints.
     """
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
@@ -313,10 +270,6 @@ def test_logits_bitwise_equal_v5(case: Case):
     text_config = _make_text_config(case.toy_config_dir, case.text_arch)
     input_ids, fwd_kwargs = _make_input_ids_and_kwargs(text_config, device)
 
-    # --- HF phase ---
-    # No "must precede VeOmni build" ordering constraint here (unlike the v4
-    # test): the v5 generated modeling files don't mutate the
-    # ``transformers.*`` namespace, so HF stays pristine regardless of order.
     model_hf = _build_hf_text_model(text_config, case.attn_implementation, target_dtype)
     with torch.no_grad():
         logits_hf = model_hf(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs).logits.detach().clone()
@@ -324,7 +277,6 @@ def test_logits_bitwise_equal_v5(case: Case):
     del model_hf
     _release()
 
-    # --- VeOmni phase ---
     model_ve = _build_veomni_text_model(text_config, case.attn_implementation, case.dtype, hf_state_dict)
     with torch.no_grad():
         logits_ve = model_ve(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs).logits.detach().clone()
