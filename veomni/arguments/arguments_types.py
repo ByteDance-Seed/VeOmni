@@ -667,9 +667,9 @@ class OpsImplementationConfig:
       ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
       patched modeling module, so config-parse-time validation would force
       every NPU user to override them even when training non-Qwen3.5 models.
-      Validating at bind time defers the check until Qwen3.5 is actually
-      loaded; ``register_qwen3_5_moe_modeling`` adds an upfront NPU guard
-      with a Qwen3.5-aware error message.
+      The kernel's ``HardwareRequirement`` raises if a non-eager value is
+      requested on NPU; the varlen (``dyn_bsz=True``) caveat is documented
+      in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),

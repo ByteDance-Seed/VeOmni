@@ -151,14 +151,23 @@ def build_foundation_model(
     if ops_implementation is not None:
         apply_ops_config(ops_implementation)
         attn_implementation = ops_implementation.attn_implementation
-    elif get_ops_config() is None:
-        raise ValueError(
-            "build_foundation_model requires `ops_implementation` (or a prior "
-            "`apply_ops_config(...)` call). Trainers pass "
-            "`args.model.ops_implementation`; standalone scripts must "
-            "construct an `OpsImplementationConfig` explicitly. "
-            "There is no longer a silent all-eager fallback."
-        )
+    else:
+        installed = get_ops_config()
+        if installed is None:
+            raise ValueError(
+                "build_foundation_model requires `ops_implementation` (or a prior "
+                "`apply_ops_config(...)` call). Trainers pass "
+                "`args.model.ops_implementation`; standalone scripts must "
+                "construct an `OpsImplementationConfig` explicitly. "
+                "There is no longer a silent all-eager fallback."
+            )
+        # Caller pre-installed the singleton (e.g. DiTTrainer building a
+        # condition model). Honour the installed config's attn unless the
+        # caller passed an explicit override — without this, the model
+        # silently uses the loader's HF default instead of the SP-aware
+        # variant the user selected.
+        if attn_implementation is None:
+            attn_implementation = installed.attn_implementation
 
     if config_kwargs is None:
         config_kwargs = {}

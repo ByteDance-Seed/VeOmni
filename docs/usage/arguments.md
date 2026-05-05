@@ -146,15 +146,15 @@ NPU validation runs at two times:
   six general-purpose ops (`moe`, `cross_entropy_loss`, `rms_norm`,
   `swiglu_mlp`, `rotary_pos_emb`, `load_balancing_loss`). Errors fire
   immediately with a model-agnostic allow-list.
-- **Model-build time** for Qwen3.5-only ops (`rms_norm_gated`,
+- **OpSlot-bind time** (`KERNEL_REGISTRY.resolve` via the kernel's
+  `HardwareRequirement`) for Qwen3.5-only ops (`rms_norm_gated`,
   `causal_conv1d`, `chunk_gated_delta_rule`). Validating these at config
   parse would force every NPU user to override them even when training
-  non-Qwen3.5 models. Instead, `qwen3_5_moe`'s NPU registration raises
-  upfront if any of the three is set to a non-eager value, and the OpSlot
-  bind layer is the safety net behind it. **Qwen3.5 GatedDeltaNet has no
-  NPU kernel today** — varlen training (`dyn_bsz=True`, the default) is
-  not supported on NPU; non-varlen training works only with all three
-  fields pinned to `"eager"`.
+  non-Qwen3.5 models, so the check fires only when Qwen3.5's patched
+  modeling is actually loaded. **Qwen3.5 GatedDeltaNet has no NPU kernel
+  today** — varlen training (`dyn_bsz=True`, the default) is not supported
+  on NPU; non-varlen training works only with all three fields pinned to
+  `"eager"`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
