@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from veomni.models.auto import build_foundation_model
+from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
@@ -19,6 +20,11 @@ _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
+# Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
+# non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
+_qwen3_5_npu_skip = pytest.mark.skipif(
+    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
+)
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -254,7 +260,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_v5_only,
+        marks=[_v5_only, _qwen3_5_npu_skip],
     ),
     pytest.param(
         "qwen3_5",
@@ -263,7 +269,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_v5_only,
+        marks=[_v5_only, _qwen3_5_npu_skip],
     ),
 ]
 

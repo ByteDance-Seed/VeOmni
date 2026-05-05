@@ -108,6 +108,10 @@ def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
+    # ``None`` = "no caller preference" — let the resolution below pick: from
+    # ``ops_implementation`` if given, else from the all-eager fallback (which
+    # itself drops to ``"eager"`` on no-flash-attn hosts). A non-None value
+    # is treated as an explicit caller override and preserved as-is.
     attn_implementation: Optional[
         Literal[
             "eager",
@@ -120,7 +124,7 @@ def build_foundation_model(
             "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
-    ] = "veomni_flash_attention_2_with_sp",
+    ] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
@@ -148,7 +152,15 @@ def build_foundation_model(
         apply_ops_config(ops_implementation)
         attn_implementation = ops_implementation.attn_implementation
     elif get_ops_config() is None:
-        apply_ops_config(OpsImplementationConfig.all_eager())
+        # Standalone callers only (tasks/infer/*, materialize_weights,
+        # dummy-forward tests); trainers always pass ``ops_implementation``.
+        # Install an all-eager singleton so per-op resolution doesn't crash.
+        # For attn, only adopt the fallback's value when the caller didn't
+        # pass an explicit one (so no-flash-attn hosts get ``"eager"``).
+        fallback = OpsImplementationConfig.all_eager()
+        apply_ops_config(fallback)
+        if attn_implementation is None:
+            attn_implementation = fallback.attn_implementation
 
     if config_kwargs is None:
         config_kwargs = {}
