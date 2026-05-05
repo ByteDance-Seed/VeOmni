@@ -49,8 +49,8 @@ Contract: ``apply_ops_config(ops_config)`` must run before any model is built,
 otherwise ``LOSS_MAPPING`` contains HF's stock wrapper which doesn't understand
 ``hidden_states=``/``weights=`` kwargs. ``build_foundation_model`` owns this:
 pass ``ops_implementation=...`` (trainers do) and it installs the config;
-otherwise it falls back to ``OpsImplementationConfig.all_eager()`` so
-standalone scripts work on any accelerator without requiring liger / triton.
+callers that omit it must have pre-installed a singleton via
+``apply_ops_config`` themselves, otherwise ``build_foundation_model`` raises.
 """
 
 from functools import partial

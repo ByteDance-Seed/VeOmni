@@ -767,42 +767,6 @@ class OpsImplementationConfig:
         },
     )
 
-    @classmethod
-    def all_eager(cls, **overrides) -> "OpsImplementationConfig":
-        """Hardware-agnostic config (every per-op field = ``"eager"``).
-
-        For tests / standalone scripts that don't need fused kernels and shouldn't
-        depend on liger / triton or the active accelerator. ``**overrides`` flips
-        specific fields (e.g. ``all_eager(moe_implementation="fused_quack")``)
-        without enumerating the rest.
-
-        ``attn_implementation`` keeps the dataclass default (``flash_attention_2``)
-        when flash-attn is importable — production GPU hosts usually have it.
-        Falls back to ``"eager"`` when it isn't, so CPU / minimal-deps
-        environments don't crash on import-time FA loading.
-        """
-        from ..utils.import_utils import is_flash_attn_2_available
-
-        attn = overrides.pop("attn_implementation", None)
-        if attn is None:
-            attn = "flash_attention_2" if is_flash_attn_2_available() else "eager"
-        return cls(
-            attn_implementation=attn,
-            moe_implementation=overrides.pop("moe_implementation", "eager"),
-            cross_entropy_loss_implementation=overrides.pop("cross_entropy_loss_implementation", "eager"),
-            rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
-            swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
-            rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
-            load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
-            # Qwen3.5 GatedDeltaNet ops — only meaningful for that model, but
-            # listed here so the safe-fallback path doesn't pull in
-            # flash-linear-attention on hosts that don't have it.
-            rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
-            causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),
-            chunk_gated_delta_rule_implementation=overrides.pop("chunk_gated_delta_rule_implementation", "eager"),
-            **overrides,
-        )
-
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {

@@ -391,12 +391,14 @@ def _build_veomni_model(case: Case, hf_state_dict):
     """Return a device-resident, eval-mode veomni model with HF weights loaded."""
     from veomni.models.auto import build_foundation_model
 
+    from ..tools.training_utils import make_eager_ops_config
+
     model = build_foundation_model(
         config_path=case.path,
         weights_path=None,
         torch_dtype=case.dtype,
-        attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
+        ops_implementation=make_eager_ops_config(attn_implementation=case.attn_implementation),
     )
 
     if case.sync_weight_key is not None:
@@ -553,14 +555,16 @@ def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buff
     """
     from veomni.models.auto import build_foundation_model
 
+    from ..tools.training_utils import make_eager_ops_config
+
     _save_hf_checkpoint(hf_state_dict, config, weights_dir)
 
     model = build_foundation_model(
         config_path=weights_dir,
         weights_path=weights_dir,
         torch_dtype=case.dtype,
-        attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
+        ops_implementation=make_eager_ops_config(attn_implementation=case.attn_implementation),
     )
 
     # Restore non-persistent buffers (e.g. rotary inv_freq) that aren't in the

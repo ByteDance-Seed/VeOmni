@@ -55,18 +55,26 @@ def run_environ_meter(args: Arguments):
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
+        ops_implementation=args.model.ops_implementation,
     )
     print(f"Model Class: {type(model)}")
 
 
+_MODEL_NAME_FOR_OVERRIDES = {
+    # Maps the parametrize model_path to the short name used by
+    # _NPU_PER_MODEL_OVERRIDES — only matters on NPU.
+    "qwen2vl-7b-instruct": "qwen2vl",
+    "llama3_2-3b-instruct": None,
+}
+
+
 @pytest.mark.parametrize(
     "model_path",
-    [
-        "qwen2vl-7b-instruct",
-        "llama3_2-3b-instruct",
-    ],
+    list(_MODEL_NAME_FOR_OVERRIDES.keys()),
 )
 def test_model_loader(model_path):
+    from tests.tools.training_utils import resolve_ops_overrides
+
     port = 12345 + random.randint(0, 100)
 
     command = [
@@ -78,6 +86,9 @@ def test_model_loader(model_path):
         "--data.train_path=tests",
         "--train.checkpoint.output_dir=.tests/cache",
         f"--train.init_device={get_device_type()}",
+        # On NPU the dataclass defaults raise at parse time; pin to the
+        # NPU-supported backend per op. No-op on GPU.
+        *resolve_ops_overrides(_MODEL_NAME_FOR_OVERRIDES[model_path]),
     ]
 
     result = subprocess.run(command, check=True)

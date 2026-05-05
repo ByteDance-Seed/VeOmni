@@ -108,10 +108,10 @@ def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
-    # ``None`` = "no caller preference" — let the resolution below pick: from
-    # ``ops_implementation`` if given, else from the all-eager fallback (which
-    # itself drops to ``"eager"`` on no-flash-attn hosts). A non-None value
-    # is treated as an explicit caller override and preserved as-is.
+    # ``None`` = "no caller preference" — resolved from ``ops_implementation``
+    # below. A non-None value is treated as an explicit caller override and
+    # preserved as-is (used by callers that pre-installed the ops singleton
+    # via ``apply_ops_config`` and only need to pin attn here).
     attn_implementation: Optional[
         Literal[
             "eager",
@@ -136,14 +136,14 @@ def build_foundation_model(
 
     If weights_path is provided, it loads the pre-trained weights, otherwise it initializes weights.
 
-    Ops dispatch: if ``ops_implementation`` is given we run ``apply_ops_config``
-    before constructing the model and the resolved ``attn_implementation`` is
-    read from it (the kwarg is ignored). Trainers always pass it. Standalone
-    scripts (``tasks/infer/*``, weight-materialization, dummy-forward tests)
-    get an ``all_eager()`` config installed automatically — works on every
-    accelerator without requiring liger / triton. If something earlier already
-    installed an ops config (e.g. ``DiTTrainer`` building a condition model
-    first), we leave it alone.
+    Ops dispatch: callers must pass ``ops_implementation`` *or* pre-install a
+    singleton via ``apply_ops_config(...)``. There is no silent all-eager
+    fallback — passing neither raises ``ValueError``. Trainers pass
+    ``args.model.ops_implementation``; standalone scripts (``tasks/infer/*``)
+    construct an explicit ``OpsImplementationConfig``. ``DiTTrainer`` builds a
+    condition model first via ``apply_ops_config`` and then calls into here
+    without the kwarg, which is fine — the singleton-already-installed branch
+    leaves it alone.
     """
     from ..ops import apply_ops_config
     from ..ops.config.singleton import get_ops_config
@@ -152,15 +152,13 @@ def build_foundation_model(
         apply_ops_config(ops_implementation)
         attn_implementation = ops_implementation.attn_implementation
     elif get_ops_config() is None:
-        # Standalone callers only (tasks/infer/*, materialize_weights,
-        # dummy-forward tests); trainers always pass ``ops_implementation``.
-        # Install an all-eager singleton so per-op resolution doesn't crash.
-        # For attn, only adopt the fallback's value when the caller didn't
-        # pass an explicit one (so no-flash-attn hosts get ``"eager"``).
-        fallback = OpsImplementationConfig.all_eager()
-        apply_ops_config(fallback)
-        if attn_implementation is None:
-            attn_implementation = fallback.attn_implementation
+        raise ValueError(
+            "build_foundation_model requires `ops_implementation` (or a prior "
+            "`apply_ops_config(...)` call). Trainers pass "
+            "`args.model.ops_implementation`; standalone scripts must "
+            "construct an `OpsImplementationConfig` explicitly. "
+            "There is no longer a silent all-eager fallback."
+        )
 
     if config_kwargs is None:
         config_kwargs = {}

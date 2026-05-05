@@ -11,6 +11,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.import_utils import is_torch_npu_available
 
 from .launch_utils import find_free_port
@@ -48,6 +49,13 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 }
 
 
+def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
+    merged = dict(_NPU_OPS_DEFAULTS)
+    if model_name is not None:
+        merged.update(_NPU_PER_MODEL_OVERRIDES.get(model_name, {}))
+    return merged
+
+
 def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
     """Return ``--model.ops_implementation.X=Y`` flags for the active hardware.
 
@@ -57,10 +65,48 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
     """
     if not is_torch_npu_available():
         return []
-    merged = dict(_NPU_OPS_DEFAULTS)
-    if model_name is not None:
-        merged.update(_NPU_PER_MODEL_OVERRIDES.get(model_name, {}))
-    return [f"--model.ops_implementation.{k}={v}" for k, v in merged.items()]
+    return [f"--model.ops_implementation.{k}={v}" for k, v in _npu_overrides(model_name).items()]
+
+
+def make_eager_ops_config(**overrides) -> OpsImplementationConfig:
+    """Hardware-agnostic ``OpsImplementationConfig`` with every field = ``"eager"``.
+
+    For tests / inference scripts that don't need fused kernels and shouldn't
+    depend on liger / triton or the active accelerator. ``**overrides`` flips
+    specific fields (e.g. ``make_eager_ops_config(attn_implementation="flash_attention_2")``)
+    without enumerating the rest.
+    """
+    return OpsImplementationConfig(
+        attn_implementation=overrides.pop("attn_implementation", "eager"),
+        moe_implementation=overrides.pop("moe_implementation", "eager"),
+        cross_entropy_loss_implementation=overrides.pop("cross_entropy_loss_implementation", "eager"),
+        rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
+        swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
+        rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
+        load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
+        rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
+        causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),
+        chunk_gated_delta_rule_implementation=overrides.pop("chunk_gated_delta_rule_implementation", "eager"),
+        **overrides,
+    )
+
+
+def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImplementationConfig:
+    """NPU-recommended ``OpsImplementationConfig`` for tests running on Ascend.
+
+    Encodes the per-op NPU backend table (``_NPU_OPS_DEFAULTS``) plus per-model
+    eager fallbacks for ops without an NPU kernel (DeepSeek-V3, Qwen-VL family).
+    ``**overrides`` flips specific fields after the recommended values are
+    applied.
+    """
+    merged = _npu_overrides(model_name)
+    merged.update(overrides)
+    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
+    # config validates at parse time.
+    merged.setdefault("rms_norm_gated_implementation", "eager")
+    merged.setdefault("causal_conv1d_implementation", "eager")
+    merged.setdefault("chunk_gated_delta_rule_implementation", "eager")
+    return OpsImplementationConfig(**merged)
 
 
 def release_device_memory():
@@ -178,8 +224,8 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
-        attn_implementation="eager",
         init_device=get_device_type(),
+        ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
 

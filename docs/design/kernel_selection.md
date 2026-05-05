@@ -74,20 +74,15 @@ is no per-forward "which impl?" lookup.
 when callers pass `ops_implementation=ops` (trainers do this), it runs
 `apply_ops_config(ops)` before constructing the model and reads
 `attn_implementation` from `ops`. Callers that pass neither
-`ops_implementation` nor a prior `apply_ops_config` get an *all-eager* safe
-fallback (`_build_safe_fallback_ops_config()` in `veomni/models/auto.py`)
-installed silently — every per-op field set to `"eager"` so the fallback
-works on any accelerator without depending on Liger / Triton. The public
-`OpsImplementationConfig()` defaults are GPU-optimal and would raise on
-hosts without those packages; production training routes through trainers
-that pass that public config explicitly. The fallback exists only so
-`self.loss_function` never trips on VeOmni's extra `hidden_states=` /
-`weights=` kwargs in scripts like `tasks/infer/*` that don't construct a
-trainer. (The DiT trainer is the one exception that still calls
-`apply_ops_config` manually — it has to populate the singleton before
-building the condition model, which uses `model_class._from_config(...)`
-rather than `build_foundation_model`. The subsequent
-`build_foundation_model` call is idempotent.)
+`ops_implementation` nor a prior `apply_ops_config` raise `ValueError` —
+there is no silent all-eager fallback. Standalone scripts (`tasks/infer/*`)
+construct an explicit `OpsImplementationConfig` (typically all-eager so
+inference doesn't depend on Liger / Triton). The DiT trainer is the one
+exception that calls `apply_ops_config` manually — it has to populate the
+singleton before building the condition model, which uses
+`model_class._from_config(...)` rather than `build_foundation_model`. The
+subsequent `build_foundation_model` call hits the
+"singleton-already-installed" branch and leaves the prior config alone.
 
 ---
 

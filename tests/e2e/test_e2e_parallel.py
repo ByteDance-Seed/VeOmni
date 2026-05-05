@@ -12,6 +12,7 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
 
@@ -39,8 +40,8 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
-        attn_implementation="eager",
         init_device="cpu",
+        ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
 

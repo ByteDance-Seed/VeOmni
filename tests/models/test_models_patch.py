@@ -17,7 +17,6 @@ from veomni.arguments import (
     ModelArguments,
     TrainingArguments,
 )
-from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -27,6 +26,7 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 from veomni.utils.loss_utils import count_loss_token
 
 from ..tools.common_utils import print_device_mem_info
+from ..tools.training_utils import make_eager_ops_config
 from .utils import (
     ModelMode,
     compare_multi_items,
@@ -398,7 +398,7 @@ def test_models_patch_fwd_bwd(
     # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
     # fused_triton / triton) would fail validation on NPU before the test
     # even runs.
-    model_config = ModelArguments(config_path=config_path, ops_implementation=OpsImplementationConfig.all_eager())
+    model_config = ModelArguments(config_path=config_path, ops_implementation=make_eager_ops_config())
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),

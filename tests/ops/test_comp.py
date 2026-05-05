@@ -161,10 +161,26 @@ def compare(args, model, grid_thw, ref_fn, test_fn):
 
 
 def main(args):
-    # Initialize the model and get the visual
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    # Initialize the model and get the visual. Pin every per-op field to
+    # eager so the benchmark builds without liger / triton / fla.
+    eager_ops = OpsImplementationConfig(
+        attn_implementation="eager",
+        moe_implementation="eager",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+        rms_norm_gated_implementation="eager",
+        causal_conv1d_implementation="eager",
+        chunk_gated_delta_rule_implementation="eager",
+    )
     dummy_model = build_foundation_model(
         config_path=args.config_path,
         init_device=args.device,
+        ops_implementation=eager_ops,
     ).model.visual
 
     dummy_model.pos_embed.weight = torch.nn.Parameter(torch.randn_like(dummy_model.pos_embed.weight))

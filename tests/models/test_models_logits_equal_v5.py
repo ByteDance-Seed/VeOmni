@@ -384,41 +384,22 @@ def _build_hf_model(case: Case, config, dtype: torch.dtype):
     return model.eval()
 
 
-def _make_eager_ops_config(attn_implementation: str):
-    """OpsImplementationConfig that pins every op to its HF-equivalent path.
-
-    The Qwen3.5 GatedDeltaNet OpSlots (rms_norm_gated / causal_conv1d /
-    chunk_gated_delta_rule) never fire under our full-attention override,
-    but ``"eager"`` instead of the default ``"fla"`` keeps the test
-    runnable without ``flash-linear-attention`` installed.
-    """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-
-    return OpsImplementationConfig(
-        attn_implementation=attn_implementation,
-        moe_implementation="eager",
-        cross_entropy_loss_implementation="eager",
-        rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
-        rotary_pos_emb_implementation="eager",
-        load_balancing_loss_implementation="eager",
-        rms_norm_gated_implementation="eager",
-        causal_conv1d_implementation="eager",
-        chunk_gated_delta_rule_implementation="eager",
-    )
-
-
 def _build_veomni_model(case: Case, config, hf_state_dict):
     """VeOmni-generated model with HF state_dict loaded."""
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
 
+    from ..tools.training_utils import make_eager_ops_config
+
     # Install our eager-everywhere ops config first so ``build_foundation_model``'s
-    # "no config installed → use defaults" branch doesn't overwrite it (the
-    # defaults rebind GatedDeltaNet slots to fla and CE to chunk_loss).
+    # contract (caller passes ops_implementation OR singleton already installed)
+    # is satisfied. The Qwen3.5 GatedDeltaNet OpSlots (rms_norm_gated /
+    # causal_conv1d / chunk_gated_delta_rule) never fire under our
+    # full-attention override, but pinning them to ``"eager"`` keeps the test
+    # runnable without ``flash-linear-attention`` installed.
     # The SP-aware FA wrappers degrade to plain FA at sp_size=1, so passing
     # ``flash_attention_2`` directly is equivalent to the SP-rewritten name.
-    apply_ops_config(_make_eager_ops_config(case.attn_implementation))
+    apply_ops_config(make_eager_ops_config(attn_implementation=case.attn_implementation))
 
     model = build_foundation_model(
         config_path=config,
