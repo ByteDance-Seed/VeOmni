@@ -24,14 +24,29 @@ _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires di
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
     # across pytest invocations *and* across GPU architectures (L20 in CI vs
-    # H100/A100 locally). Without this, the four sub-runs of the (sp, ep) grid
-    # would still see the same weights within one pytest run, but successive
-    # runs would each materialize a different random init, giving every CI
-    # attempt a different cross-config divergence to chew on.
+    # H100/A100 locally). Without this, the four sub-runs (sp/ep grid) would
+    # share weights within one pytest run but differ between runs.
     #
-    # Note: a seeded init does NOT guarantee that EP=1 and EP=2 produce
-    # close grad_norms — see `_assert_parallel_alignment` for why cross-EP
-    # divergence is intrinsic to MoE training and how the test handles it.
+    # Cross-EP grad_norm flake (L20 only). On the CI L20 hardware we have seen
+    # the step-2 EP=1 vs EP=2 grad_norm spread reach ~0.87 on a single seed,
+    # blowing past the 0.1 rtol/atol envelope below. Root cause is bf16 noise
+    # in the MoE all_to_all + group_gemm M-dim reshuffle that drifts the
+    # layer-0 expert output by ~1e-3, which flips ~1% of layer-1 top-k routing
+    # decisions and cascades through layer 3 (~5% flips) into the optimizer
+    # step. Determinism flags (`enable_full_determinism`,
+    # `enable_high_precision_for_bf16`, `enable_batch_invariant_mode`) cannot
+    # close this gap because EP and non-EP paths are structurally different:
+    # different per-rank token composition after `all_to_all`, and the world
+    # is reorganized as `ep × ep_fsdp` so FSDP gradient reduction occurs over
+    # a different rank set in bf16.
+    #
+    # We deliberately keep the strict tolerance. On H100 (8×80GB), 100
+    # in-process reps under all three determinism flags returned bit-identical
+    # results across reps with cross-EP step-2 spread = 0.0547 — well inside
+    # the bound. Relaxing the tolerance globally would mask real regressions
+    # on the hardware that does not exhibit the L20 flake. If CI flakes on
+    # this assertion, retry first; if it persists, investigate the L20
+    # mechanism rather than widening the assertion.
     torch.manual_seed(0)
     model = build_foundation_model(
         config_path=config_path,
@@ -95,101 +110,9 @@ def main(
 
     for key in log_keys:
         print_comparison_table(res, key, title=model_name)
-    _assert_parallel_alignment(res, is_moe=is_moe, rtol=rtol, atol=atol)
+    compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
-
-
-# Cross-EP grad_norm tolerance for MoE models. Loss stays close (router output
-# is the same averaged signal) but grad_norm picks up the routing-flip cascade
-# documented in `_assert_parallel_alignment`. 0.5 rtol + 1.0 atol absorbs the
-# observed CI range (≤0.9 absolute spread on toy configs) while still catching
-# order-of-magnitude regressions in the EP path.
-_MOE_CROSS_EP_GRAD_NORM_RTOL = 0.5
-_MOE_CROSS_EP_GRAD_NORM_ATOL = 1.0
-
-
-def _assert_parallel_alignment(
-    res: dict,
-    *,
-    is_moe: bool,
-    rtol: float,
-    atol: float,
-) -> None:
-    """Compare metrics across distributed configs with MoE-aware tolerances.
-
-    For dense (non-MoE) models, every parallel config (varying only SP) must
-    match within (rtol, atol).
-
-    For MoE models, the configs span both SP and EP. EP=1 vs EP=2 cannot be
-    bitwise-aligned because:
-      - the EP path runs experts on a different per-rank token composition
-        (after all_to_all) than the non-EP path (only local tokens), and
-      - the world is reorganized as ep × ep_fsdp, so FSDP gradient
-        reduction occurs over a different rank set in bf16.
-    Even with deterministic kernels and stable argsort, the residual bf16
-    noise in the router input flips top-k decisions for a small fraction of
-    tokens (~1% by layer 1, ~5% by layer 3, growing each step). On toy
-    configs this can amplify the cross-EP grad_norm spread above the strict
-    tolerance on certain GPUs.
-
-    Strategy:
-      - same-EP runs (only SP varies): strict tolerance — SP must not change
-        forward/backward semantics.
-      - cross-EP runs: loss is checked at strict tolerance (it's stable);
-        grad_norm uses a relaxed tolerance to absorb routing-flip noise.
-    """
-    if not is_moe:
-        compare_metrics(res, rtol=rtol, atol=atol)
-        return
-
-    # Group runs by EP size parsed from the trailing `_ep<N>` segment of the
-    # task name (set by `prepare_exec_cmd`). `rpartition` plus integer parse
-    # avoids the substring trap of `"_ep1" in k` (which would also match
-    # `_ep10`) and naturally extends to any EP grid larger than {1, 2}.
-    runs_by_ep: dict[int, dict] = {}
-    for k, v in res.items():
-        head, sep, tail = k.rpartition("_ep")
-        if not sep or not tail.isdigit():
-            raise AssertionError(f"MoE run key missing _ep<N> suffix: {k!r}")
-        runs_by_ep.setdefault(int(tail), {})[k] = v
-
-    if len(runs_by_ep) < 2:
-        # Single-EP slice (e.g. max_sp_size filtered everything down). Fall
-        # back to the dense comparison.
-        compare_metrics(res, rtol=rtol, atol=atol)
-        return
-
-    # Same-EP runs (only SP varies) must match within strict tolerance.
-    for ep_runs in runs_by_ep.values():
-        if len(ep_runs) >= 2:
-            compare_metrics(ep_runs, rtol=rtol, atol=atol)
-
-    # Cross-EP: pick the smallest EP as the baseline and compare each other
-    # EP value against it. Loss stays close (router output is the same
-    # averaged signal) so it uses the strict tolerance; grad_norm uses the
-    # relaxed tolerance to absorb routing-flip noise.
-    ep_values = sorted(runs_by_ep.keys())
-    base_ep = ep_values[0]
-    base_name = next(iter(runs_by_ep[base_ep]))
-    base_run = runs_by_ep[base_ep][base_name]
-
-    metric_keys = list(base_run.keys())
-    grad_keys = [k for k in metric_keys if "grad_norm" in k]
-    other_keys = [k for k in metric_keys if k not in grad_keys]
-
-    for other_ep in ep_values[1:]:
-        other_name = next(iter(runs_by_ep[other_ep]))
-        cross = {base_name: base_run, other_name: runs_by_ep[other_ep][other_name]}
-        if other_keys:
-            compare_metrics(cross, rtol=rtol, atol=atol, keys=other_keys)
-        if grad_keys:
-            compare_metrics(
-                cross,
-                rtol=_MOE_CROSS_EP_GRAD_NORM_RTOL,
-                atol=_MOE_CROSS_EP_GRAD_NORM_ATOL,
-                keys=grad_keys,
-            )
 
 
 _DEFAULT_RTOL = 1e-1
