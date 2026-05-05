@@ -9,12 +9,12 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: Qwen2RMSNorm
-#      Use LigerKernel RMSNorm
-#    - class_replacement: Qwen2MLP
-#      Use LigerKernel SwiGLU MLP
+#    - method_override: Qwen2RMSNorm.forward
+#      OpSlot guard for Liger fused RMSNorm (standard formulation)
+#    - method_override: Qwen2MLP.forward
+#      OpSlot guard for Liger fused SwiGLU MLP
 #    - function_replacement: apply_rotary_pos_emb
-#      Use LigerKernel rotary embedding
+#      OpSlot guard for Liger fused RoPE
 #    - method_override: Qwen2Model.forward
 #      Support SP in Qwen2Model.forward
 #    - method_override: Qwen2ForCausalLM.forward
@@ -27,9 +27,10 @@ from typing import Optional
 
 import torch
 from torch import nn
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernelized_func
+from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
@@ -56,17 +57,37 @@ from veomni.ops.dispatch import OpSlot
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
 
 # ======================================================================
-# [PATCHED CLASS] Qwen2MLP
-# Original class replaced with: external
-# Reason: Use LigerKernel SwiGLU MLP
-# Source: liger_kernel.transformers.swiglu
+# [MODIFIED CLASS] Qwen2MLP
+# Methods patched: forward
 # ======================================================================
-# Import from: liger_kernel.transformers.swiglu.LigerSwiGLUMLP
-from liger_kernel.transformers.swiglu import LigerSwiGLUMLP as Qwen2MLP
+
+
+class Qwen2MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    # ── SwiGLU MLP (OpSlot guard, functional Liger kernel) ───────────────────────
+    def forward(self, x):
+        # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
+        if veomni_swiglu_mlp.use_non_eager_impl:
+            return veomni_swiglu_mlp(self, x)
+        # Original HF code below, unchanged.
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 
 class Qwen2RotaryEmbedding(nn.Module):
@@ -143,9 +164,10 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Use LigerKernel rotary embedding
+# Reason: OpSlot guard for Liger fused RoPE
 # Source: veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config
 # ======================================================================
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -154,16 +176,15 @@ def apply_rotary_pos_emb(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -269,13 +290,35 @@ class Qwen2Attention(nn.Module):
 
 
 # ======================================================================
-# [PATCHED CLASS] Qwen2RMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm
-# Source: liger_kernel.transformers.rms_norm
+# [MODIFIED CLASS] Qwen2RMSNorm
+# Methods patched: forward
 # ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNorm
-from liger_kernel.transformers.rms_norm import LigerRMSNorm as Qwen2RMSNorm
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class Qwen2RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        Qwen2RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        # Original HF code below, unchanged.
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class Qwen2DecoderLayer(GradientCheckpointingLayer):
