@@ -49,7 +49,7 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
-from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 
@@ -73,15 +73,6 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3_5RMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNormForQwen3Next",
-        description="Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)",
-    )
-)
-
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` can return per-token log-probs in the unified output dataclass.
@@ -125,6 +116,7 @@ config.add_post_import_block(
     # backend (eager / fla / flash_qla) is picked from
     # OpsImplementationConfig instead of "is the library importable".
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
@@ -144,9 +136,33 @@ torch_recurrent_gated_delta_rule = None
 is_fast_path_available = None
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+veomni_rms_norm = None  # OpSlot, declared in post-import block above
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+
+
+# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+# Mirrors qwen3_5_moe's pattern: the slot binds to liger_rms_norm_qwen3_5
+# (registered for variant="qwen3_5") when rms_norm_implementation="liger_kernel"
+# and falls through to the original HF code otherwise. Replaces the previous
+# unconditional class swap to LigerRMSNormForQwen3Next so eager mode is honoured.
+
+
+@config.override_method(
+    "Qwen3_5RMSNorm.forward",
+    description="OpSlot guard for Liger fused RMSNorm (Qwen3.5 1+weight formulation)",
+)
+def qwen3_5_rmsnorm_forward_patched(self, x):
+    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(x, self.weight, self.eps)
+    # Original HF code below, unchanged.
+    output = self._norm(x.float())
+    # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+    # See https://github.com/huggingface/transformers/pull/29402
+    output = output * (1.0 + self.weight.float())
+    return output.type_as(x)
 
 
 @config.override_method(

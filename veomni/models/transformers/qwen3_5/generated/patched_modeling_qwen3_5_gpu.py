@@ -9,8 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: Qwen3_5RMSNorm
-#      Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
+#    - method_override: Qwen3_5RMSNorm.forward
+#      OpSlot guard for Liger fused RMSNorm (Qwen3.5 1+weight formulation)
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
 #      OpSlot dispatch for FusedRMSNormGated, causal_conv1d, chunk_gated_delta_rule (Qwen3.5 GatedDeltaNet)
 #    - method_override: Qwen3_5GatedDeltaNet._get_local_conv1d_weight
@@ -111,6 +111,7 @@ fused_recurrent_gated_delta_rule = None
 from veomni.ops.dispatch import OpSlot
 
 
+veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
@@ -993,13 +994,38 @@ class Qwen3_5MLP(nn.Module):
 
 
 # ======================================================================
-# [PATCHED CLASS] Qwen3_5RMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)
-# Source: liger_kernel.transformers.rms_norm
+# [MODIFIED CLASS] Qwen3_5RMSNorm
+# Methods patched: forward
 # ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNormForQwen3Next
-from liger_kernel.transformers.rms_norm import LigerRMSNormForQwen3Next as Qwen3_5RMSNorm
+
+
+class Qwen3_5RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+    # Mirrors qwen3_5_moe's pattern: the slot binds to liger_rms_norm_qwen3_5
+    # (registered for variant="qwen3_5") when rms_norm_implementation="liger_kernel"
+    # and falls through to the original HF code otherwise. Replaces the previous
+    # unconditional class swap to LigerRMSNormForQwen3Next so eager mode is honoured.
+    def forward(self, x):
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(x, self.weight, self.eps)
+        # Original HF code below, unchanged.
+        output = self._norm(x.float())
+        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
 # ======================================================================
