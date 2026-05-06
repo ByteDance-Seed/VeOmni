@@ -197,6 +197,9 @@ class TrainerTest(BaseTrainer):
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
+# Only non-migrated or out-of-scope models remain under v4; migrated models
+# (qwen2/qwen2_vl/qwen2_5_vl/qwen3/qwen3_moe/qwen3_vl/qwen3_vl_moe/qwen3_omni_moe)
+# are exercised by the v5 list below.
 _TEST_CASES_TRANSFORMERS_V4 = [
     pytest.param(
         "./tests/toy_config/llama31_toy",
@@ -204,27 +207,6 @@ _TEST_CASES_TRANSFORMERS_V4 = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="llama3.1",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen25_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen2.5",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen3_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen3_moe_toy",
-        True,
-        0.5,
-        0.02,
-        id="qwen3_moe",
     ),
     pytest.param(
         "./tests/toy_config/seed_oss_toy",
@@ -241,46 +223,11 @@ _TEST_CASES_TRANSFORMERS_V4 = [
         id="deepseek_v3",
     ),
     pytest.param(
-        "./tests/toy_config/qwen2vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen2_vl",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen25vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen2_5_vl",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen3vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3_vl",
-    ),
-    pytest.param(
         "./tests/toy_config/qwen25omni_toy",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen2_5_omni",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen3vlmoe_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3_vl_moe",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen3omni_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3_omni_moe",
     ),
 ]
 
