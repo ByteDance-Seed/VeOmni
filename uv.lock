@@ -3894,7 +3894,7 @@ requires-dist = [
     { name = "av", marker = "python_full_version == '3.12.*' and extra == 'video'", url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "blobfile", specifier = ">=3.0.0" },
     { name = "cuda-python", marker = "extra == 'gpu'", specifier = "==12.9.1" },
-    { name = "datasets", specifier = ">=2.16.0,<=2.21.0" },
+    { name = "datasets", specifier = ">=2.20.0,<=2.21.0" },
     { name = "decorator", marker = "extra == 'npu'", specifier = ">=5.2.1" },
     { name = "decorator", marker = "extra == 'npu-aarch64'", specifier = ">=5.2.1" },
     { name = "diffusers", marker = "extra == 'dit'", specifier = "==0.36.0" },
