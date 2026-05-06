@@ -21,7 +21,7 @@ import torch.distributed as dist
 from ...checkpoint import CheckpointerBase, build_checkpointer
 from ...models import save_model_assets
 from ...utils import helper
-from ...utils.save_safetensor_utils import save_hf_safetensor
+from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from .base import Callback, TrainerState
 
 
@@ -221,25 +221,12 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
             del self.trainer.optimizer
             del self.trainer.lr_scheduler
 
-        from peft import get_peft_model_state_dict
-
-        from veomni.checkpoint import ckpt_to_state_dict
-        from veomni.models.module_utils import _save_state_dict
-
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.checkpoint.output_dir,
-            ckpt_manager=args.train.checkpoint.manager,
-        )
-
-        model_state_dict = get_peft_model_state_dict(self.trainer.model, model_state_dict)
-        model_state_dict = {k: v.to(torch.bfloat16) for k, v in model_state_dict.items()}
         lora_save_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
-        os.makedirs(lora_save_path, exist_ok=True)
-        lora_adapter_file = os.path.join(lora_save_path, "adapter_model.bin")
-        _save_state_dict(model_state_dict, lora_adapter_file, safe_serialization=False)
-        self.trainer.model.peft_config["default"].save_pretrained(lora_save_path)
-        logger.info_rank0(f"Lora adapter saved at {lora_save_path} successfully!")
+        save_lora_adapter_with_dcp(
+            model=self.trainer.model,
+            save_path=lora_save_path,
+            adapter_name="default",
+        )
 
         helper.empty_cache()
         dist.barrier()

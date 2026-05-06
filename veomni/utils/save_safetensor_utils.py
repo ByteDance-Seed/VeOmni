@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import gc
+import os
+import shutil
 import time
 from typing import Dict, Optional, Sequence
 
@@ -22,6 +24,7 @@ import torch.distributed.checkpoint as dcp
 
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
+from veomni.models.module_utils import _save_state_dict
 from veomni.utils import helper
 from veomni.utils.device import synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
@@ -231,3 +234,69 @@ def save_hf_safetensor(
     # Ensure all ranks finish saving before anyone proceeds
     if dist.is_initialized():
         dist.barrier()
+
+
+@torch.no_grad()
+def save_lora_adapter_with_dcp(
+    model: torch.nn.Module,
+    save_path: str,
+    adapter_name: str = "default",
+    dcp_subdir: str = ".lora_dcp_tmp",
+) -> None:
+    """Save LoRA adapter with DCP parallel write and rank-0 consolidation.
+
+    All ranks must call this function. It performs:
+    1. Extract LoRA-only state from the live model.
+    2. Save with ``dcp.save`` in parallel to a temporary DCP directory.
+    3. Consolidate on rank 0 into ``adapter_model.bin`` and ``adapter_config.json``.
+    """
+    from peft import get_peft_model_state_dict
+    synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    os.makedirs(save_path, exist_ok=True)
+    dcp_save_path = os.path.join(save_path, dcp_subdir)
+    os.makedirs(dcp_save_path, exist_ok=True)
+
+    lora_state = get_peft_model_state_dict(model)
+    lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
+    # ckpt_to_state_dict's DCP conversion path only recognizes keys starting with "model.".
+    # Prefix LoRA keys temporarily for DCP save so consolidation can reuse existing conversion logic.
+    dcp_lora_state = {k if k.startswith("model.") else f"model.{k}": v for k, v in lora_state.items()}
+
+    storage_writer = dcp.FileSystemWriter(
+        dcp_save_path,
+        thread_count=16,
+        single_file_per_rank=True,
+        sync_files=False,
+    )
+    dcp.save(
+        state_dict=dcp_lora_state,
+        storage_writer=storage_writer,
+    )
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    is_rank_0 = not dist.is_initialized() or dist.get_rank() == 0
+    if is_rank_0:
+        consolidated_state = ckpt_to_state_dict(
+            save_checkpoint_path=dcp_save_path,
+            ckpt_manager="dcp",
+        )
+        adapter_model_file = os.path.join(save_path, "adapter_model.bin")
+        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=False)
+
+        if not hasattr(model, "peft_config") or adapter_name not in model.peft_config:
+            raise ValueError(f"Cannot find peft config for adapter '{adapter_name}' on model.")
+        model.peft_config[adapter_name].save_pretrained(save_path)
+
+        shutil.rmtree(dcp_save_path, ignore_errors=True)
+        logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    gc.collect()
+    helper.empty_cache()
