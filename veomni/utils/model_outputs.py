@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast
 
 
 @dataclass
@@ -44,6 +44,28 @@ class CausalLMOutputWithLogProbs(CausalLMOutputWithPast):
       ``H[p] = -Σ_v p_v log p_v``, matches verl's
       ``CausalLMOutputForPPO.entropy`` so the dataclass drops directly
       into verl's ``prepare_model_outputs`` consumer.
+    """
+
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+@dataclass
+class MoeCausalLMOutputWithLogProbs(MoeCausalLMOutputWithPast):
+    """``MoeCausalLMOutputWithPast`` extended with per-token ``log_probs`` and ``entropy`` fields.
+
+    Both tensors share the input ``labels`` shape (``[B, L]`` or packed
+    ``[L]``) and are zero at IGNORE_INDEX positions and the trailing
+    pad slot.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``, matching HF
+            and verl conventions.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``, matching
+            verl's ``CausalLMOutputForPPO.entropy`` so the dataclass drops
+            directly into verl's ``prepare_model_outputs`` consumer.
     """
 
     log_probs: Optional[torch.Tensor] = None
