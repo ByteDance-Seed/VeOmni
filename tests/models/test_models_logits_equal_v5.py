@@ -8,7 +8,8 @@ built side-by-side without an unpatch helper.
 Coverage
 --------
 Models under ``veomni/models/transformers/`` that register a patchgen-generated
-class via the ``transformers >= 5.0.0`` branch:
+class via the ``transformers >= 5.2.0`` branch (the version pinned by the
+``transformers5-exp`` extra in ``pyproject.toml``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe
 - VLM via text-only sub-config
@@ -86,9 +87,6 @@ class Case:
     dtype: str = "float32"
     forward_attr: Optional[str] = None  # e.g. "thinker" for Omni
     config_overrides: dict = field(default_factory=dict)
-    # Skip if installed transformers is older than this. ``None`` means the
-    # module-level >=5.0.0 gate is sufficient. glm_moe_dsa needs >=5.2.0.
-    min_transformers_version: Optional[str] = None
 
 
 def _toy(name: str) -> str:
@@ -145,7 +143,6 @@ CASES = [
         "GlmMoeDsaForCausalLM",
         "causal_lm",
         config_overrides={"_experts_implementation": "eager"},
-        min_transformers_version="5.2.0",
     ),
     Case(
         "glm_moe_dsa-sdpa",
@@ -155,7 +152,6 @@ CASES = [
         attn_implementation="sdpa",
         dtype="bfloat16",
         config_overrides={"_experts_implementation": "eager"},
-        min_transformers_version="5.2.0",
     ),
     # ── Qwen3.5 (text-only sub-config) ───────────────────────────────────
     Case("qwen3_5-text-eager", _toy("qwen3_5_toy"), "Qwen3_5ForCausalLM", "qwen3_5_text"),
@@ -250,7 +246,7 @@ def _single_rank_process_group():
     """
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if not IS_CUDA_AVAILABLE or not is_transformers_version_greater_or_equal_to("5.0.0"):
+    if not IS_CUDA_AVAILABLE or not is_transformers_version_greater_or_equal_to("5.2.0"):
         yield
         return
 
@@ -474,12 +470,8 @@ def test_logits_bitwise_equal_v5(case: Case):
     """Bitwise-equal forward: pristine HF vs VeOmni patched modeling."""
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if not is_transformers_version_greater_or_equal_to("5.0.0"):
-        pytest.skip("Scope is transformers v5 model definition only.")
-    if case.min_transformers_version is not None and not is_transformers_version_greater_or_equal_to(
-        case.min_transformers_version
-    ):
-        pytest.skip(f"transformers >= {case.min_transformers_version} required for {case.case_id}.")
+    if not is_transformers_version_greater_or_equal_to("5.2.0"):
+        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
@@ -573,7 +565,6 @@ _LOADER_CASES = [
         "GlmMoeDsaForCausalLM",
         "causal_lm",
         config_overrides={"_experts_implementation": "eager"},
-        min_transformers_version="5.2.0",
     ),
     Case(
         "glm_moe_dsa-sdpa-loader",
@@ -583,7 +574,6 @@ _LOADER_CASES = [
         attn_implementation="sdpa",
         dtype="bfloat16",
         config_overrides={"_experts_implementation": "eager"},
-        min_transformers_version="5.2.0",
     ),
 ]
 
@@ -671,12 +661,8 @@ def test_logits_bitwise_equal_v5_via_loader(case: Case):
     """
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if not is_transformers_version_greater_or_equal_to("5.0.0"):
-        pytest.skip("Scope is transformers v5 model definition only.")
-    if case.min_transformers_version is not None and not is_transformers_version_greater_or_equal_to(
-        case.min_transformers_version
-    ):
-        pytest.skip(f"transformers >= {case.min_transformers_version} required for {case.case_id}.")
+    if not is_transformers_version_greater_or_equal_to("5.2.0"):
+        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
