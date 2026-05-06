@@ -857,6 +857,10 @@ class ModelArguments:
         default=None,
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
     )
+    model_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config to overwrite foundation model config."},
+    )
     tokenizer_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},

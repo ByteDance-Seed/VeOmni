@@ -243,6 +243,7 @@ class BaseTrainer(Stateful, ABC):
             torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=self.args.train.init_device,
             ops_implementation=self.args.model.ops_implementation,
+            config_kwargs=self.args.model.model_config,
         )
         self.model_config = self.model.config
 
