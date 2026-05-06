@@ -537,11 +537,21 @@ def test_logits_bitwise_equal_v5(case: Case):
 # the model — the same shape of test as v4's
 # ``test_logits_bitwise_equal_via_runtime_converter``.
 #
-# Scope: causal-LM cases only. The qwen3_5 / VLM / Omni cases need extra
-# config surgery (text-config extraction, multimodal kwargs, thinker-only
-# forward) that would muddy the loader-level signal. A representative
-# subset across attn implementations + dtypes is enough — the loader path
-# is largely architecture-independent.
+# Coverage: every v5 MoE family with one ``fa2+bf16`` (or ``sdpa+bf16`` for
+# ``glm_moe_dsa``, which sets ``_supports_flash_attn = False``) representative,
+# plus an ``eager+fp32`` baseline where supported. The loader path itself is
+# largely architecture-independent, so the value of breadth here is the
+# *non-persistent buffer surface* (vision tower RoPE caches, audio tower
+# positional embeddings) and the larger state-dict that the safetensors round
+# trip has to walk — both stress what the in-memory sibling test misses.
+#
+# ``qwen3_5_moe`` is the lone v5 MoE we skip: that case extracts
+# ``full_config.text_config`` and builds a text-only model, switching
+# ``model_type`` from ``qwen3_5_moe`` to ``qwen3_5_moe_text``. VeOmni's
+# ``MODELING_REGISTRY`` keys off the parent ``model_type``, so handing the
+# extracted text-config to ``build_foundation_model(config_path=...)`` would
+# need either a synthetic wrapper config or a registry-bypass — both
+# misrepresent the real-user loader flow we want to cover.
 _LOADER_CASES = [
     Case(
         "qwen3_moe-eager-loader",
@@ -573,6 +583,32 @@ _LOADER_CASES = [
         "causal_lm",
         attn_implementation="sdpa",
         dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    # qwen3_vl_moe: HF init forces bf16 on the language tower, so only
+    # fa2+bf16 exercises a self-consistent dtype assignment (matches the
+    # CASES entry above).
+    Case(
+        "qwen3_vl_moe-fa2-loader",
+        _toy("qwen3vlmoe_toy"),
+        "Qwen3VLMoeForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    # qwen3_omni_moe: forward on ``model.thinker`` so the talker stays
+    # out of scope — same as the in-memory CASES entry. State-dict load
+    # still happens at the root, so talker / vision / audio sub-modules
+    # round-trip through safetensors with the rest.
+    Case(
+        "qwen3_omni_moe-fa2-loader",
+        _toy("qwen3omni_toy"),
+        "Qwen3OmniMoeForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
         config_overrides={"_experts_implementation": "eager"},
     ),
 ]
@@ -611,12 +647,20 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
     differs from a directly-on-CUDA ``1.0 / (base ** ...)`` by one ULP,
     enough to fail ``torch.equal``. Restoring HF's buffers after load
     keeps this test a bitwise check on the loader's *parameter* path; the
-    buffer rematerialisation fix is tracked separately. We pass
-    ``config_path=config`` (not ``weights_dir``) so the in-memory config
-    overrides like ``_experts_implementation`` survive — re-reading from
-    disk would round-trip those through ``PretrainedConfig`` JSON, which
-    is fine in practice but adds a needless dependency on private-attr
-    serialisation behaviour.
+    buffer rematerialisation fix is tracked separately.
+
+    Why we hand a directory (not the in-memory config) to ``build_foundation_model``
+    -------------------------------------------------------------------------------
+    Some VeOmni models register a ``MODEL_CONFIG_REGISTRY`` hook that mutates
+    the config at build-time (e.g. qwen3_omni_moe forces
+    ``tie_word_embeddings=False`` so the loader's post-load tie step is a
+    no-op on the thinker+talker container). That hook fires inside
+    ``build_config(...)``, which is reached only when ``config_path`` is a
+    string path — passing a ``PretrainedConfig`` short-circuits it.
+    We therefore feed the on-disk directory and re-apply
+    ``case.config_overrides`` via ``config_kwargs`` so private fields
+    like ``_experts_implementation`` survive without depending on
+    ``PretrainedConfig`` JSON round-trip semantics for underscored attrs.
     """
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
@@ -625,23 +669,27 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
     _save_hf_checkpoint(hf_state_dict, config, weights_dir)
 
     model = build_foundation_model(
-        config_path=config,
+        config_path=weights_dir,
         weights_path=weights_dir,
+        config_kwargs=dict(case.config_overrides),
         torch_dtype=case.dtype,
         attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
     )
 
+    # Iterate VeOmni's buffers (not HF's): the VeOmni-side model can be a
+    # subset of the HF model (e.g. omni strips ``talker`` because the talker
+    # is not subclassed locally), so HF may carry buffers that have no
+    # counterpart on VeOmni — skipping those is the correct behaviour, not
+    # masking a real defect.
     persistent_keys = set(hf_state_dict.keys())
-    for name, buf in hf_buffers.items():
+    for name, ve_buf in model.named_buffers():
         if name in persistent_keys:
             continue
-        parts = name.split(".")
-        target_module = model
-        for p in parts[:-1]:
-            target_module = getattr(target_module, p)
-        target = target_module._buffers[parts[-1]]
-        target.copy_(buf.to(target.device, dtype=target.dtype))
+        src = hf_buffers.get(name)
+        if src is None:
+            continue
+        ve_buf.copy_(src.to(ve_buf.device, dtype=ve_buf.dtype))
 
     return model.eval()
 
