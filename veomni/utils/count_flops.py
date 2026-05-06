@@ -94,6 +94,11 @@ class VeomniFlopsCounter:
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
 
+    @staticmethod
+    def _compute_lm_head_params(hidden_size, vocab_size):
+        # nn.Embedding is a table lookup, so only the lm_head matmul contributes FLOPs.
+        return vocab_size * hidden_size
+
     def _estimate_seed_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
@@ -111,9 +116,9 @@ class VeomniFlopsCounter:
         # llama use SwiGelu, gate, having up and down linear layer in mlp
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * dense_N * tokens_sum
 
@@ -157,12 +162,12 @@ class VeomniFlopsCounter:
             * self.config.kv_lora_rank
         )
         attn_linear_N += num_query_heads * self.config.v_head_dim * hidden_size
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
         moe_N = (
             (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers - first_k_dense_replace)
             + (hidden_size * self.config.intermediate_size * 3 + attn_linear_N) * first_k_dense_replace
-            + emd_and_lm_head_N
+            + lm_head_N
         )
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * moe_N * tokens_sum
@@ -197,9 +202,9 @@ class VeomniFlopsCounter:
         # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
         moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
-        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + emd_and_lm_head_N
+        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * moe_N * tokens_sum
 
@@ -231,9 +236,9 @@ class VeomniFlopsCounter:
         # llama use SwiGelu, gate, having up and down linear layer in mlp
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * dense_N * tokens_sum
 
@@ -265,9 +270,9 @@ class VeomniFlopsCounter:
         # llama use SwiGelu, gate, having up and down linear layer in mlp
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * dense_N * tokens_sum
 
@@ -306,9 +311,9 @@ class VeomniFlopsCounter:
         # non-attn per layer parm
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * dense_N * tokens_sum
 
@@ -347,9 +352,9 @@ class VeomniFlopsCounter:
         # non-attn per layer parm
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * dense_N * tokens_sum
 
@@ -397,9 +402,9 @@ class VeomniFlopsCounter:
         # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
         moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer parm
-        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + emd_and_lm_head_N
+        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * moe_N * tokens_sum
         # attn all_layer & all_token fwd & bwd flops
@@ -655,9 +660,9 @@ class VeomniFlopsCounter:
         moe_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N) * num_hidden_layers
 
         # lm head param
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * (moe_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+        dense_N_flops = 6 * (moe_N + attn_linear_N + lm_head_N) * tokens_sum
         # attn all_layer & all_token fwd & bwd flops, only count full attention layers
         seqlen_square_sum = 0
         for seqlen in batch_seqlens:
@@ -699,9 +704,9 @@ class VeomniFlopsCounter:
 
             Hybrid attention: see _compute_hybrid_attn_params docstring.
 
-            Embeddings + LM head:
-                embed_tokens:  vocab_size -> hidden_size
-                lm_head:       hidden_size -> vocab_size
+            LM head:
+                lm_head: hidden_size -> vocab_size
+                embed_tokens is an embedding table lookup and is excluded from FLOPs.
 
         Quadratic attention FLOPs (only full attention layers):
             Per layer: 2 * seq_len^2 * head_dim * num_attention_heads (Q@K + attn@V)
@@ -731,10 +736,10 @@ class VeomniFlopsCounter:
             # dense MLP per layer: gate_proj + up_proj + down_proj (SwiGLU)
             mlp_N = hidden_size * text_config.intermediate_size * 3 * num_hidden_layers
 
-        # embed_tokens + lm_head
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # lm_head only; embed_tokens is a table lookup.
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
         # linear projection flops: 6 (fwd + bwd) * params * tokens
-        dense_N_flops = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+        dense_N_flops = 6 * (mlp_N + attn_linear_N + lm_head_N) * tokens_sum
 
         # quadratic attention flops (Q@K and attn@V), only for full attention layers
         seqlen_square_sum = 0
