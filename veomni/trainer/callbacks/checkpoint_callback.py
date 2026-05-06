@@ -111,7 +111,9 @@ class CheckpointerCallback(Callback):
             "extra_state": {
                 "global_step": state.global_step,
                 "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
-                "train_dataloader": self.trainer.train_dataloader.state_dict(),
+                "train_dataloader": self.trainer.train_dataloader.state_dict()
+                if self.trainer.train_dataloader is not None
+                else {},
                 "environ_meter": self.trainer.environ_meter.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
             },
@@ -208,13 +210,17 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)
 
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
             self.trainer.checkpointer.save_future.result()
+
+        if stage == "train_end":
+            del self.trainer.optimizer
+            del self.trainer.lr_scheduler
 
         from peft import get_peft_model_state_dict
 
@@ -228,13 +234,13 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
         )
 
         model_state_dict = get_peft_model_state_dict(self.trainer.model, model_state_dict)
-        # save bf16 lora
         model_state_dict = {k: v.to(torch.bfloat16) for k, v in model_state_dict.items()}
-        lora_adapter_save_path = os.path.join(save_checkpoint_path, "adapter_model.bin")
-        os.makedirs(save_checkpoint_path, exist_ok=True)
-        _save_state_dict(model_state_dict, lora_adapter_save_path, safe_serialization=False)
-        self.trainer.model.peft_config["default"].save_pretrained(save_checkpoint_path)
-        logger.info_rank0(f"Lora adapter saved at {save_checkpoint_path} successfully!")
+        lora_save_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
+        os.makedirs(lora_save_path, exist_ok=True)
+        lora_adapter_file = os.path.join(lora_save_path, "adapter_model.bin")
+        _save_state_dict(model_state_dict, lora_adapter_file, safe_serialization=False)
+        self.trainer.model.peft_config["default"].save_pretrained(lora_save_path)
+        logger.info_rank0(f"Lora adapter saved at {lora_save_path} successfully!")
 
         helper.empty_cache()
         dist.barrier()
