@@ -12,12 +12,23 @@ class via the ``transformers >= 5.2.0`` branch (the version pinned by the
 ``transformers5-exp`` extra in ``pyproject.toml``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe
-- VLM via text-only sub-config
-  (``*ForCausalLM`` registered):   qwen3_5, qwen3_5_moe
-- VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
+- VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe,
+                                   qwen3_5, qwen3_5_moe
 - Omni thinker forward:            qwen3_omni_moe (forward on ``model.thinker``)
 - Causal-LM with MLA + DSA:        glm_moe_dsa (eager + sdpa only — the
   upstream class sets ``_supports_flash_attn = False``)
+
+The qwen3_5 family is mostly exercised through the VLM forward (the
+``Qwen3_5ForConditionalGeneration`` wrapper); every patchgen patch is
+on shared classes (``Qwen3_5DecoderLayer``, ``Qwen3_5Model``,
+``Qwen3_5RMSNorm``, …), so the VLM path covers identical text-tower
+code plus the visual tower and ``masked_scatter``. One text-only case
+(``qwen3_5-text-fa2``) is kept to cover in-memory FA2: the multimodal
+state-dict is large enough (vocab=248K × hidden=5120 × bf16 ≈ 2.5 GB)
+that the ``HF.forward → deepcopy(state_dict) → VE.forward`` sequence
+NaN's the FA2 varlen kernel via a caching-allocator collision; the
+text-only state-dict (no vision/audio towers) is small enough to dodge
+that, while exercising the same patched DecoderLayer and Model.forward.
 
 Scope decisions
 ---------------
@@ -71,10 +82,21 @@ _DTYPE_MAP = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
 # How a case maps to (config preparation, forward target, input shape):
 #   "causal_lm"     — toy config IS the text config; no extraction.
-#   "qwen3_5_text"  — extract text_config + force full_attention + cu_seq_lens_q.
+#   "qwen3_5_text"  — extract ``text_config`` and build ``Qwen3_5ForCausalLM``;
+#                     same text-tower overrides as ``qwen3_5_vlm`` and the
+#                     same ``cu_seq_lens_q``. Used to cover in-memory FA2 for
+#                     qwen3_5 (non-moe), which the multimodal path can't
+#                     because of the deepcopy + caching-allocator collision
+#                     described under the qwen3_5 family CASES block.
+#   "qwen3_5_vlm"   — full Qwen3.5 VLM forward; mutates the nested
+#                     ``text_config`` (force full_attention layers, eager
+#                     experts), passes ``cu_seq_lens_q`` (the patched
+#                     DecoderLayer asserts on it), and drives the visual
+#                     tower with a dummy 2x2 image so ``masked_scatter``
+#                     consumes every embedding once.
 #   "vlm_full"      — full VLM forward with a dummy 2x2 image.
 #   "omni_thinker"  — full Omni model; forward runs on ``model.thinker``.
-_KINDS = ("causal_lm", "qwen3_5_text", "vlm_full", "omni_thinker")
+_KINDS = ("causal_lm", "qwen3_5_text", "qwen3_5_vlm", "vlm_full", "omni_thinker")
 
 
 @dataclass(frozen=True)
@@ -153,25 +175,79 @@ CASES = [
         dtype="bfloat16",
         config_overrides={"_experts_implementation": "eager"},
     ),
-    # ── Qwen3.5 (text-only sub-config) ───────────────────────────────────
-    Case("qwen3_5-text-eager", _toy("qwen3_5_toy"), "Qwen3_5ForCausalLM", "qwen3_5_text"),
+    # ── Qwen3.5 family (VLM only, eager + FA2) ───────────────────────────
+    # Both qwen3_5 and qwen3_5_moe are exercised through the multimodal
+    # ``ForConditionalGeneration`` wrapper. The text-only ``ForCausalLM``
+    # arch was previously tested separately, but every patchgen patch is
+    # on shared classes (``Qwen3_5DecoderLayer`` / ``Qwen3_5Model`` /
+    # ``Qwen3_5RMSNorm`` …), so the VLM path covers identical text-tower
+    # code plus the visual tower and ``masked_scatter``.
+    #
+    # Coverage is eager + flash_attention_2 only — SDPA is not shipped:
+    # eager is the RNG-baseline bitwise-equal anchor, FA2 is the
+    # close-to-real-user path, and SDPA would only re-validate the same
+    # patched forward through a third attention kernel without exercising
+    # additional VeOmni code.
+    #
+    # Eager runs use bf16, not fp32: HF init forces bf16 on parts of the
+    # language tower (matching the ``qwen3_vl_moe`` constraint above), so
+    # an fp32 case would just measure a half-cast model.
+    #
+    # FA2 in-memory is intentionally absent. The ``HF.forward → deepcopy
+    # (state_dict) → VE.load_state_dict → VE.forward`` sequence keeps a
+    # ~2.5 GB GPU copy of HF's embed_tokens (vocab=248K × hidden=5120
+    # × bf16) live, which reshuffles the caching allocator into a layout
+    # that NaN's the FA2 varlen kernel on the next forward — verified on
+    # both HF and VeOmni by sweeping snapshot strategies in isolation.
+    # FA2 coverage for the non-moe variant is shipped via the loader
+    # test below (``qwen3_5-vlm-fa2-loader``), where HF is fully released
+    # before VE rebuilds.
+    #
+    # ``qwen3_5_moe-vlm-fa2`` is not shipped at all. Two stacked upstream
+    # FA2 issues block it:
+    #
+    # 1. The ``qwen3_5_moe`` toy ``num_attention_heads=16`` lands in a
+    #    ``flash_attn`` 2.8.4 ``varlen_fwd`` failure window — q ∈ {14,16,18}
+    #    with ``head_dim=256`` and ``seq_len ∈ {32,64,96,128}`` raises
+    #    ``cudaErrorIllegalAddress`` inside the kernel, reproducible on
+    #    pristine HF (no VeOmni patches). q ∈ {8,12,20,24,28,32} works.
+    # 2. Bumping the toy to ``num_attention_heads=24`` makes the case
+    #    pass standalone (3/3) but still fails when run after the rest
+    #    of this file's in-memory cases — cumulative GPU-allocator state
+    #    from ~10 preceding cases pushes the FA2 varlen kernel into a
+    #    different illegal-memory-access path. Bisected: removing any
+    #    one preceding case lets it pass; all 10 together breaks it.
+    #    Without per-test process isolation (no pytest-forked / xdist
+    #    --forked installed) we cannot ship a moe FA2 case here.
+    Case(
+        "qwen3_5-vlm-eager",
+        _toy("qwen3_5_toy"),
+        "Qwen3_5ForConditionalGeneration",
+        "qwen3_5_vlm",
+        attn_implementation="eager",
+        dtype="bfloat16",
+    ),
+    Case(
+        "qwen3_5_moe-vlm-eager",
+        _toy("qwen3_5_moe_toy"),
+        "Qwen3_5MoeForConditionalGeneration",
+        "qwen3_5_vlm",
+        attn_implementation="eager",
+        dtype="bfloat16",
+    ),
+    # In-memory FA2 for qwen3_5 (non-moe). Uses ``Qwen3_5ForCausalLM`` on the
+    # extracted ``text_config`` so the state-dict is small enough to avoid
+    # the multimodal deepcopy collision (see family-block notes above). The
+    # corresponding ``qwen3_5_moe`` case isn't shipped: even on the text
+    # path, FA2 hits a separate ``flash_attn`` 2.8.4 ``varlen_fwd`` kernel
+    # bug for ``(num_q_heads ∈ {14,16,18}, head_dim=256, seq_len ∈
+    # {32,64,96,128})`` — reproducible on pristine HF.
     Case(
         "qwen3_5-text-fa2",
         _toy("qwen3_5_toy"),
         "Qwen3_5ForCausalLM",
         "qwen3_5_text",
         attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    Case("qwen3_5_moe-text-eager", _toy("qwen3_5_moe_toy"), "Qwen3_5MoeForCausalLM", "qwen3_5_text"),
-    # FA2 swapped for SDPA: the toy's (num_kv_heads=2, head_dim=256, seq_len=32)
-    # crashes ``_flash_attn_varlen_forward`` upstream on both HF and VeOmni.
-    Case(
-        "qwen3_5_moe-text-sdpa",
-        _toy("qwen3_5_moe_toy"),
-        "Qwen3_5MoeForCausalLM",
-        "qwen3_5_text",
-        attn_implementation="sdpa",
         dtype="bfloat16",
     ),
     # ── VLMs (full forward with a dummy 2x2 image) ───────────────────────
@@ -282,15 +358,27 @@ def _make_config(case: Case):
     full_config = AutoConfig.from_pretrained(case.toy_config_dir)
 
     if case.kind == "qwen3_5_text":
-        # Extract the text sub-config and force full-attention layers
-        # (see module docstring) before applying any other overrides.
+        # Extract the text sub-config so the case builds ``Qwen3_5ForCausalLM``
+        # (no vision tower in the state-dict — see the ``qwen3_5_text`` kind
+        # description above). Same full_attention + eager-experts overrides
+        # as the VLM kind, applied directly to the extracted text_config.
         cfg = copy.deepcopy(full_config.text_config)
         if hasattr(cfg, "layer_types") and cfg.layer_types is not None:
             cfg.layer_types = ["full_attention"] * len(cfg.layer_types)
-        # HF's default ``"grouped_mm"`` routes through ``torch._grouped_mm``
-        # and crashes on the toy's tiny expert tensors; eager runs the
-        # per-expert loop on both sides.
         cfg._experts_implementation = "eager"
+    elif case.kind == "qwen3_5_vlm":
+        # Force full_attention on the language tower (without ``causal_conv1d``
+        # installed, the linear-attention path diverges between HF and VeOmni)
+        # and pin experts to ``"eager"`` (HF's default ``"grouped_mm"`` routes
+        # through ``torch._grouped_mm`` and crashes on the toy's tiny expert
+        # tensors; eager runs the per-expert loop on both sides). Both apply
+        # to the nested ``text_config`` so the multimodal wrapper and the
+        # vision tower come along unchanged.
+        cfg = copy.deepcopy(full_config)
+        text_cfg = cfg.text_config
+        if hasattr(text_cfg, "layer_types") and text_cfg.layer_types is not None:
+            text_cfg.layer_types = ["full_attention"] * len(text_cfg.layer_types)
+        text_cfg._experts_implementation = "eager"
     else:
         cfg = full_config
 
@@ -325,9 +413,9 @@ def _vision_section(config):
 def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict]:
     """Build ``(input_ids, forward_kwargs)`` for the case.
 
-    Causal-LM / qwen3_5 text: text-only ids. VLM / Omni: same base ids but
-    the first ``n_tokens`` positions are overwritten with ``image_token_id``
-    and dummy ``pixel_values`` + ``image_grid_thw = [[1, 2, 2]]`` are passed
+    Causal-LM: text-only ids. VLM / Omni: same base ids but the first
+    ``n_tokens`` positions are overwritten with ``image_token_id`` and
+    dummy ``pixel_values`` + ``image_grid_thw = [[1, 2, 2]]`` are passed
     so the visual tower runs and the patched ``masked_scatter`` consumes
     every embedding once. Omni additionally needs a zero ``audio_mask``
     to satisfy the patched asserts.
@@ -337,7 +425,7 @@ def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict]
     base_input_ids = torch.randint(32000, (1, seq_len), device=device, dtype=torch.long, generator=base_gen)
 
     fwd_kwargs: dict = {}
-    if case.kind == "qwen3_5_text":
+    if case.kind in ("qwen3_5_text", "qwen3_5_vlm"):
         # VeOmni's patched ``Qwen3_5DecoderLayer.forward`` ``assert``s on it;
         # HF ignores it via ``**kwargs``.
         fwd_kwargs["cu_seq_lens_q"] = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
@@ -553,6 +641,21 @@ def test_logits_bitwise_equal_v5(case: Case):
 # need either a synthetic wrapper config or a registry-bypass — both
 # misrepresent the real-user loader flow we want to cover.
 _LOADER_CASES = [
+    # ── Qwen3.5 VLM FA2 (loader path, non-moe only) — ordered FIRST ─────
+    # Placed before any other loader case to avoid cross-test CUDA-state
+    # leaks: a previous case's FA2 kernel can leave an async illegal
+    # memory access on the stream that surfaces only at the next
+    # ``torch.Generator`` / cublas call. In isolation this case passes
+    # 3/3; co-located after other FA2 loader cases (qwen3_omni_moe in
+    # particular) it crashes in setup.
+    Case(
+        "qwen3_5-vlm-fa2-loader",
+        _toy("qwen3_5_toy"),
+        "Qwen3_5ForConditionalGeneration",
+        "qwen3_5_vlm",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
     Case(
         "qwen3_moe-eager-loader",
         _toy("qwen3_moe_toy"),
@@ -733,7 +836,14 @@ def test_logits_bitwise_equal_v5_via_loader(case: Case):
             .logits.detach()
             .clone()
         )
-    hf_state_dict = copy.deepcopy(model_hf.state_dict())
+    # Snapshot to CPU (not deepcopy / GPU clone). For qwen3_5* the HF state-dict
+    # is large (vocab=248K, embed_tokens ~2.5GB in bf16); keeping a GPU copy
+    # alive perturbs the caching allocator into a layout that triggers NaN
+    # inside FA2's varlen kernel on the *next* forward — even when HF and VE
+    # are otherwise isolated by a disk round-trip. CPU snapshot is functionally
+    # equivalent here (``_save_hf_checkpoint`` already moves to CPU before
+    # writing, and ``hf_state_dict`` is only used for save + ``.keys()``).
+    hf_state_dict = {k: v.detach().contiguous().cpu() for k, v in model_hf.state_dict().items()}
     hf_buffers = {n: b.detach().clone() for n, b in model_hf.named_buffers()}
     del model_hf
     _release()

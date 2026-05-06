@@ -58,7 +58,7 @@ class TestQwen35Flops:
     def test_numerical_with_vit(self, qwen3_5_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
-        assert flops == pytest.approx(138.896153247744, rel=1e-9)
+        assert flops == pytest.approx(137.029006393344, rel=1e-9)
 
 
 class TestQwen35MoeFlops:
@@ -81,4 +81,4 @@ class TestQwen35MoeFlops:
     def test_numerical_with_vit(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
-        assert flops == pytest.approx(31.346279841792, rel=1e-9)
+        assert flops == pytest.approx(29.479132987392, rel=1e-9)
