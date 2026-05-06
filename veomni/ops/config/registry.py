@@ -163,17 +163,21 @@ def _import_entry(entry: str) -> object:
 
 def _check_requires(requires: tuple[str, ...]) -> None:
     """Validate that the listed packages are importable."""
+    from ...utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
+
     for pkg in requires:
         if pkg == "liger_kernel":
-            from ...utils.import_utils import is_liger_kernel_available
-
             if not is_liger_kernel_available():
                 raise RuntimeError("liger_kernel backend requested but liger-kernel is not installed.")
         elif pkg == "torch_npu":
-            from ...utils.import_utils import is_torch_npu_available
-
             if not is_torch_npu_available():
                 raise RuntimeError("npu backend requested but torch_npu is not installed.")
+        elif pkg == "triton":
+            if not is_package_available("triton"):
+                raise RuntimeError(
+                    "triton backend requested but the 'triton' package is not installed "
+                    "(or 'triton-ascend' on NPU). Install it or set the field to 'eager'."
+                )
         else:
             raise ValueError(f"Unsupported 'requires' token: {pkg!r}")
 
@@ -218,6 +222,60 @@ def apply_global_ops(ops_config: OpsImplementationConfig) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_backend(
+    op: OpSpec,
+    value: str,
+    op_overrides: dict[str, BackendSpec | None],
+) -> BackendSpec | None:
+    """Pick the BackendSpec for *value*, preferring the per-model override.
+
+    Returns ``None`` when there's nothing to bind: ``value == "eager"`` (keep
+    HF default), the model explicitly opted out (``op_overrides[value] = None``),
+    or *value* is unknown. The caller distinguishes these cases.
+    """
+    if value in op_overrides:
+        return op_overrides[value]
+    return op.backends.get(value)
+
+
+def _raise_no_backend(
+    model_name: str,
+    op: OpSpec,
+    value: str,
+    op_overrides: dict[str, BackendSpec | None],
+) -> None:
+    """Raise on a non-eager value with no resolvable backend.
+
+    Distinguishes "explicitly disabled" (``op_overrides[value] is None``) from
+    "unknown backend" so the user knows whether to switch to eager or fix a typo.
+    """
+    explicitly_disabled = value in op_overrides and op_overrides[value] is None
+    disabled_names = {k for k, v in op_overrides.items() if v is None}
+    available = sorted(((op.backends.keys() | op_overrides.keys()) - disabled_names) | {"eager"})
+    reason = (
+        f"is explicitly disabled for {model_name} (no kernel matching this backend's signature)"
+        if explicitly_disabled
+        else f"is not a registered backend for {model_name}"
+    )
+    raise ValueError(
+        f"{op.config_field}={value!r} {reason}. "
+        f"Set {op.config_field} to one of {available}. "
+        f"Use 'eager' for the HuggingFace reference."
+    )
+
+
+def _patch_target(hf_module: ModuleType, target_attr: str, backend: BackendSpec) -> None:
+    """Bind *backend* onto ``hf_module.<target_attr>``."""
+    entry_obj = _import_entry(backend.entry)
+    if backend.entry_is_factory:
+        entry_obj = entry_obj()
+    effective_target = backend.target_override or target_attr
+    if backend.replace_forward:
+        getattr(hf_module, effective_target).forward = entry_obj
+    else:
+        setattr(hf_module, effective_target, entry_obj)
+
+
 def apply_per_model_patches(
     hf_module: ModuleType,
     model_name: str,
@@ -229,58 +287,48 @@ def apply_per_model_patches(
     """Patch ``hf_module`` based on the current ``OpsImplementationConfig``.
 
     Args:
-        hf_module: HuggingFace modeling module (or any module whose attrs will
-            be replaced).
-        model_name: Display name used in log lines.
-        targets: Mapping from op name (registered via ``register_op``) to the
-            attribute on ``hf_module`` to patch.  For example
-            ``{"rms_norm": "LlamaRMSNorm"}``.
-        extra_backends: Model-specific overrides merged on top of the registry
-            defaults for each op.  Shape
-            ``{op_name: {backend_name: BackendSpec | None}}``.  A ``BackendSpec``
-            value overrides or adds a backend; a ``None`` value disables a
-            registry-default backend for this model (used e.g. by Qwen2-VL
-            which has no NPU backend for multimodal RoPE).
-        custom_patches: Optional callback invoked with
-            ``(ops_config, applied_list)`` for truly one-off behaviour that
-            does not fit the ``BackendSpec`` shape.
+        hf_module: HuggingFace modeling module whose attributes get replaced.
+        model_name: Display name for log lines and error messages.
+        targets: ``{op_name: hf_module_attr}`` — e.g. ``{"rms_norm": "LlamaRMSNorm"}``.
+        extra_backends: Per-model overrides ``{op_name: {backend_name: spec}}``.
+            ``BackendSpec`` adds/replaces a backend; ``None`` is an **explicit
+            opt-out** for cases where the registry default doesn't fit the
+            model's target signature (e.g. Wan ``rope_apply(x, **kw)`` vs.
+            Liger ``(q, k, cos, sin)``). Users then get a clean "explicitly
+            disabled" error instead of a runtime crash.
+        custom_patches: ``(ops_config, applied_list) -> None`` escape hatch for
+            one-off behavior that doesn't fit ``BackendSpec``.
     """
     ops_config = get_ops_config()
     if ops_config is None:
         return
 
-    applied: list[str] = []
     extra_backends = extra_backends or {}
+    applied: list[str] = []
 
     for op_name, target_attr in targets.items():
         try:
             op = get_op(op_name)
         except KeyError as e:
             raise KeyError(f"Unknown op {op_name!r} referenced by {model_name} device_patch.py.") from e
-
         if op.scope != OpScope.PER_MODEL:
             raise ValueError(f"{model_name}: op {op_name!r} is {op.scope.value}, not per_model.")
 
         value = getattr(ops_config, op.config_field)
         op_overrides = extra_backends.get(op_name, {})
-        if value in op_overrides:
-            backend = op_overrides[value]  # may be None (explicitly disabled)
-        else:
-            backend = op.backends.get(value)
+        backend = _resolve_backend(op, value, op_overrides)
+
         if backend is None:
-            continue
+            # ``eager`` is the only intentional no-backend case (HF default
+            # stays). Anything else is a misconfiguration — raise instead of
+            # silently downgrading, otherwise users think they got the fast
+            # kernel they asked for.
+            if value == "eager":
+                continue
+            _raise_no_backend(model_name, op, value, op_overrides)
 
         _check_requires(backend.requires)
-        entry_obj = _import_entry(backend.entry)
-        if backend.entry_is_factory:
-            entry_obj = entry_obj()
-
-        effective_target = backend.target_override or target_attr
-        if backend.replace_forward:
-            getattr(hf_module, effective_target).forward = entry_obj
-        else:
-            setattr(hf_module, effective_target, entry_obj)
-
+        _patch_target(hf_module, target_attr, backend)
         applied.append(f"{op.label} ({value})")
 
     if custom_patches is not None:

@@ -30,7 +30,7 @@ register_op(
         config_field="rms_norm_implementation",
         label="RMSNorm",
         scope=OpScope.PER_MODEL,
-        default="eager",
+        default="liger_kernel",
         backends={
             "liger_kernel": BackendSpec(
                 entry="liger_kernel.transformers.rms_norm:LigerRMSNorm",

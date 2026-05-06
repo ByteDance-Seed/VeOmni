@@ -28,7 +28,7 @@ import shutil
 
 import pytest
 
-from veomni.utils.device import get_device_type
+from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from ..tools import ParallelConfig
@@ -37,6 +37,10 @@ from ..tools import ParallelConfig
 _is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 _v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
 _v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
+# Qwen3.5 GatedDeltaNet has no NPU kernel today (varlen path unsupported).
+_qwen3_5_npu_skip = pytest.mark.skipif(
+    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
+)
 
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
@@ -60,7 +64,7 @@ def _setup_model_and_data(model_name, config_path, dataset_type="text"):
     return test_dir, train_path, dummy_dataset
 
 
-def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
+def _run_single_gpu_training(model_name, config_path, model_path, train_path, output_dir):
     """Run plain single-GPU training (nproc=1, no parallelism).
 
     Uses the same trainer script as the FSDP run, but with nproc=1 and no
@@ -80,6 +84,7 @@ def _run_single_gpu_training(config_path, model_path, train_path, output_dir):
         nproc=1,
         init_device=get_device_type(),
         extra_args=["--train.accelerator.fsdp_config.mixed_precision.enable=False"],
+        model_name=model_name,
     )
 
 
@@ -94,7 +99,7 @@ def _get_nproc():
     return count
 
 
-def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=None):
+def _run_fsdp2_training(model_name, config_path, model_path, train_path, output_dir, nproc=None):
     """Run FSDP2 distributed training and return metrics."""
     from ..tools import run_training_config
 
@@ -116,6 +121,7 @@ def _run_fsdp2_training(config_path, model_path, train_path, output_dir, nproc=N
             "--train.accelerator.ep_size=1",
             "--train.accelerator.fsdp_config.mixed_precision.enable=False",
         ],
+        model_name=model_name,
     )
 
 
@@ -141,6 +147,7 @@ def _run_fsdp_equivalence(
     try:
         # 1. Run single-GPU baseline (nproc=1, no FSDP)
         baseline_results = _run_single_gpu_training(
+            model_name=model_name,
             config_path=config_path,
             model_path=test_dir,
             train_path=train_path,
@@ -149,6 +156,7 @@ def _run_fsdp_equivalence(
 
         # 2. Run FSDP2 with all available GPUs
         fsdp2_results = _run_fsdp2_training(
+            model_name=model_name,
             config_path=config_path,
             model_path=test_dir,
             train_path=train_path,
@@ -215,7 +223,7 @@ _text_test_cases_v5 = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5",
-        marks=_v5_only,
+        marks=[_v5_only, _qwen3_5_npu_skip],
     ),
     pytest.param(
         "qwen3_5_moe",
@@ -224,7 +232,7 @@ _text_test_cases_v5 = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5_moe",
-        marks=_v5_only,
+        marks=[_v5_only, _qwen3_5_npu_skip],
     ),
 ]
 

@@ -135,10 +135,17 @@ def test_opslot_unknown_kernel_name_raises():
 # ---------------------------------------------------------------------------
 
 
+# ``OpsImplementationConfig.__post_init__`` runs ``_validate_implementations``
+# which calls ``veomni.utils.import_utils.is_torch_npu_available`` directly —
+# the registry-level IS_NPU_AVAILABLE patches above don't reach it. Mock the
+# validator's NPU detection so this GPU-scenario test can construct a config
+# with ``fused_quack`` on the NPU CI runner without the validator firing
+# before the bind step we actually want to exercise.
+@patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
 @patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
 @patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
 @patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc):
+def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc, _mock_npu):
     """Reproducer for the silent-fallback regression:
 
     User sets ``moe_implementation='fused_quack'`` on an A100. The binding
@@ -150,7 +157,21 @@ def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc):
     from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.models.auto import _bind_veomni_ops
 
-    ops_config = OpsImplementationConfig(moe_implementation="fused_quack")
+    # Start from all-eager so this test exercises only the moe_experts
+    # OpSlot binding, not the GPU-optimal defaults (which would require
+    # liger-kernel + triton in the test environment).
+    ops_config = OpsImplementationConfig(
+        attn_implementation="eager",
+        moe_implementation="fused_quack",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+        rms_norm_gated_implementation="eager",
+        causal_conv1d_implementation="eager",
+        chunk_gated_delta_rule_implementation="eager",
+    )
     # Simulate a patchgen'd modeling module with a moe_experts OpSlot.
     fake_module = SimpleNamespace(veomni_moe_experts_forward=OpSlot("moe_experts", "standard"))
 

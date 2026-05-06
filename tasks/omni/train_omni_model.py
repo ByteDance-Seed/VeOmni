@@ -134,6 +134,7 @@ def main():
         input_encoder=args.model.input_encoder,
         output_encoder=args.model.output_encoder,
         init_device=args.train.init_device,
+        ops_implementation=args.model.ops_implementation,
     )
 
     logger.info_rank0("Prepare data")

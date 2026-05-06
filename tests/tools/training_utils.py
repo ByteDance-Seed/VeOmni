@@ -11,14 +11,102 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.import_utils import is_torch_npu_available
 
 from .launch_utils import find_free_port
 
 
-# Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
-# kernel is the only option; on GPU default to Triton (SM70+).
-_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
+# NPU ops_implementation overrides per model. The public
+# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton) and
+# raise on NPU at config validation time, so every NPU test must override
+# every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
+# ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3, Qwen-VL family) pin specific
+# fields to ``eager`` where the model has no NPU kernel.
+_NPU_OPS_DEFAULTS: Dict[str, str] = {
+    "attn_implementation": "flash_attention_2",
+    "moe_implementation": "fused_npu",
+    "cross_entropy_loss_implementation": "chunk_loss",
+    "rms_norm_implementation": "npu",
+    "rotary_pos_emb_implementation": "npu",
+    "swiglu_mlp_implementation": "eager",  # no NPU backend
+    # NPU ships ``triton-ascend`` (not mainline ``triton``); the validator
+    # gates ``triton`` on ``is_package_available("triton")`` so the fused
+    # load-balancing-loss kernel would raise on the NPU runner. Pin to eager.
+    "load_balancing_loss_implementation": "eager",
+}
+
+_NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "deepseek_v3": {
+        # batch-invariant RMSNorm + deterministic RoPE are GPU-only Triton
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    # Multimodal RoPE has no NPU backend in the Qwen-VL family.
+    "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
+    "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
+    "qwen25_omni": {"rotary_pos_emb_implementation": "eager"},
+}
+
+
+def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
+    merged = dict(_NPU_OPS_DEFAULTS)
+    if model_name is not None:
+        merged.update(_NPU_PER_MODEL_OVERRIDES.get(model_name, {}))
+    return merged
+
+
+def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
+    """Return ``--model.ops_implementation.X=Y`` flags for the active hardware.
+
+    On GPU returns ``[]`` — the dataclass defaults are already optimal.
+    On NPU returns the NPU-supported backend per op, with per-model eager
+    fallbacks for ops without an NPU kernel for that specific model.
+    """
+    if not is_torch_npu_available():
+        return []
+    return [f"--model.ops_implementation.{k}={v}" for k, v in _npu_overrides(model_name).items()]
+
+
+def make_eager_ops_config(**overrides) -> OpsImplementationConfig:
+    """Hardware-agnostic ``OpsImplementationConfig`` with every field = ``"eager"``.
+
+    For tests / inference scripts that don't need fused kernels and shouldn't
+    depend on liger / triton or the active accelerator. ``**overrides`` flips
+    specific fields (e.g. ``make_eager_ops_config(attn_implementation="flash_attention_2")``)
+    without enumerating the rest.
+    """
+    return OpsImplementationConfig(
+        attn_implementation=overrides.pop("attn_implementation", "eager"),
+        moe_implementation=overrides.pop("moe_implementation", "eager"),
+        cross_entropy_loss_implementation=overrides.pop("cross_entropy_loss_implementation", "eager"),
+        rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
+        swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
+        rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
+        load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
+        rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
+        causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),
+        chunk_gated_delta_rule_implementation=overrides.pop("chunk_gated_delta_rule_implementation", "eager"),
+        **overrides,
+    )
+
+
+def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImplementationConfig:
+    """NPU-recommended ``OpsImplementationConfig`` for tests running on Ascend.
+
+    Encodes the per-op NPU backend table (``_NPU_OPS_DEFAULTS``) plus per-model
+    eager fallbacks for ops without an NPU kernel (DeepSeek-V3, Qwen-VL family).
+    ``**overrides`` flips specific fields after the recommended values are
+    applied.
+    """
+    merged = _npu_overrides(model_name)
+    merged.update(overrides)
+    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
+    # config validates at parse time.
+    merged.setdefault("rms_norm_gated_implementation", "eager")
+    merged.setdefault("causal_conv1d_implementation", "eager")
+    merged.setdefault("chunk_gated_delta_rule_implementation", "eager")
+    return OpsImplementationConfig(**merged)
 
 
 def release_device_memory():
@@ -56,6 +144,7 @@ def build_torchrun_cmd(
     extra_args: Optional[List[str]] = None,
     nproc: Optional[int] = None,
     init_device: str = "meta",
+    model_name: Optional[str] = None,
 ) -> List[str]:
     """Build a torchrun command for distributed test execution.
 
@@ -65,6 +154,10 @@ def build_torchrun_cmd(
             for plain single-GPU training.
         init_device: Device for model initialization. Use "meta" for FSDP
             (multi-GPU), device type for single-GPU (no FSDP wrapping).
+        model_name: Short model identifier (e.g. ``"qwen3_moe"``,
+            ``"deepseek_v3"``). Forwarded to ``resolve_ops_overrides`` so
+            NPU runs pick the right per-model eager fallbacks. ``None`` is
+            fine for tests not tied to a specific model.
     """
     port = find_free_port()
     if nproc is not None:
@@ -85,8 +178,6 @@ def build_torchrun_cmd(
         "--data.dyn_bsz_buffer_size=1",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=1",
-        "--model.ops_implementation.attn_implementation=flash_attention_2",
-        f"--model.ops_implementation.moe_implementation={_FUSED_MOE_IMPL}",
         f"--train.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",
@@ -98,6 +189,7 @@ def build_torchrun_cmd(
         "--train.max_steps=2",
         f"--train.checkpoint.output_dir={output_dir}",
         f"--model.model_path={model_path}",
+        *resolve_ops_overrides(model_name),
     ]
 
     if parallel_config is not None:
@@ -132,8 +224,8 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
-        attn_implementation="eager",
         init_device=get_device_type(),
+        ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
 
@@ -149,8 +241,13 @@ def run_training_config(
     nproc: Optional[int] = None,
     extra_args: Optional[List[str]] = None,
     init_device: str = "meta",
+    model_name: Optional[str] = None,
 ) -> Dict:
     """Run a single training configuration and return metrics from log.
+
+    Args:
+        model_name: Short model identifier (forwarded to ``build_torchrun_cmd``
+            for NPU-aware ops_implementation overrides).
 
     Returns:
         Dict of {metric_name: list_of_values} loaded from the JSON log.
@@ -166,6 +263,7 @@ def run_training_config(
         nproc=nproc,
         extra_args=extra_args,
         init_device=init_device,
+        model_name=model_name,
     )
 
     print(f"\n{'=' * 60}")

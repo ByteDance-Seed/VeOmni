@@ -46,11 +46,11 @@ Two dispatch paths reach these wrappers:
    already knows it wants a fused kernel calls the ``OpSlot`` directly.
 
 Contract: ``apply_ops_config(ops_config)`` must run before any model is built,
-otherwise ``LOSS_MAPPING`` contains HuggingFace's stock wrapper which does not
-understand ``hidden_states=``/``weights=`` kwargs. ``build_foundation_model``
-owns this — pass ``ops_implementation=...`` (trainers do this) and it will
-install the config; otherwise it falls back to ``OpsImplementationConfig()``
-defaults.
+otherwise ``LOSS_MAPPING`` contains HF's stock wrapper which doesn't understand
+``hidden_states=``/``weights=`` kwargs. ``build_foundation_model`` owns this:
+pass ``ops_implementation=...`` (trainers do) and it installs the config;
+callers that omit it must have pre-installed a singleton via
+``apply_ops_config`` themselves, otherwise ``build_foundation_model`` raises.
 """
 
 from functools import partial

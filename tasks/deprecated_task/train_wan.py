@@ -154,7 +154,7 @@ def main():
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
         torch_dtype="bfloat16",
-        attn_implementation=args.model.ops_implementation.attn_implementation,
+        ops_implementation=args.model.ops_implementation,
     )
     model.micro_batch_size = args.train.micro_batch_size
 

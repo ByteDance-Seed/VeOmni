@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
@@ -12,6 +11,8 @@ from veomni.trainer.vlm_trainer import (
     _get_vlm_visual_module,
 )
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+from ..tools.training_utils import make_eager_ops_config
 
 
 _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4 = [
@@ -45,17 +46,13 @@ _FREEZE_VIT_VLM_CASES = (
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     # This test only constructs the model on `meta` and verifies freeze
-    # behaviour — it never runs forward. Use an explicit eager
-    # OpsImplementationConfig so Qwen3.5 build works on NPU (no FLA backend)
-    # and on GPU hosts that don't have flash-linear-attention installed; the
-    # eager linear-attention path raises at forward-time only, which this
-    # test does not exercise.
-    ops_implementation = OpsImplementationConfig(
-        attn_implementation="eager",
-        rms_norm_gated_implementation="eager",
-        causal_conv1d_implementation="eager",
-        chunk_gated_delta_rule_implementation="eager",
-    )
+    # behaviour — it never runs forward. Use an all-eager ops config so the
+    # build works everywhere: it pins every per-op field (including the
+    # Qwen3.5 GatedDeltaNet trio that has no FLA backend on NPU and the
+    # GPU-only liger/triton defaults that fail NPU validation). Eager paths
+    # that raise only at forward time are fine because this test never
+    # forwards.
+    ops_implementation = make_eager_ops_config()
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
@@ -67,7 +64,10 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     assert visual is not None
 
     args = VeOmniVLMArguments(
-        model=VLMMModelArguments(config_path=config_path),
+        model=VLMMModelArguments(
+            config_path=config_path,
+            ops_implementation=make_eager_ops_config(),
+        ),
         data=VLMMDataArguments(train_path="dummy"),
     )
     args.train.freeze_vit = freeze_vit

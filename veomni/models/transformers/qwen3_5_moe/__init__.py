@@ -16,6 +16,13 @@ from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
+# Qwen3.5 GatedDeltaNet's three fused ops (FusedRMSNormGated, causal_conv1d,
+# chunk_gated_delta_rule) currently only ship GPU backends via FLA / FlashQLA.
+# Setting any of these to a non-eager value on NPU raises at OpSlot.bind via
+# KERNEL_REGISTRY.resolve's HardwareRequirement check; the varlen
+# (dyn_bsz=True) caveat is documented in docs/usage/arguments.md and on the
+# OpsImplementationConfig field metadata.
+
 # qwen3_5_moe is added in transformers 5.2.0.
 if is_transformers_version_greater_or_equal_to("5.2.0"):
 

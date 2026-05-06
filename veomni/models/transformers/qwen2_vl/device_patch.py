@@ -42,7 +42,10 @@ def apply_veomni_qwen2vl_device_patch():
                     entry="liger_kernel.transformers.qwen2vl_mrope:liger_multimodal_rotary_pos_emb",
                     requires=("liger_kernel",),
                 ),
-                # No ``npu`` backend for multimodal RoPE; clear the registry default.
+                # Registry default ``apply_rotary_pos_emb_npu`` doesn't fit
+                # Qwen2-VL's multimodal RoPE layout. ``None`` = explicitly
+                # disabled — raises cleanly instead of binding a wrong-shape
+                # kernel. NPU users must pin ``rotary_pos_emb_implementation: eager``.
                 "npu": None,  # type: ignore[dict-item]
             },
         },

@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 import torch
+from tools import resolve_ops_overrides
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
@@ -417,6 +418,8 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         f"--save_by_idx={str(save_by_idx).lower()}",
         f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
         "--train.seed=42",
+        # Hardware-aware ops_implementation overrides; see test_datasets.py.
+        *resolve_ops_overrides(None),
     ]
     return command
 

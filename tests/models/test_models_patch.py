@@ -26,6 +26,7 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 from veomni.utils.loss_utils import count_loss_token
 
 from ..tools.common_utils import print_device_mem_info
+from ..tools.training_utils import make_eager_ops_config
 from .utils import (
     ModelMode,
     compare_multi_items,
@@ -390,7 +391,14 @@ def test_models_patch_fwd_bwd(
             mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
         ]
 
-    model_config = ModelArguments(config_path=config_path)
+    # The actual ops backend used per test case is set by ``set_environ_param``
+    # inside ``TrainerTest`` (which calls ``apply_ops_config`` with a
+    # mode-specific config). The ops_implementation on this ModelArguments is
+    # never consumed at training time, so we pin it to all-eager — without
+    # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
+    # fused_triton / triton) would fail validation on NPU before the test
+    # even runs.
+    model_config = ModelArguments(config_path=config_path, ops_implementation=make_eager_ops_config())
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),

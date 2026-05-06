@@ -7,15 +7,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from tools import hf_local_or_remote
+from tools import hf_local_or_remote, resolve_ops_overrides
 from tools.launch_utils import find_free_port
-
-from veomni.utils.import_utils import is_torch_npu_available
-
-
-# Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
-# kernel is the only option; on GPU default to Triton (SM70+).
-_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
 
 
 MODEL_CONFIGS = {
@@ -63,8 +56,10 @@ def get_checkpoint_test_command(
         "tests/checkpoints/test_trainer_saveload.py",
         f"--model.config_path {config_path}",
         f"--model.tokenizer_path {tokenizer_path}",
-        f"--model.ops_implementation.moe_implementation {_FUSED_MOE_IMPL}",
-        "--model.ops_implementation.attn_implementation flash_attention_2",
+        # Hardware-aware ops_implementation overrides. ``resolve_ops_overrides``
+        # emits NPU-supported per-op backends on NPU (with eager fallback for
+        # ops without an NPU kernel) and the GPU-optimal baseline on GPU.
+        *resolve_ops_overrides(model_name),
         "--data.train_path dummy",
         "--data.max_seq_len 128",
         f"--train.checkpoint.output_dir {output_dir}",
