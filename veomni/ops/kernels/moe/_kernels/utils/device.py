@@ -21,14 +21,16 @@ from ......utils.device import get_device_name
 def get_device_key() -> str:
     import torch
 
-    if torch.cuda.get_device_capability() == (8, 0):
-        return "A100"  # A30 is treated the same way as A100 for the moment.
+    if torch.cuda.is_available():
+        if torch.cuda.get_device_capability() == (8, 0):
+            return "A100"  # A30 is treated the same way as A100 for the moment.
 
-    if torch.cuda.get_device_capability() == (9, 0):
-        return "H100"
+        if torch.cuda.get_device_capability() == (9, 0):
+            return "H100"
 
     name = get_device_name()
-    if name.startswith("NVIDIA "):
+    if name and name.startswith("NVIDIA "):
         name = name[len("NVIDIA ") :]
 
-    return name
+    # Fallback for non-NVIDIA devices (e.g., Intel XPU, AMD)
+    return name if name else "unknown"

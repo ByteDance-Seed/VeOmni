@@ -23,7 +23,9 @@ from .comm import all_to_all
 from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
 
 
-if not is_torch_npu_available():
+group_gemm_same_mn = None
+group_gemm_same_nk = None
+if not is_torch_npu_available() and torch.cuda.is_available():
     from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
 
@@ -149,6 +151,12 @@ class EPGroupGemm(torch.autograd.Function):
     ):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
+        
+        if group_gemm_same_nk is None:
+            raise RuntimeError(
+                "MoE fused group_gemm kernels are not available for the current device/backend. "
+                "Please use moe_implementation='eager' instead of 'fused'."
+            )
 
         # compute linear layer fc1-1
         fc1_1_output = group_gemm_same_nk(
@@ -320,6 +328,13 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
     ):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
+        
+        if group_gemm_same_nk is None:
+            raise RuntimeError(
+                "MoE fused group_gemm kernels are not available for the current device/backend. "
+                "Please use moe_implementation='eager' instead of 'fused'."
+            )
+        
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
             f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
         )
