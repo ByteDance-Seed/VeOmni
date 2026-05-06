@@ -149,7 +149,6 @@ def _save_hf_safetensor_legacy(
     save_hf_safetensor_path: str,
     model_assets: Optional[Sequence],
     ckpt_manager: str,
-    train_architecture: Optional[str],
     output_dir: Optional[str],
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
@@ -158,8 +157,6 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
-    if train_architecture == "lora":
-        model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
     save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
@@ -168,7 +165,6 @@ def save_hf_safetensor(
     save_hf_safetensor_path: Optional[str] = None,
     ckpt_manager: Optional[str] = None,
     model_assets: Optional[Sequence] = None,
-    train_architecture: Optional[str] = None,
     # Legacy only
     save_checkpoint_path: Optional[str] = None,
     output_dir: Optional[str] = None,
@@ -194,8 +190,7 @@ def save_hf_safetensor(
         ckpt_manager: Checkpoint manager type. Used for routing (distributed when "dcp")
             and passed to legacy ``ckpt_to_state_dict``.
         model_assets: Model assets (e.g., config, tokenizer) to save alongside weights.
-        train_architecture: Training architecture type. Used for routing (legacy when "lora")
-            and to filter LoRA weights in legacy mode.
+
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
@@ -207,7 +202,7 @@ def save_hf_safetensor(
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-    use_distributed = is_torch_version_greater_than("2.9") and train_architecture != "lora" and ckpt_manager == "dcp"
+    use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp"
 
     # Ensure all GPU operations are complete before reading tensor data for saving
     synchronize()
@@ -230,7 +225,6 @@ def save_hf_safetensor(
                 save_hf_safetensor_path,
                 model_assets,
                 ckpt_manager,
-                train_architecture,
                 output_dir,
             )
 

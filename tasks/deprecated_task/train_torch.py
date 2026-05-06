@@ -397,7 +397,6 @@ def main():
             save_hf_safetensor_path=hf_weights_path,
             ckpt_manager=args.train.checkpoint.manager,
             model_assets=model_assets,
-            train_architecture=args.train.train_architecture,
             save_checkpoint_path=save_checkpoint_path,
             is_rank_0=args.train.global_rank == 0,
             model=model,

@@ -208,7 +208,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| train_architecture | `Literal["full", "lora"]` | `"full"` | Parameter update strategy: `"full"` for standard SFT, `"lora"` for LoRA. |
+
 | dyn_bsz | `bool` | `True` | Enable dynamic batch size for padding-free training. |
 | micro_batch_size | `int` | `1` | Number of samples per iteration on each device. |
 | global_batch_size | `Optional[int]` | `None` | Global batch size. If `None`, uses `micro_batch_size × dp_size`. |

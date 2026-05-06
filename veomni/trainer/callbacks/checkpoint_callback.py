@@ -189,7 +189,6 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             save_hf_safetensor_path=hf_weights_path,
             model_assets=self.trainer.model_assets,
             ckpt_manager=args.train.checkpoint.manager,
-            train_architecture=args.train.train_architecture,
             output_dir=args.train.checkpoint.output_dir,
             save_checkpoint_path=save_checkpoint_path,
             model=self.trainer.model,
