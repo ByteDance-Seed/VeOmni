@@ -33,7 +33,6 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     BaseModelOutputWithDeepstackFeatures,
-    Qwen3VLMoeCausalLMOutputWithPast,
     Qwen3VLMoeModelOutputWithPast,
     load_balancing_loss_func,
 )
@@ -64,6 +63,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
 )
 from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -83,9 +83,15 @@ config.helpers.extend(qwen3_vl_config.helpers)
 
 # Additional import for the fused MoE dispatch in `PatchedQwen3VLMoeTextExperts`.
 config.add_import("veomni.ops", names=["fused_moe_forward"])
-# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can return
-# per-token log-probs in the unified output dataclass via dynamic attribute set.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+# Surface ``Qwen3VLMoeCausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs / entropy as constructor fields
+# while preserving ``aux_loss`` and ``rope_deltas``. Mutating
+# ``output.log_probs`` / ``output.entropy`` after the base-class constructor
+# would bypass ``ModelOutput`` pytree flattening, breaking FSDP2's pre-backward
+# unshard hook on ``lm_head`` and triggering ``setStorage … storage of size 0``
+# in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
+config.add_import("veomni.utils.model_outputs", names=["Qwen3VLMoeCausalLMOutputWithLogProbs"])
+config.drop_import_names("Qwen3VLMoeCausalLMOutputWithPast")
 
 config.add_post_import_block(
     """
@@ -525,7 +531,7 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> tuple | Qwen3VLMoeCausalLMOutputWithPast:
+) -> tuple | Qwen3VLMoeCausalLMOutputWithLogProbs:
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -594,7 +600,7 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
     # --- Patch.2 ---
 
-    output = Qwen3VLMoeCausalLMOutputWithPast(
+    return Qwen3VLMoeCausalLMOutputWithLogProbs(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
@@ -603,10 +609,9 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
         router_logits=getattr(outputs, "router_logits", None),
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output
 
 
 # ================================================================

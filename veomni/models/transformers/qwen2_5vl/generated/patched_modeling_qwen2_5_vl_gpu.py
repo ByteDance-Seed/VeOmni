@@ -75,6 +75,7 @@ from veomni.distributed.sequence_parallel import (
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.model_outputs import Qwen2_5_VLCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -1742,7 +1743,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         second_per_grid_ts: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | Qwen2_5_VLCausalLMOutputWithPast:
+    ) -> tuple | Qwen2_5_VLCausalLMOutputWithLogProbs:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1796,17 +1797,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             logits = self.lm_head(hidden_states)
         # --- Patch.1 ---
 
-        output = Qwen2_5_VLCausalLMOutputWithPast(
+        return Qwen2_5_VLCausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
     def prepare_inputs_for_generation(
         self,

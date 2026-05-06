@@ -49,7 +49,7 @@ from transformers.modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
@@ -65,6 +65,7 @@ from veomni.ops import fused_moe_forward
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # These are bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 veomni_rms_norm = OpSlot("rms_norm", "standard")
@@ -737,7 +738,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeCausalLMOutputWithPast:
+    ) -> MoeCausalLMOutputWithLogProbs:
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
@@ -804,7 +805,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-        output = MoeCausalLMOutputWithPast(
+        return MoeCausalLMOutputWithLogProbs(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -812,10 +813,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
     def get_parallel_plan(self):
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan

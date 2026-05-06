@@ -51,7 +51,6 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     BaseModelOutputWithDeepstackFeatures,
-    Qwen3OmniMoeThinkerCausalLMOutputWithPast,
     Qwen3OmniMoeThinkerForConditionalGeneration,
     _get_feat_extract_output_lengths,
     apply_rotary_pos_emb_vision,
@@ -80,6 +79,7 @@ from veomni.utils.constants import (
     IMAGE_INPUT_INDEX,
     VIDEO_INPUT_INDEX,
 )
+from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -111,9 +111,16 @@ config.add_import(
 config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gather"])
 config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["fused_moe_forward"])
-# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can return
-# per-token log-probs in the unified output dataclass via dynamic attribute set.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+# Surface ``Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs`` so the patched
+# ``Qwen3OmniMoeThinkerForConditionalGeneration.forward`` can return per-token
+# log-probs / entropy as constructor fields while preserving ``aux_loss`` and
+# ``rope_deltas``. Mutating ``output.log_probs`` / ``output.entropy`` after the
+# base-class constructor would bypass ``ModelOutput`` pytree flattening,
+# breaking FSDP2's pre-backward unshard hook on ``lm_head`` and triggering
+# ``setStorage … storage of size 0`` in ``chunk_logprobs.backward`` (parallels
+# VeOmni #731's qwen3_5_moe fix).
+config.add_import("veomni.utils.model_outputs", names=["Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs"])
+config.drop_import_names("Qwen3OmniMoeThinkerCausalLMOutputWithPast")
 
 config.add_post_import_block(
     """
@@ -1071,7 +1078,7 @@ def qwen3_omni_moe_thinker_forward_patched(
     cache_position=None,
     video_second_per_grid=None,
     **kwargs,
-) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithPast:
+) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
     )
@@ -1376,7 +1383,7 @@ def qwen3_omni_moe_thinker_forward_patched(
         if labels is not None and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-    output = Qwen3OmniMoeThinkerCausalLMOutputWithPast(
+    return Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         aux_loss=aux_loss,
@@ -1385,10 +1392,9 @@ def qwen3_omni_moe_thinker_forward_patched(
         past_key_values=outputs.past_key_values,
         router_logits=getattr(outputs, "router_logits", None),
         rope_deltas=self.rope_deltas,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output
 
 
 # ================================================================
@@ -1485,7 +1491,7 @@ def qwen3_omni_moe_enable_talker_patched(self):
 def qwen3_omni_moe_for_conditional_generation_forward_patched(
     self,
     **kwargs,
-) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithPast:
+) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
     return self.thinker(**kwargs)
 
 

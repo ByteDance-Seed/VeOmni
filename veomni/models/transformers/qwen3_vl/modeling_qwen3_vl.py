@@ -29,7 +29,10 @@ from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLCausalLMOutputWithPast,
+    Qwen3VLForConditionalGeneration as _Qwen3VLForConditionalGeneration,
+)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel as _Qwen3VLModel
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLModelOutputWithPast,
     Qwen3VLTextModel,
     Qwen3VLVisionAttention,
@@ -38,10 +41,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb_vision,
     eager_attention_forward,
 )
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLForConditionalGeneration as _Qwen3VLForConditionalGeneration,
-)
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel as _Qwen3VLModel
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextAttention as _Qwen3VLTextAttention
 from transformers.processing_utils import Unpack
 from transformers.utils import (
@@ -67,6 +66,7 @@ from ....distributed.sequence_parallel.async_ulysses import (
 from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
+from ....utils.model_outputs import Qwen3VLCausalLMOutputWithLogProbs
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -911,7 +911,7 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
+    ) -> Union[tuple, Qwen3VLCausalLMOutputWithLogProbs]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -956,10 +956,11 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             # The wrapper inspects ``return_log_probs`` in **kwargs and routes
             # the call to ``chunk_logprobs_function`` when True; on that path
             # ``loss``/``logits`` are ``None`` and ``log_probs`` / ``entropy``
-            # carry the per-token log-probabilities and softmax entropy.
-            # ``ModelOutput`` allows arbitrary attribute setting, so
-            # ``output.log_probs`` and ``output.entropy`` surface on the
-            # existing VL-specific output dataclass without a subclass.
+            # carry the per-token log-probabilities and softmax entropy. We
+            # surface them as constructor fields on a model-specific
+            # ``Qwen3VLCausalLMOutputWithLogProbs`` subclass so they participate
+            # in ``ModelOutput`` pytree flattening (post-construction mutation
+            # would break FSDP2's pre-backward unshard hook on ``lm_head``).
             loss, logits, log_probs, entropy = self.loss_function(
                 logits=logits,
                 labels=labels,
@@ -972,15 +973,14 @@ class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             logits = self.lm_head(hidden_states)
         # --- Patch.2 ---
 
-        output = Qwen3VLCausalLMOutputWithPast(
+        return Qwen3VLCausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
 
 def apply_veomni_qwen3vl_patch():

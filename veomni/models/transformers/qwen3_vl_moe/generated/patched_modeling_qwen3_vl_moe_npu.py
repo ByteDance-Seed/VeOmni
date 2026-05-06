@@ -112,6 +112,10 @@ from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.model_outputs import (
+    Qwen3VLCausalLMOutputWithLogProbs,  # noqa: F401  surfaced for forward log_probs path
+    Qwen3VLMoeCausalLMOutputWithLogProbs,
+)
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -2140,7 +2144,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | Qwen3VLMoeCausalLMOutputWithPast:
+    ) -> tuple | Qwen3VLMoeCausalLMOutputWithLogProbs:
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -2209,7 +2213,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                 loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
         # --- Patch.2 ---
 
-        output = Qwen3VLMoeCausalLMOutputWithPast(
+        return Qwen3VLMoeCausalLMOutputWithLogProbs(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -2218,10 +2222,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
             router_logits=getattr(outputs, "router_logits", None),
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
     def prepare_inputs_for_generation(
         self,

@@ -35,7 +35,6 @@ from transformers.modeling_utils import (
 )
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     BaseModelOutputWithDeepstackFeatures,
-    Qwen3VLCausalLMOutputWithPast,
     Qwen3VLModel,
     Qwen3VLModelOutputWithPast,
     apply_rotary_pos_emb,
@@ -60,6 +59,7 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.model_outputs import Qwen3VLCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -67,6 +67,14 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_vl_gpu.py",
     description="Qwen3-VL with VeOmni v5 compatibility (SP + async Ulysses + deepstack + fused-loss)",
 )
+# Surface ``Qwen3VLCausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs / entropy as constructor fields
+# while preserving ``rope_deltas``. Mutating ``output.log_probs`` /
+# ``output.entropy`` after the base-class constructor would bypass
+# ``ModelOutput`` pytree flattening, breaking FSDP2's pre-backward unshard
+# hook on ``lm_head`` and triggering ``setStorage … storage of size 0`` in
+# ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
+config.drop_import_names("Qwen3VLCausalLMOutputWithPast")
 
 # Imports consumed by the helpers below + the patched methods need to be
 # emitted into the generated file. We use `add_post_import_block` (not
@@ -95,7 +103,7 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
 )
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs  # noqa: F401  surfaced for forward log_probs path
+from veomni.utils.model_outputs import Qwen3VLCausalLMOutputWithLogProbs  # noqa: F401  surfaced for forward log_probs path
 """)
 
 config.add_post_import_block(
@@ -1085,7 +1093,7 @@ def qwen3_vl_for_conditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> tuple | Qwen3VLCausalLMOutputWithPast:
+) -> tuple | Qwen3VLCausalLMOutputWithLogProbs:
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1129,14 +1137,13 @@ def qwen3_vl_for_conditional_generation_forward_patched(
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
 
-    output = Qwen3VLCausalLMOutputWithPast(
+    return Qwen3VLCausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output

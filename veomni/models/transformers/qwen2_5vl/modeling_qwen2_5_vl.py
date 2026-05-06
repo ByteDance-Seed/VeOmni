@@ -29,7 +29,6 @@ from transformers.cache_utils import Cache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionTransformerPretrainedModel,
-    Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
     Qwen2_5_VLVisionAttention,
     apply_rotary_pos_emb_vision,
@@ -58,6 +57,7 @@ from ....distributed.sequence_parallel import (
 from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.device import IS_NPU_AVAILABLE
+from ....utils.model_outputs import Qwen2_5_VLCausalLMOutputWithLogProbs
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -591,7 +591,7 @@ class Qwen2_5_VLForConditionalGeneration(_Qwen2_5_VLForConditionalGeneration):
         second_per_grid_ts: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen2_5_VLCausalLMOutputWithPast]:
+    ) -> Union[tuple, Qwen2_5_VLCausalLMOutputWithLogProbs]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -679,17 +679,16 @@ class Qwen2_5_VLForConditionalGeneration(_Qwen2_5_VLForConditionalGeneration):
             logits = self.lm_head(hidden_states)
         # --- Patch.2 ---
 
-        output = Qwen2_5_VLCausalLMOutputWithPast(
+        return Qwen2_5_VLCausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
 
 def apply_veomni_qwen25_vl_patch():

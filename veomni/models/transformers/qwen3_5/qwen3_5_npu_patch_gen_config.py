@@ -23,12 +23,16 @@ Language-model focused patches from qwen3_next example:
 3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5CausalLMOutputWithPast,
     Qwen3_5DynamicCache,
     apply_mask_to_padding_states,
 )
+from transformers.utils import auto_docstring
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
@@ -463,3 +467,25 @@ config.override_method(
     replacement=qwen3_5_forconditional_generation_forward_patched,
     description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
 )
+
+
+# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` (re-used from the GPU config) can return per-token log-probs
+# while preserving ``rope_deltas``. Mirrors the GPU config's helper-after.
+@config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
+    """
+)
+class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
+    r"""
+    log_probs (`torch.FloatTensor`, *optional*):
+        Per-token log probabilities returned by VeOmni's fused loss path.
+    entropy (`torch.FloatTensor`, *optional*):
+        Per-token softmax entropy returned by VeOmni's fused loss path.
+    """
+
+    log_probs: torch.FloatTensor | None = None
+    entropy: torch.FloatTensor | None = None

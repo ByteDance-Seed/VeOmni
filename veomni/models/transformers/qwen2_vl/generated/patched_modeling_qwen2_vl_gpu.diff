@@ -1,6 +1,6 @@
 --- a/transformers/models/qwen2_vl/modeling_qwen2_vl.py
 +++ b/patched_modeling_qwen2_vl_gpu.py
-@@ -1,3 +1,79 @@
+@@ -1,3 +1,80 @@
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
 +# ==============================================================================
@@ -73,6 +73,7 @@
 +# Bound at model-build time by _bind_veomni_ops() in auto.py.
 +from veomni.ops.dispatch import OpSlot
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
++from veomni.utils.model_outputs import Qwen2VLCausalLMOutputWithLogProbs
 +
 +
 +veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -80,7 +81,7 @@
  # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
  #
  # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-@@ -17,42 +93,6 @@
+@@ -17,42 +94,6 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  """PyTorch Qwen2-VL model."""
@@ -123,7 +124,7 @@
 
 
  logger = logging.get_logger(__name__)
-@@ -374,6 +414,12 @@
+@@ -374,6 +415,12 @@
      return attn_output, attn_weights
 
 
@@ -136,7 +137,7 @@
  class VisionAttention(nn.Module):
      def __init__(self, config: Qwen2VLVisionConfig) -> None:
          super().__init__()
-@@ -392,6 +438,7 @@
+@@ -392,6 +439,7 @@
          self,
          hidden_states: torch.Tensor,
          cu_seqlens: torch.Tensor,
@@ -144,7 +145,7 @@
          rotary_pos_emb: torch.Tensor | None = None,
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
-@@ -412,8 +459,7 @@
+@@ -412,8 +460,7 @@
          )
 
          if is_flash_attention_requested(self.config):
@@ -154,7 +155,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -430,12 +476,10 @@
+@@ -430,12 +477,10 @@
                  **kwargs,
              )
          else:
@@ -167,7 +168,7 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -699,6 +743,12 @@
+@@ -699,6 +744,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -180,7 +181,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -774,16 +824,11 @@
+@@ -774,16 +825,11 @@
          self,
          hidden_states: torch.Tensor,
          grid_thw: torch.Tensor,
@@ -199,7 +200,7 @@
 
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
-@@ -795,10 +840,27 @@
+@@ -795,10 +841,27 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -227,7 +228,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -809,6 +871,23 @@
+@@ -809,6 +872,23 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -251,7 +252,7 @@
 
 
  @auto_docstring
-@@ -966,6 +1045,12 @@
+@@ -966,6 +1046,12 @@
              hidden_states=all_hidden_states,
              attentions=all_self_attns,
          )
@@ -264,7 +265,7 @@
 
 
  @auto_docstring
-@@ -1134,9 +1219,6 @@
+@@ -1134,9 +1220,6 @@
          """
          pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
@@ -274,7 +275,7 @@
 
          return vision_outputs
 
-@@ -1156,9 +1238,6 @@
+@@ -1156,9 +1239,6 @@
          """
          pixel_values = pixel_values.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
@@ -284,7 +285,7 @@
 
          return vision_outputs
 
-@@ -1260,39 +1339,65 @@
+@@ -1260,39 +1340,65 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen2VLModelOutputWithPast:
@@ -367,7 +368,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1303,6 +1408,10 @@
+@@ -1303,6 +1409,10 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -378,7 +379,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1326,6 +1435,12 @@
+@@ -1326,6 +1436,12 @@
              rope_deltas=self.rope_deltas,
          )
          return output if return_dict else output.to_tuple()
@@ -391,10 +392,11 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1402,64 +1517,21 @@
+@@ -1401,65 +1517,22 @@
+         cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
-     ) -> tuple | Qwen2VLCausalLMOutputWithPast:
+-    ) -> tuple | Qwen2VLCausalLMOutputWithPast:
 -        r"""
 -        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
 -            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -444,6 +446,7 @@
 -        ```
 -        """
 -
++    ) -> tuple | Qwen2VLCausalLMOutputWithLogProbs:
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -462,7 +465,7 @@
              image_grid_thw=image_grid_thw,
              video_grid_thw=video_grid_thw,
              position_ids=position_ids,
-@@ -1475,17 +1547,32 @@
+@@ -1475,23 +1548,40 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -500,20 +503,18 @@
 +            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 +            logits = self.lm_head(hidden_states[:, slice_indices, :])
 +
-+        output = Qwen2VLCausalLMOutputWithPast(
++        return Qwen2VLCausalLMOutputWithLogProbs(
              loss=loss,
              logits=logits,
              past_key_values=outputs.past_key_values,
-@@ -1493,6 +1580,9 @@
+             hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
++            log_probs=log_probs,
++            entropy=entropy,
          )
-+        output.log_probs = log_probs
-+        output.entropy = entropy
-+        return output
 
      def prepare_inputs_for_generation(
-         self,
 @@ -1710,5 +1800,19 @@
 
          return input_ids, model_kwargs

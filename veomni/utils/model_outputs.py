@@ -28,6 +28,11 @@ from typing import Optional
 
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLCausalLMOutputWithPast
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLCausalLMOutputWithPast
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerCausalLMOutputWithPast
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
+from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeCausalLMOutputWithPast
 
 
 @dataclass
@@ -67,6 +72,57 @@ class MoeCausalLMOutputWithLogProbs(MoeCausalLMOutputWithPast):
             verl's ``CausalLMOutputForPPO.entropy`` so the dataclass drops
             directly into verl's ``prepare_model_outputs`` consumer.
     """
+
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model-specific subclasses for multimodal/omni outputs.
+#
+# These mirror the HF base classes (preserving ``rope_deltas`` and other
+# model-specific fields) and add ``log_probs`` / ``entropy`` as constructor
+# fields. The subclasses live here (rather than inline in the patchgen config)
+# because they are needed in BOTH the patchgen-generated GPU/NPU forward AND
+# the hand-written transformers-v4 ``modeling_<arch>.py``.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class Qwen2VLCausalLMOutputWithLogProbs(Qwen2VLCausalLMOutputWithPast):
+    """``Qwen2VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+@dataclass
+class Qwen2_5_VLCausalLMOutputWithLogProbs(Qwen2_5_VLCausalLMOutputWithPast):
+    """``Qwen2_5_VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+@dataclass
+class Qwen3VLCausalLMOutputWithLogProbs(Qwen3VLCausalLMOutputWithPast):
+    """``Qwen3VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+@dataclass
+class Qwen3VLMoeCausalLMOutputWithLogProbs(Qwen3VLMoeCausalLMOutputWithPast):
+    """``Qwen3VLMoeCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+@dataclass
+class Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(Qwen3OmniMoeThinkerCausalLMOutputWithPast):
+    """``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
