@@ -29,13 +29,14 @@ import torch
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.qwen3_moe.modeling_qwen3_moe import load_balancing_loss_func
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -45,9 +46,14 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
-# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can return
-# per-token log-probs in the unified output dataclass via dynamic attribute set.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+# Surface ``MoeCausalLMOutputWithLogProbs`` so the patched ``forward`` can return
+# per-token log-probs / entropy as constructor fields. Mutating ``output.log_probs``
+# / ``output.entropy`` after constructing ``MoeCausalLMOutputWithPast`` would
+# bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward unshard
+# hook on ``lm_head`` and triggering ``setStorage … storage of size 0`` in
+# ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
+config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
+config.drop_import_names("MoeCausalLMOutputWithPast")
 
 config.add_post_import_block(
     """
@@ -285,7 +291,7 @@ def qwen3_moe_forcausallm_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> MoeCausalLMOutputWithPast:
+) -> MoeCausalLMOutputWithLogProbs:
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.output_router_logits
     )
@@ -352,7 +358,7 @@ def qwen3_moe_forcausallm_forward_patched(
         if labels is not None:
             loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-    output = MoeCausalLMOutputWithPast(
+    return MoeCausalLMOutputWithLogProbs(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
@@ -360,10 +366,9 @@ def qwen3_moe_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output
 
 
 @config.override_method(

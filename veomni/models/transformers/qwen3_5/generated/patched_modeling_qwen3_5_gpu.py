@@ -2249,6 +2249,31 @@ class Qwen3_5CausalLMOutputWithPast(ModelOutput):
 
 
 # ======================================================================
+# [HELPERS AFTER] Qwen3_5CausalLMOutputWithPast
+# ======================================================================
+
+
+# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
+    """
+)
+class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
+    r"""
+    log_probs (`torch.FloatTensor`, *optional*):
+        Per-token log probabilities returned by VeOmni's fused loss path.
+    entropy (`torch.FloatTensor`, *optional*):
+        Per-token softmax entropy returned by VeOmni's fused loss path.
+    """
+
+    log_probs: torch.FloatTensor | None = None
+    entropy: torch.FloatTensor | None = None
+
+
+# ======================================================================
 # [MODIFIED CLASS] Qwen3_5ForConditionalGeneration
 # Methods patched: get_position_id_func, forward
 # ======================================================================
@@ -2322,7 +2347,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | Qwen3_5CausalLMOutputWithPast:
+    ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -2365,17 +2390,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         else:
             logits = self.lm_head(hidden_states)
 
-        output = Qwen3_5CausalLMOutputWithPast(
+        return Qwen3_5CausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
     def prepare_inputs_for_generation(
         self,

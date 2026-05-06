@@ -32,7 +32,6 @@ from transformers.modeling_utils import (
     is_flash_attention_requested,
 )
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VLCausalLMOutputWithPast,
     Qwen2VLModel,
     Qwen2VLModelOutputWithPast,
     apply_rotary_pos_emb_vision,
@@ -50,6 +49,7 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.model_outputs import Qwen2VLCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -67,6 +67,15 @@ config.add_import(
     names=["gather_heads_scatter_seq", "gather_seq_scatter_heads", "pad_tensor", "sp_pad_and_slice"],
 )
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``Qwen2VLCausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs / entropy as constructor fields
+# while preserving ``rope_deltas``. Mutating ``output.log_probs`` /
+# ``output.entropy`` after constructing ``Qwen2VLCausalLMOutputWithPast``
+# would bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward
+# unshard hook on ``lm_head`` and triggering ``setStorage … storage of
+# size 0`` in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
+config.add_import("veomni.utils.model_outputs", names=["Qwen2VLCausalLMOutputWithLogProbs"])
+config.drop_import_names("Qwen2VLCausalLMOutputWithPast")
 
 config.add_post_import_block(
     """
@@ -433,7 +442,7 @@ def qwen2vl_for_conditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> tuple | Qwen2VLCausalLMOutputWithPast:
+) -> tuple | Qwen2VLCausalLMOutputWithLogProbs:
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -489,14 +498,13 @@ def qwen2vl_for_conditional_generation_forward_patched(
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-    output = Qwen2VLCausalLMOutputWithPast(
+    return Qwen2VLCausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output
