@@ -73,7 +73,6 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     BaseModelOutputWithPooling,
     ModelOutput,
-    MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
@@ -93,6 +92,7 @@ from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 # Additional import blocks for patches
@@ -1757,6 +1757,31 @@ class Qwen3_5MoeCausalLMOutputWithPast(ModelOutput):
     aux_loss: torch.FloatTensor | None = None
 
 
+# ======================================================================
+# [HELPERS AFTER] Qwen3_5MoeCausalLMOutputWithPast
+# ======================================================================
+
+
+# Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Qwen3_5Moe causal language model outputs extended with per-token log-prob fields.
+    """
+)
+class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
+    r"""
+    log_probs (`torch.FloatTensor`, *optional*):
+        Per-token log probabilities returned by VeOmni's fused loss path.
+    entropy (`torch.FloatTensor`, *optional*):
+        Per-token softmax entropy returned by VeOmni's fused loss path.
+    """
+
+    log_probs: torch.FloatTensor | None = None
+    entropy: torch.FloatTensor | None = None
+
+
 class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
     def __init__(self, config: Qwen3_5MoeTextConfig):
         super().__init__(config)
@@ -2400,7 +2425,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeCausalLMOutputWithPast:
+    ) -> MoeCausalLMOutputWithLogProbs:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -2492,7 +2517,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
 
-        output = MoeCausalLMOutputWithPast(
+        return MoeCausalLMOutputWithLogProbs(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -2500,10 +2525,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
 
 # ======================================================================
@@ -2581,7 +2605,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
+    ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -2647,19 +2671,18 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
             if labels is not None:
                 loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
 
-        output = Qwen3_5MoeCausalLMOutputWithPast(
+        return Qwen3_5MoeCausalLMOutputWithLogProbs(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
             router_logits=outputs.router_logits,
+            rope_deltas=outputs.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
     def prepare_inputs_for_generation(
         self,

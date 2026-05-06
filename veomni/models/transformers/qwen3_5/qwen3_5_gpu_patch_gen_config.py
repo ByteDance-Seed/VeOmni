@@ -24,6 +24,7 @@ Language-model focused patches from qwen3_next example:
 """
 
 from copy import copy
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 
@@ -45,7 +46,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     torch_chunk_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs, auto_docstring, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
@@ -75,7 +76,13 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
-# ``forward`` can return per-token log-probs in the unified output dataclass.
+# text-only ``forward`` can return per-token log-probs as constructor fields.
+# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can do the same while preserving ``rope_deltas``. Mutating
+# ``output.log_probs`` / ``output.entropy`` after the base-class constructor
+# would bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward
+# unshard hook on ``lm_head`` and triggering ``setStorage … storage of
+# size 0`` in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
 config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.drop_import_names(
@@ -1077,6 +1084,27 @@ def qwen3_5_forcausallm_forward_patched(
     )
 
 
+# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+@config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
+    """
+)
+class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
+    r"""
+    log_probs (`torch.FloatTensor`, *optional*):
+        Per-token log probabilities returned by VeOmni's fused loss path.
+    entropy (`torch.FloatTensor`, *optional*):
+        Per-token softmax entropy returned by VeOmni's fused loss path.
+    """
+
+    log_probs: torch.FloatTensor | None = None
+    entropy: torch.FloatTensor | None = None
+
+
 @config.add_helper
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
@@ -1115,7 +1143,7 @@ def qwen3_5_forconditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> tuple | Qwen3_5CausalLMOutputWithPast:
+) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1158,14 +1186,13 @@ def qwen3_5_forconditional_generation_forward_patched(
     else:
         logits = self.lm_head(hidden_states)
 
-    output = Qwen3_5CausalLMOutputWithPast(
+    return Qwen3_5CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output

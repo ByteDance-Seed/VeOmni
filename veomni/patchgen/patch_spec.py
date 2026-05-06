@@ -95,6 +95,15 @@ class ImportSpec:
 
 
 @dataclass
+class PositionedHelper:
+    """Module-level helper emitted relative to a top-level class or function."""
+
+    target: str
+    helper: Callable
+    placement: str = "after"
+
+
+@dataclass
 class PatchConfig:
     """
     Configuration for a set of patches to be applied to a source module.
@@ -112,6 +121,7 @@ class PatchConfig:
     additional_imports: list[ImportSpec] = field(default_factory=list)
     post_import_blocks: list[str] = field(default_factory=list)
     helpers: list[Callable] = field(default_factory=list)
+    positioned_helpers: list[PositionedHelper] = field(default_factory=list)
     drop_imported_names: set[str] = field(default_factory=set)
 
     # Classes/functions to exclude from the output
@@ -322,6 +332,31 @@ class PatchConfig:
             return self.add_helper  # support bare ``@config.add_helper()``
         self.helpers.append(func)
         return func
+
+    def add_helper_after(self, target: str, helper: Optional[Callable] = None):
+        """
+        Register a module-level helper to emit immediately after a top-level
+        class or function in the source module.
+
+        Use this when a helper must reference a source-defined symbol that is
+        unavailable at the import-block helper position. For example::
+
+            @config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast")
+            @dataclass
+            class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast): ...
+
+        Direct usage is also supported::
+
+            config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", MyOutput)
+        """
+
+        def decorator(obj: Callable) -> Callable:
+            self.positioned_helpers.append(PositionedHelper(target=target, helper=obj, placement="after"))
+            return obj
+
+        if helper is None:
+            return decorator
+        return decorator(helper)
 
     def add_post_import_block(self, block: str):
         """

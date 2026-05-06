@@ -1145,10 +1145,35 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2246,12 @@
+@@ -1817,6 +2246,37 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
++
++
++# ======================================================================
++# [HELPERS AFTER] Qwen3_5CausalLMOutputWithPast
++# ======================================================================
++
++
++# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
++# ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
++@dataclass
++@auto_docstring(
++    custom_intro="""
++    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
++    """
++)
++class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
++    r"""
++    log_probs (`torch.FloatTensor`, *optional*):
++        Per-token log probabilities returned by VeOmni's fused loss path.
++    entropy (`torch.FloatTensor`, *optional*):
++        Per-token softmax entropy returned by VeOmni's fused loss path.
++    """
++
++    log_probs: torch.FloatTensor | None = None
++    entropy: torch.FloatTensor | None = None
 +
 +
 +# ======================================================================
@@ -1158,10 +1183,11 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1888,53 +2323,6 @@
+@@ -1887,54 +2347,7 @@
+         cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
-     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
+-    ) -> tuple | Qwen3_5CausalLMOutputWithPast:
 -        r"""
 -        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
 -            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -1209,10 +1235,11 @@
 -        ```
 -        """
 -
++    ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,16 +2338,34 @@
+@@ -1950,22 +2363,42 @@
          )
 
          hidden_states = outputs[0]
@@ -1248,21 +1275,19 @@
 +        else:
 +            logits = self.lm_head(hidden_states)
 +
-+        output = Qwen3_5CausalLMOutputWithPast(
++        return Qwen3_5CausalLMOutputWithLogProbs(
              loss=loss,
              logits=logits,
              past_key_values=outputs.past_key_values,
-@@ -1967,6 +2373,9 @@
+             hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
++            log_probs=log_probs,
++            entropy=entropy,
          )
-+        output.log_probs = log_probs
-+        output.entropy = entropy
-+        return output
 
      def prepare_inputs_for_generation(
-         self,
-@@ -2192,6 +2601,13 @@
+@@ -2192,6 +2625,13 @@
 
          return input_ids, model_kwargs
 

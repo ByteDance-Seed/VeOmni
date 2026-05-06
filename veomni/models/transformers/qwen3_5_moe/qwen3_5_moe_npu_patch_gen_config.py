@@ -42,6 +42,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
 )
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     PatchedQwen3_5MoeExperts,
+    Qwen3_5MoeCausalLMOutputWithLogProbs,
     qwen3_5_moe_decoder_layer_forward_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -74,10 +75,10 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
-# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
-# from the GPU config) can return per-token log-probs in the unified output
-# dataclass via dynamic attribute set.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+# Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
+# (re-used from the GPU config) can return per-token log-probs in the unified
+# MoE output dataclass.
+config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -209,6 +210,9 @@ config.override_method(
         "CPU-GPU sync avoidance via pre-computed metadata."
     ),
 )
+
+
+config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", Qwen3_5MoeCausalLMOutputWithLogProbs)
 
 
 config.add_post_import_block("""

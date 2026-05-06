@@ -27,7 +27,12 @@ import transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe as hf_qwen3vlmoe
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    Qwen3VLMoeCausalLMOutputWithPast,
+    Qwen3VLMoeForConditionalGeneration as _Qwen3VLMoeForConditionalGeneration,
+)
+from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+    Qwen3VLMoeModel as _Qwen3VLMoeModel,
+)
+from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextSparseMoeBlock,
     Qwen3VLMoeVisionAttention,
@@ -35,12 +40,6 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     apply_rotary_pos_emb_vision,
     eager_attention_forward,
     load_balancing_loss_func,
-)
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    Qwen3VLMoeForConditionalGeneration as _Qwen3VLMoeForConditionalGeneration,
-)
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    Qwen3VLMoeModel as _Qwen3VLMoeModel,
 )
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeTextExperts as _Qwen3VLMoeTextExperts,
@@ -62,6 +61,7 @@ from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from ....utils.device import is_torch_npu_available
+from ....utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -782,7 +782,7 @@ class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen3VLMoeCausalLMOutputWithPast]:
+    ) -> Union[tuple, Qwen3VLMoeCausalLMOutputWithLogProbs]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -885,16 +885,15 @@ class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
                     loss.device
                 )  # make sure to reside in the same device
 
-        output = Qwen3VLMoeCausalLMOutputWithPast(
+        return Qwen3VLMoeCausalLMOutputWithLogProbs(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
 
 def apply_veomni_qwen3vlmoe_patch():

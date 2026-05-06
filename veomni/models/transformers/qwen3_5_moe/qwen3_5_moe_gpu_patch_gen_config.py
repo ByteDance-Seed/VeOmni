@@ -25,6 +25,7 @@ Patches applied:
 """
 
 from copy import copy
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 
@@ -35,7 +36,10 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPooling, MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPooling,
+    MoeModelOutputWithPast,
+)
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
     Qwen3_5MoeDynamicCache,
@@ -46,7 +50,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs, auto_docstring, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
@@ -61,6 +65,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 logger = logging.get_logger(__name__)
@@ -85,9 +90,9 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
-# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can return
-# per-token log-probs in the unified output dataclass via dynamic attribute set.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+# Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward`` can return
+# per-token log-probs in the unified MoE output dataclass.
+config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -450,6 +455,27 @@ def qwen3_5_moe_model_forward_patched(
     )
 
 
+# Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+@config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast")
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Qwen3_5Moe causal language model outputs extended with per-token log-prob fields.
+    """
+)
+class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
+    r"""
+    log_probs (`torch.FloatTensor`, *optional*):
+        Per-token log probabilities returned by VeOmni's fused loss path.
+    entropy (`torch.FloatTensor`, *optional*):
+        Per-token softmax entropy returned by VeOmni's fused loss path.
+    """
+
+    log_probs: torch.FloatTensor | None = None
+    entropy: torch.FloatTensor | None = None
+
+
 @config.add_helper
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
@@ -634,7 +660,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> MoeCausalLMOutputWithPast:
+) -> MoeCausalLMOutputWithLogProbs:
     r"""
     labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
         Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -726,7 +752,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
         if labels is not None:
             loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
 
-    output = MoeCausalLMOutputWithPast(
+    return MoeCausalLMOutputWithLogProbs(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
@@ -734,10 +760,9 @@ def qwen3_5_moe_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output
 
 
 # ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
@@ -762,7 +787,7 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
+) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -828,19 +853,18 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         if labels is not None:
             loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
 
-    output = Qwen3_5MoeCausalLMOutputWithPast(
+    return Qwen3_5MoeCausalLMOutputWithLogProbs(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
-        rope_deltas=outputs.rope_deltas,
         router_logits=outputs.router_logits,
+        rope_deltas=outputs.rope_deltas,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output
 
 
 # ── Expert parallel plan ─────────────────────────────────────────────────────

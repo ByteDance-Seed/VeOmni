@@ -116,6 +116,7 @@ from veomni.ops import fused_moe_forward
 # are inference-only speech paths excluded from the generated file).
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
@@ -2307,7 +2308,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         cache_position=None,
         video_second_per_grid=None,
         **kwargs,
-    ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithPast:
+    ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
         )
@@ -2616,7 +2617,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-        output = Qwen3OmniMoeThinkerCausalLMOutputWithPast(
+        return Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             aux_loss=aux_loss,
@@ -2625,10 +2626,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             past_key_values=outputs.past_key_values,
             router_logits=getattr(outputs, "router_logits", None),
             rope_deltas=self.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
-        output.log_probs = log_probs
-        output.entropy = entropy
-        return output
 
     def prepare_inputs_for_generation(
         self,
@@ -3064,7 +3064,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
     def forward(
         self,
         **kwargs,
-    ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithPast:
+    ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
         return self.thinker(**kwargs)
 
     # ================================================================

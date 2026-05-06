@@ -22,7 +22,6 @@ from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoePreTrained
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import (
-    MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
 )
 from transformers.processing_utils import Unpack
@@ -33,6 +32,7 @@ from transformers.utils import (
 from ....ops import fused_moe_forward
 from ....ops.dispatch import OpSlot
 from ....utils import logging
+from ....utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 logger = logging.get_logger(__name__)
@@ -177,7 +177,7 @@ def qwen3_moe_forcausal_lm_forward(
     cache_position: Optional[torch.LongTensor] = None,
     logits_to_keep: Union[int, torch.Tensor] = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> MoeCausalLMOutputWithPast:
+) -> MoeCausalLMOutputWithLogProbs:
     r"""
     labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
         Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -251,7 +251,7 @@ def qwen3_moe_forcausal_lm_forward(
         if labels is not None:
             loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-    output = MoeCausalLMOutputWithPast(
+    return MoeCausalLMOutputWithLogProbs(
         loss=loss,
         aux_loss=aux_loss,
         logits=logits,
@@ -259,10 +259,9 @@ def qwen3_moe_forcausal_lm_forward(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
+        log_probs=log_probs,
+        entropy=entropy,
     )
-    output.log_probs = log_probs
-    output.entropy = entropy
-    return output
 
 
 # ================================================================
