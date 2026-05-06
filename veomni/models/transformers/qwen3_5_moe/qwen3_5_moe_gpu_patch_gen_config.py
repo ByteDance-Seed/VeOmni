@@ -263,7 +263,6 @@ def qwen3_5_moe_model_forward_patched(
     pixel_values_videos: torch.FloatTensor | None = None,
     image_grid_thw: torch.LongTensor | None = None,
     video_grid_thw: torch.LongTensor | None = None,
-    mm_token_type_ids: torch.IntTensor | None = None,
     cache_position: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5MoeModelOutputWithPast:
@@ -272,8 +271,6 @@ def qwen3_5_moe_model_forward_patched(
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
         The temporal, height and width of feature shape of each video in LLM.
-    mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
-        Token type IDs for multimodal inputs.
     """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -420,7 +417,6 @@ def qwen3_5_moe_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            mm_token_type_ids=mm_token_type_ids,
         )
     else:
         # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---

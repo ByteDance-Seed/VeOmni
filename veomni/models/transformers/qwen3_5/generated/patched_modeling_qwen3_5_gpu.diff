@@ -909,27 +909,10 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1644,6 +1922,7 @@
-         pixel_values_videos: torch.FloatTensor | None = None,
-         image_grid_thw: torch.LongTensor | None = None,
-         video_grid_thw: torch.LongTensor | None = None,
-+        mm_token_type_ids: torch.IntTensor | None = None,
-         cache_position: torch.LongTensor | None = None,
-         **kwargs: Unpack[TransformersKwargs],
-     ) -> tuple | Qwen3_5ModelOutputWithPast:
-@@ -1652,34 +1931,144 @@
-             The temporal, height and width of feature shape of each image in LLM.
-         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-             The temporal, height and width of feature shape of each video in LLM.
-+        mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
-+            Token type IDs for multimodal inputs.
-         """
-         if (input_ids is None) ^ (inputs_embeds is not None):
-             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
+@@ -1659,27 +1937,135 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
-+
+
 +        # --- Patch.1: Support Ulysses SP by using pre-computed image and video masks ---
 +        # We use pre-computed masks to ensure all ranks have a consistent view of multimodal
 +        # placeholder positions. If masks are not provided, we reconstruct the full sequence
@@ -964,7 +947,7 @@
 +                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
 +            )
 +        # --- Patch.1 ---
-
++
          if pixel_values is not None:
              image_outputs: BaseModelOutputWithPooling = self.get_image_features(
                  pixel_values, image_grid_thw, return_dict=True
@@ -1070,11 +1053,9 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1689,7 +2078,20 @@
-                 inputs_embeds=inputs_embeds,
+@@ -1690,6 +2076,18 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
-+                mm_token_type_ids=mm_token_type_ids,
              )
 +        else:
 +            # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
@@ -1091,7 +1072,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1705,6 +2107,12 @@
+@@ -1705,6 +2103,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1104,7 +1085,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2183,36 @@
+@@ -1775,15 +2179,36 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1145,7 +1126,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2246,12 @@
+@@ -1817,6 +2242,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1158,7 +1139,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1888,53 +2323,6 @@
+@@ -1888,53 +2319,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5CausalLMOutputWithPast:
@@ -1212,7 +1193,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,16 +2338,34 @@
+@@ -1950,16 +2334,34 @@
          )
 
          hidden_states = outputs[0]
@@ -1252,7 +1233,7 @@
              loss=loss,
              logits=logits,
              past_key_values=outputs.past_key_values,
-@@ -1967,6 +2373,9 @@
+@@ -1967,6 +2369,9 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
          )
@@ -1262,7 +1243,7 @@
 
      def prepare_inputs_for_generation(
          self,
-@@ -2192,6 +2601,13 @@
+@@ -2192,6 +2597,13 @@
 
          return input_ids, model_kwargs
 
