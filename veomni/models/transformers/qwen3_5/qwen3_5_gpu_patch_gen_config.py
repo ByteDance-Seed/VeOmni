@@ -24,9 +24,11 @@ Language-model focused patches from qwen3_next example:
 """
 
 from copy import copy
-from functools import partial
+from functools import lru_cache, partial
 from types import SimpleNamespace
+from typing import Callable
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -34,6 +36,7 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, is_flash_attention_requested
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Config,
@@ -42,6 +45,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
     apply_mask_to_padding_states,
+    apply_rotary_pos_emb_vision,
+    eager_attention_forward,
     torch_chunk_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack
@@ -123,6 +128,46 @@ config.add_post_import_block(
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
+
+# Imports surfaced into the generated file for the cached rot_pos_ids helper:
+# `np` for the numpy-based pos-id builder, `lru_cache` for amortizing repeated
+# (h, w) tiles. (`Callable`, used by the patched VisionAttention forward, is
+# already imported by the upstream HF modeling module.)
+config.add_post_import_block(
+    """
+    import numpy as np
+    from functools import lru_cache
+    """
+)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Module-level helper: cached vision rotary pos-id builder
+# Adapted from vllm's qwen3_vl optimization. Keyed on (h, w, merge_size) so a
+# batch with repeated tile shapes (very common for video frames at the same
+# resolution) hits the cache instead of recomputing the numpy reshape/stack
+# per frame. Mirrors the helper qwen3_vl uses.
+# ────────────────────────────────────────────────────────────────────────────
+@config.add_helper
+@lru_cache(maxsize=1024)
+def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+    if isinstance(h, torch.Tensor):
+        h = int(h.item())
+    if isinstance(w, torch.Tensor):
+        w = int(w.item())
+    if isinstance(spatial_merge_size, torch.Tensor):
+        spatial_merge_size = int(spatial_merge_size.item())
+    hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+    h_div = h // spatial_merge_size
+    w_div = w // spatial_merge_size
+    hpos_ids = hpos_ids.reshape(h_div, spatial_merge_size, w_div, spatial_merge_size)
+    hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+    wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+    wpos_ids = wpos_ids.reshape(h_div, spatial_merge_size, w_div, spatial_merge_size)
+    wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+    return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
 
 # Dummy definitions for names that exist in the generated file's scope but not here.
@@ -576,6 +621,147 @@ def qwen3_5_model_get_placeholder_mask(self, input_ids: torch.LongTensor, **kwar
 
 
 @config.override_method(
+    "Qwen3_5VisionAttention.forward",
+    description="Use precomputed max_seqlen passed from outer forward to hoist CPU-GPU sync out of the layer loop",
+)
+def qwen3_5_vision_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    # Modification: precomputed max_seqlen from outer forward.
+    max_seqlen: int,
+    rotary_pos_emb: torch.Tensor | None = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    seq_length = hidden_states.shape[0]
+    query_states, key_states, value_states = (
+        self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+    )
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+    query_states = query_states.transpose(0, 1).unsqueeze(0)
+    key_states = key_states.transpose(0, 1).unsqueeze(0)
+    value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+
+    if is_flash_attention_requested(self.config):
+        # Modification: max_seqlen comes in as an int from the outer forward,
+        # so the `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync that
+        # upstream did per layer is hoisted out and amortized once per ViT call.
+        attn_output, _ = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
+    else:
+        # Other implementations: process each chunk separately. Identical to
+        # upstream — max_seqlen is unused here, the split-and-loop path
+        # doesn't need it.
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
+        attn_outputs = [
+            attention_interface(
+                self,
+                q,
+                k,
+                v,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )[0]
+            for q, k, v in zip(*splits)
+        ]
+        attn_output = torch.cat(attn_outputs, dim=1)
+
+    attn_output = attn_output.reshape(seq_length, -1).contiguous()
+    attn_output = self.proj(attn_output)
+    return attn_output
+
+
+@config.override_method(
+    "Qwen3_5VisionBlock.forward",
+    description="Propagate precomputed max_seqlen to attention to avoid per-layer CPU-GPU sync",
+)
+def qwen3_5_vision_block_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    # Modification: thread precomputed max_seqlen through to attention.
+    max_seqlen: int,
+    rotary_pos_emb: torch.Tensor | None = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    hidden_states = hidden_states + self.attn(
+        self.norm1(hidden_states),
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        rotary_pos_emb=rotary_pos_emb,
+        position_embeddings=position_embeddings,
+        **kwargs,
+    )
+    hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+    return hidden_states
+
+
+@config.override_method(
+    "Qwen3_5VisionModel.rot_pos_emb",
+    description="Use lru_cached rot_pos_ids helper (vllm-style) to avoid per-image Python loops on repeated (h, w) tiles",
+)
+def qwen3_5_vision_rot_pos_emb_patched(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    # Modification: replace the upstream tensor-arithmetic builder with a
+    # cached numpy helper keyed on (h, w, merge_size). Repeated tile shapes
+    # (e.g. all video frames at the same resolution) hit the cache.
+    merge_size = self.spatial_merge_size
+
+    # Modification: materialize grid_thw to a list of Python ints up front.
+    # Iterating the tensor directly yields fresh 0-d tensors per row whose
+    # `__hash__` is `id()`-based, so the @lru_cache on rot_pos_ids would
+    # *never* hit (each call gets a new tensor object as the key). One
+    # `.tolist()` does a single host sync, which is cheaper than the
+    # per-frame `.item()` conversions inside the helper and unblocks the
+    # cache for the common video case (many frames at the same resolution).
+    grid_thw_list = grid_thw.tolist()
+
+    max_hw = max(max(h, w) for _, h, w in grid_thw_list)
+    freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+    device = freq_table.device
+
+    total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
+    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+    offset = 0
+    for num_frames, height, width in grid_thw_list:
+        coords = rot_pos_ids(height, width, merge_size).to(device)  # noqa: F821 — defined via add_helper
+        if num_frames > 1:
+            coords = coords.repeat(num_frames, 1)
+        num_tokens = coords.shape[0]
+        pos_ids[offset : offset + num_tokens] = coords
+        offset += num_tokens
+
+    embeddings = freq_table[pos_ids]
+    embeddings = embeddings.flatten(1)
+    return embeddings
+
+
+@config.override_method(
     "Qwen3_5VisionModel.fast_pos_embed_interpolate",
     description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
 )
@@ -734,10 +920,22 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
             cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
         # --- Patch.4 ---
 
+    # --- Patch.5: precompute max_seqlen once to amortize CPU-GPU sync ---
+    # Upstream Qwen3_5VisionAttention.forward computes
+    # `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` per layer (depth × .item()
+    # syncs for FA2's max_length_q/k). Hoisting it here means a single sync
+    # for the whole ViT, threaded into every block via the patched
+    # Qwen3_5VisionAttention.forward / Qwen3_5VisionBlock.forward signatures.
+    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+    # --- Patch.5 ---
+
     for blk in self.blocks:
         hidden_states = blk(
             hidden_states,
             cu_seqlens=cu_seqlens,
+            # --- Patch.5 ---
+            max_seqlen=max_seqlen,
+            # --- Patch.5 ---
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -752,35 +950,49 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
 
 @config.override_method(
     "Qwen3_5VisionModel.dummy_forward",
-    description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
+    description="Provide dummy vision forward for FSDP path with config-derived SP-aware shape",
 )
 def qwen3_5_vision_model_dummy_forward(self):
     """
     # Run a fake ViT forward so every FSDP rank touches the vision tower.
     # This prevents reduce-scatter hangs when some ranks have no real images/videos.
     """
-    if get_parallel_state().sp_enabled:
-        sp_size = get_parallel_state().sp_size
+    # Modification: derive dummy shape from the vision config (patch_size /
+    # temporal_patch_size / in_channels / spatial_merge_size) instead of
+    # hard-coded 16-patch / 3*2*16*16 constants, so model variants don't
+    # silently break. Mirrors the pattern in qwen3_vl's dummy_forward.
+    patch_size = self.config.patch_size
+    temporal_patch_size = self.config.temporal_patch_size
+    in_channels = self.config.in_channels
+    merge_size = self.spatial_merge_size
 
-        # Fake patch sequence for one local rank:
-        # 16 patch tokens, each token flattened from:
-        #   3 channels * 2 temporal patches * 16 * 16 spatial patch
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-        # grid_thw describes the *global* pre-sharded vision grid, not the local shard.
-        # Here:
-        #   T = 1
-        #   H = 4 * sp_size
-        #   W = 4
-        # so total global patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
-        grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
-        dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+    t = 1
+    h_base = 2 * merge_size
+    w = 2 * merge_size
+
+    # Modification: grid_thw describes the FULL un-sharded vision grid; under
+    # SP we scale H by sp_size so that after sp_pad_and_slice the per-rank
+    # shape lines up with hidden_states (which is SP-pre-sliced below).
+    if get_parallel_state().sp_enabled:
+        h = h_base * get_parallel_state().sp_size
     else:
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-        # Non-SP case: a minimal valid 4x4 patch grid.
-        # Total patch tokens = 1 * 4 * 4 = 16.
-        grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
-        dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
-    return self(**dummy_data)
+        h = h_base
+
+    num_patches = t * h * w
+    pixel_row_size = in_channels * temporal_patch_size * patch_size * patch_size
+    pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=self.dtype, device=self.device)
+    grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
+
+    # Modification: under SP, MainCollator slices real pixel_values per rank
+    # (DataCollateInfo pack_dim=0, sp_slice=True, sp_pad_value=0,
+    # sp_pad_scale=4). The dummy path must do the same — otherwise
+    # hidden_states (after patch_embed of full pixel_values) keeps the
+    # global size while pos_embeds gets sp_pad_and_slice'd inside forward,
+    # and `hidden_states + pos_embeds` mismatches at dim 0 by sp_size.
+    if get_parallel_state().sp_enabled:
+        pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
+
+    return self(hidden_states=pixel_values, grid_thw=grid_thw)
 
 
 @config.override_method(

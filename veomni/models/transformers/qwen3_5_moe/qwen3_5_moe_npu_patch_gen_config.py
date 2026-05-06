@@ -29,9 +29,13 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_vision_attention_forward_patched,
+    qwen3_5_vision_block_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_rot_pos_emb_patched,
+    rot_pos_ids,
 )
 from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
     apply_rotary_pos_emb,
@@ -114,6 +118,19 @@ config.add_post_import_block(
     """
 )
 
+# Imports needed by the rot_pos_ids helper reused from the qwen3_5 GPU config.
+config.add_post_import_block(
+    """
+    import numpy as np
+    from functools import lru_cache
+    """
+)
+
+# Reuse the lru_cached rot_pos_ids helper defined in the qwen3_5 GPU config so
+# the patched VisionModel.rot_pos_emb finds it at module scope in the
+# generated MoE NPU file.
+config.add_helper(rot_pos_ids)
+
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
@@ -182,6 +199,24 @@ config.override_method(
 )
 
 config.override_method(
+    "Qwen3_5MoeVisionAttention.forward",
+    replacement=qwen3_5_vision_attention_forward_patched,
+    description="Use precomputed max_seqlen passed from outer forward to hoist CPU-GPU sync out of the layer loop",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionBlock.forward",
+    replacement=qwen3_5_vision_block_forward_patched,
+    description="Propagate precomputed max_seqlen to attention to avoid per-layer CPU-GPU sync",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_rot_pos_emb_patched,
+    description="Use lru_cached rot_pos_ids helper (vllm-style) to avoid per-image Python loops on repeated (h, w) tiles",
+)
+
+config.override_method(
     "Qwen3_5MoeVisionModel.fast_pos_embed_interpolate",
     replacement=qwen3_5_vision_model_fast_pos_embed_interpolate,
     description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
@@ -196,7 +231,7 @@ config.override_method(
 config.override_method(
     "Qwen3_5MoeVisionModel.dummy_forward",
     replacement=qwen3_5_vision_model_dummy_forward,
-    description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
+    description="Provide dummy vision forward for FSDP path with config-derived SP-aware shape",
 )
 
 
