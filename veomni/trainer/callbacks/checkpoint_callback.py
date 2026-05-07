@@ -181,8 +181,8 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             self.trainer.checkpointer.save_future.result()
 
         if stage == "train_end":
-            del self.trainer.optimizer
-            del self.trainer.lr_scheduler
+            self.trainer.optimizer = None
+            self.trainer.lr_scheduler = None
 
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         save_hf_safetensor(
@@ -218,8 +218,8 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
             self.trainer.checkpointer.save_future.result()
 
         if stage == "train_end":
-            del self.trainer.optimizer
-            del self.trainer.lr_scheduler
+            self.trainer.optimizer = None
+            self.trainer.lr_scheduler = None
 
         lora_save_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
         save_lora_adapter_with_dcp(

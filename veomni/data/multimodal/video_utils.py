@@ -808,6 +808,12 @@ def save_video_tensors_to_file(
                 ],
                 check=True,
             )
-        finally:
             os.remove(tmp_video_path)
-            os.remove(tmp_audio_path)
+        except Exception:
+            # Restore the original video so it is not lost on ffmpeg failure.
+            if os.path.exists(tmp_video_path):
+                os.rename(tmp_video_path, output_path)
+            raise
+        finally:
+            if os.path.exists(tmp_audio_path):
+                os.remove(tmp_audio_path)

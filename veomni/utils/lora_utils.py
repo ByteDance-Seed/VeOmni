@@ -141,8 +141,8 @@ def patch_fsdp2_lora_weight_loading(model: torch.nn.Module):
 
     _lora_layers_initialized: set = set()
 
-    def patched_init_parameter(module, name, _orig=orig_init, _initialized=_lora_layers_initialized):
-        if not any(piece.startswith("lora_") for piece in name.split(".")):
+    def patched_init_parameter(module, name, _orig=orig_init, _initialized=_lora_layers_initialized, _model=model):
+        if module is not _model or not any(piece.startswith("lora_") for piece in name.split(".")):
             _orig(module, name)
             return
         pieces = name.split(".")

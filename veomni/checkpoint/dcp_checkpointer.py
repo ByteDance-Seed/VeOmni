@@ -247,7 +247,7 @@ class OptimizerState(Stateful):
                     if val.ndim == 0:
                         placeholder[key] = torch.zeros_like(val)
                     else:
-                        placeholder[key] = torch.zeros_like(param.data)
+                        placeholder[key] = torch.zeros_like(param.data, dtype=val.dtype, device=val.device)
                 elif isinstance(val, (int, float)):
                     placeholder[key] = type(val)(0)
                 else:
