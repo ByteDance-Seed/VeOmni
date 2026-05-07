@@ -48,6 +48,16 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "qwen25_omni": {"rotary_pos_emb_implementation": "eager"},
 }
 
+# GPU per-model overrides for models whose patched ops disable a default
+# backend. Wan's ``rope_apply(x, **kwargs)`` signature is incompatible with
+# the registry-default Liger RoPE — ``device_patch.py`` marks ``liger_kernel``
+# as explicitly disabled, so any non-eager value would raise. Wan training
+# YAMLs pin ``rotary_pos_emb_implementation: eager``, but e2e tests build CLI
+# args directly (no training YAML), so we pin here as well.
+_GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+}
+
 
 def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
     merged = dict(_NPU_OPS_DEFAULTS)
@@ -59,12 +69,14 @@ def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
 def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
     """Return ``--model.ops_implementation.X=Y`` flags for the active hardware.
 
-    On GPU returns ``[]`` — the dataclass defaults are already optimal.
-    On NPU returns the NPU-supported backend per op, with per-model eager
-    fallbacks for ops without an NPU kernel for that specific model.
+    On GPU returns per-model overrides for models whose patched ops disable a
+    default backend (currently Wan); empty otherwise — dataclass defaults are
+    GPU-optimal. On NPU returns the NPU-supported backend per op, with
+    per-model eager fallbacks for ops without an NPU kernel for that model.
     """
     if not is_torch_npu_available():
-        return []
+        overrides = _GPU_PER_MODEL_OVERRIDES.get(model_name, {}) if model_name else {}
+        return [f"--model.ops_implementation.{k}={v}" for k, v in overrides.items()]
     return [f"--model.ops_implementation.{k}={v}" for k, v in _npu_overrides(model_name).items()]
 
 
