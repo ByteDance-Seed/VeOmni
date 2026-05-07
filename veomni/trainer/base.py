@@ -310,7 +310,7 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self):
+    def _build_parallelized_model(self, **kwargs):
         args: VeOmniArguments = self.args
 
         cpu_load_param_name = None
@@ -335,6 +335,7 @@ class BaseTrainer(Stateful, ABC):
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            **kwargs,
         )
         self.model.train()
 

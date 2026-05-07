@@ -207,7 +207,7 @@ class DiTTrainer:
         self._build_dataloader()
 
         if self.training_task != "offline_embedding":
-            self.base._build_parallelized_model()
+            self._build_parallelized_model()
             self.base._build_optimizer()
             self.base._build_lr_scheduler()
             self.base._build_training_context()
@@ -301,9 +301,7 @@ class DiTTrainer:
         self.condition_model.requires_grad_(False)
 
         if self.training_task == "offline_training" or self.training_task == "online_training":
-            if not bool(lora_config):
-                self.base.lora = False
-            else:
+            if bool(lora_config):
                 lora_adapter_path = lora_config.get("lora_adapter", None)
                 if lora_adapter_path is not None:
                     logger.info_rank0(f"Load lora_adapter from {lora_adapter_path}.")
@@ -333,13 +331,22 @@ class DiTTrainer:
                     self.base.model = get_peft_model(self.base.model, lora_config)
 
                 self.base.model.print_trainable_parameters()
-                self.base.lora = True
 
                 if args.train.init_device == "meta":
                     patch_fsdp_lora_weight_loading(self.base.model)
 
             pretty_print_trainable_parameters(self.base.model)
             helper.print_device_mem_info("VRAM usage after building model")
+
+    def _build_parallelized_model(self):
+        """Override base to inject adapter_path into FSDP2 parallelization kwargs."""
+        parallel_kwargs = {}
+        args: VeOmniDiTArguments = self.base.args
+        if bool(args.model.lora_config):
+            lora_adapter_path = args.model.lora_config.get("lora_adapter", None)
+            if lora_adapter_path is not None:
+                parallel_kwargs["adapter_path"] = lora_adapter_path
+        self.base._build_parallelized_model(**parallel_kwargs)
 
     def _build_model_assets(self):
         if self.training_task == "offline_training" or self.training_task == "online_training":

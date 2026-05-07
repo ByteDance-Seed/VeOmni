@@ -577,6 +577,28 @@ def parallelize_model_fsdp2(
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
             load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
 
+    adapter_path = kwargs.pop("adapter_path", None)
+    if adapter_path is not None:
+        from torch.distributed.tensor import distribute_tensor
+
+        from ..models.module_utils import (
+            load_model_lora_weights,
+            rank0_load_and_broadcast_adapter_weights,
+        )
+
+        logger.info_rank0(f"Loading adapter weights from {adapter_path}...")
+        if kwargs.get("broadcast_model_weights_from_rank0"):
+            logger.info_rank0("Loading adapter weights from disk on rank0 then broadcasting to other ranks...")
+            rank0_load_and_broadcast_adapter_weights(
+                model,
+                adapter_path,
+                get_device_type(),
+                dtensor_factory=distribute_tensor,
+            )
+        else:
+            logger.info_rank0("Every rank would read adapter weights from disk...")
+            load_model_lora_weights(model, adapter_path, get_device_type(), dtensor_factory=distribute_tensor)
+
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
 
