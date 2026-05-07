@@ -17,7 +17,6 @@ import os
 import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
@@ -40,36 +39,12 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
+from ..utils.lora_utils import patch_fsdp_lora_weight_loading
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
 
 
 logger = helper.create_logger(__name__)
-
-
-def patch_parallel_load_safetensors(model: torch.nn.Module):
-    def patch_parallel_load_safetensors(weights_path, func, model: torch.nn.Module):
-        shard_states = func(weights_path)
-        parameter_name = next(model.named_parameters())[0]
-        if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
-            shard_states = {"base_model.model." + k: v for k, v in shard_states.items()}
-        for fqn, module in model.named_modules():
-            fqn = fqn + ("." if fqn else "")
-            if hasattr(module, "base_layer"):  # using lora peft will insert "base_layer"
-                for pname, _ in module.base_layer.named_parameters():
-                    old_name = fqn + pname
-                    if old_name in shard_states:
-                        wrap_name = fqn + "base_layer." + pname
-                        shard_states[wrap_name] = shard_states.pop(old_name)
-        return shard_states
-
-    from veomni.distributed import torch_parallelize
-
-    torch_parallelize.parallel_load_safetensors = partial(
-        patch_parallel_load_safetensors,
-        func=torch_parallelize.parallel_load_safetensors,
-        model=model,
-    )
 
 
 class OfflineEmbeddingSaver:
@@ -361,7 +336,7 @@ class DiTTrainer:
                 self.base.lora = True
 
                 if args.train.init_device == "meta":
-                    patch_parallel_load_safetensors(self.base.model)
+                    patch_fsdp_lora_weight_loading(self.base.model)
 
             pretty_print_trainable_parameters(self.base.model)
             helper.print_device_mem_info("VRAM usage after building model")
