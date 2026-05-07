@@ -164,19 +164,53 @@ def patch_fsdp2_lora_weight_loading(model: torch.nn.Module):
 
 
 def patch_fsdp1_lora_weight_loading(model: torch.nn.Module):
-    def patch_parallel_load_safetensors(weights_path, func, model: torch.nn.Module):
-        shard_states = func(weights_path)
+    def patch_parallel_load_safetensors(weights_path, func, model: torch.nn.Module, **kwargs):
+        import math
+
+        import torch.distributed as dist
+
+        shard_states = func(weights_path, **kwargs)
         parameter_name = next(model.named_parameters())[0]
         if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
             shard_states = {"base_model.model." + k: v for k, v in shard_states.items()}
         for fqn, module in model.named_modules():
-            fqn = fqn + ("." if fqn else "")
+            fqn_dot = fqn + ("." if fqn else "")
             if hasattr(module, "base_layer"):  # using lora peft will insert "base_layer"
                 for pname, _ in module.base_layer.named_parameters():
-                    old_name = fqn + pname
+                    old_name = fqn_dot + pname
                     if old_name in shard_states:
-                        wrap_name = fqn + "base_layer." + pname
+                        wrap_name = fqn_dot + "base_layer." + pname
                         shard_states[wrap_name] = shard_states.pop(old_name)
+
+            # Pre-fill lora_A (kaiming) and lora_B (zeros) for LoRA layers whose
+            # weights are not already present in shard_states (i.e. scratch training).
+            # This mirrors PEFT's standard initialisation and avoids the fallback
+            # random init inside parallel_init_fsdp_fn.
+            #
+            # IMPORTANT: parallel_load_safetensors uses a sharded-ownership scheme
+            # where only the owning rank stores the actual tensor and all others store
+            # the owner's rank index. We assign rank 0 as owner for all LoRA init
+            # tensors so that create_and_sync_state uses a consistent broadcast src.
+            for adapter_name, lora_a_linear in getattr(module, "lora_A", {}).items():
+                lora_b_linear = module.lora_B[adapter_name]
+                a_key = fqn_dot + f"lora_A.{adapter_name}.weight"
+                b_key = fqn_dot + f"lora_B.{adapter_name}.weight"
+                if a_key not in shard_states:
+                    if dist.get_rank() == 0:
+                        a_w = lora_a_linear.weight
+                        t = torch.empty(a_w.shape, dtype=a_w.dtype if not a_w.is_meta else torch.float32)
+                        nn.init.kaiming_uniform_(t, a=math.sqrt(5))
+                        shard_states[a_key] = t
+                    else:
+                        shard_states[a_key] = 0
+                if b_key not in shard_states:
+                    if dist.get_rank() == 0:
+                        b_w = lora_b_linear.weight
+                        shard_states[b_key] = torch.zeros(
+                            b_w.shape, dtype=b_w.dtype if not b_w.is_meta else torch.float32
+                        )
+                    else:
+                        shard_states[b_key] = 0
         return shard_states
 
     from functools import partial
