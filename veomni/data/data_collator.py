@@ -105,6 +105,7 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "pixel_values_videos": DataCollateInfo(0, True, 0, 4),
     "image_mask": DataCollateInfo(-1, False, 0, 1),
     "video_mask": DataCollateInfo(-1, False, 0, 1),
+    "mm_token_type_ids": DataCollateInfo(-1, True, 0, 1),
     "image_grid_hw": DataCollateInfo(0, False, None, None),
     "image_grid_thw": DataCollateInfo(0, False, None, None),
     "video_grid_thw": DataCollateInfo(0, False, None, None),
@@ -199,6 +200,24 @@ class PackingCollator(DataCollator):
         pad = torch.full(pad_shape, fill_value=pad_value, dtype=feature.dtype, device=feature.device)
         return torch.cat((feature, pad), dim=dim)
 
+    def _pad_position_ids_with_arange(self, feature: torch.Tensor, dim: int, pad_size: int) -> torch.Tensor:
+        """Pad position_ids with arange(pad_size) so the pad region collapses to
+        a single segment under add_flash_attention_kwargs_from_position_ids.
+
+        Constant-0 padding made every pad token its own length-1 segment, so
+        cu_seq_lens.shape[0] varied with pad_len; flash_qla's prepare_chunk_offsets
+        kernel keys its JIT cache on next_power_of_2(cu_seqlens.shape[0]-1), which
+        triggered repeated recompiles. With arange the pad region looks like
+        [0, 1, ..., pad_size-1] and only contributes one extra segment.
+        """
+        arange = torch.arange(pad_size, dtype=feature.dtype, device=feature.device)
+        view_shape = [1] * feature.dim()
+        view_shape[dim] = pad_size
+        pad_shape = list(feature.shape)
+        pad_shape[dim] = pad_size
+        pad = arange.view(view_shape).expand(pad_shape).contiguous()
+        return torch.cat((feature, pad), dim=dim)
+
     def pad_batch_to_length(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         seq_len = batch["input_ids"].shape[-1]
         assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
@@ -214,12 +233,19 @@ class PackingCollator(DataCollator):
 
         for key in keys_to_pad:
             if key in batch:
-                batch[key] = self.pad_feature_to_length(
-                    batch[key],
-                    dim=self.collate_infos[key].pack_dim,
-                    pad_value=self.collate_infos[key].sp_pad_value,
-                    pad_size=pad_len,
-                )
+                if key == "position_ids":
+                    batch[key] = self._pad_position_ids_with_arange(
+                        batch[key],
+                        dim=self.collate_infos[key].pack_dim,
+                        pad_size=pad_len,
+                    )
+                else:
+                    batch[key] = self.pad_feature_to_length(
+                        batch[key],
+                        dim=self.collate_infos[key].pack_dim,
+                        pad_value=self.collate_infos[key].sp_pad_value,
+                        pad_size=pad_len,
+                    )
         return batch
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
