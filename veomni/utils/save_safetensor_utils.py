@@ -251,6 +251,7 @@ def save_lora_adapter_with_dcp(
     3. Consolidate on rank 0 into ``adapter_model.bin`` and ``adapter_config.json``.
     """
     from peft import get_peft_model_state_dict
+
     synchronize()
     if dist.is_initialized():
         dist.barrier()
