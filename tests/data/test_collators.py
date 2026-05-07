@@ -170,4 +170,61 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert out["max_length_k"] == exp_max_length
 
 
+def test_data_collator_mm_token_type_ids_pad_to_length_sp_disabled(monkeypatch, features_two_samples):
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU does not support this padding test yet.")
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 3, 4], dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([0, 1, 1], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 2], dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([0, 0], dtype=torch.long),
+        },
+    ]
+    collator = m.MainCollator(pad_to_length=pad_to_length)
+    out = collator(token_labels)
+
+    exp_mm_type = torch.tensor([[0, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.long)
+    assert "mm_token_type_ids" in out
+    assert out["mm_token_type_ids"].shape == out["input_ids"].shape
+    assert torch.equal(out["mm_token_type_ids"], exp_mm_type)
+
+
+def test_data_collator_mm_token_type_ids_pad_to_length_sp_enabled(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    sp_size = 2
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 3, 4], dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([0, 1, 1], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 2], dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([0, 0], dtype=torch.long),
+        },
+    ]
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=0))
+    out0 = m.MainCollator(pad_to_length=pad_to_length)(token_labels)
+    assert torch.equal(out0["mm_token_type_ids"], torch.tensor([[0, 1, 1, 0]], dtype=torch.long))
+    assert out0["mm_token_type_ids"].shape == out0["input_ids"].shape
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=1))
+    out1 = m.MainCollator(pad_to_length=pad_to_length)(token_labels)
+    assert torch.equal(out1["mm_token_type_ids"], torch.tensor([[0, 0, 0, 0]], dtype=torch.long))
+    assert out1["mm_token_type_ids"].shape == out1["input_ids"].shape
+
+
 # TODO: add omni data ci test
