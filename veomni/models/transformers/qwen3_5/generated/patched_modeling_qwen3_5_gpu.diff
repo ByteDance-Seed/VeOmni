@@ -1341,7 +1341,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2246,37 @@
+@@ -1817,6 +2324,37 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1379,7 +1379,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1887,54 +2347,7 @@
+@@ -1887,54 +2425,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1435,7 +1435,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,22 +2363,42 @@
+@@ -1950,22 +2441,42 @@
          )
 
          hidden_states = outputs[0]
@@ -1483,7 +1483,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2192,6 +2625,13 @@
+@@ -2192,6 +2703,13 @@
 
          return input_ids, model_kwargs
 
