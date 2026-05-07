@@ -50,7 +50,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, logging
+from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
@@ -59,6 +59,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
@@ -142,6 +143,12 @@ gather_heads_scatter_seq = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+
+# Mirror the GPU sentinel from qwen3_5_gpu_patch_gen_config: this config
+# registers Qwen3_5MoeVisionAttention.forward as the consumer, so the
+# pre-computed `vision_max_seqlen` int is safe to write. See Patch.5 in
+# qwen3_5_gpu_patch_gen_config.py for the full rationale.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 
 
 # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
@@ -246,6 +253,16 @@ config.override_method(
     "Qwen3_5MoeVisionModel.dummy_forward",
     replacement=qwen3_5_vision_model_dummy_forward,
     description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionAttention.forward",
+    replacement=qwen3_5_vision_attention_forward_patched,
+    description=(
+        "Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid "
+        "the per-block GPU->CPU sync that flash_attn_varlen_func incurs when "
+        "`max_length_q/k` are 0-D GPU tensors (FA's C++ binding `.item()`s them)."
+    ),
 )
 
 
@@ -457,15 +474,12 @@ def qwen3_5_moe_model_forward_patched(
 
 # Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+# See qwen3_5_gpu_patch_gen_config.py for why @auto_docstring is skipped.
 @config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast")
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Qwen3_5Moe causal language model outputs extended with per-token log-prob fields.
-    """
-)
 class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
-    r"""
+    """``Qwen3_5MoeCausalLMOutputWithPast`` extended with per-token log-prob fields.
+
     log_probs (`torch.FloatTensor`, *optional*):
         Per-token log probabilities returned by VeOmni's fused loss path.
     entropy (`torch.FloatTensor`, *optional*):
