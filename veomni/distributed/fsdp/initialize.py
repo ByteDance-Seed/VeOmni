@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import itertools
-import json
 import math
 import os
 from collections import defaultdict
@@ -22,9 +21,11 @@ from typing import Callable, Dict, Union
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import load_file
 from torch.distributed._tensor import Replicate, Shard
 
+from ...models.module_utils import _load_state_dict
 from ...utils import logging
 from ...utils.device import get_device_id
 from ...utils.fs import copy_to_local
@@ -52,10 +53,16 @@ def parallel_load_safetensors(
 
     safetensors2param = {}
     cpu_load_param_files = {}
-    index_file = os.path.join(filepath, "model.safetensors.index.json")
-    if os.path.exists(index_file):
-        index = json.load(open(index_file, "rb"))
-        for param_name, filename in index["weight_map"].items():
+
+    # Delegate checkpoint file discovery to _load_state_dict, which handles
+    # HF Transformers, Diffusers (sharded and non-sharded) naming conventions.
+    shard_iterators = _load_state_dict(filepath)
+    for iterator in shard_iterators:
+        shard_key = os.path.basename(iterator.filepath)
+        # Read only the tensor keys without loading tensor data.
+        with safe_open(iterator.filepath, framework="pt") as f:
+            keys = list(f.keys())
+        for param_name in keys:
             if specific_param_name is not None:
                 if param_name not in specific_param_name:
                     continue
@@ -64,18 +71,9 @@ def parallel_load_safetensors(
                     continue
             if cpu_load_param_name is not None:
                 if param_name in cpu_load_param_name:
-                    cpu_load_param_files[param_name] = filename
+                    cpu_load_param_files[param_name] = shard_key
                     continue
-
-            safetensors2param.setdefault(filename, []).append(param_name)
-    else:
-        # in this case, the model is small and we can load it all at once
-        param_file = os.path.join(filepath, "model.safetensors")
-        assert os.path.exists(param_file), f"Cannot find {param_file}"
-        states = load_file(param_file)
-        for param_name in states:
-            safetensors2param.setdefault("model.safetensors", []).append(param_name)
-        del states
+            safetensors2param.setdefault(shard_key, []).append(param_name)
 
     total_files = len(safetensors2param)
     ckpt_chunks = sorted(safetensors2param.keys())

@@ -224,7 +224,16 @@ class OptimizerState(Stateful):
             if id(param) in optim_param_ids:
                 fqn_to_param[fqn] = param
 
-        expected_fqns = set(fqn_to_param.keys())
+        # ``get_optimizer_state_dict`` (via ``_get_fqns``) strips the FSDP
+        # internal ``_fsdp_wrapped_module.`` prefix from every key, but
+        # ``model.named_parameters()`` on an FSDP1-wrapped model includes it.
+        # Normalize the expected FQNs to match the format used by the optimizer
+        # state dict, otherwise every param inside an FSDP unit would appear
+        # "missing" even though it has real optimizer state.
+        _FSDP_PREFIX = "_fsdp_wrapped_module."
+        normalized_fqn_to_param = {fqn.replace(_FSDP_PREFIX, ""): param for fqn, param in fqn_to_param.items()}
+
+        expected_fqns = set(normalized_fqn_to_param.keys())
         missing = expected_fqns - optim_fqns
 
         if not missing:
@@ -240,7 +249,7 @@ class OptimizerState(Stateful):
         template = sd["state"][template_fqn]
 
         for fqn in missing:
-            param = fqn_to_param[fqn]
+            param = normalized_fqn_to_param[fqn]
             placeholder = {}
             for key, val in template.items():
                 if isinstance(val, torch.Tensor):
