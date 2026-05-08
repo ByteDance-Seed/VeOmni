@@ -12,12 +12,11 @@ VeOmni is a versatile framework for both single- and multi-modal pre-training an
 ---
 
 ```{toctree}
-:maxdepth: 1
+:maxdepth: 2
 :caption: Get Started
 
-get_started/installation/install.md
-get_started/installation/install_ascend_x86.md
-get_started/installation/install_ascend_arm.md
+Installation <get_started/installation/index>
+Ascend Docker Use <get_started/AscendDockerUse/index>
 ```
 
 ```{toctree}
