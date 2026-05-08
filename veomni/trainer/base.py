@@ -27,6 +27,7 @@ Features:
 """
 
 import json
+import warnings
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict
@@ -247,8 +248,52 @@ class BaseTrainer(Stateful, ABC):
         )
         self.model_config = self.model.config
 
+    def _setup_lora(self):
+        """Wrap ``self.model`` with PEFT LoRA if ``lora_config`` is configured.
+
+        Handles two cases:
+        - Resume: ``lora_config["lora_adapter"]`` is set → use
+          ``PeftModel.from_pretrained`` so the PEFT config is read from disk.
+          Actual adapter *weights* are loaded later during parallelization.
+        - Scratch: only ``rank``, ``alpha``, ``lora_modules`` are set →
+          use ``get_peft_model``.
+        """
+        lora_config = self.args.model.lora_config
+        if not bool(lora_config):
+            return
+
+        lora_adapter_path = lora_config.get("lora_adapter", None)
+        if lora_adapter_path is not None:
+            logger.info_rank0(f"Wrapping model with PeftModel from {lora_adapter_path}.")
+            from peft import PeftModel
+
+            # When init_device="meta" the base model params are meta tensors.
+            # PeftModel.from_pretrained tries to copy loaded weights into the meta
+            # adapter params — a no-op that PyTorch warns about.
+            # Actual adapter weights are loaded later via adapter_path during parallelization.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="copying from a non-meta parameter")
+                self.model = PeftModel.from_pretrained(
+                    self.model,
+                    lora_adapter_path,
+                    is_trainable=lora_config.get("is_trainable", True),
+                )
+        else:
+            logger.info_rank0("Initialising LoRA adapter from scratch.")
+            from peft import LoraConfig, get_peft_model
+
+            peft_cfg = LoraConfig(
+                r=lora_config["rank"],
+                lora_alpha=lora_config["alpha"],
+                target_modules=lora_config["lora_modules"],
+            )
+            logger.info_rank0(f"LoraConfig: {peft_cfg.to_dict()}.")
+            self.model = get_peft_model(self.model, peft_cfg)
+
+        self.model.print_trainable_parameters()
+
     def _freeze_model_module(self):
-        # basically fully sft
+        self._setup_lora()
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
@@ -310,12 +355,16 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self, **kwargs):
+    def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
-
+        kwargs = {}
         cpu_load_param_name = None
         if hasattr(self.model, "get_parallel_plan"):
             cpu_load_param_name = getattr(self.model.get_parallel_plan(), "cpu_load_param_name", None)
+        kwargs["cpu_load_param_name"] = cpu_load_param_name
+        if bool(args.model.lora_config):
+            lora_adapter_path = args.model.lora_config.get("lora_adapter", None)
+            kwargs["adapter_path"] = lora_adapter_path
 
         # Parallelize model
         self.model = build_parallelize_model(
@@ -333,7 +382,6 @@ class BaseTrainer(Stateful, ABC):
             enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
-            cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
             **kwargs,
         )

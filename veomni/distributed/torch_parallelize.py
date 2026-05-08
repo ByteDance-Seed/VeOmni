@@ -190,37 +190,11 @@ def parallelize_model_fsdp1(
         shard_states = kwargs.get("shard_states", {})
         if weights_path:
             shard_states = parallel_load_safetensors(
-                weights_path, cpu_load_param_name=kwargs.get("cpu_load_param_name", None)
+                model,
+                weights_path,
+                cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+                adapter_path=kwargs.get("adapter_path", None),
             )
-
-        # When resuming a LoRA adapter with meta-init, merge the adapter weights into
-        # shard_states so that parallel_init_fsdp_fn can materialise lora_A / lora_B
-        # tensors from the checkpoint instead of falling back to random initialisation.
-        #
-        # IMPORTANT: parallel_load_safetensors uses a sharded-ownership scheme:
-        #   rank k  → stores the actual tensor for its shard
-        #   rank j≠k → stores k (int) to signal "receive broadcast from rank k"
-        # create_and_sync_state uses this to determine the broadcast src, so ALL
-        # ranks must agree on the src for each param or NCCL will deadlock.
-        # We assign ownership to rank 0 for all adapter params: rank 0 stores the
-        # real tensor, all other ranks store 0.
-        adapter_path = kwargs.pop("adapter_path", None)
-        if adapter_path is not None:
-            from peft import load_peft_weights
-
-            from ..models.module_utils import _read_adapter_name, _remap_adapter_key
-
-            adapter_name = _read_adapter_name(adapter_path)
-            logger.info_rank0(f"Loading adapter weights into shard_states from {adapter_path}...")
-            import torch.distributed as dist
-
-            raw_sd = load_peft_weights(adapter_path)
-            for name, tensor in raw_sd.items():
-                remapped = _remap_adapter_key(name, adapter_name)
-                if dist.get_rank() == 0:
-                    shard_states[remapped] = tensor
-                else:
-                    shard_states[remapped] = 0  # rank 0 is the owner; receive via broadcast
 
         fsdp_kwargs["param_init_fn"] = parallel_init_fsdp_fn(
             model,
@@ -591,7 +565,11 @@ def parallelize_model_fsdp2(
     else:
         from torch.distributed.tensor import distribute_tensor
 
-        logger.info_rank0("starting to load model weights...")
+        logger.info_rank0(f"starting to load model weights from {weights_path}...")
+        adapter_path = kwargs.pop("adapter_path", None)
+        if adapter_path is not None:
+            logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
+
         if kwargs.get("broadcast_model_weights_from_rank0"):
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
             rank0_load_and_broadcast_weights(
@@ -601,32 +579,17 @@ def parallelize_model_fsdp2(
                 dtensor_factory=distribute_tensor,
                 cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
                 max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+                adapter_path=adapter_path,
             )
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-            load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
-
-    adapter_path = kwargs.pop("adapter_path", None)
-    if adapter_path is not None:
-        from torch.distributed.tensor import distribute_tensor
-
-        from ..models.module_utils import (
-            load_model_lora_weights,
-            rank0_load_and_broadcast_adapter_weights,
-        )
-
-        logger.info_rank0(f"Loading adapter weights from {adapter_path}...")
-        if kwargs.get("broadcast_model_weights_from_rank0"):
-            logger.info_rank0("Loading adapter weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_adapter_weights(
+            load_model_weights(
                 model,
-                adapter_path,
+                weights_path,
                 get_device_type(),
                 dtensor_factory=distribute_tensor,
+                adapter_path=adapter_path,
             )
-        else:
-            logger.info_rank0("Every rank would read adapter weights from disk...")
-            load_model_lora_weights(model, adapter_path, get_device_type(), dtensor_factory=distribute_tensor)
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn

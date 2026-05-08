@@ -29,6 +29,7 @@ from ...utils import logging
 from ...utils.device import get_device_id
 from ...utils.fs import copy_to_local
 from ...utils.helper import CACHE_DIR
+from ...utils.lora_utils import load_peft_shard_states
 from ..parallel_plan import SpecInfo
 
 
@@ -36,10 +37,12 @@ logger = logging.get_logger(__name__)
 
 
 def parallel_load_safetensors(
+    model: torch.nn.Module,
     filepath: str,
     specific_param_name: list[str] = None,
     ignore_param_name: list[str] = None,
     cpu_load_param_name: list[str] = None,
+    **kwargs,
 ):
     assert not (specific_param_name is not None and ignore_param_name is not None)
 
@@ -112,6 +115,12 @@ def parallel_load_safetensors(
             else:
                 # other ranks: receive chunk of large params from rank0
                 shard_states[param_name] = 0
+
+    # load lora weights if using lora peft
+    parameter_name = next(model.named_parameters())[0]
+    if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
+        adapter_path = kwargs.pop("adapter_path", None)
+        shard_states = load_peft_shard_states(model, adapter_path, shard_states)
 
     return shard_states
 
