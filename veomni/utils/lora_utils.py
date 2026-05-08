@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
 
@@ -33,7 +34,6 @@ logger = logging.get_logger(__name__)
 def _read_adapter_name(adapter_path: str) -> str:
     """Read the adapter name from adapter_config.json, defaulting to 'default'."""
     import json
-    import os
 
     config_path = os.path.join(adapter_path, "adapter_config.json")
     if os.path.isfile(config_path):
@@ -138,6 +138,7 @@ def load_lora_model_weights(
     adapter_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    parameter_names_to_load: Optional[set] = None,
 ) -> None:
     """Load PEFT adapter (LoRA) weights from disk into the model on every rank.
 
@@ -145,6 +146,11 @@ def load_lora_model_weights(
     ``adapter_model.safetensors`` (or ``.bin``) directly, remaps PEFT key names
     to model FQN format, and dispatches tensors into the (potentially sharded) model.
     Use when every rank has access to the checkpoint (e.g. shared filesystem).
+
+    Args:
+        parameter_names_to_load: If provided, each successfully loaded parameter
+            name is discarded from this set so that ``post_process_after_weight_loading``
+            does not re-initialise adapter weights that have already been loaded.
     """
     from peft import load_peft_weights
 
@@ -153,6 +159,8 @@ def load_lora_model_weights(
     for name, tensor in raw_sd.items():
         name = _remap_adapter_key(name, adapter_name)
         _dispatch_parameter(model, name, tensor, dtensor_factory)
+        if parameter_names_to_load is not None:
+            parameter_names_to_load.discard(name)
 
 
 # fsdp2 init lora parameters during post_process_after_weight_loading
@@ -167,7 +175,6 @@ def _init_lora_parameter(module: "nn.Module", name: str):
         for adapter in getattr(lora_layer, "lora_A", {}).keys():
             lora_layer.reset_lora_parameters(adapter, init_lora_weights=True)
     # lora_B is initialized during lora_A reset_lora_parameters
-    return
 
 
 # fsdp2 meta device rank0 load and broadcast adapter weights
@@ -177,8 +184,15 @@ def rank0_load_and_broadcast_adapter_weights(
     adapter_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    parameter_names_to_load: Optional[set] = None,
 ) -> None:
-    """Rank-0 loads PEFT adapter weights from disk then broadcasts to all ranks."""
+    """Rank-0 loads PEFT adapter weights from disk then broadcasts to all ranks.
+
+    Args:
+        parameter_names_to_load: If provided, each successfully loaded parameter
+            name is discarded from this set so that ``post_process_after_weight_loading``
+            does not re-initialise adapter weights that have already been loaded.
+    """
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
     adapter_sd = {}
@@ -246,6 +260,8 @@ def rank0_load_and_broadcast_adapter_weights(
             f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
         )
         _dispatch_parameter(model, name, tensor, dtensor_factory)
+        if parameter_names_to_load is not None:
+            parameter_names_to_load.discard(name)
         del tensor
 
     logger.info_rank0(f"rank0_broadcast_adapter_weights: loaded {num_keys} adapter param(s)")

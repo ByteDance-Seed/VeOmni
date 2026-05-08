@@ -364,6 +364,7 @@ def load_model_weights(
             kwargs.get("adapter_path"),
             init_device,
             dtensor_factory,
+            parameter_names_to_load=parameter_names_to_load,
         )
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
@@ -739,6 +740,7 @@ def rank0_load_and_broadcast_weights(
             kwargs.get("adapter_path"),
             init_device,
             dtensor_factory,
+            parameter_names_to_load=parameter_names_to_load,
         )
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
@@ -759,7 +761,7 @@ def post_process_after_weight_loading(
         _dispatch_buffer(model, name, buffer, dtensor_factory)
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
-        for name in parameter_names_left:
+        for name in sorted(parameter_names_left):
             _init_parameter(model, name)
 
     # we should tie embeddings after loading weights because to_empty() leads to untied weights,
