@@ -51,6 +51,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
+    qwen3_vl_rmsnorm_forward_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_vision_attention_forward_patched,
@@ -60,7 +61,6 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
-from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -80,8 +80,6 @@ config.additional_imports.extend(qwen3_vl_config.additional_imports)
 config.post_import_blocks.extend(qwen3_vl_config.post_import_blocks)
 config.helpers.extend(qwen3_vl_config.helpers)
 
-# Additional import for the fused MoE dispatch in `PatchedQwen3VLMoeTextExperts`.
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 # Surface ``Qwen3VLMoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields
 # while preserving ``aux_loss`` and ``rope_deltas``. Mutating
@@ -109,7 +107,12 @@ config.add_post_import_block(
 # inside the patch bodies so they target the sibling classes).
 # ================================================================
 _NAME_MAP = {"Qwen3VL": "Qwen3VLMoe"}
-
+config.override_method(
+    "Qwen3VLMoeTextRMSNorm.forward",
+    replacement=qwen3_vl_rmsnorm_forward_patched,
+    name_map=_NAME_MAP,
+    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
+)
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
     replacement=qwen3_vl_vision_attention_forward_patched,
@@ -219,16 +222,7 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states)
         # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.2 ---
 
         with torch.no_grad():

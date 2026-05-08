@@ -80,7 +80,6 @@ config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch_npu", names=["torch_npu"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
@@ -124,6 +123,8 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")

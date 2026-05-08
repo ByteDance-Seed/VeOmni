@@ -103,7 +103,9 @@ class KernelRegistry:
         bucket = self._specs.setdefault(key, {})
         if spec.name in bucket:
             if force:
-                logger.info(f"Kernel(op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}') is replaced with new one from {spec.factory}")
+                logger.info(
+                    f"Kernel(op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}') is replaced with a new one from {spec.factory.__code__.co_filename}"
+                )
             else:
                 raise ValueError(
                     f"Duplicate kernel registration: op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}'"

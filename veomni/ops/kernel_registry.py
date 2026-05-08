@@ -113,7 +113,7 @@ class KernelRegistry:
         if spec.name in bucket:
             if force:
                 logger.info(
-                    f"Kernel(op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}') is replaced with new one from {spec.factory}"
+                    f"Kernel(op='{spec.op_name}', variant='{spec.variant}', name='{spec.name}') is replaced with a new one from {spec.factory.__code__.co_filename}"
                 )
             else:
                 raise ValueError(

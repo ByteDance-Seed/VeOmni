@@ -125,6 +125,8 @@ fused_recurrent_gated_delta_rule = None
 from veomni.ops.dispatch import OpSlot
 
 
+veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
@@ -824,6 +826,8 @@ def rotate_half(x):
 # Source: veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -1125,8 +1129,21 @@ class Qwen3_5MoeRMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+    # Mirrors qwen3_5_moe's pattern: the slot binds to liger_rms_norm_qwen3_5
+    # (registered for variant="qwen3_5") when rms_norm_implementation="liger_kernel"
+    # and falls through to the original HF code otherwise. Replaces the previous
+    # unconditional class swap to LigerRMSNormForQwen3Next so eager mode is honoured.
     def forward(self, x):
-        return torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.eps)[0]
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(x, self.weight, self.eps)
+        # Original HF code below, unchanged.
+        output = self._norm(x.float())
+        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"

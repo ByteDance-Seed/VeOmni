@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3VLTextRMSNorm.forward
+#      OpSlot guard for Liger fused RMSNorm (standard formulation)
 #    - method_override: Qwen3VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to hoist CPU-GPU sync out of the layer loop
 #    - method_override: Qwen3VLVisionBlock.forward
@@ -89,6 +91,7 @@ from veomni.utils.model_outputs import (
 )
 
 
+veomni_rms_norm = OpSlot("rms_norm", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
 
@@ -584,6 +587,12 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         return freqs_t
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3VLTextRMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3VLTextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -594,7 +603,12 @@ class Qwen3VLTextRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        # Original HF code below, unchanged.
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

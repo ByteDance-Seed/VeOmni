@@ -10,23 +10,21 @@
 #
 #  Patches applied:
 #    - method_override: Qwen3MoeRMSNorm.forward
-#      OpSlot guard for Liger fused RMSNorm (standard formulation)
+#      OpSlot guard for NPU fused RMSNorm (standard formulation)
 #    - method_override: Qwen3MoeMLP.forward
-#      OpSlot guard for Liger fused SwiGLU MLP
+#      OpSlot guard for NPU fused SwiGLU MLP
 #    - class_replacement: Qwen3MoeExperts
 #      Use v5 gate_up_proj expert weights and explicit VeOmni fused MoE path
 #    - method_override: Qwen3MoeTopKRouter.forward
 #      Return raw pre-softmax logits as `router_logits` so HF's `load_balancing_loss_func` (which applies softmax internally) stays consistent with the HF aux-loss baseline.
 #    - function_replacement: apply_rotary_pos_emb
-#      OpSlot guard for Liger fused RoPE
+#      OpSlot guard for NPU fused RoPE
 #    - method_override: Qwen3MoeModel.forward
 #      Support SP in Qwen3MoeModel.forward
 #    - method_override: Qwen3MoeForCausalLM.forward
 #      Support fused cross entropy path in Qwen3MoeForCausalLM.forward
 #    - method_override: Qwen3MoeForCausalLM.get_parallel_plan
 #      Register Qwen3Moe expert parallel plan for v5 generated modeling
-#    - method_override: Qwen3MoeSparseMoeBlock.forward
-#      Call maybe_replay_indices so RL frameworks can record / replay MoE routing decisions
 #
 # ==============================================================================
 
@@ -67,7 +65,6 @@ from veomni.ops.dispatch import OpSlot
 
 # Additional imports for patches
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
-from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 veomni_rms_norm = OpSlot("rms_norm", "standard")
@@ -87,7 +84,7 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: OpSlot guard for Liger fused RoPE
+# Reason: OpSlot guard for NPU fused RoPE
 # Source: veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(
@@ -331,12 +328,6 @@ class Qwen3MoeTopKRouter(nn.Module):
         return router_logits, router_top_value, router_indices
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3MoeSparseMoeBlock
-# Methods patched: forward
-# ======================================================================
-
-
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, config: Qwen3MoeConfig):
         super().__init__()
@@ -346,27 +337,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        # MoE router replay: when an RL framework has installed a manager via
-        # ``set_active_replay``, the manager may substitute ``selected_experts``
-        # with previously recorded target indices. The manager's sole
-        # responsibility is choosing indices; all model-specific post-topk
-        # weight math (softmax recompute, gather, renorm, dtype cast) is
-        # replicated here so the cross-framework controller stays
-        # model-agnostic. After upstream #715, ``Qwen3MoeTopKRouter`` returns
-        # pre-softmax ``router_logits`` for HF's load_balancing_loss_func
-        # consistency and discards its internal post-softmax matrix after
-        # top-k, so we recompute ``softmax`` here to feed the RR contract.
-        # The guarded block runs only when a manager is installed — the
-        # default training path pays zero extra compute.
-        if get_active_replay() is not None:
-            target_dtype = routing_weights.dtype
-            routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-            selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
-            routing_weights = routing_scores.gather(1, selected_experts)
-            if self.gate.norm_topk_prob:
-                routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
-            routing_weights = routing_weights.to(target_dtype)
+        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
         final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
@@ -799,12 +770,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
                 # returns (loss, logits, log_probs, entropy); unpack to match the
                 # OpSlot branch above.
                 loss, logits, log_probs, entropy = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
                 )
         else:
             logits = self.lm_head(hidden_states)

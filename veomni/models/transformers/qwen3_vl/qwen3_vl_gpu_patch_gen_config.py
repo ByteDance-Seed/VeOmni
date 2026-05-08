@@ -108,9 +108,29 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     """
 )
+
+
+# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+
+
+@config.override_method(
+    "Qwen3VLTextRMSNorm.forward",
+    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
+)
+def qwen3_vl_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+    # Original HF code below, unchanged.
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states.to(input_dtype)
 
 
 # ================================================================
