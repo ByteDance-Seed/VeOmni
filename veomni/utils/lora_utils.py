@@ -14,7 +14,7 @@
 
 import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -29,6 +29,40 @@ if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
 logger = logging.get_logger(__name__)
+
+
+def build_lora_key_overrides(model: "nn.Module") -> "Dict[str, str]":
+    """Build a mapping from bare base-model parameter names to PEFT-wrapped FQNs.
+
+    When a base checkpoint is loaded into a PEFT-wrapped model, each target
+    ``Linear`` is replaced by a ``LoraLinear`` that stores the original weight
+    under a ``base_layer`` sub-module.  This function produces a remapping dict
+    so callers can translate checkpoint keys transparently, e.g.::
+
+        "layers.0.self_attn.q_proj.weight"
+        -> "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
+
+    Keys absent from the returned dict should receive a plain
+    ``"base_model.model."`` prefix.
+
+    Returns:
+        A ``{checkpoint_key: model_fqn}`` dict for every LoRA layer's
+        parameters and buffers.  Empty dict if the model has no LoRA layers.
+    """
+    from typing import Dict
+
+    overrides: Dict[str, str] = {}
+    for fqn, module in model.named_modules():
+        if not hasattr(module, "base_layer"):
+            continue
+        inner = fqn[len("base_model.model.") :] if fqn.startswith("base_model.model.") else fqn
+        inner_dot = inner + ("." if inner else "")
+        wrap_dot = fqn + ("." if fqn else "") + "base_layer."
+        for pname, _ in module.base_layer.named_parameters():
+            overrides[inner_dot + pname] = wrap_dot + pname
+        for bname, _ in module.base_layer.named_buffers():
+            overrides[inner_dot + bname] = wrap_dot + bname
+    return overrides
 
 
 def _read_adapter_name(adapter_path: str) -> str:

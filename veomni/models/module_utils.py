@@ -313,17 +313,9 @@ def load_model_weights(
     # Keys not found in the map receive a plain "base_model.model." prefix.
     is_peft_model = next(model.named_parameters())[0].startswith("base_model.")
     if is_peft_model:
-        lora_key_overrides: Dict[str, str] = {}
-        for fqn, module in model.named_modules():
-            if not hasattr(module, "base_layer"):
-                continue
-            inner = fqn[len("base_model.model.") :] if fqn.startswith("base_model.model.") else fqn
-            inner_dot = inner + ("." if inner else "")
-            wrap_dot = fqn + ("." if fqn else "") + "base_layer."
-            for pname, _ in module.base_layer.named_parameters():
-                lora_key_overrides[inner_dot + pname] = wrap_dot + pname
-            for bname, _ in module.base_layer.named_buffers():
-                lora_key_overrides[inner_dot + bname] = wrap_dot + bname
+        from ..utils.lora_utils import build_lora_key_overrides
+
+        lora_key_overrides = build_lora_key_overrides(model)
 
     converter = get_checkpoint_tensor_converter(model)
     state_dict_iterators = _load_state_dict(weights_path)
@@ -403,17 +395,9 @@ def rank0_load_and_broadcast_weights(
     # lora-layer: xxx.xxx.weight -> base_model.model.xxx.xxx.base_layer.weight
     is_peft_model = next(model.named_parameters())[0].startswith("base_model.")
     if is_peft_model:
-        lora_key_overrides: Dict[str, str] = {}
-        for fqn, module in model.named_modules():
-            if not hasattr(module, "base_layer"):
-                continue
-            inner = fqn[len("base_model.model.") :] if fqn.startswith("base_model.model.") else fqn
-            inner_dot = inner + ("." if inner else "")
-            wrap_dot = fqn + ("." if fqn else "") + "base_layer."
-            for pname, _ in module.base_layer.named_parameters():
-                lora_key_overrides[inner_dot + pname] = wrap_dot + pname
-            for bname, _ in module.base_layer.named_buffers():
-                lora_key_overrides[inner_dot + bname] = wrap_dot + bname
+        from ..utils.lora_utils import build_lora_key_overrides
+
+        lora_key_overrides = build_lora_key_overrides(model)
 
     converter = get_checkpoint_tensor_converter(model)
     global_rank = get_parallel_state().global_rank
