@@ -6,7 +6,7 @@
 
 - Search for relative PRs/issues and link here: ...
 - PR title follows `[{modules}] {type}: {description}` format (enforced by [check_pr_title.yml](.github/workflows/check_pr_title.yml))
-  - **Allowed modules:** `agent`, `ci`, `ckpt`, `config`, `data`, `dist`, `docker`, `docs`, `logging`, `misc`, `model`, `omni`, `optim`, `ops`, `parallel`, `perf`, `release`, `task`, `trainer`
+  - **Allowed modules:** `agent`, `ci`, `ckpt`, `config`, `data`, `dist`, `docker`, `docs`, `logging`, `lora`, `misc`, `model`, `omni`, `optim`, `ops`, `parallel`, `perf`, `release`, `task`, `trainer`
   - **Allowed types:** `feat`, `fix`, `refactor`, `chore`, `test`
   - Breaking changes: prepend `[BREAKING]` — e.g. `[BREAKING][parallel, model] feat: dynamic batching`
 

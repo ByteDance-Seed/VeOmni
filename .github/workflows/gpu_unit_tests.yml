@@ -185,3 +185,9 @@ jobs:
           # Need v5 to support newer models like Qwen3.5 count flops tests.
           uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/utils/test_count_flops.py
       # TODO: Run other tests in transformers v5 env as well.
+      - name: Install LoRA extra [transformers-v5]
+        run: |
+          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --extra lora --group dev
+      - name: Run LoRA e2e test [transformers-v5]
+        run: |
+          uv run --frozen pytest -s -x tests/lora/test_e2e_lora.py

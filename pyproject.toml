@@ -108,6 +108,9 @@ megatron = [
 trl = [
   "trl<=0.9.6"
 ]
+lora = [
+  "peft==0.18.0"
+]
 
 fa4 = [
   "flash-attn-4",
