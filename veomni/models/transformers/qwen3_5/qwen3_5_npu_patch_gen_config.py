@@ -148,18 +148,6 @@ config.override_method(
 )
 
 
-@config.override_method(
-    "Qwen3_5RMSNormGated.forward",
-    description="Use fused rmsnorm and fused swiglu to impl gated rmsnorm",
-)
-def qwen3_5_rmsnorm_gated_forward_patched(self, hidden_states, gate=None):
-    hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-    hidden_states = torch.cat([gate, hidden_states], dim=-1)
-    hidden_states = torch_npu.npu_swiglu(hidden_states, dim=-1)
-
-    return hidden_states
-
-
 @config.replace_function(
     "apply_rotary_pos_emb",
     description="Use fused rope to impl partial rotary postion embedding",

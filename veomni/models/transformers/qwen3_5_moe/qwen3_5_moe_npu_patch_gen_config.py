@@ -51,7 +51,6 @@ from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
     apply_rotary_pos_emb_vision,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_rmsnorm_forward_patched,
-    qwen3_5_rmsnorm_gated_forward_patched,
 )
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     PatchedQwen3_5MoeExperts,
@@ -155,12 +154,6 @@ config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
     description="Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)",
-)
-
-config.override_method(
-    "Qwen3_5MoeRMSNormGated.forward",
-    replacement=qwen3_5_rmsnorm_gated_forward_patched,
-    description="Use fused rmsnorm and fused swiglu to impl gated rmsnorm",
 )
 
 config.replace_function(

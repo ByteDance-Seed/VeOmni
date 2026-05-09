@@ -11,8 +11,6 @@
 #  Patches applied:
 #    - method_override: Qwen3_5MoeRMSNorm.forward
 #      Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)
-#    - method_override: Qwen3_5MoeRMSNormGated.forward
-#      Use fused rmsnorm and fused swiglu to impl gated rmsnorm
 #    - function_replacement: apply_rotary_pos_emb
 #      Use fused rope to impl partial rotary postion embedding
 #    - function_replacement: apply_rotary_pos_emb_vision
@@ -342,12 +340,6 @@ class Qwen3_5MoeDynamicCache:
         return self.conv_states[self.last_linear_layer] is not None
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3_5MoeRMSNormGated
-# Methods patched: forward
-# ======================================================================
-
-
 class Qwen3_5MoeRMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
@@ -355,11 +347,15 @@ class Qwen3_5MoeRMSNormGated(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states, gate=None):
-        hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-        hidden_states = torch.cat([gate, hidden_states], dim=-1)
-        hidden_states = torch_npu.npu_swiglu(hidden_states, dim=-1)
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
-        return hidden_states
+        return hidden_states.to(input_dtype)
 
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
