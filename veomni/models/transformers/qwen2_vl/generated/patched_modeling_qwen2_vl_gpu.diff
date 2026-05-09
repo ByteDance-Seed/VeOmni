@@ -317,7 +317,7 @@
 +
 +            # VeOmni SP
 +            if get_parallel_state().sp_enabled:
-+                image_embeds = gather_outputs(image_embeds, gather_dim=1, group=get_parallel_state().sp_group)
++                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 +
 +            image_embeds = image_embeds[: image_mask.sum()]
 +            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -337,7 +337,7 @@
 +
 +            # VeOmni SP
 +            if get_parallel_state().sp_enabled:
-+                video_embeds = gather_outputs(video_embeds, gather_dim=1, group=get_parallel_state().sp_group)
++                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 +
 +            video_embeds = video_embeds[: video_mask.sum()]
 +            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)

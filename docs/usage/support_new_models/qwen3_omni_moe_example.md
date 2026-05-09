@@ -139,7 +139,7 @@ if pixel_values is not None:
     if sp_enabled:
         # (seq//sp, hidden) → (seq, hidden//sp)
         image_embeds = gather_outputs(
-            image_embeds, gather_dim=1, group=sp_group
+            image_embeds, gather_dim=0, group=sp_group
         )
     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 # repeat for video, audio...

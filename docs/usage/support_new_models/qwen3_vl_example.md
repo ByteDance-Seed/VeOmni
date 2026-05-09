@@ -132,7 +132,7 @@ if get_parallel_state().sp_enabled:
 if get_parallel_state().sp_enabled:
     # (seq//sp, hidden) → (seq, hidden//sp)
     image_embeds = gather_outputs(
-        image_embeds, gather_dim=1, group=get_parallel_state().sp_group
+        image_embeds, gather_dim=0, group=get_parallel_state().sp_group
     )
 ```
 

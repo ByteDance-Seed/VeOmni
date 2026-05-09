@@ -308,13 +308,13 @@ def qwen2_5_vit_forward_patched(
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
         merged_sp_padding = sp_padding_size // self.spatial_merge_unit
-        merged_hidden_states = gather_outputs(merged_hidden_states, gather_dim=1, group=get_parallel_state().sp_group)
+        merged_hidden_states = gather_outputs(merged_hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
         if merged_sp_padding > 0:
             merged_hidden_states = unpad_tensor(merged_hidden_states, dim=0, padding_size=merged_sp_padding)
         merged_hidden_states = merged_hidden_states[reverse_indices, :]
         if merged_sp_padding > 0:
             merged_hidden_states = pad_tensor(merged_hidden_states, dim=0, padding_size=merged_sp_padding)
-        merged_hidden_states = slice_input_tensor(merged_hidden_states, dim=1, group=get_parallel_state().sp_group)
+        merged_hidden_states = slice_input_tensor(merged_hidden_states, dim=0, group=get_parallel_state().sp_group)
     else:
         merged_hidden_states = merged_hidden_states[reverse_indices, :]
     # --- Patch.1 ---
@@ -471,7 +471,7 @@ def qwen2_5_vl_model_forward_patched(
         # --- Patch.6 ---
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            image_embeds = gather_outputs(image_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
         n_image_tokens = image_mask.sum().long().item()
         image_embeds = image_embeds[:n_image_tokens]
@@ -492,7 +492,7 @@ def qwen2_5_vl_model_forward_patched(
         # --- Patch.6 ---
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            video_embeds = gather_outputs(video_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
         n_video_tokens = video_mask.sum().long().item()
         video_embeds = video_embeds[:n_video_tokens]
