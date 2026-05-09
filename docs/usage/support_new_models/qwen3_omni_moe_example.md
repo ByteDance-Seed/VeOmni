@@ -129,8 +129,8 @@ sp_enabled = self.training and get_parallel_state().sp_enabled
 sp_group = get_parallel_state().sp_group if sp_enabled else None
 
 if sp_enabled:
-    inputs_embeds = gather_seq_scatter_heads(
-        inputs_embeds, seq_dim=1, head_dim=2, group=sp_group
+    inputs_embeds = gather_outputs(
+        inputs_embeds, gather_dim=1, group=sp_group
     )
 
 # Step 2: Same transform on image/video/audio embeddings, then fill back
@@ -138,8 +138,8 @@ if pixel_values is not None:
     image_embeds = self.get_image_features(pixel_values, image_grid_thw)
     if sp_enabled:
         # (seq//sp, hidden) → (seq, hidden//sp)
-        image_embeds = gather_seq_scatter_heads(
-            image_embeds, seq_dim=0, head_dim=-1, group=sp_group
+        image_embeds = gather_outputs(
+            image_embeds, gather_dim=1, group=sp_group
         )
     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 # repeat for video, audio...
@@ -147,8 +147,8 @@ if pixel_values is not None:
 # Step 3: Restore SP layout
 # (bs, seq, hidden//sp) → (bs, seq//sp, hidden)
 if sp_enabled:
-    inputs_embeds = gather_heads_scatter_seq(
-        inputs_embeds, head_dim=2, seq_dim=1, group=sp_group
+    inputs_embeds = slice_input_tensor(
+        inputs_embeds, dim=1, group=sp_group
     )
 ```
 

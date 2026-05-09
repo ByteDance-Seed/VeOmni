@@ -41,9 +41,8 @@ from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
+    slice_input_tensor,
 )
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     config as qwen3_vl_config,
@@ -308,9 +307,7 @@ def qwen3_vl_moe_model_forward_patched(
 
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
-        inputs_embeds = gather_seq_scatter_heads(
-            inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
     fake_deepstack = None
@@ -324,9 +321,7 @@ def qwen3_vl_moe_model_forward_patched(
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            image_embeds = gather_seq_scatter_heads(
-                image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             deepstack_image_embeds = [
                 gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                 for embed in deepstack_image_embeds
@@ -376,9 +371,7 @@ def qwen3_vl_moe_model_forward_patched(
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            video_embeds = gather_seq_scatter_heads(
-                video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             deepstack_video_embeds = [
                 gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                 for embed in deepstack_video_embeds
@@ -421,9 +414,8 @@ def qwen3_vl_moe_model_forward_patched(
 
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
-        inputs_embeds = gather_heads_scatter_seq(
-            inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
+
     # --- Patch.1 ---
 
     visual_pos_masks = None
