@@ -71,7 +71,7 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_outputs", "slice_input_tensor"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq", "gather_outputs", "slice_input_tensor"],
 )
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])

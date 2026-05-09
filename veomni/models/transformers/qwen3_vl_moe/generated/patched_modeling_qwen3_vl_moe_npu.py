@@ -93,10 +93,9 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_world_size,
+    slice_input_tensor,
     sp_pad_and_slice,
 )
 from veomni.distributed.sequence_parallel.async_ulysses import (
@@ -1784,9 +1783,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         fake_deepstack = None
@@ -1800,9 +1797,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
-                image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_image_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_image_embeds
@@ -1852,9 +1847,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
-                video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_video_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_video_embeds
@@ -1897,9 +1890,8 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
+
         # --- Patch.1 ---
 
         visual_pos_masks = None

@@ -67,7 +67,7 @@ config.add_import("veomni.distributed.parallel_state", names=["get_parallel_stat
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq", "gather_outputs", "slice_input_tensor"],
 )
 
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
@@ -119,6 +119,8 @@ torch_npu = None
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+gather_outputs = None
+slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above

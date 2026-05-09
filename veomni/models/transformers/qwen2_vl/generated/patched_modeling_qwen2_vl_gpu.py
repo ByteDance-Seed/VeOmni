@@ -58,12 +58,7 @@ from transformers.utils.generic import is_flash_attention_requested, maybe_autoc
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
-    pad_tensor,
-    sp_pad_and_slice,
-)
+from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, sp_pad_and_slice
 
 # Additional import blocks for patches
 # ── OpSlot declarations ──────────────────────────────────────────────────
@@ -1355,18 +1350,14 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
         # VeOmni SP Patch
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
 
             # VeOmni SP
             if get_parallel_state().sp_enabled:
-                image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                image_embeds = gather_outputs(image_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 
             image_embeds = image_embeds[: image_mask.sum()]
             image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -1382,9 +1373,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
             # VeOmni SP
             if get_parallel_state().sp_enabled:
-                video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                video_embeds = gather_outputs(video_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 
             video_embeds = video_embeds[: video_mask.sum()]
             video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -1396,9 +1385,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             inputs_embeds = inputs_embeds + fake_embeds
 
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(

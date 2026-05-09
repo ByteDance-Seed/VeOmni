@@ -174,7 +174,6 @@ def qwen3_5_rmsnorm_forward_patched(self, x):
     return output.type_as(x)
 
 
-
 @config.override_method(
     "Qwen3_5GatedDeltaNet.__init__",
     description="OpSlot dispatch for FusedRMSNormGated, causal_conv1d, chunk_gated_delta_rule (Qwen3.5 GatedDeltaNet)",

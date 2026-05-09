@@ -77,7 +77,12 @@ from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
-from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
+from veomni.distributed.sequence_parallel.ulysses import (
+    gather_heads_scatter_seq,
+    gather_outputs,
+    gather_seq_scatter_heads,
+    slice_input_tensor,
+)
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
@@ -1970,9 +1975,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             # This gives each rank visibility over the ENTIRE sequence length, which is
             # necessary to scatter vision features into their correct global positions
             # as defined by the global pre-computed masks.
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         if pixel_values is not None:
@@ -1984,9 +1987,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             # --- Patch.1: Shard image_embeds for sequence parallel scatter ---
             if get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
-                image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             n_image_tokens = image_mask.sum().long().item()
             embeds_image_mask = (
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -2027,9 +2028,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             # sequence parallel patch for video embeds
             if get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
-                video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             n_video_tokens = video_mask.sum().long().item()
             embeds_video_mask = (
                 video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -2065,9 +2064,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         if get_parallel_state().sp_enabled:
             # Restore the layout to (batch, local_seq, full_hidden) for subsequent
             # transformer layers, which expect standard Sequence Parallel sharding.
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         if position_ids is None:

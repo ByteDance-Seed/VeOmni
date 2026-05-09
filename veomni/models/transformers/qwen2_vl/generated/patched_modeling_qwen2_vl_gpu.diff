@@ -1,6 +1,6 @@
 --- a/transformers/models/qwen2_vl/modeling_qwen2_vl.py
 +++ b/patched_modeling_qwen2_vl_gpu.py
-@@ -1,3 +1,80 @@
+@@ -1,3 +1,72 @@
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
 +# ==============================================================================
@@ -31,14 +31,9 @@
 +#
 +# ==============================================================================
 +
-+# Additional imports for patches
-+import copy
 +from collections.abc import Callable
 +from dataclasses import dataclass
-+from functools import partial
-+from types import SimpleNamespace
 +from typing import Any, Optional
-+
 +import torch
 +import torch.nn as nn
 +import torch.nn.functional as F
@@ -54,34 +49,31 @@
 +from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 +from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-+from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
 +from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 +from transformers.utils.output_capturing import capture_outputs
++from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 +
++# Additional imports for patches
++import copy
++from functools import partial
++from types import SimpleNamespace
 +from veomni.distributed.parallel_state import get_parallel_state
-+from veomni.distributed.sequence_parallel import (
-+    gather_heads_scatter_seq,
-+    gather_seq_scatter_heads,
-+    pad_tensor,
-+    sp_pad_and_slice,
-+)
++from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, pad_tensor, sp_pad_and_slice
++from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
++from veomni.utils.model_outputs import Qwen2VLCausalLMOutputWithLogProbs
 +
 +# Additional import blocks for patches
 +# ── OpSlot declarations ──────────────────────────────────────────────────
 +# Bound at model-build time by _bind_veomni_ops() in auto.py.
 +from veomni.ops.dispatch import OpSlot
-+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-+from veomni.utils.model_outputs import Qwen2VLCausalLMOutputWithLogProbs
-+
-+
 +veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 +
  # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
  #
  # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-@@ -17,42 +94,6 @@
+@@ -17,42 +86,6 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  """PyTorch Qwen2-VL model."""
@@ -124,7 +116,7 @@
 
 
  logger = logging.get_logger(__name__)
-@@ -374,6 +415,12 @@
+@@ -374,6 +407,12 @@
      return attn_output, attn_weights
 
 
@@ -137,7 +129,7 @@
  class VisionAttention(nn.Module):
      def __init__(self, config: Qwen2VLVisionConfig) -> None:
          super().__init__()
-@@ -392,6 +439,7 @@
+@@ -392,6 +431,7 @@
          self,
          hidden_states: torch.Tensor,
          cu_seqlens: torch.Tensor,
@@ -145,7 +137,7 @@
          rotary_pos_emb: torch.Tensor | None = None,
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
-@@ -412,8 +460,7 @@
+@@ -412,8 +452,7 @@
          )
 
          if is_flash_attention_requested(self.config):
@@ -155,20 +147,21 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -430,12 +477,10 @@
+@@ -430,12 +469,8 @@
                  **kwargs,
              )
          else:
 -            # Other implementations: Process each chunk separately
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-             splits = [
-                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-             ]
+-            splits = [
+-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+-            ]
 -
++            splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -699,6 +744,12 @@
+@@ -699,6 +734,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -181,7 +174,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -774,16 +825,11 @@
+@@ -774,16 +815,11 @@
          self,
          hidden_states: torch.Tensor,
          grid_thw: torch.Tensor,
@@ -200,7 +193,7 @@
 
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
-@@ -795,10 +841,27 @@
+@@ -795,10 +831,27 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -228,7 +221,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -809,6 +872,23 @@
+@@ -809,6 +862,23 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -252,7 +245,7 @@
 
 
  @auto_docstring
-@@ -966,6 +1046,12 @@
+@@ -966,6 +1036,12 @@
              hidden_states=all_hidden_states,
              attentions=all_self_attns,
          )
@@ -265,7 +258,7 @@
 
 
  @auto_docstring
-@@ -1134,9 +1220,6 @@
+@@ -1134,9 +1210,6 @@
          """
          pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
@@ -275,7 +268,7 @@
 
          return vision_outputs
 
-@@ -1156,9 +1239,6 @@
+@@ -1156,9 +1229,6 @@
          """
          pixel_values = pixel_values.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
@@ -285,7 +278,7 @@
 
          return vision_outputs
 
-@@ -1260,39 +1340,65 @@
+@@ -1260,39 +1330,57 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen2VLModelOutputWithPast:
@@ -313,9 +306,7 @@
 
 +        # VeOmni SP Patch
 +        if get_parallel_state().sp_enabled:
-+            inputs_embeds = gather_seq_scatter_heads(
-+                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-+            )
++            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 +
          if pixel_values is not None:
              image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
@@ -326,9 +317,7 @@
 +
 +            # VeOmni SP
 +            if get_parallel_state().sp_enabled:
-+                image_embeds = gather_seq_scatter_heads(
-+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-+                )
++                image_embeds = gather_outputs(image_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 +
 +            image_embeds = image_embeds[: image_mask.sum()]
 +            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -348,9 +337,7 @@
 +
 +            # VeOmni SP
 +            if get_parallel_state().sp_enabled:
-+                video_embeds = gather_seq_scatter_heads(
-+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-+                )
++                video_embeds = gather_outputs(video_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 +
 +            video_embeds = video_embeds[: video_mask.sum()]
 +            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -362,13 +349,11 @@
 +            inputs_embeds = inputs_embeds + fake_embeds
 +
 +        if get_parallel_state().sp_enabled:
-+            inputs_embeds = gather_heads_scatter_seq(
-+                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-+            )
++            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1303,6 +1409,10 @@
+@@ -1303,6 +1391,10 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -379,7 +364,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1326,6 +1436,12 @@
+@@ -1326,6 +1418,12 @@
              rope_deltas=self.rope_deltas,
          )
          return output if return_dict else output.to_tuple()
@@ -392,7 +377,7 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1401,65 +1517,22 @@
+@@ -1401,65 +1499,22 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -465,7 +450,7 @@
              image_grid_thw=image_grid_thw,
              video_grid_thw=video_grid_thw,
              position_ids=position_ids,
-@@ -1475,23 +1548,40 @@
+@@ -1475,23 +1530,40 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -515,10 +500,12 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1710,5 +1800,19 @@
+@@ -1710,5 +1782,19 @@
 
          return input_ids, model_kwargs
 
+-
+-__all__ = ["Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLPreTrainedModel", "Qwen2VLTextModel"]
 +    # ================================================================
 +    # Patch: Qwen2VLForConditionalGeneration.get_position_id_func
 +    # ================================================================
@@ -533,5 +520,5 @@
 +        fake_model = SimpleNamespace(config=fake_config)
 +        return partial(get_position_id, Qwen2VLModel.get_rope_index, fake_model)
 +
-
- __all__ = ["Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLPreTrainedModel", "Qwen2VLTextModel"]
++
++__all__ = ["Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLPreTrainedModel", "Qwen2VLTextModel"]
