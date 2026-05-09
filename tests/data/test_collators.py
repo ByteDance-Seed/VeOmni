@@ -231,4 +231,41 @@ def test_vlm_collator_pad_to_length_sp_disabled(monkeypatch):
     assert torch.equal(out["mm_token_type_ids"], exp_mm_tt)
 
 
+def test_pad_to_length_strips_tail_segment_in_seqlens(monkeypatch, features_two_samples):
+    """Regression: under route-A pad_to_length, the trailing arange-padded
+    region forms a single cu_seq_lens segment of length pad_len. Downstream
+    seqlen consumers (PostCollator, EnvironMeter) must strip it so that
+    DPO's chosen/rejected indexing on log_probs.split(seq_lens) doesn't
+    treat padding as a real sample."""
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU does not support this padding test yet.")
+    import veomni.data.data_collator as m
+    from veomni.utils.helper import _compute_seqlens
+
+    pad_to_length = 8
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    collator = m.MainCollator(pad_to_length=pad_to_length)
+    out = collator(features_two_samples)
+
+    # cu_seq_lens_q = [0, 3, 5, 8] → last segment is the pad of length 3.
+    assert torch.equal(out["cu_seq_lens_q"], torch.tensor([0, 3, 5, 8], dtype=torch.int32))
+    assert int(out["_tail_pad_len"]) == 3
+
+    # SeqlensComputePostCollator must strip the tail pad segment.
+    assert m.SeqlensComputePostCollator()(out) == [3, 2]
+    # EnvironMeter helper must do the same.
+    assert _compute_seqlens(out) == [3, 2]
+
+
+def test_pad_to_length_asserts_sp_divisibility(monkeypatch, features_two_samples):
+    """SequenceParallelCollator constant-pads position_ids, which would split
+    the route-A arange tail into many length-1 segments under non-divisible
+    pad_to_length. PackingCollator must reject that configuration upfront."""
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=4, sp_rank=0))
+    with pytest.raises(AssertionError, match="must be divisible by sp_size"):
+        m.MainCollator(pad_to_length=10)
+
+
 # TODO: add omni data ci test
