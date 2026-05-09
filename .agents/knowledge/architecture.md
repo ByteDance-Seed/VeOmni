@@ -25,6 +25,26 @@ veomni/
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   ├── diffusers/      Diffusion model definitions (Wan T2V)
 │   └── seed_omni/      Omni-model architecture (encoder-foundation-decoder)
+├── optim/              Optimizer and LR scheduler construction
+│   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
+│   │                   For optimizer.type=="muon" splits params Muon vs AdamW
+│   │                   and (under FSDP+EP) further by ExtraParallel mesh, so
+│   │                   the resulting MultiOptimizer holds up to four
+│   │                   sub-optimizers: muon_<para>, muon_non_extra_parallel,
+│   │                   <para>, non_extra_parallel.
+│   ├── muon.py         DistributedMuon: DTensor-aware Muon for 2D dense and
+│   │                   3D MoE expert weights, plus the batched_newton_schulz
+│   │                   primitive (Keller-Jordan quintic NS over the trailing
+│   │                   two dims; 2D path is byte-equivalent to
+│   │                   torch.optim._muon._zeropower_via_newtonschulz, 3D path
+│   │                   uses baddbmm so each slice keeps the same fused
+│   │                   arithmetic). Per-param classifier picks one of
+│   │                   {local, fsdp_gather_2d, moe_local_3d, moe_gather_3d};
+│   │                   Shard(0) experts run locally with zero comm (opt-in
+│   │                   via OptimizerConfig.muon_expert_zero_comm), Shard(d>0)
+│   │                   experts go through one all-to-all-gather over the
+│   │                   ep_fsdp mesh.
+│   └── lr_scheduler.py LR scheduler construction
 ├── ops/                Optimized kernels and dispatch
 │   ├── config/         Unified ops registry + singleton resolved config
 │   │   ├── registry.py OpSpec/BackendSpec/OpScope + register_op/apply_*
@@ -40,7 +60,6 @@ veomni/
 │   ├── platform/       Platform-specific runtime patches
 │   │   └── npu/        HCCL pre-mul sum patch
 │   └── batch_invariant_ops/  Mode switch for deterministic ops
-├── optim/              Optimizer and LR scheduler construction
 ├── patchgen/           Auto-generate model patches from HuggingFace models
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations

@@ -292,12 +292,41 @@ def parallelize_model_fsdp1(
     return model
 
 
+def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
+    """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
+    parallel_plan = getattr(model, "get_parallel_plan", None)
+    if parallel_plan is None:
+        return False
+    plan = parallel_plan()
+    if plan is None or plan.extra_parallel_plan is None:
+        return False
+    para_plan = plan.extra_parallel_plan.get(para_name)
+    if not para_plan:
+        return False
+
+    for fqn in para_plan.keys():
+        param = dict(model.named_parameters()).get(fqn)
+        if param is None:
+            continue
+        if param.ndim < 1:
+            continue
+        local_n = param.shape[0]
+        if local_n % ep_fsdp_size != 0:
+            logger.warning_rank0(
+                f"[muon_expert_zero_comm] param {fqn!r} dim-0 ({local_n}) is not "
+                f"divisible by ep_fsdp_size={ep_fsdp_size}; cannot use Shard(0)."
+            )
+            return False
+    return True
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
+    muon_expert_zero_comm: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -326,7 +355,6 @@ def parallelize_model_fsdp2(
 
     parallel_state = get_parallel_state()
 
-    # Step 0: Get target classes to shard later
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
 
@@ -357,12 +385,7 @@ def parallelize_model_fsdp2(
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
 
-        # Attach spec mapping for checkpoint load-time reconstruction
         model._fqn2spec_info = fqn2spec_info
-        # ExtraParallel mesh does not really exist in ExtraParallel parameters' device mesh.
-        # ExtraParallel parameters are loaded as local tensors to be later sharded by fully_shard.
-        # We store each extra_parallel's fqn to module mapping in _extra_parallel_map.
-        #  e.g. {'emb': {'embed_tokens': ToyEmbed, 'decoder.embed_tokens': ToyEmbed}, 'ep': {'decoder.moe': ToyMoeExperts}}
         _extra_parallel_mesh = {}
         _extra_parallel_map = {}
         for para in parallel_state.extra_parallel_names:
@@ -454,8 +477,26 @@ def parallelize_model_fsdp2(
             para_fsdp_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para][f"{para}_fsdp"]
             para_fsdp_kwargs = dict(fsdp_kwargs)
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
-            # Prefer dim-1 sharding for expert/embed weights when composing with expert/embed shard on dim-0
-            para_fsdp_kwargs["shard_placement_fn"] = lambda param: Shard(1)
+            shard_dim_for_para = 1
+            # Muon zero-comm needs whole experts per rank; otherwise keep the
+            # default hidden-dim sharding.
+            if muon_expert_zero_comm:
+                ep_fsdp_size = parallel_state.extra_parallel_fsdp_size(para)
+                divisible = _check_extra_parallel_dim0_divisibility(model, para, ep_fsdp_size)
+                if divisible:
+                    shard_dim_for_para = 0
+                    logger.info_rank0(
+                        f"[muon_expert_zero_comm] {para}: enabling Shard(0) for "
+                        f"the FSDP step (ep_fsdp_size={ep_fsdp_size}); Muon will "
+                        "run batched NS locally with zero communication."
+                    )
+                else:
+                    logger.warning_rank0(
+                        f"[muon_expert_zero_comm] {para}: divisibility check failed "
+                        f"(ep_fsdp_size={ep_fsdp_size}); falling back to default "
+                        "Shard(1) layout (Muon will use the all-to-all-gather path)."
+                    )
+            para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
         else:
             extra_parallel_fsdp_kwargs[para] = None
@@ -615,10 +656,14 @@ def build_parallelize_model(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
+    muon_expert_zero_comm: bool = False,
     **kwargs,
 ) -> "nn.Module":
-    """
-    Applies parallel strategies to the model.
+    """Apply parallel strategies to the model.
+
+    Args:
+        muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
+            EP-local dim is divisible by ``ep_fsdp_size``.
     """
 
     parallel_state = get_parallel_state()
@@ -662,6 +707,7 @@ def build_parallelize_model(
                 enable_reshard_after_forward=enable_reshard_after_forward,
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
+                muon_expert_zero_comm=muon_expert_zero_comm,
                 **kwargs,
             )
         elif parallel_state.dp_mode == "fsdp1":

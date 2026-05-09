@@ -44,9 +44,14 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class OptimizerConfig:
-    """train.optimizer.* — Optimizer and learning-rate schedule."""
+    """train.optimizer.* — Optimizer and learning-rate schedule.
 
-    type: Literal["adamw", "anyprecision_adamw"] = field(
+    ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
+    and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
+    norms use AdamW.
+    """
+
+    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -89,6 +94,60 @@ class OptimizerConfig:
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    # ---- Muon-specific (only consulted when type == "muon") ---------------
+    muon_lr: float = field(
+        default=2e-2,
+        metadata={
+            "help": (
+                "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
+                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+            )
+        },
+    )
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={"help": "Momentum factor for the Muon group."},
+    )
+    muon_nesterov: bool = field(
+        default=True,
+        metadata={"help": "Use Nesterov momentum in Muon."},
+    )
+    muon_weight_decay: float = field(
+        default=0.0,
+        metadata={"help": "Decoupled weight decay for the Muon group."},
+    )
+    muon_ns_steps: int = field(
+        default=5,
+        metadata={"help": "Number of Newton-Schulz iteration steps in Muon."},
+    )
+    muon_ns_coefficients: List[float] = field(
+        default_factory=lambda: [3.4445, -4.7750, 2.0315],
+        metadata={"help": "Quintic Newton-Schulz polynomial coefficients (a, b, c)."},
+    )
+    muon_eps: float = field(
+        default=1e-7,
+        metadata={"help": "Numerical-stability epsilon for the spectral-norm normalization in Muon."},
+    )
+    muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] = field(
+        default="match_rms_adamw",
+        metadata={
+            "help": (
+                "Per-matrix learning-rate adjustment used by Muon. "
+                "'original' follows Keller Jordan; 'match_rms_adamw' (default) "
+                "matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer."
+            )
+        },
+    )
+    muon_expert_zero_comm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
+                "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
+                "to the default hidden-dim sharding path."
+            )
+        },
     )
 
 

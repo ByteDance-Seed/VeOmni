@@ -86,6 +86,20 @@ from .callbacks import (
 logger = logging.get_logger(__name__)
 
 
+def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
+    """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
+    return {
+        "lr": optimizer_cfg.muon_lr,
+        "momentum": optimizer_cfg.muon_momentum,
+        "nesterov": optimizer_cfg.muon_nesterov,
+        "weight_decay": optimizer_cfg.muon_weight_decay,
+        "ns_steps": optimizer_cfg.muon_ns_steps,
+        "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
+        "eps": optimizer_cfg.muon_eps,
+        "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
+    }
+
+
 class BaseTrainer(Stateful, ABC):
     """
     Base trainer class for distributed model training.
@@ -366,6 +380,9 @@ class BaseTrainer(Stateful, ABC):
             lora_adapter_path = args.model.lora_config.get("lora_adapter", None)
             kwargs["adapter_path"] = lora_adapter_path
             kwargs["is_peft_model"] = True
+
+        muon_expert_zero_comm = args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
@@ -383,6 +400,7 @@ class BaseTrainer(Stateful, ABC):
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            muon_expert_zero_comm=muon_expert_zero_comm,
             **kwargs,
         )
         self.model.train()
@@ -398,6 +416,7 @@ class BaseTrainer(Stateful, ABC):
             optimizer_type=args.train.optimizer.type,
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
+            muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
         )
 
     def _build_lr_scheduler(self):
