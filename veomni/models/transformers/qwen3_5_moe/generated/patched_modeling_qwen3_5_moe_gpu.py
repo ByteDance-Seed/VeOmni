@@ -25,6 +25,8 @@
 #      Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens.
 #    - method_override: Qwen3_5MoeVisionModel.dummy_forward
 #      Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.
+#    - method_override: Qwen3_5MoeVisionAttention.forward
+#      Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid the per-block GPU->CPU sync that flash_attn_varlen_func incurs when `max_length_q/k` are 0-D GPU tensors (FA's C++ binding `.item()`s them).
 #    - method_override: Qwen3_5MoeModel.forward
 #      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-GPU sync avoidance via pre-computed metadata.
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_position_id_func
@@ -130,6 +132,8 @@ veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
 veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+
+_VEOMNI_VISION_ATTENTION_PATCHED = True
 
 
 # ======================================================================
@@ -1320,6 +1324,12 @@ def apply_rotary_pos_emb_vision(
     return q_embed, k_embed
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5MoeVisionAttention
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3_5MoeVisionAttention(nn.Module):
     def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
         super().__init__()
@@ -1353,13 +1363,18 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
 
         if is_flash_attention_requested(self.config):
-            # Flash Attention: Use cu_seqlens for variable length attention
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            # Modification: prefer the int max_seqlen pre-computed once in
+            # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
+            # GPU-side reduction so this method still works when the model forward
+            # has not been patched (e.g. external callers, unit tests).
+            max_seqlen = kwargs.pop("vision_max_seqlen", None)
+            if max_seqlen is None:
+                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -1376,6 +1391,9 @@ class Qwen3_5MoeVisionAttention(nn.Module):
                 **kwargs,
             )
         else:
+            # Modification: drop `vision_max_seqlen` from kwargs before falling through
+            # to the non-FA path so it doesn't reach kernels that don't expect it.
+            kwargs.pop("vision_max_seqlen", None)
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
@@ -1529,7 +1547,14 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
 
         outputs = []
         dtype = self.pos_embed.weight.dtype
-        for t, h, w in grid_thw:
+        # Modification: materialize grid_thw to a CPU list once to eliminate the
+        # per-iteration host-device sync that dominated the training step under
+        # profiling (~3000 implicit `.item()` syncs/step). Iterating a GPU tensor
+        # with `for t, h, w in grid_thw` yields 0-D GPU tensors; using h/w/t as
+        # ints in `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)`
+        # and `combined.expand(t, ...)` forces an implicit `.item()` per call.
+        grid_thw_list = grid_thw.tolist()
+        for t, h, w in grid_thw_list:
             h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
             w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
 
@@ -1662,6 +1687,30 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
             # --- Patch.4 ---
 
+        # --- Patch.5: Pre-compute max_seqlen once on the host ---
+        # `flash_attn_varlen_func` expects `max_seqlen_q/k` as Python ints; passing
+        # a 0-D GPU tensor forces an `.item()` inside the C++ binding. The HF body
+        # of Qwen3_5VisionAttention.forward recomputes `(cu_seqlens[1:] - cu_seqlens[:-1]).max()`
+        # per block, costing one host-device sync per ViT block per micro-batch
+        # (~32 blocks × micro_batches per step). We hoist the computation here so
+        # it happens once per ViT forward and thread the resulting int through
+        # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
+        # picks it up via `vision_max_seqlen` and falls back to the original
+        # recompute when the key is absent (so non-VeOmni callers keep working).
+        # Gate is two-pronged:
+        #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
+        #       only in GPU generated files where the consumer override is
+        #       registered. NPU configs inject False because they reuse upstream
+        #       HF Qwen3_5VisionAttention.forward, which recomputes max_seqlen and
+        #       would leak the unused kwarg into `attention_interface(**kwargs)`.
+        #   (b) `is_flash_attention_requested(self.config)` — only FA's
+        #       `flash_attn_varlen_func` benefits from the int hand-off; eager
+        #       and sdpa paths in the consumer pop+discard the kwarg, so the
+        #       host sync would be wasted.
+        if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
+            kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        # --- Patch.5 ---
+
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
@@ -1769,14 +1818,11 @@ class Qwen3_5MoeCausalLMOutputWithPast(ModelOutput):
 
 # Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+# See qwen3_5_gpu_patch_gen_config.py for why @auto_docstring is skipped.
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Qwen3_5Moe causal language model outputs extended with per-token log-prob fields.
-    """
-)
 class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
-    r"""
+    """``Qwen3_5MoeCausalLMOutputWithPast`` extended with per-token log-prob fields.
+
     log_probs (`torch.FloatTensor`, *optional*):
         Per-token log probabilities returned by VeOmni's fused loss path.
     entropy (`torch.FloatTensor`, *optional*):

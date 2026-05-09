@@ -520,8 +520,13 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
+        # `_tail_pad_len` is internal collator metadata read by EnvironMeter
+        # (already consumed at on_step_begin) and PostCollator/SeqlensCompute
+        # (called in postforward). The HF model would reject it as an unknown
+        # kwarg, so filter at the model call site without mutating micro_batch.
+        model_inputs = {k: v for k, v in micro_batch.items() if k != "_tail_pad_len"}
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            outputs: ModelOutput = self.model(**model_inputs, use_cache=False)
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]

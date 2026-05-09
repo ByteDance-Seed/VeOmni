@@ -119,6 +119,8 @@ veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
 veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
 
+_VEOMNI_VISION_ATTENTION_PATCHED = False
+
 
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
@@ -1356,7 +1358,14 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
 
         outputs = []
         dtype = self.pos_embed.weight.dtype
-        for t, h, w in grid_thw:
+        # Modification: materialize grid_thw to a CPU list once to eliminate the
+        # per-iteration host-device sync that dominated the training step under
+        # profiling (~3000 implicit `.item()` syncs/step). Iterating a GPU tensor
+        # with `for t, h, w in grid_thw` yields 0-D GPU tensors; using h/w/t as
+        # ints in `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)`
+        # and `combined.expand(t, ...)` forces an implicit `.item()` per call.
+        grid_thw_list = grid_thw.tolist()
+        for t, h, w in grid_thw_list:
             h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
             w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
 
@@ -1488,6 +1497,30 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
                 new_cumsum = cu_seqlens[-1] + pad_seq_len
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
             # --- Patch.4 ---
+
+        # --- Patch.5: Pre-compute max_seqlen once on the host ---
+        # `flash_attn_varlen_func` expects `max_seqlen_q/k` as Python ints; passing
+        # a 0-D GPU tensor forces an `.item()` inside the C++ binding. The HF body
+        # of Qwen3_5VisionAttention.forward recomputes `(cu_seqlens[1:] - cu_seqlens[:-1]).max()`
+        # per block, costing one host-device sync per ViT block per micro-batch
+        # (~32 blocks × micro_batches per step). We hoist the computation here so
+        # it happens once per ViT forward and thread the resulting int through
+        # `**kwargs` to every block; the patched Qwen3_5VisionAttention.forward
+        # picks it up via `vision_max_seqlen` and falls back to the original
+        # recompute when the key is absent (so non-VeOmni callers keep working).
+        # Gate is two-pronged:
+        #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
+        #       only in GPU generated files where the consumer override is
+        #       registered. NPU configs inject False because they reuse upstream
+        #       HF Qwen3_5VisionAttention.forward, which recomputes max_seqlen and
+        #       would leak the unused kwarg into `attention_interface(**kwargs)`.
+        #   (b) `is_flash_attention_requested(self.config)` — only FA's
+        #       `flash_attn_varlen_func` benefits from the int hand-off; eager
+        #       and sdpa paths in the consumer pop+discard the kwarg, so the
+        #       host sync would be wasted.
+        if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
+            kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        # --- Patch.5 ---
 
         for blk in self.blocks:
             hidden_states = blk(
@@ -2200,17 +2233,12 @@ class Qwen3_5CausalLMOutputWithPast(ModelOutput):
 # ======================================================================
 
 
-# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
-# ``forward`` (re-used from the GPU config) can return per-token log-probs
-# while preserving ``rope_deltas``. Mirrors the GPU config's helper-after.
+# Mirrors the GPU config's helper-after; see qwen3_5_gpu_patch_gen_config.py
+# for why @auto_docstring is intentionally skipped here.
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
-    """
-)
 class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
-    r"""
+    """``Qwen3_5CausalLMOutputWithPast`` extended with per-token log-prob fields.
+
     log_probs (`torch.FloatTensor`, *optional*):
         Per-token log probabilities returned by VeOmni's fused loss path.
     entropy (`torch.FloatTensor`, *optional*):

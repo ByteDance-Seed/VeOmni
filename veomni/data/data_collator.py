@@ -187,6 +187,15 @@ class PackingCollator(DataCollator):
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
+        if self.sp_enabled and self.pad_to_length:
+            sp_size = get_parallel_state().sp_size
+            assert self.pad_to_length % sp_size == 0, (
+                f"pad_to_length ({self.pad_to_length}) must be divisible by sp_size ({sp_size}); "
+                "otherwise SequenceParallelCollator constant-pads the trailing arange-padded "
+                "position_ids with zeros, splitting the single trailing pad segment back into "
+                "many length-1 segments and re-introducing the cu_seq_lens shape churn that "
+                "_pad_position_ids_with_arange exists to prevent."
+            )
 
     def pad_feature_to_length(
         self,
@@ -223,6 +232,13 @@ class PackingCollator(DataCollator):
         assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
 
         pad_len = self.pad_to_length - seq_len
+        # Side-channel hint for downstream seqlen consumers (PostCollator,
+        # EnvironMeter): the trailing arange-padded segment of cu_seq_lens has
+        # length `pad_len` and must be stripped from "real" seqlens. Always
+        # set when pad_to_length is enabled (even at 0) so readers can rely on
+        # its presence as part of the contract; stripped from model inputs in
+        # BaseTrainer.forward_backward_step and DPO's _NON_MODEL_KEYS filter.
+        batch["_tail_pad_len"] = pad_len
         if pad_len == 0:
             return batch
 
@@ -476,7 +492,8 @@ class PostCollator(DataCollator):
 @dataclass
 class SeqlensComputePostCollator(DataCollator):
     def __call__(self, micro_batch: Dict[str, torch.Tensor]):
-        seq_lens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        pad_len = int(micro_batch.get("_tail_pad_len", 0))
+        seq_lens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"], pad_len=pad_len).tolist()
         return seq_lens
 
 
