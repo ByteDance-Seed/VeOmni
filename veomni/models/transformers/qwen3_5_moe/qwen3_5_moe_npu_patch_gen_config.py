@@ -73,10 +73,9 @@ config = PatchConfig(
     description="Qwen3_5Moe with mojo_opset NPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
 
-config.add_import("copy", names=["copy"])
+config.add_import("copy", is_from_import=False)
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
-config.add_import("torch_npu", names=["torch_npu"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
@@ -124,6 +123,7 @@ config.add_post_import_block(
     from veomni.ops.dispatch import OpSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
+    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "partial")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")

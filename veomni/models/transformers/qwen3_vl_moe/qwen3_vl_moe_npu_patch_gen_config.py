@@ -23,6 +23,8 @@ python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qw
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    apply_rotary_pos_emb_patched,
+    apply_rotary_pos_emb_vision_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
@@ -64,7 +66,6 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3VLMoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
-config.add_import("torch_npu", is_from_import=False)
 
 
 # ================================================================
@@ -165,49 +166,13 @@ config.override_method(
     replacement=qwen3_vl_moe_get_parallel_plan_patched,
     description="Register Qwen3VLMoe expert parallel plan for v5 generated modeling",
 )
-
-
-# ================================================================
-# Patch: apply_rotary_pos_emb -> NPU fused npu_rotary_mul
-# 1. text-side RoPE kernel; identical signature to the upstream
-#    `apply_rotary_pos_emb`, internally uses `torch_npu.npu_rotary_mul`
-# ================================================================
-@config.replace_function(
+config.replace_function(
     "apply_rotary_pos_emb",
-    description="NPU fused rotary pos emb (torch_npu.npu_rotary_mul)",
+    replacement=apply_rotary_pos_emb_patched,
+    description="OpSlot guard for NPU fused RoPE",
 )
-def apply_rotary_pos_emb_npu_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    # --- Patch.1 ---
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)  # noqa: F821 imported via add_import
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)  # noqa: F821 imported via add_import
-    return q_embed.to(q.dtype), k_embed.to(k.dtype)
-    # --- Patch.1 ---
-
-
-# ================================================================
-# Patch: apply_rotary_pos_emb_vision -> NPU fused npu_rotary_mul
-# 1. vision-side RoPE kernel; reshapes to 4D before the NPU call to
-#    satisfy the kernel's rank expectation
-# ================================================================
-@config.replace_function(
+config.replace_function(
     "apply_rotary_pos_emb_vision",
-    description="NPU fused vision rotary pos emb (torch_npu.npu_rotary_mul with 4D reshape)",
+    replacement=apply_rotary_pos_emb_vision_patched,
+    description="OpSlot guard for NPU fused vision RoPE",
 )
-def apply_rotary_pos_emb_vision_npu_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    # --- Patch.1 ---
-    orig_q_shape = q.shape
-    orig_k_shape = k.shape
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q_4d = q.unsqueeze(0).float().contiguous()
-    k_4d = k.unsqueeze(0).float().contiguous()
-    cos_4d = cos.unsqueeze(0).unsqueeze(2).float()
-    sin_4d = sin.unsqueeze(0).unsqueeze(2).float()
-    q_embed_4d = torch_npu.npu_rotary_mul(q_4d, cos_4d, sin_4d)  # noqa: F821 imported via add_import
-    k_embed_4d = torch_npu.npu_rotary_mul(k_4d, cos_4d, sin_4d)  # noqa: F821 imported via add_import
-    q_embed = q_embed_4d.squeeze(0).to(orig_q_dtype).reshape(orig_q_shape)
-    k_embed = k_embed_4d.squeeze(0).to(orig_k_dtype).reshape(orig_k_shape)
-    return q_embed, k_embed
-    # --- Patch.1 ---

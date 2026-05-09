@@ -45,9 +45,8 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    config as qwen3_vl_config,
-)
-from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    apply_rotary_pos_emb_patched,
+    apply_rotary_pos_emb_vision_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
@@ -60,6 +59,9 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_fast_pos_embed_interpolate_patched,
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
+)
+from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    config as qwen3_vl_config,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
@@ -178,6 +180,16 @@ config.override_method(
     replacement=qwen3_vl_get_position_id_func_patched,
     name_map=_NAME_MAP,
     description="Use VeOmni precomputed position-id function and unified multimodal token ids",
+)
+config.replace_function(
+    "apply_rotary_pos_emb",
+    replacement=apply_rotary_pos_emb_patched,
+    description="OpSlot guard for Liger fused RoPE",
+)
+config.replace_function(
+    "apply_rotary_pos_emb_vision",
+    replacement=apply_rotary_pos_emb_vision_patched,
+    description="OpSlot guard for Liger fused vision RoPE",
 )
 
 

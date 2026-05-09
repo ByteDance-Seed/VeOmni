@@ -683,6 +683,7 @@ class TrainingArguments:
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset({"triton"}),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
@@ -692,6 +693,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 _NPU_REQUIRED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "cross_entropy_loss_implementation": frozenset({"npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
@@ -775,6 +777,13 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
+            "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
+        },
+    )
+    rotary_pos_emb_vision_implementation: str = field(
+        default="liger_kernel",
+        metadata={
+            "help": "Rotary positional embedding in vision part. 'liger_kernel' (default, GPU) | "
             "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
         },
     )

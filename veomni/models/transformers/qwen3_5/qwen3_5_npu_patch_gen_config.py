@@ -60,10 +60,9 @@ config = PatchConfig(
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
 
-config.add_import("copy", names=["copy"])
+config.add_import("copy", is_from_import=False)
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
-config.add_import("torch_npu", names=["torch_npu"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
@@ -111,10 +110,12 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
+    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "partial")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
-    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
@@ -123,7 +124,6 @@ config.add_post_import_block(
 
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
-torch_npu = None
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
@@ -163,8 +163,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    q_embed = torch_npu.npu_rotary_mul(q_rot, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k_rot, cos, sin)
+    # Apply rotary embeddings on the first half or full tensor
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
 
     # Concatenate back to full shape
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
@@ -178,12 +179,16 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q, k = q.unsqueeze(0), k.unsqueeze(0)
-    cos = cos.unsqueeze(0).unsqueeze(2).float()
-    sin = sin.unsqueeze(0).unsqueeze(2).float()
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
-    q_embed, k_embed = q_embed.squeeze(0), k_embed.squeeze(0)
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
 
 

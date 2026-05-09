@@ -56,10 +56,9 @@
 #
 # ==============================================================================
 
-from collections.abc import Callable
-
 # Additional imports for patches
-from copy import copy
+import copy
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
@@ -69,7 +68,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from torch_npu import torch_npu
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
@@ -125,6 +123,7 @@ from veomni.ops.dispatch import OpSlot
 
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
+veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "partial")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
@@ -832,8 +831,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    q_embed = torch_npu.npu_rotary_mul(q_rot, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k_rot, cos, sin)
+    # Apply rotary embeddings on the first half or full tensor
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
 
     # Concatenate back to full shape
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
@@ -1313,12 +1313,16 @@ class Qwen3_5MoeVisionPatchMerger(nn.Module):
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q, k = q.unsqueeze(0), k.unsqueeze(0)
-    cos = cos.unsqueeze(0).unsqueeze(2).float()
-    sin = sin.unsqueeze(0).unsqueeze(2).float()
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
-    q_embed, k_embed = q_embed.squeeze(0), k_embed.squeeze(0)
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
 
 

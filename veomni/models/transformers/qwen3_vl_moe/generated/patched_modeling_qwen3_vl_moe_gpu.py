@@ -33,6 +33,10 @@
 #      Return raw image/video placeholder bool masks for VeOmni SP-aware masked_scatter
 #    - method_override: Qwen3VLMoeForConditionalGeneration.get_position_id_func
 #      Use VeOmni precomputed position-id function and unified multimodal token ids
+#    - function_replacement: apply_rotary_pos_emb
+#      OpSlot guard for Liger fused RoPE
+#    - function_replacement: apply_rotary_pos_emb_vision
+#      OpSlot guard for Liger fused vision RoPE
 #    - class_replacement: Qwen3VLMoeTextExperts
 #      Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 #    - method_override: Qwen3VLMoeModel.forward
@@ -63,7 +67,6 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import (
     use_kernel_forward_from_hub,
-    use_kernel_func_from_hub,
     use_kernelized_func,
 )
 from transformers.masking_utils import create_causal_mask
@@ -114,6 +117,8 @@ from veomni.utils.model_outputs import (
 
 veomni_rms_norm = OpSlot("rms_norm", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # These are bound at model-build time by _bind_veomni_ops() in auto.py.
@@ -428,25 +433,23 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-@use_kernel_func_from_hub("rotary_pos_emb")
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb
+# Reason: OpSlot guard for Liger fused RoPE
+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
+# ======================================================================
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -673,9 +676,15 @@ class Qwen3VLMoeVisionRotaryEmbedding(nn.Module):
         return freqs
 
 
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
+# Reason: OpSlot guard for Liger fused vision RoPE
+# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
+# ======================================================================
+# ── Vision Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()

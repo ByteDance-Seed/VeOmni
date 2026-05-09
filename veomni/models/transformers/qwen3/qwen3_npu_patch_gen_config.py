@@ -53,7 +53,6 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3CausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
-config.add_import("torch_npu", is_from_import=False)
 
 
 # ── RMSNorm (OpSlot guard, functional NPU kernel) ──────────────────────────
