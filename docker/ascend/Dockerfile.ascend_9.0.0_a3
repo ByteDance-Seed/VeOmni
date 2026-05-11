@@ -1,5 +1,8 @@
 FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-ubuntu22.04-py3.11
 
+# Set default pip index
+ARG PIP_INDEX=https://pypi.org/simple
+
 # Define environments
 ENV MAX_JOBS=16
 ENV PIP_ROOT_USER_ACTION=ignore

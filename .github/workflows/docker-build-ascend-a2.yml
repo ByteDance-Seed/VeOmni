@@ -123,7 +123,7 @@ jobs:
         id: version
         run: |
           BRANCH_NAME=$(echo "${{ github.ref }}" | sed -E 's/^refs\/(heads|tags)\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
-          BASE_NAME="${{ steps.base_image.outputs.new_image_name }}"
+          BASE_IMAGE_NAME="${{ steps.base_image.outputs.new_image_name }}"
           QUAY_REPO="quay.io/ascend/veomni"
           if [ "${{ github.event_name }}" = "release" ]; then
             RELEASE_TAG="${{ github.event.release.tag_name }}"
@@ -144,9 +144,9 @@ jobs:
             fi
             echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
           elif [ "$BRANCH_NAME" = "main" ]; then
-            echo "tag=$BASE_NAME-latest" >> "$GITHUB_OUTPUT"
+            echo "tag=$BASE_IMAGE_NAME-latest" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=$BASE_NAME-$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+            echo "tag=$BASE_IMAGE_NAME-$BRANCH_NAME" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Login to Quay
