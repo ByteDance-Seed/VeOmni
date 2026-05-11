@@ -7,7 +7,7 @@ on:
     paths:
       - "docker/ascend/Dockerfile.ascend_9.0.0_a2.x86"
       - "docker/ascend/Dockerfile.ascend_9.0.0_a2.arm"
-      - ".github/workflows/docker-build-ascend-a2-double.yml"
+      - ".github/workflows/docker-build-ascend-a2.yml"
   release:
     types: [ published ]
 

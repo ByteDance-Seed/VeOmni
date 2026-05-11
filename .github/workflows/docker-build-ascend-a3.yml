@@ -91,7 +91,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/arm64  # 🔥 A3 是 arm64 架构！
+          platforms: linux/arm64
           file: ./docker/ascend/Dockerfile.ascend_9.0.0_a3
           push: true
           tags: |
