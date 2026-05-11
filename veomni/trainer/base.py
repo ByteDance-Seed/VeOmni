@@ -84,6 +84,11 @@ from .callbacks import (
 
 logger = logging.get_logger(__name__)
 
+# Collator-produced keys that are metadata for VeOmni internals (EnvironMeter,
+# PostCollator/SeqlensCompute) and must not be forwarded to the HF model, which
+# would reject them as unknown kwargs.
+_NON_MODEL_KEYS = {"_tail_pad_len"}
+
 
 class BaseTrainer(Stateful, ABC):
     """
@@ -472,11 +477,10 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
-        # `_tail_pad_len` is internal collator metadata read by EnvironMeter
-        # (already consumed at on_step_begin) and PostCollator/SeqlensCompute
-        # (called in postforward). The HF model would reject it as an unknown
-        # kwarg, so filter at the model call site without mutating micro_batch.
-        model_inputs = {k: v for k, v in micro_batch.items() if k != "_tail_pad_len"}
+        # Drop collator-internal metadata (e.g. `_tail_pad_len`, consumed by
+        # EnvironMeter at on_step_begin and PostCollator/SeqlensCompute in
+        # postforward) before the model call without mutating micro_batch.
+        model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             outputs: ModelOutput = self.model(**model_inputs, use_cache=False)
 
