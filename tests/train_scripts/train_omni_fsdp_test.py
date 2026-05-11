@@ -1,17 +1,20 @@
 """
-Two-model FSDP pipeline test script.
+Two-model FSDP pipeline test using VeOmni infrastructure.
 
-Scenario: ModelA (encoder) and ModelB (decoder/LLM) are separately FSDP2-wrapped.
-Data flows: input → A.forward() → hidden → B.forward(hidden) → loss.
-Verifies:
-  - Backward propagates through both FSDP models correctly.
-  - Both models receive non-zero, finite gradients.
-  - Optimizer states are populated for both models.
-  - Grad norm is finite and positive after each step.
+Scenario: two independently-FSDP2-wrapped models (encoder → LLM).
+Tests that gradient flows correctly through both models and that
+VeOmni's optimizer + LR scheduler work end-to-end.
+
+VeOmni infrastructure used:
+  - init_parallel_state()       — distributed setup + FSDP mesh
+  - build_parallelize_model()   — FSDP2 / no-op wrapping per model
+  - build_optimizer()           — AdamW over combined param set
+  - build_lr_scheduler()        — constant+warmup schedule
+  - veomni_clip_grad_norm()     — FSDP2-aware gradient clipping
 
 Run with torchrun:
     torchrun --nproc_per_node=2 tests/train_scripts/train_omni_fsdp_test.py
-    torchrun --nproc_per_node=1 tests/train_scripts/train_omni_fsdp_test.py  (single GPU)
+    torchrun --nproc_per_node=1 tests/train_scripts/train_omni_fsdp_test.py
 """
 
 import json
@@ -21,225 +24,195 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributed._composable.fsdp import fully_shard
+from transformers import LlamaConfig, LlamaForCausalLM, LlamaModel
+
+from veomni.arguments import MixedPrecisionConfig
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
+from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.torch_parallelize import build_parallelize_model
+from veomni.optim import build_lr_scheduler, build_optimizer
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 os.environ.setdefault("NCCL_DEBUG", "OFF")
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Toy models
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ── Toy model dimensions ──────────────────────────────────────────────────────
 HIDDEN = 64
 SEQ_LEN = 32
-VOCAB = 256
+VOCAB = 512
 BATCH = 2
+MAX_STEPS = 3
+LR = 1e-3
 
 
-class ToyEncoder(nn.Module):
-    """Simulates a vision / audio encoder producing hidden states."""
-
-    _no_split_modules = ["ToyEncoderLayer"]
-
-    def __init__(self):
-        super().__init__()
-        self.layers = nn.ModuleList([ToyEncoderLayer() for _ in range(2)])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-
-class ToyEncoderLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc = nn.Linear(HIDDEN, HIDDEN)
-        self.norm = nn.LayerNorm(HIDDEN)
-
-    def forward(self, x):
-        return self.norm(F.gelu(self.fc(x)))
-
-
-class ToyLLM(nn.Module):
-    """Simulates a causal LLM that accepts optional encoder context.
-
-    The encoder's mean-pooled representation is *added* to every token
-    embedding so that gradients flow back to the encoder on all steps.
-    """
-
-    _no_split_modules = ["ToyLLMLayer"]
-
-    def __init__(self):
-        super().__init__()
-        self.embed = nn.Embedding(VOCAB, HIDDEN)
-        self.layers = nn.ModuleList([ToyLLMLayer() for _ in range(2)])
-        self.lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        encoder_hidden: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
-    ) -> dict:
-        x = self.embed(input_ids)  # (B, T, HIDDEN)
-        if encoder_hidden is not None:
-            # Add mean-pooled encoder context to every token position.
-            # This ensures encoder gradients flow through the loss.
-            ctx = encoder_hidden.mean(dim=1, keepdim=True)  # (B, 1, HIDDEN)
-            x = x + ctx
-        for layer in self.layers:
-            x = layer(x)
-        logits = self.lm_head(x)  # (B, T, V)
-
-        loss = None
-        if labels is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, VOCAB),
-                labels.reshape(-1),
-                ignore_index=-100,
-            )
-        return {"loss": loss, "logits": logits}
-
-
-class ToyLLMLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc = nn.Linear(HIDDEN, HIDDEN)
-        self.norm = nn.LayerNorm(HIDDEN)
-
-    def forward(self, x):
-        return self.norm(F.gelu(self.fc(x)) + x)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FSDP2 wrapping helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def wrap_fsdp2(model: nn.Module, mesh=None) -> nn.Module:
-    """Apply FSDP2 fully_shard to leaf layers first, then to the root."""
-    kwargs = {} if mesh is None else {"mesh": mesh}
-    for layer in model.modules():
-        cls_name = type(layer).__name__
-        no_split = getattr(model, "_no_split_modules", [])
-        if cls_name in no_split and layer is not model:
-            fully_shard(layer, **kwargs)
-    fully_shard(model, **kwargs)
-    return model
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Gradient norm utility (works for both FSDP2 and plain modules)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def compute_grad_norm(model: nn.Module) -> float:
-    total = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            g = p.grad
-            if hasattr(g, "to_local"):
-                g = g.to_local()
-            total += g.detach().float().norm() ** 2
-    return math.sqrt(total)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main training loop
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def main():
-    # ── distributed init ──────────────────────────────────────────────
-    if not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(device) if torch.cuda.is_available() else None
-
-    # ── build models ──────────────────────────────────────────────────
-    encoder = ToyEncoder().to(device)
-    llm = ToyLLM().to(device)
-
-    # ── FSDP2 wrapping (only when multi-GPU) ──────────────────────────
-    fsdp_enabled = world_size > 1 and torch.cuda.is_available()
-    if fsdp_enabled:
-        from torch.distributed.device_mesh import init_device_mesh
-
-        mesh = init_device_mesh("cuda", (world_size,))
-        encoder = wrap_fsdp2(encoder, mesh)
-        llm = wrap_fsdp2(llm, mesh)
-        if rank == 0:
-            print(f"[FSDP2] world_size={world_size}, mesh={mesh}")
-    else:
-        if rank == 0:
-            print("[Single-GPU] FSDP2 wrapping skipped.")
-
-    # ── optimizer (covers both models) ────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(llm.parameters()),
-        lr=1e-3,
+def _tiny_llama_config(**extra) -> LlamaConfig:
+    """Return a minimal LlamaConfig for use in tests."""
+    return LlamaConfig(
+        hidden_size=HIDDEN,
+        intermediate_size=HIDDEN * 4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        vocab_size=VOCAB,
+        max_position_embeddings=128,
+        **extra,
     )
 
-    # ── training loop ─────────────────────────────────────────────────
-    results = {"loss": [], "grad_norm_encoder": [], "grad_norm_llm": [], "optimizer_state_ok": []}
+
+# ── Combined module container ─────────────────────────────────────────────────
+
+
+class CombinedModels(nn.Module):
+    """Thin nn.Module container so build_optimizer sees all parameters at once."""
+
+    def __init__(self, encoder: nn.Module, llm: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+        self.llm = llm
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    # ── Distributed init ──────────────────────────────────────────────────────
+    if not dist.is_initialized():
+        dist.init_process_group(backend=get_dist_comm_backend())
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+
+    device_type = get_device_type()
+    get_torch_device().set_device(f"{device_type}:{local_rank}")
+    device = torch.device(f"{device_type}:{local_rank}")
+
+    # ── VeOmni parallel state (FSDP2 mesh when multi-GPU, plain DDP otherwise) ─
+    fsdp_enabled = world_size > 1
+    dp_mode = "fsdp2" if fsdp_enabled else "ddp"
+    init_device = "meta" if fsdp_enabled else device_type
+
+    init_parallel_state(
+        dp_size=world_size,
+        dp_mode=dp_mode,
+    )
+
+    # ── Build two tiny HuggingFace models ─────────────────────────────────────
+    # FSDP2 requires models on "meta"; single-GPU path materialises on device.
+    enc_cfg = _tiny_llama_config()
+    llm_cfg = _tiny_llama_config()
+
+    if init_device == "meta":
+        encoder: nn.Module = LlamaModel(enc_cfg).to("meta")
+        llm: nn.Module = LlamaForCausalLM(llm_cfg).to("meta")
+    else:
+        torch.manual_seed(42)
+        encoder = LlamaModel(enc_cfg).to(device)
+        llm = LlamaForCausalLM(llm_cfg).to(device)
+
+    # ── VeOmni parallelize (FSDP2 or no-op) ──────────────────────────────────
+    # Mixed precision disabled to keep numerics simple for this test.
+    no_mp = MixedPrecisionConfig(enable=False)
+
+    encoder = build_parallelize_model(
+        encoder,
+        init_device=init_device,
+        weights_path=None,
+        mixed_precision=no_mp,
+        enable_gradient_checkpointing=False,
+        basic_modules=["LlamaDecoderLayer"],
+    )
+    llm = build_parallelize_model(
+        llm,
+        init_device=init_device,
+        weights_path=None,
+        mixed_precision=no_mp,
+        enable_gradient_checkpointing=False,
+        basic_modules=["LlamaDecoderLayer"],
+    )
+    encoder.train()
+    llm.train()
+
+    # ── Combined container for optimizer ─────────────────────────────────────
+    combined = CombinedModels(encoder, llm)
+
+    # ── VeOmni optimizer + LR scheduler ──────────────────────────────────────
+    optimizer = build_optimizer(combined, lr=LR, weight_decay=1e-2, fused=False)
+    lr_scheduler = build_lr_scheduler(optimizer, train_steps=MAX_STEPS, lr=LR)
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    results = {
+        "loss": [],
+        "grad_norm_encoder": [],
+        "grad_norm_llm": [],
+        "lr": [],
+    }
 
     torch.manual_seed(42 + rank)
-    for step in range(3):
+    for step in range(MAX_STEPS):
         optimizer.zero_grad()
 
-        # Dummy batch
-        pixel_values = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=device)
+        # Dummy batch on device
         input_ids = torch.randint(0, VOCAB, (BATCH, SEQ_LEN), device=device)
         labels = input_ids.clone()
 
-        # ── forward through encoder (A), then LLM (B) ────────────────
-        encoder_hidden = encoder(pixel_values)  # [B, SEQ_LEN, HIDDEN]
-        out = llm(input_ids=input_ids, encoder_hidden=encoder_hidden, labels=labels)
-        loss = out["loss"]
+        # ── Forward: encoder → LLM ─────────────────────────────────────────
+        # encoder produces hidden states for each token position (B, T, HIDDEN).
+        # We pass them directly as inputs_embeds to the LLM, bypassing its own
+        # embedding lookup — this is the correct pattern for FSDP2 chaining:
+        # each model's sub-modules are only accessed inside its own forward().
+        enc_out = encoder(input_ids=input_ids)  # LlamaBaseModelOutput
+        hidden = enc_out.last_hidden_state  # (B, T, HIDDEN) — plain tensor
 
-        # ── backward ─────────────────────────────────────────────────
+        llm_out = llm(inputs_embeds=hidden, labels=labels)
+        loss = llm_out.loss
+
+        # ── Backward ──────────────────────────────────────────────────────
         loss.backward()
 
-        # ── grad norms ───────────────────────────────────────────────
-        gnorm_enc = compute_grad_norm(encoder)
-        gnorm_llm = compute_grad_norm(llm)
+        # ── VeOmni grad norm (FSDP2-aware) ────────────────────────────────
+        grad_norm = veomni_clip_grad_norm(combined, max_norm=1.0)
+
+        # Per-model norms for reporting
+        def _model_grad_norm(model: nn.Module) -> float:
+            total = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    g = p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
+                    total += g.detach().float().norm() ** 2
+            return math.sqrt(total)
+
+        gnorm_enc = _model_grad_norm(encoder)
+        gnorm_llm = _model_grad_norm(llm)
 
         optimizer.step()
+        lr_scheduler.step()
 
-        # ── optimizer state check (after first step) ─────────────────
-        opt_ok = len(optimizer.state) > 0
-
+        cur_lr = lr_scheduler.get_last_lr()[0]
         loss_val = loss.item()
+
         if rank == 0:
             print(
-                f"step {step}: loss={loss_val:.4f}  "
-                f"grad_norm_encoder={gnorm_enc:.4f}  "
-                f"grad_norm_llm={gnorm_llm:.4f}  "
-                f"optimizer_state_ok={opt_ok}"
+                f"step {step}:  loss={loss_val:.4f}  "
+                f"grad_norm={grad_norm:.4f}  "
+                f"gnorm_enc={gnorm_enc:.4f}  gnorm_llm={gnorm_llm:.4f}  "
+                f"lr={cur_lr:.2e}"
             )
             results["loss"].append(loss_val)
             results["grad_norm_encoder"].append(gnorm_enc)
             results["grad_norm_llm"].append(gnorm_llm)
-            results["optimizer_state_ok"].append(opt_ok)
+            results["lr"].append(cur_lr)
 
-    # ── assertions ────────────────────────────────────────────────────
+    # ── Assertions ────────────────────────────────────────────────────────────
     if rank == 0:
-        for step_i, (gne, gnl, opt_ok) in enumerate(
-            zip(results["grad_norm_encoder"], results["grad_norm_llm"], results["optimizer_state_ok"])
-        ):
-            assert math.isfinite(gne) and gne > 0, f"step {step_i}: encoder grad_norm={gne} is bad"
-            assert math.isfinite(gnl) and gnl > 0, f"step {step_i}: llm grad_norm={gnl} is bad"
-            assert opt_ok, f"step {step_i}: optimizer state is empty"
-        print("\n[PASS] All assertions passed: both FSDP models receive valid gradients.")
+        for i, (gne, gnl) in enumerate(zip(results["grad_norm_encoder"], results["grad_norm_llm"])):
+            assert math.isfinite(gne) and gne > 0, f"step {i}: encoder grad_norm={gne}"
+            assert math.isfinite(gnl) and gnl > 0, f"step {i}: llm grad_norm={gnl}"
+        assert len(optimizer.state) > 0, "optimizer state is empty"
+        print("\n[PASS] All assertions passed.")
 
-        # ── save results for pytest ───────────────────────────────────
+        # Save results for the pytest wrapper
         output_dir = os.environ.get("OMNI_FSDP_OUTPUT_DIR", "/tmp/omni_fsdp_test")
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "results.json"), "w") as f:
