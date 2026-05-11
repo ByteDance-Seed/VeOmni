@@ -107,8 +107,9 @@ def _full_state_dict(model: nn.Module, ep_group=None) -> dict:
 def _seed_all(seed: int, device: torch.device) -> None:
     """Re-seed CPU and the active accelerator generator before init."""
     torch.manual_seed(seed)
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    device_backend = get_torch_device()
+    if device.type == get_device_type() and hasattr(device_backend, "manual_seed_all"):
+        device_backend.manual_seed_all(seed)
 
 
 def _force_reinit(model: nn.Module, seed: int, device: torch.device) -> None:
@@ -375,8 +376,9 @@ def _run_qwen3_moe(use_zero_comm: bool) -> None:
             fsdp_state[name] = p.detach().cpu()
 
     del model, opt, name_to_param, muon_params
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    device_backend = get_torch_device()
+    if hasattr(device_backend, "empty_cache"):
+        device_backend.empty_cache()
 
     if rank == 0:
         golden = _qwen3_moe_golden_state(device, full_shapes)

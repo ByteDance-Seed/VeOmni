@@ -123,6 +123,9 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
+      - name: Run Muon optimizer tests
+        run: |
+          uv run --frozen pytest -s -x tests/optim
 
   gpu_unit_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
