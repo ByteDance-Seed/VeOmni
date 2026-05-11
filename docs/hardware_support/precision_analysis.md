@@ -55,7 +55,7 @@ seed_all(mode=True)
 Or use this custom implementation:
 
 ```python
-def seed_all(seed=42, mode=True, is_gpu=True):
+def seed_all(seed=42, mode=True, is_gpu=False):
     print("======================seed_all=============================")
     import random
     import numpy as np
@@ -90,7 +90,7 @@ if __name__ == "__main__":
 
 ### Overall Network Loss Comparison
 
-Compare the Loss curves between NPU and GPU using tools like the [Training Log Parser](https://traininglogparser.openx.huawei.com).
+Compare the Loss curves between NPU and GPU.
 
 **Judgment Criteria**:
 - If the Loss difference is within an acceptable range (e.g., <1%), precision is basically up to standard.

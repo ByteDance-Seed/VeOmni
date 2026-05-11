@@ -4,7 +4,7 @@ Performance optimization is a critical step when training models on Ascend NPUs.
 
 ## Profiling Collection Configuration and Description
 
-VeOmni's profiling configuration is located under the `train.profile.*` namespace, defined by the `ProfileConfig` class in `veomni/arguments/arguments_types.py` (lines 115-156).
+VeOmni's profiling configuration is located under the `train.profile.*` namespace, defined by the `ProfileConfig` class in `veomni/arguments/arguments_types.py` .
 
 ### Configuration Item Description
 
