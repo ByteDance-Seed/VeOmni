@@ -12,8 +12,8 @@ on:
 
 jobs:
   build-ascend-image-a3:
-    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'ByteDance-Seed' }}
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'phdddd' }}
+    runs-on: ubuntu-22.04-arm
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-build-ascend-image-a3
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -100,3 +100,4 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             BUILDKIT_INLINE_CACHE=1
+            PIP_INDEX=https://pypi.org/simple

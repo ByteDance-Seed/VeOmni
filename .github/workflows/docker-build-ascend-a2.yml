@@ -13,7 +13,7 @@ on:
 
 env:
   QUAY_REPO: quay.io/ascend/veomni
-  CACHE_REPO: ghcr.io/bytedance-seed/veomni
+  CACHE_REPO: ghcr.io/phdddd/veomni
   ARTIFACT_PREFIX: digests-a2
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -24,7 +24,7 @@ jobs:
     permissions:
       packages: write
       contents: read
-    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'ByteDance-Seed' }}
+    if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'phdddd' }}
     strategy:
       matrix:
         include:
