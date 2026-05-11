@@ -115,8 +115,8 @@ def parallel_load_safetensors(
                 shard_states[param_name] = 0
 
     # load lora weights if using lora peft
-    parameter_name = next(model.named_parameters())[0]
-    if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
+    is_peft_model = any(n.startswith("base_model.") for n, _ in model.named_parameters())
+    if is_peft_model:  # using lora peft will add prefix "base_model"
         adapter_path = kwargs.pop("adapter_path", None)
         shard_states = load_peft_shard_states(model, adapter_path, shard_states)
 

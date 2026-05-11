@@ -365,7 +365,7 @@ class BaseTrainer(Stateful, ABC):
         if bool(args.model.lora_config):
             lora_adapter_path = args.model.lora_config.get("lora_adapter", None)
             kwargs["adapter_path"] = lora_adapter_path
-
+            kwargs["is_peft_model"] = True
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,

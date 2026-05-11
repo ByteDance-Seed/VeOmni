@@ -311,7 +311,8 @@ def load_model_weights(
     # Maps bare base-model param names to PEFT-namespaced FQNs, e.g.:
     #   "layers.0.self_attn.q_proj.weight" -> "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
     # Keys not found in the map receive a plain "base_model.model." prefix.
-    is_peft_model = next(model.named_parameters())[0].startswith("base_model.")
+    is_peft_model = kwargs.get("is_peft_model", False)
+    adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
         from ..utils.lora_utils import build_lora_key_overrides
 
@@ -348,12 +349,13 @@ def load_model_weights(
         for result in converter.finalize():
             _dispatch_kv(result.name, result.tensor)
 
-    if is_peft_model and kwargs.get("adapter_path") is not None:
+    if is_peft_model and adapter_path:
+        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
         from ..utils.lora_utils import load_lora_model_weights
 
         load_lora_model_weights(
             model,
-            kwargs.get("adapter_path"),
+            adapter_path,
             init_device,
             dtensor_factory,
             parameter_names_to_load=parameter_names_to_load,
@@ -393,7 +395,8 @@ def rank0_load_and_broadcast_weights(
     # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
     # non-lora-layer: xxx.xxx -> base_model.model.xxx.xxx
     # lora-layer: xxx.xxx.weight -> base_model.model.xxx.xxx.base_layer.weight
-    is_peft_model = next(model.named_parameters())[0].startswith("base_model.")
+    is_peft_model = kwargs.get("is_peft_model", False)
+    adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
         from ..utils.lora_utils import build_lora_key_overrides
 
@@ -716,12 +719,13 @@ def rank0_load_and_broadcast_weights(
                 raise RuntimeError("Received incomplete broadcast metadata from finalize.")
             _broadcast_and_dispatch(name, shape, dtype, tensor)
 
-    if is_peft_model and kwargs.get("adapter_path") is not None:
+    if is_peft_model and adapter_path:
+        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
         from ..utils.lora_utils import rank0_load_and_broadcast_adapter_weights
 
         rank0_load_and_broadcast_adapter_weights(
             model,
-            kwargs.get("adapter_path"),
+            adapter_path,
             init_device,
             dtensor_factory,
             parameter_names_to_load=parameter_names_to_load,

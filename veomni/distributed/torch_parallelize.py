@@ -566,9 +566,13 @@ def parallelize_model_fsdp2(
         from torch.distributed.tensor import distribute_tensor
 
         logger.info_rank0(f"starting to load model weights from {weights_path}...")
+        is_peft_model = kwargs.pop("is_peft_model", False)
         adapter_path = kwargs.pop("adapter_path", None)
-        if adapter_path is not None:
-            logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
+        if is_peft_model:
+            if adapter_path is not None:
+                logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
+            else:
+                logger.info_rank0("also init peft model lora weights...")
 
         if kwargs.get("broadcast_model_weights_from_rank0"):
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
@@ -579,6 +583,7 @@ def parallelize_model_fsdp2(
                 dtensor_factory=distribute_tensor,
                 cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
                 max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+                is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
             )
         else:
@@ -588,6 +593,7 @@ def parallelize_model_fsdp2(
                 weights_path,
                 get_device_type(),
                 dtensor_factory=distribute_tensor,
+                is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
             )
 
