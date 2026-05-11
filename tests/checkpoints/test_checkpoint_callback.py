@@ -37,7 +37,6 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
         checkpoint=checkpoint_cfg,
         accelerator=accelerator,
         global_rank=0,
-        train_architecture="text",
     )
     model_cfg = SimpleNamespace(fqn_to_index_mapping={})
     args = SimpleNamespace(train=train_cfg, model=model_cfg)

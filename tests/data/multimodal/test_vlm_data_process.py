@@ -139,13 +139,29 @@ def load_veomni_processor(model_path):
 
 def load_veomni_model(config_path, device):
     """Build and return the veomni model for testing."""
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    # Pin every per-op field to eager so the test builds without liger /
+    # triton / fla; FA2 is needed for varlen multimodal forward.
+    eager_ops = OpsImplementationConfig(
+        attn_implementation="flash_attention_2",
+        moe_implementation="eager",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+        rms_norm_gated_implementation="eager",
+        causal_conv1d_implementation="eager",
+        chunk_gated_delta_rule_implementation="eager",
+    )
     print(f"\n[Setup] Building veomni model on device: {device}")
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
         torch_dtype="bfloat16",
-        attn_implementation="flash_attention_2",
         init_device=device,
+        ops_implementation=eager_ops,
     )
     model.eval()
     return model

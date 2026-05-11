@@ -61,6 +61,10 @@ config = PatchConfig(
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
+# Propagate the GPU config's dropped imports (e.g. ``Qwen3VLMoeCausalLMOutputWithPast``,
+# now superseded by ``Qwen3VLMoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
+# pre-backward unshard hook on ``lm_head``).
+config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.add_import("torch_npu", is_from_import=False)
 
 

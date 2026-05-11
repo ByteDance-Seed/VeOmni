@@ -154,11 +154,16 @@ class OptimizerState(Stateful):
 
     Args:
         optimizer (Optimizer): optimizer to wrap.
+        fill_missing_optimizer_states (bool): When True (save path), synthesize zero-filled
+            placeholder states for params that never received a gradient (e.g. weights on
+            unused modalities). This prevents DCP strict-load failures at resume time when those
+            entries are expected but absent. Should be False on the load path (default).
     """
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, *, fill_missing_optimizer_states: bool = False):
         self.model = model
         self.optimizer = optimizer
+        self.fill_missing_optimizer_states = fill_missing_optimizer_states
         # Similar to ModelState, OptimizerState also need to be ExtraParallel+FSDP2 aware
         self.parallel_state = get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
@@ -184,6 +189,76 @@ class OptimizerState(Stateful):
 
         # Single torch optimizer
         sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
+        if self.fill_missing_optimizer_states:
+            sd = self._fill_missing_optimizer_states(sd)
+        return sd
+
+    def _fill_missing_optimizer_states(self, sd):
+        """Ensure every optimizer param has state entries in the state dict.
+
+        Adam/AdamW creates state lazily on first ``step()`` with a non-None
+        gradient.  Params that never received a gradient (e.g. LoRA on unused
+        modalities) will have no state.  Additionally, ``get_optimizer_state_dict``
+        deduplicates aliased parameters (same ``id()``), emitting only one
+        canonical FQN per unique tensor.  DCP strict load fails when these
+        entries are absent at resume time.
+
+        We enumerate expected FQNs directly from the raw optimizer param_groups
+        + model FQN mapping, bypassing any dedup that ``get_optimizer_state_dict``
+        may have performed.
+        """
+        if "state" not in sd or not isinstance(sd["state"], dict):
+            return sd
+
+        optim_fqns = set(sd["state"].keys())
+
+        # Build expected FQNs from raw optimizer param_groups, not from the
+        # already-deduped sd["param_groups"].
+        optim_param_ids = set()
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                optim_param_ids.add(id(p))
+
+        fqn_to_param = {}
+        for fqn, param in self.model.named_parameters():
+            if id(param) in optim_param_ids:
+                fqn_to_param[fqn] = param
+
+        expected_fqns = set(fqn_to_param.keys())
+        missing = expected_fqns - optim_fqns
+
+        if not missing:
+            return sd
+
+        if not sd["state"]:
+            logger.warning_rank0(
+                "OptimizerState: state dict is empty, cannot create template for missing optimizer states"
+            )
+            return sd
+
+        template_fqn = next(iter(sd["state"]))
+        template = sd["state"][template_fqn]
+
+        for fqn in missing:
+            param = fqn_to_param[fqn]
+            placeholder = {}
+            for key, val in template.items():
+                if isinstance(val, torch.Tensor):
+                    if val.ndim == 0:
+                        placeholder[key] = torch.zeros_like(val)
+                    else:
+                        placeholder[key] = torch.zeros_like(param.data, dtype=val.dtype, device=val.device)
+                elif isinstance(val, (int, float)):
+                    placeholder[key] = type(val)(0)
+                else:
+                    placeholder[key] = val
+            sd["state"][fqn] = placeholder
+
+        logger.info_rank0(
+            f"OptimizerState: filled default state for {len(missing)} param(s) "
+            f"without optimizer state (no gradient received or aliased): "
+            f"{sorted(missing)}"
+        )
         return sd
 
     def load_state_dict(self, state_dict):
@@ -365,7 +440,9 @@ class DistributedCheckpointer(CheckpointerBase):
 
         save_state = {"model": ModelState(state["model"])}
         if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+            save_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], fill_missing_optimizer_states=True
+            )  # type: ignore[index]
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)

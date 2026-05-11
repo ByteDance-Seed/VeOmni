@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import yaml
+from tools import resolve_ops_overrides
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from transformers import PretrainedConfig
@@ -849,6 +850,8 @@ def build_command():
         "--train.dyn_bsz_runtime=worker",
         "--train.bsz_warmup_ratio=0",
         "--train.max_steps=6",
+        # Hardware-aware ops_implementation overrides; see test_datasets.py.
+        *resolve_ops_overrides(None),
     ]
     return command
 

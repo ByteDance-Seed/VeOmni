@@ -6,8 +6,10 @@ import torch
 from transformers import AutoTokenizer, TextStreamer
 
 from veomni.arguments import InferArguments, parse_args
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import build_foundation_model
 from veomni.utils import helper
+from veomni.utils.import_utils import is_flash_attn_2_available
 
 
 logger = helper.create_logger(__name__)
@@ -18,12 +20,33 @@ class Arguments:
     infer: "InferArguments" = field(default_factory=InferArguments)
 
 
+# Inference doesn't need fused training kernels — pin every per-op field to
+# eager. ``attn_implementation`` falls back to eager on hosts without
+# flash-attn so CPU / minimal-deps environments don't crash.
+_INFERENCE_OPS = OpsImplementationConfig(
+    attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "eager",
+    moe_implementation="eager",
+    cross_entropy_loss_implementation="eager",
+    rms_norm_implementation="eager",
+    swiglu_mlp_implementation="eager",
+    rotary_pos_emb_implementation="eager",
+    load_balancing_loss_implementation="eager",
+    rms_norm_gated_implementation="eager",
+    causal_conv1d_implementation="eager",
+    chunk_gated_delta_rule_implementation="eager",
+)
+
+
 def main() -> None:
     args = parse_args(Arguments)
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     helper.set_seed(args.infer.seed)
     helper.enable_third_party_logging()
-    model = build_foundation_model(config_path=args.infer.model_path, weights_path=args.infer.model_path)
+    model = build_foundation_model(
+        config_path=args.infer.model_path,
+        weights_path=args.infer.model_path,
+        ops_implementation=_INFERENCE_OPS,
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.infer.tokenizer_path, padding_side="left")
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     logger.info("tips: use `clear` to remove the history, use `exit` to exit the conversation.")

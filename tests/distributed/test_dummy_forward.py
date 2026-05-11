@@ -145,6 +145,8 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     from veomni.models.auto import build_foundation_model
     from veomni.utils.device import get_device_type
 
+    from ..tools.training_utils import make_eager_ops_config
+
     _apply_patches()
 
     # Tight NCCL timeout so a missing dummy_forward fails fast instead of hanging
@@ -160,8 +162,8 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
-        attn_implementation="eager",
         init_device="meta",
+        ops_implementation=make_eager_ops_config(),
     )
     model.train()
 

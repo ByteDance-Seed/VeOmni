@@ -30,46 +30,73 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs  # noqa: F401  re-emitted into generated file
 
 
 config = PatchConfig(
     source_module="transformers.models.qwen2.modeling_qwen2",
     target_file="patched_modeling_qwen2_gpu.py",
-    description="Qwen2 with LigerKernel GPU replacements",
+    description="Qwen2 with OpSlot-based GPU kernel replacements",
 )
+
+# Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
+# ``forward`` can return per-token log-probs in the unified output dataclass.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
 
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+    veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     """
 )
 
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen2RMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNorm",
-        description="Use LigerKernel RMSNorm",
-    )
+# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+
+
+@config.override_method(
+    "Qwen2RMSNorm.forward",
+    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
 )
+def qwen2_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+    # Original HF code below, unchanged.
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states.to(input_dtype)
 
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen2MLP",
-        replacement_module="liger_kernel.transformers.swiglu",
-        replacement_name="LigerSwiGLUMLP",
-        description="Use LigerKernel SwiGLU MLP",
-    )
+
+# ── SwiGLU MLP (OpSlot guard, functional Liger kernel) ───────────────────────
+
+
+@config.override_method(
+    "Qwen2MLP.forward",
+    description="OpSlot guard for Liger fused SwiGLU MLP",
 )
+def qwen2_mlp_forward_patched(self, x):
+    # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
+    if veomni_swiglu_mlp.use_non_eager_impl:
+        return veomni_swiglu_mlp(self, x)
+    # Original HF code below, unchanged.
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return down_proj
 
 
-@config.replace_function("apply_rotary_pos_emb", description="Use LigerKernel rotary embedding")
-def apply_rotary_pos_emb_liger(
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+
+
+@config.replace_function("apply_rotary_pos_emb", description="OpSlot guard for Liger fused RoPE")
+def apply_rotary_pos_emb_patched(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -77,16 +104,19 @@ def apply_rotary_pos_emb_liger(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+
+# Dummy reference resolved at codegen time from the generated module.
+rotate_half = None  # noqa: E305
 
 
 @config.override_method("Qwen2Model.forward", description="Support SP in Qwen2Model.forward")
@@ -190,10 +220,12 @@ def qwen2forcausallm_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
+    entropy = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -203,13 +235,17 @@ def qwen2forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss, _, log_probs, entropy = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+            )
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-    return CausalLMOutputWithPast(
+    return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
+        log_probs=log_probs,
+        entropy=entropy,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

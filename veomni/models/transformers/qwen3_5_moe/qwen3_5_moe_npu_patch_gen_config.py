@@ -42,6 +42,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
 )
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     PatchedQwen3_5MoeExperts,
+    Qwen3_5MoeCausalLMOutputWithLogProbs,
     qwen3_5_moe_decoder_layer_forward_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -74,6 +75,10 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
+# (re-used from the GPU config) can return per-token log-probs in the unified
+# MoE output dataclass.
+config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -83,22 +88,30 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # TODO: Add torch npu ops chunk_gated_delta_rule and causal_conv1d_fn in the future.
-    chunk_gated_delta_rule = None
-    causal_conv1d_fn = None
+    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
+    # linear-attention impl raises at OpSlot.bind() time. These None
+    # placeholders preserve the upstream HF top-level
+    # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
+    # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
+    # assignments in __init__ resolve to torch.
     FusedRMSNormGated = None
-    fused_recurrent_gated_delta_rule = None
+    causal_conv1d_fn = None
     causal_conv1d_update = None
+    chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
     """
 )
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
-    # These are bound at model-build time by _bind_veomni_ops() in auto.py.
+    # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
 
@@ -106,6 +119,9 @@ config.add_post_import_block(
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
+veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 
 
 config.override_method(
@@ -194,6 +210,9 @@ config.override_method(
         "CPU-GPU sync avoidance via pre-computed metadata."
     ),
 )
+
+
+config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", Qwen3_5MoeCausalLMOutputWithLogProbs)
 
 
 config.add_post_import_block("""

@@ -36,7 +36,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2MLP,
     Qwen2RMSNorm,
     Qwen2VLAttention,
-    Qwen2VLCausalLMOutputWithPast,
     Qwen2VLModelOutputWithPast,
     Qwen2VLTextConfig,
     TransformersKwargs,
@@ -63,6 +62,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....utils import logging
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from ....utils.model_outputs import Qwen2VLCausalLMOutputWithLogProbs
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -457,7 +457,7 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen2VLCausalLMOutputWithPast]:
+    ) -> Union[tuple, Qwen2VLCausalLMOutputWithLogProbs]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -488,8 +488,10 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
         # --- Patch.2 ---
         loss = None
         logits = None
+        log_probs = None
+        entropy = None
         if labels is not None:
-            loss, logits = self.loss_function(
+            loss, logits, log_probs, entropy = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -501,13 +503,15 @@ class Qwen2VLForConditionalGeneration(_Qwen2VLForConditionalGeneration):
             logits = self.lm_head(hidden_states)
         # --- Patch.2 ---
 
-        return Qwen2VLCausalLMOutputWithPast(
+        return Qwen2VLCausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
 
 

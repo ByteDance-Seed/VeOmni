@@ -14,7 +14,7 @@ from transformers import (
 )
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
-from veomni.checkpoint import build_checkpointer
+from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data.diffusion.data_loader import build_dit_dataloader
 from veomni.data.diffusion.dataset import build_text_image_dataset
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
@@ -127,10 +127,6 @@ class MyTrainingArguments(TrainingArguments):
     vit_lr: float = field(
         default=1e-6,
         metadata={"help": "Learning rate for visual encoder parameters."},
-    )
-    train_architecture: Literal["lora", "full"] = field(
-        default="full",
-        metadata={"help": "Model structure to train. LoRA training or full training."},
     )
 
 
@@ -273,8 +269,8 @@ def main():
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
-    if args.train.train_architecture == "lora":
-        logger.info_rank0("train_architecture is lora")
+    if bool(args.model.lora_rank):
+        logger.info_rank0("lora training")
         _use_orig_params = True
         freeze_parameters(model)
         add_lora_to_model(
@@ -288,7 +284,7 @@ def main():
         )
         model.to(torch.bfloat16)
     else:
-        logger.info_rank0("train_architecture is full")
+        logger.info_rank0("full training")
         _use_orig_params = False
 
     logger.info_rank0(f"model: {model}")
@@ -547,17 +543,26 @@ def main():
                 }
                 Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
                 hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-                save_hf_safetensor(
-                    save_hf_safetensor_path=hf_weights_path,
-                    ckpt_manager=args.train.checkpoint.manager,
-                    model_assets=model_assets,
-                    train_architecture=args.train.train_architecture,
-                    save_checkpoint_path=save_checkpoint_path,
-                    output_dir=args.train.checkpoint.output_dir,
-                    is_rank_0=args.train.global_rank == 0,
-                    model=model,
-                    fqn_to_index_mapping=args.model.fqn_to_index_mapping,
-                )
+                if bool(args.model.lora_rank):
+                    if args.train.global_rank == 0:
+                        model_state_dict = ckpt_to_state_dict(
+                            save_checkpoint_path=save_checkpoint_path,
+                            ckpt_manager=args.train.checkpoint.manager,
+                            output_dir=args.train.checkpoint.output_dir,
+                        )
+                        model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
+                        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+                else:
+                    save_hf_safetensor(
+                        save_hf_safetensor_path=hf_weights_path,
+                        ckpt_manager=args.train.checkpoint.manager,
+                        model_assets=model_assets,
+                        save_checkpoint_path=save_checkpoint_path,
+                        output_dir=args.train.checkpoint.output_dir,
+                        is_rank_0=args.train.global_rank == 0,
+                        model=model,
+                        fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                    )
 
         data_loader_tqdm.close()
         epoch_time = time.time() - epoch_start_time
@@ -586,17 +591,26 @@ def main():
             }
             Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
             hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-            save_hf_safetensor(
-                save_hf_safetensor_path=hf_weights_path,
-                ckpt_manager=args.train.checkpoint.manager,
-                model_assets=model_assets,
-                train_architecture=args.train.train_architecture,
-                save_checkpoint_path=save_checkpoint_path,
-                output_dir=args.train.checkpoint.output_dir,
-                is_rank_0=args.train.global_rank == 0,
-                model=model,
-                fqn_to_index_mapping=args.model.fqn_to_index_mapping,
-            )
+            if bool(args.model.lora_rank):
+                if args.train.global_rank == 0:
+                    model_state_dict = ckpt_to_state_dict(
+                        save_checkpoint_path=save_checkpoint_path,
+                        ckpt_manager=args.train.checkpoint.manager,
+                        output_dir=args.train.checkpoint.output_dir,
+                    )
+                    model_state_dict = {k: v for k, v in model_state_dict.items() if "lora" in k}
+                    save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+            else:
+                save_hf_safetensor(
+                    save_hf_safetensor_path=hf_weights_path,
+                    ckpt_manager=args.train.checkpoint.manager,
+                    model_assets=model_assets,
+                    save_checkpoint_path=save_checkpoint_path,
+                    output_dir=args.train.checkpoint.output_dir,
+                    is_rank_0=args.train.global_rank == 0,
+                    model=model,
+                    fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                )
 
     synchronize()
     # release memory

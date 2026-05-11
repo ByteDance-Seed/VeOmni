@@ -21,6 +21,7 @@ import av
 import librosa
 import numpy as np
 import soundfile as sf
+import torch
 
 from ...utils import logging
 
@@ -170,3 +171,28 @@ def extract_audio_from_video(
         audio_fps = None
 
     return audio, audio_fps
+
+
+def save_audio_tensor_to_file(
+    audio: Union[torch.Tensor, np.ndarray],
+    output_path: str,
+    sample_rate: int = 32000,
+):
+    """Save audio tensor or numpy array to WAV file.
+
+    Args:
+        audio: Audio data. Supports shapes:
+            - (T,) mono
+            - (C, T) multi-channel
+            - (T, C) multi-channel (auto-detected when C <= 8)
+        sample_rate: Audio sample rate in Hz.
+    """
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+
+    if audio.ndim == 2:
+        # (C, T) -> (T, C) for soundfile (expects samples-first)
+        if audio.shape[0] <= 8 and audio.shape[1] > 8:
+            audio = audio.T
+
+    sf.write(output_path, audio, samplerate=sample_rate)

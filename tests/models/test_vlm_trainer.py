@@ -12,6 +12,8 @@ from veomni.trainer.vlm_trainer import (
 )
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
+from ..tools.training_utils import make_eager_ops_config
+
 
 _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4 = [
     pytest.param("./tests/toy_config/qwen2vl_toy", id="qwen2_vl"),
@@ -43,18 +45,29 @@ _FREEZE_VIT_VLM_CASES = (
 )
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
+    # This test only constructs the model on `meta` and verifies freeze
+    # behaviour — it never runs forward. Use an all-eager ops config so the
+    # build works everywhere: it pins every per-op field (including the
+    # Qwen3.5 GatedDeltaNet trio that has no FLA backend on NPU and the
+    # GPU-only liger/triton defaults that fail NPU validation). Eager paths
+    # that raise only at forward time are fine because this test never
+    # forwards.
+    ops_implementation = make_eager_ops_config()
     model = build_foundation_model(
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",
-        attn_implementation="eager",
         init_device="meta",
+        ops_implementation=ops_implementation,
     )
     visual = _get_vlm_visual_module(model)
     assert visual is not None
 
     args = VeOmniVLMArguments(
-        model=VLMMModelArguments(config_path=config_path),
+        model=VLMMModelArguments(
+            config_path=config_path,
+            ops_implementation=make_eager_ops_config(),
+        ),
         data=VLMMDataArguments(train_path="dummy"),
     )
     args.train.freeze_vit = freeze_vit

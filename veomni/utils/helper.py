@@ -114,6 +114,8 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
 
 
 def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    if "latents" not in micro_batch:
+        return []
     dit_latents_seqlens = []
     for latents in micro_batch["latents"]:
         latent_shape = latents.shape
@@ -236,11 +238,11 @@ class EnvironMeter:
             group=get_parallel_state().dp_group,
         )
         flops_promised = flops_promised * self.world_size
-        mfu = flops_achieved / flops_promised
+        mfu = flops_achieved / flops_promised if flops_promised else 0
 
         # calculate average effective len and tokens per second
-        avg_effective_len = batch_tokens / self.global_batch_size
-        avg_sample_seq_len = batch_tokens / real_global_batch_size
+        avg_effective_len = batch_tokens / self.global_batch_size if self.global_batch_size else 0
+        avg_sample_seq_len = batch_tokens / real_global_batch_size if real_global_batch_size else 0
         tokens_per_second = batch_tokens / delta_time
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size

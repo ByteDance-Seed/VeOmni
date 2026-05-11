@@ -146,6 +146,11 @@ def prepare_exec_cmd(
                 output_dir=os.path.join(output_dir, task_name),
                 parallel_config=ParallelConfig(sp_size=mode.sp_size, ep_size=mode.ep_size, fsdp_mode="fsdp2"),
                 nproc=mode.sp_size * 4,
+                # Forwarded to ``resolve_ops_overrides`` inside
+                # ``build_torchrun_cmd`` so per-model NPU eager fallbacks
+                # (e.g. DeepSeek-V3 RMSNorm/RoPE, Qwen2-VL multimodal RoPE)
+                # are emitted on the NPU side.
+                model_name=model_name,
             )
             command_list.append((task_name, cmd_kwargs))
 

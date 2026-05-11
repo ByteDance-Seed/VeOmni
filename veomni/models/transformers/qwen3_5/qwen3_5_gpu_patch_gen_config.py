@@ -24,6 +24,7 @@ Language-model focused patches from qwen3_next example:
 """
 
 from copy import copy
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 
@@ -45,11 +46,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     torch_chunk_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs, auto_docstring, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
-from veomni.patchgen.patch_spec import PatchConfig, create_patch_from_external
+from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 
@@ -73,16 +74,16 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
-config.patches.append(
-    create_patch_from_external(
-        target="Qwen3_5RMSNorm",
-        replacement_module="liger_kernel.transformers.rms_norm",
-        replacement_name="LigerRMSNormForQwen3Next",
-        description="Use LigerKernel RMSNorm for Qwen3Next (1+weight centered formulation)",
-    )
-)
-
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+# Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
+# text-only ``forward`` can return per-token log-probs as constructor fields.
+# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can do the same while preserving ``rope_deltas``. Mutating
+# ``output.log_probs`` / ``output.entropy`` after the base-class constructor
+# would bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward
+# unshard hook on ``lm_head`` and triggering ``setStorage … storage of
+# size 0`` in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.drop_import_names(
     "FusedRMSNormGated",
@@ -93,54 +94,87 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # Modification: We are not using https://github.com/Dao-AILab/causal-conv1d now
-    # we are using the triton impl of causal_conv1d from fla.
-    # TODO: Evaluate Tridao's impl in the future.
-    try:
-        from fla.modules import FusedRMSNormGated
-        from fla.modules.convolution import causal_conv1d as causal_conv1d_fn
-        from fla.modules.convolution import causal_conv1d_update
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-    except ImportError:
-        chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
-        FusedRMSNormGated = None
-        causal_conv1d_update, causal_conv1d_fn = None, None
-        logging.get_logger(__name__).warning(
-            "Failed to import FLA modules: fallback to eager implementation."
-            "This case can't support dynamic batching packing!"
-        )
+    # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
+    # used to come from `try: from fla.modules import ... except ImportError`
+    # at module import time. That selection now lives in OpSlot guards (see
+    # below) — picked from OpsImplementationConfig instead of "is the library
+    # importable". These None placeholders only exist so:
+    #   (1) the upstream HF module-level
+    #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
+    #       resolves to False (legacy warning behaviour preserved); and
+    #   (2) the decode-only `*_update` / `fused_recurrent_*` paths, which raise
+    #       NotImplementedError in our patched forward, still satisfy the
+    #       `<fla_name> or <torch_fallback>` assignments in __init__.
+    FusedRMSNormGated = None
+    causal_conv1d_fn = None
+    causal_conv1d_update = None
+    chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
     """
 )
 
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
+    # Bound at model-build time by _bind_veomni_ops() in auto.py. The three
+    # linear-attention slots replace the previous import-time
+    # `if FusedRMSNormGated is None ... else ...` /
+    # `chunk_gated_delta_rule or torch_chunk_gated_delta_rule` selection so the
+    # backend (eager / fla / flash_qla) is picked from
+    # OpsImplementationConfig instead of "is the library importable".
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
 
 
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
-FusedRMSNormGated = None
 Qwen3_5GatedDeltaNet = None
-causal_conv1d_fn = None
-causal_conv1d_update = None
+causal_conv1d_update = None  # decode-only; placeholder set in post-import block above
 torch_causal_conv1d_update = None
-chunk_gated_delta_rule = None
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
-fused_recurrent_gated_delta_rule = None
+fused_recurrent_gated_delta_rule = None  # decode-only; placeholder set in post-import block above
 torch_recurrent_gated_delta_rule = None
 is_fast_path_available = None
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+veomni_rms_norm = None  # OpSlot, declared in post-import block above
+veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
+veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+
+
+# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+# Mirrors qwen3_5_moe's pattern: the slot binds to liger_rms_norm_qwen3_5
+# (registered for variant="qwen3_5") when rms_norm_implementation="liger_kernel"
+# and falls through to the original HF code otherwise. Replaces the previous
+# unconditional class swap to LigerRMSNormForQwen3Next so eager mode is honoured.
+
+
+@config.override_method(
+    "Qwen3_5RMSNorm.forward",
+    description="OpSlot guard for Liger fused RMSNorm (Qwen3.5 1+weight formulation)",
+)
+def qwen3_5_rmsnorm_forward_patched(self, x):
+    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(x, self.weight, self.eps)
+    # Original HF code below, unchanged.
+    output = self._norm(x.float())
+    # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+    # See https://github.com/huggingface/transformers/pull/29402
+    output = output * (1.0 + self.weight.float())
+    return output.type_as(x)
 
 
 @config.override_method(
     "Qwen3_5GatedDeltaNet.__init__",
-    description="Use device-agnostic get_device_id() for FusedRMSNormGated init",
+    description="OpSlot dispatch for FusedRMSNormGated, causal_conv1d, chunk_gated_delta_rule (Qwen3.5 GatedDeltaNet)",
 )
 def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: int):
     super().__init__()
@@ -176,24 +210,35 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     A = torch.empty(self.num_v_heads).uniform_(0, 16)
     self.A_log = nn.Parameter(torch.log(A))
 
-    self.norm = (
-        Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        if FusedRMSNormGated is None
-        else FusedRMSNormGated(
+    # Modification: OpSlot dispatch for fused gated RMSNorm. The slot stores
+    # the FusedRMSNormGated *class* (see veomni.ops.kernels.gated_delta_rule),
+    # so calling it constructs a module with the fused kernel; eager falls
+    # through to upstream Qwen3_5RMSNormGated.
+    if veomni_rms_norm_gated.use_non_eager_impl:
+        self.norm = veomni_rms_norm_gated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
             activation=self.activation,
-            # Modification: use device-agnostic get_device_id() instead of hardcoded device
             device=get_device_id(),
             dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
         )
-    )
+    else:
+        self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
     self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-    self.causal_conv1d_fn = causal_conv1d_fn
+    # Modification: OpSlot dispatch for causal conv1d / chunk gated delta-rule.
+    # We freeze the resolved kernel (or None for eager) on the instance via
+    # `.bound_kernel()`; storing the OpSlot itself would couple the instance to
+    # the module-global slot, and a second model rebinding the slot with a
+    # different impl would silently switch this instance's kernel too.
+    # `eager` leaves causal_conv1d_fn = None (the varlen path then raises) and
+    # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
+    # for varlen training; the decode-only `*_update` aliases are kept None
+    # because the precomputed-state path raises NotImplementedError anyway.
+    self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
     self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-    self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+    self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
     self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
     if not is_fast_path_available:
@@ -353,6 +398,21 @@ def qwen3_5_gated_deltanet_forward_patched(
     key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
     value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
 
+    # Modification: contiguous-ify q/k/v before chunk_gated_delta_rule.
+    # After torch.split + reshape above, query/key/value are views over mixed_qkv whose
+    # stride[1] equals the full QKV-pack width (2*key_dim + value_dim), not the per-tensor
+    # dim. The FLA kernel tolerates this stride layout, but FlashQLA's TileLang
+    # `tilelang_prepare_h_kernel` asserts `v.stride[1] == num_v_heads * head_v_dim` and
+    # raises (`expected 4096, but got 8192` for a Qwen3.5-4B-style config).
+    # Forcing contiguous here is a no-op when the layout already matches (so it stays
+    # cheap for FLA / eager paths) and unblocks the FlashQLA backend without bloating
+    # OpSlot factory wrappers. Fix all three for symmetry — q/k usually become contiguous
+    # via repeat_interleave below in GQA configs, but non-GQA models would otherwise hit
+    # the same stride mismatch on q/k from a stricter kernel.
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
     beta = b.sigmoid()
     # If the model is loaded in fp16, without the .float() here, A might be -inf
     # Modification: slice A_log/dt_bias for local V-heads under Ulysses SP.
@@ -368,10 +428,16 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
+        # Modification: instance-local guard. The kernel was selected at
+        # ``__init__`` time and cached on ``self.chunk_gated_delta_rule``;
+        # reading the module-global OpSlot here would diverge if a second
+        # model rebinds it with a different config (the OpSlot is a process-
+        # wide singleton).
         if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
             raise RuntimeError(
-                "Varlen training requires FLA. Install flash-linear-attention so "
-                "chunk_gated_delta_rule supports cu_seqlens."
+                "Varlen training requires a non-eager chunk_gated_delta_rule kernel. "
+                "Set chunk_gated_delta_rule_implementation='fla' (and install flash-linear-attention) "
+                "or 'flash_qla' (with the optional flash-qla extra) in OpsImplementationConfig."
             )
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -986,10 +1052,12 @@ def qwen3_5_forcausallm_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
+    entropy = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -999,17 +1067,42 @@ def qwen3_5_forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss, _, log_probs, entropy = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+            )
     else:
         logits = self.lm_head(hidden_states)
 
-    return CausalLMOutputWithPast(
+    return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
+        log_probs=log_probs,
+        entropy=entropy,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
+
+
+# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
+@config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
+    """
+)
+class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
+    r"""
+    log_probs (`torch.FloatTensor`, *optional*):
+        Per-token log probabilities returned by VeOmni's fused loss path.
+    entropy (`torch.FloatTensor`, *optional*):
+        Per-token softmax entropy returned by VeOmni's fused loss path.
+    """
+
+    log_probs: torch.FloatTensor | None = None
+    entropy: torch.FloatTensor | None = None
 
 
 @config.add_helper
@@ -1050,7 +1143,7 @@ def qwen3_5_forconditional_generation_forward_patched(
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
-) -> tuple | Qwen3_5CausalLMOutputWithPast:
+) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1072,10 +1165,12 @@ def qwen3_5_forconditional_generation_forward_patched(
 
     loss = None
     logits = None
+    log_probs = None
+    entropy = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1085,17 +1180,19 @@ def qwen3_5_forconditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _ = self.loss_function(
+            loss, _, log_probs, entropy = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
     else:
         logits = self.lm_head(hidden_states)
 
-    return Qwen3_5CausalLMOutputWithPast(
+    return Qwen3_5CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
+        log_probs=log_probs,
+        entropy=entropy,
     )

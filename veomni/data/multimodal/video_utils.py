@@ -15,7 +15,7 @@
 
 import math
 import subprocess
-from typing import ByteString, Dict, List, Union
+from typing import ByteString, Dict, List, Optional, Union
 
 import av
 import librosa
@@ -678,7 +678,13 @@ def load_video(video: VideoInput, **kwargs):
         return videos[0], video_meta[0], audios[0], audio_meta[0]
 
 
-def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
+def save_video_tensors_to_file(
+    video: torch.Tensor,
+    output_path,
+    fps: int = 24,
+    audio: Optional[np.ndarray] = None,
+    audio_sample_rate: int = 32000,
+):
     """
     video:
         torch.Tensor
@@ -713,6 +719,8 @@ def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
 
         if vmin >= -1 and vmax <= 1:
             video = (video + 1) / 2
+            vmin = video.min()
+            vmax = video.max()
 
         if vmin >= 0 and vmax <= 1:
             video = video * 255
@@ -759,3 +767,53 @@ def save_video_tensors_to_file(video: torch.Tensor, output_path, fps: int = 24):
         container.mux(packet)
 
     container.close()
+
+    if audio is not None:
+        import os
+        import subprocess
+        import tempfile
+
+        import soundfile as sf
+
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+        # (C, T) -> (T, C)
+        if audio.ndim == 2 and audio.shape[0] <= 8 and audio.shape[1] > 8:
+            audio = audio.T
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
+            tmp_audio_path = tmp_audio.name
+            sf.write(tmp_audio_path, audio, samplerate=audio_sample_rate)
+
+        tmp_video_path = output_path + ".tmp.mp4"
+        os.rename(output_path, tmp_video_path)
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-i",
+                    tmp_video_path,
+                    "-i",
+                    tmp_audio_path,
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    output_path,
+                ],
+                check=True,
+            )
+            os.remove(tmp_video_path)
+        except Exception:
+            # Restore the original video so it is not lost on ffmpeg failure.
+            if os.path.exists(tmp_video_path):
+                os.rename(tmp_video_path, output_path)
+            raise
+        finally:
+            if os.path.exists(tmp_audio_path):
+                os.remove(tmp_audio_path)

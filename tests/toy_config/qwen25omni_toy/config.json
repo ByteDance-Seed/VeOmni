@@ -1,6 +1,6 @@
 {
     "architectures": [
-      "Qwen2_5OmniModel"
+      "Qwen2_5OmniForConditionalGeneration"
     ],
     "enable_audio_output": false,
     "enable_talker": true,

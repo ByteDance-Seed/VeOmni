@@ -71,7 +71,7 @@ register_op(
         config_field="load_balancing_loss_implementation",
         label="LoadBalancingLoss",
         scope=OpScope.GLOBAL,
-        default="eager",
+        default="triton",
         global_slot="veomni.ops.kernels.load_balancing_loss:_load_balancing_loss",
         backends={
             "eager": BackendSpec(entry="veomni.ops.kernels.load_balancing_loss.eager:load_balancing_loss_pytorch"),

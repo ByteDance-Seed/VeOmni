@@ -2,11 +2,16 @@ import copy
 import os
 import random
 import subprocess
+import sys
 from functools import partial
 from typing import Any, Dict, List
 
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import pytest
 import yaml
+from tools import resolve_ops_overrides
 from transformers import PretrainedConfig
 from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
 
@@ -245,6 +250,11 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         "--data.dataloader.pin_memory=False",
         "--train.num_train_epochs=5",
         "--train.checkpoint.output_dir=.tests/cache",
+        # Hardware-aware ops_implementation overrides. ``resolve_ops_overrides``
+        # emits NPU-supported per-op backends on NPU and ``[]`` on GPU (the
+        # dataclass defaults are already GPU-optimal). FakeModel is not
+        # registered, so ``model_name=None`` skips per-model eager fallbacks.
+        *resolve_ops_overrides(None),
     ]
     return command
 

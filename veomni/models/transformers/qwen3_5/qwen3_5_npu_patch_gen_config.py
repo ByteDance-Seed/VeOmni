@@ -23,12 +23,16 @@ Language-model focused patches from qwen3_next example:
 3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5CausalLMOutputWithPast,
     Qwen3_5DynamicCache,
     apply_mask_to_padding_states,
 )
+from transformers.utils import auto_docstring
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
@@ -68,6 +72,10 @@ config.add_import(
 
 config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
+# from the GPU config) can return per-token log-probs in the unified output
+# dataclass.
+config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -77,12 +85,18 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # TODO: Add torch npu ops chunk_gated_delta_rule and causal_conv1d_fn in the future.
-    chunk_gated_delta_rule = None
-    causal_conv1d_fn = None
+    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
+    # linear-attention impl raises at OpSlot.bind() time, which is desirable —
+    # a silent fallback would mask the misconfiguration. These None
+    # placeholders preserve the upstream HF top-level
+    # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
+    # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
+    # assignments in __init__ resolve to torch.
     FusedRMSNormGated = None
-    fused_recurrent_gated_delta_rule = None
+    causal_conv1d_fn = None
     causal_conv1d_update = None
+    chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
     """
 )
 
@@ -92,6 +106,9 @@ config.add_post_import_block(
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
+    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
 
@@ -102,6 +119,9 @@ torch_npu = None
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
+veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
+veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 
 
 @config.override_method(
@@ -313,10 +333,13 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
+        # Modification: instance-local guard (see GPU patch comment).
         if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
             raise RuntimeError(
-                "Varlen training requires FLA. Install flash-linear-attention so "
-                "chunk_gated_delta_rule supports cu_seqlens."
+                "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
+                "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
+                "(and install flash-linear-attention) or 'flash_qla' (with the optional flash-qla "
+                "extra) in OpsImplementationConfig."
             )
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -444,3 +467,25 @@ config.override_method(
     replacement=qwen3_5_forconditional_generation_forward_patched,
     description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
 )
+
+
+# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` (re-used from the GPU config) can return per-token log-probs
+# while preserving ``rope_deltas``. Mirrors the GPU config's helper-after.
+@config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
+    """
+)
+class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
+    r"""
+    log_probs (`torch.FloatTensor`, *optional*):
+        Per-token log probabilities returned by VeOmni's fused loss path.
+    entropy (`torch.FloatTensor`, *optional*):
+        Per-token softmax entropy returned by VeOmni's fused loss path.
+    """
+
+    log_probs: torch.FloatTensor | None = None
+    entropy: torch.FloatTensor | None = None

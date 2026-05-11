@@ -62,52 +62,56 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
 
 
 def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
-    """Bind all OpSlot instances found in *modeling_module*.
+    """Bind every OpSlot in *modeling_module* from *ops_config*.
 
     Returns ``True`` if at least one OpSlot was found (and bound).
     """
-    found = False
+    bound: list[str] = []
     moe_experts_kernel: Optional[str] = None
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
-        if isinstance(obj, OpSlot):
-            # `moe_experts` is the one op whose user-facing config field is not
-            # `moe_experts_implementation` but `moe_implementation`, and its
-            # values carry a `fused_` prefix (e.g. `fused_triton`) that the
-            # KERNEL_REGISTRY entries don't. Translate here so the registry
-            # lookup finds the kernel and the HardwareRequirement check fires.
-            if obj.op_name == "moe_experts":
-                impl_name = (
-                    "eager"
-                    if ops_config.moe_implementation == "eager"
-                    else ops_config.moe_implementation.removeprefix("fused_")
-                )
-                if impl_name != "eager":
-                    moe_experts_kernel = impl_name
-            else:
-                impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
-            obj.bind(impl_name)
-            logger.info_rank0(f"OpSlot '{name}' bound to '{impl_name}' -> {obj}")
-            found = True
+        if not isinstance(obj, OpSlot):
+            continue
+        # ``moe_experts`` reads ``moe_implementation`` (not the
+        # ``{op}_implementation`` convention) and its values carry a
+        # ``fused_`` prefix the registry entries don't. Translate so the
+        # registry lookup finds the kernel and the HardwareRequirement
+        # check fires.
+        if obj.op_name == "moe_experts":
+            impl_name = (
+                "eager"
+                if ops_config.moe_implementation == "eager"
+                else ops_config.moe_implementation.removeprefix("fused_")
+            )
+            if impl_name != "eager":
+                moe_experts_kernel = impl_name
+        else:
+            impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
+        obj.bind(impl_name)
+        bound.append(f"{obj.op_name} ({impl_name})")
 
-    # The OpSlot only acts as an eager-vs-fused guard
-    # (``slot.use_non_eager_impl``). Inside the fused branch, modeling code
-    # calls ``veomni.ops.fused_moe_forward(...)``, which dispatches through
-    # the module-level pointer ``veomni.ops.kernels.moe._fused_moe_forward``.
-    # Bind that pointer here to the kernel matching the slot so the two stay
-    # in sync. Eager bindings leave the pointer untouched.
+    # OpSlot is just an eager-vs-fused guard; inside the fused branch the
+    # generated modeling code dispatches through the module-level pointer
+    # ``veomni.ops.kernels.moe._fused_moe_forward``. Keep the pointer in
+    # sync with the slot's bound kernel; eager leaves it untouched.
     if moe_experts_kernel is not None:
         from ..ops.kernels.moe import apply_veomni_fused_moe_patch
 
         apply_veomni_fused_moe_patch(fused_moe_kernel=moe_experts_kernel)
 
-    return found
+    if bound:
+        logger.info_rank0(f"OpSlot dispatch bound: {', '.join(bound)}.")
+    return bool(bound)
 
 
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
+    # ``None`` = "no caller preference" — resolved from ``ops_implementation``
+    # below. A non-None value is treated as an explicit caller override and
+    # preserved as-is (used by callers that pre-installed the ops singleton
+    # via ``apply_ops_config`` and only need to pin attn here).
     attn_implementation: Optional[
         Literal[
             "eager",
@@ -120,7 +124,7 @@ def build_foundation_model(
             "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
-    ] = "veomni_flash_attention_2_with_sp",
+    ] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
@@ -132,14 +136,14 @@ def build_foundation_model(
 
     If weights_path is provided, it loads the pre-trained weights, otherwise it initializes weights.
 
-    Ops dispatch is owned by this function: when ``ops_implementation`` is
-    provided we run ``apply_ops_config`` before constructing the model, and the
-    resolved ``attn_implementation`` is read from it (the explicit
-    ``attn_implementation`` kwarg is ignored in that case). Trainers always
-    pass ``ops_implementation``; standalone scripts that omit it get a default
-    ``OpsImplementationConfig()`` installed automatically — unless something
-    earlier (e.g. a ``DiTTrainer`` building a condition model first) already
-    installed one, in which case we leave it alone.
+    Ops dispatch: callers must pass ``ops_implementation`` *or* pre-install a
+    singleton via ``apply_ops_config(...)``. There is no silent all-eager
+    fallback — passing neither raises ``ValueError``. Trainers pass
+    ``args.model.ops_implementation``; standalone scripts (``tasks/infer/*``)
+    construct an explicit ``OpsImplementationConfig``. ``DiTTrainer`` builds a
+    condition model first via ``apply_ops_config`` and then calls into here
+    without the kwarg, which is fine — the singleton-already-installed branch
+    leaves it alone.
     """
     from ..ops import apply_ops_config
     from ..ops.config.singleton import get_ops_config
@@ -147,8 +151,23 @@ def build_foundation_model(
     if ops_implementation is not None:
         apply_ops_config(ops_implementation)
         attn_implementation = ops_implementation.attn_implementation
-    elif get_ops_config() is None:
-        apply_ops_config(OpsImplementationConfig())
+    else:
+        installed = get_ops_config()
+        if installed is None:
+            raise ValueError(
+                "build_foundation_model requires `ops_implementation` (or a prior "
+                "`apply_ops_config(...)` call). Trainers pass "
+                "`args.model.ops_implementation`; standalone scripts must "
+                "construct an `OpsImplementationConfig` explicitly. "
+                "There is no longer a silent all-eager fallback."
+            )
+        # Caller pre-installed the singleton (e.g. DiTTrainer building a
+        # condition model). Honour the installed config's attn unless the
+        # caller passed an explicit override — without this, the model
+        # silently uses the loader's HF default instead of the SP-aware
+        # variant the user selected.
+        if attn_implementation is None:
+            attn_implementation = installed.attn_implementation
 
     if config_kwargs is None:
         config_kwargs = {}
@@ -180,6 +199,23 @@ def build_foundation_model(
         config.encoder_data_balance = False
 
     loader: Optional[BaseModelLoader] = get_loader(config)
+
+    # ── Pre-init: OpSlot binding ──────────────────────────────────────────
+    # ``get_loader`` -> ``get_model_class`` -> ``MODELING_REGISTRY[...]()``
+    # has already imported the patched modeling module, so ``loader.model_cls``
+    # is in ``sys.modules`` and we can resolve OpSlot bindings *before*
+    # the model is constructed. This matters for slots consumed inside
+    # ``__init__`` (e.g. Qwen3.5's GatedDeltaNet picks between
+    # ``Qwen3_5RMSNormGated`` and ``FusedRMSNormGated`` at init time based
+    # on ``veomni_rms_norm_gated.use_non_eager_impl``); slots consumed only
+    # in ``forward`` would also work post-init, but binding once, here, keeps
+    # the timing uniform. Assumes ``loader.model_cls`` is final at this point —
+    # i.e. no loader rewrites it between here and ``loader.load_model()`` below.
+    model_cls = getattr(loader, "model_cls", None) if loader is not None else None
+    modeling_module = sys.modules.get(model_cls.__module__) if model_cls is not None else None
+    if modeling_module is not None:
+        if _bind_veomni_ops(modeling_module, get_ops_config()):
+            logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     init_kwargs = {
         "config": config,
@@ -214,16 +250,6 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
-
-    # ── Post-load: OpSlot binding ─────────────────────────────────────────
-    # OpSlots are module-level singletons, so binding them after the model
-    # is constructed is fine (and necessary — the patched modeling module is
-    # only guaranteed to be importable once the loader has instantiated the
-    # model class).
-    modeling_module = sys.modules.get(model.__class__.__module__)
-    if modeling_module is not None:
-        if _bind_veomni_ops(modeling_module, get_ops_config()):
-            logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     if is_torch_npu_available():
         # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,

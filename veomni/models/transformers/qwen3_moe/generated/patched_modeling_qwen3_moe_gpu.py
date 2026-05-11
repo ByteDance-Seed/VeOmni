@@ -9,14 +9,16 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: Qwen3MoeRMSNorm
-#      Use LigerKernel RMSNorm
-#    - class_replacement: Qwen3MoeMLP
-#      Use LigerKernel SwiGLU MLP
+#    - method_override: Qwen3MoeRMSNorm.forward
+#      OpSlot guard for Liger fused RMSNorm (standard formulation)
+#    - method_override: Qwen3MoeMLP.forward
+#      OpSlot guard for Liger fused SwiGLU MLP
 #    - class_replacement: Qwen3MoeExperts
 #      Use v5 gate_up_proj expert weights and explicit VeOmni fused MoE path
+#    - method_override: Qwen3MoeTopKRouter.forward
+#      Return raw pre-softmax logits as `router_logits` so HF's `load_balancing_loss_func` (which applies softmax internally) stays consistent with the HF aux-loss baseline.
 #    - function_replacement: apply_rotary_pos_emb
-#      Use LigerKernel rotary embedding
+#      OpSlot guard for Liger fused RoPE
 #    - method_override: Qwen3MoeModel.forward
 #      Support SP in Qwen3MoeModel.forward
 #    - method_override: Qwen3MoeForCausalLM.forward
@@ -30,13 +32,13 @@ from collections.abc import Callable
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import (
+    use_kernel_forward_from_hub,
     use_kernelized_func,
 )
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -47,7 +49,7 @@ from transformers.modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
@@ -63,8 +65,12 @@ from veomni.ops import fused_moe_forward
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # These are bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
@@ -79,7 +85,7 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Use LigerKernel rotary embedding
+# Reason: OpSlot guard for Liger fused RoPE
 # Source: veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(
@@ -90,16 +96,15 @@ def apply_rotary_pos_emb(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -215,13 +220,30 @@ class Qwen3MoeAttention(nn.Module):
 
 
 # ======================================================================
-# [PATCHED CLASS] Qwen3MoeMLP
-# Original class replaced with: external
-# Reason: Use LigerKernel SwiGLU MLP
-# Source: liger_kernel.transformers.swiglu
+# [MODIFIED CLASS] Qwen3MoeMLP
+# Methods patched: forward
 # ======================================================================
-# Import from: liger_kernel.transformers.swiglu.LigerSwiGLUMLP
-from liger_kernel.transformers.swiglu import LigerSwiGLUMLP as Qwen3MoeMLP
+
+
+class Qwen3MoeMLP(nn.Module):
+    def __init__(self, config, intermediate_size=None):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    # ── SwiGLU MLP (OpSlot guard, functional Liger kernel) ───────────────────────
+    def forward(self, x):
+        # Modification: OpSlot guard — use fused SwiGLU kernel when bound.
+        if veomni_swiglu_mlp.use_non_eager_impl:
+            return veomni_swiglu_mlp(self, x)
+        # Original HF code below, unchanged.
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 
 # ======================================================================
@@ -282,6 +304,12 @@ class Qwen3MoeExperts(torch.nn.Module):
         return final_hidden_states
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeTopKRouter
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3MoeTopKRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -291,16 +319,23 @@ class Qwen3MoeTopKRouter(nn.Module):
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
-        router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        # Return raw pre-softmax logits as `router_logits`; HF's
+        # `load_balancing_loss_func` applies softmax internally. The post-softmax
+        # tensor is kept locally as `routing_weights` for top-k selection only.
+        router_logits = torch.nn.functional.linear(hidden_states, self.weight)
+        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        router_top_value = router_top_value.to(router_logits.dtype)
-        router_scores = router_top_value
-        return router_logits, router_scores, router_indices
+        # Modification: keep ``router_top_value`` in the softmax's fp32 dtype to
+        # match HF's reference path (HF re-binds ``router_logits`` to the post-
+        # softmax fp32 tensor and then casts back to that dtype, which is a
+        # no-op). The fused MoE call site casts to ``final_hidden_states.dtype``
+        # itself, so leaving fp32 here is harmless.
+        router_top_value = router_top_value.to(routing_weights.dtype)
+        return router_logits, router_top_value, router_indices
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -318,13 +353,35 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
 
 # ======================================================================
-# [PATCHED CLASS] Qwen3MoeRMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm
-# Source: liger_kernel.transformers.rms_norm
+# [MODIFIED CLASS] Qwen3MoeRMSNorm
+# Methods patched: forward
 # ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNorm
-from liger_kernel.transformers.rms_norm import LigerRMSNorm as Qwen3MoeRMSNorm
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class Qwen3MoeRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        Qwen3MoeRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        # Original HF code below, unchanged.
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
@@ -681,7 +738,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeCausalLMOutputWithPast:
+    ) -> MoeCausalLMOutputWithLogProbs:
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
@@ -704,10 +761,12 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
+        log_probs = None
+        entropy = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits = veomni_causal_lm_loss(
+                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -718,8 +777,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits); unpack to match the OpSlot branch above.
-                loss, logits = self.loss_function(
+                # returns (loss, logits, log_probs, entropy); unpack to match the
+                # OpSlot branch above.
+                loss, logits, log_probs, entropy = self.loss_function(
                     logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
                 )
         else:
@@ -745,7 +805,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 
-        return MoeCausalLMOutputWithPast(
+        return MoeCausalLMOutputWithLogProbs(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -753,6 +813,8 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
+            log_probs=log_probs,
+            entropy=entropy,
         )
 
     def get_parallel_plan(self):

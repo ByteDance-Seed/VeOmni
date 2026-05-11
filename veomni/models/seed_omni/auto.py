@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 import torch
 
+from ...arguments.arguments_types import OpsImplementationConfig
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.import_utils import is_transformers_version_greater_or_equal_to
 from ..auto import build_config, build_foundation_model, build_processor, build_tokenizer
@@ -92,10 +93,30 @@ def build_omni_model(
     attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2"]] = "flash_attention_2",
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
+    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> "PreTrainedModel":
     """
     Builds omni modality model using foundation model, encoders, and decoders.
+
+    ``ops_implementation`` is required (or a prior ``apply_ops_config(...)``
+    must have installed the singleton). The SeedOmniConfig branch forwards
+    it to ``build_foundation_model``; the encoder/decoder branch builds
+    ``SeedOmniModel._from_config`` directly so we install the singleton
+    here too — the foundation submodule's ``self.loss_function`` needs
+    VeOmni's ``LOSS_MAPPING``.
     """
+    from ...ops import apply_ops_config
+    from ...ops.config.singleton import get_ops_config
+
+    if ops_implementation is not None:
+        apply_ops_config(ops_implementation)
+    elif get_ops_config() is None:
+        raise ValueError(
+            "build_omni_model requires `ops_implementation` (or a prior "
+            "`apply_ops_config(...)` call). Trainers pass "
+            "`args.model.ops_implementation`."
+        )
+
     if decoders is None:
         decoders = {}
     if encoders is None:
@@ -114,6 +135,7 @@ def build_omni_model(
             attn_implementation=attn_implementation,
             init_device=init_device,
             config_kwargs=config_kwargs,
+            ops_implementation=ops_implementation,
         )
 
     foundation_config = foundation_config.to_dict()

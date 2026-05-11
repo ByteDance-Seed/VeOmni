@@ -905,3 +905,172 @@ class GradientCheckpointingLayer(nn.Module):
         if self.gradient_checkpointing and self.training:
             return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
         return super().__call__(*args, **kwargs)
+
+
+# ------------------------------------------------------------------
+# Lora-related load utils
+# ------------------------------------------------------------------
+
+
+@torch.no_grad()
+def rank0_broadcast_adapter_weights(
+    model: Union["nn.Module", "PreTrainedModel"],
+    adapter_sd: Dict[str, "torch.Tensor"],
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+) -> None:
+    """
+    Broadcast pre-loaded adapter (LoRA) weights from rank 0 to all ranks.
+
+    Only rank 0 needs ``adapter_sd`` populated with real tensors; other ranks
+    may pass an empty dict.  The function first broadcasts the key count and
+    then iterates exactly like ``rank0_load_and_broadcast_weights``: metadata
+    broadcast → tensor broadcast → ``_dispatch_parameter``.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        for name, tensor in adapter_sd.items():
+            _dispatch_parameter(model, name, tensor, dtensor_factory)
+        return
+
+    global_rank = get_parallel_state().global_rank
+    torch_device = torch.device(init_device)
+
+    # Broadcast the number of adapter keys so all ranks know the loop count
+    count_tensor = torch.tensor(
+        [len(adapter_sd)],
+        dtype=torch.int64,
+        device=torch_device if torch_device.type != "cpu" else torch.device("cpu"),
+    )
+    dist.broadcast(count_tensor, src=0)
+    num_keys = int(count_tensor.item())
+
+    if num_keys == 0:
+        return
+
+    sorted_keys = sorted(adapter_sd.keys()) if global_rank == 0 else [None] * num_keys
+
+    for i in range(num_keys):
+        if global_rank == 0:
+            name = sorted_keys[i]
+            tensor = adapter_sd[name].to(torch_device, non_blocking=True)
+            metadata = BroadcastMetadata(False, name, tensor.shape, tensor.dtype)
+        else:
+            metadata = BroadcastMetadata(False, None, None, None)
+
+        metadata_list = [metadata]
+        dist.broadcast_object_list(metadata_list, src=0)
+        metadata = metadata_list[0]
+
+        name = metadata.name
+        shape = metadata.shape
+        dtype = metadata.dtype
+
+        if global_rank != 0:
+            tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+
+        dist.broadcast(tensor, src=0)
+        _dispatch_parameter(model, name, tensor, dtensor_factory)
+        del tensor
+
+    logger.info_rank0(f"rank0_broadcast_adapter_weights: loaded {num_keys} adapter param(s)")
+
+
+def _read_adapter_name(adapter_path: str) -> str:
+    """Read the adapter name from adapter_config.json, defaulting to 'default'."""
+    import json
+    import os
+
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.isfile(config_path):
+        with open(config_path) as f:
+            cfg = json.load(f)
+        return cfg.get("adapter_name", "default") or "default"
+    return "default"
+
+
+def _remap_adapter_key(key: str, adapter_name: str) -> str:
+    """Remap a PEFT-saved key to model FQN format.
+
+    PEFT saves ``lora_A.weight`` but the model FQN is ``lora_A.<adapter_name>.weight``.
+    """
+    parts = key.split(".")
+    new_parts = []
+    for p in parts:
+        new_parts.append(p)
+        if p in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+            new_parts.append(adapter_name)
+    return ".".join(new_parts)
+
+
+@torch.no_grad()
+def load_model_lora_weights(
+    model: Union["nn.Module", "PreTrainedModel"],
+    adapter_path: str,
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+) -> None:
+    """Load PEFT adapter (LoRA) weights from disk into the model on every rank.
+
+    Mirrors ``load_model_weights`` but targets adapter files.  Each rank reads
+    ``adapter_model.safetensors`` (or ``.bin``) directly, remaps PEFT key names
+    to model FQN format, and dispatches tensors into the (potentially sharded) model.
+    Use when every rank has access to the checkpoint (e.g. shared filesystem).
+    For single-reader + broadcast, use ``load_adapter_state_dict_rank0`` +
+    ``rank0_broadcast_adapter_weights`` instead.
+    """
+    from peft import load_peft_weights
+
+    adapter_name = _read_adapter_name(adapter_path)
+    logger.info_rank0(f"load_model_lora_weights: loading from {adapter_path} (adapter_name={adapter_name!r})")
+
+    raw_sd = load_peft_weights(adapter_path, device=init_device)
+    for name, tensor in raw_sd.items():
+        _dispatch_parameter(model, _remap_adapter_key(name, adapter_name), tensor, dtensor_factory)
+
+    logger.info_rank0("load_model_lora_weights: done")
+
+
+def load_adapter_state_dict_rank0(adapter_path: str) -> Dict[str, "torch.Tensor"]:
+    """Rank-0 loads PEFT adapter weights from disk and remaps keys to model FQN format.
+
+    PEFT saves keys as ``lora_A.weight`` but the model FQN is ``lora_A.default.weight``.
+    Only rank 0 reads the file; other ranks return an empty dict.
+    Tensors are broadcast to all ranks later via ``rank0_broadcast_adapter_weights``.
+    """
+    global_rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if global_rank != 0:
+        return {}
+
+    from peft import load_peft_weights
+
+    adapter_name = _read_adapter_name(adapter_path)
+    raw_sd = load_peft_weights(adapter_path, device="cpu")
+    remapped = {_remap_adapter_key(k, adapter_name): v for k, v in raw_sd.items()}
+
+    if remapped:
+        first_raw = next(iter(raw_sd))
+        first_remapped = next(iter(remapped))
+        logger.info_rank0(
+            f"Loaded {len(remapped)} adapter weight(s) from {adapter_path}, "
+            f"key remap example: {first_raw} -> {first_remapped}"
+        )
+
+    return remapped
+
+
+@torch.no_grad()
+def rank0_load_and_broadcast_adapter_weights(
+    model: Union["nn.Module", "PreTrainedModel"],
+    adapter_path: str,
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+) -> None:
+    """Rank-0 loads PEFT adapter weights from disk then broadcasts to all ranks.
+
+    Combines ``load_adapter_state_dict_rank0`` and
+    ``rank0_broadcast_adapter_weights`` into one call, mirroring the base-model
+    ``rank0_load_and_broadcast_weights``.
+    """
+    adapter_sd = load_adapter_state_dict_rank0(adapter_path)
+    rank0_broadcast_adapter_weights(model, adapter_sd, init_device, dtensor_factory)

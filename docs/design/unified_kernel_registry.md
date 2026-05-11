@@ -277,13 +277,9 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field; mismatches (e.g. `fused_triton` on NPU) raise in `apply_veomni_fused_moe_patch` rather than silently falling back |
 | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | |
 | `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
-
-`rms_norm_gated_implementation` is listed above because it is called out in
-the op taxonomy (§1) as a replaceable variant for Qwen3.5 MoE's
-`RMSNormGated`, but the corresponding config field is not yet on
-`OpsImplementationConfig` and the op has no non-eager backend registered.
-It is tracked here so the design stays coherent; when a fused kernel lands
-the field will be added alongside.
+| `rms_norm_gated_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla`. No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time (#714) |
+| `causal_conv1d_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet pre-mixer; default `fla`. `eager` has no torch fallback for `cu_seqlens` — varlen training raises at forward time. No NPU backend (#714) |
+| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` | Qwen3.5 linear attention; default `fla`. `flash_qla` is an opt-in extra (QwenLM FlashQLA). No NPU backend (#714) |
 
 Convenience preset:
 

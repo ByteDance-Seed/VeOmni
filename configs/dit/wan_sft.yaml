@@ -3,6 +3,11 @@ model:
   config_path: ./configs/model_configs/wan/wani2v_14b.json
   ops_implementation:
     attn_implementation: flash_attention_2
+    # Wan's RoPE has a non-standard signature (rope_apply takes a single
+    # tensor plus freqs/head_dim kwargs) so the framework's default
+    # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
+    # Wan-specific liger wrapper exists.
+    rotary_pos_emb_implementation: eager
 
 data:
   train_path: Wanmini480

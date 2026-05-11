@@ -48,6 +48,31 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 _PATCHED_MODULE = "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _bind_qwen3_5_op_slots():
+    """Bind the patched module's OpSlots to FLA before any test runs.
+
+    ``build_foundation_model`` is what normally calls ``_bind_veomni_ops`` to
+    resolve each ``OpSlot`` to a concrete kernel. These tests skip that path —
+    they construct ``Qwen3_5GatedDeltaNet`` directly to isolate the SP layer —
+    so without this fixture every slot stays unbound, ``bound_kernel()``
+    returns ``None`` in ``__init__``, and the varlen guard in ``forward``
+    raises ``RuntimeError``.
+
+    These tests already require FLA (see the ``causal_conv1d_fn is None`` skip
+    inside each test), so binding to the FLA defaults matches existing intent.
+    """
+    if causal_conv1d_fn is None:
+        # No FLA installed → individual tests will skip; nothing to bind.
+        return
+    import importlib
+
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models.auto import _bind_veomni_ops
+
+    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+
+
 def _set_deterministic(seed=42):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True

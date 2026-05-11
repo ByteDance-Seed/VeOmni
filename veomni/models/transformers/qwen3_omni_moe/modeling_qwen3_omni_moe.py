@@ -48,6 +48,7 @@ from ....ops.dispatch import OpSlot
 from ....ops.kernels.cross_entropy import ForCausalLMLoss
 from ....utils import logging
 from ....utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from ....utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 from ..attention_utils import VARLEN_ATTENTION_TYPES
 
 
@@ -926,7 +927,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
         cache_position=None,
         video_second_per_grid=None,
         **kwargs,
-    ) -> Union[tuple, hf_qwen3_omni_moe.Qwen3OmniMoeThinkerCausalLMOutputWithPast]:
+    ) -> Union[tuple, Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs]:
         r"""
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
@@ -1228,8 +1229,14 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
         # NOTE: ForCausalLMLoss pads labels to (S+1) then slices [..., 1:] back to length S, so
         # shift_labels stays at length S — matching the full, unsliced hidden_states. Do NOT
         # pre-slice hidden_states[..., :-1, :] here or the shapes will mismatch.
+        log_probs = None
+        entropy = None
         if labels is not None:
-            loss, logits = ForCausalLMLoss(
+            # Direct ForCausalLMLoss call (no `**kwargs` passthrough), so the
+            # log-probs / entropy dispatch is unreachable here today; the
+            # third and fourth tuple slots stay ``None`` and we just unpack
+            # to keep the contract uniform with the other modelings.
+            loss, logits, log_probs, entropy = ForCausalLMLoss(
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
@@ -1251,7 +1258,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-        return hf_qwen3_omni_moe.Qwen3OmniMoeThinkerCausalLMOutputWithPast(
+        return Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
             aux_loss=aux_loss,
@@ -1259,6 +1266,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoe
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
             rope_deltas=self.rope_deltas,
+            log_probs=log_probs,
+            entropy=entropy,
         )
 
 
@@ -1273,7 +1282,7 @@ class Qwen3OmniMoeForConditionalGeneration(hf_qwen3_omni_moe.Qwen3OmniMoeForCond
     def forward(
         self,
         **kwargs,
-    ) -> Union[tuple, hf_qwen3_omni_moe.Qwen3OmniMoeThinkerCausalLMOutputWithPast]:
+    ) -> Union[tuple, Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs]:
         thinker_outputs = self.thinker(
             **kwargs,
         )

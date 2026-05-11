@@ -26,6 +26,7 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 from veomni.utils.loss_utils import count_loss_token
 
 from ..tools.common_utils import print_device_mem_info
+from ..tools.training_utils import make_eager_ops_config
 from .utils import (
     ModelMode,
     compare_multi_items,
@@ -380,13 +381,24 @@ def test_models_patch_fwd_bwd(
     # - HF backend doesn't support the test's position_ids test cases.
     # - VeOmni backend doesn't support the padded_bsh cases as we only support packed sequence case.
     if case_id in ("qwen3_5", "qwen3_5_moe"):
+        if IS_NPU_AVAILABLE:
+            # Qwen3.5 GatedDeltaNet has no NPU backend (no FLA / FlashQLA on
+            # Ascend); the OpSlot bind for fla raises on NPU.
+            return
         #    hf_model_modes = [mode for mode in hf_model_modes if mode.attn_case != "position_ids"]
         hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
         veomni_model_modes = [
             mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
         ]
 
-    model_config = ModelArguments(config_path=config_path)
+    # The actual ops backend used per test case is set by ``set_environ_param``
+    # inside ``TrainerTest`` (which calls ``apply_ops_config`` with a
+    # mode-specific config). The ops_implementation on this ModelArguments is
+    # never consumed at training time, so we pin it to all-eager — without
+    # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
+    # fused_triton / triton) would fail validation on NPU before the test
+    # even runs.
+    model_config = ModelArguments(config_path=config_path, ops_implementation=make_eager_ops_config())
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),

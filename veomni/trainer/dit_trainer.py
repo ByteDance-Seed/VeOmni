@@ -17,7 +17,6 @@ import os
 import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
@@ -40,36 +39,12 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
+from ..utils.lora_utils import patch_fsdp_lora_weight_loading
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
 
 
 logger = helper.create_logger(__name__)
-
-
-def patch_parallel_load_safetensors(model: torch.nn.Module):
-    def patch_parallel_load_safetensors(weights_path, func, model: torch.nn.Module):
-        shard_states = func(weights_path)
-        parameter_name = next(model.named_parameters())[0]
-        if parameter_name.startswith("base_model."):  # using lora peft will add prefix "base_model"
-            shard_states = {"base_model.model." + k: v for k, v in shard_states.items()}
-        for fqn, module in model.named_modules():
-            fqn = fqn + ("." if fqn else "")
-            if hasattr(module, "base_layer"):  # using lora peft will insert "base_layer"
-                for pname, _ in module.base_layer.named_parameters():
-                    old_name = fqn + pname
-                    if old_name in shard_states:
-                        wrap_name = fqn + "base_layer." + pname
-                        shard_states[wrap_name] = shard_states.pop(old_name)
-        return shard_states
-
-    from veomni.distributed import torch_parallelize
-
-    torch_parallelize.parallel_load_safetensors = partial(
-        patch_parallel_load_safetensors,
-        func=torch_parallelize.parallel_load_safetensors,
-        model=model,
-    )
 
 
 class OfflineEmbeddingSaver:
@@ -90,12 +65,24 @@ class OfflineEmbeddingSaver:
         self.dataset_length = dataset_length
         self.batch_len = math.ceil(dataset_length / self.shard_num)
         logger.info(f"Rank [{self.dp_rank}] save to [{self.save_path}] each batch_len [{self.batch_len}].")
+        os.makedirs(self.save_path, exist_ok=True)
         self.rest_len = self.dataset_length
+
+    @staticmethod
+    def _cpu_recursive(obj):
+        """Move tensors to CPU recursively, leave other types unchanged."""
+        if isinstance(obj, torch.Tensor):
+            return obj.cpu()
+        if isinstance(obj, dict):
+            return {k: OfflineEmbeddingSaver._cpu_recursive(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(OfflineEmbeddingSaver._cpu_recursive(v) for v in obj)
+        return obj
 
     def to_save_bytes(self, save_item: Dict[str, torch.Tensor]):
         converted_dict = {}
         for key in list(save_item.keys()):
-            converted_dict[key] = pk.dumps(save_item[key].cpu())
+            converted_dict[key] = pk.dumps(self._cpu_recursive(save_item[key]))
             del save_item[key]
         return converted_dict
 
@@ -220,7 +207,7 @@ class DiTTrainer:
         self._build_dataloader()
 
         if self.training_task != "offline_embedding":
-            self.base._build_parallelized_model()
+            self._build_parallelized_model()
             self.base._build_optimizer()
             self.base._build_lr_scheduler()
             self.base._build_training_context()
@@ -236,7 +223,6 @@ class DiTTrainer:
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
         args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
         if args.train.training_task == "offline_embedding":
-            assert args.train.ulysses_parallel_size == 1, "Ulysses parallel size must be 1 for offline embedding."
             assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
             if args.data.offline_embedding_save_dir is None:
                 self.offline_embedding_save_dir = f"{args.data.train_path}_offline"
@@ -245,8 +231,13 @@ class DiTTrainer:
 
             args.data.drop_last = False
             args.data.shuffle = False
-            args.train.save_epochs = 0
-            args.train.save_hf_weights = False
+            args.train.checkpoint.save_epochs = 0
+            args.train.checkpoint.save_hf_weights = False
+            # No gradient accumulation needed; process one sample per step to
+            # avoid broadcast_object_list serialising all micro-batches at once
+            # which can OOM CPU memory with large video data.
+            args.train.global_batch_size = get_parallel_state().dp_size
+            args.train.dataloader_batch_size = 1
             logger.info_rank0(
                 f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
             )
@@ -262,7 +253,8 @@ class DiTTrainer:
         # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
         # below will re-apply the same config — that call is idempotent.
         apply_ops_config(args.model.ops_implementation)
-        dit_config = build_config(args.model.config_path)
+        model_config = args.model.model_config
+        dit_config = build_config(args.model.config_path, **model_config)
         self.base.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
         self._build_condition_model(
@@ -276,6 +268,7 @@ class DiTTrainer:
                 torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 init_device=args.train.init_device,
                 ops_implementation=args.model.ops_implementation,
+                config_kwargs=model_config,
             )
             self.base.model_config = getattr(self.base.model, "config", None)
         else:
@@ -308,15 +301,24 @@ class DiTTrainer:
         self.condition_model.requires_grad_(False)
 
         if self.training_task == "offline_training" or self.training_task == "online_training":
-            if not bool(lora_config):
-                self.base.lora = False
-            else:
+            if bool(lora_config):
                 lora_adapter_path = lora_config.get("lora_adapter", None)
                 if lora_adapter_path is not None:
                     logger.info_rank0(f"Load lora_adapter from {lora_adapter_path}.")
+                    import warnings
+
                     from peft import PeftModel
 
-                    self.base.model = PeftModel.from_pretrained(self.base.model, lora_adapter_path)
+                    # When init_device="meta" the base model params are meta tensors.
+                    # PEFT's from_pretrained tries to copy loaded weights into the meta
+                    # adapter params, which is a no-op that PyTorch warns about.
+                    # The actual adapter weights are loaded later via adapter_path in
+                    # parallelize_model_fsdp2 (rank0 broadcast or per-rank read).
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message="copying from a non-meta parameter")
+                        self.base.model = PeftModel.from_pretrained(
+                            self.base.model, lora_adapter_path, is_trainable=lora_config.get("is_trainable", True)
+                        )
                 else:
                     from peft import LoraConfig, get_peft_model
 
@@ -329,13 +331,22 @@ class DiTTrainer:
                     self.base.model = get_peft_model(self.base.model, lora_config)
 
                 self.base.model.print_trainable_parameters()
-                self.base.lora = True
 
                 if args.train.init_device == "meta":
-                    patch_parallel_load_safetensors(self.base.model)
+                    patch_fsdp_lora_weight_loading(self.base.model)
 
             pretty_print_trainable_parameters(self.base.model)
             helper.print_device_mem_info("VRAM usage after building model")
+
+    def _build_parallelized_model(self):
+        """Override base to inject adapter_path into FSDP2 parallelization kwargs."""
+        parallel_kwargs = {}
+        args: VeOmniDiTArguments = self.base.args
+        if bool(args.model.lora_config):
+            lora_adapter_path = args.model.lora_config.get("lora_adapter", None)
+            if lora_adapter_path is not None:
+                parallel_kwargs["adapter_path"] = lora_adapter_path
+        self.base._build_parallelized_model(**parallel_kwargs)
 
     def _build_model_assets(self):
         if self.training_task == "offline_training" or self.training_task == "online_training":
@@ -359,8 +370,31 @@ class DiTTrainer:
         if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
             self.base.train_dataset = None
 
-        # Sync _train_steps across the SP group so every rank runs the same number
-        # of training steps (required to avoid deadlocks in broadcast_object_list).
+        if self.training_task == "offline_embedding":
+            if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
+                dp_rank = get_parallel_state().dp_rank
+                dp_size = get_parallel_state().dp_size
+                dataset_len = len(self.base.train_dataset)
+                base_count = dataset_len // dp_size
+                extra = dataset_len % dp_size
+                valid_data_length = base_count + (1 if dp_rank < extra else 0)
+                logger.info(f"Rank {args.train.global_rank} data length to save: {valid_data_length}")
+                self.offline_embedding_saver = OfflineEmbeddingSaver(
+                    save_path=self.offline_embedding_save_dir,
+                    dataset_length=valid_data_length,
+                )
+                padded_len = (
+                    math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
+                    * args.train.global_batch_size
+                )
+                self.base.train_dataset.data_len = padded_len
+                args._train_steps = padded_len // dp_size // args.train.dataloader_batch_size
+                self.base.train_steps = args.train_steps
+            else:
+                self.offline_embedding_saver = None
+
+        # Sync _train_steps across the SP group AFTER padding so every rank
+        # agrees on step count (required to avoid deadlocks in broadcast_object_list).
         if get_parallel_state().sp_enabled:
             steps_t = torch.zeros(1, dtype=torch.int64, device=torch.device(get_device_type()))
             if get_parallel_state().sp_rank == 0:
@@ -372,24 +406,6 @@ class DiTTrainer:
             )
             args._train_steps = int(steps_t.item())
             self.base.train_steps = args.train_steps
-
-        if self.training_task == "offline_embedding":
-            dp_size = get_parallel_state().dp_size
-            base = len(self.base.train_dataset) // dp_size
-            extra = len(self.base.train_dataset) % dp_size
-            extra_for_rank = max(0, min(1, extra - args.train.local_rank))
-            valid_data_length = base + extra_for_rank
-            logger.info(f"Rank {args.train.global_rank} data length to save: {valid_data_length}")
-            self.offline_embedding_saver = OfflineEmbeddingSaver(
-                save_path=self.offline_embedding_save_dir,
-                dataset_length=valid_data_length,
-            )
-
-            # pad dataset_len
-            self.base.train_dataset.data_len = (
-                math.ceil(self.base.train_dataset.data_len / (args.train.global_batch_size))
-                * args.train.global_batch_size
-            )
 
     def _build_dataloader(self):
         """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
@@ -476,8 +492,9 @@ class DiTTrainer:
                 micro_batch = self.condition_model.get_condition(**micro_batch)
 
         if self.training_task == "offline_embedding":
-            for item in self._unpack_dict_of_list(micro_batch):
-                self.offline_embedding_saver.save(item)
+            if self.offline_embedding_saver is not None:  # sp_rank 0 save
+                for item in self._unpack_dict_of_list(micro_batch):
+                    self.offline_embedding_saver.save(item)
             del micro_batch
             return 0.0, {}
 
@@ -590,7 +607,7 @@ class DiTTrainer:
 
         synchronize()
 
-        if self.training_task == "offline_embedding":
+        if self.training_task == "offline_embedding" and self.offline_embedding_saver is not None:
             self.offline_embedding_saver.save_last()
 
         self.base.destroy_distributed()

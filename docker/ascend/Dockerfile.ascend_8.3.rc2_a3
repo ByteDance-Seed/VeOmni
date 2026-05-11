@@ -1,6 +1,9 @@
 # FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-a3-openeuler24.03-py3.11
 FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-a3-ubuntu22.04-py3.11
 
+# Set default pip index
+ARG PIP_INDEX=https://pypi.org/simple
+
 # Define environments
 ENV MAX_JOBS=16
 ENV PIP_ROOT_USER_ACTION=ignore

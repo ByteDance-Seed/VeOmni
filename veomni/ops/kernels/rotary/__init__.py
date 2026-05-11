@@ -30,7 +30,7 @@ register_op(
         config_field="rotary_pos_emb_implementation",
         label="RoPE",
         scope=OpScope.PER_MODEL,
-        default="eager",
+        default="liger_kernel",
         backends={
             "liger_kernel": BackendSpec(
                 entry="liger_kernel.transformers.rope:liger_rotary_pos_emb",

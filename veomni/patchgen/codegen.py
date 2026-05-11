@@ -319,7 +319,7 @@ def strip_patch_decorators(source: str) -> str:
     by tracking parenthesis depth until the decorator is fully closed.
     """
     _PATCH_DECORATOR_RE = re.compile(
-        r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init|add_helper)\b"
+        r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init|add_helper|add_helper_after)\b"
     )
     source_lines = source.splitlines()
     filtered_lines: list[str] = []
@@ -567,13 +567,38 @@ class ModelingCodeGenerator:
             f"# {'=' * 70}",
         ]
         for helper in self.config.helpers:
-            src = get_object_source_with_leading_comments(helper)
+            src = self._render_helper_source(helper)
             if not src:
                 continue
-            src = textwrap.dedent(src)
-            src = strip_patch_decorators(src)
             lines.append("")
-            lines.append(src.rstrip())
+            lines.append(src)
+        return "\n".join(lines)
+
+    def _render_helper_source(self, helper: Any) -> str:
+        src = get_object_source_with_leading_comments(helper)
+        if not src:
+            return ""
+        src = textwrap.dedent(src)
+        src = strip_patch_decorators(src)
+        return src.rstrip()
+
+    def _generate_positioned_helpers_after(self, target: str) -> str:
+        helpers = [h.helper for h in self.config.positioned_helpers if h.target == target and h.placement == "after"]
+        if not helpers:
+            return ""
+
+        lines: list[str] = [
+            "",
+            f"# {'=' * 70}",
+            f"# [HELPERS AFTER] {target}",
+            f"# {'=' * 70}",
+        ]
+        for helper in helpers:
+            src = self._render_helper_source(helper)
+            if not src:
+                continue
+            lines.append("")
+            lines.append(src)
         return "\n".join(lines)
 
     def _apply_class_replacement(
@@ -968,6 +993,7 @@ class ModelingCodeGenerator:
             self.load_source()
 
         output_parts = []
+        emitted_positioned_targets: set[str] = set()
 
         # 1. Generate header
         output_parts.append(self._generate_header())
@@ -995,10 +1021,20 @@ class ModelingCodeGenerator:
                 if node.name not in self.config.exclude:
                     output_parts.append(self._generate_class_source(node, {}))
                     output_parts.append("")
+                    positioned_helpers = self._generate_positioned_helpers_after(node.name)
+                    if positioned_helpers:
+                        output_parts.append(positioned_helpers)
+                        output_parts.append("")
+                        emitted_positioned_targets.add(node.name)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if node.name not in self.config.exclude:
                     output_parts.append(self._generate_function_source(node))
                     output_parts.append("")
+                    positioned_helpers = self._generate_positioned_helpers_after(node.name)
+                    if positioned_helpers:
+                        output_parts.append(positioned_helpers)
+                        output_parts.append("")
+                        emitted_positioned_targets.add(node.name)
             elif isinstance(node, ast.Assign):
                 # Module-level assignments (like __all__, DOCSTRINGS, etc.)
                 # Special case: if this is `__all__ = [...]` of string literals,
@@ -1029,6 +1065,14 @@ class ModelingCodeGenerator:
                     end_line = get_node_end_line(node, self.source_lines)
                     output_parts.append(extract_source_segment(self.source_lines, node.lineno, end_line))
                     output_parts.append("")
+
+        missing_positioned_targets = sorted(
+            {h.target for h in self.config.positioned_helpers if h.placement == "after"} - emitted_positioned_targets
+        )
+        if missing_positioned_targets:
+            raise CodegenError(
+                "Positioned helper target(s) not found in generated output: " + ", ".join(missing_positioned_targets)
+            )
 
         # 4. Join and format output
         output = "\n".join(output_parts)

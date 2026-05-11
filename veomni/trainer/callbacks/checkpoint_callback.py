@@ -21,7 +21,7 @@ import torch.distributed as dist
 from ...checkpoint import CheckpointerBase, build_checkpointer
 from ...models import save_model_assets
 from ...utils import helper
-from ...utils.save_safetensor_utils import save_hf_safetensor
+from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from .base import Callback, TrainerState
 
 
@@ -111,7 +111,9 @@ class CheckpointerCallback(Callback):
             "extra_state": {
                 "global_step": state.global_step,
                 "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
-                "train_dataloader": self.trainer.train_dataloader.state_dict(),
+                "train_dataloader": self.trainer.train_dataloader.state_dict()
+                if self.trainer.train_dataloader is not None
+                else {},
                 "environ_meter": self.trainer.environ_meter.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
             },
@@ -179,15 +181,14 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             self.trainer.checkpointer.save_future.result()
 
         if stage == "train_end":
-            del self.trainer.optimizer
-            del self.trainer.lr_scheduler
+            self.trainer.optimizer = None
+            self.trainer.lr_scheduler = None
 
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
         save_hf_safetensor(
             save_hf_safetensor_path=hf_weights_path,
             model_assets=self.trainer.model_assets,
             ckpt_manager=args.train.checkpoint.manager,
-            train_architecture=args.train.train_architecture,
             output_dir=args.train.checkpoint.output_dir,
             save_checkpoint_path=save_checkpoint_path,
             model=self.trainer.model,
@@ -208,7 +209,7 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)
@@ -216,25 +217,16 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
             self.trainer.checkpointer.save_future.result()
 
-        from peft import get_peft_model_state_dict
+        if stage == "train_end":
+            self.trainer.optimizer = None
+            self.trainer.lr_scheduler = None
 
-        from veomni.checkpoint import ckpt_to_state_dict
-        from veomni.models.module_utils import _save_state_dict
-
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.checkpoint.output_dir,
-            ckpt_manager=args.train.checkpoint.manager,
+        lora_save_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
+        save_lora_adapter_with_dcp(
+            model=self.trainer.model,
+            save_path=lora_save_path,
+            adapter_name="default",
         )
-
-        model_state_dict = get_peft_model_state_dict(self.trainer.model, model_state_dict)
-        # save bf16 lora
-        model_state_dict = {k: v.to(torch.bfloat16) for k, v in model_state_dict.items()}
-        lora_adapter_save_path = os.path.join(save_checkpoint_path, "adapter_model.bin")
-        os.makedirs(save_checkpoint_path, exist_ok=True)
-        _save_state_dict(model_state_dict, lora_adapter_save_path, safe_serialization=False)
-        self.trainer.model.peft_config["default"].save_pretrained(save_checkpoint_path)
-        logger.info_rank0(f"Lora adapter saved at {save_checkpoint_path} successfully!")
 
         helper.empty_cache()
         dist.barrier()

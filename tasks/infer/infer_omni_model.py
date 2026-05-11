@@ -7,12 +7,14 @@ import torch
 from PIL import Image
 
 from veomni.arguments import InferArguments, parse_args
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data import build_multimodal_chat_template
 from veomni.data.multimodal.multimodal_transform import mask_input_ids
 from veomni.models import build_foundation_model, build_processor
 from veomni.models.seed_omni import SeedOmniModel, SeedOmniProcessor
 from veomni.utils import helper
 from veomni.utils.device import get_device_type
+from veomni.utils.import_utils import is_flash_attn_2_available
 
 
 logger = helper.create_logger(__name__)
@@ -112,6 +114,23 @@ data_mapping = {
 }
 
 
+# Inference doesn't need fused training kernels — pin every per-op field to
+# eager. ``attn_implementation`` falls back to eager on hosts without
+# flash-attn so CPU / minimal-deps environments don't crash.
+_INFERENCE_OPS = OpsImplementationConfig(
+    attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "eager",
+    moe_implementation="eager",
+    cross_entropy_loss_implementation="eager",
+    rms_norm_implementation="eager",
+    swiglu_mlp_implementation="eager",
+    rotary_pos_emb_implementation="eager",
+    load_balancing_loss_implementation="eager",
+    rms_norm_gated_implementation="eager",
+    causal_conv1d_implementation="eager",
+    chunk_gated_delta_rule_implementation="eager",
+)
+
+
 def main() -> None:
     args = parse_args(Arguments)
     logger.info(json.dumps(asdict(args), indent=2))
@@ -119,7 +138,9 @@ def main() -> None:
     helper.enable_third_party_logging()
     # config model and processor
     model: SeedOmniModel = (
-        build_foundation_model(args.infer.model_path, args.infer.model_path).eval().to(get_device_type())
+        build_foundation_model(args.infer.model_path, args.infer.model_path, ops_implementation=_INFERENCE_OPS)
+        .eval()
+        .to(get_device_type())
     )
     position_id_func = model.get_position_id_func()
     modality_info = model.get_modality()
