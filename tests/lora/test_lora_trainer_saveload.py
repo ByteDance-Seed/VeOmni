@@ -256,15 +256,17 @@ def test_lora_trainer_saveload():
     import subprocess
 
     import pytest
-    import torch
+
+    from veomni.utils.device import get_torch_device
 
     from ..tools.launch_utils import find_free_port
 
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if gpu_count < 1:
-        pytest.skip("Requires at least 1 GPU")
+    torch_device = get_torch_device()
+    device_count = torch_device.device_count() if torch_device.is_available() else 0
+    if device_count < 1:
+        pytest.skip("Requires at least 1 accelerator device")
 
-    nproc = min(gpu_count, 4)
+    nproc = min(device_count, 4)
     output_dir = "/tmp/test_lora_saveload"
     port = find_free_port()
 
