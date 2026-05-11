@@ -190,4 +190,4 @@ jobs:
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --extra lora --group dev
       - name: Run LoRA e2e test [transformers-v5]
         run: |
-          uv run --frozen pytest -s -x tests/lora/test_e2e_lora.py
+          uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py

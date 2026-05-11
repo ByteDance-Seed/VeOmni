@@ -243,3 +243,43 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Pytest entry point
+# ---------------------------------------------------------------------------
+
+
+def test_lora_trainer_saveload():
+    """Run the LoRA save/load test via torchrun and assert it passes."""
+    import shutil
+    import subprocess
+
+    import pytest
+    import torch
+
+    from ..tools.launch_utils import find_free_port
+
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if gpu_count < 1:
+        pytest.skip("Requires at least 1 GPU")
+
+    nproc = min(gpu_count, 4)
+    output_dir = "/tmp/test_lora_saveload"
+    port = find_free_port()
+
+    cmd = [
+        "torchrun",
+        "--nnodes=1",
+        f"--nproc_per_node={nproc}",
+        f"--master_port={port}",
+        __file__,
+        "tests/lora/qwen3_toy_lora.yaml",  # positional config_file
+        f"--train.checkpoint.output_dir={output_dir}",
+    ]
+
+    try:
+        result = subprocess.run(cmd, check=True)
+        assert result.returncode == 0
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)

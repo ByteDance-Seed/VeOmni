@@ -3799,7 +3799,6 @@ dit = [
     { name = "diffusers" },
     { name = "ftfy" },
     { name = "librosa" },
-    { name = "peft" },
     { name = "soundfile" },
 ]
 fa4 = [
@@ -3826,6 +3825,9 @@ gpu = [
     { name = "torchaudio", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/" } },
     { name = "torchcodec", version = "0.8.1", source = { registry = "https://pypi.org/simple" } },
     { name = "torchvision", version = "0.24.1+cu129", source = { registry = "https://download.pytorch.org/whl/" } },
+]
+lora = [
+    { name = "peft" },
 ]
 megatron = [
     { name = "megatron-energon" },
@@ -3918,7 +3920,7 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", marker = "extra == 'fa4'", specifier = ">=4.4.2" },
     { name = "nvidia-nccl-cu12", marker = "extra == 'gpu'" },
     { name = "packaging", specifier = ">=23.0,<26.0" },
-    { name = "peft", marker = "extra == 'dit'" },
+    { name = "peft", marker = "extra == 'lora'", specifier = "==0.18.1" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0.0,<5.0" },
     { name = "psutil" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=6.0.0,<8.0" },
@@ -3957,7 +3959,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'trl'", specifier = "<=0.9.6" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "audio", "video", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl", "fa4", "flash-qla", "transformers5-exp"]
+provides-extras = ["dev", "audio", "video", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl", "lora", "fa4", "flash-qla", "transformers5-exp"]
 
 [package.metadata.requires-dev]
 dev = [
