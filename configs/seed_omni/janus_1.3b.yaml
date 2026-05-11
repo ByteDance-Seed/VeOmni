@@ -1,0 +1,127 @@
+# OmniModel V2 — Janus-1.3B demo configuration
+#
+# Split checkpoint first:
+#   python scripts/split_janus.py \
+#     --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
+#
+# Then set JANUS_SPLIT_DIR below and launch training.
+
+# ── Module registry ───────────────────────────────────────────────────────────
+modules:
+  vision_encoder:
+    model_type: janus_vision_encoder
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/vision_encoder
+
+  vq_decoder:
+    model_type: janus_vq_decoder
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/vq_decoder
+    freeze_vqvae: true
+
+  ar_llm:
+    model_type: janus_llm
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/ar_llm
+    image_token_id: 100577      # <und_img> placeholder in tokenizer
+    gen_image_token_id: 100578  # <gen_img> placeholder in tokenizer
+
+# ── Named connection pool (each is one atomic edge) ───────────────────────────
+connections:
+  # ── execute AR-LLM (text / multimodal understanding)
+  run_ar:
+    module: ar_llm
+
+  # ── vision_encoder → ar_llm  (understanding images)
+  vision_to_ar:
+    from: vision_encoder
+    output: image_embeds
+    to: ar_llm
+    as: und_image_embeds
+
+  # ── vq_decoder → ar_llm  (generation teacher-forcing embeddings)
+  vae_enc_to_ar:
+    from: vq_decoder
+    output: gen_embeds
+    to: ar_llm
+    as: gen_image_embeds
+
+  # ── ar_llm → vq_decoder  (VQ token ID → codebook embed, during inference)
+  ar_to_vq:
+    from: ar_llm
+    output: vq_token_id
+    to: vq_decoder
+    as: token_id
+
+  # ── vq_decoder → ar_llm  (codebook embed → next LLM input, during inference)
+  vq_dec_to_ar:
+    from: vq_decoder
+    output: embed
+    to: ar_llm
+    as: inputs_embeds
+
+# ── Training DAG ──────────────────────────────────────────────────────────────
+# Scenario A: Text + image understanding SFT  (vision_encoder → ar_llm)
+training_graph:
+  connections:
+    - vision_to_ar
+    - run_ar
+
+# Alternative scenarios (switch training_graph.connections to activate):
+#
+# Scenario B: Image generation SFT  (vq_decoder → ar_llm)
+#   connections: [vae_enc_to_ar, run_ar]
+#
+# Scenario C: Joint understanding + generation SFT
+#   connections: [vision_to_ar, vae_enc_to_ar, run_ar]
+#
+# Scenario D: Generate VQ embeddings only (offline embedding)
+#   connections: [vision_to_ar]      # no run_ar; trainer saves vision_encoder output
+#
+# Scenario E: Train only ar_llm with pre-cached embeddings
+#   connections: [run_ar]            # batch already has und_image_embeds from disk
+
+# ── Inference FSM ─────────────────────────────────────────────────────────────
+generation_states:
+  initial: text_ar
+  done_state: done   # special terminal state
+
+  states:
+    text_ar:
+      body:
+        - run_ar
+      token_length:
+        type: variable
+      transitions:
+        - condition:
+            type: token_match
+            token_id: 100577   # <und_img> → should not appear in generation; skip
+          next_state: text_ar
+        - condition:
+            type: token_match
+            token_id: 100578   # <gen_img> → switch to VQ image generation
+          next_state: image_vq
+        - condition:
+            type: token_match
+            token_id: 2        # </s> EOS → done
+          next_state: done
+
+    image_vq:
+      # AR-LLM generates one VQ token per step; VQ decoder converts it to embed
+      # that feeds back as the next LLM input.  576 tokens = 24×24 VQ grid.
+      body:
+        - run_ar       # generate next VQ token ID from LLM
+        - ar_to_vq     # route vq_token_id → vq_decoder
+        - vq_dec_to_ar # route embed → ar_llm.inputs_embeds
+      token_length:
+        type: fixed
+        value: 576
+      transitions:
+        - condition:
+            type: steps_complete   # 576 steps done → back to text
+          next_state: text_ar
+
+    done:
+      body: []
+      token_length:
+        type: fixed
+        value: 0
+      transitions: []

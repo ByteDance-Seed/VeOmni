@@ -12,38 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
-from .auto import SeedOmniConfig, SeedOmniModel, SeedOmniProcessor, build_omni_model, build_omni_processor
-from .decoder import *
-from .encoder import *
-from .foundation import *
-
-
-@MODEL_CONFIG_REGISTRY.register("seed_omni")
-def register_seed_omni_config():
-    from .configuration_seed_omni import SeedOmniConfig
-
-    return SeedOmniConfig
-
-
-@MODELING_REGISTRY.register("seed_omni")
-def register_seed_omni_modeling(architecture: str):
-    from .modeling_seed_omni import SeedOmniModel
-
-    return SeedOmniModel
-
-
-@MODEL_PROCESSOR_REGISTRY.register("SeedOmniProcessor")
-def register_seed_omni_processor():
-    from .processing_seed_omni import SeedOmniProcessor
-
-    return SeedOmniProcessor
+# ── V2 OmniModel exports ───────────────────────────────────────────────────
+from .configuration_seed_omni import OmniConfig
+from .generation import GenerationStateMachine
+from .graph import OmniGraph
+from .modeling_omni import OmniModel
+from .module import OmniModule
+from .modules import JanusLLM, JanusVisionEncoder, JanusVQDecoder
 
 
 __all__ = [
-    "build_omni_model",
-    "build_omni_processor",
-    "SeedOmniModel",
-    "SeedOmniConfig",
-    "SeedOmniProcessor",
+    # Core V2
+    "OmniConfig",
+    "OmniGraph",
+    "OmniModule",
+    "OmniModel",
+    "GenerationStateMachine",
+    # Janus modules
+    "JanusVisionEncoder",
+    "JanusVQDecoder",
+    "JanusLLM",
 ]

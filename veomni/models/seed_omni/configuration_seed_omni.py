@@ -1,103 +1,92 @@
+"""
+OmniConfig — central configuration for OmniModel V2.
+
+YAML structure (maps 1-to-1 to this class):
+
+  modules:
+    vision_encoder: {model_type: janus_vision_encoder, ...extra kwargs}
+    vq_decoder:     {model_type: janus_vq_decoder, ...}
+    ar_llm:         {model_type: janus_llm, ...}
+
+  connections:
+    run_ar:           {module: ar_llm}
+    vision_to_ar:     {from: vision_encoder, output: image_embeds, to: ar_llm, as: und_image_embeds}
+    vae_enc_to_ar:    {from: vq_decoder,     output: gen_embeds,   to: ar_llm, as: gen_image_embeds}
+    ar_to_vq:         {from: ar_llm,         output: vq_token_id,  to: vq_decoder, as: token_id}
+    vq_dec_to_ar:     {from: vq_decoder,     output: embed,        to: ar_llm, as: inputs_embeds}
+
+  training_graph:
+    connections: [vision_to_ar, run_ar]
+
+  generation_states:
+    initial: text_ar
+    states:
+      text_ar:
+        body: [run_ar]
+        token_length: {type: variable}
+        transitions:
+          - {condition: {type: token_match, token_id: 100577}, next_state: image_vq}
+      image_vq:
+        body: [run_ar, ar_to_vq, vq_dec_to_ar]
+        token_length: {type: fixed, value: 576}
+        transitions:
+          - {condition: {type: steps_complete}, next_state: text_ar}
+"""
+
 from copy import deepcopy
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Optional
 
-from transformers import AutoConfig, PretrainedConfig
-
-from ..loader import MODEL_CONFIG_REGISTRY
+from transformers import PretrainedConfig
 
 
-def _init_config(config_dict: Optional[Dict[str, Any]]) -> Optional["PretrainedConfig"]:
+class OmniConfig(PretrainedConfig):
+    """Configuration for OmniModel V2.
+
+    All nested dicts are stored as plain Python dicts for JSON serialisability.
+    OmniModel's ``__init__`` calls :meth:`module_config` and the graph /
+    generation helpers when it needs typed access.
     """
-    Initialize model config from config_dict. If config_dict is None, return a PretrainedConfig.
-    """
-    if config_dict is None:
-        return PretrainedConfig()
 
-    config_dict = deepcopy(config_dict)
-    model_type = config_dict.pop("model_type")
-    if model_type == "":
-        return PretrainedConfig()
-    return MODEL_CONFIG_REGISTRY[model_type]()(**config_dict)
-
-
-class SeedOmniEncoderConfig(PretrainedConfig):
-    model_type = "seed_omni_encoder"
-    sub_configs = {
-        "image_config": AutoConfig,
-        "video_config": AutoConfig,
-        "audio_config": AutoConfig,
-        "text_config": AutoConfig,
-    }
+    model_type = "omni"
 
     def __init__(
         self,
-        image_config: Optional[Dict[str, Any]] = None,
-        video_config: Optional[Dict[str, Any]] = None,
-        audio_config: Optional[Dict[str, Any]] = None,
-        text_config: Optional[Dict[str, Any]] = None,
-        encode_input: bool = True,
-        encode_output: bool = False,
-        initializer_range: float = 0.02,
+        modules: Optional[Dict[str, Dict]] = None,
+        connections: Optional[Dict[str, Dict]] = None,
+        training_graph: Optional[Dict] = None,
+        generation_states: Optional[Dict] = None,
         **kwargs,
     ):
-        self.image_config = _init_config(image_config)
-        self.video_config = _init_config(video_config)
-        self.audio_config = _init_config(audio_config)
-        self.text_config = _init_config(text_config)
-        self.encode_input = encode_input
-        self.encode_output = encode_output
-        self.initializer_range = initializer_range
+        # Store all as plain dicts so they serialise cleanly with PretrainedConfig
+        self.modules: Dict[str, Dict] = modules or {}
+        self.connections: Dict[str, Dict] = connections or {}
+        self.training_graph: Dict = training_graph or {"connections": []}
+        self.generation_states: Optional[Dict] = generation_states
+
         super().__init__(**kwargs)
 
+    # ── Accessors ─────────────────────────────────────────────────────────────
 
-class SeedOmniDecoderConfig(PretrainedConfig):
-    model_type = "seed_omni_decoder"
-    sub_configs = {
-        "image_config": AutoConfig,
-        "video_config": AutoConfig,
-        "audio_config": AutoConfig,
-    }
+    def module_config(self, name: str) -> Dict[str, Any]:
+        """Return the raw config dict for a module by name."""
+        cfg = self.modules.get(name)
+        if cfg is None:
+            raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
+        return deepcopy(cfg)
 
-    def __init__(
-        self,
-        image_config: Optional[Dict[str, Any]] = None,
-        video_config: Optional[Dict[str, Any]] = None,
-        audio_config: Optional[Dict[str, Any]] = None,
-        encode_input: bool = False,
-        encode_output: bool = True,
-        initializer_range: float = 0.02,
-        **kwargs,
-    ):
-        self.image_config = _init_config(image_config)
-        self.video_config = _init_config(video_config)
-        self.audio_config = _init_config(audio_config)
-        self.encode_input = encode_input
-        self.encode_output = encode_output
-        self.initializer_range = initializer_range
-        super().__init__(**kwargs)
+    @property
+    def training_connections(self) -> List[str]:
+        return self.training_graph.get("connections", [])
 
+    @property
+    def module_names(self) -> List[str]:
+        return list(self.modules.keys())
 
-class SeedOmniConfig(PretrainedConfig):
-    model_type = "seed_omni"
-    sub_configs = {"encoder_config": AutoConfig, "foundation_config": AutoConfig, "decoder_config": AutoConfig}
+    def has_generation_states(self) -> bool:
+        return self.generation_states is not None
 
-    def __init__(
-        self,
-        encoder_config: Dict[Literal["image_config"], Dict[str, Any]] = None,
-        foundation_config: Optional[Dict[str, Any]] = None,
-        decoder_config: Dict[Literal["image_config"], Dict[str, Any]] = None,
-        initializer_range: float = 0.02,
-        **kwargs,
-    ):
-        if decoder_config is None:
-            decoder_config = {}
-        if encoder_config is None:
-            encoder_config = {}
-        self.encoder_config = SeedOmniEncoderConfig(**encoder_config)
-        self.decoder_config = SeedOmniDecoderConfig(**decoder_config)
-        self.foundation_config = _init_config(foundation_config)
-        self.initializer_range = initializer_range
-        super().__init__(architectures=kwargs.pop("architectures", "SeedOmniForCausalLM"), **kwargs)
+    # ── Factory: load from YAML dict ──────────────────────────────────────────
 
-    def get_text_config(self, decoder=False) -> PretrainedConfig:
-        return self.foundation_config
+    @classmethod
+    def from_dict(cls, config_dict: Dict, **kwargs) -> "OmniConfig":
+        return cls(**{k: v for k, v in config_dict.items() if k in cls.__init__.__code__.co_varnames}, **kwargs)
