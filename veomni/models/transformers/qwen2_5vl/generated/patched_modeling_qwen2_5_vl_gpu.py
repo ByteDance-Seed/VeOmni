@@ -561,7 +561,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         unpadded_dim_size = cu_seqlens[-1]
         sp_padding_size = 0
         if get_parallel_state().sp_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=1, group=get_parallel_state().sp_group)
+            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
             sp_padding_size = hidden_states.size(0) - unpadded_dim_size
             if sp_padding_size > 0:
                 hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
@@ -588,7 +588,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                 cu_window_seqlens = torch.cat([cu_window_seqlens, new_cumsum.unsqueeze(0)], dim=0)
                 # --- Patch.2 ---
             # --- Patch.1 ---
-            hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
+            hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
             # --- Patch.1 ---
             # --- Patch.2 ---
             emb = sp_pad_and_slice(emb, dim=0)

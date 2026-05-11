@@ -332,7 +332,7 @@ def qwen3_5_moe_model_forward_patched(
         # --- Patch.1: Shard image_embeds for sequence parallel scatter ---
         if get_parallel_state().sp_enabled:
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
-            image_embeds = gather_outputs(image_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
         n_image_tokens = image_mask.sum().long().item()
         embeds_image_mask = (
@@ -374,7 +374,7 @@ def qwen3_5_moe_model_forward_patched(
         # sequence parallel patch for video embeds
         if get_parallel_state().sp_enabled:
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
-            video_embeds = gather_outputs(video_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
         n_video_tokens = video_mask.sum().long().item()
         embeds_video_mask = (
