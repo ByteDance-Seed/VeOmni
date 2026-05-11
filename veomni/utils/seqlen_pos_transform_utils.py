@@ -112,14 +112,22 @@ def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor, pad_len: int = 0) ->
        region forms exactly one trailing segment of length ``pad_len``. We
        strip that single segment.
 
-    2. ``pad_len == 0`` (legacy / SP padding / no caller-side info):
+    2. ``pad_len == 0`` (no caller-side info / SP constant-0 padding):
        fall back to the heuristic that strips trailing length-1 segments
-       (legacy constant-0 pad created ``pad_len`` length-1 segments).
+       (SequenceParallelCollator constant-0 pads position_ids, which yields
+       ``pad_size`` length-1 segments at the tail).
 
     Returns: 1D tensor of valid seqlens (excludes tail padding segments).
     """
     diff = cu_seqlens[1:] - cu_seqlens[:-1]
-    if pad_len > 0 and diff.numel() > 0 and int(diff[-1].item()) == pad_len:
+    if pad_len > 0:
+        # Route A invariant: the arange-padded tail is exactly one segment of
+        # length pad_len. If this ever fails (e.g. an extra collation step ran
+        # between PackingCollator and here), bail loudly rather than silently
+        # mis-stripping via the length-1 heuristic.
+        assert diff.numel() > 0 and int(diff[-1].item()) == pad_len, (
+            f"expected a single trailing pad segment of length {pad_len}, got cu_seqlens={cu_seqlens.tolist()}"
+        )
         return diff[:-1]
     pad = int((torch.flip(diff == 1, (0,)).cumprod(0)).sum().item())
     return diff[:-pad] if pad else diff
