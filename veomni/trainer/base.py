@@ -255,8 +255,26 @@ class BaseTrainer(Stateful, ABC):
         - Resume: ``lora_config["lora_adapter"]`` is set → use
           ``PeftModel.from_pretrained`` so the PEFT config is read from disk.
           Actual adapter *weights* are loaded later during parallelization.
-        - Scratch: only ``rank``, ``alpha``, ``lora_modules`` are set →
-          use ``get_peft_model``.
+        - Scratch: ``rank`` / ``alpha`` are set →  use ``get_peft_model``.
+
+        Recognised ``lora_config`` keys (in addition to ``rank`` / ``alpha`` /
+        ``lora_adapter`` / ``is_trainable``):
+
+        - ``lora_modules`` (list[str]): forwarded to PEFT ``target_modules``.
+          Use for ``nn.Linear`` targets (q/k/v/o, dense MLP, shared experts).
+        - ``target_parameters`` (list[str]): forwarded to PEFT
+          ``target_parameters`` (PEFT >= 0.19). Use for 3D ``nn.Parameter``
+          MoE expert weights, e.g.
+          ``model.layers.*.mlp.experts.gate_up_proj`` /
+          ``model.layers.*.mlp.experts.down_proj``. PEFT materialises a
+          per-expert LoRA contribution on every forward; this is "Mode 1"
+          — independent LoRA per expert.
+        - ``share_expert_lora`` (bool, default ``False``): when ``True``,
+          attach a single LoRA shared by all experts ("Mode 2"). PEFT does
+          not natively support this, so the experts module gets wrapped by
+          a VeOmni-owned ``LoraSharedExperts`` module. *Wired up in a
+          follow-up commit; setting this raises ``NotImplementedError`` for
+          now.*
         """
         lora_config = self.args.model.lora_config
         if not bool(lora_config):
@@ -282,10 +300,26 @@ class BaseTrainer(Stateful, ABC):
             logger.info_rank0("Initialising LoRA adapter from scratch.")
             from peft import LoraConfig, get_peft_model
 
+            if lora_config.get("share_expert_lora", False):
+                raise NotImplementedError(
+                    "lora_config['share_expert_lora']=True (a single LoRA shared across all "
+                    "experts) is not implemented yet. Use target_parameters with the default "
+                    "share_expert_lora=False for independent per-expert LoRA."
+                )
+
+            target_modules = lora_config.get("lora_modules", None)
+            target_parameters = lora_config.get("target_parameters", None)
+            if not target_modules and not target_parameters:
+                raise ValueError(
+                    "lora_config must specify at least one of 'lora_modules' (for nn.Linear "
+                    "targets) or 'target_parameters' (for nn.Parameter MoE expert targets)."
+                )
+
             peft_cfg = LoraConfig(
                 r=lora_config["rank"],
                 lora_alpha=lora_config["alpha"],
-                target_modules=lora_config["lora_modules"],
+                target_modules=target_modules,
+                target_parameters=target_parameters,
             )
             logger.info_rank0(f"LoraConfig: {peft_cfg.to_dict()}.")
             self.model = get_peft_model(self.model, peft_cfg)
