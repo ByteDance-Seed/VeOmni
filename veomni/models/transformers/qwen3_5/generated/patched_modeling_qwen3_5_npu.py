@@ -1353,12 +1353,13 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
 
         outputs = []
         dtype = self.pos_embed.weight.dtype
-        # Modification: materialize grid_thw to a CPU list once to eliminate the
-        # per-iteration host-device sync that dominated the training step under
-        # profiling (~3000 implicit `.item()` syncs/step). Iterating a GPU tensor
-        # with `for t, h, w in grid_thw` yields 0-D GPU tensors; using h/w/t as
-        # ints in `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)`
-        # and `combined.expand(t, ...)` forces an implicit `.item()` per call.
+        # Modification: materialize grid_thw to a CPU list once before the loop.
+        # Iterating the GPU `grid_thw` tensor yields 0-D GPU scalars for t/h/w;
+        # using them in `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)`
+        # and `combined.expand(t, ...)` forces an implicit `.item()` per call, i.e.
+        # several host<->device syncs per image. Under `torch.cuda.set_sync_debug_mode`
+        # this loop was the single largest source of implicit syncs in the Qwen3.5-VL
+        # training step; `rot_pos_emb` / `get_image_features` already do the same.
         grid_thw_list = grid_thw.tolist()
         for t, h, w in grid_thw_list:
             h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
