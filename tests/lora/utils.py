@@ -123,8 +123,34 @@ def full_eager_ops() -> OpsImplementationConfig:
     )
 
 
-def build_toy(toy_dir: str):
+def fused_triton_moe_ops() -> OpsImplementationConfig:
+    """Eager everywhere *except* MoE, which uses the Triton group-gemm backend.
+
+    Selecting ``moe_implementation="fused_triton"`` triggers
+    ``apply_veomni_fused_moe_patch("triton")`` during ``build_foundation_model``,
+    which is what installs ``veomni.ops.kernels.moe._fused_lora_moe_forward``.
+    The fused MoE-LoRA tests need that pointer to be non-``None`` to actually
+    exercise the kernel path inside ``LoraSharedExperts.forward``.
+    """
+    return OpsImplementationConfig(
+        attn_implementation="eager",
+        moe_implementation="fused_triton",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+    )
+
+
+def build_toy(toy_dir: str, *, ops: Optional[OpsImplementationConfig] = None):
     """Build a bf16 toy model from ``tests/toy_config/<toy_dir>/`` on the active device.
+
+    Args:
+        toy_dir: Subdir under ``tests/toy_config/`` (e.g. ``"qwen3_moe_toy"``).
+        ops: Optional ops backend selection. Defaults to :func:`full_eager_ops`
+            so eager wrapper code paths are exercised; pass
+            :func:`fused_triton_moe_ops` for kernel-path tests.
 
     Skips the calling test when the toy config dir is missing.
     """
@@ -136,7 +162,7 @@ def build_toy(toy_dir: str):
         weights_path=None,
         torch_dtype="bfloat16",
         init_device=DEVICE.type,
-        ops_implementation=full_eager_ops(),
+        ops_implementation=ops if ops is not None else full_eager_ops(),
     )
 
 

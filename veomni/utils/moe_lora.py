@@ -263,6 +263,11 @@ class LoraSharedExperts(nn.Module):
 
         scaling = lora_alpha / (math.sqrt(r) if use_rslora else r)
         self.register_buffer("lora_scaling", torch.tensor(scaling, dtype=torch.float32))
+        # Python-float copy of the scaling factor — used by the fused MoE-LoRA
+        # forward kernel (``veomni.ops.kernels.moe.lora_group_gemm``) which takes
+        # the scale as a plain float to avoid a host/device sync inside the
+        # autograd.Function. Kept in lock-step with ``lora_scaling``.
+        self._lora_scale_value: float = float(scaling)
 
         # Freeze base; only our lora_* are trainable.
         for p in self.base_layer.parameters():
@@ -343,12 +348,94 @@ class LoraSharedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # Phase 4 will add a fused-kernel branch here, mirroring the
-        # ``veomni_moe_experts_forward.use_non_eager_impl`` guard inside
-        # Qwen3MoeExperts.forward. For now we are eager-only.
+        # Fused-kernel path: available for both v5 fused and v4 split layouts
+        # when (a) the user opted into a non-eager ``moe_implementation`` whose
+        # patch function bound a LoRA-aware kernel (currently 'fused_triton';
+        # Quack/NPU leave ``_fused_lora_moe_forward = None`` so we transparently
+        # fall back to eager), and (b) we are not under expert parallelism (EP
+        # support comes in Phase 5; the kernel itself raises NotImplementedError
+        # on EP, but we short-circuit here so the eager path runs cleanly).
+        # Mirrors the ``veomni_moe_experts_forward.use_non_eager_impl`` guard
+        # inside the generated MoE experts forward.
+        from ..distributed.parallel_state import get_parallel_state
+        from ..ops.kernels import moe as _moe_ops
+
+        use_fused = _moe_ops._fused_lora_moe_forward is not None and not get_parallel_state().ep_enabled
         if self._layout == "fused_v5":
+            if use_fused:
+                return self._fused_forward_fused_v5(
+                    _moe_ops._fused_lora_moe_forward, hidden_states, top_k_index, top_k_weights
+                )
             return self._eager_forward_fused_v5(hidden_states, top_k_index, top_k_weights)
+        # split_v4
+        if use_fused:
+            return self._fused_forward_split_v4(
+                _moe_ops._fused_lora_moe_forward, hidden_states, top_k_index, top_k_weights
+            )
         return self._eager_forward_split_v4(hidden_states, top_k_index, top_k_weights)
+
+    def _fused_forward_fused_v5(
+        self,
+        fused_kernel,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch into the bound fused MoE-LoRA kernel for the v5 fused layout.
+
+        ``fused_kernel`` is the kernel pointer captured by ``forward`` so we
+        don't re-read the module attribute twice (cheap optimisation, also
+        keeps this method side-effect free for testing).
+        """
+        base = self.base_layer
+        return fused_kernel(
+            num_experts=base.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_2_weight=base.gate_up_proj,
+            fc2_weight=base.down_proj,
+            lora_a_gate_up=self.get_lora_A_weight("gate_up_proj"),
+            lora_b_gate_up=self.get_lora_B_weight("gate_up_proj"),
+            lora_a_down=self.get_lora_A_weight("down_proj"),
+            lora_b_down=self.get_lora_B_weight("down_proj"),
+            lora_scale_gate_up=self._lora_scale_value,
+            lora_scale_down=self._lora_scale_value,
+        )
+
+    def _fused_forward_split_v4(
+        self,
+        fused_kernel,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch into the bound fused MoE-LoRA kernel for the v4 split layout.
+
+        v4 has separate ``gate_proj`` and ``up_proj`` base weights (no fused
+        ``gate_up_proj``), and correspondingly two distinct LoRA pairs on
+        gate / up — both shared across experts. The down LoRA shape is
+        identical to the v5 case.
+        """
+        base = self.base_layer
+        return fused_kernel(
+            num_experts=base.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_weight=base.gate_proj,
+            fc1_2_weight=base.up_proj,
+            fc2_weight=base.down_proj,
+            lora_a_gate=self.get_lora_A_weight("gate_proj"),
+            lora_b_gate=self.get_lora_B_weight("gate_proj"),
+            lora_scale_gate=self._lora_scale_value,
+            lora_a_up=self.get_lora_A_weight("up_proj"),
+            lora_b_up=self.get_lora_B_weight("up_proj"),
+            lora_scale_up=self._lora_scale_value,
+            lora_a_down=self.get_lora_A_weight("down_proj"),
+            lora_b_down=self.get_lora_B_weight("down_proj"),
+            lora_scale_down=self._lora_scale_value,
+        )
 
     def _eager_forward_fused_v5(
         self,
