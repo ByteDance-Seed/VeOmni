@@ -2022,18 +2022,14 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-            # TODO(perf): host-device sync per forward. `n_image_tokens` == `sum(prod(image_grid_thw))
-            # // spatial_merge_size**2` — known on the host once `image_grid_thw` is available CPU-side;
-            # precompute it in the data collator and pass it in to drop the `.item()`. (The
-            # `image_embeds[:n_image_tokens]` slice below may then also be removable — `masked_scatter`
-            # already consumes only the first `n_image_tokens` rows, with SP padding trailing.)
-            # See .pr-drafts/tingyang-fix-qwen3_5_key_fix.md follow-ups.
-            n_image_tokens = image_mask.sum().long().item()
             embeds_image_mask = (
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-            # Slice tensor to drop any padded image tokens
-            image_embeds = image_embeds[:n_image_tokens]
+            # `masked_scatter` consumes exactly `image_mask.sum()` elements from `image_embeds`, taking the
+            # leading rows in order — image-placeholder positions in `input_ids` are laid out in the same
+            # order as their vision tokens, and the data collator pads the vision sequence only at the
+            # *end*. So any padded vision rows are trailing and simply go unused; no `image_embeds[:n]`
+            # slice is needed, which also removes the `image_mask.sum().item()` host-device sync.
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
@@ -2069,14 +2065,12 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-            # TODO(perf): host-device sync per forward — see the `n_image_tokens` note above.
-            n_video_tokens = video_mask.sum().long().item()
             embeds_video_mask = (
                 video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-
-            # Slice tensor to drop any padded video tokens
-            video_embeds = video_embeds[:n_video_tokens]
+            # As with `image_embeds` above: `masked_scatter` uses exactly `video_mask.sum()` leading rows,
+            # any collator-padded vision rows are trailing and unused — no `video_embeds[:n]` slice (and no
+            # `video_mask.sum().item()` host-device sync) needed.
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 

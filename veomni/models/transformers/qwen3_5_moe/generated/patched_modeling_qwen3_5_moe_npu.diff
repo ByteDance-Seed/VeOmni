@@ -1222,7 +1222,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
-@@ -1777,34 +2154,148 @@
+@@ -1777,34 +2154,142 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1284,19 +1284,15 @@
 +                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
 +                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 +
-+            # TODO(perf): host-device sync per forward. `n_image_tokens` == `sum(prod(image_grid_thw))
-+            # // spatial_merge_size**2` — known on the host once `image_grid_thw` is available CPU-side;
-+            # precompute it in the data collator and pass it in to drop the `.item()`. (The
-+            # `image_embeds[:n_image_tokens]` slice below may then also be removable — `masked_scatter`
-+            # already consumes only the first `n_image_tokens` rows, with SP padding trailing.)
-+            # See .pr-drafts/tingyang-fix-qwen3_5_key_fix.md follow-ups.
-+            n_image_tokens = image_mask.sum().long().item()
 +            embeds_image_mask = (
 +                image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
              )
 -            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-+            # Slice tensor to drop any padded image tokens
-+            image_embeds = image_embeds[:n_image_tokens]
++            # `masked_scatter` consumes exactly `image_mask.sum()` elements from `image_embeds`, taking the
++            # leading rows in order — image-placeholder positions in `input_ids` are laid out in the same
++            # order as their vision tokens, and the data collator pads the vision sequence only at the
++            # *end*. So any padded vision rows are trailing and simply go unused; no `image_embeds[:n]`
++            # slice is needed, which also removes the `image_mask.sum().item()` host-device sync.
 +            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 +            inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 +
@@ -1336,15 +1332,13 @@
 +                # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
 +                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 +
-+            # TODO(perf): host-device sync per forward — see the `n_image_tokens` note above.
-+            n_video_tokens = video_mask.sum().long().item()
 +            embeds_video_mask = (
 +                video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
              )
 -            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-+
-+            # Slice tensor to drop any padded video tokens
-+            video_embeds = video_embeds[:n_video_tokens]
++            # As with `image_embeds` above: `masked_scatter` uses exactly `video_mask.sum()` leading rows,
++            # any collator-padded vision rows are trailing and unused — no `video_embeds[:n]` slice (and no
++            # `video_mask.sum().item()` host-device sync) needed.
 +            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 +            inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 +
@@ -1379,7 +1373,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1814,7 +2305,19 @@
+@@ -1814,7 +2299,19 @@
                  inputs_embeds=inputs_embeds,
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
@@ -1399,7 +1393,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1914,6 +2417,12 @@
+@@ -1914,6 +2411,12 @@
      return overall_loss * num_experts
 
 
@@ -1412,7 +1406,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1934,6 +2443,7 @@
+@@ -1934,6 +2437,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1420,7 +1414,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1949,7 +2459,7 @@
+@@ -1949,7 +2453,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1429,7 +1423,7 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1993,24 +2503,55 @@
+@@ -1993,24 +2497,55 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1502,7 +1496,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2018,7 +2559,15 @@
+@@ -2018,7 +2553,15 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1519,7 +1513,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2622,7 @@
+@@ -2073,6 +2616,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1527,7 +1521,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2089,58 +2639,7 @@
+@@ -2089,58 +2633,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1587,7 +1581,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,37 +2655,67 @@
+@@ -2156,37 +2649,67 @@
          )
 
          hidden_states = outputs[0]
@@ -1675,7 +1669,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2413,6 +2942,19 @@
+@@ -2413,6 +2936,19 @@
 
          return input_ids, model_kwargs
 
