@@ -1,0 +1,68 @@
+# LoRA fine-tuning config for Qwen3.5-MoE-VL with shared-experts MoE LoRA ("Mode 2").
+#
+# Note the multimodal experts FQN is nested under `model.language_model.layers.*` —
+# different from the text-only `qwen3_moe_lora.yaml`. The wrapper auto-detects
+# the v5 fused layout (`gate_up_proj` / `down_proj`) and matches the same eager
+# per-expert dispatch used by `Qwen3_5MoeExperts`.
+
+model:
+  model_path: Qwen/Qwen3.5-35B-A3B
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: eager
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 16
+    alpha: 32
+    use_rslora: false
+    lora_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    target_parameters:
+      - model.language_model.layers.*.mlp.experts.gate_up_proj
+      - model.language_model.layers.*.mlp.experts.down_proj
+    share_expert_lora: true
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  chat_template: qwen3vl
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_max_pixels: 602112
+    video_max_pixels: 602112
+    video_total_pixels: 2889523
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
+
+train:
+  accelerator:
+    ulysses_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable_reentrant: false
+  freeze_vit: true
+  optimizer:
+    lr: 1.0e-4
+    lr_decay_style: cosine
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: 16
+  max_steps: 500
+  init_device: meta
+  checkpoint:
+    output_dir: Qwen3.5-35B-A3B-vl-lora
+    manager: dcp
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: VeOmni
+    name: Qwen3.5-35B-A3B-vl-lora

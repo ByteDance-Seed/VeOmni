@@ -122,7 +122,17 @@ class Qwen3VLMoeCausalLMOutputWithLogProbs(Qwen3VLMoeCausalLMOutputWithPast):
 
 @dataclass
 class Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(Qwen3OmniMoeThinkerCausalLMOutputWithPast):
-    """``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+    """``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``, matching HF
+            and verl conventions.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``, matching
+            verl's ``CausalLMOutputForPPO.entropy`` so the dataclass drops
+            directly into verl's ``prepare_model_outputs`` consumer.
+    """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
