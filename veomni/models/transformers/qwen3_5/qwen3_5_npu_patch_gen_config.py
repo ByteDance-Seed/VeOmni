@@ -68,10 +68,14 @@ config.add_import("veomni.distributed.parallel_state", names=["get_parallel_stat
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq", "gather_outputs", "slice_input_tensor"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
 
-config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+# gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
+# (re-exported by the package __init__), not in .ulysses.
+config.add_import(
+    "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
+)
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
 # from the GPU config) can return per-token log-probs in the unified output
