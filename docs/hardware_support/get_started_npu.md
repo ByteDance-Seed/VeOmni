@@ -15,6 +15,7 @@ This guide provides comprehensive information for using VeOmni framework with As
 ## Key Updates
 
 2026/5/11: Veomni provides images of the version of Ascend Cann9.0.0.
+
 2025/12/23: VeOmni supports training on Ascend NPU.
 
 ## Installation
