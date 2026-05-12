@@ -49,46 +49,10 @@ register_op(
 # ── rotary_pos_emb (Torch_npu) ───────────────────────────────────
 
 
-def _npu_partial_apply_rotary_pos_emb_factory():
-    from .npu_rotary_pos_emb import partial_apply_rotary_pos_emb
-
-    return partial_apply_rotary_pos_emb
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="rotary_pos_emb",
-        variant="partial",
-        factory=_npu_partial_apply_rotary_pos_emb_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="partial apply_rotary_pos_emb on NPU",
-    )
-)
-
-
-def _npu_partial_apply_rotary_pos_emb_vision_factory():
-    from .npu_rotary_pos_emb import partial_apply_rotary_pos_emb_vision
-
-    return partial_apply_rotary_pos_emb_vision
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="rotary_pos_emb_vision",
-        variant="partial",
-        factory=_npu_partial_apply_rotary_pos_emb_vision_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="partial apply_rotary_pos_emb_vision on NPU",
-    )
-)
-
-
 def _npu_full_apply_rotary_pos_emb_factory():
-    from .npu_rotary_pos_emb import full_apply_rotary_pos_emb
+    from .npu import apply_rotary_pos_emb_npu
 
-    return full_apply_rotary_pos_emb
+    return apply_rotary_pos_emb_npu
 
 
 KERNEL_REGISTRY.register(
@@ -103,10 +67,10 @@ KERNEL_REGISTRY.register(
 )
 
 
-def _npu_full_apply_rotary_pos_emb_vision_factory():
-    from .npu_rotary_pos_emb import full_apply_rotary_pos_emb_vision
+def _npu_apply_rotary_pos_emb_vision_factory():
+    from .npu import apply_rotary_pos_emb_vision_npu
 
-    return full_apply_rotary_pos_emb_vision
+    return apply_rotary_pos_emb_vision_npu
 
 
 KERNEL_REGISTRY.register(
@@ -114,8 +78,26 @@ KERNEL_REGISTRY.register(
         name="npu",
         op_name="rotary_pos_emb_vision",
         variant="full",
-        factory=_npu_full_apply_rotary_pos_emb_vision_factory,
+        factory=_npu_apply_rotary_pos_emb_vision_factory,
         hardware=HardwareRequirement(device_type="npu"),
         description="full apply_rotary_pos_emb_vision on NPU",
+    )
+)
+
+
+def _npu_partial_apply_rotary_pos_emb_factory():
+    from .npu import partial_apply_rotary_pos_emb_npu
+
+    return partial_apply_rotary_pos_emb_npu
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rotary_pos_emb",
+        variant="partial",
+        factory=_npu_partial_apply_rotary_pos_emb_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="partial apply_rotary_pos_emb on NPU",
     )
 )

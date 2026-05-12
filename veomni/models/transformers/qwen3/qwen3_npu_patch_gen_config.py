@@ -78,7 +78,7 @@ config.override_method(
 # ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
 
 
-config.override_method(
+config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
     description="OpSlot guard for NPU fused RoPE",

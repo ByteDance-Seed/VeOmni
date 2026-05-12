@@ -111,7 +111,7 @@ from veomni.ops.dispatch import OpSlot
 
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
-veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "partial")
+veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")

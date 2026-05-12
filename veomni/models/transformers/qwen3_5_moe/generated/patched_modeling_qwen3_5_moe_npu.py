@@ -123,7 +123,7 @@ from veomni.ops.dispatch import OpSlot
 
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
-veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "partial")
+veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
