@@ -59,7 +59,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
-    qwen3_5_vision_attention_forward_patched,
+    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
@@ -384,6 +384,12 @@ def qwen3_5_moe_model_forward_patched(
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
             image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
+        # TODO(perf): host-device sync per forward. `n_image_tokens` == `sum(prod(image_grid_thw))
+        # // spatial_merge_size**2` — known on the host once `image_grid_thw` is available CPU-side;
+        # precompute it in the data collator and pass it in to drop the `.item()`. (The
+        # `image_embeds[:n_image_tokens]` slice below may then also be removable — `masked_scatter`
+        # already consumes only the first `n_image_tokens` rows, with SP padding trailing.)
+        # See .pr-drafts/tingyang-fix-qwen3_5_key_fix.md follow-ups.
         n_image_tokens = image_mask.sum().long().item()
         embeds_image_mask = (
             image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -426,6 +432,7 @@ def qwen3_5_moe_model_forward_patched(
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
             video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
+        # TODO(perf): host-device sync per forward — see the `n_image_tokens` note above.
         n_video_tokens = video_mask.sum().long().item()
         embeds_video_mask = (
             video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -509,8 +516,13 @@ def qwen3_5_moe_model_forward_patched(
 @config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast")
 @dataclass
 class Qwen3_5MoeCausalLMOutputWithLogProbs(Qwen3_5MoeCausalLMOutputWithPast):
-    """``Qwen3_5MoeCausalLMOutputWithPast`` extended with per-token log-prob fields.
-
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
     log_probs (`torch.FloatTensor`, *optional*):
         Per-token log probabilities returned by VeOmni's fused loss path.
     entropy (`torch.FloatTensor`, *optional*):
@@ -620,6 +632,12 @@ config.override_method(
     replacement=qwen3_5_gated_deltanet_forward_patched,
     name_map=_NAME_MAP,
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
+)
+
+config.override_method(
+    "Qwen3_5MoeTextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
 )
 
 
