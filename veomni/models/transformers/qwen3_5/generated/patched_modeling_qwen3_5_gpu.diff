@@ -563,11 +563,36 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      _no_split_modules = ["Qwen3_5VisionBlock"]
-@@ -1159,67 +1388,71 @@
+@@ -1159,67 +1388,79 @@
          return embeddings
 
      def fast_pos_embed_interpolate(self, grid_thw):
--        grid_thw_list = grid_thw.tolist()
++        """
++        Efficient implementation adapted from vLLM's Qwen-VL optimization.
++
++        Key optimizations over standard Transformers implementation:
++        1. Computational Efficiency: Reduces bilinear interpolation multiplications from 4 to 1
++           per patch using algebraic simplification (w11=dh*dw; w10=dh-w11; w01=dw-w11; w00=1-dh-w01).
++        2. Vectorization: Uses torch.meshgrid to compute indices and weights for the entire
++           grid at once, avoiding expensive Python loops.
++
++        Original source: https://github.com/vllm-project/vllm/blob/95c0f92/vllm/model_executor/models/qwen3_vl.py#L470
++        """
++
++        num_grid_per_side = self.num_grid_per_side
++        m_size = self.spatial_merge_size
++        hidden_dim = self.pos_embed.embedding_dim
++
++        outputs = []
++        dtype = self.pos_embed.weight.dtype
++        # Modification: materialize grid_thw to a CPU list once before the loop.
++        # Iterating the GPU `grid_thw` tensor yields 0-D GPU scalars for t/h/w;
++        # using them in `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)`
++        # and `combined.expand(t, ...)` forces an implicit `.item()` per call, i.e.
++        # several host<->device syncs per image. Under `torch.cuda.set_sync_debug_mode`
++        # this loop was the single largest source of implicit syncs in the Qwen3.5-VL
++        # training step; `rot_pos_emb` / `get_image_features` already do the same.
+         grid_thw_list = grid_thw.tolist()
 -        grid_ts = [row[0] for row in grid_thw_list]
 -        grid_hs = [row[1] for row in grid_thw_list]
 -        grid_ws = [row[2] for row in grid_thw_list]
@@ -576,7 +601,7 @@
 -        idx_list = [[] for _ in range(4)]
 -        weight_list = [[] for _ in range(4)]
 -
--        for t, h, w in grid_thw_list:
+         for t, h, w in grid_thw_list:
 -            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
 -            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
 -
@@ -628,25 +653,6 @@
 -            patch_pos_embeds_permute.append(pos_embed)
 -        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
 -        return patch_pos_embeds
-+        """
-+        Efficient implementation adapted from vLLM's Qwen-VL optimization.
-+
-+        Key optimizations over standard Transformers implementation:
-+        1. Computational Efficiency: Reduces bilinear interpolation multiplications from 4 to 1
-+           per patch using algebraic simplification (w11=dh*dw; w10=dh-w11; w01=dw-w11; w00=1-dh-w01).
-+        2. Vectorization: Uses torch.meshgrid to compute indices and weights for the entire
-+           grid at once, avoiding expensive Python loops.
-+
-+        Original source: https://github.com/vllm-project/vllm/blob/95c0f92/vllm/model_executor/models/qwen3_vl.py#L470
-+        """
-+
-+        num_grid_per_side = self.num_grid_per_side
-+        m_size = self.spatial_merge_size
-+        hidden_dim = self.pos_embed.embedding_dim
-+
-+        outputs = []
-+        dtype = self.pos_embed.weight.dtype
-+        for t, h, w in grid_thw:
 +            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
 +            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
 +
@@ -696,7 +702,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1237,15 +1470,20 @@
+@@ -1237,15 +1478,20 @@
          hidden_states = self.patch_embed(hidden_states)
 
          pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -725,7 +731,7 @@
 
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
-@@ -1257,6 +1495,50 @@
+@@ -1257,6 +1503,50 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -776,7 +782,7 @@
          for blk in self.blocks:
              hidden_states = blk(
                  hidden_states,
-@@ -1271,6 +1553,34 @@
+@@ -1271,6 +1561,34 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -811,7 +817,7 @@
 
 
  @dataclass
-@@ -1396,6 +1706,12 @@
+@@ -1396,6 +1714,12 @@
          if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
              linear_attn_mask = None
          return linear_attn_mask
@@ -824,7 +830,7 @@
 
 
  @auto_docstring
-@@ -1530,68 +1846,35 @@
+@@ -1530,68 +1854,35 @@
 
      @can_return_tuple
      @auto_docstring
@@ -914,7 +920,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1644,6 +1927,7 @@
+@@ -1644,6 +1935,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -922,7 +928,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5ModelOutputWithPast:
-@@ -1652,34 +1936,136 @@
+@@ -1652,34 +1944,136 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1067,7 +1073,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1689,7 +2075,20 @@
+@@ -1689,7 +2083,20 @@
                  inputs_embeds=inputs_embeds,
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
@@ -1088,7 +1094,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1705,6 +2104,12 @@
+@@ -1705,6 +2112,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1101,7 +1107,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2180,36 @@
+@@ -1775,15 +2188,36 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1142,7 +1148,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2243,37 @@
+@@ -1817,6 +2251,37 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1180,7 +1186,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1887,54 +2344,7 @@
+@@ -1887,54 +2352,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1236,7 +1242,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,22 +2360,42 @@
+@@ -1950,22 +2368,42 @@
          )
 
          hidden_states = outputs[0]
@@ -1284,7 +1290,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2192,6 +2622,13 @@
+@@ -2192,6 +2630,13 @@
 
          return input_ids, model_kwargs
 
