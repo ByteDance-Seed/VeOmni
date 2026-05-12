@@ -77,16 +77,26 @@ def _read_adapter_name(adapter_path: str) -> str:
     return "default"
 
 
+_LORA_EXACT_PARTS = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
+_LORA_PREFIX_PARTS = ("lora_A_", "lora_B_")
+
+
 def _remap_adapter_key(key: str, adapter_name: str) -> str:
     """Remap a PEFT-saved key to model FQN format.
 
     PEFT saves ``lora_A.weight`` but the model FQN is ``lora_A.<adapter_name>.weight``.
+
+    Also handles VeOmni's :class:`~veomni.utils.moe_lora.LoraSharedExperts`
+    wrappers, whose attributes are named ``lora_A_<param>`` /
+    ``lora_B_<param>`` (suffix per target parameter, e.g.
+    ``lora_A_gate_up_proj``). These are detected by ``startswith`` so the same
+    ``<part>.<adapter>.weight`` insertion applies.
     """
     parts = key.split(".")
     new_parts = []
     for p in parts:
         new_parts.append(p)
-        if p in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+        if p in _LORA_EXACT_PARTS or p.startswith(_LORA_PREFIX_PARTS):
             new_parts.append(adapter_name)
     return ".".join(new_parts)
 
@@ -205,6 +215,19 @@ def _init_lora_parameter(module: "nn.Module", name: str):
         if piece.startswith("lora_"):
             break
         lora_layer = getattr(lora_layer, piece)
+
+    # Shared MoE LoRA wrapper owns multiple lora_A_<param> ModuleDicts; its
+    # reset_lora_parameters re-initialises every adapter on every target param
+    # idempotently, so we just dispatch to it once. Avoid the hasattr check
+    # below (which would also match the wrapper but would loop over the
+    # accessor property `lora_A`, redundantly resetting on every `lora_A_*`
+    # key the caller iterates).
+    from .moe_lora import LoraSharedExperts
+
+    if isinstance(lora_layer, LoraSharedExperts):
+        lora_layer.reset_lora_parameters(init_lora_weights=True)
+        return
+
     if "lora_A" in name and hasattr(lora_layer, "reset_lora_parameters"):
         for adapter in getattr(lora_layer, "lora_A", {}).keys():
             lora_layer.reset_lora_parameters(adapter, init_lora_weights=True)
