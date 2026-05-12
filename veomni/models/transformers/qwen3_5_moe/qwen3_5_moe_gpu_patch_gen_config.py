@@ -312,11 +312,26 @@ def qwen3_5_moe_model_forward_patched(
     # --- Patch.4: Pop pre-computed Flash Attention kwargs to avoid ViT forward re-computation ---
     # The LM-level flash-attention kwargs (`cu_seq_lens_q`, `cu_seq_lens_k`, `max_length_q`, `max_length_k`) are injected for packed-sequence attention. They must not reach the ViT, which computes its own `cu_seqlens`
     flash_attn_kwargs = {}
-    flash_attn_kwargs = {}
     for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
         if key in kwargs:
             flash_attn_kwargs[key] = kwargs.pop(key)
     # --- Patch.4 ---
+
+    # --- Patch.5: Pull the precomputed-on-host ViT metadata (VeOmni's VisionMetadataCollator) out of
+    # kwargs and re-key it without the modality prefix, so it reaches the vision tower via
+    # get_{image,video}_features and never leaks into the ViT block / language-model kwargs. ---
+    _vision_metadata_names = ("pos_embed_indices", "pos_embed_weights", "rot_pos_ids", "cu_seqlens", "max_hw")
+    image_vision_kwargs = {
+        f"vision_{name}": kwargs.pop(f"vision_image_{name}")
+        for name in _vision_metadata_names
+        if f"vision_image_{name}" in kwargs
+    }
+    video_vision_kwargs = {
+        f"vision_{name}": kwargs.pop(f"vision_video_{name}")
+        for name in _vision_metadata_names
+        if f"vision_video_{name}" in kwargs
+    }
+    # --- Patch.5 ---
 
     # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
     if get_parallel_state().sp_enabled:
@@ -330,7 +345,7 @@ def qwen3_5_moe_model_forward_patched(
 
     if pixel_values is not None:
         image_outputs: BaseModelOutputWithPooling = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True
+            pixel_values, image_grid_thw, return_dict=True, **image_vision_kwargs
         )
         image_embeds = image_outputs.pooler_output
 
@@ -373,7 +388,7 @@ def qwen3_5_moe_model_forward_patched(
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithPooling = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vision_kwargs
         )
         video_embeds = video_outputs.pooler_output
 

@@ -390,6 +390,112 @@ def process_sample_qwen_vl(
     )
 
 
+def compute_qwen3_5_vision_metadata(
+    grid_thw_list: List[List[int]],
+    num_grid_per_side: int,
+    spatial_merge_size: int,
+) -> Dict[str, "torch.Tensor"]:
+    """Precompute, on the host, the per-vision-token metadata that Qwen3.5-VL's vision tower
+    otherwise re-derives from the (GPU) ``grid_thw`` tensor on every forward.
+
+    ``Qwen3_5VisionModel.fast_pos_embed_interpolate`` / ``rot_pos_emb`` / ``forward`` build the
+    bilinear position-embedding lookup, the rotary position ids and ``cu_seqlens`` by iterating /
+    ``.tolist()``-ing ``grid_thw`` — each a host↔device sync per ViT forward. Since these are a pure
+    function of ``grid_thw`` (a tiny ``(num_images, 3)`` tensor the data collator already has on the
+    host), we compute them here and feed them in; the model just indexes the result.
+
+    Layout matches the patch-token order in ``pixel_values``: per image ``(t, h, w)``, the
+    ``h * w`` tokens of each frame are laid out in spatial-merge-block order
+    ``(block_row, block_col, intra_row, intra_col)`` and the ``t`` frames are concatenated, then all
+    images are concatenated.
+
+    Returns a dict with:
+      - ``pos_embed_indices`` ``(N, 4)`` int64 — the 4 grid-embedding indices per token (bilinear corners)
+      - ``pos_embed_weights`` ``(N, 4)`` float32 — the 4 bilinear weights per token
+      - ``rot_pos_ids`` ``(N, 2)`` int64 — the (row, col) coords per token (indexes the rotary freq table)
+      - ``cu_seqlens`` ``(num_frames + 1,)`` int32 — one varlen segment of length ``h * w`` per frame
+      - ``max_hw`` int — ``max(max(h, w))`` over images (size of the rotary freq table needed)
+    where ``N == sum(t * h * w)``.
+    """
+    m = spatial_merge_size
+    g = num_grid_per_side
+
+    pos_idx_chunks: List["torch.Tensor"] = []
+    pos_w_chunks: List["torch.Tensor"] = []
+    rot_chunks: List["torch.Tensor"] = []
+    cu_seqlens: List[int] = [0]
+    max_hw = 0
+
+    for t, h, w in grid_thw_list:
+        mh, mw = h // m, w // m
+
+        # Bilinear interpolation onto the (g x g) position-embedding grid. float64 matches the
+        # `torch.linspace(..., dtype=torch.float64)` the model uses; `linspace` is the same simple
+        # deterministic recurrence on CPU and GPU, so the interpolated coords (and hence the
+        # truncated `floor` corners below) are identical to the on-the-fly path.
+        h_idxs = torch.linspace(0, g - 1, h, dtype=torch.float64)
+        w_idxs = torch.linspace(0, g - 1, w, dtype=torch.float64)
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=g - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=g - 1)
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        dh_g, dw_g = torch.meshgrid(dh, dw, indexing="ij")  # (h, w)
+        hf_g, wf_g = torch.meshgrid(h_floor, w_floor, indexing="ij")
+        hc_g, wc_g = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+        w11 = dh_g * dw_g
+        w10 = dh_g - w11
+        w01 = dw_g - w11
+        w00 = 1 - dh_g - w01
+        # corners: (h_floor, w_floor), (h_floor, w_ceil), (h_ceil, w_floor), (h_ceil, w_ceil)
+        h_grid = torch.stack([hf_g, hf_g, hc_g, hc_g])  # (4, h, w)
+        w_grid = torch.stack([wf_g, wc_g, wf_g, wc_g])  # (4, h, w)
+        idx_hw = h_grid * g + w_grid  # (4, h, w) long
+        wt_hw = torch.stack([w00, w01, w10, w11])  # (4, h, w) float64
+
+        # Reorder the (h, w) axes -> spatial-merge-block flatten (block_row, block_col, intra_row, intra_col),
+        # i.e. reshape (h, w) -> (mh, m, mw, m) [=(br, ir, bc, ic)] then permute to (br, bc, ir, ic).
+        idx_tok = idx_hw.reshape(4, mh, m, mw, m).permute(0, 1, 3, 2, 4).reshape(4, h * w).transpose(0, 1).contiguous()
+        wt_tok = (
+            wt_hw.reshape(4, mh, m, mw, m)
+            .permute(0, 1, 3, 2, 4)
+            .reshape(4, h * w)
+            .transpose(0, 1)
+            .to(torch.float32)
+            .contiguous()
+        )  # (h*w, 4)
+        r_grid, c_grid = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")  # (h, w), values r / c
+        rot_tok = torch.stack(
+            [
+                r_grid.reshape(mh, m, mw, m).permute(0, 2, 1, 3).reshape(h * w),
+                c_grid.reshape(mh, m, mw, m).permute(0, 2, 1, 3).reshape(h * w),
+            ],
+            dim=-1,
+        ).contiguous()  # (h*w, 2) long
+
+        if t > 1:  # the t frames share the same per-position metadata
+            idx_tok = idx_tok.repeat(t, 1)
+            wt_tok = wt_tok.repeat(t, 1)
+            rot_tok = rot_tok.repeat(t, 1)
+
+        pos_idx_chunks.append(idx_tok)
+        pos_w_chunks.append(wt_tok)
+        rot_chunks.append(rot_tok)
+        for _ in range(t):
+            cu_seqlens.append(cu_seqlens[-1] + h * w)
+        max_hw = max(max_hw, h, w)
+
+    return {
+        "pos_embed_indices": torch.cat(pos_idx_chunks, dim=0),
+        "pos_embed_weights": torch.cat(pos_w_chunks, dim=0),
+        "rot_pos_ids": torch.cat(rot_chunks, dim=0),
+        "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
+        "max_hw": max_hw,
+    }
+
+
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_omni_moe")
 def process_sample_qwen_omni(

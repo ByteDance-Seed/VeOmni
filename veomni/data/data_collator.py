@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,7 @@ from ..distributed.sequence_parallel import gather_outputs
 from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+from .data_transform import compute_qwen3_5_vision_metadata
 
 
 logger = logging.get_logger(__name__)
@@ -174,6 +175,38 @@ class PrecomputePositionIDsCollator(DataCollator):
                 # default position_ids is 0 ~ seq_len - 1 for text models
                 feature["position_ids"] = torch.arange(feature["input_ids"].size(-1), dtype=torch.int64)
         return features
+
+
+@dataclass
+class VisionMetadataCollator(DataCollator):
+    """Precompute Qwen3.5-VL ViT metadata on the host so the model's vision forward doesn't have to
+    derive it from the GPU ``grid_thw`` tensor (which forces host↔device syncs per forward).
+
+    Runs after :class:`PackingCollator` (so ``image_grid_thw`` / ``video_grid_thw`` are already the
+    micro-batch-wide concatenated CPU tensors) and before :class:`SequenceParallelCollator`. The
+    emitted ``vision_{image,video}_*`` keys are deliberately *not* registered in the collate infos:
+    they carry the full (unsharded) vision sequence, exactly mirroring what ``Qwen3_5VisionModel``
+    derives from the full ``grid_thw`` today — the model still does its own SP padding/slicing on the
+    derived position/rotary embeddings. Only enabled for Qwen3.5-VL (see ``MainCollator``); other
+    models never see these keys.
+
+    See :func:`veomni.data.data_transform.compute_qwen3_5_vision_metadata`.
+    """
+
+    num_grid_per_side: int = None
+    spatial_merge_size: int = None
+
+    def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        for modality, grid_key in (("image", "image_grid_thw"), ("video", "video_grid_thw")):
+            grid_thw = batch.get(grid_key, None)
+            if grid_thw is None or len(grid_thw) == 0:
+                continue
+            metadata = compute_qwen3_5_vision_metadata(
+                grid_thw.tolist(), self.num_grid_per_side, self.spatial_merge_size
+            )
+            for name, value in metadata.items():
+                batch[f"vision_{modality}_{name}"] = value
+        return batch
 
 
 @dataclass
@@ -354,6 +387,7 @@ class MainCollator(DataCollator):
     data_collate_info: Dict[str, Union[DataCollateInfo, tuple, Dict]] = field(default_factory=lambda: {})
     pad_to_length: bool = False
     seq_classification: bool = False
+    vision_metadata_config: Optional[Dict] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -365,6 +399,9 @@ class MainCollator(DataCollator):
             Whether to pad sequence to a fixed length. Default is False.
         seq_classification:
             If True, sequence classification task. Default is False.
+        vision_metadata_config:
+            If not None, append a :class:`VisionMetadataCollator` (Qwen3.5-VL only) that precomputes
+            ViT metadata on the host. Expected keys: ``num_grid_per_side``, ``spatial_merge_size``.
     """
 
     def __post_init__(self):
@@ -398,6 +435,8 @@ class MainCollator(DataCollator):
                 seq_classification=self.seq_classification,
             )
         )
+        if self.vision_metadata_config is not None:
+            self.preforward_pipeline.append(VisionMetadataCollator(**self.vision_metadata_config))
         if get_parallel_state().sp_enabled:
             self.preforward_pipeline.append(
                 SequenceParallelCollator(collate_infos=self.collate_infos, seq_classification=self.seq_classification)
