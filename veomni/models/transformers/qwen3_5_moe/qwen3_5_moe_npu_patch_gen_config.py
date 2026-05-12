@@ -29,6 +29,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
@@ -265,6 +266,12 @@ config.override_method(
     replacement=qwen3_5_gated_deltanet_forward_patched,
     name_map=_NAME_MAP,
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
+)
+
+config.override_method(
+    "Qwen3_5MoeTextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
 )
 
 
