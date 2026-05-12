@@ -221,6 +221,7 @@ class VLMTrainer:
         pad_to_length = self.base.args.train.pad_to_length
         self.base.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
+            pad_seq_to_multiple_of=self.base.args.train.pad_seq_to_multiple_of,
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
             vision_metadata_config=vision_metadata_config,
