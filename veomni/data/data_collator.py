@@ -243,11 +243,19 @@ class PackingCollator(DataCollator):
         relies on ``valid_seqlens_from_cu_seqlens`` (``PostCollator`` / ``PackingPostCollator``) would
         keep it as a real chunk. That path is not exercised by SFT/PT loss training; combine
         ``pad_seq_to_multiple_of`` with such a path only after teaching it to drop the padding chunk.
+
+        The padded length is ``ceil(seq_len / multiple_of) * multiple_of``, i.e. at most
+        ``multiple_of - 1`` extra tokens. ``multiple_of`` is validated (in ``VeOmniArguments.__post_init__``)
+        to be a multiple of ``ulysses_size`` and ``<= micro_batch_size * max_seq_len``; together with the
+        dyn_bsz packer's contract that the packed length stays within ``micro_batch_size * max_seq_len``,
+        the bucketed length stays within that worst-case HBM budget whenever ``multiple_of`` divides it
+        (the ``__post_init__`` warning flags the rare case where it does not).
         """
         seq_len = batch["input_ids"].shape[-1]
         target_len = ((seq_len + multiple_of - 1) // multiple_of) * multiple_of
         pad_len = target_len - seq_len
-        if pad_len <= 0:
+        assert 0 <= pad_len < multiple_of, f"pad_len ({pad_len}) must be in [0, multiple_of={multiple_of})"
+        if pad_len == 0:
             return batch
 
         for key in self.collate_infos.keys():

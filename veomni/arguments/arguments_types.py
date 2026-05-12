@@ -1135,6 +1135,12 @@ class VeOmniArguments:
                         f"micro_batch_size * max_seq_len ({cap}); clamping to {cap}."
                     )
                     self.train.pad_seq_to_multiple_of = cap
+                elif cap % self.train.pad_seq_to_multiple_of != 0:
+                    logger.warning_rank0(
+                        f"pad_seq_to_multiple_of ({self.train.pad_seq_to_multiple_of}) does not evenly divide "
+                        f"micro_batch_size * max_seq_len ({cap}); a packed length near that cap can round up to "
+                        f"slightly above it. Prefer a divisor of {cap}."
+                    )
                 logger.info_rank0(
                     f"pad packed micro-batch sequence length up to a multiple of {self.train.pad_seq_to_multiple_of}"
                 )
