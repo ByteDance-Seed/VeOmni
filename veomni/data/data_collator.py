@@ -180,6 +180,7 @@ class PrecomputePositionIDsCollator(DataCollator):
 class PackingCollator(DataCollator):
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
     pad_to_length: int = False
+    pad_seq_to_multiple_of: int = 0
     seq_classification: bool = (
         False  # whether the training task is sequence classification, if true, do not mask boundary labels
     )
@@ -222,6 +223,51 @@ class PackingCollator(DataCollator):
                 )
         return batch
 
+    def pad_batch_to_multiple_of(self, batch: Dict[str, torch.Tensor], multiple_of: int) -> Dict[str, torch.Tensor]:
+        """Pad the packed micro-batch sequence length up to the next multiple of ``multiple_of``.
+
+        Unlike ``pad_batch_to_length`` (which pads to a fixed worst-case length), this only adds the
+        few tokens needed to reach the next bucket boundary, so the JIT-compiled per-layer kernels
+        (Triton/TileLang gated-delta-rule, Triton MoE group_gemm, flash-attn varlen) see a small,
+        stable set of sequence lengths and stop re-autotuning/re-compiling on every step.
+
+        The padding region is treated as ONE self-contained sub-sequence: ``input_ids -> 0``,
+        ``labels -> IGNORE_INDEX`` (so it never affects the loss), ``attention_mask -> 1`` (kept
+        all-ones so the linear-attention mask short-circuit still applies), ``image_mask/video_mask
+        -> 0``, and ``position_ids`` restart at 0 (``arange(pad_len)``) so the cu_seqlens derived
+        from position_ids gain exactly one extra segment and the block-diagonal attention isolates
+        the padding from the real tokens.
+
+        NOTE: the trailing padding segment is a single segment of length ``pad_len`` (not ``pad_len``
+        length-1 segments like the ``pad_to_length`` / sp-padding tail), so a logits-split path that
+        relies on ``valid_seqlens_from_cu_seqlens`` (``PostCollator`` / ``PackingPostCollator``) would
+        keep it as a real chunk. That path is not exercised by SFT/PT loss training; combine
+        ``pad_seq_to_multiple_of`` with such a path only after teaching it to drop the padding chunk.
+        """
+        seq_len = batch["input_ids"].shape[-1]
+        target_len = ((seq_len + multiple_of - 1) // multiple_of) * multiple_of
+        pad_len = target_len - seq_len
+        if pad_len <= 0:
+            return batch
+
+        for key in self.collate_infos.keys():
+            if self.collate_infos[key].pack_dim != -1 or key not in batch:
+                continue
+            if key == "position_ids":
+                feature = batch[key]
+                pad_shape = [1] * (feature.dim() - 1) + [pad_len]
+                pos_pad = torch.arange(pad_len, dtype=feature.dtype, device=feature.device).reshape(pad_shape)
+                pos_pad = pos_pad.expand(*feature.shape[:-1], pad_len).contiguous()
+                batch[key] = torch.cat((feature, pos_pad), dim=-1)
+            else:
+                batch[key] = self.pad_feature_to_length(
+                    batch[key],
+                    dim=-1,
+                    pad_value=self.collate_infos[key].sp_pad_value,
+                    pad_size=pad_len,
+                )
+        return batch
+
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         batch = defaultdict(list)
         for feature in features:
@@ -253,6 +299,8 @@ class PackingCollator(DataCollator):
 
         if self.pad_to_length:
             batch = self.pad_batch_to_length(batch)
+        elif self.pad_seq_to_multiple_of and self.pad_seq_to_multiple_of > 1:
+            batch = self.pad_batch_to_multiple_of(batch, self.pad_seq_to_multiple_of)
 
         if not self.sp_enabled:
             add_flash_attention_kwargs_from_position_ids(batch)
@@ -353,6 +401,7 @@ class SequenceParallelCollator(DataCollator):
 class MainCollator(DataCollator):
     data_collate_info: Dict[str, Union[DataCollateInfo, tuple, Dict]] = field(default_factory=lambda: {})
     pad_to_length: bool = False
+    pad_seq_to_multiple_of: int = 0
     seq_classification: bool = False
 
     """
@@ -363,6 +412,10 @@ class MainCollator(DataCollator):
             User config to override the default collate info.
         pad_to_length:
             Whether to pad sequence to a fixed length. Default is False.
+        pad_seq_to_multiple_of:
+            If > 1 (and pad_to_length is disabled), pad the packed micro-batch sequence length up to the
+            next multiple of this value. Bucketing the sequence length avoids JIT-kernel recompiles under
+            dyn_bsz. Default is 0 (off).
         seq_classification:
             If True, sequence classification task. Default is False.
     """
@@ -395,6 +448,7 @@ class MainCollator(DataCollator):
             PackingCollator(
                 collate_infos=self.collate_infos,
                 pad_to_length=self.pad_to_length,
+                pad_seq_to_multiple_of=self.pad_seq_to_multiple_of,
                 seq_classification=self.seq_classification,
             )
         )

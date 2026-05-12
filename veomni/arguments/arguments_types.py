@@ -400,6 +400,17 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Pad packed sequences to a fixed length when using dynamic batch size."},
     )
+    pad_seq_to_multiple_of: int = field(
+        default=0,
+        metadata={
+            "help": "When using dyn_bsz, pad the packed micro-batch sequence length up to the next multiple of "
+            "this value (0 = off). Must be a multiple of accelerator.ulysses_size. Trades a few padding tokens "
+            "per step (their labels are IGNORE_INDEX, so they do not affect the loss) for a bucketed sequence "
+            "length, which avoids JIT-kernel recompiles -- Triton/TileLang gated-delta-rule, Triton MoE "
+            "group_gemm, etc. are shape-specialized and otherwise re-autotune/re-compile on every new packed "
+            "length. Ignored (overridden) when pad_to_length is enabled."
+        },
+    )
     bsz_warmup_ratio: float = field(
         default=0,
         metadata={"help": "Ratio of batch size warmup steps."},
@@ -1096,6 +1107,37 @@ class VeOmniArguments:
             else:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
+
+        if self.train.pad_seq_to_multiple_of:
+            if not self.train.dyn_bsz:
+                logger.warning_rank0(
+                    "pad_seq_to_multiple_of only applies to dyn_bsz packing; dyn_bsz is disabled, so it is ignored."
+                )
+                self.train.pad_seq_to_multiple_of = 0
+            elif self.train.pad_to_length:
+                logger.warning_rank0(
+                    "pad_seq_to_multiple_of is ignored because pad_to_length is enabled "
+                    "(packed sequences are already padded to the fixed length micro_batch_size * max_seq_len)."
+                )
+                self.train.pad_seq_to_multiple_of = 0
+            else:
+                sp_size = self.train.accelerator.ulysses_size
+                if self.train.pad_seq_to_multiple_of % sp_size != 0:
+                    raise ValueError(
+                        f"pad_seq_to_multiple_of ({self.train.pad_seq_to_multiple_of}) must be a multiple of "
+                        f"accelerator.ulysses_size ({sp_size}) so the bucketed sequence length stays divisible by "
+                        "the ulysses degree."
+                    )
+                cap = self.train.micro_batch_size * self.data.max_seq_len
+                if self.train.pad_seq_to_multiple_of > cap:
+                    logger.warning_rank0(
+                        f"pad_seq_to_multiple_of ({self.train.pad_seq_to_multiple_of}) exceeds "
+                        f"micro_batch_size * max_seq_len ({cap}); clamping to {cap}."
+                    )
+                    self.train.pad_seq_to_multiple_of = cap
+                logger.info_rank0(
+                    f"pad packed micro-batch sequence length up to a multiple of {self.train.pad_seq_to_multiple_of}"
+                )
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:

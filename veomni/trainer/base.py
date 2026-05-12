@@ -285,6 +285,7 @@ class BaseTrainer(Stateful, ABC):
         pad_to_length = self.args.train.pad_to_length
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
+            pad_seq_to_multiple_of=self.args.train.pad_seq_to_multiple_of,
             seq_classification=seq_classification,
         )
 
