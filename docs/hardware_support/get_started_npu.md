@@ -48,11 +48,11 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 | Model                | Model Size       | Support | FSDP1 | FSDP2 | EP | SP | Note                                           |
 |----------------------|------------------|---------|-------|-------|----|----|------------------------------------------------|
 | [Qwen3](../examples/qwen3.md) | 8B               | ✅       |       | ✅     |    |    |
-|                      | 30B              | ✅       |       | ✅     |    |    |                                                |
-| [Qwen3.5](../examples/qwen3.md) | 9B    | ✅        |         |       | ✅     |    |    |
-|                      | 35B              | ✅       |       | ✅     |    |    |                                                |
-| [Qwen3-MoE](../examples/qwen3.md) | 30B-A3B          | ✅       |       | ✅     | ✅  |    |
-|                      | 235B-A22B        | ✅       |       | ✅     | ✅  |    |                                                |
+|                      | 30B              | ✅       |       | ✅     | ✅   | ✅   |                                                |
+| [Qwen3.5](../examples/qwen3.md) | 9B    | ✅        |         | ✅    |      |✅    |    |
+|                      | 35B              | ✅       |       | ✅     |✅    |✅    |                                                |
+| [Qwen3-MoE](../examples/qwen3.md) | 30B-A3B          | ✅       |       | ✅     | ✅  |✅    |
+|                      | 235B-A22B        | ✅       |       | ✅     | ✅  | ✅   |                                                |
 | [Qwen3-VL](../examples/qwen3_vl.md) | 8B               | ✅       |       | ✅     |    | ✅  |                               |
 |                      | 30B              | ✅       |       | ✅     | ✅  | ✅  |                                                |
 | Qwen3-VL-MoE         | 30B-A3B          | ✅       |       | ✅     | ✅  | ✅  |                               |
