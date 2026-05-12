@@ -1489,48 +1489,83 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
             grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
                 The temporal, height and width of feature shape of each image in LLM.
 
+        Keyword Args (optional, passed through `**kwargs`):
+            vision_pos_embed_indices / vision_pos_embed_weights / vision_rot_pos_ids / vision_cu_seqlens /
+            vision_max_hw: precomputed-on-host ViT metadata from VeOmni's `VisionMetadataCollator`. When
+                present, the bilinear position-embedding lookup, the rotary position ids and `cu_seqlens`
+                are taken directly instead of being re-derived from the GPU `grid_thw` tensor (each a
+                host-device sync per ViT forward). When absent (e.g. `dummy_forward`, eval / `generate`),
+                the forward falls back to the on-the-fly path below.
+
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        # Precomputed ViT metadata (host-side, from VeOmni's VisionMetadataCollator). All-or-nothing:
+        # either every key is present, or we fall back to deriving from `grid_thw` (one `.tolist()` sync).
+        vision_pos_embed_indices = kwargs.pop("vision_pos_embed_indices", None)
+        vision_pos_embed_weights = kwargs.pop("vision_pos_embed_weights", None)
+        vision_rot_pos_ids = kwargs.pop("vision_rot_pos_ids", None)
+        vision_cu_seqlens = kwargs.pop("vision_cu_seqlens", None)
+        vision_max_hw = kwargs.pop("vision_max_hw", None)
+        use_precomputed = vision_pos_embed_indices is not None
+
         hidden_states = self.patch_embed(hidden_states)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        if use_precomputed:
+            # pos_embeds[i] = sum over the 4 bilinear-interpolation corners of pos_embed(idx) * weight,
+            # with idx/weight laid out in the same spatial-merge-block + frame order as the patch tokens
+            # (see compute_qwen3_5_vision_metadata). Equivalent to fast_pos_embed_interpolate(grid_thw),
+            # but with the per-image t/h/w loop (and its implicit `.item()`s) moved to the data collator.
+            pos_embeds = (
+                self.pos_embed(vision_pos_embed_indices)
+                * vision_pos_embed_weights.to(self.pos_embed.weight.dtype).unsqueeze(-1)
+            ).sum(dim=1)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 
         # --- Patch.1: Sequence parallel padding and slicing for position embeddings ---
         if get_parallel_state().sp_enabled:
-            # Note: grid_thw records the original, unpadded visual shapes. However, the data collator
-            # pads the visual sequence (hidden_states) to a multiple of (sp_size * pad_scale)
-            # to support Sequence Parallelism and subsequent spatial merging.
-            #
-            # pad_scale=4 matches the 4-to-1 spatial merge (2x2 pooling) ratio in the Qwen-VL Vision Tower.
-            # We must manually pad and slice the generated position embeddings to ensure they
-            # correctly align with the padded and sharded hidden states.
+            # grid_thw / the precomputed metadata cover the original, unpadded visual sequence; the data
+            # collator pads hidden_states to a multiple of (sp_size * pad_scale). pad_scale=4 matches the
+            # 4-to-1 spatial merge (2x2 pooling). Pad and slice pos_embeds to align with the padded,
+            # sharded hidden states.
             pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
         # --- Patch.1 ---
 
         hidden_states = hidden_states + pos_embeds
 
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0,
-            # Select dtype based on the following factors:
-            #  - FA2 requires that cu_seqlens_q must have dtype int32
-            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
-            # See https://github.com/huggingface/transformers/pull/34852 for more information
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        if use_precomputed:
+            cu_seqlens = vision_cu_seqlens
+            total_seq_len = vision_rot_pos_ids.shape[0]  # == sum(t*h*w); a Python int, no host-device sync
+            rotary_pos_emb = self.rotary_pos_emb(vision_max_hw)[vision_rot_pos_ids].flatten(1)
+        else:
+            # Build cu_seqlens on the host (one varlen segment of h*w per frame) and carry total_seq_len
+            # as a plain int — the GPU-tensor `repeat_interleave(...).cumsum(0)` / `cu_seqlens[-1]` paths
+            # each force a host-device sync.
+            grid_thw_list = grid_thw.tolist()
+            cu_seqlens_list = [0]
+            for t, h, w in grid_thw_list:
+                frame_len = h * w
+                for _ in range(t):
+                    cu_seqlens_list.append(cu_seqlens_list[-1] + frame_len)
+            total_seq_len = cu_seqlens_list[-1]
+            cu_seqlens = torch.tensor(
+                cu_seqlens_list,
+                device=hidden_states.device,
+                # FA2 requires int32 for cu_seqlens_q; torch.onnx.export requires it match grid_thw's dtype.
+                # See https://github.com/huggingface/transformers/pull/34852
+                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            )
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
 
         # --- Patch.2: Flatten full-sequence rotary embeddings using the actual total sequence length ---
         # In Sequence Parallelism, hidden_states.size(0) only represents the local shard length.
-        # We must use cu_seqlens[-1] (derived from unpadded grid_thw) to flatten the global
+        # We must use total_seq_len (the full unpadded vision length) to flatten the global
         # rotary_pos_emb. This ensures the embeddings cover the entire original sequence
         # before they are padded and sliced in Patch 3 to match the sharded hidden_states.
-        total_seq_len = cu_seqlens[-1]
         rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
         # --- Patch.2 ---
 
@@ -1557,7 +1592,8 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
             # Parallel operations (e.g., All-to-All).
             sp_size = get_parallel_state().sp_size
             # Calculate global padding: (local_seq_len * num_ranks) - original_total_len
-            pad_seq_len = seq_len * sp_size - total_seq_len.item()
+            # (total_seq_len is already a host int — no `.item()` sync needed here.)
+            pad_seq_len = seq_len * sp_size - total_seq_len
             if pad_seq_len > 0:
                 # Append a new entry to cu_seqlens to include the padding tokens as a final segment
                 new_cumsum = cu_seqlens[-1] + pad_seq_len
@@ -1895,7 +1931,9 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
     @can_return_tuple
     @auto_docstring
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None):
+    def get_image_features(
+        self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None, **kwargs
+    ):
         r"""
         Processes images through the vision tower and returns features as a single contiguous tensor.
 
@@ -1905,10 +1943,13 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         to support Sequence Parallelism (SP) and FSDP2 efficiently. Keeping features
         contiguous avoids Python list-overhead and enables direct execution of
         vectorized kernels in the main forward pass.
+
+        `**kwargs` carries the optional precomputed-on-host ViT metadata (`vision_*`) through to
+        `Qwen3_5VisionModel.forward` (also used by `get_video_features`).
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         vision_output: BaseModelOutputWithPooling = self.visual(
-            pixel_values, grid_thw=image_grid_thw, return_dict=True
+            pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
         )
         return vision_output
 
@@ -2018,6 +2059,22 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                 flash_attn_kwargs[key] = kwargs.pop(key)
         # --- Patch.4 ---
 
+        # --- Patch.5: Pull the precomputed-on-host ViT metadata (VeOmni's VisionMetadataCollator) out of
+        # kwargs and re-key it without the modality prefix, so it reaches the vision tower via
+        # get_{image,video}_features and never leaks into the ViT block / language-model kwargs. ---
+        _vision_metadata_names = ("pos_embed_indices", "pos_embed_weights", "rot_pos_ids", "cu_seqlens", "max_hw")
+        image_vision_kwargs = {
+            f"vision_{name}": kwargs.pop(f"vision_image_{name}")
+            for name in _vision_metadata_names
+            if f"vision_image_{name}" in kwargs
+        }
+        video_vision_kwargs = {
+            f"vision_{name}": kwargs.pop(f"vision_video_{name}")
+            for name in _vision_metadata_names
+            if f"vision_video_{name}" in kwargs
+        }
+        # --- Patch.5 ---
+
         # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
         if get_parallel_state().sp_enabled:
             # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
@@ -2029,7 +2086,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
         if pixel_values is not None:
             image_outputs: BaseModelOutputWithPooling = self.get_image_features(
-                pixel_values, image_grid_thw, return_dict=True
+                pixel_values, image_grid_thw, return_dict=True, **image_vision_kwargs
             )
             image_embeds = image_outputs.pooler_output
 
@@ -2069,7 +2126,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
         if pixel_values_videos is not None:
             video_outputs: BaseModelOutputWithPooling = self.get_video_features(
-                pixel_values_videos, video_grid_thw, return_dict=True
+                pixel_values_videos, video_grid_thw, return_dict=True, **video_vision_kwargs
             )
             video_embeds = video_outputs.pooler_output
 
