@@ -31,6 +31,7 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from .muon import DistributedMuon, split_muon_adamw_params
 
 
@@ -273,6 +274,11 @@ def build_optimizer(
     muon_kwargs: Optional[Dict[str, Any]] = None,
 ) -> "torch.optim.Optimizer":
     if optimizer_type == "muon":
+        if not is_transformers_version_greater_or_equal_to("5.0.0"):
+            raise RuntimeError(
+                "optimizer_type='muon' is only supported with transformers>=5.0.0. "
+                "Please switch to the transformers v5 environment or use AdamW."
+            )
         if param_groups is not None:
             logger.warning_rank0(
                 "build_optimizer(optimizer_type='muon') ignores the provided "

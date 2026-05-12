@@ -35,11 +35,17 @@ from veomni.utils.device import (
     get_dist_comm_backend,
     get_torch_device,
 )
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 SEED = 7777
 EP_SIZE = 2
 QWEN3_MOE_TOY_CFG = "tests/toy_config/qwen3_moe_toy"
+
+pytestmark = pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.0.0"),
+    reason="Muon training support is transformers v5-only.",
+)
 
 
 def _distributed_smoke(use_zero_comm: bool) -> None:
@@ -100,7 +106,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
     expected_shard_dim = 0 if use_zero_comm else 1
     sample_name = "model.layers.0.mlp.experts.gate_up_proj"
     p = dict(model.named_parameters()).get(sample_name)
-    assert p is not None, f"expected param {sample_name} to exist on the toy Qwen3-MoE model"
+    assert p is not None, f"expected param {sample_name} to exist on the toy Qwen3-MoE v5 model"
     assert isinstance(p, DTensor), f"{sample_name} should be a DTensor under FSDP+EP, got {type(p)}"
     shard_dims = [pl.dim for pl in p.placements if isinstance(pl, Shard)]
     assert shard_dims == [expected_shard_dim], (

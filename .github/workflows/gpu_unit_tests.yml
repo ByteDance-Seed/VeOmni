@@ -123,10 +123,6 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
-      - name: Run Muon optimizer tests
-        run: |
-          uv run --frozen pytest -s -x tests/optim
-
   gpu_unit_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: lint
@@ -187,6 +183,11 @@ jobs:
         run: |
           # Need v5 to support newer models like Qwen3.5 count flops tests.
           uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/utils/test_count_flops.py
+      - name: Run Muon optimizer tests [transformers-v5]
+        run: |
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev pytest -s -x tests/optim/test_muon_unit.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev pytest -s -x tests/optim/test_muon_fsdp2_parity.py
+          uv run --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
       # TODO: Run other tests in transformers v5 env as well.
       - name: Install LoRA extra [transformers-v5]
         run: |

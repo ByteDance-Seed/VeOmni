@@ -1,4 +1,5 @@
 # Sample Qwen3-MoE-30B-A3B SFT config using Muon with FSDP2 + EP.
+# Muon support is transformers v5-only in VeOmni.
 # Muon handles 2D hidden weights and 3D expert stacks; AdamW handles
 # embeddings, lm_head, norms and biases.
 
