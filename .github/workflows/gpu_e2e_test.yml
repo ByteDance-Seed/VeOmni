@@ -100,12 +100,7 @@ jobs:
 
   gpu_e2e_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
-    # Serialize after the v4 job: both target the same L20-8 self-hosted
-    # runner pool with `--gpus all`, and concurrent runs that land on the
-    # same physical host trip a GPU OOM (a sibling container claims 43+ GiB
-    # of the 44 GiB card). Keep this `needs` until per-host concurrency or
-    # per-slice labels are wired up at the runner level.
-    needs: gpu_e2e_tests_v4
+    needs: lint
     # Same runner/container/env as gpu_e2e_tests_v4 above; see comments there.
     runs-on: [self-hosted, l20-8]
     timeout-minutes: 60
