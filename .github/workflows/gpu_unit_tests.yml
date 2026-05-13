@@ -79,6 +79,11 @@ jobs:
       CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
       CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
       CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
+      # Pin the v4-legacy env: the explicit `uv sync` below installs
+      # transformers==4.57.3 via the legacy extra; `UV_NO_SYNC` tells every
+      # subsequent `uv run` to use the venv as-is instead of re-syncing
+      # back to the project default (which is now v5 after this PR).
+      UV_NO_SYNC: "1"
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

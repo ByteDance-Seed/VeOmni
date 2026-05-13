@@ -26,6 +26,7 @@ from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
 from veomni.utils import helper
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -282,6 +283,15 @@ TEST_EP_SIZES = [1, 4, 8]
 
 @pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
 def test_trainer_saveload(model_name: str, ep_size: int):
+    # deepseek_v3 hasn't been migrated to transformers v5 in VeOmni: its
+    # v4-style monkey-patch raises
+    # ``RuntimeError: deepseek_v3 has not been migrated...`` on v5 (see
+    # ``veomni/models/loader.py::raise_if_not_migrated_to_v5``). Skip the
+    # deepseek_v3 saveload cases on v5 until the model is ported;
+    # qwen3_moe still exercises the dcp save/load path on every
+    # transformers version.
+    if model_name == "deepseek_v3" and is_transformers_version_greater_or_equal_to("5.0.0"):
+        pytest.skip("deepseek_v3 has not been migrated to transformers v5 in VeOmni.")
     _run_trainer_saveload_and_verify(model_name, ep_size)
 
 
