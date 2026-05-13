@@ -46,6 +46,10 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25_omni": {"rotary_pos_emb_implementation": "eager"},
+    # qwen2 v5 patched modeling declares an OpSlot for rotary_pos_emb but
+    # KERNEL_REGISTRY has no `npu` entry for (rotary_pos_emb, full) — only
+    # `liger_kernel`. Pin to eager until the NPU KernelSpec is registered.
+    "qwen2": {"rotary_pos_emb_implementation": "eager"},
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
