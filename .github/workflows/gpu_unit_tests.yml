@@ -89,6 +89,24 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Free shared L20 GPU
+        # Some prior CI runs on this physical host leak Python/torchrun
+        # processes that keep tens of GiB pinned on the GPUs even after
+        # their sibling container exits. Without this kill step the next
+        # job lands on the same physical host and OOMs at the first
+        # large allocation (e.g. ``Process X has 43.80 GiB memory in use``
+        # on a 44 GiB card). Safe here because the L20-8 self-hosted
+        # runners are 1-job-per-physical-host and ``--gpus all`` already
+        # claims the whole card.
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
       - name: Sync dependencies [transformers-v4-legacy]
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers-v4-legacy --extra gpu --extra audio --group dev
@@ -156,6 +174,18 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Free shared L20 GPU
+        # See gpu_unit_tests_v4 for rationale — kill leftover GPU
+        # processes from prior CI runs that share this physical host.
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
       - name: Detect changed paths for conditional tests
         id: changes
         run: |

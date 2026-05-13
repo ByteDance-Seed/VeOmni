@@ -68,6 +68,14 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 # args directly (no training YAML), so we pin here as well.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+    # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
+    # by the fused Liger cross-entropy kernel materializing the full
+    # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it
+    # processes the vocab in chunks so peak allocation stays well below
+    # the ~5 GiB Liger asks for, which lets these tests survive shared
+    # L20 runners where another job is still holding part of the card.
+    "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
+    "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
 }
 
 
