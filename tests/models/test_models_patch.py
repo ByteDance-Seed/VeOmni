@@ -313,15 +313,22 @@ _TEST_CASES_TRANSFORMERS_V5 = [
     pytest.param(
         "./tests/toy_config/qwen3_5_toy/config.json",
         False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
+        # qwen3_5* uses chunk_loss in liger mode (see forward_backward_step
+        # — fused Liger CE OOMs on the qwen3_5 full vocab). chunk_loss is
+        # bit-exact with eager but drifts ~3% from HF native CE in bfloat16
+        # via the GatedDeltaNet linear-attention path. Bump tolerance so
+        # the HF↔VeOmni gnorm comparison stays in band.
+        0.05,
+        0.05,
         id="qwen3_5",
     ),
     pytest.param(
         "./tests/toy_config/qwen3_5_moe_toy/config.json",
         True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
+        # Same chunk_loss/HF drift as qwen3_5 above; MoE path adds
+        # routing-loss noise on top so allow a slightly wider envelope.
+        0.05,
+        0.05,
         id="qwen3_5_moe",
     ),
     pytest.param(
