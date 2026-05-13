@@ -86,6 +86,10 @@ jobs:
       CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
       CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
       CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
+      # uv's default 30s timeout fires intermittently on the CN runners
+      # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
+      # 5 min so a slow link doesn't fail the whole sync.
+      UV_HTTP_TIMEOUT: "300"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
