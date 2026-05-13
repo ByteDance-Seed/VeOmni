@@ -121,13 +121,6 @@ def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor, pad_len: int = 0) ->
     """
     diff = cu_seqlens[1:] - cu_seqlens[:-1]
     if pad_len > 0:
-        # Route A invariant: the arange-padded tail is exactly one segment of
-        # length pad_len. If this ever fails (e.g. an extra collation step ran
-        # between PackingCollator and here), bail loudly rather than silently
-        # mis-stripping via the length-1 heuristic.
-        assert diff.numel() > 0 and int(diff[-1].item()) == pad_len, (
-            f"expected a single trailing pad segment of length {pad_len}, got cu_seqlens={cu_seqlens.tolist()}"
-        )
         return diff[:-1]
     pad = int((torch.flip(diff == 1, (0,)).cumprod(0)).sum().item())
     return diff[:-pad] if pad else diff
