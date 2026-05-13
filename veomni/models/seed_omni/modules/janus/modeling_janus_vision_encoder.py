@@ -63,6 +63,26 @@ class JanusVisionEncoder(OmniModule):
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
+    def pre_forward(self, pixel_values: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:
+        """Packing: flatten per-sample multi-image tensors.
+
+        Accepts ``pixel_values`` in two shapes:
+
+        * ``(B, C, H, W)`` — one image per sample (already flat), pass through.
+        * ``(B, N_images, C, H, W)`` — N images per sample; flatten to
+          ``(B * N_images, C, H, W)`` so the vision backbone sees a single
+          batch dimension.  The original ``(B, N_images)`` shape is stored in
+          ``_pv_shape`` for potential use in ``post_forward``.
+
+        All other kwargs are passed through unchanged.
+        """
+        if pixel_values is not None and pixel_values.ndim == 5:
+            # (B, N_images, C, H, W) → (B*N_images, C, H, W)
+            b, n = pixel_values.shape[:2]
+            pixel_values = pixel_values.reshape(b * n, *pixel_values.shape[2:])
+            kwargs["_pv_batch_n_images"] = (b, n)
+        return dict(pixel_values=pixel_values, **kwargs)
+
     def forward(self, pixel_values: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:
         """Encode understanding image patches to LLM-space embeddings.
 
@@ -72,12 +92,36 @@ class JanusVisionEncoder(OmniModule):
         if pixel_values is None:
             return {}
 
-        # vision_model returns pooler_output of shape (B*N_images, num_patches, vision_hidden)
+        # pixel_values: (B_flat, C, H, W) — already flattened by pre_forward
         vision_out = self.vision_model(pixel_values, return_dict=True)
-        # pooler_output: (B, num_patches, vision_hidden)
-        feats = vision_out.pooler_output if hasattr(vision_out, "pooler_output") else vision_out.last_hidden_state
-        image_embeds = self.aligner(feats)  # (B, num_patches, llm_hidden)
+        # last_hidden_state: (B_flat, num_patches, vision_hidden) — per-patch features
+        feats = vision_out.last_hidden_state
+        # feats: (B_flat, num_patches, vision_hidden)
+        image_embeds = self.aligner(feats)  # (B_flat, num_patches, llm_hidden)
+
+        # Reshape back to (B, N_images * num_patches, llm_hidden) if multi-image packing was used
+        b_n = kwargs.pop("_pv_batch_n_images", None)
+        if b_n is not None:
+            b, n = b_n
+            p = image_embeds.size(1)
+            image_embeds = image_embeds.reshape(b, n * p, image_embeds.size(2))
+
         return {"image_embeds": image_embeds}
+
+    # ── Build lifecycle ───────────────────────────────────────────────────────
+
+    @classmethod
+    def _build_nn_module(cls, cfg: Dict[str, Any], init_device: str = "cpu") -> "JanusVisionEncoder":
+        """Construct JanusVisionEncoder from a raw config dict.
+
+        Allocates the module on *init_device* (use ``"meta"`` for lazy
+        allocation when weights will be loaded by ``build_parallelize_model``).
+        """
+        config = JanusVisionEncoderConfig(
+            vision_config=cfg.get("vision_config"),
+        )
+        with torch.device(init_device):
+            return cls(config)
 
     # ── Checkpoint helpers ───────────────────────────────────────────────────
 
@@ -86,7 +130,9 @@ class JanusVisionEncoder(OmniModule):
         """Extract vision encoder weights from a loaded JanusForConditionalGeneration."""
 
         vision_cfg = janus_model.config.vision_config
-        cfg = JanusVisionEncoderConfig(vision_config=vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg))
+        cfg = JanusVisionEncoderConfig(
+            vision_config=vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg)
+        )
         enc = cls(cfg)
         enc.vision_model.load_state_dict(janus_model.model.vision_model.state_dict())
         enc.aligner.load_state_dict(janus_model.model.aligner.state_dict())

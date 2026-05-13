@@ -102,6 +102,25 @@ class JanusVQDecoder(OmniModule):
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
+    def pre_forward(
+        self,
+        gen_image_patches: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Packing: flatten per-sample multi-image patch tensors.
+
+        Accepts ``gen_image_patches`` in two shapes:
+
+        * ``(B, 3, H, W)`` — one image per sample, pass through.
+        * ``(B, N_images, 3, H, W)`` — N images; flatten to
+          ``(B * N_images, 3, H, W)``.
+        """
+        if gen_image_patches is not None and gen_image_patches.ndim == 5:
+            b, n = gen_image_patches.shape[:2]
+            gen_image_patches = gen_image_patches.reshape(b * n, *gen_image_patches.shape[2:])
+            kwargs["_gpatch_batch_n_images"] = (b, n)
+        return dict(gen_image_patches=gen_image_patches, **kwargs)
+
     def forward(
         self,
         gen_image_patches: Optional[torch.Tensor] = None,
@@ -116,14 +135,24 @@ class JanusVQDecoder(OmniModule):
         if gen_image_patches is None:
             return {}
 
+        # gen_image_patches: (B_flat, 3, H, W) after pre_forward flattening
+        b_n = kwargs.pop("_gpatch_batch_n_images", None)
+
         with torch.no_grad() if self.config.freeze_vqvae else torch.enable_grad():
             vq_out = self.vqmodel.encode(gen_image_patches)
-        vq_token_ids = vq_out.image_tokens  # (B, N_patches)
+        vq_token_ids = vq_out.image_tokens  # (B_flat, N_patches)
         vq_loss = vq_out.embedding_loss if hasattr(vq_out, "embedding_loss") else None
 
         # Generation embeddings: lookup + project to LLM hidden size
         gen_embeds_raw = self.generation_embeddings(vq_token_ids)  # (B, N, embed_dim)
-        gen_embeds = self.generation_aligner(gen_embeds_raw)       # (B, N, llm_hidden)
+        gen_embeds = self.generation_aligner(gen_embeds_raw)  # (B, N, llm_hidden)
+
+        # Reshape back to (B, N_images * N_patches, ...) if multi-image packing was used
+        if b_n is not None:
+            b, n = b_n
+            p = vq_token_ids.size(1)
+            vq_token_ids = vq_token_ids.reshape(b, n * p)
+            gen_embeds = gen_embeds.reshape(b, n * p, gen_embeds.size(2))
 
         out = {
             "gen_embeds": gen_embeds,
@@ -158,8 +187,8 @@ class JanusVQDecoder(OmniModule):
         if token_id.ndim == 1:
             token_id = token_id.unsqueeze(1)  # (B, 1)
 
-        embed_raw = self.generation_embeddings(token_id)   # (B, 1, embed_dim)
-        embed = self.generation_aligner(embed_raw)          # (B, 1, llm_hidden)
+        embed_raw = self.generation_embeddings(token_id)  # (B, 1, embed_dim)
+        embed = self.generation_aligner(embed_raw)  # (B, 1, llm_hidden)
         return {"embed": embed}
 
     def decode_pixels(self, vq_token_ids: torch.Tensor) -> torch.Tensor:
@@ -176,6 +205,23 @@ class JanusVQDecoder(OmniModule):
         """
         pixel_values = self.vqmodel.decode(vq_token_ids)  # (B, 3, H, W)
         return pixel_values.permute(0, 2, 3, 1)
+
+    # ── Build lifecycle ───────────────────────────────────────────────────────
+
+    @classmethod
+    def _build_nn_module(cls, cfg: Dict[str, Any], init_device: str = "cpu") -> "JanusVQDecoder":
+        """Construct JanusVQDecoder from a raw config dict.
+
+        ``cfg["freeze_vqvae"]`` (default ``True``) freezes the VQVAE backbone
+        after construction so only the generation projection layers are trained,
+        matching the original Janus training recipe.
+        """
+        config = JanusVQDecoderConfig(
+            vq_config=cfg.get("vq_config"),
+            freeze_vqvae=cfg.get("freeze_vqvae", True),
+        )
+        with torch.device(init_device):
+            return cls(config)
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
 

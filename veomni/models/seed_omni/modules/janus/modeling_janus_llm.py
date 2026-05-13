@@ -48,6 +48,9 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, PretrainedConfig
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel.data import gather_outputs, sp_pad_and_slice
+
 from ...module import OmniModule
 
 
@@ -103,6 +106,72 @@ class JanusLLM(OmniModule):
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
+    def pre_forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Packing + SP slice for the LLM micro-batch.
+
+        Steps (when SP is enabled):
+          1. ``sp_pad_and_slice`` pads the sequence length to be divisible by
+             ``sp_size``, then returns this rank's contiguous slice.
+          2. The same slice is applied to ``labels``, ``attention_mask``, and
+             ``position_ids`` so all sequence-parallel tensors are aligned.
+          3. ``und_image_embeds`` and other non-sequence tensors are passed
+             through unchanged; the ``_scatter_image_embeds`` in ``forward``
+             will naturally inject only the embeds whose placeholder tokens
+             landed in this rank's sequence slice.
+
+        Note on multi-image SP routing
+        --------------------------------
+        When a sequence contains multiple images and SP splits the sequence,
+        placeholder tokens for different images may land on different ranks.
+        ``masked_scatter`` handles this correctly as long as each rank's
+        ``und_image_embeds`` slice contains exactly the patches for the
+        placeholders present in that rank's ``input_ids`` chunk.  In practice
+        this is guaranteed when sequence packing assigns at most one image per
+        packed sub-sequence (the standard convention for Janus training).
+        """
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            if input_ids is not None:
+                input_ids = sp_pad_and_slice(input_ids, dim=1, pad_value=0)
+            if labels is not None:
+                labels = sp_pad_and_slice(labels, dim=1, pad_value=-100)
+            if attention_mask is not None:
+                attention_mask = sp_pad_and_slice(attention_mask, dim=1, pad_value=0)
+            if position_ids is not None:
+                position_ids = sp_pad_and_slice(position_ids, dim=1, pad_value=0)
+
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **kwargs,
+        )
+
+    def post_forward(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
+        """SP gather: all-gather ``hidden_states`` across SP ranks.
+
+        After gather, downstream connections (e.g. a DiT conditioner) receive
+        the full-length hidden state sequence rather than the SP-local slice.
+        The gather applies a ``1/sp_size`` gradient scaling on the backward
+        pass to compensate for the all-reduce in SP loss averaging.
+        """
+        ps = get_parallel_state()
+        if ps.sp_enabled and "hidden_states" in outputs:
+            outputs["hidden_states"] = gather_outputs(
+                outputs["hidden_states"],
+                gather_dim=1,
+                scale_grad=True,
+            )
+        return outputs
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -149,7 +218,7 @@ class JanusLLM(OmniModule):
             **{k: v for k, v in kwargs.items() if k in ("cache_position",)},
         )
         hidden_states = lm_out.last_hidden_state  # (B, T, D)
-        logits = self.lm_head(hidden_states)       # (B, T, V)
+        logits = self.lm_head(hidden_states)  # (B, T, V)
 
         lm_loss = None
         if labels is not None:
@@ -193,9 +262,9 @@ class JanusLLM(OmniModule):
             past_key_values=past_key_values,
             use_cache=True,
         )
-        hidden = lm_out.last_hidden_state          # (B, 1, D)
-        logits = self.lm_head(hidden)              # (B, 1, V)
-        next_token_logits = logits[:, -1, :]       # (B, V)
+        hidden = lm_out.last_hidden_state  # (B, 1, D)
+        logits = self.lm_head(hidden)  # (B, 1, V)
+        next_token_logits = logits[:, -1, :]  # (B, V)
 
         # Sample
         if temperature != 1.0:
@@ -206,11 +275,11 @@ class JanusLLM(OmniModule):
         next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
 
         return {
-            "last_token_id": next_token.squeeze(-1),      # (B,) for FSM transition check
-            "input_ids": next_token,                       # feed back as next step input
+            "last_token_id": next_token.squeeze(-1),  # (B,) for FSM transition check
+            "input_ids": next_token,  # feed back as next step input
             "logits": logits,
             "past_key_values": lm_out.past_key_values,
-            "vq_token_id": next_token.squeeze(-1),         # alias for vq_decoder connection
+            "vq_token_id": next_token.squeeze(-1),  # alias for vq_decoder connection
         }
 
     # ── Internal helpers ─────────────────────────────────────────────────────
@@ -234,6 +303,39 @@ class JanusLLM(OmniModule):
         sorted_indices_to_remove = cumulative_probs - torch.softmax(sorted_logits, dim=-1) > top_p
         sorted_logits[sorted_indices_to_remove] = float("-inf")
         return logits.scatter(1, sorted_indices, sorted_logits)
+
+    # ── Build lifecycle ───────────────────────────────────────────────────────
+
+    @classmethod
+    def _build_nn_module(cls, cfg: Dict[str, Any], init_device: str = "cpu") -> "JanusLLM":
+        """Construct JanusLLM from a raw config dict.
+
+        Stores ``cfg["weights_path"]`` on the instance so :meth:`get_assets`
+        can load the tokenizer without re-reading the config.
+        """
+        config = JanusLLMConfig(
+            text_config=cfg.get("text_config"),
+            image_token_id=cfg.get("image_token_id", 100577),
+            gen_image_token_id=cfg.get("gen_image_token_id", 100578),
+        )
+        with torch.device(init_device):
+            module = cls(config)
+        module._weights_path = cfg.get("weights_path")
+        return module
+
+    def get_assets(self):
+        """Return the LLaMA tokenizer bundled with this module's weights.
+
+        Called by :meth:`OmniModel.collect_assets` after all modules are built.
+        The tokenizer is used by the data pipeline and for saving model assets.
+        Returns an empty list if no ``weights_path`` was set.
+        """
+        weights_path = getattr(self, "_weights_path", None)
+        if not weights_path:
+            return []
+        from transformers import AutoTokenizer
+
+        return [AutoTokenizer.from_pretrained(weights_path)]
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
 

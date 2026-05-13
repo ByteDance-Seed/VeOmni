@@ -5,24 +5,44 @@
 #     --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
 #
-# Then set JANUS_SPLIT_DIR below and launch training.
+# Parallelism
+# -----------
+# All sub-modules are wrapped by build_parallelize_model using the global
+# `train.accelerator.fsdp_config.fsdp_mode` (ddp / fsdp1 / fsdp2) set in the
+# trainer YAML. SP for ar_llm is auto-applied by its pre_forward / post_forward
+# hooks when the global parallel_state has sp_enabled.
+#
+# Micro-batch sizes
+# -----------------
+# Global batch B must be divisible by every module's micro_batch_size:
+#   B % vision_encoder.micro_batch_size == 0
+#   B % vq_decoder.micro_batch_size     == 0
+#   B % ar_llm.micro_batch_size         == 0
+# Example: B=8, vision_encoder=4, vq_decoder=4, ar_llm=2  → all divide evenly.
 
 # ── Module registry ───────────────────────────────────────────────────────────
 modules:
   vision_encoder:
     model_type: janus_vision_encoder
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/vision_encoder
+    # Micro-batch: process 4 images at a time through the vision tower
+    micro_batch_size: 4
 
   vq_decoder:
     model_type: janus_vq_decoder
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/vq_decoder
     freeze_vqvae: true
+    # Micro-batch: process 4 images at a time through VQVAE encode
+    micro_batch_size: 4
 
   ar_llm:
     model_type: janus_llm
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/ar_llm
     image_token_id: 100577      # <und_img> placeholder in tokenizer
     gen_image_token_id: 100578  # <gen_img> placeholder in tokenizer
+    # Micro-batch: process 2 sequences per forward call
+    # (keep this <= vision_encoder.micro_batch_size and ensure B % 2 == 0)
+    micro_batch_size: 2
 
 # ── Named connection pool (each is one atomic edge) ───────────────────────────
 connections:

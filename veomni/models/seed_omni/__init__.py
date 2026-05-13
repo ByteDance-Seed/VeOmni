@@ -17,8 +17,8 @@ from .configuration_seed_omni import OmniConfig
 from .generation import GenerationStateMachine
 from .graph import OmniGraph
 from .modeling_omni import OmniModel
-from .module import OmniModule
-from .modules import JanusLLM, JanusVisionEncoder, JanusVQDecoder
+from .module import OmniBuildArgs, OmniModule
+from .modules import MODULE_REGISTRY, JanusLLM, JanusVisionEncoder, JanusVQDecoder
 
 
 __all__ = [
@@ -26,8 +26,10 @@ __all__ = [
     "OmniConfig",
     "OmniGraph",
     "OmniModule",
+    "OmniBuildArgs",
     "OmniModel",
     "GenerationStateMachine",
+    "MODULE_REGISTRY",
     # Janus modules
     "JanusVisionEncoder",
     "JanusVQDecoder",
