@@ -118,6 +118,18 @@ class TrainerTest(BaseTrainer):
         pass
 
     def forward_backward_step(self, state_dict: Dict[str, torch.Tensor], model_mode: ModelMode, dataloader):
+        # Aggressive teardown of any model / optimizer / lr_scheduler from the
+        # previous mode iteration. Without this the prior FSDP-wrapped model
+        # plus its optimizer states stay pinned across `_build_model` calls
+        # (Python GC alone is not enough because FSDP / lazy-init hold cross
+        # references), and on multi-mode runs over qwen3_5 we accumulate
+        # 5+ GiB per mode, eventually OOM'ing on the embedding tensor for the
+        # next model build (manifested as ``Process X has 43.80 GiB``).
+        for _attr in ("model", "optimizer", "lr_scheduler"):
+            if hasattr(self, _attr):
+                delattr(self, _attr)
+        _release_device_memory()
+
         set_environ_param(model_mode)
         _apply_patches()
 
