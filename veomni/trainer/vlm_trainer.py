@@ -199,7 +199,8 @@ class VLMTrainer:
         )
 
     def _build_collate_fn(self):
-        if self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        model_config = self.base.model_config
+        if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             data_collate_info = {
                 "audio_feature_lengths": (0, False, None, None),
                 "input_features": (0, True, 0, 1),
@@ -207,12 +208,23 @@ class VLMTrainer:
             }
         else:
             data_collate_info = {}
+        # Qwen3.5-VL: precompute the ViT position/rotary/cu_seqlens metadata on the host so the
+        # vision forward doesn't sync on the GPU `grid_thw` tensor every step.
+        vision_metadata_config = None
+        if model_config.model_type in ("qwen3_5", "qwen3_5_moe"):
+            vision_config = model_config.vision_config
+            vision_metadata_config = {
+                "num_grid_per_side": int(vision_config.num_position_embeddings**0.5),
+                "spatial_merge_size": vision_config.spatial_merge_size,
+            }
         seq_classification = self.base.args.data.data_type == "classification"
         pad_to_length = self.base.args.train.pad_to_length
         self.base.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
+            pad_seq_to_multiple_of=self.base.args.train.pad_seq_to_multiple_of,
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
+            vision_metadata_config=vision_metadata_config,
         )
 
     def _build_optimizer(self):

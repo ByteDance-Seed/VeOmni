@@ -99,13 +99,28 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
     return (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)
 
 
-def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
+def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor, pad_len: int = 0) -> torch.Tensor:
     """
     cu_seqlens: shape (B+1,), monotonic non-decreasing.
-    padding at the tail is represented by consecutive +1 increments:
-      ..., n, n+1, n+2, ... , n+padlen (sp padding / pad_to_length padding)
-    Return: 1D tensor of valid seqlens (exclude tail padding segments).
+    pad_len: total number of pad tokens at the tail of the packed sequence
+      (PackingCollator.pad_to_length - real_seq_len).
+
+    Two padding schemes are recognised:
+
+    1. ``pad_len > 0`` (current ``PackingCollator`` behaviour, route A):
+       position_ids in the pad region are ``arange(pad_len)``, so the pad
+       region forms exactly one trailing segment of length ``pad_len``. We
+       strip that single segment.
+
+    2. ``pad_len == 0`` (no caller-side info / SP constant-0 padding):
+       fall back to the heuristic that strips trailing length-1 segments
+       (SequenceParallelCollator constant-0 pads position_ids, which yields
+       ``pad_size`` length-1 segments at the tail).
+
+    Returns: 1D tensor of valid seqlens (excludes tail padding segments).
     """
     diff = cu_seqlens[1:] - cu_seqlens[:-1]
+    if pad_len > 0:
+        return diff[:-1]
     pad = int((torch.flip(diff == 1, (0,)).cumprod(0)).sum().item())
     return diff[:-pad] if pad else diff

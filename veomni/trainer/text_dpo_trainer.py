@@ -33,12 +33,15 @@ from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
+from .base import _NON_MODEL_KEYS as _BASE_NON_MODEL_KEYS
 from .base import BaseTrainer
 
 
 logger = logging.get_logger(__name__)
 
-_NON_MODEL_KEYS = {"labels"}
+# DPO carries "labels" as a structured pair (chosen_labels / rejected_labels) in the batch but feeds
+# them to its own loss, not the model — so filter on top of BaseTrainer's set.
+_NON_MODEL_KEYS = _BASE_NON_MODEL_KEYS | {"labels"}
 
 
 # ================================ DPO Arguments ======================================

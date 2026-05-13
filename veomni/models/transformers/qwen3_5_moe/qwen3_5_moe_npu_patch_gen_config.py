@@ -71,9 +71,13 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq", "gather_outputs", "slice_input_tensor"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
-config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+# gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
+# (re-exported by the package __init__), not in .ulysses.
+config.add_import(
+    "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
+)
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
 # (re-used from the GPU config) can return per-token log-probs in the unified
@@ -124,6 +128,12 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+
+# Mirror the qwen3_5 NPU sentinel: this NPU config reuses
+# qwen3_5_vision_model_forward (Patch.5) but does NOT register the
+# Qwen3_5MoeVisionAttention.forward consumer. False suppresses the host sync
+# and kwarg leak — see qwen3_5_gpu_patch_gen_config.py Patch.5 for rationale.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 
 
 config.override_method(

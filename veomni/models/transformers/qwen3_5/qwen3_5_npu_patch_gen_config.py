@@ -32,7 +32,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DynamicCache,
     apply_mask_to_padding_states,
 )
-from transformers.utils import auto_docstring
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
@@ -67,10 +66,13 @@ config.add_import("veomni.distributed.parallel_state", names=["get_parallel_stat
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq", "gather_outputs", "slice_input_tensor"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
-
-config.add_import("veomni.distributed.sequence_parallel", names=["sp_pad_and_slice"])
+# gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
+# (re-exported by the package __init__), not in .ulysses.
+config.add_import(
+    "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
+)
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
 # from the GPU config) can return per-token log-probs in the unified output
@@ -124,6 +126,13 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+
+# This NPU config reuses qwen3_5_vision_model_forward (Patch.5) from the GPU
+# config but does NOT register the Qwen3_5VisionAttention.forward consumer —
+# NPU vision attention runs the upstream HF body which recomputes max_seqlen
+# itself. Setting the sentinel to False suppresses Patch.5's host sync /
+# kwarg leak into `attention_interface(**kwargs)` on NPU.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 
 
 @config.override_method(
@@ -471,18 +480,13 @@ config.override_method(
 )
 
 
-# Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
-# ``forward`` (re-used from the GPU config) can return per-token log-probs
-# while preserving ``rope_deltas``. Mirrors the GPU config's helper-after.
+# Mirrors the GPU config's helper-after; see qwen3_5_gpu_patch_gen_config.py
+# for why @auto_docstring is intentionally skipped here.
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for Qwen3_5 causal language model outputs extended with per-token log-prob fields.
-    """
-)
 class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
-    r"""
+    """``Qwen3_5CausalLMOutputWithPast`` extended with per-token log-prob fields.
+
     log_probs (`torch.FloatTensor`, *optional*):
         Per-token log probabilities returned by VeOmni's fused loss path.
     entropy (`torch.FloatTensor`, *optional*):

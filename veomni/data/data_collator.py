@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,7 @@ from ..distributed.sequence_parallel import gather_outputs
 from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+from .data_transform import compute_qwen3_5_vision_metadata
 
 
 logger = logging.get_logger(__name__)
@@ -105,6 +106,7 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "pixel_values_videos": DataCollateInfo(0, True, 0, 4),
     "image_mask": DataCollateInfo(-1, False, 0, 1),
     "video_mask": DataCollateInfo(-1, False, 0, 1),
+    "mm_token_type_ids": DataCollateInfo(-1, True, 0, 1),
     "image_grid_hw": DataCollateInfo(0, False, None, None),
     "image_grid_thw": DataCollateInfo(0, False, None, None),
     "video_grid_thw": DataCollateInfo(0, False, None, None),
@@ -177,15 +179,57 @@ class PrecomputePositionIDsCollator(DataCollator):
 
 
 @dataclass
+class VisionMetadataCollator(DataCollator):
+    """Precompute Qwen3.5-VL ViT metadata on the host so the model's vision forward doesn't have to
+    derive it from the GPU ``grid_thw`` tensor (which forces host↔device syncs per forward).
+
+    Runs after :class:`PackingCollator` (so ``image_grid_thw`` / ``video_grid_thw`` are already the
+    micro-batch-wide concatenated CPU tensors) and before :class:`SequenceParallelCollator`. The
+    emitted ``vision_{image,video}_*`` keys are deliberately *not* registered in the collate infos:
+    they carry the full (unsharded) vision sequence, exactly mirroring what ``Qwen3_5VisionModel``
+    derives from the full ``grid_thw`` today — the model still does its own SP padding/slicing on the
+    derived position/rotary embeddings. Only enabled for Qwen3.5-VL (see ``MainCollator``); other
+    models never see these keys.
+
+    See :func:`veomni.data.data_transform.compute_qwen3_5_vision_metadata`.
+    """
+
+    num_grid_per_side: int = None
+    spatial_merge_size: int = None
+
+    def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        for modality, grid_key in (("image", "image_grid_thw"), ("video", "video_grid_thw")):
+            grid_thw = batch.get(grid_key, None)
+            if grid_thw is None or len(grid_thw) == 0:
+                continue
+            metadata = compute_qwen3_5_vision_metadata(
+                grid_thw.tolist(), self.num_grid_per_side, self.spatial_merge_size
+            )
+            for name, value in metadata.items():
+                batch[f"vision_{modality}_{name}"] = value
+        return batch
+
+
+@dataclass
 class PackingCollator(DataCollator):
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
     pad_to_length: int = False
+    pad_seq_to_multiple_of: int = 0
     seq_classification: bool = (
         False  # whether the training task is sequence classification, if true, do not mask boundary labels
     )
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
+        if self.sp_enabled and self.pad_to_length:
+            sp_size = get_parallel_state().sp_size
+            assert self.pad_to_length % sp_size == 0, (
+                f"pad_to_length ({self.pad_to_length}) must be divisible by sp_size ({sp_size}); "
+                "otherwise SequenceParallelCollator constant-pads the trailing arange-padded "
+                "position_ids with zeros, splitting the single trailing pad segment back into "
+                "many length-1 segments and re-introducing the cu_seq_lens shape churn that "
+                "_pad_position_ids_with_arange exists to prevent."
+            )
 
     def pad_feature_to_length(
         self,
@@ -199,28 +243,88 @@ class PackingCollator(DataCollator):
         pad = torch.full(pad_shape, fill_value=pad_value, dtype=feature.dtype, device=feature.device)
         return torch.cat((feature, pad), dim=dim)
 
-    def pad_batch_to_length(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        seq_len = batch["input_ids"].shape[-1]
-        assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
+    def _pad_position_ids_with_arange(self, feature: torch.Tensor, dim: int, pad_size: int) -> torch.Tensor:
+        """Pad position_ids with arange(pad_size) so the pad region collapses to
+        a single segment under add_flash_attention_kwargs_from_position_ids.
 
-        pad_len = self.pad_to_length - seq_len
+        Constant-0 padding made every pad token its own length-1 segment, so
+        cu_seq_lens.shape[0] varied with pad_len; flash_qla's prepare_chunk_offsets
+        kernel keys its JIT cache on next_power_of_2(cu_seqlens.shape[0]-1), which
+        triggered repeated recompiles. With arange the pad region looks like
+        [0, 1, ..., pad_size-1] and only contributes one extra segment.
+        """
+        arange = torch.arange(pad_size, dtype=feature.dtype, device=feature.device)
+        view_shape = [1] * feature.dim()
+        view_shape[dim] = pad_size
+        pad_shape = list(feature.shape)
+        pad_shape[dim] = pad_size
+        pad = arange.view(view_shape).expand(pad_shape).contiguous()
+        return torch.cat((feature, pad), dim=dim)
+
+    def _pad_tail(self, batch: Dict[str, torch.Tensor], pad_len: int) -> Dict[str, torch.Tensor]:
+        """Append a single arange-padded sub-sequence of length ``pad_len`` to every seq-len-major
+        (``pack_dim == -1``) field in ``batch``, and set the ``_tail_pad_len`` side-channel hint.
+
+        Shared body of ``pad_batch_to_length`` (fixed worst-case length) and
+        ``pad_batch_to_multiple_of`` (bucketed length under dyn_bsz). Both modes produce the same
+        kind of tail — a single arange-padded segment whose length is recorded in
+        ``_tail_pad_len`` for downstream consumers (``PostCollator``, ``EnvironMeter``) to strip.
+
+        ``_tail_pad_len`` is always set (even when ``pad_len == 0``) so readers can rely on its
+        presence as part of the contract; ``BaseTrainer.forward_backward_step`` filters it out of
+        model inputs (see also DPO's ``_NON_MODEL_KEYS``).
+
+        ``position_ids`` is padded with ``arange(pad_len)`` (via ``_pad_position_ids_with_arange``)
+        so the pad region collapses to a single cu_seq_lens segment; every other field uses its
+        registered ``sp_pad_value``. ``labels`` ends up filled with ``IGNORE_INDEX`` and
+        ``attention_mask`` with ``1`` (kept all-ones so the linear-attention mask short-circuit
+        still applies).
+        """
+        batch["_tail_pad_len"] = pad_len
         if pad_len == 0:
             return batch
 
-        keys_to_pad = []
-        for key in self.collate_infos.keys():
-            if self.collate_infos[key].pack_dim == -1:
-                keys_to_pad.append(key)
-
-        for key in keys_to_pad:
-            if key in batch:
+        for key, info in self.collate_infos.items():
+            if info.pack_dim != -1 or key not in batch:
+                continue
+            if key == "position_ids":
+                batch[key] = self._pad_position_ids_with_arange(batch[key], dim=-1, pad_size=pad_len)
+            else:
                 batch[key] = self.pad_feature_to_length(
                     batch[key],
-                    dim=self.collate_infos[key].pack_dim,
-                    pad_value=self.collate_infos[key].sp_pad_value,
+                    dim=-1,
+                    pad_value=info.sp_pad_value,
                     pad_size=pad_len,
                 )
         return batch
+
+    def pad_batch_to_length(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        seq_len = batch["input_ids"].shape[-1]
+        assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
+        return self._pad_tail(batch, pad_len=self.pad_to_length - seq_len)
+
+    def pad_batch_to_multiple_of(self, batch: Dict[str, torch.Tensor], multiple_of: int) -> Dict[str, torch.Tensor]:
+        """Pad the packed micro-batch sequence length up to the next multiple of ``multiple_of``.
+
+        Unlike ``pad_batch_to_length`` (which pads to a fixed worst-case length), this only adds the
+        few tokens needed to reach the next bucket boundary, so the JIT-compiled per-layer kernels
+        (Triton/TileLang gated-delta-rule, Triton MoE group_gemm, flash-attn varlen) see a small,
+        stable set of sequence lengths and stop re-autotuning/re-compiling on every step.
+
+        Tail layout / ``_tail_pad_len`` contract are shared with ``pad_batch_to_length`` — see
+        ``_pad_tail``. The padded length is ``ceil(seq_len / multiple_of) * multiple_of``, i.e. at
+        most ``multiple_of - 1`` extra tokens. ``multiple_of`` is validated (in
+        ``VeOmniArguments.__post_init__``) to be a multiple of ``ulysses_size`` and
+        ``<= micro_batch_size * max_seq_len``; together with the dyn_bsz packer's contract that the
+        packed length stays within ``micro_batch_size * max_seq_len``, the bucketed length stays
+        within that worst-case HBM budget whenever ``multiple_of`` divides it (the
+        ``__post_init__`` warning flags the rare case where it does not).
+        """
+        seq_len = batch["input_ids"].shape[-1]
+        target_len = ((seq_len + multiple_of - 1) // multiple_of) * multiple_of
+        pad_len = target_len - seq_len
+        assert 0 <= pad_len < multiple_of, f"pad_len ({pad_len}) must be in [0, multiple_of={multiple_of})"
+        return self._pad_tail(batch, pad_len=pad_len)
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         batch = defaultdict(list)
@@ -253,6 +357,8 @@ class PackingCollator(DataCollator):
 
         if self.pad_to_length:
             batch = self.pad_batch_to_length(batch)
+        elif self.pad_seq_to_multiple_of and self.pad_seq_to_multiple_of > 1:
+            batch = self.pad_batch_to_multiple_of(batch, self.pad_seq_to_multiple_of)
 
         if not self.sp_enabled:
             add_flash_attention_kwargs_from_position_ids(batch)
@@ -353,7 +459,9 @@ class SequenceParallelCollator(DataCollator):
 class MainCollator(DataCollator):
     data_collate_info: Dict[str, Union[DataCollateInfo, tuple, Dict]] = field(default_factory=lambda: {})
     pad_to_length: bool = False
+    pad_seq_to_multiple_of: int = 0
     seq_classification: bool = False
+    vision_metadata_config: Optional[Dict] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -363,8 +471,15 @@ class MainCollator(DataCollator):
             User config to override the default collate info.
         pad_to_length:
             Whether to pad sequence to a fixed length. Default is False.
+        pad_seq_to_multiple_of:
+            If > 1 (and pad_to_length is disabled), pad the packed micro-batch sequence length up to the
+            next multiple of this value. Bucketing the sequence length avoids JIT-kernel recompiles under
+            dyn_bsz. Default is 0 (off).
         seq_classification:
             If True, sequence classification task. Default is False.
+        vision_metadata_config:
+            If not None, append a :class:`VisionMetadataCollator` (Qwen3.5-VL only) that precomputes
+            ViT metadata on the host. Expected keys: ``num_grid_per_side``, ``spatial_merge_size``.
     """
 
     def __post_init__(self):
@@ -395,9 +510,12 @@ class MainCollator(DataCollator):
             PackingCollator(
                 collate_infos=self.collate_infos,
                 pad_to_length=self.pad_to_length,
+                pad_seq_to_multiple_of=self.pad_seq_to_multiple_of,
                 seq_classification=self.seq_classification,
             )
         )
+        if self.vision_metadata_config is not None:
+            self.preforward_pipeline.append(VisionMetadataCollator(**self.vision_metadata_config))
         if get_parallel_state().sp_enabled:
             self.preforward_pipeline.append(
                 SequenceParallelCollator(collate_infos=self.collate_infos, seq_classification=self.seq_classification)
@@ -450,7 +568,8 @@ class PostCollator(DataCollator):
 @dataclass
 class SeqlensComputePostCollator(DataCollator):
     def __call__(self, micro_batch: Dict[str, torch.Tensor]):
-        seq_lens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        pad_len = int(micro_batch.get("_tail_pad_len", 0))
+        seq_lens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"], pad_len=pad_len).tolist()
         return seq_lens
 
 
