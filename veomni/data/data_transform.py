@@ -415,6 +415,7 @@ def compute_qwen3_5_vision_metadata(
       - ``rot_pos_ids`` ``(N, 2)`` int64 — the (row, col) coords per token (indexes the rotary freq table)
       - ``cu_seqlens`` ``(num_frames + 1,)`` int32 — one varlen segment of length ``h * w`` per frame
       - ``max_hw`` int — ``max(max(h, w))`` over images (size of the rotary freq table needed)
+      - ``max_seg_len`` int — ``max(h * w)`` over frames (max FA varlen segment length, pre-SP-padding)
     where ``N == sum(t * h * w)``.
     """
     m = spatial_merge_size
@@ -425,6 +426,7 @@ def compute_qwen3_5_vision_metadata(
     rot_chunks: List["torch.Tensor"] = []
     cu_seqlens: List[int] = [0]
     max_hw = 0
+    max_seg_len = 0
 
     for t, h, w in grid_thw_list:
         mh, mw = h // m, w // m
@@ -486,6 +488,7 @@ def compute_qwen3_5_vision_metadata(
         for _ in range(t):
             cu_seqlens.append(cu_seqlens[-1] + h * w)
         max_hw = max(max_hw, h, w)
+        max_seg_len = max(max_seg_len, h * w)
 
     return {
         "pos_embed_indices": torch.cat(pos_idx_chunks, dim=0),
@@ -493,6 +496,7 @@ def compute_qwen3_5_vision_metadata(
         "rot_pos_ids": torch.cat(rot_chunks, dim=0),
         "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
         "max_hw": max_hw,
+        "max_seg_len": max_seg_len,
     }
 
 

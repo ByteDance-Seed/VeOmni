@@ -1425,11 +1425,12 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
 
         Keyword Args (optional, passed through `**kwargs`):
             vision_pos_embed_indices / vision_pos_embed_weights / vision_rot_pos_ids / vision_cu_seqlens /
-            vision_max_hw: precomputed-on-host ViT metadata from VeOmni's `VisionMetadataCollator`. When
-                present, the bilinear position-embedding lookup, the rotary position ids and `cu_seqlens`
-                are taken directly instead of being re-derived from the GPU `grid_thw` tensor (each a
-                host-device sync per ViT forward). When absent (e.g. `dummy_forward`, eval / `generate`),
-                the forward falls back to the on-the-fly path below.
+            vision_max_hw / vision_max_seg_len: precomputed-on-host ViT metadata from VeOmni's
+                `VisionMetadataCollator`. When present, the bilinear position-embedding lookup, the rotary
+                position ids, `cu_seqlens`, and the FA `max_seqlen` int hand-off are taken directly instead
+                of being re-derived from the GPU `grid_thw` / `cu_seqlens` tensors (each a host-device sync
+                per ViT forward). When absent (e.g. `dummy_forward`, eval / `generate`), the forward falls
+                back to the on-the-fly path below.
 
         Returns:
             `torch.Tensor`: hidden_states.
@@ -1441,6 +1442,7 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         vision_rot_pos_ids = kwargs.pop("vision_rot_pos_ids", None)
         vision_cu_seqlens = kwargs.pop("vision_cu_seqlens", None)
         vision_max_hw = kwargs.pop("vision_max_hw", None)
+        vision_max_seg_len = kwargs.pop("vision_max_seg_len", None)
         use_precomputed = vision_pos_embed_indices is not None
 
         hidden_states = self.patch_embed(hidden_states)
@@ -1554,8 +1556,21 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         #       `flash_attn_varlen_func` benefits from the int hand-off; eager
         #       and sdpa paths in the consumer pop+discard the kwarg, so the
         #       host sync would be wasted.
+        # In the `use_precomputed` fast path, `vision_max_seg_len` is precomputed on the
+        # host (max h*w across all frames) and the optional Patch.4 SP-pad segment length
+        # is a host int — so the int hand-off is fully sync-free. In the fallback path,
+        # cu_seqlens lives on GPU and we eat one `.item()` per ViT forward (still much
+        # better than per-block).
         if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
-            kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+            if use_precomputed:
+                max_seqlen = vision_max_seg_len
+                if get_parallel_state().sp_enabled:
+                    pad_seq_len = seq_len * get_parallel_state().sp_size - total_seq_len
+                    if pad_seq_len > 0:
+                        max_seqlen = max(max_seqlen, pad_seq_len)
+                kwargs["vision_max_seqlen"] = max_seqlen
+            else:
+                kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
         # --- Patch.5 ---
 
         for blk in self.blocks:
@@ -1996,7 +2011,14 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         # --- Patch.5: Pull the precomputed-on-host ViT metadata (VeOmni's VisionMetadataCollator) out of
         # kwargs and re-key it without the modality prefix, so it reaches the vision tower via
         # get_{image,video}_features and never leaks into the ViT block / language-model kwargs. ---
-        _vision_metadata_names = ("pos_embed_indices", "pos_embed_weights", "rot_pos_ids", "cu_seqlens", "max_hw")
+        _vision_metadata_names = (
+            "pos_embed_indices",
+            "pos_embed_weights",
+            "rot_pos_ids",
+            "cu_seqlens",
+            "max_hw",
+            "max_seg_len",
+        )
         image_vision_kwargs = {
             f"vision_{name}": kwargs.pop(f"vision_image_{name}")
             for name in _vision_metadata_names

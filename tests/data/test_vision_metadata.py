@@ -39,6 +39,7 @@ def _ref_metadata(grid_thw_list, num_grid_per_side, m):
     g = num_grid_per_side
     pos_idx, pos_w, rot, cu = [], [], [], [0]
     max_hw = 0
+    max_seg_len = 0
     for t, h, w in grid_thw_list:
         h_lin = torch.linspace(0, g - 1, h, dtype=torch.float64).tolist()
         w_lin = torch.linspace(0, g - 1, w, dtype=torch.float64).tolist()
@@ -66,12 +67,14 @@ def _ref_metadata(grid_thw_list, num_grid_per_side, m):
             rot.extend(frame_rot)
             cu.append(cu[-1] + h * w)
         max_hw = max(max_hw, h, w)
+        max_seg_len = max(max_seg_len, h * w)
     return {
         "pos_embed_indices": torch.tensor(pos_idx, dtype=torch.long),
         "pos_embed_weights": torch.tensor(pos_w, dtype=torch.float32),
         "rot_pos_ids": torch.tensor(rot, dtype=torch.long),
         "cu_seqlens": torch.tensor(cu, dtype=torch.int32),
         "max_hw": max_hw,
+        "max_seg_len": max_seg_len,
     }
 
 
@@ -89,12 +92,14 @@ def test_compute_vision_metadata_matches_reference(grid_thw_list):
     assert got["rot_pos_ids"].dtype == torch.long
     assert got["cu_seqlens"].dtype == torch.int32
     assert isinstance(got["max_hw"], int)
+    assert isinstance(got["max_seg_len"], int)
 
     assert torch.equal(got["pos_embed_indices"], exp["pos_embed_indices"])
     assert torch.equal(got["rot_pos_ids"], exp["rot_pos_ids"])
     assert torch.equal(got["cu_seqlens"], exp["cu_seqlens"])
     assert torch.allclose(got["pos_embed_weights"], exp["pos_embed_weights"])
     assert got["max_hw"] == exp["max_hw"]
+    assert got["max_seg_len"] == exp["max_seg_len"]
     # bilinear weights sum to 1 per token
     assert torch.allclose(got["pos_embed_weights"].sum(dim=1), torch.ones(n), atol=1e-5)
 
@@ -172,6 +177,8 @@ def test_vision_metadata_collator_via_main_collator(monkeypatch):
     assert out["vision_image_rot_pos_ids"].shape == (n, 2)
     assert out["vision_image_cu_seqlens"].shape == (3,)  # 2 frames -> 3 boundaries
     assert isinstance(out["vision_image_max_hw"], int) and out["vision_image_max_hw"] == 6
+    # max(h*w) over frames: max(4*6=24, 2*2=4) == 24
+    assert isinstance(out["vision_image_max_seg_len"], int) and out["vision_image_max_seg_len"] == 24
     assert "vision_video_pos_embed_indices" not in out  # no video in this batch
 
     exp = compute_qwen3_5_vision_metadata([[1, 4, 6], [1, 2, 2]], NUM_GRID_PER_SIDE, SPATIAL_MERGE_SIZE)

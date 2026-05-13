@@ -777,17 +777,18 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1231,31 +1423,140 @@
+@@ -1231,31 +1423,155 @@
              grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
                  The temporal, height and width of feature shape of each image in LLM.
 
 +        Keyword Args (optional, passed through `**kwargs`):
 +            vision_pos_embed_indices / vision_pos_embed_weights / vision_rot_pos_ids / vision_cu_seqlens /
-+            vision_max_hw: precomputed-on-host ViT metadata from VeOmni's `VisionMetadataCollator`. When
-+                present, the bilinear position-embedding lookup, the rotary position ids and `cu_seqlens`
-+                are taken directly instead of being re-derived from the GPU `grid_thw` tensor (each a
-+                host-device sync per ViT forward). When absent (e.g. `dummy_forward`, eval / `generate`),
-+                the forward falls back to the on-the-fly path below.
++            vision_max_hw / vision_max_seg_len: precomputed-on-host ViT metadata from VeOmni's
++                `VisionMetadataCollator`. When present, the bilinear position-embedding lookup, the rotary
++                position ids, `cu_seqlens`, and the FA `max_seqlen` int hand-off are taken directly instead
++                of being re-derived from the GPU `grid_thw` / `cu_seqlens` tensors (each a host-device sync
++                per ViT forward). When absent (e.g. `dummy_forward`, eval / `generate`), the forward falls
++                back to the on-the-fly path below.
 +
          Returns:
              `torch.Tensor`: hidden_states.
@@ -799,6 +800,7 @@
 +        vision_rot_pos_ids = kwargs.pop("vision_rot_pos_ids", None)
 +        vision_cu_seqlens = kwargs.pop("vision_cu_seqlens", None)
 +        vision_max_hw = kwargs.pop("vision_max_hw", None)
++        vision_max_seg_len = kwargs.pop("vision_max_seg_len", None)
 +        use_precomputed = vision_pos_embed_indices is not None
 +
          hidden_states = self.patch_embed(hidden_states)
@@ -924,13 +926,26 @@
 +        #       `flash_attn_varlen_func` benefits from the int hand-off; eager
 +        #       and sdpa paths in the consumer pop+discard the kwarg, so the
 +        #       host sync would be wasted.
++        # In the `use_precomputed` fast path, `vision_max_seg_len` is precomputed on the
++        # host (max h*w across all frames) and the optional Patch.4 SP-pad segment length
++        # is a host int — so the int hand-off is fully sync-free. In the fallback path,
++        # cu_seqlens lives on GPU and we eat one `.item()` per ViT forward (still much
++        # better than per-block).
 +        if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
-+            kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
++            if use_precomputed:
++                max_seqlen = vision_max_seg_len
++                if get_parallel_state().sp_enabled:
++                    pad_seq_len = seq_len * get_parallel_state().sp_size - total_seq_len
++                    if pad_seq_len > 0:
++                        max_seqlen = max(max_seqlen, pad_seq_len)
++                kwargs["vision_max_seqlen"] = max_seqlen
++            else:
++                kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
 +        # --- Patch.5 ---
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -1271,6 +1572,34 @@
+@@ -1271,6 +1587,34 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -965,7 +980,7 @@
 
 
  @dataclass
-@@ -1396,6 +1725,12 @@
+@@ -1396,6 +1740,12 @@
          if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
              linear_attn_mask = None
          return linear_attn_mask
@@ -978,7 +993,7 @@
 
 
  @auto_docstring
-@@ -1531,67 +1866,39 @@
+@@ -1531,67 +1881,39 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
@@ -1069,7 +1084,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1644,6 +1951,7 @@
+@@ -1644,6 +1966,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1077,7 +1092,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5ModelOutputWithPast:
-@@ -1652,6 +1960,8 @@
+@@ -1652,6 +1975,8 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1086,7 +1101,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1659,27 +1969,143 @@
+@@ -1659,27 +1984,150 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1117,7 +1132,14 @@
 +        # --- Patch.5: Pull the precomputed-on-host ViT metadata (VeOmni's VisionMetadataCollator) out of
 +        # kwargs and re-key it without the modality prefix, so it reaches the vision tower via
 +        # get_{image,video}_features and never leaks into the ViT block / language-model kwargs. ---
-+        _vision_metadata_names = ("pos_embed_indices", "pos_embed_weights", "rot_pos_ids", "cu_seqlens", "max_hw")
++        _vision_metadata_names = (
++            "pos_embed_indices",
++            "pos_embed_weights",
++            "rot_pos_ids",
++            "cu_seqlens",
++            "max_hw",
++            "max_seg_len",
++        )
 +        image_vision_kwargs = {
 +            f"vision_{name}": kwargs.pop(f"vision_image_{name}")
 +            for name in _vision_metadata_names
@@ -1240,7 +1262,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1689,7 +2115,20 @@
+@@ -1689,7 +2137,20 @@
                  inputs_embeds=inputs_embeds,
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
@@ -1261,7 +1283,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1705,6 +2144,12 @@
+@@ -1705,6 +2166,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1274,7 +1296,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2220,36 @@
+@@ -1775,15 +2242,36 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1315,7 +1337,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2283,33 @@
+@@ -1817,6 +2305,33 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1349,7 +1371,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1887,54 +2380,7 @@
+@@ -1887,54 +2402,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1405,7 +1427,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,22 +2396,42 @@
+@@ -1950,22 +2418,42 @@
          )
 
          hidden_states = outputs[0]
@@ -1453,7 +1475,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2192,6 +2658,13 @@
+@@ -2192,6 +2680,13 @@
 
          return input_ids, model_kwargs
 

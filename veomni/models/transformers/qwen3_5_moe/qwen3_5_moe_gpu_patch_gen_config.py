@@ -332,7 +332,14 @@ def qwen3_5_moe_model_forward_patched(
     # --- Patch.5: Pull the precomputed-on-host ViT metadata (VeOmni's VisionMetadataCollator) out of
     # kwargs and re-key it without the modality prefix, so it reaches the vision tower via
     # get_{image,video}_features and never leaks into the ViT block / language-model kwargs. ---
-    _vision_metadata_names = ("pos_embed_indices", "pos_embed_weights", "rot_pos_ids", "cu_seqlens", "max_hw")
+    _vision_metadata_names = (
+        "pos_embed_indices",
+        "pos_embed_weights",
+        "rot_pos_ids",
+        "cu_seqlens",
+        "max_hw",
+        "max_seg_len",
+    )
     image_vision_kwargs = {
         f"vision_{name}": kwargs.pop(f"vision_image_{name}")
         for name in _vision_metadata_names
