@@ -137,9 +137,9 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
-      - name: Sync dependencies
+      - name: Sync dependencies [transformers-v4-legacy]
         run: |
-          uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
+          uv sync --frozen --python 3.11 --no-group transformers-stable --extra transformers-v4-legacy --extra npu --extra audio --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -174,19 +174,18 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
-      - name: Sync dependencies [transformers-v5]
+      - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
-      - name: Run models tests [transformers-v5]
+          uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
+      - name: Run models tests
         run: |
           uv run  --frozen pytest -v -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
-      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
+      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
-      - name: Run utils tests [transformers-v5]
+      - name: Run utils tests
         run: |
-          # Need v5 to support newer models like Qwen3.5 count flops tests.
-          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -v -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py

@@ -87,5 +87,5 @@ After `import veomni`:
   The bare `flash_attention_4` name still requires Transformers v5; for Transformers v4,
   use `attn_implementation="veomni_flash_attention_4_with_sp"`.
 - FA4 requires the `flash-attn-cute` package (`flash_attn.cute`). To install FA4:
-  - **Transformers v5**: `uv sync --extra gpu --extra fa4 --extra transformers5-exp --no-group transformers-stable`
-  - **Transformers v4**: `uv sync --extra gpu --extra fa4`
+  - **Transformers v5 (default)**: `uv sync --extra gpu --extra fa4`
+  - **Transformers v4 (legacy)**: `uv sync --no-group transformers-stable --extra transformers-v4-legacy --extra gpu --extra fa4`

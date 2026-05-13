@@ -18,11 +18,11 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 
-4. **Transformers version: dual-track (v4.57.3 / v5.2.0), new development targets v5**
-   - VeOmni currently supports two transformers versions via uv conflicts:
-     - **Default**: `transformers==4.57.3` (dependency group `transformers-stable`, active by default)
-     - **Experimental**: `transformers==5.2.0` (optional extra `transformers5-exp`)
-   - Switch: `uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev`
+4. **Transformers version: dual-track (v5.2.0 default / v4.57.3 legacy), new development targets v5**
+   - VeOmni supports two transformers versions via uv conflicts:
+     - **Default**: `transformers==5.2.0` (dependency group `transformers-stable`, active by default)
+     - **Legacy (sunset)**: `transformers==4.57.3` (optional extra `transformers-v4-legacy`)
+   - Switch to legacy: `uv sync --no-group transformers-stable --extra transformers-v4-legacy --extra gpu --dev`
    - **All new code must target v5 APIs.** v4 compatibility code exists but will be removed.
    - Version branching uses `is_transformers_version_greater_or_equal_to()` from `veomni/utils/import_utils.py`.
    - Key v4→v5 API changes:

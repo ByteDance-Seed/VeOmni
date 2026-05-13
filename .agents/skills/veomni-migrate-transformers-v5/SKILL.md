@@ -57,10 +57,10 @@ source .venv/bin/activate
 python -c "import transformers; print(transformers.__version__)"
 ```
 
-If not `5.2.0`, switch envs:
+If not `5.2.0`, re-sync the default env (v5 is the project default):
 
 ```bash
-uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
+uv sync --frozen --extra gpu --extra audio --group dev
 source .venv/bin/activate
 ```
 
@@ -675,8 +675,8 @@ Activate venv with the v5 extra:
 
 ```bash
 source .venv/bin/activate
-# If not already synced with v5:
-# uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --dev
+# If not already synced (v5 is the default):
+# uv sync --extra gpu --extra audio --dev
 ```
 
 Run (v5 presence is auto-detected by the test suite):
@@ -936,6 +936,6 @@ This skill migrates an **existing** model directory to v5. For:
 - New model (does not yet exist under `veomni/models/transformers/`): use
   `/veomni-new-model`.
 - New op / kernel: use `/veomni-new-op`.
-- uv / dependency bumps (e.g. upgrading to a new `transformers5-exp` version):
-  use `/veomni-uv-update`.
+- uv / dependency bumps (e.g. upgrading the `transformers-stable` pin or the
+  `transformers-v4-legacy` pin): use `/veomni-uv-update`.
 - Bugs uncovered during migration: use `/veomni-debug`.
