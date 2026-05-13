@@ -261,42 +261,47 @@ class PackingCollator(DataCollator):
         pad = arange.view(view_shape).expand(pad_shape).contiguous()
         return torch.cat((feature, pad), dim=dim)
 
-    def pad_batch_to_length(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        seq_len = batch["input_ids"].shape[-1]
-        assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
+    def _pad_tail(self, batch: Dict[str, torch.Tensor], pad_len: int) -> Dict[str, torch.Tensor]:
+        """Append a single arange-padded sub-sequence of length ``pad_len`` to every seq-len-major
+        (``pack_dim == -1``) field in ``batch``, and set the ``_tail_pad_len`` side-channel hint.
 
-        pad_len = self.pad_to_length - seq_len
-        # Side-channel hint for downstream seqlen consumers (PostCollator,
-        # EnvironMeter): the trailing arange-padded segment of cu_seq_lens has
-        # length `pad_len` and must be stripped from "real" seqlens. Always
-        # set when pad_to_length is enabled (even at 0) so readers can rely on
-        # its presence as part of the contract; stripped from model inputs in
-        # BaseTrainer.forward_backward_step and DPO's _NON_MODEL_KEYS filter.
+        Shared body of ``pad_batch_to_length`` (fixed worst-case length) and
+        ``pad_batch_to_multiple_of`` (bucketed length under dyn_bsz). Both modes produce the same
+        kind of tail — a single arange-padded segment whose length is recorded in
+        ``_tail_pad_len`` for downstream consumers (``PostCollator``, ``EnvironMeter``) to strip.
+
+        ``_tail_pad_len`` is always set (even when ``pad_len == 0``) so readers can rely on its
+        presence as part of the contract; ``BaseTrainer.forward_backward_step`` filters it out of
+        model inputs (see also DPO's ``_NON_MODEL_KEYS``).
+
+        ``position_ids`` is padded with ``arange(pad_len)`` (via ``_pad_position_ids_with_arange``)
+        so the pad region collapses to a single cu_seq_lens segment; every other field uses its
+        registered ``sp_pad_value``. ``labels`` ends up filled with ``IGNORE_INDEX`` and
+        ``attention_mask`` with ``1`` (kept all-ones so the linear-attention mask short-circuit
+        still applies).
+        """
         batch["_tail_pad_len"] = pad_len
         if pad_len == 0:
             return batch
 
-        keys_to_pad = []
-        for key in self.collate_infos.keys():
-            if self.collate_infos[key].pack_dim == -1:
-                keys_to_pad.append(key)
-
-        for key in keys_to_pad:
-            if key in batch:
-                if key == "position_ids":
-                    batch[key] = self._pad_position_ids_with_arange(
-                        batch[key],
-                        dim=self.collate_infos[key].pack_dim,
-                        pad_size=pad_len,
-                    )
-                else:
-                    batch[key] = self.pad_feature_to_length(
-                        batch[key],
-                        dim=self.collate_infos[key].pack_dim,
-                        pad_value=self.collate_infos[key].sp_pad_value,
-                        pad_size=pad_len,
-                    )
+        for key, info in self.collate_infos.items():
+            if info.pack_dim != -1 or key not in batch:
+                continue
+            if key == "position_ids":
+                batch[key] = self._pad_position_ids_with_arange(batch[key], dim=-1, pad_size=pad_len)
+            else:
+                batch[key] = self.pad_feature_to_length(
+                    batch[key],
+                    dim=-1,
+                    pad_value=info.sp_pad_value,
+                    pad_size=pad_len,
+                )
         return batch
+
+    def pad_batch_to_length(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        seq_len = batch["input_ids"].shape[-1]
+        assert seq_len <= self.pad_to_length, "pad_to_length must be >= packed sequence length."
+        return self._pad_tail(batch, pad_len=self.pad_to_length - seq_len)
 
     def pad_batch_to_multiple_of(self, batch: Dict[str, torch.Tensor], multiple_of: int) -> Dict[str, torch.Tensor]:
         """Pad the packed micro-batch sequence length up to the next multiple of ``multiple_of``.
@@ -306,45 +311,20 @@ class PackingCollator(DataCollator):
         (Triton/TileLang gated-delta-rule, Triton MoE group_gemm, flash-attn varlen) see a small,
         stable set of sequence lengths and stop re-autotuning/re-compiling on every step.
 
-        The padding region is treated as ONE self-contained sub-sequence: ``input_ids -> 0``,
-        ``labels -> IGNORE_INDEX`` (so it never affects the loss), ``attention_mask -> 1`` (kept
-        all-ones so the linear-attention mask short-circuit still applies), ``image_mask/video_mask
-        -> 0``, and ``position_ids`` restart at 0 (via ``_pad_position_ids_with_arange``) so the
-        cu_seqlens derived from position_ids gain exactly one extra segment and the block-diagonal
-        attention isolates the padding from the real tokens. ``_tail_pad_len`` is also set so that
-        downstream seqlen consumers (``PostCollator``, ``EnvironMeter``) strip the pad segment from
-        their per-sample length lists -- the same contract ``pad_batch_to_length`` follows.
-
-        The padded length is ``ceil(seq_len / multiple_of) * multiple_of``, i.e. at most
-        ``multiple_of - 1`` extra tokens. ``multiple_of`` is validated (in ``VeOmniArguments.__post_init__``)
-        to be a multiple of ``ulysses_size`` and ``<= micro_batch_size * max_seq_len``; together with the
-        dyn_bsz packer's contract that the packed length stays within ``micro_batch_size * max_seq_len``,
-        the bucketed length stays within that worst-case HBM budget whenever ``multiple_of`` divides it
-        (the ``__post_init__`` warning flags the rare case where it does not).
+        Tail layout / ``_tail_pad_len`` contract are shared with ``pad_batch_to_length`` — see
+        ``_pad_tail``. The padded length is ``ceil(seq_len / multiple_of) * multiple_of``, i.e. at
+        most ``multiple_of - 1`` extra tokens. ``multiple_of`` is validated (in
+        ``VeOmniArguments.__post_init__``) to be a multiple of ``ulysses_size`` and
+        ``<= micro_batch_size * max_seq_len``; together with the dyn_bsz packer's contract that the
+        packed length stays within ``micro_batch_size * max_seq_len``, the bucketed length stays
+        within that worst-case HBM budget whenever ``multiple_of`` divides it (the
+        ``__post_init__`` warning flags the rare case where it does not).
         """
         seq_len = batch["input_ids"].shape[-1]
         target_len = ((seq_len + multiple_of - 1) // multiple_of) * multiple_of
         pad_len = target_len - seq_len
         assert 0 <= pad_len < multiple_of, f"pad_len ({pad_len}) must be in [0, multiple_of={multiple_of})"
-        # Side-channel hint for PostCollator / EnvironMeter — same contract as pad_batch_to_length.
-        # Always set (even when 0) so readers can rely on its presence.
-        batch["_tail_pad_len"] = pad_len
-        if pad_len == 0:
-            return batch
-
-        for key in self.collate_infos.keys():
-            if self.collate_infos[key].pack_dim != -1 or key not in batch:
-                continue
-            if key == "position_ids":
-                batch[key] = self._pad_position_ids_with_arange(batch[key], dim=-1, pad_size=pad_len)
-            else:
-                batch[key] = self.pad_feature_to_length(
-                    batch[key],
-                    dim=-1,
-                    pad_value=self.collate_infos[key].sp_pad_value,
-                    pad_size=pad_len,
-                )
-        return batch
+        return self._pad_tail(batch, pad_len=pad_len)
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         batch = defaultdict(list)
