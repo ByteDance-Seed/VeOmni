@@ -27,6 +27,9 @@ Features:
 """
 
 import json
+import os
+import threading
+import time
 import warnings
 from abc import ABC
 from collections import defaultdict
@@ -89,6 +92,14 @@ logger = logging.get_logger(__name__)
 # PostCollator/SeqlensCompute) and must not be forwarded to the HF model, which
 # would reject them as unknown kwargs.
 _NON_MODEL_KEYS = {"_tail_pad_len"}
+
+# Grace period (seconds) for Python interpreter shutdown after the trainer
+# finishes. See ``BaseTrainer.arm_exit_watchdog`` for why this exists. Sized
+# to comfortably cover the slowest legitimate teardown (wandb final upload of
+# a large run + dataloader worker shutdown + stdio flush) on the configs
+# trained here today; tune via the method's ``timeout_s`` arg if you need
+# longer for an unusually large artifact / checkpoint upload.
+_EXIT_WATCHDOG_TIMEOUT_S = 180
 
 
 class BaseTrainer(Stateful, ABC):
@@ -605,6 +616,52 @@ class BaseTrainer(Stateful, ABC):
         dist.barrier()
         dist.destroy_process_group()
 
+    def arm_exit_watchdog(self, timeout_s: int = _EXIT_WATCHDOG_TIMEOUT_S) -> None:
+        """Bound the time Python's interpreter shutdown is allowed to take.
+
+        After ``train()`` returns, the normal exit path runs ``atexit`` handlers
+        (wandb finalize, multiprocessing manager shutdown, stdio flush, file
+        descriptor close). With ``data.dataloader.type=streaming`` (mosaicml-
+        streaming via veomni_patch), each dataloader worker registers a
+        ``Checkpointer`` background thread that talks to a
+        ``multiprocessing.SyncManager`` subprocess for cross-worker state. On
+        some configurations (most consistently num_workers=2 in this codebase)
+        ``BaseManager.shutdown()`` can block in ``socket.recv`` against a
+        dead/unresponsive manager subprocess for tens of minutes -- well past
+        any reasonable trial grace period, so the trial framework eventually
+        ``SIGTERM``s the run and a DONE outcome is recorded as STOPPED.
+
+        Spawn a daemon thread that ``os._exit(0)``s the process after the
+        grace period. If interpreter shutdown completes within ``timeout_s``
+        the process is already gone and the daemon thread dies with it
+        (clean DONE); if shutdown deadlocks, the watchdog fires and exits
+        with success (DONE not STOPPED).
+
+        Calling this is safe only after ``destroy_distributed()`` -- the
+        process group must already be destroyed since ``os._exit`` skips
+        further cleanup.
+
+        Caveats:
+        - Success-path only: ``train()`` calls this as its last statement, so
+          an exception earlier in ``train()`` leaves the process unprotected
+          and the streaming-dataloader hang can still occur on failed runs.
+        - The watchdog exits 0 unconditionally. If atexit raises an actual
+          error (e.g. a wandb upload failure mid-flush) the watchdog will
+          mask it as success rather than propagate a non-zero exit.
+        """
+        logger.info_rank0(f"Arming exit watchdog ({timeout_s}s grace period for interpreter shutdown)")
+
+        def _watchdog() -> None:
+            time.sleep(timeout_s)
+            logger.warning(
+                f"Exit watchdog fired after {timeout_s}s -- Python interpreter "
+                "shutdown did not complete (likely a mosaicml-streaming SyncManager "
+                "deadlock); force-exiting with success."
+            )
+            os._exit(0)
+
+        threading.Thread(target=_watchdog, name="veomni_exit_watchdog", daemon=True).start()
+
     def train(self):
         args: VeOmniArguments = self.args
         self.on_train_begin()
@@ -644,3 +701,12 @@ class BaseTrainer(Stateful, ABC):
         synchronize()
 
         self.destroy_distributed()
+
+        # Cap Python interpreter shutdown at a bounded grace period (see
+        # ``arm_exit_watchdog``). Normal cleanup (wandb finalize, stdio
+        # flush, dataloader teardown) gets to run; if it deadlocks (seen on
+        # mosaicml-streaming + num_workers=2 paths where
+        # ``BaseManager.shutdown()`` waits forever on a dead manager
+        # subprocess), the watchdog force-exits with success so the trial
+        # records DONE rather than getting SIGTERMed after ~30min (STOPPED).
+        self.arm_exit_watchdog()
