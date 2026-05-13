@@ -637,10 +637,49 @@ class LoraIndependentExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # Round 1 ships eager only. Round 2 will add a fused dispatch branch
-        # mirroring LoraSharedExperts.forward (gated on
-        # ``_fused_lora_moe_forward`` pointer + EP-off).
+        # Mirrors LoraSharedExperts.forward: enable the fused path when (a)
+        # the active ``moe_implementation`` bound a Mode 1 LoRA-aware kernel
+        # (currently only 'fused_triton'; Quack/NPU leave the pointer as
+        # ``None`` so we transparently fall back), and (b) we are not under
+        # expert parallelism (EP support comes in Phase 5).
+        from ..distributed.parallel_state import get_parallel_state
+        from ..ops.kernels import moe as _moe_ops
+
+        use_fused = _moe_ops._fused_independent_lora_moe_forward is not None and not get_parallel_state().ep_enabled
+        if use_fused:
+            return self._fused_forward(
+                _moe_ops._fused_independent_lora_moe_forward, hidden_states, top_k_index, top_k_weights
+            )
         return self._eager_forward(hidden_states, top_k_index, top_k_weights)
+
+    def _fused_forward(
+        self,
+        fused_kernel,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch into the bound fused independent-LoRA MoE kernel.
+
+        ``fused_kernel`` is the kernel pointer captured by ``forward`` so we
+        don't re-read the module attribute twice (cheap optimisation, also
+        keeps this method side-effect free for testing).
+        """
+        base = self.base_layer
+        return fused_kernel(
+            num_experts=base.num_experts,
+            routing_weights=top_k_weights.to(hidden_states.dtype),
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            fc1_1_2_weight=base.gate_up_proj,
+            fc2_weight=base.down_proj,
+            lora_a_gate_up=self.get_lora_A_weight("gate_up_proj"),
+            lora_b_gate_up=self.get_lora_B_weight("gate_up_proj"),
+            lora_a_down=self.get_lora_A_weight("down_proj"),
+            lora_b_down=self.get_lora_B_weight("down_proj"),
+            lora_scale_gate_up=self._lora_scale_value,
+            lora_scale_down=self._lora_scale_value,
+        )
 
     def _eager_forward(
         self,

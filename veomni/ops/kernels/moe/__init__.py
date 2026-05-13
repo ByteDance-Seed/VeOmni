@@ -25,12 +25,18 @@ from ....utils.import_utils import (
 logger = logging.get_logger(__name__)
 
 _fused_moe_forward = None
-# Sibling pointer for the LoRA-aware fused MoE path. ``None`` means "no
+# Sibling pointers for the LoRA-aware fused MoE paths. ``None`` means "no
 # fused-LoRA kernel bound for the active ``moe_implementation``" — in that
-# case the LoRA wrapper (``veomni.utils.moe_lora.LoraSharedExperts``) keeps
-# using its eager forward. Currently bound only for ``fused_triton``; the
-# Quack and NPU backends leave this as ``None`` and the eager fallback runs.
+# case the LoRA wrappers in ``veomni.utils.moe_lora`` keep using their
+# eager forwards. Both are currently bound only for ``fused_triton``; the
+# Quack and NPU backends leave them as ``None`` and the eager fallback runs.
+#
+# * ``_fused_lora_moe_forward`` — Mode 2 (shared LoRA across experts), used
+#   by ``LoraSharedExperts``.
+# * ``_fused_independent_lora_moe_forward`` — Mode 1 (independent per-expert
+#   LoRA), used by ``LoraIndependentExperts``.
 _fused_lora_moe_forward = None
+_fused_independent_lora_moe_forward = None
 
 
 def fused_moe_forward(
@@ -121,6 +127,63 @@ def fused_lora_moe_forward(
     )
 
 
+def fused_independent_lora_moe_forward(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    lora_a_gate_up: torch.Tensor,
+    lora_b_gate_up: torch.Tensor,
+    lora_a_down: torch.Tensor,
+    lora_b_down: torch.Tensor,
+    lora_scale_gate_up: float,
+    lora_scale_down: float,
+):
+    """Public dispatcher for the fused MoE forward + independent per-expert MoE-LoRA (Mode 1).
+
+    Same shape contract as :func:`fused_lora_moe_forward` except every LoRA
+    tensor carries a leading expert dim (``[E, r, ...]`` / ``[E, ..., r]``).
+    See
+    :func:`veomni.ops.kernels.moe.lora_group_gemm.group_gemm_fused_independent_lora_moe_forward`.
+
+    Raises ``NotImplementedError`` if no LoRA-aware fused kernel is bound for
+    the active ``moe_implementation`` — callers (see
+    :class:`veomni.utils.moe_lora.LoraIndependentExperts`) are expected to
+    check this module's ``_fused_independent_lora_moe_forward`` is non-``None``
+    before calling.
+    """
+    if _fused_independent_lora_moe_forward is None:
+        raise NotImplementedError(
+            "No fused independent MoE-LoRA kernel is bound. Set ops_implementation.moe_implementation "
+            "to a backend that ships a LoRA variant (currently 'fused_triton') or fall back "
+            "to the eager LoRA forward."
+        )
+
+    assert routing_weights.dtype in [torch.bfloat16, torch.float16], (
+        f"routing_weights dtype must be bfloat16 or float16 for fused MoE kernel, but got {routing_weights.dtype}"
+    )
+    assert hidden_states.dtype in [torch.bfloat16, torch.float16], (
+        f"hidden_states dtype must be bfloat16 or float16 for fused MoE kernel, but got {hidden_states.dtype}"
+    )
+
+    return _fused_independent_lora_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hidden_states,
+        fc1_1_2_weight=fc1_1_2_weight,
+        fc2_weight=fc2_weight,
+        lora_a_gate_up=lora_a_gate_up,
+        lora_b_gate_up=lora_b_gate_up,
+        lora_a_down=lora_a_down,
+        lora_b_down=lora_b_down,
+        lora_scale_gate_up=lora_scale_gate_up,
+        lora_scale_down=lora_scale_down,
+    )
+
+
 def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
     """Bind the global ``_fused_moe_forward`` function pointer.
 
@@ -138,7 +201,7 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
             below. Unknown names that reach the OSS dispatch raise
             ``ValueError``.
     """
-    global _fused_moe_forward, _fused_lora_moe_forward
+    global _fused_moe_forward, _fused_lora_moe_forward, _fused_independent_lora_moe_forward
     if fused_moe_kernel == "npu":
         if not is_torch_npu_available():
             raise RuntimeError(
@@ -149,6 +212,7 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
         _fused_moe_forward = npu_fused_moe_forward
         # NPU has no LoRA-aware fused kernel yet → wrapper falls back to eager.
         _fused_lora_moe_forward = None
+        _fused_independent_lora_moe_forward = None
     elif fused_moe_kernel == "quack":
         if is_torch_npu_available():
             raise RuntimeError("fused_moe_kernel='quack' is GPU-only. Use 'npu' on NPU devices.")
@@ -162,16 +226,21 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
         _fused_moe_forward = quack_gemm_fused_moe_forward
         # Quack has no LoRA-aware fused kernel yet → wrapper falls back to eager.
         _fused_lora_moe_forward = None
+        _fused_independent_lora_moe_forward = None
     elif fused_moe_kernel == "triton":
         if is_torch_npu_available():
             raise RuntimeError("fused_moe_kernel='triton' is GPU-only. Use 'npu' on NPU devices.")
         if not is_fused_moe_available():
             raise RuntimeError("fused_moe_kernel='triton' requires triton to be installed and a supported GPU.")
         from .group_gemm import group_gemm_fused_moe_forward
-        from .lora_group_gemm import group_gemm_fused_lora_moe_forward
+        from .lora_group_gemm import (
+            group_gemm_fused_independent_lora_moe_forward,
+            group_gemm_fused_lora_moe_forward,
+        )
 
         _fused_moe_forward = group_gemm_fused_moe_forward
         _fused_lora_moe_forward = group_gemm_fused_lora_moe_forward
+        _fused_independent_lora_moe_forward = group_gemm_fused_independent_lora_moe_forward
     else:
         raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
 

@@ -11,41 +11,47 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Triton fused MoE forward with shared MoE-LoRA (Mode 2), non-EP.
+"""Triton fused MoE forward with MoE-LoRA, non-EP.
 
-Numerics: identical to the eager wrapper at
-``veomni.utils.moe_lora.LoraSharedExperts._eager_forward`` modulo
-fused/grouped-gemm rounding. The single ``autograd.Function`` mirrors
-the layout of the non-LoRA ``MergedFc1TritonFusedMoeExpertFunction``:
+Two ``autograd.Function`` classes — one per LoRA mode — both backed by the
+same ``group_gemm_same_nk`` / ``group_gemm_same_mn`` triton primitives as
+the non-LoRA ``MergedFc1TritonFusedMoeExpertFunction``. Both target the
+fused experts layout (single ``[E, 2I, H]`` fc1 + ``[E, H, I]`` fc2).
 
-* ``MergedFc1TritonFusedLoRAMoeExpertFunction`` — fused experts layout
-  (single ``[E, 2I, H]`` fc1 weight, single fused gate+up LoRA pair).
-  LoRA delta is added to ``fc1_output`` before chunk/silu, and to
-  ``fc2_output``.
+* :class:`MergedFc1TritonFusedLoRAMoeExpertFunction` — **Mode 2** (shared
+  LoRA). One 2-D LoRA pair broadcast across all experts of a layer, so
+  the LoRA matmuls are plain :func:`torch.nn.functional.linear` with no
+  per-expert dispatch.
+* :class:`MergedFc1IndependentTritonFusedLoRAMoeExpertFunction` — **Mode 1**
+  (independent per-expert LoRA, the trainer default). 3-D LoRA tensors with
+  a leading expert dim, so every LoRA matmul is itself a grouped-gemm using
+  the same ``cumsum_M``/``max_M`` boundaries as the base ``fc1``/``fc2``.
 
-LoRA delta math:
+LoRA delta math (both modes):
 
-* fc1: ``Δfc1 = (S @ A.T) @ B.T * scale``, where ``S`` is the scattered
-  hidden state (one row per (token, top-k slot)). The LoRA pair is shared
-  across experts but evaluated per scattered row — equivalent to evaluating
-  it once on ``hidden_states`` and indexing by ``scatter_index``.
-* fc2: ``Δfc2 = (W @ A_dn.T) @ B_dn.T * scale_dn``, where
-  ``W = fc1_weighted_output`` (i.e. ``mid * routing_weight``). Both base
-  ``down`` and the LoRA delta are linear in ``mid``, so applying the routing
-  weight before fc2 is equivalent to weighting the per-expert output
-  afterwards (matches eager).
+* fc1: ``Δfc1_e = (S_e @ A_gu_e.T) @ B_gu_e.T * scale_gu``, where ``S_e``
+  is the scattered hidden state for tokens routed to expert ``e``.
+* fc2: ``Δfc2_e = (W_e @ A_dn_e.T) @ B_dn_e.T * scale_dn``, where
+  ``W_e = fc1_weighted_output_e`` (``mid_e * routing_weight_e``). Both
+  base ``down`` and the LoRA delta are linear in ``mid``, so applying the
+  routing weight before fc2 is equivalent to weighting the per-expert
+  output afterwards (matches the eager wrapper).
 
-Backward is hand-derived (the underlying ``group_gemm_same_nk`` /
-``group_gemm_same_mn`` are leaf triton calls with no autograd integration).
-The LoRA parameters get closed-form gradients; the base activations
-accumulate the LoRA contribution into ``grad_scatter_output`` /
-``grad_fc1_weighted_output`` so the chain through the existing base
-backward stays unchanged.
+For Mode 2 the per-expert ``A``/``B`` collapses to a single shared pair, so
+the chain reduces to two ``F.linear`` calls; for Mode 1 each step is a
+grouped-gemm. The right-hand factorisation (``A`` then ``B``) avoids
+materialising the ``[E, 2I, H]`` / ``[E, H, I]`` deltas — the same memory
+trick the eager wrapper uses (see
+``veomni.utils.moe_lora.LoraSharedExperts._eager_forward`` and
+``LoraIndependentExperts._eager_forward``).
 
-Phase 4 scope:
-    * Mode 2 LoRA only: a single 2-D ``A``/``B`` pair per target parameter,
-      shared across experts. Per-expert (Mode 1) LoRA needs leading
-      ``num_experts`` dims and is left to a future iteration.
+Backward is hand-derived (the underlying triton primitives are leaf calls
+with no autograd integration). The LoRA parameters get closed-form
+gradients; the base activations accumulate the LoRA contribution into
+``grad_scatter_output`` / ``grad_fc1_weighted_output`` so the chain
+through the existing base backward stays unchanged.
+
+Scope:
     * Non-EP only. EP support comes in Phase 5 via the
       ``EPMergedFc1GroupGemm``-equivalent path.
 """
@@ -306,6 +312,370 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         )
 
 
+class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
+    """Fused MoE forward + independent per-expert MoE-LoRA (Mode 1), fused experts layout, non-EP.
+
+    Differs from :class:`MergedFc1TritonFusedLoRAMoeExpertFunction` only in
+    that the LoRA tensors carry a leading expert dim, so each ``A``/``B``
+    matmul is itself a grouped-gemm using the same boundaries
+    (``cumsum_M`` / ``cumsum_K``) as the base ``fc1`` / ``fc2``.
+
+    Inputs (forward):
+        num_experts: ``E``, the global expert count for this layer.
+        gate_weights: ``[B*S, topk]`` routing weights per (token, slot).
+        expert_index: ``[B*S, topk]`` selected expert ids per (token, slot).
+        hidden_states: ``[B, S, H]`` (or ``[N, H]``) input activations.
+        fc1_1_2_weight: ``[E, 2I, H]`` fused gate+up base weight.
+        fc2_weight: ``[E, H, I]`` down base weight.
+        lora_a_gu: ``[E, r, H]``  per-expert LoRA A on fused gate+up.
+        lora_b_gu: ``[E, 2I, r]`` per-expert LoRA B on fused gate+up.
+        lora_a_dn: ``[E, r, I]``  per-expert LoRA A on down.
+        lora_b_dn: ``[E, H, r]``  per-expert LoRA B on down.
+        lora_scale_gu: scaling for the gate+up LoRA delta (``alpha / r``
+            or ``alpha / sqrt(r)`` for rsLoRA).
+        lora_scale_dn: scaling for the down LoRA delta.
+
+    Output:
+        ``[B, S, H]`` (or ``[N, H]``) — same shape as ``hidden_states``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        num_experts,
+        gate_weights,
+        expert_index,
+        hidden_states,
+        fc1_1_2_weight,
+        fc2_weight,
+        lora_a_gu,
+        lora_b_gu,
+        lora_a_dn,
+        lora_b_dn,
+        lora_scale_gu,
+        lora_scale_dn,
+    ):
+        splits = expert_histogram(expert_index, num_experts)
+        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        scatter_output = moe_scatter(hidden_states, scatter_index)  # [T, H]   T = B*S*topk
+        cumsum_t = torch.cumsum(splits, dim=0)
+        max_t = scatter_output.shape[0]
+
+        # Base fc1 (group-gemm): [T, 2I]
+        fc1_output = group_gemm_same_nk(
+            a=scatter_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_a=False,
+            transpose_b=True,
+        )
+
+        # LoRA fc1 delta on gate+up (per-expert).
+        # Per expert e:
+        #   tmp_gu_e = scatter_output_e @ lora_a_gu[e].T              # [n_e, r]
+        #   delta_e  = tmp_gu_e         @ lora_b_gu[e].T * scale_gu   # [n_e, 2I]
+        # Both fold into group_gemm_same_nk with transpose_b=True.
+        tmp_gu = group_gemm_same_nk(
+            a=scatter_output,
+            b=lora_a_gu,  # [E, r, H] → N=r, K=H
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=True,
+        )  # [T, r]
+        lora_delta_gu = group_gemm_same_nk(
+            a=tmp_gu,
+            b=lora_b_gu,  # [E, 2I, r] → N=2I, K=r
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=True,
+        )  # [T, 2I]
+        lora_delta_gu = lora_delta_gu * lora_scale_gu
+        fc1_output = fc1_output + lora_delta_gu
+
+        # Standard fused MoE post-fc1.
+        fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)  # views, no copy
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        fc1_activation = fc1_1_activation * fc1_2_output  # mid in eager terms — [T, I]
+
+        reshaped_gate_weight = gate_weights.reshape(-1, 1)
+        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
+        scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
+
+        fc1_weighted_output = fc1_activation * scattered_gate_weight  # [T, I]
+
+        # Base fc2 (group-gemm): [T, H]
+        fc2_output = group_gemm_same_nk(
+            a=fc1_weighted_output,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_a=False,
+            transpose_b=True,
+        )
+
+        # LoRA fc2 delta on down (per-expert).
+        tmp_dn = group_gemm_same_nk(
+            a=fc1_weighted_output,
+            b=lora_a_dn,  # [E, r, I] → N=r, K=I
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=True,
+        )  # [T, r]
+        lora_delta_dn = group_gemm_same_nk(
+            a=tmp_dn,
+            b=lora_b_dn,  # [E, H, r] → N=H, K=r
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=True,
+        )  # [T, H]
+        lora_delta_dn = lora_delta_dn * lora_scale_dn
+        fc2_output = fc2_output + lora_delta_dn
+
+        expert_output = moe_gather(fc2_output, scatter_index)
+        output = expert_output.reshape(hidden_states.shape)
+
+        ctx.num_experts = num_experts
+        ctx.lora_scale_gu = lora_scale_gu
+        ctx.lora_scale_dn = lora_scale_dn
+        ctx.save_for_backward(
+            gate_weights,
+            fc1_1_2_weight,
+            fc2_weight,
+            hidden_states,
+            scatter_index,
+            scatter_output,
+            cumsum_t,
+            fc1_1_output,
+            fc1_2_output,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+            lora_a_gu,
+            lora_b_gu,
+            lora_a_dn,
+            lora_b_dn,
+            tmp_gu,
+            tmp_dn,
+        )
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            gate_weights,
+            fc1_1_2_weight,
+            fc2_weight,
+            hidden_states,
+            scatter_index,
+            scatter_output,
+            cumsum_t,
+            fc1_1_output,
+            fc1_2_output,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+            lora_a_gu,
+            lora_b_gu,
+            lora_a_dn,
+            lora_b_dn,
+            tmp_gu,
+            tmp_dn,
+        ) = ctx.saved_tensors
+        scale_gu = ctx.lora_scale_gu
+        scale_dn = ctx.lora_scale_dn
+
+        hidden_dim = grad_output.shape[-1]
+        grad_output = grad_output.view(-1, hidden_dim)
+        max_t = grad_output.shape[0]
+
+        # MoE step 10: undo gather → grad on per-(token,slot) fc2 output.
+        grad_fc2_output = moe_scatter(grad_output, scatter_index)  # [T, H]
+
+        # ---- LoRA fc2 backward (per-expert closed form). ----------------
+        # Forward: lora_delta_dn_e = tmp_dn_e @ lora_b_dn[e].T * scale_dn,
+        #          tmp_dn_e        = fc1_weighted_output_e @ lora_a_dn[e].T.
+        # grad_lora_delta_dn = grad_fc2_output (added into fc2_output).
+        # grad_tmp_dn_e = grad_fc2_output_e @ lora_b_dn[e] * scale_dn — N=r, K=H.
+        grad_tmp_dn = group_gemm_same_nk(
+            a=grad_fc2_output,
+            b=lora_b_dn,  # [E, H, r] → K=H, N=r
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=False,
+        )  # [T, r]
+        grad_tmp_dn = grad_tmp_dn * scale_dn
+
+        grad_lora_b_dn = None
+        if lora_b_dn.requires_grad:
+            grad_lora_b_dn = torch.empty_like(lora_b_dn)
+            # grad_lora_b_dn[e] = grad_fc2_output_e.T @ tmp_dn_e * scale_dn — [H, r] per expert.
+            group_gemm_same_mn(
+                a=grad_fc2_output,
+                b=tmp_dn,
+                c=grad_lora_b_dn,
+                cumsum_K=cumsum_t,
+                max_K=max_t,
+                transpose_a=True,
+                transpose_b=False,
+            )
+            grad_lora_b_dn.mul_(scale_dn)
+
+        grad_lora_a_dn = None
+        if lora_a_dn.requires_grad:
+            grad_lora_a_dn = torch.empty_like(lora_a_dn)
+            # grad_lora_a_dn[e] = grad_tmp_dn_e.T @ fc1_weighted_output_e — [r, I] per expert.
+            group_gemm_same_mn(
+                a=grad_tmp_dn,
+                b=fc1_weighted_output,
+                c=grad_lora_a_dn,
+                cumsum_K=cumsum_t,
+                max_K=max_t,
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        # grad_fc1_weighted_output (LoRA branch): grad_tmp_dn_e @ lora_a_dn[e] — N=I, K=r.
+        grad_fc1_weighted_output_lora = group_gemm_same_nk(
+            a=grad_tmp_dn,
+            b=lora_a_dn,  # [E, r, I] → K=r, N=I
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=False,
+        )  # [T, I]
+
+        # MoE step 9 (base) — dgrad of fc2 wrt fc1_weighted_output.
+        grad_fc1_weighted_output = group_gemm_same_nk(
+            a=grad_fc2_output,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=False,
+        )  # [T, I]
+        grad_fc1_weighted_output = grad_fc1_weighted_output + grad_fc1_weighted_output_lora
+
+        # MoE step 9 (base) — wgrad of fc2.
+        grad_fc2_weight = None
+        if fc2_weight.requires_grad:
+            grad_fc2_weight = torch.empty_like(fc2_weight)
+            group_gemm_same_mn(
+                a=grad_fc2_output,
+                b=fc1_weighted_output,
+                c=grad_fc2_weight,
+                cumsum_K=cumsum_t,
+                max_K=max_t,
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        # MoE step 8: split routing-weight scale through fc1_weighted_output = fc1_activation * sgw.
+        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
+        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
+        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
+        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
+
+        # MoE step 7: chain through silu(gate) * up.
+        # Recompute silu output to save memory (matches existing function).
+        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
+        grad_fc1_2_output = fc1_1_activation * grad_fc1_activation
+        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)  # [T, 2I]
+
+        # ---- LoRA fc1 backward (per-expert closed form). ----------------
+        # Forward: lora_delta_gu_e = tmp_gu_e @ lora_b_gu[e].T * scale_gu,
+        #          tmp_gu_e        = scatter_output_e @ lora_a_gu[e].T.
+        # grad_lora_delta_gu = grad_fc1_output (added into fc1_output before chunk).
+        grad_tmp_gu = group_gemm_same_nk(
+            a=grad_fc1_output,
+            b=lora_b_gu,  # [E, 2I, r] → K=2I, N=r
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=False,
+        )  # [T, r]
+        grad_tmp_gu = grad_tmp_gu * scale_gu
+
+        grad_lora_b_gu = None
+        if lora_b_gu.requires_grad:
+            grad_lora_b_gu = torch.empty_like(lora_b_gu)
+            group_gemm_same_mn(
+                a=grad_fc1_output,
+                b=tmp_gu,
+                c=grad_lora_b_gu,
+                cumsum_K=cumsum_t,
+                max_K=max_t,
+                transpose_a=True,
+                transpose_b=False,
+            )
+            grad_lora_b_gu.mul_(scale_gu)
+
+        grad_lora_a_gu = None
+        if lora_a_gu.requires_grad:
+            grad_lora_a_gu = torch.empty_like(lora_a_gu)
+            group_gemm_same_mn(
+                a=grad_tmp_gu,
+                b=scatter_output,
+                c=grad_lora_a_gu,
+                cumsum_K=cumsum_t,
+                max_K=max_t,
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        # grad_scatter_output (LoRA branch): grad_tmp_gu_e @ lora_a_gu[e] — N=H, K=r.
+        grad_scatter_output_lora = group_gemm_same_nk(
+            a=grad_tmp_gu,
+            b=lora_a_gu,  # [E, r, H] → K=r, N=H
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=False,
+        )  # [T, H]
+
+        # MoE step 4 (base) — single dgrad for merged fc1.
+        grad_scatter_output = group_gemm_same_nk(
+            a=grad_fc1_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_t,
+            transpose_b=False,
+        )
+        grad_scatter_output = grad_scatter_output + grad_scatter_output_lora
+
+        # MoE step 4 (base) — single wgrad for merged fc1.
+        grad_fc1_1_2_weight = None
+        if fc1_1_2_weight.requires_grad:
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+            group_gemm_same_mn(
+                a=grad_fc1_output,
+                b=scatter_output,
+                c=grad_fc1_1_2_weight,
+                cumsum_K=cumsum_t,
+                max_K=max_t,
+                transpose_a=True,
+                transpose_b=False,
+            )
+
+        # MoE step 3.
+        grad_hidden_states = moe_gather(grad_scatter_output, scatter_index)
+        grad_hidden_states = grad_hidden_states.reshape(hidden_states.shape)
+
+        return (
+            None,  # num_experts
+            grad_gate_weight,  # gate_weights
+            None,  # expert_index
+            grad_hidden_states,  # hidden_states
+            grad_fc1_1_2_weight,  # fc1_1_2_weight
+            grad_fc2_weight,  # fc2_weight
+            grad_lora_a_gu,  # lora_a_gu
+            grad_lora_b_gu,  # lora_b_gu
+            grad_lora_a_dn,  # lora_a_dn
+            grad_lora_b_dn,  # lora_b_dn
+            None,  # lora_scale_gu
+            None,  # lora_scale_dn
+        )
+
+
 def group_gemm_fused_lora_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -351,6 +721,67 @@ def group_gemm_fused_lora_moe_forward(
             "implemented yet (Phase 5). Disable EP or fall back to eager for now."
         )
     return MergedFc1TritonFusedLoRAMoeExpertFunction.apply(
+        num_experts,
+        routing_weights,
+        selected_experts,
+        hidden_states,
+        fc1_1_2_weight,
+        fc2_weight,
+        lora_a_gate_up,
+        lora_b_gate_up,
+        lora_a_down,
+        lora_b_down,
+        lora_scale_gate_up,
+        lora_scale_down,
+    )
+
+
+def group_gemm_fused_independent_lora_moe_forward(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    lora_a_gate_up: torch.Tensor,
+    lora_b_gate_up: torch.Tensor,
+    lora_a_down: torch.Tensor,
+    lora_b_down: torch.Tensor,
+    lora_scale_gate_up: float,
+    lora_scale_down: float,
+) -> torch.Tensor:
+    """Triton grouped-gemm fused MoE forward with independent per-expert MoE-LoRA (Mode 1).
+
+    Same shape contract as :func:`group_gemm_fused_lora_moe_forward` except
+    that every LoRA tensor carries a leading expert dim:
+
+    Args:
+        num_experts: number of experts ``E`` in this MoE layer.
+        routing_weights: ``[B*S, topk]`` per-(token, slot) routing weights.
+        selected_experts: ``[B*S, topk]`` per-(token, slot) selected expert ids.
+        hidden_states: ``[B, S, H]`` (or ``[N, H]``) input activations.
+        fc1_1_2_weight: ``[E, 2I, H]`` fused gate+up base weight.
+        fc2_weight: ``[E, H, I]`` down base weight.
+        lora_a_gate_up: ``[E, r, H]``  per-expert LoRA A on fused gate+up.
+        lora_b_gate_up: ``[E, 2I, r]`` per-expert LoRA B on fused gate+up.
+        lora_a_down: ``[E, r, I]``  per-expert LoRA A on down.
+        lora_b_down: ``[E, H, r]``  per-expert LoRA B on down.
+        lora_scale_gate_up: scaling for the gate+up LoRA delta.
+        lora_scale_down: scaling for the down LoRA delta.
+
+    Returns:
+        ``[B, S, H]`` (or ``[N, H]``) — same shape as ``hidden_states``.
+
+    Constraints in this phase:
+        * Non-EP only. ``get_parallel_state().ep_enabled`` is checked here and
+          raises ``NotImplementedError``; EP comes in Phase 5.
+    """
+    if get_parallel_state().ep_enabled:
+        raise NotImplementedError(
+            "group_gemm_fused_independent_lora_moe_forward: expert parallelism (EP) support is not "
+            "implemented yet (Phase 5). Disable EP or fall back to eager for now."
+        )
+    return MergedFc1IndependentTritonFusedLoRAMoeExpertFunction.apply(
         num_experts,
         routing_weights,
         selected_experts,
