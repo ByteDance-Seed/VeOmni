@@ -125,9 +125,11 @@ class TrainerTest(BaseTrainer):
         # references), and on multi-mode runs over qwen3_5 we accumulate
         # 5+ GiB per mode, eventually OOM'ing on the embedding tensor for the
         # next model build (manifested as ``Process X has 43.80 GiB``).
+        # ``hasattr`` returns True for class-level descriptors that ``delattr``
+        # can't remove (e.g. inherited properties on BaseTrainer), so use the
+        # instance ``__dict__`` directly.
         for _attr in ("model", "optimizer", "lr_scheduler"):
-            if hasattr(self, _attr):
-                delattr(self, _attr)
+            self.__dict__.pop(_attr, None)
         _release_device_memory()
 
         set_environ_param(model_mode)
