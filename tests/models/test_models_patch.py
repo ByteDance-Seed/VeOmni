@@ -130,7 +130,17 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rms_norm_implementation = "liger_kernel"
             self.args.model.ops_implementation.swiglu_mlp_implementation = "liger_kernel"
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "liger_kernel"
-            self.args.model.ops_implementation.cross_entropy_loss_implementation = "liger_kernel"
+            # qwen3_5 / qwen3_5_moe have a large vocab and the fused Liger
+            # cross-entropy materializes the full [B, S, V] logits buffer
+            # (~5 GiB on the toy config), which OOMs on shared L20 runners
+            # where another job is still holding part of the card. Use
+            # chunk_loss for those two models — it processes the vocab in
+            # chunks so peak allocation stays modest; the other liger ops
+            # (rms_norm / rotary / swiglu) are still exercised.
+            if model_name in ("qwen3_5", "qwen3_5_moe"):
+                self.args.model.ops_implementation.cross_entropy_loss_implementation = "chunk_loss"
+            else:
+                self.args.model.ops_implementation.cross_entropy_loss_implementation = "liger_kernel"
         else:
             self.args.model.ops_implementation.rms_norm_implementation = "eager"
             self.args.model.ops_implementation.swiglu_mlp_implementation = "eager"
