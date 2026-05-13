@@ -99,16 +99,21 @@ def sync_weight_deepseek_v3(config, state_dict_source, veomni_model):
 
 def sync_weight_qwen3_omni_moe(config, state_dict_source, veomni_model):
     """
-    Align HF state dict to VeOmni Qwen3-Omni-MoE thinker layout (experts stacked per module).
+    Align HF state dict to VeOmni Qwen3-Omni-MoE thinker layout.
 
-    On transformers v4, upstream HF stores thinker experts as ``nn.ModuleList`` with
-    per-expert keys (``thinker.model.layers.{i}.mlp.experts.{j}.{proj}.weight``). After the
-    OpSlot migration, VeOmni's v4 thinker uses the same stacked-parameter layout in both
-    eager and fused modes (``thinker.model.layers.{i}.mlp.experts.{gate_proj,up_proj,
-    down_proj}``). We stack here so the test can copy the HF state dict over.
+    HF thinker layout differs between transformers v4 and v5:
 
-    Visual / audio / talker keys pass through unchanged — the talker tower keeps
-    ``nn.ModuleList`` experts on v4 so the per-expert format already matches.
+    - **v4**: experts are ``nn.ModuleList`` with per-expert keys
+      ``thinker.model.layers.{i}.mlp.experts.{j}.{gate_proj,up_proj,down_proj}.weight``.
+      VeOmni stacks them into ``experts.{gate_proj,up_proj,down_proj}`` of shape
+      ``[E, ...]``.
+    - **v5**: experts are stored as fused stacked parameters
+      ``thinker.model.layers.{i}.mlp.experts.gate_up_proj`` (shape ``[E, 2*I, H]``)
+      and ``experts.down_proj`` (shape ``[E, H, I]``). VeOmni uses the same fused
+      layout, so the keys match directly and no stacking is needed.
+
+    Detect the layout via key presence on layer 0 and dispatch accordingly. Visual /
+    audio / talker keys pass through unchanged in both versions.
     """
     text_config = config.thinker_config.text_config
     layer_num = text_config.num_hidden_layers
@@ -116,21 +121,24 @@ def sync_weight_qwen3_omni_moe(config, state_dict_source, veomni_model):
 
     hf_model_state_dict = state_dict_source
     veomni_model_state_dict = veomni_model.state_dict()
-    # copy weights
+    # Copy direct-matching keys (everything outside the per-expert MoE block).
     for i in hf_model_state_dict.keys():
         if i in veomni_model_state_dict.keys():
             veomni_model_state_dict[i] = hf_model_state_dict[i]
 
-    # Stack thinker experts.
-    for layer_id in range(layer_num):
-        for module_name in ["gate_proj", "up_proj", "down_proj"]:
-            expert_weights = []
-            for expert_id in range(expert_num):
-                key = f"thinker.model.layers.{layer_id}.mlp.experts.{expert_id}.{module_name}.weight"
-                expert_weights.append(hf_model_state_dict[key])
+    v5_layout = "thinker.model.layers.0.mlp.experts.gate_up_proj" in hf_model_state_dict
+    if not v5_layout:
+        # v4: stack per-expert weights into fused tensors.
+        for layer_id in range(layer_num):
+            for module_name in ["gate_proj", "up_proj", "down_proj"]:
+                expert_weights = []
+                for expert_id in range(expert_num):
+                    key = f"thinker.model.layers.{layer_id}.mlp.experts.{expert_id}.{module_name}.weight"
+                    expert_weights.append(hf_model_state_dict[key])
 
-            veomni_module_name = f"thinker.model.layers.{layer_id}.mlp.experts.{module_name}"
-            veomni_model_state_dict[veomni_module_name] = torch.stack(expert_weights, dim=0)
+                veomni_module_name = f"thinker.model.layers.{layer_id}.mlp.experts.{module_name}"
+                veomni_model_state_dict[veomni_module_name] = torch.stack(expert_weights, dim=0)
+    # v5: keys already match; the direct-copy loop above handled them.
 
     veomni_model.load_state_dict(veomni_model_state_dict)
 
