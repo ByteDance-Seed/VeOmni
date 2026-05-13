@@ -84,10 +84,7 @@ from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
-from veomni.distributed.sequence_parallel.ulysses import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
-)
+from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
