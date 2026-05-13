@@ -78,19 +78,23 @@ def fused_lora_moe_forward(
     hidden_states: torch.Tensor,
     fc1_1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
-    lora_a_gate_up: torch.Tensor,
-    lora_b_gate_up: torch.Tensor,
+    lora_a_gate: torch.Tensor,
+    lora_b_gate: torch.Tensor,
+    lora_a_up: torch.Tensor,
+    lora_b_up: torch.Tensor,
     lora_a_down: torch.Tensor,
     lora_b_down: torch.Tensor,
-    lora_scale_gate_up: float,
+    lora_scale_gate: float,
+    lora_scale_up: float,
     lora_scale_down: float,
 ):
-    """Public dispatcher for the fused MoE forward + shared MoE-LoRA (Mode 2).
+    """Public dispatcher for the fused MoE forward + shared seed-style two-LoRA (Mode 2).
 
     Mirrors :func:`fused_moe_forward` for the fused experts layout: a single
-    ``fc1_1_2_weight`` (``[E, 2I, H]``) plus the fused gate+up LoRA pair and
-    the down LoRA pair (see
-    :func:`veomni.ops.kernels.moe.lora_group_gemm.group_gemm_fused_lora_moe_forward`).
+    ``fc1_1_2_weight`` (``[E, 2I, H]``) plus two independent rank-r LoRA
+    pairs (``gate`` + ``up``) covering the gate_up halves, plus the down
+    LoRA pair. See
+    :func:`veomni.ops.kernels.moe.lora_group_gemm.group_gemm_fused_lora_moe_forward`.
 
     Raises ``NotImplementedError`` if no LoRA-aware fused kernel is bound for
     the active ``moe_implementation`` — callers (see
@@ -118,11 +122,14 @@ def fused_lora_moe_forward(
         hidden_states=hidden_states,
         fc1_1_2_weight=fc1_1_2_weight,
         fc2_weight=fc2_weight,
-        lora_a_gate_up=lora_a_gate_up,
-        lora_b_gate_up=lora_b_gate_up,
+        lora_a_gate=lora_a_gate,
+        lora_b_gate=lora_b_gate,
+        lora_a_up=lora_a_up,
+        lora_b_up=lora_b_up,
         lora_a_down=lora_a_down,
         lora_b_down=lora_b_down,
-        lora_scale_gate_up=lora_scale_gate_up,
+        lora_scale_gate=lora_scale_gate,
+        lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
     )
 
@@ -134,14 +141,17 @@ def fused_independent_lora_moe_forward(
     hidden_states: torch.Tensor,
     fc1_1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
-    lora_a_gate_up: torch.Tensor,
-    lora_b_gate_up: torch.Tensor,
+    lora_a_gate: torch.Tensor,
+    lora_b_gate: torch.Tensor,
+    lora_a_up: torch.Tensor,
+    lora_b_up: torch.Tensor,
     lora_a_down: torch.Tensor,
     lora_b_down: torch.Tensor,
-    lora_scale_gate_up: float,
+    lora_scale_gate: float,
+    lora_scale_up: float,
     lora_scale_down: float,
 ):
-    """Public dispatcher for the fused MoE forward + independent per-expert MoE-LoRA (Mode 1).
+    """Public dispatcher for the fused MoE forward + independent per-expert seed-style two-LoRA (Mode 1).
 
     Same shape contract as :func:`fused_lora_moe_forward` except every LoRA
     tensor carries a leading expert dim (``[E, r, ...]`` / ``[E, ..., r]``).
@@ -175,11 +185,14 @@ def fused_independent_lora_moe_forward(
         hidden_states=hidden_states,
         fc1_1_2_weight=fc1_1_2_weight,
         fc2_weight=fc2_weight,
-        lora_a_gate_up=lora_a_gate_up,
-        lora_b_gate_up=lora_b_gate_up,
+        lora_a_gate=lora_a_gate,
+        lora_b_gate=lora_b_gate,
+        lora_a_up=lora_a_up,
+        lora_b_up=lora_b_up,
         lora_a_down=lora_a_down,
         lora_b_down=lora_b_down,
-        lora_scale_gate_up=lora_scale_gate_up,
+        lora_scale_gate=lora_scale_gate,
+        lora_scale_up=lora_scale_up,
         lora_scale_down=lora_scale_down,
     )
 

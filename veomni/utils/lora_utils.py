@@ -87,10 +87,12 @@ def _remap_adapter_key(key: str, adapter_name: str) -> str:
     PEFT saves ``lora_A.weight`` but the model FQN is ``lora_A.<adapter_name>.weight``.
 
     Also handles VeOmni's :class:`~veomni.utils.moe_lora.LoraSharedExperts`
-    wrappers, whose attributes are named ``lora_A_<param>`` /
-    ``lora_B_<param>`` (suffix per target parameter, e.g.
-    ``lora_A_gate_up_proj``). These are detected by ``startswith`` so the same
-    ``<part>.<adapter>.weight`` insertion applies.
+    / :class:`~veomni.utils.moe_lora.LoraIndependentExperts` wrappers,
+    whose attributes are named ``lora_A_<spec>`` / ``lora_B_<spec>``
+    (suffix per logical LoRA spec — ``lora_A_gate_proj``,
+    ``lora_A_up_proj``, ``lora_A_down_proj`` for the seed-style two-LoRA
+    layout on fused ``gate_up_proj``). Detected by ``startswith`` so the
+    same ``<part>.<adapter>.weight`` insertion applies.
     """
     parts = key.split(".")
     new_parts = []

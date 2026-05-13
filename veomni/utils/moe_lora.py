@@ -21,29 +21,66 @@ parent attribute (so downstream lookups by FQN continue to resolve):
   *per expert* (3D ``[E, r, H]`` and ``[E, O, r]`` tensors). Equivalent in
   semantics to PEFT 0.19's ``target_parameters`` 3D-LoRA path, but VeOmni
   owns it end-to-end so we can (a) dispatch into a fused MoE-LoRA triton
-  kernel in Round 2 and (b) keep eager / fused on identical math + key
-  conventions.
+  kernel and (b) keep eager / fused on identical math + key conventions.
 * :class:`LoraSharedExperts` — **Mode 2**. A single LoRA pair (2D
   ``[r, H]`` and ``[O, r]`` tensors) shared across all experts of the
   layer. PEFT does not natively support this — a 2D parameter target
   isn't expressible via ``target_parameters`` (which assumes a leading
   expert dim).
 
+Logical LoRA targets (seed-style two-LoRA on fused gate_up)
+-----------------------------------------------------------
+Even though the experts module stores ``gate_up_proj`` as one fused 3-D
+``nn.Parameter`` of shape ``[E, 2I, H]``, the wrapper allocates **two
+independent LoRA pairs** for it — one for the gate half and one for the
+up half — keyed ``"gate_proj"`` and ``"up_proj"`` internally. The
+``down_proj`` parameter gets a single LoRA pair keyed ``"down_proj"``.
+So every wrapped experts module owns exactly three logical LoRA pairs:
+
+==================  =====================  =====================
+logical key          shared shapes (2-D)    independent shapes (3-D)
+==================  =====================  =====================
+``gate_proj``       ``A:[r,H]`` ``B:[I,r]`` ``A:[E,r,H]`` ``B:[E,I,r]``
+``up_proj``         ``A:[r,H]`` ``B:[I,r]`` ``A:[E,r,H]`` ``B:[E,I,r]``
+``down_proj``       ``A:[r,I]`` ``B:[H,r]`` ``A:[E,r,I]`` ``B:[E,H,r]``
+==================  =====================  =====================
+
+Why two LoRAs instead of one ``[2I, r]`` pair on the merged ``gate_up_proj``?
+Sharing one ``A:[r, H]`` projection between gate and up forces both
+deltas through the *same* low-rank subspace of ``x`` — strictly less
+expressive (rank ``r`` in the joint (gate, up) output space) than two
+independent rank-``r`` adapters (rank up to ``2r``). The seed_kernels
+reference (``seed_fused_lora_moe`` — ``lora_fc1_1_*`` for gate,
+``lora_fc1_2_*`` for up) takes the same view and so does v4 PEFT when
+``gate_proj`` / ``up_proj`` are unmerged. Slightly more LoRA params on
+gate_up (``2r(H + I)`` vs ``r(H + 2I)``) in exchange for the extra
+expressivity and v4↔v5 semantic consistency.
+
 Forward strategy
 ----------------
-For one expert ``e`` with base weight ``W_e`` of shape ``[O, H]``::
+For one expert ``e`` with the merged base weight ``W_gu_e`` of shape
+``[2I, H]`` (gate stacked above up) and per-half LoRA pairs
+``(A_g, B_g)`` / ``(A_u, B_u)``::
 
-    aug_out_e(x) = (W_e + B_e @ A_e * s) @ x
-                 = W_e @ x + B_e @ (A_e @ x) * s
+    gate_aug_e(x) = W_gate_e @ x + B_g_e @ (A_g_e @ x) * s
+    up_aug_e(x)   = W_up_e   @ x + B_u_e @ (A_u_e @ x) * s
+    mid_e         = SiLU(gate_aug_e(x)) * up_aug_e(x)
+    out_e         = W_dn_e @ mid_e + B_dn_e @ (A_dn_e @ mid_e) * s
 
-The right-hand form avoids materialising an ``[E, O, H]`` delta tensor
-(which is what PEFT's ``ParamWrapper`` does for Mode 1 and what the docs
-warn about as runtime overhead). For Mode 2 the LoRA pair is shared, so
-the gate/up LoRA contribution depends only on the *input* token and can
-be computed once per token outside the per-expert dispatch loop; for
-Mode 1 every expert's LoRA is independent so it must be computed inside
-the loop. The down LoRA always lives inside the loop because its input
-is the per-expert intermediate activation ``silu(gate) * up``.
+The LoRA delta is added to the **pre-activation** linear (i.e.
+``gate_aug`` / ``up_aug``) before SiLU — never to the post-activation
+``mid`` — because SiLU is non-linear. This is enforced in both eager
+forwards and the fused kernel by chunking the merged ``gate_up_proj``
+output *after* adding the per-half LoRA deltas.
+
+The right-hand factorisation ``B @ (A @ x) * s`` avoids materialising an
+``[E, O, H]`` delta tensor (which is what PEFT's ``ParamWrapper`` does for
+Mode 1 and what the docs warn about as runtime overhead). For Mode 2 the
+gate/up LoRA contributions depend only on the *input* token and can be
+computed once per token outside the per-expert dispatch loop; for Mode 1
+every expert's LoRA is independent so it must be computed inside the
+loop. The down LoRA always lives inside the loop because its input is
+the per-expert intermediate activation ``silu(gate_aug) * up_aug``.
 
 Expected experts module layout
 ------------------------------
@@ -62,22 +99,23 @@ original 3D parameters move to ``mlp.experts.base_layer.<param>``; the EP
 parallel plan must be aware of this on resume (handled in a later phase
 when the trainer wires through to ``build_parallelize_model``).
 
-A fused-Triton path is bound for Mode 2 in
-``veomni/ops/kernels/moe/lora_group_gemm.py``; the Mode 1 fused path lands
-in Round 2 and falls back to eager until then.
+A fused-Triton path is bound for both modes in
+``veomni/ops/kernels/moe/lora_group_gemm.py`` (non-EP and EP).
 
 PEFT save/load compatibility
 ----------------------------
-Both wrappers store LoRA weights as ``self.lora_A_<param>`` /
-``self.lora_B_<param>``, ``nn.ModuleDict`` keyed by adapter name. Mode 2
-uses ``nn.Linear(in, r, bias=False)`` (2D ``.weight``); Mode 1 uses a tiny
-:class:`_LoraParam3D` container exposing a 3D ``.weight``. Either way the
-state-dict key shape is ``lora_A_<param>.<adapter>.weight`` and PEFT's
+Both wrappers store LoRA weights as ``self.lora_A_<spec>`` /
+``self.lora_B_<spec>`` ``nn.ModuleDict`` keyed by adapter name, where
+``<spec>`` is one of the three logical keys ``gate_proj`` / ``up_proj`` /
+``down_proj``. Mode 2 uses ``nn.Linear(in, r, bias=False)`` (2D
+``.weight``); Mode 1 uses a tiny :class:`_LoraParam3D` container
+exposing a 3D ``.weight``. Either way the state-dict key shape is
+``lora_A_<spec>.<adapter>.weight`` and PEFT's
 ``get_peft_model_state_dict`` / ``set_peft_model_state_dict`` round-trip
 unchanged.
 
 VeOmni's ``_remap_adapter_key`` (used by FSDP1 / rank-0 broadcast loaders)
-recognises the ``lora_A_<param>`` / ``lora_B_<param>`` attribute names via
+recognises the ``lora_A_<spec>`` / ``lora_B_<spec>`` attribute names via
 a ``startswith`` extension in ``veomni/utils/lora_utils.py``.
 
 A sidecar file ``veomni_moe_lora.json`` is written next to PEFT's
@@ -86,8 +124,12 @@ A sidecar file ``veomni_moe_lora.json`` is written next to PEFT's
 alpha / use_rslora / adapter_name. The resume path
 (``PeftModel.from_pretrained``) reads the sidecar and re-installs the
 matching wrappers *before* PEFT loads the state dict; without the
-wrappers in place, the saved ``lora_A_<param>.<adapter>.weight`` keys
+wrappers in place, the saved ``lora_A_<spec>.<adapter>.weight`` keys
 would have no destination and PEFT silently drops them.
+
+The sidecar schema version is bumped to 3 with this seed-style two-LoRA
+layout — older v1 / v2 sidecars (single ``lora_A_gate_up_proj`` pair)
+are refused on load with a clear migration message.
 """
 
 from __future__ import annotations
@@ -163,6 +205,13 @@ def _find_target_parameter_modules(
 # Fused experts layout: base experts module owns these two 3D Parameters.
 _FUSED_PARAMS = ("gate_up_proj", "down_proj")
 
+# Logical LoRA spec keys per experts-module parameter. ``gate_up_proj`` (the
+# fused 2I-output linear) decomposes into two independent rank-r adapters —
+# one for the gate half, one for the up half (seed_kernels-style); see
+# ``seed_fused_lora_moe`` ``lora_fc1_1_*`` / ``lora_fc1_2_*`` for the
+# reference layout. ``down_proj`` keeps a single LoRA pair.
+_LORA_SPEC_KEYS = ("gate_proj", "up_proj", "down_proj")
+
 
 def _validate_fused_layout(base_layer: nn.Module) -> None:
     """Raise if ``base_layer`` is not the v5-style fused MoE experts layout.
@@ -201,12 +250,19 @@ class LoraSharedExperts(nn.Module):
             supported; the name is stored for save/load helpers.
 
     LoRA parameters live in PEFT-style ``ModuleDict`` containers, one per
-    target parameter, each keyed by adapter name and holding an
-    ``nn.Linear(in_features, r)`` (for A) or ``nn.Linear(r, out_features)``
-    (for B): ``lora_A_gate_up_proj``, ``lora_B_gate_up_proj``,
+    *logical* LoRA target — three pairs total per wrapped experts module,
+    each keyed by adapter name and holding an ``nn.Linear(in_features, r)``
+    (for A) or ``nn.Linear(r, out_features)`` (for B):
+    ``lora_A_gate_proj``, ``lora_B_gate_proj``,
+    ``lora_A_up_proj``, ``lora_B_up_proj``,
     ``lora_A_down_proj``, ``lora_B_down_proj``.
 
-    The resulting FQNs (``...experts.lora_A_<param>.<adapter>.weight``) pass
+    The fused ``gate_up_proj`` parameter on the base experts module is
+    therefore covered by **two independent rank-r adapters** (one per
+    half). See the file docstring "Logical LoRA targets (seed-style two-LoRA
+    on fused gate_up)" for the rationale.
+
+    The resulting FQNs (``...experts.lora_A_<spec>.<adapter>.weight``) pass
     PEFT's ``get_peft_model_state_dict`` filter and round-trip through
     ``set_peft_model_state_dict`` unchanged, so the standard
     ``model.save_pretrained`` / ``PeftModel.from_pretrained`` path works
@@ -242,12 +298,15 @@ class LoraSharedExperts(nn.Module):
         # layout (the only layout VeOmni MoE-LoRA supports — see file
         # docstring "Expected experts module layout").
         _validate_fused_layout(base_layer)
-        # Shapes for each LoRA pair: A is [r, in_features], B is [out_features, r].
-        # Naming follows F.linear semantics: F.linear(x, W) computes x @ W.T,
-        # so for base weight W_e of shape [O, H], the pair (A: [r, H], B: [O, r])
-        # gives delta_W = B @ A of shape [O, H].
+        # Three logical LoRA pairs per experts module: gate_proj + up_proj
+        # together cover the fused gate_up_proj base param (seed-style
+        # two-LoRA), and down_proj covers the down base param. Shapes follow
+        # F.linear semantics: F.linear(x, W) computes x @ W.T, so for an
+        # output dim of ``O`` and input dim of ``H`` the pair (A: [r, H],
+        # B: [O, r]) gives delta_W = B @ A of shape [O, H].
         self._lora_specs = {
-            "gate_up_proj": (self.hidden_dim, 2 * self.intermediate_dim),
+            "gate_proj": (self.hidden_dim, self.intermediate_dim),
+            "up_proj": (self.hidden_dim, self.intermediate_dim),
             "down_proj": (self.intermediate_dim, self.hidden_dim),
         }
 
@@ -256,7 +315,7 @@ class LoraSharedExperts(nn.Module):
         ref = next(base_layer.parameters())
         factory_kwargs = {"dtype": ref.dtype, "device": ref.device}
 
-        for pname, (in_feat, out_feat) in self._lora_specs.items():
+        for spec_name, (in_feat, out_feat) in self._lora_specs.items():
             # Use ModuleDict[adapter -> Linear(bias=False)] to match PEFT's
             # save/load conventions exactly. The Linear is never invoked via
             # __call__ in our forward — we read .weight directly — but the
@@ -264,8 +323,8 @@ class LoraSharedExperts(nn.Module):
             # set_peft_model_state_dict round-trip our keys.
             a_dict = nn.ModuleDict({adapter_name: nn.Linear(in_feat, r, bias=False, **factory_kwargs)})
             b_dict = nn.ModuleDict({adapter_name: nn.Linear(r, out_feat, bias=False, **factory_kwargs)})
-            self.add_module(f"lora_A_{pname}", a_dict)
-            self.add_module(f"lora_B_{pname}", b_dict)
+            self.add_module(f"lora_A_{spec_name}", a_dict)
+            self.add_module(f"lora_B_{spec_name}", b_dict)
 
         scaling = lora_alpha / (math.sqrt(r) if use_rslora else r)
         self.register_buffer("lora_scaling", torch.tensor(scaling, dtype=torch.float32))
@@ -354,22 +413,30 @@ class LoraSharedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # Fused-kernel path: available when (a) the user opted into a
-        # non-eager ``moe_implementation`` whose patch function bound a
-        # LoRA-aware kernel (currently 'fused_triton'; Quack/NPU leave
-        # ``_fused_lora_moe_forward = None`` so we transparently fall back
-        # to eager), and (b) we are not under expert parallelism (EP
-        # support comes in Phase 5; the kernel itself raises
-        # NotImplementedError on EP, but we short-circuit here so the
-        # eager path runs cleanly). Mirrors the
-        # ``veomni_moe_experts_forward.use_non_eager_impl`` guard inside
-        # the generated MoE experts forward.
+        # Fused-kernel path: available when the user opted into a non-eager
+        # ``moe_implementation`` whose patch function bound a LoRA-aware
+        # kernel (currently 'fused_triton'; Quack/NPU leave
+        # ``_fused_lora_moe_forward = None`` so we transparently fall back to
+        # eager). The bound kernel handles the EP branch internally via
+        # ``preprocess`` / ``token_pre_all2all`` / ``EPMergedFc1SharedLoRAGroupGemm``
+        # / ``tokens_post_all2all`` — no EP gating needed here.
         from ..distributed.parallel_state import get_parallel_state
         from ..ops.kernels import moe as _moe_ops
 
-        use_fused = _moe_ops._fused_lora_moe_forward is not None and not get_parallel_state().ep_enabled
-        if use_fused:
+        if _moe_ops._fused_lora_moe_forward is not None:
             return self._fused_forward(_moe_ops._fused_lora_moe_forward, hidden_states, top_k_index, top_k_weights)
+        # Eager fallback. Note: the eager forward indexes ``base.gate_up_proj``
+        # / ``base.down_proj`` by global ``top_k_index``, which only works when
+        # the experts module owns the *full* expert set. Under EP the experts
+        # module is local-sliced and ``top_k_index`` carries global ids, so
+        # eager would index out of range. Surface that as a clear error rather
+        # than letting the indexing fail downstream.
+        if get_parallel_state().ep_enabled:
+            raise RuntimeError(
+                "LoraSharedExperts: eager forward does not support expert parallelism (EP). "
+                "Set ops_implementation.moe_implementation='fused_triton' to use the EP-aware "
+                "fused LoRA path, or disable EP."
+            )
         return self._eager_forward(hidden_states, top_k_index, top_k_weights)
 
     def _fused_forward(
@@ -383,7 +450,10 @@ class LoraSharedExperts(nn.Module):
 
         ``fused_kernel`` is the kernel pointer captured by ``forward`` so we
         don't re-read the module attribute twice (cheap optimisation, also
-        keeps this method side-effect free for testing).
+        keeps this method side-effect free for testing). Passes both halves
+        of the seed-style gate_up LoRA pair as separate ``(A, B, scale)``
+        triples — the kernel keeps them split end-to-end to avoid the
+        rank-collapse a merged ``[2I, H]`` LoRA would impose.
         """
         base = self.base_layer
         return fused_kernel(
@@ -393,11 +463,14 @@ class LoraSharedExperts(nn.Module):
             hidden_states=hidden_states,
             fc1_1_2_weight=base.gate_up_proj,
             fc2_weight=base.down_proj,
-            lora_a_gate_up=self.get_lora_A_weight("gate_up_proj"),
-            lora_b_gate_up=self.get_lora_B_weight("gate_up_proj"),
+            lora_a_gate=self.get_lora_A_weight("gate_proj"),
+            lora_b_gate=self.get_lora_B_weight("gate_proj"),
+            lora_a_up=self.get_lora_A_weight("up_proj"),
+            lora_b_up=self.get_lora_B_weight("up_proj"),
             lora_a_down=self.get_lora_A_weight("down_proj"),
             lora_b_down=self.get_lora_B_weight("down_proj"),
-            lora_scale_gate_up=self._lora_scale_value,
+            lora_scale_gate=self._lora_scale_value,
+            lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
         )
 
@@ -409,15 +482,21 @@ class LoraSharedExperts(nn.Module):
     ) -> torch.Tensor:
         base = self.base_layer
         scale = self.lora_scaling.to(hidden_states.dtype)
-        a_gu = self.get_lora_A_weight("gate_up_proj")
-        b_gu = self.get_lora_B_weight("gate_up_proj")
+        a_gate = self.get_lora_A_weight("gate_proj")
+        b_gate = self.get_lora_B_weight("gate_proj")
+        a_up = self.get_lora_A_weight("up_proj")
+        b_up = self.get_lora_B_weight("up_proj")
         a_dn = self.get_lora_A_weight("down_proj")
         b_dn = self.get_lora_B_weight("down_proj")
 
-        # Shared LoRA delta on gate_up depends only on x → compute once.
-        # F.linear(x, A): [N, H] @ [H, r] -> [N, r]
-        # F.linear(., B): [N, r] @ [r, 2I] -> [N, 2I]
-        lora_x_gate_up = F.linear(F.linear(hidden_states, a_gu), b_gu) * scale
+        # Two independent shared LoRA deltas — gate and up each get their
+        # own rank-r adapter. Both depend only on x ⇒ compute once and slice
+        # per expert below. Cat into a single ``[N, 2I]`` block so the
+        # per-expert add lines up with the merged ``base.gate_up_proj``
+        # output before chunk + SiLU (LoRA must enter pre-activation).
+        gate_delta = F.linear(F.linear(hidden_states, a_gate), b_gate) * scale  # [N, I]
+        up_delta = F.linear(F.linear(hidden_states, a_up), b_up) * scale  # [N, I]
+        lora_x_gate_up = torch.cat([gate_delta, up_delta], dim=-1)  # [N, 2I]
 
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
@@ -494,21 +573,29 @@ class LoraIndependentExperts(nn.Module):
         adapter_name: PEFT-style adapter name. Currently a single adapter is
             supported; the name is stored for save/load helpers.
 
-    LoRA tensors are 3-D with the leading dim equal to ``num_experts``::
+    LoRA tensors are 3-D with the leading dim equal to ``num_experts``;
+    the fused ``gate_up_proj`` base parameter is covered by **two
+    independent rank-r adapters** (seed-style two-LoRA, see file
+    docstring), keyed ``gate_proj`` / ``up_proj``::
 
-        lora_A_gate_up_proj.<adapter>.weight   # [E, r, H]
-        lora_B_gate_up_proj.<adapter>.weight   # [E, 2I, r]
-        lora_A_down_proj.<adapter>.weight      # [E, r, I]
-        lora_B_down_proj.<adapter>.weight      # [E, H, r]
+        lora_A_gate_proj.<adapter>.weight   # [E, r, H]
+        lora_B_gate_proj.<adapter>.weight   # [E, I, r]
+        lora_A_up_proj.<adapter>.weight     # [E, r, H]
+        lora_B_up_proj.<adapter>.weight     # [E, I, r]
+        lora_A_down_proj.<adapter>.weight   # [E, r, I]
+        lora_B_down_proj.<adapter>.weight   # [E, H, r]
 
-    Forward semantics for token ``t`` routed to expert ``e``::
+    Forward semantics for token ``t`` routed to expert ``e`` (with the
+    merged base ``W_gu_e`` chunked into gate / up halves on the fly)::
 
-        delta_W_e = B_e @ A_e * (alpha / r)        # [O, H], never materialised
-        out_t = base_e @ x_t + B_e @ (A_e @ x_t) * scale
+        gate_aug_e(x_t) = W_gate_e @ x_t + B_g_e @ (A_g_e @ x_t) * scale
+        up_aug_e(x_t)   = W_up_e   @ x_t + B_u_e @ (A_u_e @ x_t) * scale
+        mid_t           = SiLU(gate_aug_e(x_t)) * up_aug_e(x_t)
+        out_t           = W_dn_e @ mid_t + B_dn_e @ (A_dn_e @ mid_t) * scale
 
-    Equivalent in math to PEFT 0.19's ``target_parameters`` 3-D path; we own
-    it so the wrapper's ``forward`` can dispatch into a fused MoE-LoRA triton
-    kernel (Round 2). Until that lands, only the eager forward is exercised.
+    The wrapper's ``forward`` dispatches into a fused MoE-LoRA triton
+    kernel (non-EP and EP) when bound, falling back to the eager loop
+    above otherwise.
     """
 
     def __init__(
@@ -538,24 +625,28 @@ class LoraIndependentExperts(nn.Module):
         # layout (the only layout VeOmni MoE-LoRA supports — see file
         # docstring "Expected experts module layout").
         _validate_fused_layout(base_layer)
-        # Per-target (in_features, out_features) — same as LoraSharedExperts;
-        # 3-D parameter shapes derived below add a leading expert dim.
+        # Three logical LoRA pairs per experts module — same key set as
+        # LoraSharedExperts. The 3-D parameter shapes derived below add a
+        # leading expert dim. ``gate_proj`` and ``up_proj`` together cover
+        # the fused ``gate_up_proj`` base param (seed-style two-LoRA);
+        # ``down_proj`` covers the down base param.
         self._lora_specs = {
-            "gate_up_proj": (self.hidden_dim, 2 * self.intermediate_dim),
+            "gate_proj": (self.hidden_dim, self.intermediate_dim),
+            "up_proj": (self.hidden_dim, self.intermediate_dim),
             "down_proj": (self.intermediate_dim, self.hidden_dim),
         }
 
         ref = next(base_layer.parameters())
         factory_kwargs = {"dtype": ref.dtype, "device": ref.device}
 
-        # Per-target ModuleDict[adapter -> _LoraParam3D]. Leading expert dim
+        # Per-spec ModuleDict[adapter -> _LoraParam3D]. Leading expert dim
         # makes every LoRA slice independent; downstream forward indexes by
         # expert_idx the same way it indexes ``base.gate_up_proj[expert_idx]``.
-        for pname, (in_feat, out_feat) in self._lora_specs.items():
+        for spec_name, (in_feat, out_feat) in self._lora_specs.items():
             a_dict = nn.ModuleDict({adapter_name: _LoraParam3D((self.num_experts, r, in_feat), **factory_kwargs)})
             b_dict = nn.ModuleDict({adapter_name: _LoraParam3D((self.num_experts, out_feat, r), **factory_kwargs)})
-            self.add_module(f"lora_A_{pname}", a_dict)
-            self.add_module(f"lora_B_{pname}", b_dict)
+            self.add_module(f"lora_A_{spec_name}", a_dict)
+            self.add_module(f"lora_B_{spec_name}", b_dict)
 
         scaling = lora_alpha / (math.sqrt(r) if use_rslora else r)
         self.register_buffer("lora_scaling", torch.tensor(scaling, dtype=torch.float32))
@@ -637,18 +728,24 @@ class LoraIndependentExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # Mirrors LoraSharedExperts.forward: enable the fused path when (a)
+        # Mirrors LoraSharedExperts.forward: prefer the fused branch whenever
         # the active ``moe_implementation`` bound a Mode 1 LoRA-aware kernel
         # (currently only 'fused_triton'; Quack/NPU leave the pointer as
-        # ``None`` so we transparently fall back), and (b) we are not under
-        # expert parallelism (EP support comes in Phase 5).
+        # ``None`` so we transparently fall back). The bound kernel handles
+        # the EP branch internally via ``preprocess`` / ``token_pre_all2all``
+        # / ``EPMergedFc1IndependentLoRAGroupGemm`` / ``tokens_post_all2all``.
         from ..distributed.parallel_state import get_parallel_state
         from ..ops.kernels import moe as _moe_ops
 
-        use_fused = _moe_ops._fused_independent_lora_moe_forward is not None and not get_parallel_state().ep_enabled
-        if use_fused:
+        if _moe_ops._fused_independent_lora_moe_forward is not None:
             return self._fused_forward(
                 _moe_ops._fused_independent_lora_moe_forward, hidden_states, top_k_index, top_k_weights
+            )
+        if get_parallel_state().ep_enabled:
+            raise RuntimeError(
+                "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
+                "Set ops_implementation.moe_implementation='fused_triton' to use the EP-aware "
+                "fused LoRA path, or disable EP."
             )
         return self._eager_forward(hidden_states, top_k_index, top_k_weights)
 
@@ -663,7 +760,9 @@ class LoraIndependentExperts(nn.Module):
 
         ``fused_kernel`` is the kernel pointer captured by ``forward`` so we
         don't re-read the module attribute twice (cheap optimisation, also
-        keeps this method side-effect free for testing).
+        keeps this method side-effect free for testing). Passes both halves
+        of the seed-style gate_up LoRA pair as separate ``(A, B, scale)``
+        triples — the kernel keeps them split end-to-end.
         """
         base = self.base_layer
         return fused_kernel(
@@ -673,11 +772,14 @@ class LoraIndependentExperts(nn.Module):
             hidden_states=hidden_states,
             fc1_1_2_weight=base.gate_up_proj,
             fc2_weight=base.down_proj,
-            lora_a_gate_up=self.get_lora_A_weight("gate_up_proj"),
-            lora_b_gate_up=self.get_lora_B_weight("gate_up_proj"),
+            lora_a_gate=self.get_lora_A_weight("gate_proj"),
+            lora_b_gate=self.get_lora_B_weight("gate_proj"),
+            lora_a_up=self.get_lora_A_weight("up_proj"),
+            lora_b_up=self.get_lora_B_weight("up_proj"),
             lora_a_down=self.get_lora_A_weight("down_proj"),
             lora_b_down=self.get_lora_B_weight("down_proj"),
-            lora_scale_gate_up=self._lora_scale_value,
+            lora_scale_gate=self._lora_scale_value,
+            lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
         )
 
@@ -689,8 +791,10 @@ class LoraIndependentExperts(nn.Module):
     ) -> torch.Tensor:
         base = self.base_layer
         scale = self.lora_scaling.to(hidden_states.dtype)
-        a_gu = self.get_lora_A_weight("gate_up_proj")  # [E, r, H]
-        b_gu = self.get_lora_B_weight("gate_up_proj")  # [E, 2I, r]
+        a_gate = self.get_lora_A_weight("gate_proj")  # [E, r, H]
+        b_gate = self.get_lora_B_weight("gate_proj")  # [E, I, r]
+        a_up = self.get_lora_A_weight("up_proj")  # [E, r, H]
+        b_up = self.get_lora_B_weight("up_proj")  # [E, I, r]
         a_dn = self.get_lora_A_weight("down_proj")  # [E, r, I]
         b_dn = self.get_lora_B_weight("down_proj")  # [E, H, r]
 
@@ -706,9 +810,15 @@ class LoraIndependentExperts(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
 
-            # Per-expert LoRA on gate_up — independent, computed inside the loop.
-            gate_up_lora = F.linear(F.linear(current_state, a_gu[expert_idx]), b_gu[expert_idx]) * scale
-            gate_up = F.linear(current_state, base.gate_up_proj[expert_idx]) + gate_up_lora
+            # Per-expert LoRA on gate and up halves — independent rank-r
+            # adapters, both computed inside the per-expert loop. Cat the
+            # per-half deltas into [n_e, 2I] so the add lines up with the
+            # merged base ``gate_up_proj`` output before chunk + SiLU.
+            gate_delta = F.linear(F.linear(current_state, a_gate[expert_idx]), b_gate[expert_idx]) * scale  # [n_e, I]
+            up_delta = F.linear(F.linear(current_state, a_up[expert_idx]), b_up[expert_idx]) * scale  # [n_e, I]
+            gate_up = F.linear(current_state, base.gate_up_proj[expert_idx]) + torch.cat(
+                [gate_delta, up_delta], dim=-1
+            )
             gate, up = gate_up.chunk(2, dim=-1)
             mid = self.act_fn(gate) * up
 
@@ -909,19 +1019,29 @@ def iter_moe_lora_parameters(model: nn.Module):
 # Sidecar metadata + I/O — kept in this module so save/load callers don't need
 # to know the JSON schema.
 #
-# Schema v2 (current)::
+# Schema v3 (current — seed-style two-LoRA on fused gate_up)::
 #
 #     {
-#       "version": 2,
+#       "version": 3,
 #       "mode": "shared" | "independent",   # which wrapper class to rebuild
 #       "r": <int>, "lora_alpha": <int>, "use_rslora": <bool>, "adapter_name": <str>,
-#       "target_parameter_patterns": [<glob>, ...],
+#       "target_parameter_patterns": [<glob>, ...],   # user-facing yaml patterns
 #       "wrapped_fqns": [<fqn>, ...]
 #     }
+#
+# Schema changes vs older versions:
+#   * v3 (current): every wrapper allocates 3 logical LoRA pairs
+#     (``gate_proj`` + ``up_proj`` + ``down_proj``). State-dict keys use
+#     ``lora_A_gate_proj`` / ``lora_A_up_proj`` / ``lora_A_down_proj``.
+#   * v1 / v2 (deprecated): every wrapper allocated 2 logical LoRA pairs
+#     (single merged ``gate_up_proj`` + ``down_proj``). State-dict keys
+#     used ``lora_A_gate_up_proj``. Loading these into a v3 wrapper is not
+#     supported — adapter shapes don't line up — and is refused with a
+#     clear migration message in :func:`read_moe_lora_sidecar`.
 # ──────────────────────────────────────────────────────────────────────────────
 
 MOE_LORA_SIDECAR_NAME = "veomni_moe_lora.json"
-_MOE_LORA_SIDECAR_VERSION = 2
+_MOE_LORA_SIDECAR_VERSION = 3
 
 
 def get_moe_lora_metadata(model: nn.Module) -> dict[str, Any] | None:
@@ -988,8 +1108,11 @@ def write_moe_lora_sidecar(model: nn.Module, save_path: str) -> str | None:
 def read_moe_lora_sidecar(adapter_path: str) -> dict[str, Any] | None:
     """Load the sidecar dict if present, else return ``None``.
 
-    Validates ``mode`` is one of ``"shared"`` / ``"independent"``; returns the
-    raw dict on success so callers can inspect / dispatch on it.
+    Validates ``mode`` is one of ``"shared"`` / ``"independent"`` and that
+    the recorded ``version`` matches the current schema. Older v1/v2
+    sidecars (single merged ``gate_up_proj`` LoRA) are refused here with a
+    clear migration message so the resume path fails fast instead of
+    silently dropping the saved gate_up adapter on PEFT load.
     """
     sidecar_path = os.path.join(adapter_path, MOE_LORA_SIDECAR_NAME)
     if not os.path.isfile(sidecar_path):
@@ -999,6 +1122,15 @@ def read_moe_lora_sidecar(adapter_path: str) -> dict[str, Any] | None:
     mode = sidecar.get("mode")
     if mode not in ("shared", "independent"):
         raise ValueError(f"{sidecar_path}: invalid 'mode' field {mode!r}; expected 'shared' or 'independent'.")
+    version = sidecar.get("version")
+    if version != _MOE_LORA_SIDECAR_VERSION:
+        raise ValueError(
+            f"{sidecar_path}: sidecar version {version!r} is not supported by this VeOmni "
+            f"build (expected v{_MOE_LORA_SIDECAR_VERSION}). v1/v2 sidecars stored a single "
+            "merged ``gate_up_proj`` LoRA; the current wrapper allocates two independent "
+            "rank-r adapters (``gate_proj`` + ``up_proj``) for the fused gate+up base "
+            "parameter. Re-train with this build to regenerate a v3 adapter."
+        )
     return sidecar
 
 

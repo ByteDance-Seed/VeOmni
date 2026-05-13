@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Triton fused MoE-LoRA forward/backward parity tests (non-EP).
+"""Triton fused MoE-LoRA forward/backward parity tests (non-EP + EP single-rank).
 
 Exercises the fused experts path in both
 :class:`veomni.utils.moe_lora.LoraSharedExperts` (Mode 2 — shared LoRA) and
@@ -20,15 +20,24 @@ per-expert LoRA). Both require the fused experts layout (single
 ``[E, 2I, H]`` ``gate_up_proj`` + single ``[E, H, I]`` ``down_proj``); see
 :func:`veomni.utils.moe_lora._validate_fused_layout`.
 
+The ``gate_up_proj`` parameter is covered by **two independent rank-r LoRA
+pairs** (seed-style two-LoRA, see ``veomni.utils.moe_lora`` file
+docstring). All four autograd classes carry the per-half ``(A_gate,
+B_gate, A_up, B_up)`` tensors end-to-end; the EP-class tests below build
+matching leaf tensors so backward parity covers each adapter
+independently.
+
 Uses the same :func:`build_toy` + :func:`load_lora_config` machinery as
 ``test_moe_lora_eager.py``. Each test flips ``moe_implementation`` between
 ``fused_triton`` (kernel path) and ``eager`` (reference) and compares:
 
 1. forward outputs at small bf16 tolerance, and
-2. d/dlora_A, d/dlora_B at small bf16 tolerance.
+2. d/dlora_A_*, d/dlora_B_* at small bf16 tolerance.
 
-Out of scope (planned later):
-* EP path — Phase 5.
+The EP-class single-rank parity test reproduces the non-EP class's
+``preprocess`` + ``scatter`` machinery in-process so the EP autograd
+classes can be exercised without spinning up a process group; the full
+multi-process EP2 alignment is covered by the Phase 6 distributed tests.
 
 Run:
     pytest -v tests/lora/test_moe_lora_fused.py
@@ -285,4 +294,212 @@ def test_fused_vs_eager_backward_parity(mode):
         assert l2 <= _GRAD_L2REL_TOL, (
             f"[{mode}] {n}: grad parity broken — L2 relative error {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
             f"(eager_norm={ge.float().norm().item():.3e}, max|fused-eager|={(ge - gf).abs().max().item():.3e})"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EP autograd-class single-rank parity (Phase 5).
+#
+# These exercise the LoRA math inside ``EPMergedFc1{Shared,Independent}LoRAGroupGemm``
+# without spinning up a process group. We hand-build the same scatter / cumsum
+# the non-EP class would compute internally, run the EP class on that permuted
+# block, then replay the routing-weight + gather to compare against the non-EP
+# reference. The actual all-to-all + permute-reorder plumbing in
+# ``_ep_dispatch_fused_lora_moe`` is exercised by the existing non-LoRA EP tests
+# (``EPMergedFc1GroupGemm`` reuses ``preprocess`` / ``token_pre_all2all`` /
+# ``tokens_post_all2all`` 1:1) and by the multi-process Phase 6 EP2 tests; this
+# unit-level check just locks in the LoRA math added on top.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_lora_leaf(*shape: int, dtype: torch.dtype, device: torch.device, scale: float = 0.02) -> torch.Tensor:
+    """Make a leaf parameter-shaped tensor with ``requires_grad=True`` after scaling.
+
+    ``torch.randn(...) * scale`` would create a non-leaf because the scaling op
+    captures autograd; ``.detach()`` then ``requires_grad_()`` keeps it a leaf
+    so ``.grad`` populates after ``backward()``.
+    """
+    return (torch.randn(*shape, dtype=dtype, device=device) * scale).detach().requires_grad_(True)
+
+
+def _build_lora_leaves(mode: str, *, E: int, H: int, I: int, r: int, dtype: torch.dtype, device: torch.device):
+    """Build a fresh, deterministic set of LoRA leaf tensors for ``mode``.
+
+    Mirrors the seed-style two-LoRA layout of the wrappers / autograd
+    classes: ``gate`` and ``up`` each get their own rank-r adapter on the
+    fused gate_up base weight, plus a single ``down`` adapter. Re-seeded by
+    the caller for cross-branch reproducibility (same seed → same initial
+    values) so EP and non-EP branches start from identical LoRA state.
+    """
+    if mode == "shared":
+        return {
+            "lora_a_gate": _make_lora_leaf(r, H, dtype=dtype, device=device),
+            "lora_b_gate": _make_lora_leaf(I, r, dtype=dtype, device=device),
+            "lora_a_up": _make_lora_leaf(r, H, dtype=dtype, device=device),
+            "lora_b_up": _make_lora_leaf(I, r, dtype=dtype, device=device),
+            "lora_a_down": _make_lora_leaf(r, I, dtype=dtype, device=device),
+            "lora_b_down": _make_lora_leaf(H, r, dtype=dtype, device=device),
+        }
+    return {
+        "lora_a_gate": _make_lora_leaf(E, r, H, dtype=dtype, device=device),
+        "lora_b_gate": _make_lora_leaf(E, I, r, dtype=dtype, device=device),
+        "lora_a_up": _make_lora_leaf(E, r, H, dtype=dtype, device=device),
+        "lora_b_up": _make_lora_leaf(E, I, r, dtype=dtype, device=device),
+        "lora_a_down": _make_lora_leaf(E, r, I, dtype=dtype, device=device),
+        "lora_b_down": _make_lora_leaf(E, H, r, dtype=dtype, device=device),
+    }
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_ep_class_matches_nonep_class_single_rank(mode):
+    """EP autograd class output AND LoRA grads match the non-EP class on the same permuted token block.
+
+    Math equivalence: routing-weight scaling commutes with the linear ``down``
+    + LoRA-down chain, so applying ``scattered_gate_weights`` *after* fc2 (the
+    EP convention, via ``tokens_post_all2all`` → ``unpermute``) and applying
+    it *before* fc2 (the non-EP convention, baked into the class) produce the
+    same forward output and same LoRA gradients up to bf16 reduction-order
+    noise. The forward leg is the easy half; the backward leg also closes
+    over ``grad_lora_a_*`` / ``grad_lora_b_*`` per-expert chains, which is
+    where any bug in the EP autograd backward would surface.
+    """
+    _require_cuda_with_triton()
+
+    from veomni.ops.kernels.moe._kernels.kernel.moe import (
+        expert_histogram,
+        moe_gather,
+        moe_scatter,
+    )
+    from veomni.ops.kernels.moe.lora_group_gemm import (
+        EPMergedFc1IndependentLoRAGroupGemm,
+        EPMergedFc1SharedLoRAGroupGemm,
+        MergedFc1IndependentTritonFusedLoRAMoeExpertFunction,
+        MergedFc1TritonFusedLoRAMoeExpertFunction,
+    )
+
+    _CLASSES = {
+        "shared": (EPMergedFc1SharedLoRAGroupGemm, MergedFc1TritonFusedLoRAMoeExpertFunction),
+        "independent": (EPMergedFc1IndependentLoRAGroupGemm, MergedFc1IndependentTritonFusedLoRAMoeExpertFunction),
+    }
+    ep_cls, nonep_cls = _CLASSES[mode]
+
+    dev = torch.device("cuda")
+    dtype = torch.bfloat16
+    B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
+    scale_gate, scale_up, scale_down = 0.5, 0.5, 0.5
+
+    # Build the shared inputs once — base weights stay frozen, the EP-side
+    # permuted view is computed by manually replicating the non-EP class's
+    # internal scatter/cumsum so we can hand the EP class the same token block.
+    torch.manual_seed(0)
+    hidden_states = torch.randn(B, H, dtype=dtype, device=dev)
+    top_k_index = torch.randint(0, E, (B, top_k), device=dev)
+    top_k_weights = torch.softmax(torch.randn(B, top_k, dtype=torch.float32, device=dev), dim=-1).to(dtype)
+
+    splits = expert_histogram(top_k_index, E)
+    scatter_index = top_k_index.flatten().argsort(stable=True).argsort().int().view(top_k_index.shape)
+    permute_tokens = moe_scatter(hidden_states, scatter_index)  # [T, H], grouped by expert
+    cumsum = torch.cumsum(splits, dim=0)
+    T = permute_tokens.shape[0]
+    scattered_gate_weights = torch.empty(T, 1, dtype=dtype, device=dev)
+    scattered_gate_weights[scatter_index.flatten()] = top_k_weights.reshape(-1, 1)
+
+    gate_up_proj = (torch.randn(E, 2 * I, H, dtype=dtype, device=dev) * 0.05).detach()
+    down_proj = (torch.randn(E, H, I, dtype=dtype, device=dev) * 0.05).detach()
+
+    # Argument order for both EP and non-EP autograd.Function.apply, after
+    # the leading positional args (permute_tokens/cumsum or
+    # num_experts/top_k_weights/top_k_index/hidden_states + base weights).
+    # Matches ``MergedFc1*Function.forward`` and ``EPMergedFc1*GroupGemm.forward``.
+    _LORA_KEYS = ("lora_a_gate", "lora_b_gate", "lora_a_up", "lora_b_up", "lora_a_down", "lora_b_down")
+
+    def _build_branch(*, ep: bool):
+        """Build one branch's LoRA leaves + run its forward; return (output, lora_dict).
+
+        Re-seeding ``torch.manual_seed(123)`` before ``_build_lora_leaves`` makes
+        both branches start from byte-identical LoRA values, which is the only
+        way the per-tensor grad parity below is meaningful. Each branch owns
+        its own leaf tensors so ``torch.autograd.grad`` calls are isolated.
+        """
+        torch.manual_seed(123)
+        lora = _build_lora_leaves(mode, E=E, H=H, I=I, r=r, dtype=dtype, device=dev)
+        if ep:
+            out = ep_cls.apply(
+                permute_tokens,
+                cumsum,
+                gate_up_proj,
+                down_proj,
+                *(lora[k] for k in _LORA_KEYS),
+                scale_gate,
+                scale_up,
+                scale_down,
+            )
+        else:
+            out = nonep_cls.apply(
+                E,
+                top_k_weights,
+                top_k_index,
+                hidden_states,
+                gate_up_proj,
+                down_proj,
+                *(lora[k] for k in _LORA_KEYS),
+                scale_gate,
+                scale_up,
+                scale_down,
+            )
+        return out, lora
+
+    nonep_out, nonep_lora = _build_branch(ep=False)  # [B, H], routing weight baked in
+    ep_permuted, ep_lora = _build_branch(ep=True)  # [T, H], routing weight applied later
+
+    # ── Forward parity ───────────────────────────────────────────────────────
+    # Replay the EP post-step (sgw multiply + unpermute) under no_grad — only
+    # needed for the forward comparison; the backward leg uses a synthetic
+    # upstream grad below to avoid having to differentiate ``moe_gather``.
+    with torch.no_grad():
+        ep_out = moe_gather(ep_permuted.detach() * scattered_gate_weights, scatter_index).reshape(hidden_states.shape)
+    fwd_l2 = _l2_rel(ep_out, nonep_out.detach())
+    assert fwd_l2 <= _FWD_L2REL_TOL, (
+        f"[{mode}] EP-vs-non-EP single-rank forward parity broken: "
+        f"L2 rel {fwd_l2:.4%} > {_FWD_L2REL_TOL:.2%} (ref_norm={nonep_out.float().norm().item():.3e})"
+    )
+
+    # ── Backward parity (per LoRA tensor) ────────────────────────────────────
+    # Use a single synthetic upstream grad on the [B, H] output instead of a
+    # pow(2).sum() loss, so both branches see *identical* upstream signal (no
+    # bf16-forward noise leaking into the grad comparison).
+    #
+    # For the EP class, autograd doesn't reach back through ``moe_gather``
+    # (raw Triton kernel, no backward registered), so we hand-derive the
+    # equivalent upstream grad on the permuted-token tensor:
+    #   ``ep_out[b]   = sum_k permuted[scatter_index[b,k]] * sgw[scatter_index[b,k]]``
+    #   ``∂loss/∂permuted[t] = grad_out[b] * sgw[t]``
+    # which is exactly ``moe_scatter(grad_out, scatter_index) * sgw`` because
+    # ``scatter_index`` is a permutation in this synthetic setup.
+    torch.manual_seed(456)
+    grad_out = (torch.randn(B, H, dtype=dtype, device=dev) * 0.1).detach()
+    grad_permuted = (moe_scatter(grad_out, scatter_index) * scattered_gate_weights).detach()
+
+    nonep_grads = dict(
+        zip(
+            _LORA_KEYS,
+            torch.autograd.grad(nonep_out, [nonep_lora[k] for k in _LORA_KEYS], grad_outputs=grad_out),
+        )
+    )
+    ep_grads = dict(
+        zip(
+            _LORA_KEYS,
+            torch.autograd.grad(ep_permuted, [ep_lora[k] for k in _LORA_KEYS], grad_outputs=grad_permuted),
+        )
+    )
+
+    for name in _LORA_KEYS:
+        g_nonep, g_ep = nonep_grads[name], ep_grads[name]
+        assert g_nonep.shape == g_ep.shape, (
+            f"[{mode}] {name}: grad shape mismatch nonep={g_nonep.shape} ep={g_ep.shape}"
+        )
+        l2 = _l2_rel(g_ep, g_nonep)
+        assert l2 <= _GRAD_L2REL_TOL, (
+            f"[{mode}] {name}: EP-vs-non-EP backward parity broken — L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
+            f"(nonep_norm={g_nonep.float().norm().item():.3e}, max|Δ|={(g_nonep - g_ep).abs().max().item():.3e})"
         )

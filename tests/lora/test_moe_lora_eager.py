@@ -71,6 +71,7 @@ import pytest
 import torch
 
 from veomni.utils.moe_lora import (
+    _LORA_SPEC_KEYS,
     LoraIndependentExperts,
     LoraSharedExperts,
     apply_independent_moe_lora,
@@ -83,6 +84,7 @@ from veomni.utils.moe_lora import (
 from .utils import (
     build_toy,
     experts_module_globs,
+    find_all_matching_modules,
     find_first_matching_module,
     load_lora_config,
 )
@@ -115,12 +117,14 @@ def _expected_ndim(mode: str) -> int:
 # Parametrised per-model wrapper tests
 # ---------------------------------------------------------------------------
 
-# Each entry is (toy_config_dir, expected_layer_count_for_assertion).
+# Toys to exercise. The expected count of experts modules to wrap is derived
+# *from the built model* via :func:`find_all_matching_modules` so a toy adding
+# or removing MoE layers doesn't silently desync from a hardcoded number here.
 _MODEL_CASES = [
-    pytest.param("qwen3_moe_toy", 4, id="qwen3_moe"),
-    pytest.param("qwen3_5_moe_toy", 4, id="qwen3_5_moe"),
-    pytest.param("qwen3vlmoe_toy", 2, id="qwen3_vl_moe"),
-    pytest.param("qwen3omni_toy", 2, id="qwen3_omni_moe"),
+    pytest.param("qwen3_moe_toy", id="qwen3_moe"),
+    pytest.param("qwen3_5_moe_toy", id="qwen3_5_moe"),
+    pytest.param("qwen3vlmoe_toy", id="qwen3_vl_moe"),
+    pytest.param("qwen3omni_toy", id="qwen3_omni_moe"),
 ]
 
 _MODE_CASES = [
@@ -149,16 +153,24 @@ def _select_yaml_then_build(toy_dir: str):
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
-@pytest.mark.parametrize("toy_dir,expected_n_layers", _MODEL_CASES)
-def test_layout_validate_and_wrap(toy_dir: str, expected_n_layers: int, mode: str):
+@pytest.mark.parametrize("toy_dir", _MODEL_CASES)
+def test_layout_validate_and_wrap(toy_dir: str, mode: str):
     """Wrapping with the paired yaml's ``target_parameters`` must replace exactly the experts modules.
 
-    Also asserts the wrapper picks up the yaml-declared LoRA specs
-    (``gate_up_proj`` / ``down_proj``) and that LoRA tensor rank matches
-    the mode (2-D for shared, 3-D for independent).
+    Also asserts the wrapper exposes the canonical seed-style LoRA spec set
+    (``gate_proj`` / ``up_proj`` / ``down_proj`` — three logical pairs per
+    wrapped module, with ``gate_up_proj`` decomposing into two independent
+    rank-r adapters) and that LoRA tensor rank matches the mode (2-D for
+    shared, 3-D for independent).
     """
     model, lora_cfg = _select_yaml_then_build(toy_dir)
     patterns = lora_cfg["target_parameters"]
+    # Count experts modules in the *built* model that match the yaml patterns —
+    # the wrapper should replace every one of them and nothing else.
+    expected_fqns = find_all_matching_modules(model, experts_module_globs(patterns))
+    assert expected_fqns, (
+        f"{toy_dir}: yaml patterns {patterns} matched no experts module in the built model — stale yaml?"
+    )
     wrapped = _apply(
         mode,
         model,
@@ -167,30 +179,37 @@ def test_layout_validate_and_wrap(toy_dir: str, expected_n_layers: int, mode: st
         lora_alpha=lora_cfg["alpha"],
         freeze_base_model=True,
     )
-    assert len(wrapped) == expected_n_layers, (
-        f"{toy_dir}/{mode}: expected {expected_n_layers} wrapped experts modules, got {len(wrapped)}: {wrapped}"
+    assert sorted(wrapped) == expected_fqns, (
+        f"{toy_dir}/{mode}: wrapped FQNs {sorted(wrapped)} ≠ expected (matching) {expected_fqns}"
     )
-    expected_specs = {p.rsplit(".", 1)[1] for p in patterns}
+    # Wrapper allocates the canonical 3 logical specs unconditionally for the
+    # v5 fused experts layout — ``gate_up_proj`` matched in the yaml expands
+    # to ``gate_proj`` + ``up_proj`` (seed-style two-LoRA), and ``down_proj``
+    # stays a single pair.
+    expected_specs = set(_LORA_SPEC_KEYS)
     expected_cls = _wrapper_cls(mode)
     expected_lora_ndim = _expected_ndim(mode)
     for fqn in wrapped:
         w = model.get_submodule(fqn)
         assert isinstance(w, expected_cls), f"{fqn}: expected {expected_cls.__name__}, got {type(w).__name__}"
         assert set(w._lora_specs) == expected_specs, (
-            f"{fqn}: lora_specs {set(w._lora_specs)} ≠ yaml-declared {expected_specs}"
+            f"{fqn}: lora_specs {set(w._lora_specs)} ≠ canonical {expected_specs}"
         )
-        # Spot-check tensor rank: 2-D for shared (one matrix per layer), 3-D for
-        # independent (leading expert dim). Catches accidental cross-mode
-        # regressions early without poking into ParameterDict guts.
-        a_w = w.get_lora_A_weight(next(iter(expected_specs)))
-        assert a_w.ndim == expected_lora_ndim, (
-            f"{fqn}/{mode}: expected lora_A ndim={expected_lora_ndim}, got {a_w.ndim} (shape={tuple(a_w.shape)})"
-        )
+        # Spot-check tensor rank on every logical spec: 2-D for shared (one
+        # matrix per layer), 3-D for independent (leading expert dim).
+        # Catches accidental cross-mode regressions and any half (gate / up /
+        # down) that fails to allocate.
+        for spec_name in expected_specs:
+            a_w = w.get_lora_A_weight(spec_name)
+            assert a_w.ndim == expected_lora_ndim, (
+                f"{fqn}/{mode}/{spec_name}: expected lora_A ndim={expected_lora_ndim}, "
+                f"got {a_w.ndim} (shape={tuple(a_w.shape)})"
+            )
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
-@pytest.mark.parametrize("toy_dir,expected_n_layers", _MODEL_CASES)
-def test_eager_forward_no_op_at_init(toy_dir: str, expected_n_layers: int, mode: str):
+@pytest.mark.parametrize("toy_dir", _MODEL_CASES)
+def test_eager_forward_no_op_at_init(toy_dir: str, mode: str):
     """Direct experts.forward() with kaiming-A / zero-B must reproduce the base output exactly."""
     model, lora_cfg = _select_yaml_then_build(toy_dir)
     patterns = lora_cfg["target_parameters"]
@@ -223,8 +242,8 @@ def test_eager_forward_no_op_at_init(toy_dir: str, expected_n_layers: int, mode:
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
-@pytest.mark.parametrize("toy_dir,expected_n_layers", _MODEL_CASES)
-def test_backward_isolates_to_lora_params(toy_dir: str, expected_n_layers: int, mode: str):
+@pytest.mark.parametrize("toy_dir", _MODEL_CASES)
+def test_backward_isolates_to_lora_params(toy_dir: str, mode: str):
     """Backward through a wrapped experts module must only fill grads for ``lora_A_*`` / ``lora_B_*``."""
     model, lora_cfg = _select_yaml_then_build(toy_dir)
     patterns = lora_cfg["target_parameters"]
@@ -259,12 +278,13 @@ def test_backward_isolates_to_lora_params(toy_dir: str, expected_n_layers: int, 
         elif n.startswith("base_layer."):
             n_base_with_grad += 1
     # At init lora_B == 0 ⇒ dL/dlora_A = 0 (chain through B). So only lora_B
-    # params gain grad. The fused experts layout has two targets
-    # (gate_up + down), so we expect at least 2 lora_B params with non-zero
-    # grad in both modes.
+    # params gain grad. The seed-style fused experts layout has three logical
+    # targets (gate + up + down), so we expect at least 3 lora_B params with
+    # non-zero grad in both modes.
     assert n_base_with_grad == 0, f"{toy_dir}/{mode}: base layer must stay frozen, got {n_base_with_grad}"
-    assert n_lora_with_grad >= 2, (
-        f"{toy_dir}/{mode}: expected at least 2 lora_B params with grad, got {n_lora_with_grad}"
+    assert n_lora_with_grad >= 3, (
+        f"{toy_dir}/{mode}: expected at least 3 lora_B params with grad "
+        f"(gate + up + down halves), got {n_lora_with_grad}"
     )
 
 
@@ -307,6 +327,15 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
         base_out = model(input_ids=input_ids).logits.clone()
     base_state = {k: v.clone() for k, v in model.state_dict().items()}
 
+    # Pre-PEFT: count experts modules matching the yaml patterns. PEFT wraps
+    # linears (not experts), so the experts module count is stable across
+    # ``get_peft_model``. We assert on count rather than FQN identity because
+    # PEFT prefixes everything with ``base_model.model.`` once it wraps the
+    # model — and the FQN-identity check is already covered by
+    # ``test_layout_validate_and_wrap`` above.
+    expected_n_experts = len(find_all_matching_modules(model, experts_module_globs(patterns)))
+    assert expected_n_experts > 0, f"qwen3_moe_toy: yaml patterns {patterns} matched no experts module — stale yaml?"
+
     # Wrap with the same hyper-params the user-facing yaml declares.
     peft_cfg = LoraConfig(r=rank, lora_alpha=alpha, target_modules=linear_targets)
     wrapped_model = get_peft_model(model, peft_cfg)
@@ -318,7 +347,9 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
         lora_alpha=alpha,
         freeze_base_model=False,  # PEFT already froze
     )
-    assert len(wrapped) == 4
+    assert len(wrapped) == expected_n_experts, (
+        f"{mode}: wrapped {len(wrapped)} experts modules, expected {expected_n_experts}: {wrapped}"
+    )
 
     # No-op at init.
     wrapped_model.eval()

@@ -232,3 +232,15 @@ def find_first_matching_module(model: torch.nn.Module, module_globs: list[str]) 
         f"no module in {type(model).__name__} matched any of {module_globs!r} — "
         "is the paired lora.yaml stale w.r.t. the toy modeling code?"
     )
+
+
+def find_all_matching_modules(model: torch.nn.Module, module_globs: list[str]) -> list[str]:
+    """Return every FQN in ``model`` matching any of ``module_globs``, sorted.
+
+    Used by tests to derive the *expected* count of experts modules to wrap
+    straight from the built model rather than hardcoding a per-toy number —
+    so adding/removing MoE layers in a toy config doesn't silently desync
+    from the test's expected count.
+    """
+    regs = [glob_to_regex(g) for g in module_globs]
+    return sorted(fqn for fqn, _ in model.named_modules() if any(r.match(fqn) for r in regs))
