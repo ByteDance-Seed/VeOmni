@@ -216,15 +216,17 @@ def _init_lora_parameter(module: "nn.Module", name: str):
             break
         lora_layer = getattr(lora_layer, piece)
 
-    # Shared MoE LoRA wrapper owns multiple lora_A_<param> ModuleDicts; its
-    # reset_lora_parameters re-initialises every adapter on every target param
-    # idempotently, so we just dispatch to it once. Avoid the hasattr check
-    # below (which would also match the wrapper but would loop over the
-    # accessor property `lora_A`, redundantly resetting on every `lora_A_*`
-    # key the caller iterates).
-    from .moe_lora import LoraSharedExperts
+    # VeOmni MoE-LoRA wrappers own multiple lora_A_<param> ModuleDicts; their
+    # reset_lora_parameters re-initialise every adapter on every target param
+    # idempotently, so we dispatch once. Avoid the hasattr check below (which
+    # would also match the wrapper but would loop over the accessor property
+    # `lora_A`, redundantly resetting on every `lora_A_*` key the caller
+    # iterates). Both Mode 1 (independent, 3-D LoRA) and Mode 2 (shared, 2-D
+    # LoRA) are handled by the same dispatch since they share the
+    # ``reset_lora_parameters`` signature.
+    from .moe_lora import is_lora_moe_experts
 
-    if isinstance(lora_layer, LoraSharedExperts):
+    if is_lora_moe_experts(lora_layer):
         lora_layer.reset_lora_parameters(init_lora_weights=True)
         return
 

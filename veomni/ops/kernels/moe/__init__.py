@@ -70,26 +70,21 @@ def fused_lora_moe_forward(
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
+    lora_a_gate_up: torch.Tensor,
+    lora_b_gate_up: torch.Tensor,
     lora_a_down: torch.Tensor,
     lora_b_down: torch.Tensor,
+    lora_scale_gate_up: float,
     lora_scale_down: float,
-    **layout_kwargs,
 ):
     """Public dispatcher for the fused MoE forward + shared MoE-LoRA (Mode 2).
 
-    Mirrors :func:`fused_moe_forward` but with two layout-specific keyword
-    sets handled by the bound kernel (see
-    :func:`veomni.ops.kernels.moe.lora_group_gemm.group_gemm_fused_lora_moe_forward`):
-
-    * **v5 fused** — ``fc1_1_2_weight``, ``lora_a_gate_up``, ``lora_b_gate_up``,
-      ``lora_scale_gate_up``.
-    * **v4 split** — ``fc1_1_weight``, ``fc1_2_weight``, ``lora_a_gate``,
-      ``lora_b_gate``, ``lora_scale_gate``, ``lora_a_up``, ``lora_b_up``,
-      ``lora_scale_up``.
-
-    The down LoRA triple is always required (positional). Mixing layouts
-    raises in the underlying kernel.
+    Mirrors :func:`fused_moe_forward` for the fused experts layout: a single
+    ``fc1_1_2_weight`` (``[E, 2I, H]``) plus the fused gate+up LoRA pair and
+    the down LoRA pair (see
+    :func:`veomni.ops.kernels.moe.lora_group_gemm.group_gemm_fused_lora_moe_forward`).
 
     Raises ``NotImplementedError`` if no LoRA-aware fused kernel is bound for
     the active ``moe_implementation`` — callers (see
@@ -111,15 +106,18 @@ def fused_lora_moe_forward(
     )
 
     return _fused_lora_moe_forward(
-        num_experts,
-        routing_weights,
-        selected_experts,
-        hidden_states,
-        fc2_weight,
-        lora_a_down,
-        lora_b_down,
-        lora_scale_down,
-        **layout_kwargs,
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hidden_states,
+        fc1_1_2_weight=fc1_1_2_weight,
+        fc2_weight=fc2_weight,
+        lora_a_gate_up=lora_a_gate_up,
+        lora_b_gate_up=lora_b_gate_up,
+        lora_a_down=lora_a_down,
+        lora_b_down=lora_b_down,
+        lora_scale_gate_up=lora_scale_gate_up,
+        lora_scale_down=lora_scale_down,
     )
 
 

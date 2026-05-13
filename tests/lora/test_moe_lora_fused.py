@@ -13,21 +13,14 @@
 # limitations under the License.
 """Triton fused MoE-LoRA forward parity tests (Phase 4, non-EP).
 
-Covers both layouts handled by
-:class:`veomni.utils.moe_lora.LoraSharedExperts`:
+Exercises the fused experts path in
+:class:`veomni.utils.moe_lora.LoraSharedExperts._fused_forward` (the only
+layout VeOmni MoE-LoRA supports — see
+:func:`veomni.utils.moe_lora._validate_fused_layout`).
 
-* **v5 fused** (``_fused_forward_fused_v5``) — exercised when the installed
-  ``transformers`` is on the v5 modeling path (>= 5.0.0 for qwen3_moe).
-* **v4 split** (``_fused_forward_split_v4``) — exercised when the installed
-  ``transformers`` is on the v4 modeling path (< 5.0.0 for qwen3_moe).
-
-Both branches use the same :func:`build_toy` + :func:`load_lora_config`
-machinery as ``test_moe_lora_eager.py``; the version-routed
-``veomni/models/transformers/qwen3_moe/__init__.py`` selects the matching
-modeling code at import time, so a single test body covers both layouts.
-
-Each branch flips ``moe_implementation`` between ``fused_triton`` (kernel
-path) and ``eager`` (reference) and compares:
+Uses the same :func:`build_toy` + :func:`load_lora_config` machinery as
+``test_moe_lora_eager.py``. Each test flips ``moe_implementation`` between
+``fused_triton`` (kernel path) and ``eager`` (reference) and compares:
 
 1. forward outputs at small bf16 tolerance, and
 2. d/dlora_A, d/dlora_B at small bf16 tolerance.
@@ -58,7 +51,7 @@ from .utils import (
 )
 
 
-_TOY = "qwen3_moe_toy"  # Phase 4 / Phase 6 scope: qwen3_moe (v4 split + v5 fused, both via toy).
+_TOY = "qwen3_moe_toy"  # Phase 4 / Phase 6 scope: qwen3_moe (fused experts layout).
 
 # Forward and backward parity are checked via L2 relative error
 # (``||fused - eager|| / ||eager||``) instead of element-wise atol/rtol.
@@ -153,10 +146,7 @@ def _build_wrapped(*, fused: bool, lora_b_perturb_std: float = 0.02):
 
     Same RNG seed for both invocations → identical base + LoRA tensors. The
     only difference is which ``moe_implementation`` was patched at build time,
-    which determines whether ``_fused_lora_moe_forward`` is bound. Layout
-    (v5 fused vs v4 split) is whatever the version-routed
-    ``veomni/models/transformers/qwen3_moe/__init__.py`` resolves to for the
-    installed ``transformers``.
+    which determines whether ``_fused_lora_moe_forward`` is bound.
     """
     torch.manual_seed(0)
     with warnings.catch_warnings():
@@ -186,11 +176,10 @@ def test_wrapper_dispatch_chooses_fused_when_pointer_bound():
     """``LoraSharedExperts.forward`` must take the fused branch when the pointer is bound, eager otherwise."""
     _require_cuda_with_triton()
 
-    # Path A: fused build → wrapper.forward calls the layout's fused branch.
+    # Path A: fused build → wrapper.forward calls the fused branch.
     model_f, fqn_f, exp_f, lora_cfg = _build_wrapped(fused=True, lora_b_perturb_std=0.0)
     wrapper_f = model_f.get_submodule(fqn_f)
     assert isinstance(wrapper_f, LoraSharedExperts)
-    assert wrapper_f._layout in ("fused_v5", "split_v4"), f"unexpected layout {wrapper_f._layout!r}"
     h, idx, w = _make_inputs(exp_f)
     out_f = wrapper_f(h, idx, w)
     assert out_f.shape == h.shape
@@ -221,7 +210,7 @@ def test_fused_vs_eager_forward_parity():
     model_f, fqn_f, _exp_f, _ = _build_wrapped(fused=True, lora_b_perturb_std=0.02)
     wrapper_f = model_f.get_submodule(fqn_f)
     # Sanity: identical seed / wrap → identical LoRA tensors → makes the parity check meaningful.
-    # Iterate the layout's actual LoRA targets (v5: gate_up_proj/down_proj; v4: gate_proj/up_proj/down_proj).
+    # Iterate the wrapper's LoRA targets (gate_up_proj, down_proj — fused experts layout).
     for pname in wrapper_e._lora_specs:
         assert torch.equal(wrapper_e.get_lora_A_weight(pname), wrapper_f.get_lora_A_weight(pname))
         assert torch.equal(wrapper_e.get_lora_B_weight(pname), wrapper_f.get_lora_B_weight(pname))
@@ -230,7 +219,7 @@ def test_fused_vs_eager_forward_parity():
 
     l2 = _l2_rel(out_fused, out_eager)
     assert l2 <= _FWD_L2REL_TOL, (
-        f"forward parity broken ({wrapper_e._layout}): L2 relative error {l2:.4%} > {_FWD_L2REL_TOL:.2%} "
+        f"forward parity broken: L2 relative error {l2:.4%} > {_FWD_L2REL_TOL:.2%} "
         f"(eager_norm={out_eager.float().norm().item():.3e})"
     )
 
@@ -247,12 +236,10 @@ def test_fused_vs_eager_backward_parity():
         # Fixed loss (sum-of-squares) so both paths see the same upstream grad pattern.
         loss = wrapper(h, idx, w).float().pow(2).sum()
         loss.backward()
-        grads = {n: p.grad.detach().clone() for n, p in wrapper.named_parameters() if p.grad is not None}
-        return wrapper._layout, grads
+        return {n: p.grad.detach().clone() for n, p in wrapper.named_parameters() if p.grad is not None}
 
-    layout_e, grads_eager = _grads(fused=False)
-    layout_f, grads_fused = _grads(fused=True)
-    assert layout_e == layout_f, f"layout mismatch eager={layout_e!r} fused={layout_f!r}"
+    grads_eager = _grads(fused=False)
+    grads_fused = _grads(fused=True)
 
     assert set(grads_eager) == set(grads_fused), (
         f"different param sets received grad: only-eager={set(grads_eager) - set(grads_fused)}, "
@@ -267,6 +254,6 @@ def test_fused_vs_eager_backward_parity():
         assert ge.shape == gf.shape, f"{n}: shape mismatch eager={ge.shape} fused={gf.shape}"
         l2 = _l2_rel(gf, ge)
         assert l2 <= _GRAD_L2REL_TOL, (
-            f"{n} ({layout_e}): grad parity broken — L2 relative error {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
+            f"{n}: grad parity broken — L2 relative error {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
             f"(eager_norm={ge.float().norm().item():.3e}, max|fused-eager|={(ge - gf).abs().max().item():.3e})"
         )

@@ -1,12 +1,9 @@
-# LoRA fine-tuning config for Qwen3-Omni-MoE on transformers < 5.2.0 (v4 split experts).
-#
-# v4 modeling lives at `veomni/models/transformers/qwen3_omni_moe/modeling_qwen3_omni_moe.py`
-# and stores three independent 3D nn.Parameters on `Qwen3OmniMoeThinkerExperts`:
-# `gate_proj`, `up_proj`, `down_proj`. v5 fuses gate+up into `gate_up_proj` —
-# see `qwen3_omni_lora_v5.yaml` for that layout.
+# LoRA fine-tuning config for Qwen3-Omni-MoE.
 #
 # Qwen3-Omni-MoE wraps the LM under a `thinker.` prefix; experts FQN is
-# `thinker.model.layers.*.mlp.experts.{gate_proj,up_proj,down_proj}`.
+# `thinker.model.layers.*.mlp.experts.{gate_up_proj,down_proj}`. The wrapper
+# auto-detects the fused experts layout regardless of where the experts module
+# sits in the model tree.
 
 model:
   model_path: Qwen3-Omni-30B-A3B-Instruct
@@ -27,8 +24,7 @@ model:
       - v_proj
       - o_proj
     target_parameters:
-      - thinker.model.layers.*.mlp.experts.gate_proj
-      - thinker.model.layers.*.mlp.experts.up_proj
+      - thinker.model.layers.*.mlp.experts.gate_up_proj
       - thinker.model.layers.*.mlp.experts.down_proj
     share_expert_lora: true
 

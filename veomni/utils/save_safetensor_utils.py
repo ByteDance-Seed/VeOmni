@@ -293,17 +293,18 @@ def save_lora_adapter_with_dcp(
             raise ValueError(f"Cannot find peft config for adapter '{adapter_name}' on model.")
         model.peft_config[adapter_name].save_pretrained(save_path)
 
-        # If the model has VeOmni shared-MoE-LoRA wrappers, write a sidecar
-        # next to adapter_config.json so the resume path can reconstruct them
-        # before PEFT loads weights. PEFT itself doesn't know about these
-        # wrappers, but their state_dict keys round-trip through the standard
-        # PEFT save/load path because they follow the lora_*<adapter> naming
-        # convention (see veomni/utils/moe_lora.py docstring).
-        from .moe_lora import write_shared_lora_sidecar
+        # If the model has VeOmni MoE-LoRA wrappers (Mode 1 independent or
+        # Mode 2 shared), write a sidecar next to adapter_config.json so the
+        # resume path can reconstruct them before PEFT loads weights. PEFT
+        # itself doesn't know about these wrappers, but their state_dict
+        # keys round-trip through the standard PEFT save/load path because
+        # they follow the lora_*<adapter> naming convention (see
+        # veomni/utils/moe_lora.py docstring).
+        from .moe_lora import write_moe_lora_sidecar
 
-        sidecar = write_shared_lora_sidecar(model, save_path)
+        sidecar = write_moe_lora_sidecar(model, save_path)
         if sidecar is not None:
-            logger.info_rank0(f"Shared-MoE-LoRA sidecar written: {sidecar}")
+            logger.info_rank0(f"MoE-LoRA sidecar written: {sidecar}")
 
         shutil.rmtree(dcp_save_path, ignore_errors=True)
         logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")

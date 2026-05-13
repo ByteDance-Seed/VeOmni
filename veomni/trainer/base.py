@@ -262,25 +262,30 @@ class BaseTrainer(Stateful, ABC):
 
         - ``lora_modules`` (list[str]): forwarded to PEFT ``target_modules``.
           Use for ``nn.Linear`` targets (q/k/v/o, dense MLP, shared experts).
-        - ``target_parameters`` (list[str]): forwarded to PEFT
-          ``target_parameters`` (PEFT >= 0.19). Use for 3D ``nn.Parameter``
-          MoE expert weights, e.g.
+        - ``target_parameters`` (list[str]): identifies the 3-D ``nn.Parameter``
+          MoE expert weights to attach LoRA to, e.g.
           ``model.layers.*.mlp.experts.gate_up_proj`` /
-          ``model.layers.*.mlp.experts.down_proj``. PEFT materialises a
-          per-expert LoRA contribution on every forward; this is "Mode 1"
-          — independent LoRA per expert.
-        - ``share_expert_lora`` (bool, default ``False``): when ``True``,
-          attach a single LoRA pair *shared* by all experts ("Mode 2") via
-          a VeOmni-owned :class:`~veomni.utils.moe_lora.LoraSharedExperts`
-          wrapper, instead of forwarding ``target_parameters`` to PEFT.
-          ``target_parameters`` then identifies which experts modules to
-          wrap (any module owning at least one matching 3D ``nn.Parameter``).
-          ``lora_modules`` may still be provided in the same config to apply
-          standard PEFT LoRA on the surrounding ``nn.Linear`` layers
-          (q/k/v/o, router, etc.) alongside the shared MoE LoRA.
+          ``model.layers.*.mlp.experts.down_proj``. VeOmni owns this end-to-end
+          via the wrappers in :mod:`veomni.utils.moe_lora`; PEFT's own
+          ``target_parameters`` is **not** used (we replace the experts module,
+          not the parameter, so we can plug fused MoE-LoRA kernels in later).
+        - ``share_expert_lora`` (bool, default ``False``): selects the wrapper
+          flavour for the modules matched by ``target_parameters``:
+
+            * ``False`` (default) → :class:`~veomni.utils.moe_lora.LoraIndependentExperts`
+              (Mode 1): one LoRA pair *per expert* (3-D ``[E, r, H]`` /
+              ``[E, O, r]`` tensors). Mathematically equivalent to PEFT 0.19's
+              ``target_parameters`` 3-D path.
+            * ``True`` → :class:`~veomni.utils.moe_lora.LoraSharedExperts`
+              (Mode 2): a single LoRA pair *shared* across all experts of the
+              layer (2-D ``[r, H]`` / ``[O, r]`` tensors).
+
+          ``lora_modules`` may be provided alongside ``target_parameters`` so
+          standard PEFT LoRA on surrounding ``nn.Linear`` layers (q/k/v/o,
+          shared_expert, router etc.) coexists with the MoE-LoRA wrappers.
         - ``use_rslora`` (bool, default ``False``): rank-stabilised LoRA
-          scaling (``alpha / sqrt(r)``); forwarded to PEFT and to the
-          shared-MoE wrapper.
+          scaling (``alpha / sqrt(r)``); forwarded to PEFT and to both
+          MoE-LoRA wrapper flavours.
         """
         lora_config = self.args.model.lora_config
         if not bool(lora_config):
@@ -291,20 +296,22 @@ class BaseTrainer(Stateful, ABC):
             logger.info_rank0(f"Wrapping model with PeftModel from {lora_adapter_path}.")
             from peft import PeftModel
 
-            from ..utils.moe_lora import apply_shared_moe_lora_from_sidecar, read_shared_lora_sidecar
+            from ..utils.moe_lora import apply_moe_lora_from_sidecar, read_moe_lora_sidecar
 
-            # If the saved adapter contains shared-MoE-LoRA wrappers (Mode 2),
-            # the sidecar tells us which experts modules to re-wrap *before*
-            # PEFT loads the adapter state dict — otherwise the saved
-            # ``lora_A_<param>.<adapter>.weight`` keys have no destination in
-            # the model and PEFT silently drops them as `unexpected_keys`.
-            sidecar = read_shared_lora_sidecar(lora_adapter_path)
+            # If the saved adapter contains MoE-LoRA wrappers (Mode 1 or
+            # Mode 2), the sidecar tells us which experts modules to re-wrap
+            # *before* PEFT loads the adapter state dict — otherwise the
+            # saved ``lora_A_<param>.<adapter>.weight`` keys have no
+            # destination in the model and PEFT silently drops them as
+            # ``unexpected_keys``. Dispatch on ``sidecar["mode"]``.
+            sidecar = read_moe_lora_sidecar(lora_adapter_path)
             if sidecar is not None:
                 logger.info_rank0(
-                    f"Found shared-MoE-LoRA sidecar at {lora_adapter_path}; re-installing "
-                    f"{len(sidecar.get('wrapped_fqns', []))} wrapper(s) before PeftModel.from_pretrained."
+                    f"Found {sidecar['mode']} MoE-LoRA sidecar at {lora_adapter_path}; "
+                    f"re-installing {len(sidecar.get('wrapped_fqns', []))} wrapper(s) "
+                    "before PeftModel.from_pretrained."
                 )
-                apply_shared_moe_lora_from_sidecar(self.model, sidecar)
+                apply_moe_lora_from_sidecar(self.model, sidecar)
 
             # When init_device="meta" the base model params are meta tensors.
             # PeftModel.from_pretrained tries to copy loaded weights into the meta
@@ -330,61 +337,65 @@ class BaseTrainer(Stateful, ABC):
                     "lora_config must specify at least one of 'lora_modules' (for nn.Linear "
                     "targets) or 'target_parameters' (for nn.Parameter MoE expert targets)."
                 )
-            # share_expert_lora controls the *handling* of target_parameters
-            # when present. If target_parameters is empty, the flag has no
-            # effect and we fall through to the standard PEFT path on
-            # lora_modules only.
-            wrap_shared_moe = bool(share_expert_lora) and bool(target_parameters)
+
+            # Pick the wrapper flavour for the matched experts modules. The
+            # default (Mode 1, independent per-expert) is a drop-in functional
+            # replacement for PEFT 0.19's ``target_parameters`` 3-D path, but
+            # owned by VeOmni so we can dispatch into a fused triton MoE-LoRA
+            # kernel (Round 2) without depending on PEFT internals.
+            wrap_moe = bool(target_parameters)
+            moe_mode = "shared" if share_expert_lora else "independent"
             if share_expert_lora and not target_parameters:
                 logger.info_rank0(
                     "lora_config['share_expert_lora']=True but no target_parameters set; "
                     "the flag is inert (no MoE LoRA wrappers will be installed)."
                 )
-            if wrap_shared_moe and not target_modules:
-                # Without lora_modules we never call get_peft_model, so the
-                # resulting model has no peft_config and our save helper has
-                # nothing to anchor adapter_config.json against. Phase 2 keeps
-                # this combination unsupported; users can pass an empty/dummy
-                # lora_modules list once we add a custom save path for the
-                # share-only case.
+            if wrap_moe and not target_modules:
+                # Without ``lora_modules`` we never call ``get_peft_model``, so
+                # the resulting model has no ``peft_config`` and our save helper
+                # has nothing to anchor ``adapter_config.json`` against. Same
+                # constraint applies to both wrapper flavours.
                 raise NotImplementedError(
-                    "share_expert_lora=True with target_parameters but no lora_modules "
-                    "is not supported yet (no PEFT shell, so save/load has nothing to "
-                    "anchor adapter_config.json). Add at least one nn.Linear target to "
-                    "'lora_modules' (e.g. 'q_proj') for now."
+                    "target_parameters set without lora_modules is not supported yet "
+                    "(no PEFT shell → save/load has nothing to anchor adapter_config.json "
+                    "against). Add at least one nn.Linear target to 'lora_modules' "
+                    "(e.g. 'q_proj') alongside the MoE expert targets for now."
                 )
 
-            # Mode 2: PEFT only handles target_modules — apply_shared_moe_lora
-            # wraps experts modules ourselves below.
-            peft_target_parameters = None if wrap_shared_moe else target_parameters
+            # VeOmni owns both MoE-LoRA modes — never forward
+            # ``target_parameters`` to PEFT, otherwise we'd double-wrap the
+            # experts (PEFT's _LoraParameterWrapper + our wrapper).
             peft_cfg = LoraConfig(
                 r=lora_config["rank"],
                 lora_alpha=lora_config["alpha"],
                 target_modules=target_modules,
-                target_parameters=peft_target_parameters,
+                target_parameters=None,
                 use_rslora=use_rslora,
             )
             logger.info_rank0(f"LoraConfig: {peft_cfg.to_dict()}.")
             if target_modules:
-                # get_peft_model freezes everything except the new q/k/v/o LoRA;
-                # apply_shared_moe_lora can then skip its own freeze pass.
+                # get_peft_model freezes everything except the new q/k/v/o
+                # LoRA; the MoE wrapper can then skip its own freeze pass.
                 self.model = get_peft_model(self.model, peft_cfg)
 
-            if wrap_shared_moe:
-                from ..utils.moe_lora import apply_shared_moe_lora
+            if wrap_moe:
+                from ..utils.moe_lora import apply_independent_moe_lora, apply_shared_moe_lora
 
-                wrapped = apply_shared_moe_lora(
+                apply_fn = apply_shared_moe_lora if moe_mode == "shared" else apply_independent_moe_lora
+                wrapped = apply_fn(
                     self.model,
                     target_parameter_patterns=target_parameters,
                     r=lora_config["rank"],
                     lora_alpha=lora_config["alpha"],
                     use_rslora=use_rslora,
-                    # If PEFT already wrapped the model, it has marked everything
-                    # except adapter params as frozen; do not undo that.
+                    # If PEFT already wrapped the model, it has marked
+                    # everything except adapter params as frozen; don't undo
+                    # that.
                     freeze_base_model=not bool(target_modules),
                 )
                 logger.info_rank0(
-                    f"Wrapped {len(wrapped)} experts module(s) with shared MoE LoRA (showing first 3): {wrapped[:3]}"
+                    f"Wrapped {len(wrapped)} experts module(s) with {moe_mode} MoE-LoRA "
+                    f"(showing first 3): {wrapped[:3]}"
                 )
 
         if hasattr(self.model, "print_trainable_parameters"):

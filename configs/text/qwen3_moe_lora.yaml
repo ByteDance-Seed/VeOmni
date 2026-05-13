@@ -1,7 +1,7 @@
-# LoRA fine-tuning config for Qwen3-MoE on transformers >= 5.0.0 (v5 fused experts).
+# LoRA fine-tuning config for Qwen3-MoE.
 #
-# v5 `Qwen3MoeExperts` stores fused `gate_up_proj` (3D, [num_experts, hidden, 2*intermediate])
-# and `down_proj`. Use `qwen3_moe_lora_v4.yaml` for transformers < 5.0.0 (split layout).
+# `Qwen3MoeExperts` stores fused `gate_up_proj` (3D, [num_experts, 2*intermediate, hidden])
+# and `down_proj` (3D, [num_experts, hidden, intermediate]).
 #
 # `lora_config` schema (`veomni/trainer/base.py::_setup_lora`):
 #   - `lora_modules`         — nn.Linear targets handled by PEFT (q/k/v/o, router, etc.).
