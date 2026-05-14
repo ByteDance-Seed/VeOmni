@@ -208,7 +208,12 @@ def build_torchrun_cmd(
         f"--model.config_path={config_path}",
         f"--data.train_path={train_path}",
         "--data.dyn_bsz_buffer_size=1",
-        "--train.global_batch_size=16",
+        # Keep micro_batch=1 (already minimum) and global=8 so the
+        # grad-accum cycles per step stay small. The qwen3_5 toy with
+        # its full 248K vocab embedding fragments the PyTorch allocator
+        # quickly; fewer fw+bw passes per step ⇒ less cache thrash and
+        # less GPU memory required on the L20 (44 GiB) runners.
+        "--train.global_batch_size=8",
         "--train.micro_batch_size=1",
         f"--train.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
