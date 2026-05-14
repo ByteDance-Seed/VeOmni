@@ -2,16 +2,20 @@
 
 This document guides developers on how to quickly locate and resolve precision issues when migrating and training models on Ascend NPUs. Through standardized processes and tool usage, even first-time users can efficiently achieve precision alignment.
 
-## Precision Standards and Acceptance Metrics
+## Understanding Precision Considerations
 
-In Ascend NPUs, GPU (CUDA) training results are typically used as a baseline to compare with NPU training results. Precision standards primarily evaluate whether model training on Ascend NPUs is consistent with baseline results. Usually, precision standards focus on the Mean Absolute Error (MAE) or Mean Relative Error (MRE) of loss values.
+When working with Ascend NPUs, precision behavior can vary based on multiple factors including model architecture, operator implementations, and training configurations. Instead of rigid thresholds, it's important to focus on identifying and analyzing precision discrepancies that may impact model performance.
 
-### Core Precision Metrics
+### Common Precision Indicators
 
-- **Mean Absolute Error (MAE)**: ≤ 1% ~ 2%
-- **Mean Relative Error (MRE)**: ≤ 1% ~ 2%
+While specific thresholds depend on the use case, the following metrics can help identify potential precision issues:
 
-These standards apply to most model migration and training scenarios, but may need adjustment based on specific client requirements in certain cases.
+- **Loss Consistency**: Stable and expected loss reduction patterns during training
+- **Output Similarity**: Comparable model outputs for identical inputs
+- **Numerical Stability**: Absence of NaN/Inf values and extreme outliers
+- **Convergence Behavior**: Similar training convergence characteristics across runs
+
+Precision analysis should be tailored to the specific model and training objectives, considering factors like model size, complexity, and target performance metrics.
 
 ## Precision Anomaly Determination
 
