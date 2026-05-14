@@ -38,8 +38,18 @@ Please refer to the specific installation guides based on your architecture:
 
 VeOmni also provides Docker support for Ascend NPUs. For detailed instructions on building and using Ascend Docker images, please refer to:
 
-- [Ascend A3 Docker Image Build and Usage Guide](../get_started/AscendDockerUse/build_a3_docker.md)
-- [Ascend A2 Docker Image Build and Usage Guide](../get_started/AscendDockerUse/build_a2_docker.md)
+- [Ascend A3 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a3_docker.md)
+- [Ascend A2 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a2_docker.md)
+
+## Version Compatibility
+
+The following table shows the supported software versions for VeOmni when running on Ascend NPUs:
+
+| VeOmni Version | PyTorch | torch_npu | CANN Version | Python Version |
+|----------------|-------- | -----------|--------------|----------------|
+| 0.1.0 | 2.7.1                | 2.7.1             | 8.3rc2      | 3.11           |
+| 0.1.8 | 2.7.1                | 2.7.1             | 9.0.0       | 3.11           |
+| main  | In-development    | In-development | In-development | In-development |
 
 ## Supported Models
 
@@ -47,10 +57,9 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 
 | Model                | Model Size       | Support | FSDP1 | FSDP2 | EP | SP | Note                                           |
 |----------------------|------------------|---------|-------|-------|----|----|------------------------------------------------|
-| [Qwen3](../examples/qwen3.md) | 8B               | ✅       |       | ✅     |    | ✅   |
-|                      | 30B              | ✅       |       | ✅     | ✅   | ✅   |                                                |
+| [Qwen3](../examples/qwen3.md) | 8B/30B               | ✅       |       | ✅     |    | ✅   |
 | [Qwen3.5](../examples/qwen3.md) | 9B    |          |         | ✅    |      |✅    | supporting   |
-|                      | 35B              |         |       | ✅     |✅    |✅    |  supporting                                   |
+|                      | 35B-A3B              |         |       | ✅     |✅    |✅    |  supporting                                   |
 | [Qwen3-VL](../examples/qwen3_vl.md) | 8B               | ✅       |       | ✅     |    | ✅  |                               |
 |                      | 30B              | ✅       |       | ✅     | ✅  | ✅  |                                                |
 | [Wan2.1](../examples/wan2.1.md)    | 14B              | ✅       | ✅     |       |    | ✅  |                               |
@@ -63,37 +72,9 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 
 For detailed configuration files and training examples, please refer to the [configs](https://github.com/ByteDance-Seed/VeOmni/tree/main/configs) directory in the repository.
 
-## Ascend Environment Variables
+For information about optimizing environment variables for Ascend NPUs, please refer to our dedicated documentation:
 
-### CPU_AFFINITY_CONF
-
-```shell
-export CPU_AFFINITY_CONF=1
-```
-Enable coarse-grained or fine-grained CPU core binding. This configuration helps prevent thread contention, improves cache hit rates, avoids memory access across different NUMA (Non-Uniform Memory Access) nodes, and reduces task scheduling overhead—collectively optimizing task execution efficiency.
-Parameter Settings:
-
-* `0`: Disable the binding function. Default is `0`.
-* `1`: Enable coarse-grained kernel binding.
-* `2`: Enable fine-grained kernel binding.
-
-### PYTORCH_NPU_ALLOC_CONF
-
-```bash
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-```
-
-`expandable_segments:<value>`: Enable the memory pool extension segment feature.  
-* `True`: This configuration instructs the cache allocator to create specific memory blocks with the capability to be extended later. This allows for more efficient handling of scenarios where the required memory size frequently changes during runtime.  
-* `False`: The memory pool extension segment feature is disabled, and the original memory allocation method is used. Default is `False`.
-
-### MULTI_STREAM_MEMORY_REUSE
-
-```bash
-export MULTI_STREAM_MEMORY_REUSE=2
-```
-
-Refer to: https://github.com/ByteDance-Seed/VeOmni/issues/575
+[Ascend Environment Variables Configuration Guide](npu_variables.md)
 
 ## Typical Usage
 

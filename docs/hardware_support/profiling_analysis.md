@@ -47,7 +47,7 @@ train:
 
 After configuring the collection script, start the training script to begin performance data collection. Results are output to the specified folder. MindStudio is typically used for visual analysis of profiling data.
 
-Use MindStudio Insight's visualization tools for performance analysis, viewing operator execution time, communication time, memory usage, etc. For details, refer to the [Ascend Tool Official Documentation](https://www.hiascend.com/document/detail/zh/mindstudio/70RC3/msinsightug/msascendinsightug/Insight_userguide_0002.html).
+Use MindStudio Insight's visualization tools for performance analysis, viewing operator execution time, communication time, memory usage, etc. For details, refer to the [Ascend Tool Official Documentation](https://www.hiascend.com/document/detail/zh/mindstudio/2600/GUI_baseddevelopmenttool/MindStudioInsight/docs/zh/user_guide/overview.md).
 
 ## Typical Performance Problem Analysis
 

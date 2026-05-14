@@ -44,6 +44,7 @@ usage/agent_workflow.md
 
 hardware_support/get_started_npu.md
 hardware_support/typical_usage.md
+hardware_support/npu_variables.md
 hardware_support/precision_analysis.md
 hardware_support/profiling_analysis.md
 hardware_support/FAQ.md

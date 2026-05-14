@@ -126,7 +126,7 @@ After identifying the problematic operator, conduct isolated testing.
 
 ## Tool for Locating Precision Issues - MindStudio
 
-Use the `mindstudio-probe` tool for precision data collection. This document provides examples; for details, please refer to the [Ascend Tool Official Documentation](https://gitcode.com/Ascend/msprobe/tree/f5900e0670ab5406b75d79635dde062d80ad84f0).
+Use the `mindstudio-probe` tool for precision data collection. This document provides examples; for details, please refer to the [Ascend Tool Official Documentation](https://gitcode.com/Ascend/msprobe/).
 
 ### Localization Process
 
