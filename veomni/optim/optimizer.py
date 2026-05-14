@@ -31,6 +31,8 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
+from .muon import DistributedMuon, split_muon_adamw_params
 
 
 logger = logging.get_logger(__name__)
@@ -269,13 +271,37 @@ def build_optimizer(
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    muon_kwargs: Optional[Dict[str, Any]] = None,
 ) -> "torch.optim.Optimizer":
-    # ExtraParallel-aware routing: for FSDP2+ExtraParallel, split params into ExtraParallel and non-ExtraParallel groups and build two optimizers.
+    if optimizer_type == "muon":
+        if not is_transformers_version_greater_or_equal_to("5.0.0"):
+            raise RuntimeError(
+                "optimizer_type='muon' is only supported with transformers>=5.0.0. "
+                "Please switch to the transformers v5 environment or use AdamW."
+            )
+        if param_groups is not None:
+            logger.warning_rank0(
+                "build_optimizer(optimizer_type='muon') ignores the provided "
+                "param_groups argument; all parameters are re-split by "
+                "split_muon_adamw_params. To control vit vs. backbone learning "
+                "rates with Muon, file a follow-up or use AdamW for now."
+            )
+        return _build_muon_with_adamw(
+            model,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            fused=fused,
+            no_decay_modules=no_decay_modules,
+            no_decay_params=no_decay_params,
+            muon_kwargs=muon_kwargs,
+        )
+
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
         )
-    # Other cases remain the same
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
         param_groups = [
@@ -301,9 +327,133 @@ def build_optimizer(
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
-        raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+        raise ValueError(
+            "Only adamw, anyprecision_adamw and muon are supported as optimizers; "
+            f"got optimizer_type={optimizer_type!r}."
+        )
 
     return optim
+
+
+def _is_extra_parallel_param(p: torch.nn.Parameter, extra_parallel_names: Sequence[str]) -> Optional[str]:
+    """Return the ExtraParallel name for a DTensor param, or ``None``."""
+    if DTensor is None or not isinstance(p, DTensor):
+        return None
+    mesh = getattr(p, "device_mesh", None)
+    names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
+    for para in extra_parallel_names:
+        if f"{para}_fsdp" in names:
+            return para
+    return None
+
+
+def _build_muon_with_adamw(
+    model: "nn.Module",
+    lr: float,
+    betas: Tuple[float, float],
+    eps: float,
+    weight_decay: float,
+    fused: bool,
+    no_decay_modules: Optional[List[str]],
+    no_decay_params: Optional[List[str]],
+    muon_kwargs: Optional[Dict[str, Any]],
+) -> "MultiOptimizer":
+    """Build a Muon (2D/3D hidden weights) + AdamW (everything else) MultiOptimizer.
+
+    ExtraParallel params are split into separate sub-optimizers so DCP state
+    dict keys and grad-clipping metadata stay keyed by mesh.
+    """
+    muon_kwargs = dict(muon_kwargs or {})
+    muon_params, adamw_params, muon_names, adamw_names = split_muon_adamw_params(
+        model,
+        no_decay_modules=no_decay_modules,
+        no_decay_params=no_decay_params,
+    )
+    if not muon_params:
+        raise ValueError(
+            "Muon optimizer was selected but the model has no eligible 2D/3D parameters. "
+            "Falling back to AdamW would be silent so we raise instead."
+        )
+
+    extra_parallel_aware = _should_build_extra_parallel_aware(model)
+    parallel_state = get_parallel_state() if extra_parallel_aware else None
+    extra_parallel_names = list(parallel_state.extra_parallel_names) if extra_parallel_aware else []
+
+    def _split_by_ep(
+        params: List[torch.nn.Parameter],
+    ) -> Tuple[Dict[str, List[torch.nn.Parameter]], List[torch.nn.Parameter]]:
+        per_para: Dict[str, List[torch.nn.Parameter]] = {p: [] for p in extra_parallel_names}
+        non_para: List[torch.nn.Parameter] = []
+        if not extra_parallel_aware:
+            return per_para, list(params)
+        for p in params:
+            para = _is_extra_parallel_param(p, extra_parallel_names)
+            if para is not None:
+                per_para[para].append(p)
+            else:
+                non_para.append(p)
+        return per_para, non_para
+
+    muon_per_para, muon_non_para = _split_by_ep(muon_params)
+    adamw_per_para, adamw_non_para = _split_by_ep(adamw_params)
+
+    logger.info_rank0(
+        f"Muon optimizer: {len(muon_params)} param(s) on Muon, {len(adamw_params)} on AdamW. "
+        f"First few Muon params: {muon_names[:5]}; first few AdamW params: {adamw_names[:5]}."
+    )
+    if extra_parallel_aware:
+        for para in extra_parallel_names:
+            logger.info_rank0(
+                f"Muon split for {para}: muon_{para}={len(muon_per_para[para])}, "
+                f"adamw_{para}={len(adamw_per_para[para])}, "
+                f"muon_non_extra_parallel={len(muon_non_para)}, adamw_non_extra_parallel={len(adamw_non_para)}"
+            )
+
+    def _make_muon(params: List[torch.nn.Parameter]) -> DistributedMuon:
+        return DistributedMuon(
+            params,
+            lr=muon_kwargs.get("lr", 2e-2),
+            weight_decay=muon_kwargs.get("weight_decay", 0.0),
+            momentum=muon_kwargs.get("momentum", 0.95),
+            nesterov=muon_kwargs.get("nesterov", True),
+            ns_coefficients=tuple(muon_kwargs.get("ns_coefficients", (3.4445, -4.7750, 2.0315))),
+            eps=muon_kwargs.get("eps", 1e-7),
+            ns_steps=muon_kwargs.get("ns_steps", 5),
+            adjust_lr_fn=muon_kwargs.get("adjust_lr_fn", "match_rms_adamw"),
+        )
+
+    def _make_adamw(params: List[torch.nn.Parameter]) -> AdamW:
+        groups = _make_param_groups_for_subset(model, params, weight_decay, no_decay_modules, no_decay_params)
+        foreach = not fused
+        return AdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, fused=fused, foreach=foreach)
+
+    optimizer_dict: Dict[str, Optimizer] = {}
+    if extra_parallel_aware:
+        for para in extra_parallel_names:
+            if muon_per_para[para]:
+                optimizer_dict[f"muon_{para}"] = _make_muon(muon_per_para[para])
+        if muon_non_para:
+            optimizer_dict["muon_non_extra_parallel"] = _make_muon(muon_non_para)
+    else:
+        optimizer_dict["muon"] = _make_muon(muon_non_para)
+
+    if extra_parallel_aware:
+        for para in extra_parallel_names:
+            if adamw_per_para[para]:
+                optimizer_dict[para] = _make_adamw(adamw_per_para[para])
+        if adamw_non_para:
+            optimizer_dict["non_extra_parallel"] = _make_adamw(adamw_non_para)
+    elif adamw_params:
+        optimizer_dict["adamw"] = _make_adamw(adamw_non_para)
+
+    # Grad clipping groups by mesh, not by optimizer type.
+    if extra_parallel_aware:
+        model._extra_parallel_param_groups = {
+            para: list(muon_per_para[para]) + list(adamw_per_para[para]) for para in extra_parallel_names
+        }
+        model._extra_parallel_param_groups["non_extra_parallel"] = list(muon_non_para) + list(adamw_non_para)
+
+    return MultiOptimizer(model, optimizer_dict, key_names=list(optimizer_dict.keys()))
 
 
 def build_extra_parallel_fsdp2_optimizer(

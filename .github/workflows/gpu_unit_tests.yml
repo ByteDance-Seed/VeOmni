@@ -155,7 +155,6 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
-
   gpu_unit_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: lint
@@ -227,6 +226,11 @@ jobs:
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |
           uv run --frozen pytest -s -x tests/utils/test_count_flops.py
+      - name: Run Muon optimizer tests
+        run: |
+          uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
+          uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
+          uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
       # TODO: also run these tests on the legacy v4 path (currently skipped there).
       - name: Install LoRA extra
         run: |
