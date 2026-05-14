@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed._tensor import Shard
-from torch.distributed.fsdp import FSDPModule
+from torch.distributed.fsdp import FSDPModule, CPUOffloadPolicy
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
@@ -203,6 +203,11 @@ def parallelize_model_fsdp2(
             cast_forward_inputs=mixed_precision.cast_forward_inputs,
         )
         fsdp_kwargs["mp_policy"] = mp_policy
+    # prepare offload_policy kwargs
+    enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
+    if enable_fsdp_cpu_offload:
+        logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
+        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
         modules_to_ignore_in_mixed_precision = model.get_ignore_modules_in_mixed_precision()
@@ -351,9 +356,10 @@ def parallelize_model_fsdp2(
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
+    materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
     if weights_path is None:
-        model.to_empty(device=get_device_type())
+        model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
         model.init_weights()
     else:
@@ -373,7 +379,7 @@ def parallelize_model_fsdp2(
             rank0_load_and_broadcast_weights(
                 model,
                 weights_path,
-                get_device_type(),
+                materialize_device,
                 dtensor_factory=distribute_tensor,
                 cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
                 max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
@@ -386,7 +392,7 @@ def parallelize_model_fsdp2(
             load_model_weights(
                 model,
                 weights_path,
-                get_device_type(),
+                materialize_device,
                 dtensor_factory=_dt_local_split,
                 is_peft_model=is_peft_model,
                 adapter_path=adapter_path,

@@ -42,7 +42,7 @@ from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from ..utils.device import synchronize
+from ..utils.device import get_device_type, synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.import_utils import is_diffusers_available
 from .checkpoint_tensor_loading import get_checkpoint_tensor_converter, maybe_convert_checkpoint_tensor
@@ -176,6 +176,7 @@ def _dispatch_parameter(
     tensor: "torch.Tensor",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     parallel_plan: Optional["ParallelPlan"] = None,
+    dtensor_to_cpu: bool = False,
 ) -> None:
     """
     Assigns parameter to an empty model.
@@ -190,15 +191,17 @@ def _dispatch_parameter(
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
-    tensor = tensor.to(orig_tensor)
     if hasattr(orig_tensor, "device_mesh"):  # dtensor
-        if orig_tensor.device.type == "cpu":
-            raise ValueError("Cannot load dtensor on CPU.")
-
+        if dtensor_factory is None:
+            raise ValueError("dtensor parameter requires a dtensor_factory.")
         device_mesh = orig_tensor.device_mesh
         placements = orig_tensor.placements
-        module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+        sharded_tensor = dtensor_factory(tensor.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        if dtensor_to_cpu:
+            sharded_tensor = sharded_tensor.to("cpu")
+        module._parameters[local_name].data.copy_(sharded_tensor)
     else:  # not dtensor
+        tensor = tensor.to(orig_tensor)
         module._parameters[local_name].data.copy_(tensor)
 
 
@@ -207,6 +210,7 @@ def _dispatch_buffer(
     name: str,
     buffer: "torch.Tensor",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    dtensor_to_cpu: bool = False,
 ) -> None:
     """
     Assigns buffer to an empty model.
@@ -220,9 +224,18 @@ def _dispatch_buffer(
 
         device_mesh = orig_tensor.device_mesh
         placements = orig_tensor.placements
-        module._buffers[name] = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        sharded_buffer = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        if dtensor_to_cpu:
+            sharded_buffer = sharded_buffer.to("cpu")
+        module._buffers[name] = sharded_buffer
     else:
         module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
+
+
+def _get_communication_device(init_device: Literal["cpu", "cuda", "npu"]) -> torch.device:
+    if init_device == "cpu":
+        return torch.device(get_device_type())
+    return torch.device(init_device)
 
 
 def _init_parameter(
@@ -301,6 +314,7 @@ def load_model_weights(
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
+    dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available
     parallel_plan = None
@@ -326,7 +340,7 @@ def load_model_weights(
             buffer_dict[name] = tensor.clone()
         elif name in parameter_names_to_load:
             parameter_names_to_load.remove(name)
-            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
         else:
             logger.info_rank0(f"Unexpected key in state dict: {name}.")
 
@@ -361,7 +375,9 @@ def load_model_weights(
             parameter_names_to_load=parameter_names_to_load,
         )
 
-    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
+    post_process_after_weight_loading(
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+    )
 
 
 @torch.no_grad()
@@ -386,6 +402,7 @@ def rank0_load_and_broadcast_weights(
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
+    dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available
     parallel_plan = None
@@ -404,7 +421,7 @@ def rank0_load_and_broadcast_weights(
 
     converter = get_checkpoint_tensor_converter(model)
     global_rank = get_parallel_state().global_rank
-    torch_device = torch.device(init_device)
+    torch_device = _get_communication_device(init_device)
 
     def _broadcast_and_dispatch(name, shape, dtype, tensor):
         """Broadcast a single (name, tensor) from rank0 and dispatch it."""
@@ -424,7 +441,7 @@ def rank0_load_and_broadcast_weights(
             buffer_dict[name] = tensor.detach().clone()
         elif name in parameter_names_to_load:
             parameter_names_to_load.discard(name)
-            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
         else:
             if global_rank == 0:
                 logger.info_rank0(f"Unexpected key in state dict: {name}.")
@@ -531,22 +548,23 @@ def rank0_load_and_broadcast_weights(
 
             chunk_loaded_data = list(tensor.chunk(para_size, dim=0))
 
-        assert shard_tensor.is_cuda, "Shard parameter should be on CUDA."
         is_shard_tensor_dtensor = hasattr(shard_tensor, "device_mesh")
         if is_shard_tensor_dtensor:
             device_mesh = shard_tensor.device_mesh
             placements = shard_tensor.placements
+            shard_comm_device = torch.device(device_mesh.device_type)
         else:
             device_mesh = None
             placements = None
+            shard_comm_device = _get_communication_device(init_device)
 
         broadcast_buffer = torch.empty(
             shard_tensor.shape,
             dtype=shard_tensor.dtype,
-            device=shard_tensor.device,
+            device=shard_comm_device,
         )
         shard_dst_ranks = _get_extra_parallel_shard_dst_ranks(
-            parallel_state, para_group_name, para_size, shard_tensor.device
+            parallel_state, para_group_name, para_size, shard_comm_device
         )
         for chunk_id in range(para_size):
             # For example:
@@ -574,9 +592,12 @@ def rank0_load_and_broadcast_weights(
 
                 if global_rank in dst_ranks:
                     if is_shard_tensor_dtensor:
-                        shard_tensor.copy_(dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous())
+                        chunk_tensor = dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous()
+                        if dtensor_to_cpu:
+                            chunk_tensor = chunk_tensor.to("cpu")
+                        shard_tensor.copy_(chunk_tensor)
                     else:
-                        shard_tensor.copy_(broadcast_buffer.contiguous())
+                        shard_tensor.copy_(broadcast_buffer.to(shard_tensor.device).contiguous())
 
             elif global_rank in send_seq:
                 if is_shard_tensor_dtensor:
@@ -588,9 +609,12 @@ def rank0_load_and_broadcast_weights(
                 dist.recv(broadcast_buffer, src=0, tag=tag)
 
                 if is_shard_tensor_dtensor:
-                    shard_tensor.copy_(dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous())
+                    chunk_tensor = dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous()
+                    if dtensor_to_cpu:
+                        chunk_tensor = chunk_tensor.to("cpu")
+                    shard_tensor.copy_(chunk_tensor)
                 else:
-                    shard_tensor.copy_(broadcast_buffer.contiguous())
+                    shard_tensor.copy_(broadcast_buffer.to(shard_tensor.device).contiguous())
 
         logger.info_rank0(
             f"{name=}, {shape=}, {dtype=}, chunk and broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
@@ -731,7 +755,9 @@ def rank0_load_and_broadcast_weights(
             parameter_names_to_load=parameter_names_to_load,
         )
 
-    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
+    post_process_after_weight_loading(
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+    )
 
 
 def post_process_after_weight_loading(
@@ -739,6 +765,7 @@ def post_process_after_weight_loading(
     buffer_dict,
     parameter_names_left: Optional[set[str]] = None,
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    dtensor_to_cpu: bool = False,
 ):
     """
     shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights.
@@ -746,7 +773,7 @@ def post_process_after_weight_loading(
     parameter_names_left = parameter_names_left or set()
 
     for name, buffer in buffer_dict.items():
-        _dispatch_buffer(model, name, buffer, dtensor_factory)
+        _dispatch_buffer(model, name, buffer, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu)
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
         for name in sorted(parameter_names_left):

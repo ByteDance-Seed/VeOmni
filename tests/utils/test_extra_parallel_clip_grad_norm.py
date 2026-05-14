@@ -2,6 +2,7 @@ import math
 import subprocess
 from dataclasses import dataclass, field
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor, Shard
@@ -184,6 +185,10 @@ def main():
             if grad is None:
                 continue
             grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+            if args.train.accelerator.fsdp_config.offload:
+                assert grad_local.device.type == "cpu", (
+                    f"Expected offloaded grad for {name} to be on cpu, got {grad_local.device.type}."
+                )
             logger.info_rank0(f"{msg}: the local grad for {name}: {grad_local}")
             if name == "decoder.moe.experts":
                 torch.testing.assert_close(
@@ -351,7 +356,8 @@ def test_clip_grad_norm_fsdp2_emb8():
     assert result.returncode == 0
 
 
-def test_clip_grad_norm_fsdp2_ep2_emb4():
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_fsdp2_ep2_emb4(cpu_offload: bool):
     command = [
         "torchrun",
         "--nnodes=1",
@@ -367,6 +373,8 @@ def test_clip_grad_norm_fsdp2_ep2_emb4():
         "--train.init_device=meta",
         "--train.checkpoint.output_dir='debug'",
     ]
+    if cpu_offload:
+        command.append("--train.accelerator.fsdp_config.offload=True")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 

@@ -131,23 +131,23 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
         for g in grads
     ]
 
-    default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
-    res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
+    reduce_device = torch.device(get_device_type())
+    res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
     with torch.no_grad():
         grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
         for (device, _), ([device_grads_local], _) in grouped_grads_local.items():
             if _has_foreach_support(device_grads_local, device) or _device_has_foreach_support(device):
                 out = torch._foreach_pow_(torch._foreach_norm(device_grads_local, p), p)
-                res += torch.sum(torch.stack(out)).to(default_device)
+                res += torch.sum(torch.stack(out)).to(reduce_device)
             else:
                 for grad_local in device_grads_local:
                     gn = torch.norm(grad_local, p=p)
-                    res = res + (gn**p).to(default_device)
+                    res = res + (gn**p).to(reduce_device)
     return res
 
 
 def _local_max(params: List[torch.nn.Parameter]) -> torch.Tensor:
-    dev = None
+    reduce_device = torch.device(get_device_type())
     mx = None
     for q in params:
         g = q.grad
@@ -157,14 +157,12 @@ def _local_max(params: List[torch.nn.Parameter]) -> torch.Tensor:
             g_local = g.to_local()
         else:
             g_local = g
-        if dev is None:
-            dev = g_local.device
-            mx = torch.tensor(0.0, device=dev, dtype=torch.float32)
+        if mx is None:
+            mx = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
         gn = torch.max(torch.abs(g_local.detach().to(torch.float32)))
-        mx = torch.maximum(mx, gn)
+        mx = torch.maximum(mx, gn.to(reduce_device))
     if mx is None:
-        dev = torch.device(get_device_type())
-        mx = torch.tensor(0.0, device=dev, dtype=torch.float32)
+        mx = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
     return mx
 
 
