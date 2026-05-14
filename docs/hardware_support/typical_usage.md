@@ -4,7 +4,7 @@ This document provides a complete step-by-step guide for training the Qwen3-VL 8
 
 ## Prerequisites
 
-- Ascend NPU environment with CANN 8.3.RC1 installed
+- Ascend NPU environment with CANN 9.0.0 installed
 - VeOmni framework installed (see [Installation](get_started_npu.md#installation) section)
 - Sufficient storage space for dataset and model weights
 
@@ -54,6 +54,34 @@ python3 scripts/download_hf_model.py \
 ## Step 4: Configure Training
 
 VeOmni uses YAML configuration files for training. You can directly modify the configuration file at `configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml` to adjust parameters like batch size, learning rate, and other hyperparameters according to your needs.
+
+### NPU-Friendly Operator Configurations
+
+**Important**: The default configuration files are optimized for GPU environments. When running on Ascend NPUs, we recommend adding the following **minimal NPU-friendly operator configurations** to your model's YAML file. These settings optimize operator implementations specifically for NPU hardware and are generally applicable to most models in the repository:
+
+```yaml
+model:
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_npu
+    cross_entropy_loss_implementation: npu
+    rms_norm_implementation: npu
+    rotary_pos_emb_implementation: npu
+    swiglu_mlp_implementation: eager           # no NPU backend available
+    load_balancing_loss_implementation: eager  # triton-ascend not exposed as `triton`
+    # Qwen3.5 GatedDeltaNet trio — only meaningful for Qwen3.5 MoE models;
+    # pin to eager on NPU (no NPU kernel) and set train.dyn_bsz=False:
+    rms_norm_gated_implementation: eager
+    causal_conv1d_implementation: eager
+    chunk_gated_delta_rule_implementation: eager
+```
+
+These configurations specify the optimal implementation for each operator type when running on NPUs:
+- Use NPU-optimized implementations where available (rms_norm_implementation: npu)
+- Fall back to compatible implementations for operations without NPU support (eager)
+- Configure specialized settings for model-specific components (Qwen3.5 GatedDeltaNet)
+
+**Note**: Some models with structurally-incompatible kernels (e.g., Wan rope_apply, Qwen2-VL multimodal RoPE) already include these NPU-friendly configurations in their default YAML files.
 
 ## Step 5: Start Training
 

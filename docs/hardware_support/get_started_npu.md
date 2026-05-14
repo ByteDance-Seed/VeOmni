@@ -47,8 +47,7 @@ The following table shows the supported software versions for VeOmni when runnin
 
 | VeOmni Version | PyTorch | torch_npu | CANN Version | Python Version |
 |----------------|-------- | -----------|--------------|----------------|
-| 0.1.0 | 2.7.1                | 2.7.1             | 8.3rc2      | 3.11           |
-| 0.1.8 | 2.7.1                | 2.7.1             | 9.0.0       | 3.11           |
+| 0.1.0 | 2.7.1                | 2.7.1             | 8.3rc2/9.0.0      | 3.11           |
 | main  | In-development    | In-development | In-development | In-development |
 
 ## Supported Models
