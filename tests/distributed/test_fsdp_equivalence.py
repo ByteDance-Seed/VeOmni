@@ -187,24 +187,6 @@ def _run_fsdp_equivalence(
 
 _text_test_cases_v4 = [
     pytest.param(
-        "qwen3",
-        "./tests/toy_config/qwen3_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3",
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3_moe",
-        "./tests/toy_config/qwen3_moe_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3_moe",
-        marks=_v4_only,
-    ),
-    pytest.param(
         "llama3.1",
         "./tests/toy_config/llama31_toy",
         False,

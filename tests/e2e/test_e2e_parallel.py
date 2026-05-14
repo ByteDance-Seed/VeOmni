@@ -126,33 +126,6 @@ text_test_cases = [
         marks=_v5_only,
     ),
     pytest.param(
-        "qwen2.5",
-        "./tests/toy_config/qwen25_toy",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3",
-        "./tests/toy_config/qwen3_toy",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3_moe",
-        "./tests/toy_config/qwen3_moe_toy",
-        True,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
-    ),
-    pytest.param(
         "qwen3_moe",
         "./tests/toy_config/qwen3_moe_toy",
         True,  # is_moe
@@ -169,7 +142,8 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_v4_only,
+        marks=_v5_only,
+        id="seed_oss_v5",
     ),
     pytest.param(
         "deepseek_v3",
@@ -189,23 +163,7 @@ qwen2vl_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen2vl",
-        "./tests/toy_config/qwen2vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
         marks=_v5_only,
-    ),
-    pytest.param(
-        "qwen25vl",
-        "./tests/toy_config/qwen25vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        marks=_v4_only,
     ),
     pytest.param(
         "qwen25vl",
@@ -225,25 +183,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3vl",
-        "./tests/toy_config/qwen3vl_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
         marks=_v5_only,
-    ),
-    pytest.param(
-        "qwen3vlmoe",
-        "./tests/toy_config/qwen3vlmoe_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v4_only,
     ),
     pytest.param(
         "qwen3vlmoe",
@@ -286,14 +226,6 @@ qwen2omni_test_cases = [
 ]
 
 qwen3omni_test_cases = [
-    pytest.param(
-        "qwen3_omni_moe",
-        "./tests/toy_config/qwen3omni_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        marks=_v4_only,
-    ),
     pytest.param(
         "qwen3_omni_moe",
         "./tests/toy_config/qwen3omni_toy",

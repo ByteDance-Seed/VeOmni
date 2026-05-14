@@ -84,22 +84,15 @@ def _toy(name: str) -> str:
 # variant: HF v4 `_init_weights` hard-codes bf16 for the language tower,
 # so an fp32 case there would just be testing a half-cast model.
 CASES = [
+    # Only models that are still v4-only on `main` keep cases here. Models
+    # with a v5 patchgen (qwen2/qwen3/qwen3_moe/qwen2_vl/qwen2_5_vl/qwen3_vl/
+    # qwen3_vl_moe/qwen3_omni_moe and seed_oss in this branch) are exercised
+    # exclusively by the v5 logits-equal suite to avoid duplicate runner time.
     # ---- text-only causal-LM ----
     # eager + fp32
-    Case("qwen2_5-toy-eager", _toy("qwen25_toy"), sync_weight_key=None),
     Case("llama3_1-toy-eager", _toy("llama31_toy"), sync_weight_key=None),
-    Case("seed_oss-toy-eager", _toy("seed_oss_toy"), sync_weight_key=None),
-    Case("qwen3-toy-eager", _toy("qwen3_toy"), sync_weight_key=None),
-    Case("qwen3_moe-toy-eager", _toy("qwen3_moe_toy"), sync_weight_key="qwen3_moe"),
     Case("deepseek_v3-toy-eager", _toy("deepseek_v3_toy"), sync_weight_key="deepseek_v3"),
     # flash_attention_2 + bf16 (FA2 does not support fp32)
-    Case(
-        "qwen2_5-toy-fa2",
-        _toy("qwen25_toy"),
-        sync_weight_key=None,
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
     Case(
         "llama3_1-toy-fa2",
         _toy("llama31_toy"),
@@ -108,68 +101,9 @@ CASES = [
         dtype="bfloat16",
     ),
     Case(
-        "seed_oss-toy-fa2",
-        _toy("seed_oss_toy"),
-        sync_weight_key=None,
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    Case(
-        "qwen3-toy-fa2",
-        _toy("qwen3_toy"),
-        sync_weight_key=None,
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    Case(
-        "qwen3_moe-toy-fa2",
-        _toy("qwen3_moe_toy"),
-        sync_weight_key="qwen3_moe",
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    Case(
         "deepseek_v3-toy-fa2",
         _toy("deepseek_v3_toy"),
         sync_weight_key="deepseek_v3",
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    # ---- VLMs ----
-    # eager + fp32
-    Case("qwen2_vl-toy-eager", _toy("qwen2vl_toy"), sync_weight_key=None),
-    Case("qwen2_5_vl-toy-eager", _toy("qwen25vl_toy"), sync_weight_key=None),
-    Case("qwen3_vl-toy-eager", _toy("qwen3vl_toy"), sync_weight_key=None),
-    # flash_attention_2 + bf16
-    Case(
-        "qwen2_vl-toy-fa2",
-        _toy("qwen2vl_toy"),
-        sync_weight_key=None,
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    Case(
-        "qwen2_5_vl-toy-fa2",
-        _toy("qwen25vl_toy"),
-        sync_weight_key=None,
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    Case(
-        "qwen3_vl-toy-fa2",
-        _toy("qwen3vl_toy"),
-        sync_weight_key=None,
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    # qwen3_vl_moe: HF init forces bf16 for the language tower, so only
-    # fa2+bf16 exercises a self-consistent dtype assignment. State-dict
-    # layout already matches between HF and VeOmni (both stack
-    # `experts.gate_up_proj` / `experts.down_proj`), so no sync adapter.
-    Case(
-        "qwen3_vl_moe-toy-fa2",
-        _toy("qwen3vlmoe_toy"),
-        sync_weight_key=None,
         attn_implementation="flash_attention_2",
         dtype="bfloat16",
     ),
@@ -189,17 +123,6 @@ CASES = [
         "qwen2_5_omni-toy-fa2",
         _toy("qwen25omni_toy"),
         sync_weight_key=None,
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-        forward_attr="thinker",
-    ),
-    # qwen3_omni_moe: HF forces bf16 on the thinker; thinker experts use
-    # per-expert HF layout, stacked on the VeOmni side -> needs the
-    # `qwen3_omni_moe` sync adapter from `weight_sync_adapters.py`.
-    Case(
-        "qwen3_omni_moe-toy-fa2",
-        _toy("qwen3omni_toy"),
-        sync_weight_key="qwen3_omni_moe",
         attn_implementation="flash_attention_2",
         dtype="bfloat16",
         forward_attr="thinker",
@@ -492,17 +415,11 @@ def test_logits_bitwise_equal(case: Case):
 # Subset of CASES exercised through the runtime converter — only the MoE
 # models, since the converter only fires for them. Mirrors the eager+fp32
 # and fa2+bf16 split of CASES so the converter path gets exercised against
-# both the attention kernels and the dtypes that real users hit.
+# both the attention kernels and the dtypes that real users hit. qwen3_moe
+# moved to the v5 suite together with its v5 patchgen + v5 runtime
+# converter, so only the still-v4-only deepseek_v3 stays here.
 _RUNTIME_CONVERTER_CASES = [
-    Case("qwen3_moe-toy-runtime-converter", _toy("qwen3_moe_toy"), sync_weight_key="qwen3_moe"),
     Case("deepseek_v3-toy-runtime-converter", _toy("deepseek_v3_toy"), sync_weight_key="deepseek_v3"),
-    Case(
-        "qwen3_moe-toy-runtime-converter-fa2",
-        _toy("qwen3_moe_toy"),
-        sync_weight_key="qwen3_moe",
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
     Case(
         "deepseek_v3-toy-runtime-converter-fa2",
         _toy("deepseek_v3_toy"),

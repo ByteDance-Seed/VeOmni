@@ -129,6 +129,12 @@ veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 
+# Mirror the qwen3_5 NPU sentinel: this NPU config reuses
+# qwen3_5_vision_model_forward (Patch.5) but does NOT register the
+# Qwen3_5MoeVisionAttention.forward consumer. False suppresses the host sync
+# and kwarg leak — see qwen3_5_gpu_patch_gen_config.py Patch.5 for rationale.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
+
 
 config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
