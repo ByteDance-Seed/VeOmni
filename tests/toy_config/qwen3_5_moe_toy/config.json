@@ -2,14 +2,14 @@
     "architectures": [
         "Qwen3_5MoeForConditionalGeneration"
     ],
-    "image_token_id": 248056,
+    "image_token_id": 2046,
     "model_type": "qwen3_5_moe",
     "text_config": {
         "attention_bias": false,
         "attention_dropout": 0.0,
         "attn_output_gate": true,
         "dtype": "bfloat16",
-        "eos_token_id": 248044,
+        "eos_token_id": 2040,
         "full_attention_interval": 4,
         "head_dim": 256,
         "hidden_act": "silu",
@@ -42,7 +42,7 @@
         "router_aux_loss_coef": 0.001,
         "shared_expert_intermediate_size": 512,
         "use_cache": true,
-        "vocab_size": 248320,
+        "vocab_size": 2048,
         "mamba_ssm_dtype": "float32",
         "rope_parameters": {
             "mrope_interleaved": true,
@@ -58,7 +58,7 @@
     },
     "tie_word_embeddings": false,
     "transformers_version": "4.57.0.dev0",
-    "video_token_id": 248057,
+    "video_token_id": 2047,
     "vision_config": {
         "deepstack_visual_indexes": [],
         "depth": 27,
@@ -75,6 +75,6 @@
         "spatial_merge_size": 2,
         "temporal_patch_size": 2
     },
-    "vision_end_token_id": 248054,
-    "vision_start_token_id": 248053
+    "vision_end_token_id": 2045,
+    "vision_start_token_id": 2044
 }
