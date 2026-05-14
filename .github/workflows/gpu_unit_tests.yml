@@ -61,7 +61,7 @@ jobs:
     # `l20-8` runner is picked; use `[self-hosted, l20-N]` to pin to a specific
     # box. See github_runner/README.md for the full label scheme.
     runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60 # Increase this timeout value as needed
+    timeout-minutes: 90
     # The self-hosted runner itself is a minimal myoung34/github-runner container
     # with just the runner + docker CLI; real CI work runs inside the VeOmni GPU
     # image as a sibling container via the host docker socket.
@@ -161,7 +161,7 @@ jobs:
     needs: lint
     # Same runner/container/env as gpu_unit_tests_v4 above; see comments there.
     runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60
+    timeout-minutes: 90
     container:
       image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
       volumes:

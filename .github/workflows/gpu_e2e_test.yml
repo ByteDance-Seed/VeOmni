@@ -60,7 +60,7 @@ jobs:
     # Self-hosted L20-8 fleet managed by github_runner/ (ansible). See
     # github_runner/README.md for the full label scheme.
     runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60 # Increase this timeout value as needed
+    timeout-minutes: 90
     container:
       image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
       volumes:
@@ -128,7 +128,7 @@ jobs:
     needs: lint
     # Same runner/container/env as gpu_e2e_tests_v4 above; see comments there.
     runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60
+    timeout-minutes: 90
     container:
       image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
       volumes:

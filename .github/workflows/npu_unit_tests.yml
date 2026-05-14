@@ -45,7 +45,7 @@ jobs:
     # `[self-hosted, 910b-N]` if you need to pin to a specific runner, or
     # `[self-hosted, 910b-host-N]` to pin to a specific physical machine.
     runs-on: [self-hosted, 910b-8]
-    timeout-minutes: 60 # Increase this timeout value as needed
+    timeout-minutes: 90
     container:
       image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
       volumes:
