@@ -113,6 +113,20 @@ jobs:
       - name: Run e2e training test
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+      - name: Free GPUs between test steps
+        # See v5 job for rationale — kill any pytest/torchrun workers
+        # that outlived the previous pytest session before starting the
+        # next test step.
+        if: always()
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
       - name: Run FSDP equivalence tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
@@ -170,6 +184,21 @@ jobs:
         # skipped there — not straightforward to enable due to L20 OOM).
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
+      - name: Free GPUs between test steps
+        # pytest's mp.spawn / torchrun workers sometimes outlive the pytest
+        # session — they hold tens of GiB on GPU 0 and OOM the next test.
+        # Sweep again between test steps; the job-start cleanup alone
+        # isn't enough.
+        if: always()
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
       - name: Run FSDP equivalence tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
