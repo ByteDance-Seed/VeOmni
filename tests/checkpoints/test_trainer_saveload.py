@@ -277,9 +277,10 @@ def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
     shutil.rmtree(get_output_dir(model_name, ep_size))
 
 
-# NOTE: ``qwen3_moe`` is v5-only (``veomni/models/transformers/qwen3_moe/__init__.py``
-# raises on transformers < 5.0.0), and ``deepseek_v3`` is currently v4-only. Pick the
-# right model per env so this test stays green in both v4 and v5 CI matrices.
+# NOTE: ``qwen3_moe`` keeps a v4 monkey-patch fallback for now, but we only
+# exercise it in the v5 lane here — the v4 lane covers ``deepseek_v3`` (still
+# v4-only) instead. Splitting the matrix this way keeps both CI lanes short
+# and avoids redoing the same MoE save/load on both transformers versions.
 if is_transformers_version_greater_or_equal_to("5.0.0"):
     TEST_MODELS = ["qwen3_moe"]
 else:
