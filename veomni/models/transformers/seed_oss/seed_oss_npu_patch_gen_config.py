@@ -73,11 +73,9 @@ def apply_rotary_pos_emb_npu(
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from veomni.ops.npu_patch import npu_fused_operator
+    from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_npu as _apply_rotary_pos_emb_npu
 
-    return npu_fused_operator.apply_rotary_pos_emb_npu(
-        q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim
-    )
+    return _apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
 
 
 # ================================================================
@@ -89,10 +87,10 @@ def apply_rotary_pos_emb_npu(
     description="Use NPU fused RMSNorm forward",
 )
 def seed_oss_rmsnorm_forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-    from veomni.ops.npu_patch import npu_fused_operator
+    from veomni.ops.kernels.rms_norm.npu import rms_norm_forward_npu
 
     # --- Patch.1: NPU fused RMSNorm ---
-    return npu_fused_operator.rms_norm_forward_npu(self, x)
+    return rms_norm_forward_npu(self, x)
     # --- Patch.1: NPU fused RMSNorm ---
 
 
