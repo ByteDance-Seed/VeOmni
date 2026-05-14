@@ -1,8 +1,56 @@
+"""Bitwise logits-equal tests for transformers v5 models.
+
+Sibling to ``test_models_logits_equal_v4.py`` (v4-only scope, runs on the
+``transformers-v4-legacy`` lane). v5 ships self-contained generated modeling
+under ``veomni/models/transformers/<model>/generated/``, so pristine
+``transformers.*`` classes stay untouched and HF + VeOmni can be built
+side-by-side without an unpatch helper.
+
+Coverage
+--------
+Models under ``veomni/models/transformers/`` that register a patchgen-generated
+class via the ``transformers >= 5.0.0`` branch:
+
+- Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3
+- VLM via text-only sub-config
+  (``*ForCausalLM`` registered):   qwen3_5, qwen3_5_moe
+- VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
+- Omni thinker forward:            qwen3_omni_moe (forward on ``model.thinker``)
+
+``glm_moe_dsa`` is omitted: no toy config exists for it.
+
+The MoE families that ship a v5 runtime checkpoint converter additionally have
+an end-to-end runtime-converter case (currently ``deepseek_v3``): a per-expert
+HF safetensors checkpoint is written via ``save_pretrained`` (which emits the
+qwen2_moe-style per-expert layout for v5) and reloaded through
+``build_foundation_model`` so ``DeepseekV3CheckpointTensorConverter`` runs the
+real disk → buffered-stack → fused ``gate_up_proj`` merge.
+
+Scope decisions
+---------------
+- Qwen3.5 layers are forced to all ``"full_attention"``: without
+  ``causal_conv1d`` installed, HF's linear-attention path uses
+  ``F.silu(self.conv1d(...))`` while VeOmni dispatches to fla's Triton
+  ``causal_conv1d`` — different implementations, not bitwise equal.
+- ``cu_seq_lens_q`` is supplied for Qwen3.5: VeOmni's patched
+  ``Qwen3_5DecoderLayer.forward`` ``assert``\\s on it; HF ignores it via
+  ``**kwargs``.
+- VLM image input is a single dummy 2x2 patch — small enough to keep the
+  test fast, large enough to actually run the visual tower.
+- Omni audio is a follow-up; only the ``audio_mask`` zero-tensor is passed
+  so the patched asserts succeed and the audio tower stays dark.
+- ``deepseek_v3`` covers eager+fp32 only: its MLA SDPA reshape doesn't
+  reach bitwise parity with HF on the toy config (logit drift dominates the
+  bf16 noise floor — tracked separately).
+"""
+
 import copy
 import gc
 import importlib.util
 import os
-from dataclasses import dataclass
+import shutil
+import tempfile
+from dataclasses import dataclass, field
 from typing import Optional
 
 import pytest
@@ -16,27 +64,14 @@ from veomni.utils.device import (
     get_torch_device,
 )
 
-# Importing `hf_unpatch` here (rather than from `utils`) captures pristine HF
-# class attributes before any veomni import has a chance to monkey-patch them,
-# without dragging in the heavy `veomni.data` import chain (av/torchcodec).
-# `apply_veomni_hf_unpatch()` restores them; we call it before every HF build
-# so leaks from the previous test do not poison the current one.
-from .hf_unpatch import apply_veomni_hf_unpatch  # noqa: E402
 
-
-# Must be set before `import veomni` so GPU kernel patches remain gated off.
-# VEOMNI_USE_LIGER_KERNEL=0 disables Liger substitutions in qwen3 / qwen3_moe
-# gpu_patch.py. VEOMNI_USE_FUSED_KERNELS=0 additionally disables fused-kernel
-# paths (Triton RoPE + batch-invariant RMSNorm) that some models default to
-# when Liger is off.
-os.environ.setdefault("VEOMNI_USE_LIGER_KERNEL", "0")
-os.environ.setdefault("VEOMNI_USE_FUSED_KERNELS", "0")
+# Required by ``dist.init_process_group`` in the module-scoped fixture.
 os.environ.setdefault("RANK", "0")
 os.environ.setdefault("LOCAL_RANK", "0")
 os.environ.setdefault("WORLD_SIZE", "1")
 os.environ.setdefault("MASTER_ADDR", "localhost")
-os.environ.setdefault("MASTER_PORT", "12355")
-# Required by torch.use_deterministic_algorithms for cuBLAS.
+os.environ.setdefault("MASTER_PORT", "12356")
+# Required by ``torch.use_deterministic_algorithms`` for cuBLAS.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
@@ -44,72 +79,154 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 
 _DTYPE_MAP = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
+# How a case maps to (config preparation, forward target, input shape):
+#   "causal_lm"     — toy config IS the text config; no extraction.
+#   "qwen3_5_text"  — extract text_config + force full_attention + cu_seq_lens_q.
+#   "vlm_full"      — full VLM forward with a dummy 2x2 image.
+#   "omni_thinker"  — full Omni model; forward runs on ``model.thinker``.
+_KINDS = ("causal_lm", "qwen3_5_text", "vlm_full", "omni_thinker")
+
 
 @dataclass(frozen=True)
 class Case:
-    """One bitwise-equal comparison between a native HF build and a VeOmni build.
-
-    `attn_implementation` is forwarded to both sides; FA2 requires bf16.
-    The HF class is resolved from `config.architectures[0]` (no per-case
-    override). `forward_attr` targets a submodule (`model.thinker` for
-    Omni) while state-dict load still happens at the root, so the talker /
-    vision sub-modules get the same random init on both sides.
-    """
-
     case_id: str
-    path: str
+    toy_config_dir: str
+    arch: str
+    kind: str
     attn_implementation: str = "eager"
     dtype: str = "float32"
-    forward_attr: Optional[str] = None
+    forward_attr: Optional[str] = None  # e.g. "thinker" for Omni
+    config_overrides: dict = field(default_factory=dict)
 
 
 def _toy(name: str) -> str:
     return os.path.join(REPO_ROOT, "tests", "toy_config", name)
 
 
-# Scope: transformers v4, single CUDA rank.
-# Causal-LM cases use text-only input_ids (shape (1, 32), vocab floor
-# 32000 to dodge every 151xxx multimodal placeholder id).
-# VL / Omni cases add a dummy 2x2 image (1 placeholder token after merger)
-# so the visual tower actually runs. Audio is a follow-up: Omni passes
-# zero `audio_mask` to satisfy the patched asserts but no `input_features`,
-# so the audio tower stays dark.
-#
-# Two MoE families (qwen3_vl_moe, qwen3_omni_moe) skip the eager+fp32
-# variant: HF v4 `_init_weights` hard-codes bf16 for the language tower,
-# so an fp32 case there would just be testing a half-cast model.
+# Each model gets eager+fp32 (RNG-init parity baseline) and a real-user
+# attention path (FA2+bf16 where supported, else SDPA+bf16).
 CASES = [
-    # Only models that are still v4-only on `main` keep cases here. Models
-    # with a v5 patchgen (qwen2/qwen3/qwen3_moe/qwen2_vl/qwen2_5_vl/qwen3_vl/
-    # qwen3_vl_moe/qwen3_omni_moe and seed_oss in this branch) are exercised
-    # exclusively by the v5 logits-equal suite to avoid duplicate runner time.
-    # ---- text-only causal-LM ----
-    # eager + fp32
-    Case("llama3_1-toy-eager", _toy("llama31_toy")),
-    # flash_attention_2 + bf16 (FA2 does not support fp32)
+    # ── causal-LM ─────────────────────────────────────────────────────────
+    Case("qwen2-eager", _toy("qwen2_toy"), "Qwen2ForCausalLM", "causal_lm"),
     Case(
-        "llama3_1-toy-fa2",
-        _toy("llama31_toy"),
+        "qwen2-fa2",
+        _toy("qwen2_toy"),
+        "Qwen2ForCausalLM",
+        "causal_lm",
         attn_implementation="flash_attention_2",
         dtype="bfloat16",
     ),
-    # ---- Omni (thinker-only forward) ----
-    # The Omni public class is a thinker+talker wrapper; we run forward on
-    # `model.thinker` so the comparison stays focused on the thinker stack
-    # (text + visual + audio). State-dict load still happens at the root,
-    # so talker/audio/visual sub-modules get the same random init on both
-    # sides.
+    Case("qwen3-eager", _toy("qwen3_toy"), "Qwen3ForCausalLM", "causal_lm"),
     Case(
-        "qwen2_5_omni-toy-eager",
-        _toy("qwen25omni_toy"),
-        forward_attr="thinker",
+        "qwen3-fa2",
+        _toy("qwen3_toy"),
+        "Qwen3ForCausalLM",
+        "causal_lm",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
     ),
     Case(
-        "qwen2_5_omni-toy-fa2",
-        _toy("qwen25omni_toy"),
+        "qwen3_moe-eager",
+        _toy("qwen3_moe_toy"),
+        "Qwen3MoeForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    Case(
+        "qwen3_moe-fa2",
+        _toy("qwen3_moe_toy"),
+        "Qwen3MoeForCausalLM",
+        "causal_lm",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    # deepseek_v3: HF v5 builds the fused ``gate_up_proj [E, 2*I, H]`` directly
+    # via ``DeepseekV3NaiveMoe`` (no ``_experts_implementation`` knob). VeOmni's
+    # PatchedDeepseekV3NaiveMoe dispatches on the ``moe_experts`` OpSlot — eager
+    # loop here because the test runs without fused-kernel bindings.
+    #
+    # eager+fp32 only: deepseek_v3 ships MLA (multi-head latent attention) with
+    # split q_a / q_b / kv_a / kv_b projections, and the patchgen-generated SDPA
+    # path doesn't currently reach bitwise parity with HF's MLA SDPA reshape on
+    # the toy config (logit drift dominates the bf16 noise floor — tracked
+    # separately). The eager+fp32 case is sufficient here to validate the
+    # patchgen modeling: it covers the MoE expert dispatch, the OpSlot-guarded
+    # cross-entropy, and the v5 ``gate_up_proj`` layout end-to-end.
+    Case("deepseek_v3-eager", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    # ── Qwen3.5 (text-only sub-config) ───────────────────────────────────
+    Case("qwen3_5-text-eager", _toy("qwen3_5_toy"), "Qwen3_5ForCausalLM", "qwen3_5_text"),
+    Case(
+        "qwen3_5-text-fa2",
+        _toy("qwen3_5_toy"),
+        "Qwen3_5ForCausalLM",
+        "qwen3_5_text",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    Case("qwen3_5_moe-text-eager", _toy("qwen3_5_moe_toy"), "Qwen3_5MoeForCausalLM", "qwen3_5_text"),
+    # FA2 swapped for SDPA: the toy's (num_kv_heads=2, head_dim=256, seq_len=32)
+    # crashes ``_flash_attn_varlen_forward`` upstream on both HF and VeOmni.
+    Case(
+        "qwen3_5_moe-text-sdpa",
+        _toy("qwen3_5_moe_toy"),
+        "Qwen3_5MoeForCausalLM",
+        "qwen3_5_text",
+        attn_implementation="sdpa",
+        dtype="bfloat16",
+    ),
+    # ── VLMs (full forward with a dummy 2x2 image) ───────────────────────
+    Case("qwen2_vl-eager", _toy("qwen2vl_toy"), "Qwen2VLForConditionalGeneration", "vlm_full"),
+    Case(
+        "qwen2_vl-fa2",
+        _toy("qwen2vl_toy"),
+        "Qwen2VLForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    Case("qwen2_5_vl-eager", _toy("qwen25vl_toy"), "Qwen2_5_VLForConditionalGeneration", "vlm_full"),
+    Case(
+        "qwen2_5_vl-fa2",
+        _toy("qwen25vl_toy"),
+        "Qwen2_5_VLForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    Case("qwen3_vl-eager", _toy("qwen3vl_toy"), "Qwen3VLForConditionalGeneration", "vlm_full"),
+    Case(
+        "qwen3_vl-fa2",
+        _toy("qwen3vl_toy"),
+        "Qwen3VLForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    # qwen3_vl_moe: HF init forces bf16 on the language tower (init_zeros for
+    # the offset RMSNorm), so eager+fp32 would just test a half-cast model.
+    # ``_experts_implementation="eager"`` matches qwen3_moe — without it HF
+    # defaults to ``"grouped_mm"`` (``torch._grouped_mm``) which diverges
+    # numerically from VeOmni's eager expert loop.
+    Case(
+        "qwen3_vl_moe-fa2",
+        _toy("qwen3vlmoe_toy"),
+        "Qwen3VLMoeForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    # ── Omni (forward on ``model.thinker`` so talker stays out of scope) ──
+    Case(
+        "qwen3_omni_moe-fa2",
+        _toy("qwen3omni_toy"),
+        "Qwen3OmniMoeForConditionalGeneration",
+        "omni_thinker",
         attn_implementation="flash_attention_2",
         dtype="bfloat16",
         forward_attr="thinker",
+        config_overrides={"_experts_implementation": "eager"},
     ),
 ]
 
@@ -123,17 +240,14 @@ def _apply_determinism():
 
 @pytest.fixture(scope="module", autouse=True)
 def _single_rank_process_group():
-    """Module-scoped 1-rank process group for the v4 patches' all_gather calls.
+    """1-rank NCCL group for VeOmni's SP-aware attention wrappers.
 
-    Some patches (qwen2_5_vl) call `dist.all_gather` unconditionally — even
-    at sp_size=1 — and crash without a default group. Teardown only fires
-    if we created the group, so we don't yank state from unrelated tests.
-    Mirrors the test bodies' skip gates so a skip-only environment doesn't
-    pay an init cost.
+    Only init/teardown if we created the group; gated on the same skip
+    conditions as the test bodies so a skip-only run doesn't pay the cost.
     """
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if not IS_CUDA_AVAILABLE or is_transformers_version_greater_or_equal_to("5.0.0"):
+    if not IS_CUDA_AVAILABLE or not is_transformers_version_greater_or_equal_to("5.0.0"):
         yield
         return
 
@@ -141,10 +255,8 @@ def _single_rank_process_group():
 
     we_initialised = False
     if not dist.is_initialized():
-        # Bind the accelerator before init_process_group: on multi-GPU CI
-        # hosts the comm library can otherwise pick the wrong visible device
-        # and hang/fail. The IS_CUDA_AVAILABLE gate above already ensures
-        # we have an accelerator here.
+        # Bind the accelerator before init so NCCL doesn't pick the wrong
+        # visible device on multi-GPU CI hosts.
         get_torch_device().set_device(int(os.environ.get("LOCAL_RANK", "0")))
         dist.init_process_group(backend=get_dist_comm_backend(), rank=0, world_size=1)
         we_initialised = True
@@ -161,97 +273,79 @@ def _release():
         empty_cache()
 
 
-def _resolve_hf_class(config):
-    """Look up the concrete HF class from `config.architectures[0]`.
-
-    Every toy config carries the concrete class name there, so one lookup
-    covers causal-LMs, VLMs, and Omni wrappers — the latter aren't in any
-    `AutoModel*` mapping anyway.
-    """
-    import transformers
-
-    arch = config.architectures[0]
-    return getattr(transformers, arch)
+# ── config preparation ───────────────────────────────────────────────────
 
 
-def _build_hf_model(case: Case):
-    """Return a device-resident, eval-mode HF model randomly initialised from config."""
+def _make_config(case: Case):
+    """Return the config the test will hand to both HF and VeOmni."""
     from transformers import AutoConfig
 
-    apply_veomni_hf_unpatch()
-    config = AutoConfig.from_pretrained(case.path)
-    torch.manual_seed(0)
-    get_torch_device().manual_seed_all(0)
-    cls = _resolve_hf_class(config)
-    target_dtype = _DTYPE_MAP[case.dtype]
-    # `_from_config` inits weights directly at `target_dtype` — a
-    # `cls(config).to(bf16)` path would init in fp32 first, producing
-    # different random bytes than VeOmni's bf16-from-the-start build (RNG
-    # output depends on tensor dtype). Allocating on-device matches
-    # VeOmni's init path so rotary `inv_freq` and friends share arithmetic.
-    with torch.device(get_device_type()):
-        model_hf = cls._from_config(
-            config,
-            torch_dtype=target_dtype,
-            attn_implementation=case.attn_implementation,
-        )
-    return model_hf.eval()
+    full_config = AutoConfig.from_pretrained(case.toy_config_dir)
+
+    if case.kind == "qwen3_5_text":
+        # Extract the text sub-config and force full-attention layers
+        # (see module docstring) before applying any other overrides.
+        cfg = copy.deepcopy(full_config.text_config)
+        if hasattr(cfg, "layer_types") and cfg.layer_types is not None:
+            cfg.layer_types = ["full_attention"] * len(cfg.layer_types)
+        # HF's default ``"grouped_mm"`` routes through ``torch._grouped_mm``
+        # and crashes on the toy's tiny expert tensors; eager runs the
+        # per-expert loop on both sides.
+        cfg._experts_implementation = "eager"
+    else:
+        cfg = full_config
+
+    cfg.architectures = [case.arch]
+    for k, v in case.config_overrides.items():
+        setattr(cfg, k, v)
+    return cfg
 
 
-# Causal-LM toy configs that have no `vision_config` / `thinker_config` —
-# every forward kwargs construction below stays a no-op for these.
-_CAUSAL_LM_MODEL_TYPES = frozenset({"qwen2", "qwen3", "qwen3_moe", "llama", "seed_oss"})
+# ── input construction ───────────────────────────────────────────────────
 
 
 def _vision_section(config):
-    """Return `(vision_config, image_token_id, audio_token_id)` or `(None,)*3`.
+    """Return ``(vision_config, image_token_id)`` or ``(None, None)``.
 
-    Top-level VLs carry `vision_config` on the root; Omni nests it under
-    `thinker_config`. The placeholder field was renamed `_index` -> `_id`
+    Top-level VLs carry ``vision_config`` on the root; Omni nests it under
+    ``thinker_config``. The placeholder field renamed ``_index`` -> ``_id``
     between qwen2_5_omni and qwen3_omni_moe — accept either.
     """
-    if config.model_type in _CAUSAL_LM_MODEL_TYPES:
-        return None, None, None
-    if hasattr(config, "thinker_config"):
-        cfg = config.thinker_config
-    else:
-        cfg = config
-    vision_config = getattr(cfg, "vision_config", None)
+    if not hasattr(config, "vision_config") and not hasattr(config, "thinker_config"):
+        return None, None
+    vc_root = config.thinker_config if hasattr(config, "thinker_config") else config
+    vision_config = getattr(vc_root, "vision_config", None)
     if vision_config is None:
-        return None, None, None
-    # Don't `or` — token id 0 is technically valid and would short-circuit.
-    image_token = getattr(cfg, "image_token_index", None)
+        return None, None
+    image_token = getattr(vc_root, "image_token_index", None)
     if image_token is None:
-        image_token = getattr(cfg, "image_token_id", None)
-    audio_token = getattr(cfg, "audio_token_index", None)
-    if audio_token is None:
-        audio_token = getattr(cfg, "audio_token_id", None)
-    return vision_config, image_token, audio_token
+        image_token = getattr(vc_root, "image_token_id", None)
+    return vision_config, image_token
 
 
-def _make_inputs(case: Case, config, device, dtype):
-    """Build `(input_ids, forward_kwargs)` for the case.
+def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict]:
+    """Build ``(input_ids, forward_kwargs)`` for the case.
 
-    Causal-LM: text-only `(1, 32)` ids, vocab floor 32000 dodges every
-    151xxx multimodal placeholder.
-
-    VL / Omni: same base ids but the first
-    `n_tokens = grid_t * grid_h * grid_w // spatial_merge_size**2` positions
-    hold `image_token_id`, alongside dummy `pixel_values` +
-    `image_grid_thw = [[1, 2, 2]]`. `n_tokens` matches what the merger
-    emits, so the patched `masked_scatter` consumes every embedding once.
-    `pixel_values` shape comes from `vision_config` (qwen2/2.5: patch_size
-    14; qwen3: 16). `image_mask` / `video_mask` (and `audio_mask` for
-    Omni) are passed explicitly because the patches otherwise call
-    `dist.all_gather` to recompute them. Audio is a follow-up: Omni
-    passes zero `audio_mask` for the asserts but no `input_features`.
+    Causal-LM / qwen3_5 text: text-only ids. VLM / Omni: same base ids but
+    the first ``n_tokens`` positions are overwritten with ``image_token_id``
+    and dummy ``pixel_values`` + ``image_grid_thw = [[1, 2, 2]]`` are passed
+    so the visual tower runs and the patched ``masked_scatter`` consumes
+    every embedding once. Omni additionally needs a zero ``audio_mask``
+    to satisfy the patched asserts.
     """
+    seq_len = 32
     base_gen = torch.Generator(device=device).manual_seed(0)
-    base_input_ids = torch.randint(0, 32000, (1, 32), device=device, dtype=torch.long, generator=base_gen)
+    base_input_ids = torch.randint(32000, (1, seq_len), device=device, dtype=torch.long, generator=base_gen)
 
-    vision_config, image_token_id, _ = _vision_section(config)
-    if vision_config is None:
-        return base_input_ids, {}
+    fwd_kwargs: dict = {}
+    if case.kind == "qwen3_5_text":
+        # VeOmni's patched ``Qwen3_5DecoderLayer.forward`` ``assert``s on it;
+        # HF ignores it via ``**kwargs``.
+        fwd_kwargs["cu_seq_lens_q"] = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+
+    vision_config, image_token_id = _vision_section(config)
+    if vision_config is None or case.kind in ("causal_lm", "qwen3_5_text"):
+        return base_input_ids, fwd_kwargs
 
     patch_size = getattr(vision_config, "patch_size", 14)
     temporal_patch_size = getattr(vision_config, "temporal_patch_size", 2)
@@ -269,23 +363,82 @@ def _make_inputs(case: Case, config, device, dtype):
 
     input_ids = base_input_ids.clone()
     input_ids[0, :n_tokens] = image_token_id
-
     image_mask = input_ids == image_token_id
     video_mask = torch.zeros_like(input_ids, dtype=torch.bool)
 
-    forward_kwargs = {
-        "pixel_values": pixel_values,
-        "image_grid_thw": image_grid_thw,
-        "image_mask": image_mask,
-        "video_mask": video_mask,
-    }
-    if case.forward_attr == "thinker":
-        forward_kwargs["audio_mask"] = torch.zeros_like(input_ids, dtype=torch.bool)
-    return input_ids, forward_kwargs
+    fwd_kwargs.update(
+        {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            # ``image_mask`` / ``video_mask`` are passed explicitly because
+            # the patches otherwise call ``dist.all_gather`` on input_ids to
+            # recompute them.
+            "image_mask": image_mask,
+            "video_mask": video_mask,
+        }
+    )
+    if case.kind == "omni_thinker":
+        fwd_kwargs["audio_mask"] = torch.zeros_like(input_ids, dtype=torch.bool)
+
+    return input_ids, fwd_kwargs
+
+
+# ── HF / VeOmni model build ──────────────────────────────────────────────
+
+
+def _resolve_hf_class(arch: str):
+    import transformers
+
+    return getattr(transformers, arch)
+
+
+def _build_hf_model(case: Case, config, dtype: torch.dtype):
+    """Pristine HF model — same seed + init path as VeOmni."""
+    cls = _resolve_hf_class(case.arch)
+    torch.manual_seed(0)
+    get_torch_device().manual_seed_all(0)
+    # ``_from_config(..., torch_dtype=...)`` inits at ``dtype`` directly;
+    # ``cls(config).to(dtype)`` would init in fp32 first and produce
+    # different RNG bytes (RNG output is dtype-dependent). On-device init
+    # matches VeOmni's path so rotary ``inv_freq`` shares arithmetic.
+    with torch.device(get_device_type()):
+        model = cls._from_config(
+            config,
+            torch_dtype=dtype,
+            attn_implementation=case.attn_implementation,
+        )
+    return model.eval()
+
+
+def _build_veomni_model(case: Case, config, hf_state_dict):
+    """VeOmni-generated model with HF state_dict loaded."""
+    from veomni.models.auto import build_foundation_model
+    from veomni.ops import apply_ops_config
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    # Install our eager-everywhere ops config first so ``build_foundation_model``'s
+    # contract (caller passes ops_implementation OR singleton already installed)
+    # is satisfied. The Qwen3.5 GatedDeltaNet OpSlots (rms_norm_gated /
+    # causal_conv1d / chunk_gated_delta_rule) never fire under our
+    # full-attention override, but pinning them to ``"eager"`` keeps the test
+    # runnable without ``flash-linear-attention`` installed.
+    # The SP-aware FA wrappers degrade to plain FA at sp_size=1, so passing
+    # ``flash_attention_2`` directly is equivalent to the SP-rewritten name.
+    apply_ops_config(make_eager_ops_config(attn_implementation=case.attn_implementation))
+
+    model = build_foundation_model(
+        config_path=config,
+        weights_path=None,
+        torch_dtype=case.dtype,
+        attn_implementation=case.attn_implementation,
+        init_device=get_device_type(),
+    )
+    model.load_state_dict(hf_state_dict)
+    return model.eval()
 
 
 def _forward_target(model, case: Case):
-    """Return the submodule we run forward on (`model` itself by default)."""
     if case.forward_attr is None:
         return model
     target = model
@@ -294,60 +447,29 @@ def _forward_target(model, case: Case):
     return target
 
 
-def _build_veomni_model(case: Case, hf_state_dict):
-    """Return a device-resident, eval-mode veomni model with HF weights loaded."""
-    from veomni.models.auto import build_foundation_model
-
-    from ..tools.training_utils import make_eager_ops_config
-
-    model = build_foundation_model(
-        config_path=case.path,
-        weights_path=None,
-        torch_dtype=case.dtype,
-        init_device=get_device_type(),
-        ops_implementation=make_eager_ops_config(attn_implementation=case.attn_implementation),
-    )
-
-    model.load_state_dict(hf_state_dict)
-
-    return model.eval()
-
-
 @pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
-def test_logits_bitwise_equal(case: Case):
-    """Verify veomni forward logits are bitwise identical to native HF.
-
-    Scope: transformers v4 model definition, single sequence, single GPU,
-    no GPU kernel patching (Liger + Triton fused kernels both disabled).
-    HF is random-initialised from the toy config; its state dict is synced
-    to veomni via the layout adapters.
-
-    Execution order is mandatory: the HF forward must run BEFORE any
-    veomni model build, because `build_foundation_model` triggers
-    `apply_veomni_*_patch` which monkey-patches HF module classes
-    process-wide.
-    """
+def test_logits_bitwise_equal_v5(case: Case):
+    """Bitwise-equal forward: pristine HF vs VeOmni patched modeling."""
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if is_transformers_version_greater_or_equal_to("5.0.0"):
-        pytest.skip("Scope is transformers v4 model definition only.")
+    if not is_transformers_version_greater_or_equal_to("5.0.0"):
+        pytest.skip("Scope is transformers v5 model definition only.")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
-    if not os.path.isdir(case.path):
-        pytest.skip(f"Path not found: {case.path}")
+    if not os.path.isdir(case.toy_config_dir):
+        pytest.skip(f"Path not found: {case.toy_config_dir}")
     if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
 
-    from transformers import AutoConfig
-
     _apply_determinism()
-    device_type = get_device_type()
-    target_dtype = _DTYPE_MAP[case.dtype]
-    config = AutoConfig.from_pretrained(case.path)
-    input_ids, fwd_kwargs = _make_inputs(case, config, device_type, target_dtype)
 
-    # --- HF phase (must precede any veomni model build) ---
-    model_hf = _build_hf_model(case)
+    device = get_device_type()
+    target_dtype = _DTYPE_MAP[case.dtype]
+
+    config = _make_config(case)
+    input_ids, fwd_kwargs = _make_inputs(case, config, device, target_dtype)
+
+    model_hf = _build_hf_model(case, config, target_dtype)
     with torch.no_grad():
         logits_hf = (
             _forward_target(model_hf, case)(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs)
@@ -358,10 +480,7 @@ def test_logits_bitwise_equal(case: Case):
     del model_hf
     _release()
 
-    # --- veomni phase ---
-    # `input_ids.clone()` — the patched Omni thinker zeroes placeholder
-    # positions in-place before embedding, so reuse a fresh tensor.
-    model_ve = _build_veomni_model(case, hf_state_dict)
+    model_ve = _build_veomni_model(case, config, hf_state_dict)
     with torch.no_grad():
         logits_ve = (
             _forward_target(model_ve, case)(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs)
@@ -384,6 +503,164 @@ def test_logits_bitwise_equal(case: Case):
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
             f"[{case.case_id}] logits not bitwise equal: "
+            f"{n_mis}/{total} mismatched, max_abs_diff={max_abs:.3e}, "
+            f"first_mismatch_indices={first_idx}"
+        )
+
+
+# ── Runtime-converter coverage ────────────────────────────────────────────
+# End-to-end test for VeOmni's v5 MoE checkpoint converter
+# ``DeepseekV3CheckpointTensorConverter``: write a per-expert HF safetensors
+# checkpoint (which is what ``save_pretrained`` emits for v5 deepseek_v3 thanks
+# to the ``qwen2_moe`` conversion mapping), load it through
+# ``build_foundation_model`` so the converter is exercised on the real
+# safetensors-streaming load path, and assert bitwise-equal logits against the
+# pristine HF model. This is the only place where the per-expert →
+# stack-and-fuse merge logic actually runs against a real disk checkpoint;
+# in-memory tests (``test_models_patch.py`` and the sibling
+# ``test_logits_bitwise_equal_v5``) all hit HF's already-fused state dict
+# layout and never touch the merge code path.
+_RUNTIME_CONVERTER_CASES = [
+    Case("deepseek_v3-runtime-converter-eager", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+]
+
+
+def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buffers, config, weights_dir: str):
+    """Build a VeOmni model by routing load through the v5 runtime converter.
+
+    Mirrors the v4 sibling that lives in ``test_models_logits_equal_v4.py``: write
+    a per-expert HF checkpoint dir, hand it to ``build_foundation_model``, and
+    let ``DeepseekV3CheckpointTensorConverter`` merge per-expert tensors into
+    the v5 fused ``gate_up_proj``/``down_proj`` layout at load time.
+
+    Why we restore HF's non-persistent buffers after load
+    -----------------------------------------------------
+    The rotary ``inv_freq`` is registered ``persistent=False``, so it isn't in
+    the safetensors. On the ``weights_path != None`` path, the model is built
+    under ``init_empty_weights()``, which patches ``register_parameter`` but
+    not ``register_buffer`` — so ``inv_freq`` is computed on CPU during
+    ``__init__``, snapshotted, then ``.to(device)``-copied to CUDA. That
+    CPU-computed-then-moved value differs from a directly-on-CUDA
+    ``1.0 / (base ** ...)`` by a small amount, propagating into a non-zero
+    logits delta — enough to fail ``torch.equal``. Restoring HF's buffers after
+    load keeps this test a bitwise check on the converter's *parameter*
+    loading, matching the v4 sibling's approach. A loader fix
+    (``init_empty_weights(include_buffers=True)`` + recompute on
+    ``init_device`` after ``to_empty``) is tracked separately.
+    """
+    from safetensors.torch import save_file
+
+    from veomni.models.auto import build_foundation_model
+    from veomni.ops import apply_ops_config
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    config.save_pretrained(weights_dir)
+    save_file(
+        {k: v.detach().contiguous().cpu() for k, v in hf_state_dict.items()},
+        os.path.join(weights_dir, "model.safetensors"),
+    )
+
+    apply_ops_config(make_eager_ops_config(attn_implementation=case.attn_implementation))
+    model = build_foundation_model(
+        config_path=weights_dir,
+        weights_path=weights_dir,
+        torch_dtype=case.dtype,
+        attn_implementation=case.attn_implementation,
+        init_device=get_device_type(),
+    )
+
+    # Restore non-persistent buffers (e.g. rotary ``inv_freq``) that aren't in
+    # the state dict — see docstring above. Walking by FQN keeps this
+    # independent of how nested they are.
+    persistent_keys = set(hf_state_dict.keys())
+    for name, buf in hf_buffers.items():
+        if name in persistent_keys:
+            continue
+        parts = name.split(".")
+        target_module = model
+        for p in parts[:-1]:
+            target_module = getattr(target_module, p)
+        target = target_module._buffers[parts[-1]]
+        target.copy_(buf.to(target.device, dtype=target.dtype))
+
+    return model.eval()
+
+
+@pytest.mark.parametrize("case", _RUNTIME_CONVERTER_CASES, ids=[c.case_id for c in _RUNTIME_CONVERTER_CASES])
+def test_logits_bitwise_equal_via_runtime_converter_v5(case: Case):
+    """Smoke test: per-expert HF checkpoint -> v5 runtime converter -> bitwise-equal forward.
+
+    Complements ``test_logits_bitwise_equal_v5``: that one feeds HF's
+    in-memory (already-fused) state dict directly to a VeOmni model; this one
+    writes a real per-expert HF checkpoint (``save_pretrained`` for v5
+    deepseek_v3 emits per-expert keys via the ``qwen2_moe`` conversion
+    mapping) and routes loading through ``DeepseekV3CheckpointTensorConverter``,
+    the path users hit with a vanilla HF model dir. Bitwise-equal logits prove
+    the converter's per-expert -> stacked + cat-fused merge yields the exact
+    same parameters HF builds in-memory.
+    """
+    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+    if not is_transformers_version_greater_or_equal_to("5.0.0"):
+        pytest.skip("Scope is transformers v5 model definition only.")
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    if not os.path.isdir(case.toy_config_dir):
+        pytest.skip(f"Path not found: {case.toy_config_dir}")
+    if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        pytest.skip("flash_attn package not installed.")
+
+    _apply_determinism()
+
+    device = get_device_type()
+    target_dtype = _DTYPE_MAP[case.dtype]
+    config = _make_config(case)
+    input_ids, fwd_kwargs = _make_inputs(case, config, device, target_dtype)
+
+    # --- HF phase (must precede any veomni model build, same as the sibling test) ---
+    model_hf = _build_hf_model(case, config, target_dtype)
+    with torch.no_grad():
+        logits_hf = (
+            _forward_target(model_hf, case)(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs)
+            .logits.detach()
+            .clone()
+        )
+    hf_state_dict = copy.deepcopy(model_hf.state_dict())
+    hf_buffers = {n: b.detach().clone() for n, b in model_hf.named_buffers()}
+    del model_hf
+    _release()
+
+    # --- veomni phase: load the HF checkpoint through build_foundation_model ---
+    tmp_dir = tempfile.mkdtemp(prefix="veomni_v5_converter_test_")
+    try:
+        model_ve = _build_veomni_model_via_runtime_converter(case, hf_state_dict, hf_buffers, config, tmp_dir)
+        with torch.no_grad():
+            logits_ve = (
+                _forward_target(model_ve, case)(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs)
+                .logits.detach()
+                .clone()
+            )
+        del model_ve
+        _release()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        del hf_state_dict
+        _release()
+
+    assert logits_hf.shape == logits_ve.shape, (
+        f"[{case.case_id}] shape mismatch: hf={tuple(logits_hf.shape)} ve={tuple(logits_ve.shape)}"
+    )
+
+    if not torch.equal(logits_hf, logits_ve):
+        diff = (logits_hf.float() - logits_ve.float()).abs()
+        ne = logits_hf != logits_ve
+        n_mis = int(ne.sum().item())
+        total = logits_hf.numel()
+        max_abs = float(diff.max().item())
+        first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
+        raise AssertionError(
+            f"[{case.case_id}] logits not bitwise equal via runtime converter: "
             f"{n_mis}/{total} mismatched, max_abs_diff={max_abs:.3e}, "
             f"first_mismatch_indices={first_idx}"
         )

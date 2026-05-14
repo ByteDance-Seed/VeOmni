@@ -10,30 +10,23 @@ from veomni.trainer.vlm_trainer import (
     VLMTrainer,
     _get_vlm_visual_module,
 )
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from ..tools.training_utils import make_eager_ops_config
 
 
-# Per-case version gate so the v4 lane has at least one collected test
-# (otherwise the whole module would skip with ``allow_module_level=True``,
-# pytest reports ``0 collected / 1 skipped`` and exits with code 5, failing CI).
-_v5_only = pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.0.0"),
-    reason="Requires transformers >= 5.0.0",
-)
-
-
+# v5-default scope. Models in the list either require transformers >= 5.0.0
+# (qwen3_5*, qwen2_5_vl, qwen3_vl*) or are dual-version with v5 as the
+# preferred path (qwen2_vl). The v4-legacy CI lane skips this file and
+# instead exercises ``test_models_patch_v4.py`` for its v4-only models;
+# duplicate v4 coverage on the dual-version models was retired together
+# with the broader transformers v4 wind-down.
 _FREEZE_VIT_VLM_CASES = [
-    # qwen2_vl keeps a v4 monkey-patch fallback (see
-    # ``veomni/models/transformers/qwen2_vl/__init__.py``) so it runs on both
-    # transformers stacks and acts as the v4 lane's smoke test for this file.
     pytest.param("./tests/toy_config/qwen2vl_toy/config.json", id="qwen2_vl"),
-    pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5", marks=_v5_only),
-    pytest.param("./tests/toy_config/qwen3_5_moe_toy/config.json", id="qwen3_5_moe", marks=_v5_only),
-    pytest.param("./tests/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl", marks=_v5_only),
-    pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl", marks=_v5_only),
-    pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe", marks=_v5_only),
+    pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
+    pytest.param("./tests/toy_config/qwen3_5_moe_toy/config.json", id="qwen3_5_moe"),
+    pytest.param("./tests/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl"),
+    pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
+    pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
 ]
 
 

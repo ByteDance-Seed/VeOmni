@@ -19,6 +19,10 @@
 #      Provide dummy vision forward for FSDP path with SP-aware shape
 #    - method_override: Qwen2_5_VLModel.get_placeholder_mask
 #      Return raw image/video placeholder bool masks for VeOmni SP-aware masked_scatter
+#    - method_override: Qwen2_5_VLModel.get_image_features
+#      Skip upstream split — outer forward gathers SP-scattered pooler_output before use
+#    - method_override: Qwen2_5_VLModel.get_video_features
+#      Skip upstream split — outer forward gathers SP-scattered pooler_output before use
 #    - method_override: Qwen2_5_VLModel.forward
 #      VeOmni SP + precomputed position-id + dummy-forward multimodal patches
 #    - method_override: Qwen2_5_VLForConditionalGeneration.get_position_id_func
@@ -1159,7 +1163,7 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5_VLModel
-# Methods patched: get_placeholder_mask, forward
+# Methods patched: get_placeholder_mask, get_image_features, get_video_features, forward
 # ======================================================================
 
 
@@ -1354,12 +1358,19 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         """
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
         vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
-        split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        video_embeds = torch.split(vision_outputs.pooler_output, split_sizes)
-        vision_outputs.pooler_output = video_embeds
-
         return vision_outputs
 
+    # ================================================================
+    # Patch: Qwen2_5_VLModel.{get_image_features,get_video_features}
+    # Skip the upstream HF ``torch.split(pooler_output, split_sizes)``: the
+    # visual tower returns an SP-scattered ``pooler_output`` (each rank holds
+    # ``total_tokens / sp_size`` rows), so the split — whose sizes are
+    # computed from the *full* grid — fails with
+    # ``split_with_sizes expects split_sizes to sum exactly to N``. Returning
+    # the raw ``BaseModelOutputWithPooling`` lets the outer forward gather
+    # pooler_output along dim 0 before slicing, matching the pattern already
+    # used in qwen2_vl (which has the same override).
+    # ================================================================
     @can_return_tuple
     @auto_docstring
     def get_image_features(
@@ -1376,10 +1387,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        image_embeds = torch.split(vision_outputs.pooler_output, split_sizes)
-        vision_outputs.pooler_output = image_embeds
-
         return vision_outputs
 
     # ================================================================
@@ -1457,9 +1464,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     #    are None on this rank — keeps visual params on the FSDP all-reduce
     #    graph via fake_embeds * 0
     # 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
-    # 6. v5 visual return contract: get_image_features / get_video_features
-    #    now return BaseModelOutputWithPooling whose pooler_output is a
-    #    tuple[per-image tensor] — concat into a single tensor
+    # 6. get_{image,video}_features now skip the upstream split (see
+    #    overrides above); pooler_output is a single SP-scattered tensor
+    #    ready for the SP gather + masked_scatter below.
     # ================================================================
     @auto_docstring
     def forward(
@@ -1517,10 +1524,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         if pixel_values is not None:
             # --- Patch.6 ---
-            # v5 get_image_features returns BaseModelOutputWithPooling whose
-            # pooler_output is tuple[per-image tensor] after torch.split
+            # VeOmni overrides get_image_features to skip the upstream split,
+            # so pooler_output is a single SP-scattered tensor.
             image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
-            image_embeds = torch.cat(image_embeds, dim=0)
             # --- Patch.6 ---
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
@@ -1540,8 +1546,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         if pixel_values_videos is not None:
             # --- Patch.6 ---
+            # VeOmni overrides get_video_features to skip the upstream split,
+            # so pooler_output is a single SP-scattered tensor.
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True).pooler_output
-            video_embeds = torch.cat(video_embeds, dim=0)
             # --- Patch.6 ---
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:

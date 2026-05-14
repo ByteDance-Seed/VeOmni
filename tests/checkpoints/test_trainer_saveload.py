@@ -26,7 +26,6 @@ from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
 from veomni.utils import helper
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -279,24 +278,20 @@ def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
 
 # MoE save/load coverage runs in the v5 lane only — both ``qwen3_moe`` and
 # ``deepseek_v3`` migrated to the v5 patchgen path, and their v4 CI lanes
-# were retired together with the broader transformers v4 wind-down.
+# were retired together with the broader transformers v4 wind-down. The
+# CI workflow only executes this file from ``gpu_unit_tests_v5`` so a
+# ``skipif`` on transformers >= 5.0.0 would just turn the v4-environment
+# failure (``raise_if_not_migrated_to_v5``) into a less informative
+# ``0 collected`` exit-5 error if it ever leaked back into the v4 lane.
 TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
 TEST_EP_SIZES = [1, 4, 8]
 
 
-@pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.0.0"),
-    reason="MoE save/load coverage moved to the v5 lane; skip on transformers < 5.0.0",
-)
 @pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
 def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
 
 
-@pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.0.0"),
-    reason="qwen3_moe is v5-only; skip hf-safetensor save test on transformers < 5.0.0",
-)
 @pytest.mark.parametrize("ep_size", TEST_EP_SIZES)
 def test_trainer_save_hf_safetensor(ep_size: int):
     # only test save hf safetensor on qwen3_moe to save resources
