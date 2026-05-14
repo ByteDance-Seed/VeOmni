@@ -1,6 +1,6 @@
 import os
-from dataclasses import asdict, dataclass, fields, replace
-from typing import Callable, Dict, Optional
+from dataclasses import asdict, dataclass, fields
+from typing import Dict
 
 import torch
 from rich.console import Console
@@ -33,7 +33,6 @@ _FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
 class ModelMode:
     modeling_backend: str
     attn_implementation: str
-    sync_weight_func: Optional[Callable] = None
     moe_implementation: str = "eager"
     use_liger_kernel: bool = False
 
@@ -77,7 +76,7 @@ def _append_veomni_modes(modes: list, moe_implementation: str = "eager"):
 
 
 def _base_model_modes():
-    """Base (non-MoE) model modes; all use sync_weight_func=None by default."""
+    """Base (non-MoE) model modes."""
     modes = []
     for hf_attn in _HF_ATTN:
         if _skip_fa3_npu(hf_attn):
@@ -97,28 +96,16 @@ def _moe_model_modes():
     return modes
 
 
-def prepare_model_modes(
-    is_moe: bool = False,
-    sync_weight_func: Optional[Callable] = None,
-):
+def prepare_model_modes(is_moe: bool = False):
     """
     Build model modes for patch tests.
 
     Args:
         is_moe: If True, include MoE-specific modes (e.g. fused MoE).
-        sync_weight_func: Optional callable(config, state_dict, model) used only for
-            VeOmni backend modes when HF/VeOmni state dict layouts differ. Will be
-            removed in a future version when layouts align; pass None for normal models.
     """
     base_modes = _base_model_modes()
     moe_modes = _moe_model_modes()
     final_models_modes = base_modes + moe_modes if is_moe else base_modes
-
-    if sync_weight_func is not None:
-        final_models_modes = [
-            replace(mode, sync_weight_func=sync_weight_func) if mode.modeling_backend == "veomni" else mode
-            for mode in final_models_modes
-        ]
 
     hf_model_modes = [m for m in final_models_modes if m.modeling_backend == "hf"]
     veomni_model_modes = [m for m in final_models_modes if m.modeling_backend == "veomni"]
@@ -205,7 +192,7 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
     first_mode = next(iter(output_dict.keys()))
 
     table = Table(title=f"Alignment Result: [bold magenta]{model_type} {value_key}[/bold magenta]")
-    mode_fields = [f.name for f in fields(first_mode) if f.name != "sync_weight_func"]
+    mode_fields = [f.name for f in fields(first_mode)]
 
     for field in mode_fields:
         table.add_column(field, style="cyan", justify="left")

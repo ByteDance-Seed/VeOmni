@@ -35,7 +35,6 @@ from .utils import (
     print_all_values,
     set_environ_param,
 )
-from .weight_sync_adapters import get_sync_weight_func
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -143,11 +142,16 @@ class TrainerTest(BaseTrainer):
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
-        # Sync weights
-        if model_mode.sync_weight_func is None:
-            self.model.load_state_dict(state_dict)
-        else:
-            model_mode.sync_weight_func(self.model_config, state_dict, self.model)
+        # Sync weights — every model that test_models_patch covers now has a
+        # matching VeOmni v5 layout, so a straight load is sufficient. The
+        # per-model adapter shim (``weight_sync_adapters.py``) was retired
+        # together with the broader transformers v4 wind-down. When loading
+        # from a real on-disk HF safetensors checkpoint the per-expert →
+        # fused merge still happens, but at the runtime-converter layer
+        # (e.g. ``DeepseekV3CheckpointTensorConverter``); that path is
+        # exercised by ``test_logits_bitwise_equal_via_runtime_converter_v5``
+        # in ``test_models_logits_equal_v5.py``.
+        self.model.load_state_dict(state_dict)
 
         if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
             self.model.disable_talker()
@@ -193,7 +197,7 @@ class TrainerTest(BaseTrainer):
         return result_metrics
 
 
-# Test case: (config_path, is_moe, rtol, atol). id= must match weight_sync_adapters key if the model needs custom sync.
+# Test case: (config_path, is_moe, rtol, atol).
 # rtol/atol: tolerances for compare_multi_items; can be set per case.
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
@@ -205,13 +209,6 @@ _TEST_CASES_TRANSFORMERS_V4 = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="llama3.1",
-    ),
-    pytest.param(
-        "./tests/toy_config/deepseek_v3_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="deepseek_v3",
     ),
     pytest.param(
         "./tests/toy_config/qwen25omni_toy",
@@ -286,6 +283,13 @@ _TEST_CASES_TRANSFORMERS_V5 = [
         _DEFAULT_ATOL,
         id="seed_oss",
     ),
+    pytest.param(
+        "./tests/toy_config/deepseek_v3_toy/config.json",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v3",
+    ),
 ]
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
@@ -305,13 +309,7 @@ def test_models_patch_fwd_bwd(
     atol: float,
 ):
     case_id = request.node.callspec.id
-    sync_weight_func = get_sync_weight_func(case_id)
-    hf_model_modes, veomni_model_modes = prepare_model_modes(is_moe=is_moe, sync_weight_func=sync_weight_func)
-
-    # delete flash_attention_3 mode for hf deepseek_v3.
-    # TODO: transformers v5 fixed this, remove this after veomni support transformers v5.
-    if case_id == "deepseek_v3":
-        hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
+    hf_model_modes, veomni_model_modes = prepare_model_modes(is_moe=is_moe)
 
     # hf qwen2_5_omni fa3 error
     if case_id == "qwen2_5_omni":
