@@ -26,6 +26,7 @@ from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
 from veomni.utils import helper
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -276,7 +277,13 @@ def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
     shutil.rmtree(get_output_dir(model_name, ep_size))
 
 
-TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
+# NOTE: ``qwen3_moe`` is v5-only (``veomni/models/transformers/qwen3_moe/__init__.py``
+# raises on transformers < 5.0.0), and ``deepseek_v3`` is currently v4-only. Pick the
+# right model per env so this test stays green in both v4 and v5 CI matrices.
+if is_transformers_version_greater_or_equal_to("5.0.0"):
+    TEST_MODELS = ["qwen3_moe"]
+else:
+    TEST_MODELS = ["deepseek_v3"]
 TEST_EP_SIZES = [1, 4, 8]
 
 
@@ -285,6 +292,10 @@ def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
 
 
+@pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.0.0"),
+    reason="qwen3_moe is v5-only; skip hf-safetensor save test on transformers < 5.0.0",
+)
 @pytest.mark.parametrize("ep_size", TEST_EP_SIZES)
 def test_trainer_save_hf_safetensor(ep_size: int):
     # only test save hf safetensor on qwen3_moe to save resources
