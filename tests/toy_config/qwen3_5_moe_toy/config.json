@@ -42,7 +42,7 @@
         "router_aux_loss_coef": 0.001,
         "shared_expert_intermediate_size": 512,
         "use_cache": true,
-        "vocab_size": 2048,
+        "vocab_size": 248320,
         "mamba_ssm_dtype": "float32",
         "rope_parameters": {
             "mrope_interleaved": true,

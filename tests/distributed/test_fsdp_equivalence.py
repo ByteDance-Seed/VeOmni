@@ -198,9 +198,16 @@ _text_test_cases_v4 = [
 ]
 
 _text_test_cases_v5 = [
+    # NOTE: these tests use ``*_fsdp_equiv_toy`` configs (vocab_size=2048)
+    # rather than the shared ``*_toy`` configs (vocab_size=248320). The
+    # single-GPU baseline (nproc=1, no FSDP sharding) has to fit the whole
+    # model + Adam state on one 44 GiB L20; the production vocab alone
+    # pushes optimizer state past the card. Shrinking vocab is safe here:
+    # DummyDataset emits tokens in [0, 1024) and this test is text-only
+    # equivalence — image/video/vision special tokens are never embedded.
     pytest.param(
         "qwen3_5",
-        "./tests/toy_config/qwen3_5_toy/config.json",
+        "./tests/toy_config/qwen3_5_fsdp_equiv_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
@@ -209,7 +216,7 @@ _text_test_cases_v5 = [
     ),
     pytest.param(
         "qwen3_5_moe",
-        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        "./tests/toy_config/qwen3_5_moe_fsdp_equiv_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
