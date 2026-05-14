@@ -44,6 +44,10 @@ env:
   # next 2.4 GiB request). Expandable segments coalesce the free
   # blocks so the toy e2e fits the 44 GiB card.
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # Disable UCX's signal-handler chain — see gpu_unit_tests.yml for
+  # rationale (NCCL's RDMA plugin pulls in libucs, whose SIGSEGV
+  # handler trips libnvidia-ptxjitcompiler.so.1 on rank teardown).
+  UCX_HANDLE_ERRORS: "none"
 
 jobs:
   lint:
