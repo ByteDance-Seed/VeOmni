@@ -15,43 +15,24 @@
 """
 Tests for transformers v4 on-the-fly MoE expert weight stacking converters.
 
-The v4 patches for `qwen3_moe`, `deepseek_v3`, and `qwen3_omni_moe` (in fused
-mode) store experts as three separate stacked nn.Parameters. The converters
-in this test file fold the per-expert HF checkpoint format into that layout
-at load time so users can pass vanilla HF checkpoints directly.
+Only `deepseek_v3` is exercised here: `qwen3_moe` and `qwen3_omni_moe` already
+have transformers v5 patchgen support and a v5 runtime converter, so their v4
+factories were retired together with the v4 ``__init__`` branches in those
+models. The shared `MoEV4StackingConverter` plumbing stays covered by the
+generic unit tests further down.
 """
 
-import os
 import re
-import shutil
-import tempfile
 from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
-from transformers import AutoConfig
 
 from veomni.models.checkpoint_tensor_loading import maybe_convert_checkpoint_tensor
-from veomni.models.loader import get_model_class
-from veomni.models.module_utils import init_empty_weights, load_model_weights
 from veomni.models.transformers._moe_v4_converter import MoEV4StackingConverter
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter_v4 import (
     create_deepseek_v3_v4_checkpoint_tensor_converter,
 )
-from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter_v4 import (
-    create_qwen3_moe_v4_checkpoint_tensor_converter,
-)
-from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter_v4 import (
-    create_qwen3_omni_moe_v4_checkpoint_tensor_converter,
-)
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-
-try:
-    from transformers.initialization import no_init_weights
-except ImportError:
-    from transformers.modeling_utils import no_init_weights
 
 
 NUM_EXPERTS = 4
@@ -271,39 +252,6 @@ class TestMoEV4StackingConverterMultiPrefix:
 
 
 # ---------------------------------------------------------------------------
-# qwen3_moe v4 factory
-# ---------------------------------------------------------------------------
-
-
-class TestQwen3MoeV4Factory:
-    def test_factory_creates_converter(self):
-        model = SimpleNamespace(config=SimpleNamespace(num_experts=NUM_EXPERTS))
-        converter = create_qwen3_moe_v4_checkpoint_tensor_converter(model)
-        assert isinstance(converter, MoEV4StackingConverter)
-        assert converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
-
-    def test_full_conversion_emits_three_keys(self):
-        model = SimpleNamespace(config=SimpleNamespace(num_experts=NUM_EXPERTS))
-        converter = create_qwen3_moe_v4_checkpoint_tensor_converter(model)
-        emitted = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            for e in range(NUM_EXPERTS):
-                r = maybe_convert_checkpoint_tensor(
-                    _hf_expert_key("model.layers.0.mlp", e, proj),
-                    _hf_expert_tensor(proj, e),
-                    converter,
-                )
-                if r is not None:
-                    emitted[r.name] = r.tensor
-        assert converter.finalize() == []
-        assert set(emitted.keys()) == {
-            "model.layers.0.mlp.experts.gate_proj",
-            "model.layers.0.mlp.experts.up_proj",
-            "model.layers.0.mlp.experts.down_proj",
-        }
-
-
-# ---------------------------------------------------------------------------
 # deepseek_v3 v4 factory
 # ---------------------------------------------------------------------------
 
@@ -337,225 +285,3 @@ class TestDeepseekV3V4Factory:
         assert result is not None
         assert result.name == dense_key
         assert torch.equal(result.tensor, dense_t)
-
-
-# ---------------------------------------------------------------------------
-# qwen3_omni_moe v4 factory — always fires after OpSlot migration
-# ---------------------------------------------------------------------------
-
-
-def _omni_top_level_model():
-    """SimpleNamespace mimicking Qwen3OmniMoeForConditionalGeneration's config shape."""
-    text_config = SimpleNamespace(num_experts=NUM_EXPERTS)
-    thinker_config = SimpleNamespace(text_config=text_config)
-    return SimpleNamespace(config=SimpleNamespace(thinker_config=thinker_config))
-
-
-def _omni_thinker_standalone_model():
-    """SimpleNamespace mimicking Qwen3OmniMoeThinkerForConditionalGeneration's config shape."""
-    text_config = SimpleNamespace(num_experts=NUM_EXPERTS)
-    return SimpleNamespace(config=SimpleNamespace(text_config=text_config))
-
-
-def _omni_text_model_standalone():
-    """SimpleNamespace mimicking Qwen3OmniMoeThinkerTextModel's config shape."""
-    return SimpleNamespace(config=SimpleNamespace(num_experts=NUM_EXPERTS))
-
-
-class TestQwen3OmniMoeV4FactoryFiresUnconditionally:
-    """After the OpSlot migration the thinker uses stacked-parameter storage in
-    both eager and fused modes (the eager path runs the standard expert loop
-    over the stacked tensors), so the converter always fires for thinker keys
-    regardless of the runtime ``ops_implementation.moe_implementation`` selection.
-    """
-
-    def test_top_level(self):
-        assert isinstance(
-            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model()),
-            MoEV4StackingConverter,
-        )
-
-    def test_thinker_standalone(self):
-        assert isinstance(
-            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_thinker_standalone_model()),
-            MoEV4StackingConverter,
-        )
-
-    def test_text_model_standalone(self):
-        assert isinstance(
-            create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_text_model_standalone()),
-            MoEV4StackingConverter,
-        )
-
-
-class TestQwen3OmniMoeV4FactoryTopLevel:
-    """Top-level Qwen3OmniMoeForConditionalGeneration: thinker prefix only, talker keys pass through."""
-
-    def setup_method(self):
-        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_top_level_model())
-
-    def test_handles_thinker_prefix(self):
-        assert self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
-        last = None
-        for e in range(NUM_EXPERTS):
-            last = self.converter.convert(
-                f"thinker.model.layers.0.mlp.experts.{e}.gate_proj.weight",
-                _hf_expert_tensor("gate_proj", e),
-            )
-        assert last is not None
-        assert last.name == "thinker.model.layers.0.mlp.experts.gate_proj"
-
-    def test_does_not_match_talker_prefix(self):
-        """Talker tower runs in eager (nn.ModuleList) on v4; converter must leave its keys alone."""
-        talker_key = "talker.model.layers.0.mlp.experts.0.gate_proj.weight"
-        assert not self.converter.can_handle(talker_key)
-
-        # Pass-through via maybe_convert_checkpoint_tensor:
-        t = torch.randn(INTERMEDIATE_DIM, HIDDEN_DIM)
-        result = maybe_convert_checkpoint_tensor(talker_key, t, self.converter)
-        assert result is not None and result.name == talker_key
-        assert torch.equal(result.tensor, t)
-
-    def test_does_not_match_unprefixed_keys(self):
-        """When loading the top-level container, expert keys without `thinker.` prefix
-        are unexpected — pass them through so the dispatcher can flag them."""
-        assert not self.converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
-
-
-class TestQwen3OmniMoeV4FactoryThinkerStandalone:
-    """Standalone Qwen3OmniMoeThinkerForConditionalGeneration: experts under `model.layers.*`."""
-
-    def setup_method(self):
-        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_thinker_standalone_model())
-
-    def test_handles_model_prefix(self):
-        # The standalone thinker class wraps a `.model = Qwen3OmniMoeThinkerTextModel`,
-        # so its parameter FQNs (and the matching HF checkpoint keys) start with `model.`.
-        assert self.converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
-
-        last = None
-        for e in range(NUM_EXPERTS):
-            last = self.converter.convert(
-                f"model.layers.0.mlp.experts.{e}.gate_proj.weight",
-                _hf_expert_tensor("gate_proj", e),
-            )
-        assert last is not None
-        assert last.name == "model.layers.0.mlp.experts.gate_proj"
-
-    def test_does_not_match_thinker_or_talker_prefixes(self):
-        # The standalone thinker never sees `thinker.*` or `talker.*` keys.
-        assert not self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
-        assert not self.converter.can_handle("talker.model.layers.0.mlp.experts.0.gate_proj.weight")
-
-
-class TestQwen3OmniMoeV4FactoryTextModelStandalone:
-    """Standalone Qwen3OmniMoeThinkerTextModel: experts under `layers.*` (the model class IS the root)."""
-
-    def setup_method(self):
-        self.converter = create_qwen3_omni_moe_v4_checkpoint_tensor_converter(_omni_text_model_standalone())
-
-    def test_handles_bare_layers_prefix(self):
-        assert self.converter.can_handle("layers.0.mlp.experts.0.gate_proj.weight")
-
-        last = None
-        for e in range(NUM_EXPERTS):
-            last = self.converter.convert(
-                f"layers.0.mlp.experts.{e}.gate_proj.weight",
-                _hf_expert_tensor("gate_proj", e),
-            )
-        assert last is not None
-        assert last.name == "layers.0.mlp.experts.gate_proj"
-
-    def test_does_not_match_wrapped_prefixes(self):
-        assert not self.converter.can_handle("model.layers.0.mlp.experts.0.gate_proj.weight")
-        assert not self.converter.can_handle("thinker.model.layers.0.mlp.experts.0.gate_proj.weight")
-
-
-# ---------------------------------------------------------------------------
-# End-to-end integration: build a tiny v4 patched model, write per-expert
-# safetensors, run load_model_weights, and verify the resulting stacked
-# parameters reproduce torch.stack of the per-expert inputs.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    is_transformers_version_greater_or_equal_to("5.0.0"),
-    reason="v4 converter only fires under transformers<5; on v5 the v5 converter handles loading.",
-)
-class TestQwen3MoeV4LoadIntegration:
-    """End-to-end check that load_model_weights pipes per-expert HF keys through the converter
-    into the v4 patched model's stacked nn.Parameters."""
-
-    def _make_tiny_state_dict(self, cfg) -> dict:
-        sd = {}
-        rng = torch.Generator().manual_seed(0)
-        L, E, H, I = cfg.num_hidden_layers, cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size
-        head = cfg.head_dim
-        for layer in range(L):
-            for e in range(E):
-                sd[f"model.layers.{layer}.mlp.experts.{e}.gate_proj.weight"] = torch.randn(
-                    I, H, generator=rng
-                ).bfloat16()
-                sd[f"model.layers.{layer}.mlp.experts.{e}.up_proj.weight"] = torch.randn(
-                    I, H, generator=rng
-                ).bfloat16()
-                sd[f"model.layers.{layer}.mlp.experts.{e}.down_proj.weight"] = torch.randn(
-                    H, I, generator=rng
-                ).bfloat16()
-            sd[f"model.layers.{layer}.mlp.gate.weight"] = torch.randn(E, H, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.input_layernorm.weight"] = torch.randn(H, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.post_attention_layernorm.weight"] = torch.randn(H, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.self_attn.q_proj.weight"] = torch.randn(2 * head, H, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.self_attn.k_proj.weight"] = torch.randn(head, H, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.self_attn.v_proj.weight"] = torch.randn(head, H, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.self_attn.o_proj.weight"] = torch.randn(H, 2 * head, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.self_attn.q_norm.weight"] = torch.randn(head, generator=rng).bfloat16()
-            sd[f"model.layers.{layer}.self_attn.k_norm.weight"] = torch.randn(head, generator=rng).bfloat16()
-        sd["model.embed_tokens.weight"] = torch.randn(cfg.vocab_size, H, generator=rng).bfloat16()
-        sd["model.norm.weight"] = torch.randn(H, generator=rng).bfloat16()
-        sd["lm_head.weight"] = torch.randn(cfg.vocab_size, H, generator=rng).bfloat16()
-        return sd
-
-    def test_per_expert_hf_checkpoint_loads_into_stacked_params(self):
-        toy_cfg_dir = os.path.join(os.path.dirname(__file__), "..", "toy_config", "qwen3_moe_toy")
-        with tempfile.TemporaryDirectory() as tmp:
-            shutil.copy(os.path.join(toy_cfg_dir, "config.json"), os.path.join(tmp, "config.json"))
-            cfg = AutoConfig.from_pretrained(tmp)
-            cfg.hidden_size = 16
-            cfg.intermediate_size = 32
-            cfg.moe_intermediate_size = 12
-            cfg.num_experts = NUM_EXPERTS
-            cfg.num_attention_heads = 2
-            cfg.num_key_value_heads = 1
-            cfg.head_dim = 8
-            cfg.num_hidden_layers = 1
-            cfg.vocab_size = 32
-
-            # The v4 expert layout is shared by eager and fused modes; loading test
-            # only depends on the parameter shapes, so eager keeps this test
-            # CPU-only (no triton kernel needed).
-            cfg._moe_implementation = "eager"
-            cfg.torch_dtype = torch.bfloat16
-
-            sd = self._make_tiny_state_dict(cfg)
-            save_file(sd, os.path.join(tmp, "model.safetensors"))
-
-            # Trigger registration; attaches our v4 converter staticmethod to the HF class.
-            cls = get_model_class(cfg)
-            assert hasattr(cls, "_create_checkpoint_tensor_converter"), (
-                "v4 init branch should attach _create_checkpoint_tensor_converter"
-            )
-
-            with init_empty_weights(), no_init_weights():
-                model = cls._from_config(cfg, torch_dtype=torch.bfloat16, attn_implementation="eager")
-
-            load_model_weights(model, tmp, init_device="cpu")
-
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                param = getattr(model.model.layers[0].mlp.experts, proj)
-                expected = torch.stack(
-                    [sd[f"model.layers.0.mlp.experts.{e}.{proj}.weight"] for e in range(NUM_EXPERTS)]
-                )
-                assert not param.is_meta, f"{proj} still on meta after load"
-                assert param.shape == expected.shape
-                assert torch.equal(param.detach().cpu(), expected), f"value mismatch for {proj}"

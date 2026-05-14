@@ -15,25 +15,22 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 from ..tools.training_utils import make_eager_ops_config
 
 
-_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4 = [
-    pytest.param("./tests/toy_config/qwen2vl_toy", id="qwen2_vl"),
-    pytest.param("./tests/toy_config/qwen25vl_toy", id="qwen2_5_vl"),
-    pytest.param("./tests/toy_config/qwen3vl_toy", id="qwen3_vl"),
-]
+# Every VLM family covered by this test now has v5 patchgen support, so the
+# v4 list collapsed into the v5 list. Skip the whole module on transformers<5
+# to avoid invoking v5-only model paths under the legacy stack.
+if not is_transformers_version_greater_or_equal_to("5.0.0"):
+    pytest.skip(
+        "test_vlm_trainer covers only v5-supported VLMs; skipping under transformers<5.",
+        allow_module_level=True,
+    )
 
-_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5 = [
+_FREEZE_VIT_VLM_CASES = [
     pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
     pytest.param("./tests/toy_config/qwen3_5_moe_toy/config.json", id="qwen3_5_moe"),
     pytest.param("./tests/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl"),
     pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
     pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
 ]
-
-_FREEZE_VIT_VLM_CASES = (
-    _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5
-    if is_transformers_version_greater_or_equal_to("5.0.0")
-    else _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4
-)
 
 
 @pytest.mark.parametrize(
