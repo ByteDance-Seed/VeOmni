@@ -20,10 +20,10 @@ You can find the latest official Ascend CANN images at: [Ascend Hub](https://www
 
 ```bash
 # for arm
-docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
 
 # for x86
-docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
 ```
 
 ## Step 2: Build the Custom Image
@@ -40,7 +40,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3.rc2_a2 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
   .
 ```
 
@@ -53,7 +53,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3.rc2_a2.arm \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
   .
 ```
 
@@ -63,7 +63,7 @@ For x86:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3.rc2_a2 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
   .
 ```
 
@@ -71,14 +71,14 @@ For ARM64:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3.rc2_a2.arm \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
   .
 ```
 
 ### Image Components
 The built image includes:
 - Ubuntu 22.04 with Python 3.11
-- Ascend CANN 8.3.rc2 runtime
+- Ascend CANN 9.0.0 runtime
 - VeOmni framework with NPU support
 - TorchCodec for efficient video processing
 - All necessary development tools and dependencies
@@ -221,14 +221,14 @@ Update the proxy settings in both the build and run commands to match your envir
 
 ### Dockerfile Details
 
-#### x86 Dockerfile (Dockerfile.ascend_8.3.rc2_a2)
+#### x86 Dockerfile (Dockerfile.ascend_9.0.0_a2)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Installs and configures `uv` for dependency management
 4. Uses `uv` to install VeOmni framework with NPU support
 5. Sets up the virtual environment
 
-#### ARM64 Dockerfile (Dockerfile.ascend_8.3.rc2_a2.arm)
+#### ARM64 Dockerfile (Dockerfile.ascend_9.0.0_a2.arm)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Uses `pip` to install VeOmni framework with NPU support
