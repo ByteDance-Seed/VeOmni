@@ -47,10 +47,16 @@ env:
   # Disable UCX's signal-handler chain. NCCL's RDMA plugin pulls in
   # libucs, which registers a SIGSEGV handler that itself segfaults
   # via libnvidia-ptxjitcompiler.so.1 when a rank tears down its
-  # CUDA context (observed twice on test_trainer_saveload[*-8] after
-  # all weight checks pass; rank exits with -11 and torchrun reports
-  # the whole job failed even though the actual test logic finished).
+  # CUDA context (observed on test_trainer_saveload[*-8] after all
+  # weight checks pass; rank exits with -11 and torchrun reports the
+  # whole job failed even though the test logic completed).
   UCX_HANDLE_ERRORS: "none"
+  # Force eager CUDA module loading. The shutdown segfault traces
+  # showed a libnvidia-ptxjitcompiler.so.1 worker thread crashing on
+  # __clone teardown — characteristic of the JIT compiler still
+  # running when the process exits. EAGER compiles all PTX upfront at
+  # context init so no JIT threads remain alive at shutdown.
+  CUDA_MODULE_LOADING: "EAGER"
 
 jobs:
   lint:

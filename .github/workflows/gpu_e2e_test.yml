@@ -48,6 +48,9 @@ env:
   # rationale (NCCL's RDMA plugin pulls in libucs, whose SIGSEGV
   # handler trips libnvidia-ptxjitcompiler.so.1 on rank teardown).
   UCX_HANDLE_ERRORS: "none"
+  # Force eager CUDA module loading so PTX JIT threads aren't alive
+  # at process exit — see gpu_unit_tests.yml for the same rationale.
+  CUDA_MODULE_LOADING: "EAGER"
 
 jobs:
   lint:
