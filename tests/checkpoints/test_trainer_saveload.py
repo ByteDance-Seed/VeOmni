@@ -276,13 +276,9 @@ def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
     shutil.rmtree(get_output_dir(model_name, ep_size))
 
 
-# MoE save/load coverage runs in the v5 lane only — both ``qwen3_moe`` and
-# ``deepseek_v3`` migrated to the v5 patchgen path, and their v4 CI lanes
-# were retired together with the broader transformers v4 wind-down. The
-# CI workflow only executes this file from ``gpu_unit_tests_v5`` so a
-# ``skipif`` on transformers >= 5.0.0 would just turn the v4-environment
-# failure (``raise_if_not_migrated_to_v5``) into a less informative
-# ``0 collected`` exit-5 error if it ever leaked back into the v4 lane.
+# MoE save/load coverage. Both ``qwen3_moe`` and ``deepseek_v3`` ship the
+# v5 patchgen path, so both run unconditionally — the v4 CI lane was
+# retired together with the broader transformers v4 wind-down.
 TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
 TEST_EP_SIZES = [1, 4, 8]
 

@@ -165,15 +165,16 @@ class TrainerTest(BaseTrainer):
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
-        # Sync weights — every model that test_models_patch covers now has a
-        # matching VeOmni v5 layout, so a straight load is sufficient. The
-        # per-model adapter shim (``weight_sync_adapters.py``) was retired
-        # together with the broader transformers v4 wind-down. When loading
-        # from a real on-disk HF safetensors checkpoint the per-expert →
-        # fused merge still happens, but at the runtime-converter layer
-        # (e.g. ``DeepseekV3CheckpointTensorConverter``); that path is
-        # exercised by ``test_logits_bitwise_equal_via_runtime_converter_v5``
-        # in ``test_models_logits_equal.py``.
+        # Sync weights — every model that test_models_patch covers ships a
+        # VeOmni v5 layout that matches HF's in-memory state dict, so a
+        # straight ``load_state_dict`` is sufficient. The per-model
+        # ``weight_sync_adapters.py`` shim was retired with the v4 wind-down.
+        # When loading from a real on-disk HF safetensors checkpoint, the
+        # per-expert → fused merge still happens, but at the runtime-
+        # converter layer (e.g. ``DeepseekV3CheckpointTensorConverter``);
+        # that path is exercised by
+        # ``test_logits_bitwise_equal_v5_via_loader`` in
+        # ``test_models_logits_equal.py``.
         self.model.load_state_dict(state_dict)
 
         if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
@@ -222,13 +223,14 @@ class TrainerTest(BaseTrainer):
 
 # Test case: (config_path, is_moe, rtol, atol).
 # rtol/atol: tolerances for compare_multi_items; can be set per case.
-DEFAULT_RTOL = 1e-2
-DEFAULT_ATOL = 1e-2
+_DEFAULT_RTOL = 1e-2
+_DEFAULT_ATOL = 1e-2
 
-# v5-only test cases. Models that are still v4-only (llama3.1, qwen2_5_omni)
-# live in the sibling ``test_models_patch_v4.py`` and are exercised by the
-# dedicated ``gpu_unit_tests_v4`` lane against the ``transformers-v4-legacy``
-# extra.
+# transformers v5 only — VeOmni's v4 monkey-patch path was retired together
+# with the v4 CI lane. v4-only models that have not yet been migrated to
+# patchgen (currently llama3_1 and qwen2_5_omni) are *not* covered here;
+# they keep their v4-style modeling code in-tree but no longer have an
+# fwd/bwd parity test. Migrate them to v5 to bring them back into this list.
 TEST_CASES = [
     pytest.param(
         "./tests/toy_config/qwen3_5_toy/config.json",
@@ -254,76 +256,70 @@ TEST_CASES = [
     pytest.param(
         "./tests/toy_config/qwen2vl_toy/config.json",
         False,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="qwen2_vl",
     ),
     pytest.param(
         "./tests/toy_config/qwen2_toy/config.json",
         False,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="qwen2",
     ),
     pytest.param(
         "./tests/toy_config/qwen25vl_toy/config.json",
         False,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="qwen2_5_vl",
     ),
     pytest.param(
         "./tests/toy_config/qwen3vl_toy/config.json",
         False,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="qwen3_vl",
     ),
     pytest.param(
         "./tests/toy_config/qwen3vlmoe_toy/config.json",
         True,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="qwen3_vl_moe",
     ),
     pytest.param(
         "./tests/toy_config/qwen3omni_toy/config.json",
         True,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="qwen3_omni_moe",
     ),
     pytest.param(
         "./tests/toy_config/seed_oss_toy/config.json",
         False,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="seed_oss",
     ),
     pytest.param(
         "./tests/toy_config/deepseek_v3_toy/config.json",
         True,
-        DEFAULT_RTOL,
-        DEFAULT_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         id="deepseek_v3",
     ),
 ]
 
 
-def run_models_patch_fwd_bwd(
+@pytest.mark.parametrize("config_path, is_moe, rtol, atol", TEST_CASES)
+def test_models_patch_fwd_bwd(
     request: pytest.FixtureRequest,
     config_path: str,
     is_moe: bool,
     rtol: float,
     atol: float,
 ):
-    """Shared body for the v5 and v4 ``test_models_patch_fwd_bwd`` parametrizations.
-
-    Lifted out so ``test_models_patch_v4.py`` can re-use it against the
-    transformers-v4-legacy extra without re-collecting the v5 cases (and
-    vice versa). This is a plain helper, not a test — pytest only collects
-    the thin ``test_models_patch_fwd_bwd`` wrappers in each file.
-    """
     case_id = request.node.callspec.id
     hf_model_modes, veomni_model_modes = prepare_model_modes(is_moe=is_moe)
 
@@ -409,14 +405,3 @@ def run_models_patch_fwd_bwd(
 
     _release_device_memory()
     print_device_mem_info("[Memory Info] after running train_compare_models:")
-
-
-@pytest.mark.parametrize("config_path, is_moe, rtol, atol", TEST_CASES)
-def test_models_patch_fwd_bwd(
-    request: pytest.FixtureRequest,
-    config_path: str,
-    is_moe: bool,
-    rtol: float,
-    atol: float,
-):
-    run_models_patch_fwd_bwd(request, config_path, is_moe, rtol, atol)

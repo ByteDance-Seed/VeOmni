@@ -1,10 +1,11 @@
 """Bitwise logits-equal tests for transformers v5 models.
 
-Sibling to ``test_models_logits_equal_v4.py`` (v4-only scope, runs on the
-``transformers-v4-legacy`` lane). v5 ships self-contained generated modeling
-under ``veomni/models/transformers/<model>/generated/``, so pristine
+v5 ships self-contained generated modeling under
+``veomni/models/transformers/<model>/generated/``, so pristine
 ``transformers.*`` classes stay untouched and HF + VeOmni can be built
-side-by-side without an unpatch helper.
+side-by-side without an unpatch helper. The transformers v4 lane (and its
+sibling logits-equal file) was retired — v4-only models that have not yet
+been migrated to patchgen no longer have logits-equal coverage.
 
 Coverage
 --------

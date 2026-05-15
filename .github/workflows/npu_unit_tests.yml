@@ -141,9 +141,8 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
-      # NPU jobs run only the default (v5). The v4 NPU path is the sunset
-      # track; we do not exercise it in CI on NPU (GPU CI keeps the v4
-      # coverage via the dedicated *_v4 jobs).
+      # Default (transformers v5) only. The v4 dependency path is sunset
+      # and no longer exercised in CI.
       - name: Sync dependencies
         run: |
           uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
