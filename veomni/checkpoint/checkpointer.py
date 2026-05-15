@@ -78,9 +78,9 @@ def dcp_checkpointer(dist_backend: str):
 
     if not is_torch_version_greater_than("2.4"):
         raise ValueError("DCP checkpoint manager requires torch version >= 2.4")
-    if dist_backend not in ["ddp", "fsdp1", "fsdp2"]:
+    if dist_backend not in ["ddp", "fsdp2"]:
         raise ValueError(
-            f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: ddp, fsdp1, fsdp2"
+            f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: ddp, fsdp2"
         )
     from .dcp_checkpointer import DistributedCheckpointer
 

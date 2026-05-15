@@ -151,7 +151,6 @@ class MultiOptimizer(Optimizer, Stateful):
     Compatible with torch.distributed.checkpoint optimizer APIs that accept a Mapping.
 
     This class is needed for ExtraParallel+FSDP2 case because ExtraParallel and non-ExtraParallel param have different FSDP sharding dimension (dim-0 vs. dim-1)
-    For comparison, ExtraParallel+FSDP1 also shards ExtraParallel parameters along dim-0 for FSDP, so it can use the default optimizer class.
     """
 
     def __init__(
