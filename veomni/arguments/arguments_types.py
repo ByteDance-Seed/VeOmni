@@ -612,12 +612,6 @@ class TrainingArguments:
         else:
             raise ValueError(f"`global_batch_size` should be a multiple of {self.micro_batch_size * acc.dp_size}.")
 
-<<<<<<< HEAD
-=======
-        if self.gradient_accumulation_steps > 1 and acc.fsdp_config.offload and acc.fsdp_config.fsdp_mode == "fsdp1":
-            raise ValueError("Gradient accumulation is not supported with FSDP1 CPU offload.")
-
->>>>>>> 2f38a99 ([parallel] feat: add cpu offload for fsdp2)
         # dataloader batch size
         if self.dyn_bsz:
             if self.dyn_bsz_runtime == "main":

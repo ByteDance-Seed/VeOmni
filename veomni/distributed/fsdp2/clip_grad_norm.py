@@ -30,6 +30,15 @@ def clip_grad_norm(
             foreach=foreach,
         )
 
+    if getattr(model, "_fsdp_cpu_offload_enabled", False):
+        return _cpu_offload_fsdp2_clip_grad_norm(
+            model,
+            max_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=error_if_nonfinite,
+            foreach=foreach,
+        )
+
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.parameters(),
         max_norm,
@@ -40,6 +49,25 @@ def clip_grad_norm(
     if isinstance(grad_norm, DTensor):
         grad_norm = grad_norm.full_tensor()
     return grad_norm
+
+
+@torch.no_grad()
+def _cpu_offload_fsdp2_clip_grad_norm(
+    model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
+) -> torch.Tensor:
+    ps = get_parallel_state()
+    params = [p for p in model.parameters() if p.grad is not None]
+    total_norm_or_pth_sum = _fsdp2_reduce_group(
+        params=params,
+        norm_type=norm_type,
+        reduce_groups=[("fsdp", ps.fsdp_group)],
+    )
+    total_norm = _finalize_total_norm(total_norm_or_pth_sum, norm_type)
+    _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
+
+    torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=foreach)
+
+    return total_norm
 
 
 @torch.no_grad()
@@ -113,7 +141,9 @@ def extra_parallel_fsdp2_clip_grad_norm(
     if math.isinf(norm_type):
         total_norm = torch.maximum(non_extra_parallel_total, *extra_parallel_total.values())
     else:
-        total_norm = (non_extra_parallel_total + sum(extra_parallel_total.values())) ** (1.0 / float(norm_type))
+        total_norm = _finalize_total_norm(non_extra_parallel_total + sum(extra_parallel_total.values()), norm_type)
+
+    _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
 
     # Apply the same clip coefficient to both groups
     for para in ps.extra_parallel_names:
@@ -121,6 +151,23 @@ def extra_parallel_fsdp2_clip_grad_norm(
     torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
+
+
+def _finalize_total_norm(total_norm_or_pth_sum: torch.Tensor, norm_type: float) -> torch.Tensor:
+    if math.isinf(norm_type):
+        return total_norm_or_pth_sum
+    return total_norm_or_pth_sum ** (1.0 / float(norm_type))
+
+
+def _raise_if_nonfinite(total_norm: torch.Tensor, norm_type: float, error_if_nonfinite: bool) -> None:
+    if not error_if_nonfinite:
+        return
+    if bool((~torch.isfinite(total_norm)).item()):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, "
+            "so it cannot be clipped. To disable this error and scale the gradients by the non-finite norm anyway, "
+            "set `error_if_nonfinite=False`"
+        )
 
 
 # compute local sum of param gard norm

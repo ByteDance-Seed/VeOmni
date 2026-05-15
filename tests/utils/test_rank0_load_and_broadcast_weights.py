@@ -405,7 +405,7 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: b
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=True)
 
-    world_size = 2
+    world_size = 4
     port = 12345 + random.randint(0, 100)
     command = [
         "torchrun",
@@ -580,7 +580,7 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=False)
 
-    world_size = 2
+    world_size = 4
     port = 12345 + random.randint(0, 100)
     command = [
         "torchrun",

@@ -161,6 +161,7 @@ class TextDPOTrainer:
             ),
             enable_reentrant=False,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,

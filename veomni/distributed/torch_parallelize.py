@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed._tensor import Shard
-from torch.distributed.fsdp import FSDPModule, CPUOffloadPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
@@ -205,6 +205,7 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["mp_policy"] = mp_policy
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
+    model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
         logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
