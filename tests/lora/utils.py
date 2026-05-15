@@ -45,6 +45,7 @@ import yaml
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models import build_foundation_model
+from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
@@ -55,8 +56,11 @@ from veomni.utils.import_utils import is_transformers_version_greater_or_equal_t
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TOY_CONFIG_ROOT = os.path.join(REPO_ROOT, "tests", "toy_config")
 
-# CUDA build of a 1B-param toy is ~0.7 s vs ~30 s on CPU. Use GPU when present.
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Accelerator build of a 1B-param toy is ~0.7 s vs ~30 s on CPU. Use the
+# active accelerator (CUDA / NPU) via ``get_device_type`` when present, else
+# fall back to CPU. ``get_device_type`` already returns ``"cpu"`` when no
+# accelerator is available.
+DEVICE = torch.device(get_device_type())
 
 
 # ---------------------------------------------------------------------------

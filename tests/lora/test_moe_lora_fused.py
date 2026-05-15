@@ -50,6 +50,7 @@ import warnings
 import pytest
 import torch
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.moe_lora import (
     LoraIndependentExperts,
     LoraSharedExperts,
@@ -117,7 +118,7 @@ def _l2_rel(actual: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def _require_cuda_with_triton() -> None:
-    if not torch.cuda.is_available():
+    if not IS_CUDA_AVAILABLE:
         pytest.skip("fused MoE-LoRA kernel requires CUDA.")
     try:
         import triton  # noqa: F401
@@ -411,7 +412,7 @@ def test_ep_class_matches_nonep_class_single_rank(mode):
     }
     ep_cls, nonep_cls = _CLASSES[mode]
 
-    dev = torch.device("cuda")
+    dev = torch.device(get_device_type())
     dtype = torch.bfloat16
     B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
     scale_gate, scale_up, scale_down = 0.5, 0.5, 0.5
