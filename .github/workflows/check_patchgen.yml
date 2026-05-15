@@ -33,4 +33,4 @@ jobs:
         uses: astral-sh/setup-uv@v6
 
       - name: Check patchgen drift
-        run: uv run --no-group transformers-stable --extra transformers5-exp --extra gpu --dev python -m veomni.patchgen.check_patchgen
+        run: uv run --extra gpu --dev python -m veomni.patchgen.check_patchgen

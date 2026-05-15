@@ -337,6 +337,17 @@ def load_model_weights(
             return bare_name
         return lora_key_overrides.get(bare_name, "base_model.model." + bare_name)
 
+    # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
+    # Maps bare base-model param names to PEFT-namespaced FQNs, e.g.:
+    #   "layers.0.self_attn.q_proj.weight" -> "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
+    # Keys not found in the map receive a plain "base_model.model." prefix.
+    is_peft_model = kwargs.get("is_peft_model", False)
+    adapter_path = kwargs.get("adapter_path", None)
+    if is_peft_model:
+        from ..utils.lora_utils import build_lora_key_overrides
+
+        lora_key_overrides = build_lora_key_overrides(model)
+
     converter = get_checkpoint_tensor_converter(model)
     state_dict_iterators = _load_state_dict(weights_path)
 
@@ -354,6 +365,8 @@ def load_model_weights(
     ):
         for name, tensor in state_dict_iterator:
             name = _convert_weight_key(name, model)
+            if is_peft_model:
+                name = lora_key_overrides.get(name, "base_model.model." + name)
             converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
             if converted is None:
                 continue
@@ -381,6 +394,18 @@ def load_model_weights(
             # from ``[E, ...]`` to ``[E_local, ...]`` before the DTensor
             # copy or the propagation asserts on shape mismatch.
             parallel_plan=parallel_plan,
+        )
+
+    if is_peft_model and adapter_path:
+        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
+        from ..utils.lora_utils import load_lora_model_weights
+
+        load_lora_model_weights(
+            model,
+            adapter_path,
+            init_device,
+            dtensor_factory,
+            parameter_names_to_load=parameter_names_to_load,
         )
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
@@ -416,6 +441,16 @@ def rank0_load_and_broadcast_weights(
         from ..distributed.parallel_plan import get_runtime_parallel_plan
 
         parallel_plan = get_runtime_parallel_plan(model)
+
+    # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
+    # non-lora-layer: xxx.xxx -> base_model.model.xxx.xxx
+    # lora-layer: xxx.xxx.weight -> base_model.model.xxx.xxx.base_layer.weight
+    is_peft_model = kwargs.get("is_peft_model", False)
+    adapter_path = kwargs.get("adapter_path", None)
+    if is_peft_model:
+        from ..utils.lora_utils import build_lora_key_overrides
+
+        lora_key_overrides = build_lora_key_overrides(model)
 
     # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
     # non-lora-layer: xxx.xxx -> base_model.model.xxx.xxx
@@ -664,6 +699,8 @@ def rank0_load_and_broadcast_weights(
                     try:
                         key, tensor = next(iterator)  # type: ignore[arg-type]
                         key = _convert_weight_key(key, model)
+                        if is_peft_model:
+                            key = lora_key_overrides.get(key, "base_model.model." + key)
                         converted = maybe_convert_checkpoint_tensor(key, tensor, converter)
                         if converted is None:
                             continue
@@ -801,7 +838,7 @@ def post_process_after_weight_loading(
             _init_parameter(model, name)
 
     # we should tie embeddings after loading weights because to_empty() leads to untied weights,
-    # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
+    # except in the FSDP2 (swap tensor) context.
     if getattr(model.config, "tie_word_embeddings", True):
         try:
             input_embeddings = model.get_input_embeddings()

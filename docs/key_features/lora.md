@@ -107,27 +107,9 @@ else:
 
 ## 3. Weight Loading with LoRA
 
-### FSDP1 (`init_device: cuda`)
-
-For FSDP1, weight loading goes through `parallel_load_safetensors`
-(`veomni/distributed/fsdp/initialize.py`). When LoRA is active, the function delegates to
-`load_peft_shard_states` (`veomni/utils/lora_utils.py`), which:
-
-1. **Remaps base-model keys**: PEFT wraps each target `Linear` with a `base_layer` sub-module.
-   The key `model.layers.0.self_attn.q_proj.weight` becomes
-   `model.layers.0.self_attn.q_proj.base_layer.weight`.
-
-2. **Loads adapter weights** (resume only): reads `adapter_model.bin` /
-   `adapter_model.safetensors`, remaps PEFT keys
-   (`lora_A.weight` → `lora_A.default.weight`) and injects them into `shard_states`.
-
-3. **Initialises adapter weights from scratch**: for LoRA layers absent from `shard_states`
-   (fresh training), calls `module.reset_lora_parameters()` on rank 0 and broadcasts.
-
-### FSDP2 (`init_device: meta`)
-
-For FSDP2, weight loading goes through `build_parallelize_model` and then
-`post_process_after_weight_loading` in `torch_parallelize.py`. The LoRA-specific path:
+VeOmni LoRA training uses FSDP2 with `init_device: meta`. Weight loading goes through
+`build_parallelize_model` and then `post_process_after_weight_loading` in
+`torch_parallelize.py`. The LoRA-specific path:
 
 1. **Base-model weights**: loaded via `rank0_load_and_broadcast_weights` or
    `load_model_weights` — the standard FSDP2 path, unchanged for LoRA.
@@ -143,8 +125,7 @@ For FSDP2, weight loading goes through `build_parallelize_model` and then
 
 **Key difference from base model loading:** PEFT saves adapter keys without the adapter-name
 infix (e.g. `lora_A.weight`), whereas the live model stores them as
-`lora_A.<adapter_name>.weight`. The `_remap_adapter_key` utility handles this translation
-for both FSDP1 and FSDP2.
+`lora_A.<adapter_name>.weight`. The `_remap_adapter_key` utility handles this translation.
 
 ---
 
@@ -183,7 +164,7 @@ Output structure for each checkpoint:
 
 ## 5. Training Examples
 
-### 5.1 Wan2.1-I2V-1.3B LoRA (DiT, FSDP1)
+### 5.1 Wan2.1-I2V-1.3B LoRA (DiT, FSDP2)
 
 Config: [`configs/dit/wan2.1_I2V_1.3B_lora.yaml`](../../configs/dit/wan2.1_I2V_1.3B_lora.yaml)
 
@@ -201,10 +182,10 @@ model:
       - ffn.net.2
 
 train:
-  init_device: cuda
+  init_device: meta
   accelerator:
     fsdp_config:
-      fsdp_mode: fsdp1
+      fsdp_mode: fsdp2
 ```
 
 Launch (8 GPUs, SP=2):
@@ -296,12 +277,12 @@ bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
 
 ## 6. Testing
 
-The test suite is under `tests/lora/` and uses a small Qwen3-MoE toy model.
+The test suite is under `tests/lora/` and uses small MoE toy models.
 Suite layout:
 
 | Test | Coverage |
 |------|----------|
-| `test_moe_lora_eager.py` | Wrapper layout + autograd parity for both Mode 1 (independent) and Mode 2 (shared); covers all v5 MoE configs (qwen3_moe / qwen3_5_moe / qwen3_vl_moe / qwen3_omni_moe). |
+| `test_moe_lora_eager.py` | Wrapper layout + autograd parity for both Mode 1 (independent) and Mode 2 (shared); covers all v5 MoE configs (qwen3_moe / qwen3_5_moe / qwen3_vl_moe / qwen3_omni_moe / deepseek_v3). |
 | `test_moe_lora_fused.py` | Triton fused MoE-LoRA kernel parity vs eager (forward + backward) and EP autograd-class parity vs non-EP under controlled inputs. |
 | `test_moe_lora_trainer.py` | Production save/load/resume round-trip: writer (DCP shard + HF adapter) → DCP-resume subprocess → adapter-resume subprocess; bit-exact LoRA reload assertion. The yaml enables both `lora_modules` (linear LoRA on `q_proj`/`v_proj`) and `target_parameters` (MoE-LoRA wrappers), so both LoRA flavors round-trip end-to-end. |
 | `test_moe_lora_ep2.py` | Trainer-driven EP=2 coverage: (a) integration assertions that the EP plumbing engages (plan-bridge fires, EP slicing happens at the right ratio, DCP consolidates EP shards before HF save); (b) `test_moe_lora_ep_save_load_parallel_align` -- one EP=2 seeder writes both an HF adapter (full `[E, r, H]`) and DCP shards, then three resumer subprocesses validate cross-EP adapter parity (EP=1 vs EP=2 adapter-load trajectories match) and EP=2 DCP round-trip parity (DCP-resumer trajectory matches the seeder's tail). |

@@ -10,30 +10,23 @@ from veomni.trainer.vlm_trainer import (
     VLMTrainer,
     _get_vlm_visual_module,
 )
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from ..tools.training_utils import make_eager_ops_config
 
 
-_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4 = [
-    pytest.param("./tests/toy_config/qwen2vl_toy", id="qwen2_vl"),
-    pytest.param("./tests/toy_config/qwen25vl_toy", id="qwen2_5_vl"),
-    pytest.param("./tests/toy_config/qwen3vl_toy", id="qwen3_vl"),
-]
-
-_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5 = [
+# transformers v5 scope. Models in the list either require transformers
+# >= 5.0.0 (qwen3_5*, qwen2_5_vl, qwen3_vl*) or are dual-version with v5
+# as the preferred path (qwen2_vl). The v4 CI lane was retired together
+# with the broader transformers v4 wind-down, so v4 coverage on the
+# dual-version models is no longer exercised.
+_FREEZE_VIT_VLM_CASES = [
+    pytest.param("./tests/toy_config/qwen2vl_toy/config.json", id="qwen2_vl"),
     pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
     pytest.param("./tests/toy_config/qwen3_5_moe_toy/config.json", id="qwen3_5_moe"),
     pytest.param("./tests/toy_config/qwen25vl_toy/config.json", id="qwen2_5_vl"),
     pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
     pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
 ]
-
-_FREEZE_VIT_VLM_CASES = (
-    _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5
-    if is_transformers_version_greater_or_equal_to("5.0.0")
-    else _FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4
-)
 
 
 @pytest.mark.parametrize(

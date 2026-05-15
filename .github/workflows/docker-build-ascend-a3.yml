@@ -5,7 +5,7 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "docker/ascend/Dockerfile.ascend_8.3.rc2_a3"
+      - "docker/ascend/Dockerfile.ascend_9.0.0_a3"
       - ".github/workflows/docker-build-ascend-a3.yml"
   release:
     types: [ published ]
@@ -13,7 +13,7 @@ on:
 jobs:
   build-ascend-image-a3:
     if: ${{ github.event_name != 'pull_request' && github.repository_owner == 'ByteDance-Seed' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-arm
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-build-ascend-image-a3
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -34,7 +34,7 @@ jobs:
       - name: Get base image name and tag
         id: base_image
         run: |
-          BASE_IMAGE_FULL=$(grep '^FROM' ./docker/ascend/Dockerfile.ascend_8.3.rc2_a3 | head -1 | cut -d' ' -f2)
+          BASE_IMAGE_FULL=$(grep '^FROM' ./docker/ascend/Dockerfile.ascend_9.0.0_a3 | head -1 | cut -d' ' -f2)
           echo "Base image full: $BASE_IMAGE_FULL"
           BASE_IMAGE_TAG=$(echo "$BASE_IMAGE_FULL" | cut -d':' -f2)
           echo "Base image tag: $BASE_IMAGE_TAG"
@@ -46,7 +46,7 @@ jobs:
       - name: Get image tag
         id: version
         run: |
-          BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's/^refs\/(heads|tags)\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
+          BRANCH_NAME=$(echo "${{ github.ref }}" | sed -E 's/^refs\/(heads|tags)\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
           BASE_IMAGE_NAME="${{ steps.base_image.outputs.new_image_name }}"
           QUAY_REPO="quay.io/ascend/veomni"
           if [ "${{ github.event_name }}" = "release" ]; then
@@ -68,7 +68,9 @@ jobs:
             fi
             echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
           elif [ "$BRANCH_NAME" = "main" ]; then
-            echo "tag=${BASE_IMAGE_NAME}-latest" >> "$GITHUB_OUTPUT"
+            echo "tag=$BASE_IMAGE_NAME-latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$BASE_IMAGE_NAME-$BRANCH_NAME" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Docker Buildx
@@ -89,8 +91,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/arm64  # 🔥 A3 是 arm64 架构！
-          file: ./docker/ascend/Dockerfile.ascend_8.3.rc2_a3
+          platforms: linux/arm64
+          file: ./docker/ascend/Dockerfile.ascend_9.0.0_a3
           push: true
           tags: |
             quay.io/ascend/veomni:${{ steps.version.outputs.tag }}
@@ -98,3 +100,4 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             BUILDKIT_INLINE_CACHE=1
+            PIP_INDEX=https://pypi.org/simple

@@ -21,8 +21,6 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
-    # ExtraParallel-aware path (FSDP2 + ExtraParallel): maintain mathematical parity with FSDP1 clipper
-
     if hasattr(model, "_extra_parallel_param_groups"):
         return extra_parallel_fsdp2_clip_grad_norm(
             model,
@@ -49,7 +47,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
     """
-    ExtraParallel-aware gradient clipping for composable FSDP2 with reductions mirroring FSDP1:
+    ExtraParallel-aware gradient clipping for composable FSDP2:
 
     - Compute local norms for non-ExtraParallel and ExtraParallel parameter groups separately.
     - For finite p: sum p-th powers across the appropriate groups, then take 1/p.

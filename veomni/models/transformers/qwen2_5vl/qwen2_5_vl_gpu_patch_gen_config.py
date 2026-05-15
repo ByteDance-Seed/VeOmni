@@ -43,9 +43,9 @@ from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
+    gather_outputs,
     pad_tensor,
+    slice_input_tensor,
     sp_pad_and_slice,
     unpad_tensor,
 )
@@ -67,7 +67,7 @@ config.add_import("types", names=["SimpleNamespace"])
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import(
     "veomni.distributed.sequence_parallel",
-    names=["gather_heads_scatter_seq", "gather_seq_scatter_heads", "pad_tensor", "sp_pad_and_slice", "unpad_tensor"],
+    names=["gather_outputs", "slice_input_tensor", "pad_tensor", "sp_pad_and_slice", "unpad_tensor"],
 )
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``Qwen2_5_VLCausalLMOutputWithLogProbs`` so the patched multimodal
@@ -204,8 +204,8 @@ def qwen2_5_vl_vision_block_forward_patched(
 
 # ================================================================
 # Patch: Qwen2_5_VisionTransformerPretrainedModel.forward
-# 1. SP all-to-all to get full-seq hidden_states for window attention
-#    (gather_seq_scatter_heads / gather_heads_scatter_seq around the
+# 1. SP all_gather to get full-seq hidden_states for window attention
+#    (gather_outputs / slice_input_tensor around the
 #    window-index permutation + merger fill-back)
 # 2. SP-pad cu_seqlens / cu_window_seqlens / position embeddings so the
 #    padded tokens participate in a valid attention window
@@ -244,9 +244,7 @@ def qwen2_5_vit_forward_patched(
     unpadded_dim_size = cu_seqlens[-1]
     sp_padding_size = 0
     if get_parallel_state().sp_enabled:
-        hidden_states = gather_seq_scatter_heads(
-            hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
         sp_padding_size = hidden_states.size(0) - unpadded_dim_size
         if sp_padding_size > 0:
             hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
@@ -273,9 +271,7 @@ def qwen2_5_vit_forward_patched(
             cu_window_seqlens = torch.cat([cu_window_seqlens, new_cumsum.unsqueeze(0)], dim=0)
             # --- Patch.2 ---
         # --- Patch.1 ---
-        hidden_states = gather_heads_scatter_seq(
-            hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
         # --- Patch.2 ---
         emb = sp_pad_and_slice(emb, dim=0)
@@ -312,17 +308,13 @@ def qwen2_5_vit_forward_patched(
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
         merged_sp_padding = sp_padding_size // self.spatial_merge_unit
-        merged_hidden_states = gather_seq_scatter_heads(
-            merged_hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        merged_hidden_states = gather_outputs(merged_hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
         if merged_sp_padding > 0:
             merged_hidden_states = unpad_tensor(merged_hidden_states, dim=0, padding_size=merged_sp_padding)
         merged_hidden_states = merged_hidden_states[reverse_indices, :]
         if merged_sp_padding > 0:
             merged_hidden_states = pad_tensor(merged_hidden_states, dim=0, padding_size=merged_sp_padding)
-        merged_hidden_states = gather_heads_scatter_seq(
-            merged_hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-        )
+        merged_hidden_states = slice_input_tensor(merged_hidden_states, dim=0, group=get_parallel_state().sp_group)
     else:
         merged_hidden_states = merged_hidden_states[reverse_indices, :]
     # --- Patch.1 ---
@@ -395,10 +387,63 @@ def qwen2_5_vl_model_get_placeholder_mask_patched(
 
 
 # ================================================================
+# Patch: Qwen2_5_VLModel.{get_image_features,get_video_features}
+# Skip the upstream HF ``torch.split(pooler_output, split_sizes)``: the
+# visual tower returns an SP-scattered ``pooler_output`` (each rank holds
+# ``total_tokens / sp_size`` rows), so the split — whose sizes are
+# computed from the *full* grid — fails with
+# ``split_with_sizes expects split_sizes to sum exactly to N``. Returning
+# the raw ``BaseModelOutputWithPooling`` lets the outer forward gather
+# pooler_output along dim 0 before slicing, matching the pattern already
+# used in qwen2_vl (which has the same override).
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLModel.get_image_features",
+    description="Skip upstream split — outer forward gathers SP-scattered pooler_output before use",
+)
+def qwen2_5_vl_model_get_image_features_patched(
+    self,
+    pixel_values: torch.FloatTensor,
+    image_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithPooling:
+    r"""
+    pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input images.
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    """
+    pixel_values = pixel_values.type(self.visual.dtype)
+    vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
+    return vision_outputs
+
+
+@config.override_method(
+    "Qwen2_5_VLModel.get_video_features",
+    description="Skip upstream split — outer forward gathers SP-scattered pooler_output before use",
+)
+def qwen2_5_vl_model_get_video_features_patched(
+    self,
+    pixel_values_videos: torch.FloatTensor,
+    video_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithPooling:
+    r"""
+    pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input videos.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    """
+    pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+    vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
+    return vision_outputs
+
+
+# ================================================================
 # Patch: Qwen2_5_VLModel.forward
-# 1. Ulysses SP scatter/gather around the visual-embed masked_scatter
-#    (gather_seq_scatter_heads on inputs_embeds + image/video embeds,
-#    gather_heads_scatter_seq after fill-back)
+# 1. Ulysses SP gather/slice around the visual-embed masked_scatter
+#    (gather_outputs on inputs_embeds + image/video embeds,
+#    slice_input_tensor after fill-back)
 # 2. precomputed image/video masks: use kwargs["image_mask"/"video_mask"]
 #    when provided by the VeOmni data pipeline; otherwise all-gather
 #    input_ids across SP group and recompute masks on the full sequence
@@ -409,9 +454,9 @@ def qwen2_5_vl_model_get_placeholder_mask_patched(
 #    are None on this rank — keeps visual params on the FSDP all-reduce
 #    graph via fake_embeds * 0
 # 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
-# 6. v5 visual return contract: get_image_features / get_video_features
-#    now return BaseModelOutputWithPooling whose pooler_output is a
-#    tuple[per-image tensor] — concat into a single tensor
+# 6. get_{image,video}_features now skip the upstream split (see
+#    overrides above); pooler_output is a single SP-scattered tensor
+#    ready for the SP gather + masked_scatter below.
 # ================================================================
 @config.override_method(
     "Qwen2_5_VLModel.forward",
@@ -437,6 +482,16 @@ def qwen2_5_vl_model_forward_patched(
     second_per_grid_ts: torch.Tensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5_VLModelOutputWithPast:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+        The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -467,23 +522,18 @@ def qwen2_5_vl_model_forward_patched(
 
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
-        inputs_embeds = gather_seq_scatter_heads(
-            inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
     if pixel_values is not None:
         # --- Patch.6 ---
-        # v5 get_image_features returns BaseModelOutputWithPooling whose
-        # pooler_output is tuple[per-image tensor] after torch.split
+        # VeOmni overrides get_image_features to skip the upstream split,
+        # so pooler_output is a single SP-scattered tensor.
         image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
-        image_embeds = torch.cat(image_embeds, dim=0)
         # --- Patch.6 ---
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            image_embeds = gather_seq_scatter_heads(
-                image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
         n_image_tokens = image_mask.sum().long().item()
         image_embeds = image_embeds[:n_image_tokens]
@@ -499,14 +549,13 @@ def qwen2_5_vl_model_forward_patched(
 
     if pixel_values_videos is not None:
         # --- Patch.6 ---
+        # VeOmni overrides get_video_features to skip the upstream split,
+        # so pooler_output is a single SP-scattered tensor.
         video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True).pooler_output
-        video_embeds = torch.cat(video_embeds, dim=0)
         # --- Patch.6 ---
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            video_embeds = gather_seq_scatter_heads(
-                video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
         n_video_tokens = video_mask.sum().long().item()
         video_embeds = video_embeds[:n_video_tokens]
@@ -522,9 +571,7 @@ def qwen2_5_vl_model_forward_patched(
 
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
-        inputs_embeds = gather_heads_scatter_seq(
-            inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
     if position_ids is None:
@@ -638,6 +685,16 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5_VLCausalLMOutputWithLogProbs:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+        The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -685,8 +742,17 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             loss, _, log_probs, entropy = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
             )
+            if log_probs is not None:
+                # log_probs path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---

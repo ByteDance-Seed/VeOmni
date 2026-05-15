@@ -35,101 +35,44 @@ permissions:
 env:
   IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
   NCCL_DEBUG: "WARN"
+  # uv's default 30s timeout is too short for the ~617 MiB
+  # nvidia-cudnn-cu12 wheel on the CN runners; bump to 5 min so a
+  # transient slow link doesn't fail the whole sync.
+  UV_HTTP_TIMEOUT: "300"
+  # qwen3_5's full 248K vocab embedding fragments the PyTorch allocator
+  # on the L20 (9+ GiB ends up reserved-but-unallocated, OOMing the
+  # next 2.4 GiB request). Expandable segments coalesce the free
+  # blocks so the toy training fits the 44 GiB card.
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # Disable UCX's signal-handler chain. NCCL's RDMA plugin pulls in
+  # libucs, which registers a SIGSEGV handler that itself segfaults
+  # via libnvidia-ptxjitcompiler.so.1 when a rank tears down its
+  # CUDA context (observed on test_trainer_saveload[*-8] after all
+  # weight checks pass; rank exits with -11 and torchrun reports the
+  # whole job failed even though the test logic completed).
+  UCX_HANDLE_ERRORS: "none"
 
 jobs:
   lint:
     uses: ./.github/workflows/check_pr_lint.yml
 
-  # gpu_unit_tests_v4 and gpu_unit_tests_v5 run in parallel on separate l20-8
-  # runners. They share identical runner/container/env config; only the
-  # dependency sync (transformers stable vs. transformers5-exp) and the test
-  # set differ. Keep the two jobs in sync when modifying shared parts.
+  # The v4 (transformers 4.57.3) job has been retired — v5 is now the
+  # default install and v4 is sunset (see pyproject.toml comments). All
+  # previously v4-only test invocations have been moved into the v5
+  # job below; tests that are gated by a transformers-v4 check skip
+  # themselves on v5 and become no-ops.
 
-  gpu_unit_tests_v4:
+  gpu_unit_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: lint
     # Self-hosted L20-8 fleet managed by github_runner/ (ansible). Any free
     # `l20-8` runner is picked; use `[self-hosted, l20-N]` to pin to a specific
     # box. See github_runner/README.md for the full label scheme.
     runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60 # Increase this timeout value as needed
-    # The self-hosted runner itself is a minimal myoung34/github-runner container
-    # with just the runner + docker CLI; real CI work runs inside the VeOmni GPU
-    # image as a sibling container via the host docker socket.
-    container:
-      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
-      volumes:
-        # Shared CI asset NFS. Mounted on every runner host by
-        # github_runner/setup.yml (see veomni_ci_nfs_* in group_vars/all.yml).
-        # Layout: /mnt/veomni_ci/{models/<org>/<name>,datasets,
-        #                        datasets/custom_data/samples/sample.mp4}
-        - /mnt/veomni_ci:/mnt/veomni_ci:ro
-      options: >-
-        --gpus all
-        --ipc host
-        --shm-size 32g
-    env:
-      # hf-mirror is a safety net; actual model data should come from the NFS
-      # share via CI_HF_MODELS_DIR (see tests/tools/__init__::hf_local_or_remote).
-      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      HF_ENDPOINT: "https://hf-mirror.com"
-      HF_HUB_ENABLE_HF_TRANSFER: "0" # hf-mirror does not support hf_transfer
-      NCCL_DEBUG: "WARN"
-      # Shared NFS paths (see workflow container.volumes above).
-      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
-      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
-      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
-
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      - name: Sync dependencies
-        run: |
-          uv sync --frozen --extra gpu --extra audio --group dev
-      - name: Run parallel tests
-        # TODO: run all tests under tests/parallel/ulysses after we verify
-        #       tests/parallel/ulysses/test_ulysses_async.py still works
-        run: |
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
-          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
-      - name: Run models tests
-        run: |
-          uv run --frozen pytest -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -s -x tests/models/test_models_patch.py
-          uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
-          uv run --frozen pytest -s -x tests/models/test_models_logits_equal.py
-      - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, emb+fsdp2, ep+emb+fsdp2) clip grad norm test
-        run: |
-          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
-      - name: Run fsdp2 all ranks or rank0 load model weights
-        run: |
-          uv run --frozen pytest -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
-      - name: Run checkpoint callback unit tests
-        run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py
-      - name: Run e2e dcp save and load test
-        run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
-      - name: Run distributed tests (dummy_forward)
-        run: |
-          uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
-      - name: Run data tests
-        run: |
-          uv run --frozen pytest -s -x tests/data
-      - name: Run ops tests
-        run: |
-          uv run --frozen pytest -s -x tests/ops
-
-  gpu_unit_tests_v5:
-    if: github.repository_owner == 'ByteDance-Seed'
-    needs: lint
-    # Same runner/container/env as gpu_unit_tests_v4 above; see comments there.
-    runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60
+    # Bumped to 120m after merging the former v4 job's test steps into this
+    # job — the combined suite (parallel/ulysses, data, ops, fsdp utils,
+    # checkpoint callback, etc.) doesn't fit the previous 90m budget.
+    timeout-minutes: 120
     container:
       image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
       volumes:
@@ -151,6 +94,23 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Free shared L20 GPU
+        # Some prior CI runs on this physical host leak Python/torchrun
+        # processes that keep tens of GiB pinned on the GPUs even after
+        # their sibling container exits. Without this kill step the next
+        # job lands on the same physical host and OOMs at the first
+        # large allocation. Safe here because the L20-8 self-hosted
+        # runners are 1-job-per-physical-host and ``--gpus all`` already
+        # claims the whole card.
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
       - name: Detect changed paths for conditional tests
         id: changes
         run: |
@@ -161,43 +121,76 @@ jobs:
           else
             echo "qwen3_5_ulysses=false" >> "$GITHUB_OUTPUT"
           fi
-      - name: Sync dependencies [transformers-v5]
+      - name: Sync dependencies
         run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
-      - name: Run models tests [transformers-v5]
-        # TODO: Run the following tests with proper `--no-group transformers-stable --extra transformers5-exp` to enable transformers v5.
-        # Currently those tests are effectively skipped (but it's not straightforward to enable due to L20 OOM).
+          uv sync --frozen --extra gpu --extra audio --group dev
+      - name: Run parallel tests
+        # TODO: run all tests under tests/parallel/ulysses after we verify
+        #       tests/parallel/ulysses/test_ulysses_async.py still works
+        run: |
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
+      - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
-      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests [transformers-v5]
+          uv run --frozen pytest -s -x tests/models/test_checkpoint_tensor_converter.py
+          uv run --frozen pytest -s -x tests/models/test_return_log_probs_e2e.py
+      - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses.py
-      - name: Run e2e dcp save and load test [transformers-v5]
+      - name: Run fsdp2/extra_parallel+fsdp2 clip grad norm test
+        run: |
+          uv run --frozen pytest -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+      - name: Run fsdp2 all ranks or rank0 load model weights
+        run: |
+          uv run --frozen pytest -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
+      - name: Run checkpoint callback unit tests
+        run: |
+          uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py
+      - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
-      - name: Run utils tests [transformers-v5]
+      - name: Run distributed tests (dummy_forward)
+        run: |
+          uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
+      - name: Run data tests
+        run: |
+          uv run --frozen pytest -s -x tests/data
+      - name: Run ops tests
+        run: |
+          uv run --frozen pytest -s -x tests/ops
+      - name: Run utils tests
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |
-          # Need v5 to support newer models like Qwen3.5 count flops tests.
-          uv run --frozen --no-group transformers-stable --extra transformers5-exp pytest -s -x tests/utils/test_count_flops.py
-      # TODO: Run other tests in transformers v5 env as well.
-      - name: Install LoRA extra [transformers-v5]
+          uv run --frozen pytest -s -x tests/utils/test_count_flops.py
+      - name: Run Muon optimizer tests
         run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --extra lora --group dev
-      - name: Run LoRA e2e tests [transformers-v5]
-        # MoE-LoRA suite supersedes the deleted dense-only test_lora_trainer_saveload.py:
-        #   - eager: wrapper layout + autograd parity (Mode 1 + Mode 2, all v5 MoE configs)
-        #   - fused: triton kernel parity vs eager (forward + backward, EP autograd classes)
-        #   - trainer: production save/load/resume round-trip (DCP shard + HF adapter,
+          uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
+          uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
+          uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
+      - name: Install LoRA extra
+        run: |
+          uv sync --frozen --extra gpu --extra audio --extra lora --group dev
+      - name: Run LoRA e2e tests
+        # Coverage:
+        #   - lora_trainer_saveload: dense Qwen3 + linear LoRA save/load smoke test
+        #   - moe_lora_eager: wrapper layout + autograd parity (Mode 1 + Mode 2, all v5 MoE configs)
+        #   - moe_lora_fused: triton kernel parity vs eager (forward + backward, EP autograd classes)
+        #   - moe_lora_trainer: production save/load/resume round-trip (DCP shard + HF adapter,
         #     bit-exact LoRA reload, also covers linear LoRA on q_proj/v_proj since the
         #     yaml enables both lora_modules and target_parameters)
-        #   - ep2: EP=1 vs EP=2 trainer-driven integration + per-step loss/grad_norm alignment
+        #   - moe_lora_ep2: EP=1 vs EP=2 trainer-driven integration + per-step loss/grad_norm alignment
         # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
         run: |
+          uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_fused.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py

@@ -141,15 +141,11 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
     )
 
 
-def _skip_unless_cuda_v4(toy_path: str):
+def _skip_unless_cuda(toy_path: str):
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(toy_path):
         pytest.skip(f"Path not found: {toy_path}")
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-    if is_transformers_version_greater_or_equal_to("5.0.0"):
-        pytest.skip("Toy config targets transformers v4 model definition.")
 
 
 _MODELS = [
@@ -188,7 +184,7 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     by ``F.cross_entropy(reduction='none')`` on the full logits differ
     by at most zero — they execute the same ops on the same data.
     """
-    _skip_unless_cuda_v4(toy_path)
+    _skip_unless_cuda(toy_path)
     _apply_determinism()
 
     # Batch-invariant mode patches mm/addmm/log_softmax via Triton, which
@@ -333,7 +329,7 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
     4. ``output.log_probs <= 0`` everywhere (actual log-probabilities).
     5. ``output.entropy >= 0`` everywhere (softmax entropy).
     """
-    _skip_unless_cuda_v4(toy_path)
+    _skip_unless_cuda(toy_path)
     _apply_determinism()
 
     torch.manual_seed(0)
@@ -375,7 +371,7 @@ def test_return_log_probs_backward_flows_gradients(toy_path, family):
     Same kwargs-flow contract as the bitwise test — exercised on both
     text and VLM model families.
     """
-    _skip_unless_cuda_v4(toy_path)
+    _skip_unless_cuda(toy_path)
     _apply_determinism()
 
     torch.manual_seed(1)

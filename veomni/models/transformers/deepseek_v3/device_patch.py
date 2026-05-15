@@ -61,6 +61,22 @@ def _make_batch_invariant_rms_norm_forward():
     return _fused_rms_norm_forward
 
 
+_TRITON_ROPE_BACKEND = BackendSpec(
+    # The Triton backend replaces ``DeepseekV3RotaryEmbedding.forward``
+    # rather than the module-level ``apply_rotary_pos_emb``.
+    entry="veomni.models.transformers.deepseek_v3.device_patch:_make_deterministic_rope_forward",
+    entry_is_factory=True,
+    replace_forward=True,
+    target_override="DeepseekV3RotaryEmbedding",
+)
+
+_TRITON_RMS_NORM_BACKEND = BackendSpec(
+    entry="veomni.models.transformers.deepseek_v3.device_patch:_make_batch_invariant_rms_norm_forward",
+    entry_is_factory=True,
+    replace_forward=True,
+)
+
+
 def apply_veomni_deepseek_v3_device_patch():
     apply_per_model_patches(
         hf_module=hf_deepseek_v3,
@@ -71,22 +87,34 @@ def apply_veomni_deepseek_v3_device_patch():
             "swiglu_mlp": "DeepseekV3MLP",
         },
         extra_backends={
-            "rotary_pos_emb": {
-                # The Triton backend replaces ``DeepseekV3RotaryEmbedding.forward``
-                # rather than the module-level ``apply_rotary_pos_emb``.
-                "triton": BackendSpec(
-                    entry="veomni.models.transformers.deepseek_v3.device_patch:_make_deterministic_rope_forward",
-                    entry_is_factory=True,
-                    replace_forward=True,
-                    target_override="DeepseekV3RotaryEmbedding",
-                ),
-            },
-            "rms_norm": {
-                "triton": BackendSpec(
-                    entry="veomni.models.transformers.deepseek_v3.device_patch:_make_batch_invariant_rms_norm_forward",
-                    entry_is_factory=True,
-                    replace_forward=True,
-                ),
-            },
+            "rotary_pos_emb": {"triton": _TRITON_ROPE_BACKEND},
+            "rms_norm": {"triton": _TRITON_RMS_NORM_BACKEND},
+        },
+    )
+
+
+def apply_veomni_deepseek_v3_v5_device_patch(gen_module):
+    """Backend selection for the v5 patchgen-generated module.
+
+    Only ``rotary_pos_emb`` and ``rms_norm`` are patched here. ``swiglu_mlp``
+    is intentionally skipped: ``DeepseekV3MoE.__init__`` (in the generated
+    module) constructs ``shared_experts = DeepseekV3MLP(config, intermediate_size=...)``
+    via the module's global lookup, so swapping ``gen_module.DeepseekV3MLP``
+    to ``LigerSwiGLUMLP`` (which rejects the ``intermediate_size`` kwarg)
+    would break instantiation. The v4 monkey-patch path escapes this because
+    its ``modeling_deepseek_v3.py`` captures ``DeepseekV3MLP`` via ``from ...
+    import`` at module scope *before* ``apply_per_model_patches`` runs, so
+    its local reference stays bound to the original class.
+    """
+    apply_per_model_patches(
+        hf_module=gen_module,
+        model_name="DeepSeek-V3 (v5)",
+        targets={
+            "rotary_pos_emb": "apply_rotary_pos_emb",
+            "rms_norm": "DeepseekV3RMSNorm",
+        },
+        extra_backends={
+            "rotary_pos_emb": {"triton": _TRITON_ROPE_BACKEND},
+            "rms_norm": {"triton": _TRITON_RMS_NORM_BACKEND},
         },
     )

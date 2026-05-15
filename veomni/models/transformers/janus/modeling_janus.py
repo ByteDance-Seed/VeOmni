@@ -60,9 +60,9 @@ from transformers.modeling_outputs import ModelOutput
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
+    gather_outputs,
     reduce_sequence_parallel_loss,
+    slice_input_tensor,
 )
 from ..llama.modeling_llama import LlamaForCausalLM
 from .configuration_janus import JanusConfig, JanusGenVisionConfig, JanusVisionConfig
@@ -1259,16 +1259,14 @@ class Janus(PreTrainedModel):
             inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
             if get_parallel_state().sp_enabled:
-                inputs_embeds = gather_seq_scatter_heads(
-                    inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-                )
+                inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
             if input_pixel_values is not None:
                 input_image_embeds = self.aligner(self.vision_model(input_pixel_values))
                 bs, n, d = input_image_embeds.shape
                 input_image_embeds = rearrange(input_image_embeds, "b n d -> (b n) d", b=bs, n=n, d=d)
                 if get_parallel_state().sp_enabled:
-                    input_image_embeds = gather_seq_scatter_heads(
-                        input_image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                    input_image_embeds = gather_outputs(
+                        input_image_embeds, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 input_image_embeds = input_image_embeds[: image_input_mask.sum()]
 
@@ -1286,8 +1284,8 @@ class Janus(PreTrainedModel):
                 ouput_image_embeds = self.prepare_gen_img_embeds(indices)
 
                 if get_parallel_state().sp_enabled:
-                    ouput_image_embeds = gather_seq_scatter_heads(
-                        ouput_image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+                    ouput_image_embeds = gather_outputs(
+                        ouput_image_embeds, gather_dim=0, group=get_parallel_state().sp_group
                     )
                 ouput_image_embeds = ouput_image_embeds[: image_output_mask.sum()]
 
@@ -1302,9 +1300,7 @@ class Janus(PreTrainedModel):
                 inputs_embeds = inputs_embeds + fake_embeds
 
             if get_parallel_state().sp_enabled:
-                inputs_embeds = gather_heads_scatter_seq(
-                    inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-                )
+                inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         if position_ids is not None:
             position_ids = position_ids.squeeze(1)
 

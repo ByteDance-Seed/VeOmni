@@ -71,20 +71,20 @@ uv sync --extra gpu --dev
 
 ## Scenario 4: Update transformers Version
 
-transformers uses a **dual-track** setup: default `4.57.3` (group `transformers-stable`) and experimental `5.2.0` (extra `transformers5-exp`), declared as conflicts in `[tool.uv.conflicts]`.
+transformers uses a **dual-track** setup: default `5.2.0` (group `transformers-stable`) and legacy `4.57.3` (extra `transformers-v4-legacy`), declared as conflicts in `[tool.uv.conflicts]`.
 
-**Bump within a track** (e.g. 4.57.3 → 4.58.0, or 5.2.0 → 5.3.0):
+**Bump within a track** (e.g. 5.2.0 → 5.3.0, or 4.57.3 → 4.58.0):
 1. Edit the pinned version in the relevant section of `pyproject.toml`:
-   - Stable: `[dependency-groups]` -> `transformers-stable`
-   - Experimental: `[project.optional-dependencies]` -> `transformers5-exp`
+   - Default (v5): `[dependency-groups]` -> `transformers-stable`
+   - Legacy (v4): `[project.optional-dependencies]` -> `transformers-v4-legacy`
 2. Regenerate lockfile and sync:
 
 ```bash
 uv lock
-# Stable:
+# Default (v5):
 uv sync --extra gpu --dev
-# Or v5:
-uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu --dev
+# Or legacy v4:
+uv sync --no-group transformers-stable --extra transformers-v4-legacy --extra gpu --dev
 ```
 
 3. Check for API breakage — key v4→v5 differences:

@@ -44,9 +44,14 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class OptimizerConfig:
-    """train.optimizer.* — Optimizer and learning-rate schedule."""
+    """train.optimizer.* — Optimizer and learning-rate schedule.
 
-    type: Literal["adamw", "anyprecision_adamw"] = field(
+    ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
+    and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
+    norms use AdamW.
+    """
+
+    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -89,6 +94,60 @@ class OptimizerConfig:
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    # ---- Muon-specific (only consulted when type == "muon") ---------------
+    muon_lr: float = field(
+        default=2e-2,
+        metadata={
+            "help": (
+                "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
+                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+            )
+        },
+    )
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={"help": "Momentum factor for the Muon group."},
+    )
+    muon_nesterov: bool = field(
+        default=True,
+        metadata={"help": "Use Nesterov momentum in Muon."},
+    )
+    muon_weight_decay: float = field(
+        default=0.0,
+        metadata={"help": "Decoupled weight decay for the Muon group."},
+    )
+    muon_ns_steps: int = field(
+        default=5,
+        metadata={"help": "Number of Newton-Schulz iteration steps in Muon."},
+    )
+    muon_ns_coefficients: List[float] = field(
+        default_factory=lambda: [3.4445, -4.7750, 2.0315],
+        metadata={"help": "Quintic Newton-Schulz polynomial coefficients (a, b, c)."},
+    )
+    muon_eps: float = field(
+        default=1e-7,
+        metadata={"help": "Numerical-stability epsilon for the spectral-norm normalization in Muon."},
+    )
+    muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] = field(
+        default="match_rms_adamw",
+        metadata={
+            "help": (
+                "Per-matrix learning-rate adjustment used by Muon. "
+                "'original' follows Keller Jordan; 'match_rms_adamw' (default) "
+                "matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer."
+            )
+        },
+    )
+    muon_expert_zero_comm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
+                "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
+                "to the default hidden-dim sharding path."
+            )
+        },
     )
 
 
@@ -188,15 +247,11 @@ class MixedPrecisionConfig:
     )
     param_dtype: str = field(
         default="bfloat16",
-        metadata={"help": "Dtype for the unsharded parameter (DDP, FSDP1, FSDP2)."},
+        metadata={"help": "Dtype for the unsharded parameter."},
     )
     reduce_dtype: str = field(
         default="float32",
-        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1, FSDP2)."},
-    )
-    buffer_dtype: str = field(
-        default=None,
-        metadata={"help": "Dtype for the buffer (DDP, FSDP1)."},
+        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce)."},
     )
     output_dtype: str = field(
         default=None,
@@ -214,7 +269,6 @@ class MixedPrecisionConfig:
 
         _check_dtype(self.param_dtype)
         _check_dtype(self.reduce_dtype)
-        _check_dtype(self.buffer_dtype)
         _check_dtype(self.output_dtype)
 
 
@@ -222,8 +276,8 @@ class MixedPrecisionConfig:
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp1", "fsdp2"] = field(
-        default="ddp",
+    fsdp_mode: Literal["ddp", "fsdp2"] = field(
+        default="fsdp2",
         metadata={"help": "Data parallel mode."},
     )
     reshard_after_forward: bool = field(
@@ -234,17 +288,9 @@ class FSDPConfig:
         default=True,
         metadata={"help": "Enable reshard after backward for FSDP2."},
     )
-    full_shard: bool = field(
-        default=True,
-        metadata={"help": "Enable fully shard for FSDP training (ZeRO-3)."},
-    )
     forward_prefetch: bool = field(
         default=True,
         metadata={"help": "Enable forward prefetch."},
-    )
-    offload: bool = field(
-        default=False,
-        metadata={"help": "Enable CPU offload for FSDP1."},
     )
     max_load_broadcast_size: float = field(
         default=20.0,
@@ -253,6 +299,13 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+
+    def __post_init__(self):
+        if self.fsdp_mode not in ("ddp", "fsdp2"):
+            raise ValueError(
+                f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
+                "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
+            )
 
 
 @dataclass
@@ -413,9 +466,9 @@ class TrainingArguments:
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
-        default="cuda",
+        default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -554,9 +607,6 @@ class TrainingArguments:
             logger.info_rank0(f"Set gradient accumulation to {self.gradient_accumulation_steps}.")
         else:
             raise ValueError(f"`global_batch_size` should be a multiple of {self.micro_batch_size * acc.dp_size}.")
-
-        if self.gradient_accumulation_steps > 1 and acc.fsdp_config.offload:
-            raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # dataloader batch size
         if self.dyn_bsz:

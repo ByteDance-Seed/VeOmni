@@ -62,9 +62,7 @@ from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     slice_input_tensor,
     sp_pad_and_slice,
     unpad_tensor,
@@ -100,9 +98,7 @@ config.add_import("veomni.distributed.parallel_state", names=["get_parallel_stat
 config.add_import(
     "veomni.distributed.sequence_parallel",
     names=[
-        "gather_heads_scatter_seq",
         "gather_outputs",
-        "gather_seq_scatter_heads",
         "slice_input_tensor",
         "sp_pad_and_slice",
         "unpad_tensor",
@@ -688,6 +684,12 @@ def qwen3_omni_moe_audio_forward_patched(
     aftercnn_lens=None,
     **kwargs,
 ):
+    r"""
+    feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length
+    aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length after cnn
+    """
     # --- Patch.1 ---
     input_features = input_features.permute(1, 0)  # (len, num_mel_bins) -> (num_mel_bins, len)
     # --- Patch.1 ---
@@ -816,6 +818,12 @@ def qwen3_omni_moe_thinker_text_model_forward_patched(
     deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple | MoeModelOutputWithPast:
+    r"""
+    visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
+        The mask of the visual positions.
+    deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
+        The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -998,6 +1006,10 @@ def qwen3_omni_moe_thinker_get_audio_features_patched(
     audio_feature_lengths=None,
     **kwargs,
 ):
+    r"""
+    audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
+        The length of feature shape of each audio in LLM.
+    """
     audio_outputs = self.audio_tower(
         input_features,
         feature_lens=audio_feature_lengths,
@@ -1042,11 +1054,11 @@ def qwen3_omni_moe_thinker_get_position_id_func_patched(self):
 #    for full mask information when using SP.
 # 3. [ViT] Pop flash-attention kwargs before ViT forward so ViT computes its
 #    own cu_seqlens from grid_thw.
-# 4. [SP] gather_seq_scatter_heads on input/image/video/audio embeddings to
+# 4. [SP] gather_outputs on input/image/video/audio embeddings to
 #    do the multimodal fill-back on the full sequence.
 # 5. [FSDP] Dummy ViT/audio forward when pixel_values/input_features is None
 #    on this rank.
-# 6. [SP] gather_heads_scatter_seq to restore seq-parallel layout.
+# 6. [SP] slice_input_tensor to restore seq-parallel layout.
 # 7. [SP] all_gather deepstack embeddings then select per-rank slice.
 # 8. [Loss] Delegate loss to `self.loss_function` for fused CE.
 # 9. [PosIDs] Transpose precomputed position_ids from (bs, 3, L) to (3, bs, L).
@@ -1079,6 +1091,20 @@ def qwen3_omni_moe_thinker_forward_patched(
     video_second_per_grid=None,
     **kwargs,
 ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
+        The length of feature shape of each audio in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    use_audio_in_video (`bool`, *optional*):
+        Whether or not use audio track in video, should same as the parameter in `process_audio_info`.
+    video_second_per_grid (`torch.LongTensor` of shape `(num_videos)`, *optional*):
+        Number of seconds per grid for each video, used for temporal feature mapping.
+    """
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
     )
@@ -1104,9 +1130,7 @@ def qwen3_omni_moe_thinker_forward_patched(
 
     # --- Patch.4 ---
     if self.training and get_parallel_state().sp_enabled:
-        inputs_embeds = gather_seq_scatter_heads(
-            inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
     # --- Patch.4 ---
 
     # --- Patch.10 ---
@@ -1125,9 +1149,7 @@ def qwen3_omni_moe_thinker_forward_patched(
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
         # --- Patch.4 ---
         if self.training and get_parallel_state().sp_enabled:
-            audio_features = gather_seq_scatter_heads(
-                audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-            )
+            audio_features = gather_outputs(audio_features, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.4 ---
         n_audio_tokens = audio_mask.sum().long().item()
         audio_features = audio_features[:n_audio_tokens]
@@ -1151,9 +1173,7 @@ def qwen3_omni_moe_thinker_forward_patched(
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         # --- Patch.4 ---
         if self.training and get_parallel_state().sp_enabled:
-            image_embeds = gather_seq_scatter_heads(
-                image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.4 ---
 
         n_image_tokens = image_mask.sum().long().item()
@@ -1185,9 +1205,7 @@ def qwen3_omni_moe_thinker_forward_patched(
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         # --- Patch.4 ---
         if self.training and get_parallel_state().sp_enabled:
-            video_embeds = gather_seq_scatter_heads(
-                video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
         # --- Patch.4 ---
 
         n_video_tokens = video_mask.sum().long().item()
@@ -1215,9 +1233,7 @@ def qwen3_omni_moe_thinker_forward_patched(
 
     # --- Patch.6 ---
     if self.training and get_parallel_state().sp_enabled:
-        inputs_embeds = gather_heads_scatter_seq(
-            inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
         sp_size = get_parallel_state().sp_size
         sp_rank = get_parallel_state().sp_rank
@@ -1356,6 +1372,8 @@ def qwen3_omni_moe_thinker_forward_patched(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
                 ignore_index=IGNORE_INDEX,
                 **kwargs,
             )

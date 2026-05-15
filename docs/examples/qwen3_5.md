@@ -1,13 +1,13 @@
 # Qwen3.5 training guide
 
-> **Note:** Qwen3.5 requires transformers v5.
+> **Note:** Qwen3.5 requires transformers v5 (now the project default).
 
 ## Install dependencies
 
-Qwen3.5 depends on transformers v5 (experimental). Sync the correct dependency group:
+Qwen3.5 depends on transformers v5, which is now the default install:
 
 ```shell
-uv sync --no-group transformers-stable --extra transformers5-exp --extra gpu
+uv sync --extra gpu
 ```
 
 ## Download dataset

@@ -45,9 +45,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     pad_tensor,
     slice_input_tensor,
     unpad_tensor,
@@ -561,9 +559,7 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
         unpadded_dim_size = cu_seqlens[-1]
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            hidden_states = gather_seq_scatter_heads(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-            )
+            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
             sp_padding_size = hidden_states.size(0) - unpadded_dim_size
             if sp_padding_size > 0:
                 hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
@@ -586,9 +582,7 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
                 cu_window_seqlens = torch.cat([cu_window_seqlens, new_cumsum.unsqueeze(0)], dim=0)
 
-            hidden_states = gather_heads_scatter_seq(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-            )
+            hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
             rotary_pos_emb = slice_input_tensor(rotary_pos_emb, dim=0)
         # --- Patch.1 ---
 
@@ -623,9 +617,7 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             sp_padding_size = hidden_states.size(0) - unpadded_dim_size
-            hidden_states = gather_seq_scatter_heads(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-            )
+            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
             if sp_padding_size > 0:
                 hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
         # --- Patch.1 ---
@@ -635,9 +627,7 @@ class Qwen2_5OmniVisionEncoder(_Qwen2_5OmniVisionEncoder):
         if get_parallel_state().sp_enabled:
             if sp_padding_size > 0:
                 hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
-            hidden_states = gather_heads_scatter_seq(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-            )
+            hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         return hidden_states
@@ -770,9 +760,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
 
             # --- Patch.3 ---
             if get_parallel_state().sp_enabled:
-                inputs_embeds = gather_seq_scatter_heads(
-                    inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-                )
+                inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
             # --- Patch.3 ---
 
             # 2. Merge text , audios , image and video
@@ -798,9 +786,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
                 # --- Patch.3 ---
                 if get_parallel_state().sp_enabled:
                     # audio_features gathered in audio_tower
-                    audio_features = gather_seq_scatter_heads(
-                        audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-                    )
+                    audio_features = gather_outputs(audio_features, gather_dim=0, group=get_parallel_state().sp_group)
                 # --- Patch.3 ---
 
                 # --- Patch.4 ---
@@ -821,9 +807,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 # --- Patch.3 ---
                 if get_parallel_state().sp_enabled:
-                    image_embeds = gather_seq_scatter_heads(
-                        image_embeds, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-                    )
+                    image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 # --- Patch.3 ---
                 # --- Patch.4 ---
                 image_embeds = image_embeds[: image_mask.sum()]
@@ -843,9 +827,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 # --- Patch.3 ---
                 if get_parallel_state().sp_enabled:
-                    video_embeds = gather_seq_scatter_heads(
-                        video_embeds, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
-                    )
+                    video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 # --- Patch.3 ---
 
                 # --- Patch.4 ---
@@ -862,9 +844,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(_Qwen2_5OmniThinkerForCondition
 
             # --- Patch.3 ---
             if get_parallel_state().sp_enabled:
-                inputs_embeds = gather_heads_scatter_seq(
-                    inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-                )
+                inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
             # --- Patch.3 ---
 
         if attention_mask is not None and position_ids is None:
