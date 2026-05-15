@@ -554,25 +554,15 @@
      @auto_docstring
      def forward(
          self,
-@@ -1312,17 +1489,6 @@
-         second_per_grid_ts: torch.Tensor | None = None,
-         **kwargs: Unpack[TransformersKwargs],
-     ) -> tuple | Qwen2_5_VLModelOutputWithPast:
--        r"""
--        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
--            The temporal, height and width of feature shape of each image in LLM.
--        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
--            The temporal, height and width of feature shape of each video in LLM.
--        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
--            The rope index difference between sequence length and multimodal rope.
--        second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
--            The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
--        """
+@@ -1322,7 +1499,6 @@
+         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+         """
 -
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-@@ -1332,21 +1498,78 @@
+@@ -1332,21 +1508,78 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -659,7 +649,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1358,6 +1581,15 @@
+@@ -1358,6 +1591,15 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -675,7 +665,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1410,6 +1642,12 @@
+@@ -1410,6 +1652,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -688,7 +678,7 @@
 
 
  class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
-@@ -1466,6 +1704,16 @@
+@@ -1466,6 +1714,16 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -705,24 +695,24 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1488,64 +1736,13 @@
+@@ -1488,12 +1746,8 @@
          second_per_grid_ts: torch.Tensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
 -    ) -> tuple | Qwen2_5_VLCausalLMOutputWithPast:
--        r"""
++    ) -> tuple | Qwen2_5_VLCausalLMOutputWithLogProbs:
+         r"""
 -        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
 -            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
 -            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
 -            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
--        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
--            The temporal, height and width of feature shape of each image in LLM.
--        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
--            The temporal, height and width of feature shape of each video in LLM.
--        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
--            The rope index difference between sequence length and multimodal rope.
--        second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
--            The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+             The temporal, height and width of feature shape of each image in LLM.
+         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+@@ -1502,50 +1756,13 @@
+             The rope index difference between sequence length and multimodal rope.
+         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
 -
 -        Example:
 -
@@ -759,9 +749,8 @@
 -        >>> output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 -        >>> print(output_text)
 -        ```
--        """
+         """
 -
-+    ) -> tuple | Qwen2_5_VLCausalLMOutputWithLogProbs:
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -772,7 +761,7 @@
              input_ids=input_ids,
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
-@@ -1564,25 +1761,44 @@
+@@ -1564,25 +1781,44 @@
              **kwargs,
          )
 
@@ -827,7 +816,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1803,5 +2019,25 @@
+@@ -1803,5 +2039,25 @@
 
          return input_ids, model_kwargs
 

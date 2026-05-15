@@ -573,6 +573,9 @@ def qwen3_5_model_get_image_features(
     self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None
 ):
     r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+
     Processes images through the vision tower and returns features as a single contiguous tensor.
 
     Optimization Note:

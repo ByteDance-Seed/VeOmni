@@ -482,6 +482,16 @@ def qwen2_5_vl_model_forward_patched(
     second_per_grid_ts: torch.Tensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5_VLModelOutputWithPast:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+        The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -675,6 +685,16 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5_VLCausalLMOutputWithLogProbs:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+        The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

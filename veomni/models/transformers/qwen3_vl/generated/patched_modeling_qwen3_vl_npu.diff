@@ -966,19 +966,19 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
-@@ -1088,63 +1474,36 @@
+@@ -1088,10 +1474,8 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
 -    ) -> tuple | BaseModelOutputWithDeepstackFeatures:
--        r"""
++    ) -> BaseModelOutputWithDeepstackFeatures:
+         r"""
 -        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
 -            The tensors corresponding to the input images.
--        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
--            The temporal, height and width of feature shape of each image in LLM.
--        """
-+    ) -> BaseModelOutputWithDeepstackFeatures:
-         pixel_values = pixel_values.type(self.visual.dtype)
+         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+             The temporal, height and width of feature shape of each image in LLM.
+         """
+@@ -1099,52 +1483,31 @@
          vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
              pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
          )
@@ -1048,7 +1048,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1184,6 +1543,24 @@
+@@ -1184,6 +1547,24 @@
              position_ids = None
          return position_ids
 
@@ -1073,19 +1073,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1200,20 +1577,38 @@
-         cache_position: torch.LongTensor | None = None,
-         **kwargs: Unpack[TransformersKwargs],
-     ) -> tuple | Qwen3VLModelOutputWithPast:
--        r"""
--        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
--            The temporal, height and width of feature shape of each image in LLM.
--        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
--            The temporal, height and width of feature shape of each video in LLM.
--        """
-         if (input_ids is None) ^ (inputs_embeds is not None):
-             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
+@@ -1212,8 +1593,32 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1120,7 +1108,7 @@
 
          if pixel_values is not None:
              image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-@@ -1221,11 +1616,49 @@
+@@ -1221,11 +1626,49 @@
              )
              image_embeds = image_outputs.pooler_output
              deepstack_image_embeds = image_outputs.deepstack_features
@@ -1174,7 +1162,7 @@
 
          if pixel_values_videos is not None:
              video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-@@ -1233,18 +1666,59 @@
+@@ -1233,18 +1676,59 @@
              )
              video_embeds = video_outputs.pooler_output
              deepstack_video_embeds = video_outputs.deepstack_features
@@ -1242,7 +1230,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1254,24 +1728,56 @@
+@@ -1254,24 +1738,56 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1304,7 +1292,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1286,7 +1792,10 @@
+@@ -1286,7 +1802,10 @@
          )
 
          return Qwen3VLModelOutputWithPast(
@@ -1316,7 +1304,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1318,6 +1827,12 @@
+@@ -1318,6 +1837,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1329,7 +1317,7 @@
 
 
  class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
-@@ -1372,6 +1887,16 @@
+@@ -1372,6 +1897,16 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1346,7 +1334,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1388,54 +1913,7 @@
+@@ -1388,54 +1923,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1402,7 +1390,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1451,22 +1929,43 @@
+@@ -1451,22 +1939,43 @@
          )
 
          hidden_states = outputs[0]
@@ -1453,7 +1441,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1693,6 +2192,25 @@
+@@ -1693,6 +2202,25 @@
 
          return input_ids, model_kwargs
 

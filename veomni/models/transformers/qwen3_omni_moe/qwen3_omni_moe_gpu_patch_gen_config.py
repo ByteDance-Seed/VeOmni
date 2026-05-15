@@ -684,6 +684,12 @@ def qwen3_omni_moe_audio_forward_patched(
     aftercnn_lens=None,
     **kwargs,
 ):
+    r"""
+    feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length
+    aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length after cnn
+    """
     # --- Patch.1 ---
     input_features = input_features.permute(1, 0)  # (len, num_mel_bins) -> (num_mel_bins, len)
     # --- Patch.1 ---
@@ -812,6 +818,12 @@ def qwen3_omni_moe_thinker_text_model_forward_patched(
     deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple | MoeModelOutputWithPast:
+    r"""
+    visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
+        The mask of the visual positions.
+    deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
+        The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -994,6 +1006,10 @@ def qwen3_omni_moe_thinker_get_audio_features_patched(
     audio_feature_lengths=None,
     **kwargs,
 ):
+    r"""
+    audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
+        The length of feature shape of each audio in LLM.
+    """
     audio_outputs = self.audio_tower(
         input_features,
         feature_lens=audio_feature_lengths,
@@ -1075,6 +1091,20 @@ def qwen3_omni_moe_thinker_forward_patched(
     video_second_per_grid=None,
     **kwargs,
 ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
+        The length of feature shape of each audio in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    use_audio_in_video (`bool`, *optional*):
+        Whether or not use audio track in video, should same as the parameter in `process_audio_info`.
+    video_second_per_grid (`torch.LongTensor` of shape `(num_videos)`, *optional*):
+        Number of seconds per grid for each video, used for temporal feature mapping.
+    """
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
     )

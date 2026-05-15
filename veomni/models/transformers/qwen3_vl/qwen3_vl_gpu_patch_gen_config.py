@@ -734,6 +734,10 @@ def qwen3_vl_model_get_image_features_patched(
     image_grid_thw: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> BaseModelOutputWithDeepstackFeatures:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    """
     pixel_values = pixel_values.type(self.visual.dtype)
     vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
         pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
@@ -807,6 +811,12 @@ def qwen3_vl_model_forward_patched(
     cache_position: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3VLModelOutputWithPast:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 

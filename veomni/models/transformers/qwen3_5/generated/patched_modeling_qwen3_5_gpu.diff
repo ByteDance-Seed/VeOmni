@@ -897,7 +897,7 @@
 
 
  @auto_docstring
-@@ -1530,68 +1890,35 @@
+@@ -1530,68 +1890,38 @@
 
      @can_return_tuple
      @auto_docstring
@@ -911,8 +911,9 @@
          r"""
 -        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
 -            The tensors corresponding to the input images.
--        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
--            The temporal, height and width of feature shape of each image in LLM.
+         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+             The temporal, height and width of feature shape of each image in LLM.
++
 +        Processes images through the vision tower and returns features as a single contiguous tensor.
 +
 +        Optimization Note:
@@ -987,7 +988,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1644,6 +1971,7 @@
+@@ -1644,6 +1974,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -995,7 +996,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5ModelOutputWithPast:
-@@ -1652,34 +1980,136 @@
+@@ -1652,34 +1983,136 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1140,7 +1141,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1689,7 +2119,20 @@
+@@ -1689,7 +2122,20 @@
                  inputs_embeds=inputs_embeds,
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
@@ -1161,7 +1162,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1705,6 +2148,12 @@
+@@ -1705,6 +2151,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1174,7 +1175,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2224,36 @@
+@@ -1775,15 +2227,36 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1215,7 +1216,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2287,38 @@
+@@ -1817,6 +2290,38 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1254,7 +1255,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1887,54 +2389,7 @@
+@@ -1887,54 +2392,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1310,7 +1311,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,22 +2405,42 @@
+@@ -1950,22 +2408,42 @@
          )
 
          hidden_states = outputs[0]
@@ -1358,7 +1359,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2192,6 +2667,13 @@
+@@ -2192,6 +2670,13 @@
 
          return input_ids, model_kwargs
 

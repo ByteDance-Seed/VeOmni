@@ -176,18 +176,18 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -774,16 +820,11 @@
+@@ -774,8 +820,8 @@
          self,
          hidden_states: torch.Tensor,
          grid_thw: torch.Tensor,
 -        **kwargs: Unpack[TransformersKwargs],
 -    ) -> torch.Tensor:
--        r"""
--        grid_thw (`torch.LongTensor` of shape `(num_images, 3)`):
--            The temporal, height and width dimensions of feature shape for each image. Each row contains [t, h, w] values.
--        """
 +        **kwargs,
 +    ) -> BaseModelOutputWithPooling:
+         r"""
+         grid_thw (`torch.LongTensor` of shape `(num_images, 3)`):
+             The temporal, height and width dimensions of feature shape for each image. Each row contains [t, h, w] values.
+@@ -783,7 +829,6 @@
          hidden_states = self.patch_embed(hidden_states)
          rotary_pos_emb = self.rot_pos_emb(grid_thw)
          emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
@@ -195,7 +195,7 @@
 
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
-@@ -795,10 +836,27 @@
+@@ -795,10 +840,27 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -223,7 +223,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -809,6 +867,23 @@
+@@ -809,6 +871,23 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -247,7 +247,7 @@
 
 
  @auto_docstring
-@@ -966,6 +1041,12 @@
+@@ -966,6 +1045,12 @@
              hidden_states=all_hidden_states,
              attentions=all_self_attns,
          )
@@ -260,7 +260,7 @@
 
 
  @auto_docstring
-@@ -1134,9 +1215,6 @@
+@@ -1134,9 +1219,6 @@
          """
          pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
@@ -270,7 +270,7 @@
 
          return vision_outputs
 
-@@ -1156,9 +1234,6 @@
+@@ -1156,9 +1238,6 @@
          """
          pixel_values = pixel_values.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
@@ -280,18 +280,10 @@
 
          return vision_outputs
 
-@@ -1260,39 +1335,57 @@
-         cache_position: torch.LongTensor | None = None,
-         **kwargs: Unpack[TransformersKwargs],
-     ) -> tuple | Qwen2VLModelOutputWithPast:
--        r"""
--        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
--            The temporal, height and width of feature shape of each image in LLM.
--        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
--            The temporal, height and width of feature shape of each video in LLM.
--        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
--            The rope index difference between sequence length and multimodal rope.
--        """
+@@ -1268,31 +1347,57 @@
+         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+             The rope index difference between sequence length and multimodal rope.
+         """
 -
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
@@ -355,7 +347,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1303,6 +1396,10 @@
+@@ -1303,6 +1408,10 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -366,7 +358,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1326,6 +1423,12 @@
+@@ -1326,6 +1435,12 @@
              rope_deltas=self.rope_deltas,
          )
          return output if return_dict else output.to_tuple()
@@ -379,22 +371,23 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1401,65 +1504,22 @@
+@@ -1401,65 +1516,30 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
 -    ) -> tuple | Qwen2VLCausalLMOutputWithPast:
--        r"""
++    ) -> tuple | Qwen2VLCausalLMOutputWithLogProbs:
+         r"""
 -        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
 -            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
 -            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
 -            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
--        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
--            The temporal, height and width of feature shape of each image in LLM.
--        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
--            The temporal, height and width of feature shape of each video in LLM.
--        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
--            The rope index difference between sequence length and multimodal rope.
+         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+             The temporal, height and width of feature shape of each image in LLM.
+         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+             The temporal, height and width of feature shape of each video in LLM.
+         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+             The rope index difference between sequence length and multimodal rope.
 -
 -        Example:
 -
@@ -431,9 +424,8 @@
 -        >>> output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 -        >>> print(output_text)
 -        ```
--        """
+         """
 -
-+    ) -> tuple | Qwen2VLCausalLMOutputWithLogProbs:
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -452,7 +444,7 @@
              image_grid_thw=image_grid_thw,
              video_grid_thw=video_grid_thw,
              position_ids=position_ids,
-@@ -1475,23 +1535,40 @@
+@@ -1475,23 +1555,40 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -502,7 +494,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1710,5 +1787,19 @@
+@@ -1710,5 +1807,19 @@
 
          return input_ids, model_kwargs
 
