@@ -699,8 +699,6 @@ def rank0_load_and_broadcast_weights(
                     try:
                         key, tensor = next(iterator)  # type: ignore[arg-type]
                         key = _convert_weight_key(key, model)
-                        if is_peft_model:
-                            key = lora_key_overrides.get(key, "base_model.model." + key)
                         converted = maybe_convert_checkpoint_tensor(key, tensor, converter)
                         if converted is None:
                             continue
@@ -711,6 +709,10 @@ def rank0_load_and_broadcast_weights(
                         # mapped to their PEFT-wrapped ``...base_layer.weight``
                         # destination when the experts module is wrapped by
                         # ``LoraSharedExperts`` / ``LoraIndependentExperts``.
+                        # Bare-key lookup intentionally: ``lora_key_overrides``
+                        # is keyed by base-model FQNs (no ``base_model.model.``
+                        # prefix), and the converter is given the bare key so
+                        # MoE per-expert pattern matches still fire.
                         if is_peft_model:
                             key = lora_key_overrides.get(key, "base_model.model." + key)
                         logger.info_rank0(f"loading {key=}")
