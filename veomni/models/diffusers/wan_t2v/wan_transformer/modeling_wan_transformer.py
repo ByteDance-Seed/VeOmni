@@ -23,7 +23,7 @@ from .....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_outputs,
     gather_seq_scatter_heads,
-    slice_input_tensor_scale_grad,
+    slice_input_tensor,
 )
 from .....utils import logging
 from .configuration_wan_transformer import WanTransformer3DModelConfig
@@ -208,7 +208,7 @@ def WanTransformer3DModel_forward(
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
     if get_parallel_state().sp_enabled:
-        hidden_states = slice_input_tensor_scale_grad(hidden_states, dim=1)
+        hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
 
         # Slice rotary embeddings to the local rank's positions (no gradient).
         freqs_cos, freqs_sin = rotary_emb
@@ -354,6 +354,13 @@ def apply_veomni_wan_transformer_patch() -> None:
     would be absent, making sequence slicing incorrect.
     """
     _WanTransformer3DModel.forward = WanTransformer3DModel_forward
+    # Newer diffusers (resolved under transformers v5) gate FA2 with a strict
+    # ``_supports_flash_attn_2 = False`` on WanTransformer3DModel and raise on
+    # init when callers request the FA2 attention path. VeOmni's training
+    # already exercises FA2 (via our SP-aware attention processor) and goes
+    # through the WanAttention forward we control — opt in to FA2 here so the
+    # diffusers gate doesn't refuse on our behalf.
+    _WanTransformer3DModel._supports_flash_attn_2 = True
     logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
 
     from veomni.models.transformers.wan.device_patch import apply_veomni_wan_device_patch

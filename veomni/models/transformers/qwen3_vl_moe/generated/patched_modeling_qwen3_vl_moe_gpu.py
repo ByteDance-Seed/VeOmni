@@ -87,10 +87,9 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_world_size,
+    slice_input_tensor,
     sp_pad_and_slice,
 )
 from veomni.distributed.sequence_parallel.async_ulysses import (
@@ -1637,6 +1636,10 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         image_grid_thw: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithDeepstackFeatures:
+        r"""
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        """
         pixel_values = pixel_values.type(self.visual.dtype)
         vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
             pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
@@ -1731,6 +1734,12 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3VLMoeModelOutputWithPast:
+        r"""
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1759,9 +1768,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         fake_deepstack = None
@@ -1775,9 +1782,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
-                image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_image_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_image_embeds
@@ -1827,9 +1832,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
-                video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_video_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_video_embeds
@@ -1872,9 +1875,8 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
+
         # --- Patch.1 ---
 
         visual_pos_masks = None
@@ -2160,7 +2162,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                 # returns (loss, logits, log_probs, entropy); unpack to match the
                 # OpSlot branch above.
                 loss, logits, log_probs, entropy = self.loss_function(
-                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
         else:
             logits = self.lm_head(hidden_states)

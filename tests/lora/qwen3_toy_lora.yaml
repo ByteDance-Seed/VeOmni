@@ -1,0 +1,32 @@
+model:
+  config_path: tests/toy_config/qwen3_toy/config.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 8
+    alpha: 16
+    lora_modules:
+      - q_proj
+      - v_proj
+
+data:
+  train_path: dummy
+  max_seq_len: 128
+
+train:
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+  init_device: meta
+  global_batch_size: 4
+  micro_batch_size: 1
+  max_steps: 3
+  checkpoint:
+    output_dir: /tmp/test_lora_saveload
+    save_steps: 0
+    save_hf_weights: false
+    manager: dcp

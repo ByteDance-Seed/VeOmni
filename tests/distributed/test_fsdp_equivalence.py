@@ -11,8 +11,8 @@ Approach:
   Both runs use the SAME VeOmni trainer (train_text_test.py) to ensure identical
   data pipeline, loss normalization (per-token via mean_global_loss), and batch
   invariant mode. The only difference is FSDP wrapping:
-  - Baseline: nproc=1, init_device=device (no FSDP, full gradient accumulation)
-  - FSDP:    nproc=2, init_device=meta   (FSDP2 sharded)
+  - Baseline: nproc=1, init_device=device, fsdp_mode=ddp (no FSDP, full grad accum)
+  - FSDP:    nproc=2, init_device=meta,   fsdp_mode=fsdp2 (sharded)
 
   We compare **grad_norm** as the primary correctness signal. With per-token loss
   normalization and the fsdp_size multiplier, the effective gradient is mathematically
@@ -29,14 +29,10 @@ import shutil
 import pytest
 
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from ..tools import ParallelConfig
 
 
-_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
-_v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.0.0")
-_v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0")
 # Qwen3.5 GatedDeltaNet has no NPU kernel today (varlen path unsupported).
 _qwen3_5_npu_skip = pytest.mark.skipif(
     IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
@@ -83,7 +79,10 @@ def _run_single_gpu_training(model_name, config_path, model_path, train_path, ou
         task_name="single_gpu",
         nproc=1,
         init_device=get_device_type(),
-        extra_args=["--train.accelerator.fsdp_config.mixed_precision.enable=False"],
+        extra_args=[
+            "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+            "--train.accelerator.fsdp_config.mixed_precision.enable=False",
+        ],
         model_name=model_name,
     )
 
@@ -185,58 +184,56 @@ def _run_fsdp_equivalence(
 
 # --- Text model test cases ---
 
-_text_test_cases_v4 = [
-    pytest.param(
-        "qwen3",
-        "./tests/toy_config/qwen3_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3",
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "qwen3_moe",
-        "./tests/toy_config/qwen3_moe_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3_moe",
-        marks=_v4_only,
-    ),
-    pytest.param(
-        "llama3.1",
-        "./tests/toy_config/llama31_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="llama3.1",
-        marks=_v4_only,
-    ),
-]
-
-_text_test_cases_v5 = [
+# transformers v5 only — the v4 CI lane was retired together with the
+# broader transformers v4 wind-down. v4-only models that have not yet
+# been migrated to patchgen are commented out below; uncomment a case
+# once the corresponding model gains a v5 patchgen path.
+#
+# NOTE: these tests use ``*_fsdp_equiv_toy`` configs (vocab_size=2048)
+# rather than the shared ``*_toy`` configs (vocab_size=248320). The
+# single-GPU baseline (nproc=1, no FSDP sharding) has to fit the whole
+# model + Adam state on one 44 GiB L20; the production vocab alone
+# pushes optimizer state past the card. Shrinking vocab is safe here:
+# DummyDataset emits tokens in [0, 1024) and this test is text-only
+# equivalence — image/video/vision special tokens are never embedded.
+_text_test_cases = [
+    # TODO(transformers v5 migration): re-enable llama3.1 once it is
+    # ported to the patchgen pipeline (currently v4-only).
+    # pytest.param(
+    #     "llama3.1",
+    #     "./tests/toy_config/llama31_toy",
+    #     False,
+    #     _DEFAULT_RTOL,
+    #     _DEFAULT_ATOL,
+    #     id="llama3.1",
+    # ),
     pytest.param(
         "qwen3_5",
-        "./tests/toy_config/qwen3_5_toy/config.json",
+        "./tests/toy_config/qwen3_5_fsdp_equiv_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5",
-        marks=[_v5_only, _qwen3_5_npu_skip],
+        marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
         "qwen3_5_moe",
-        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        "./tests/toy_config/qwen3_5_moe_fsdp_equiv_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5_moe",
-        marks=[_v5_only, _qwen3_5_npu_skip],
+        marks=_qwen3_5_npu_skip,
+    ),
+    pytest.param(
+        "deepseek_v3",
+        "./tests/toy_config/deepseek_v3_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v3",
     ),
 ]
-
-_text_test_cases = _text_test_cases_v4 + _text_test_cases_v5
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", _text_test_cases)

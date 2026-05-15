@@ -23,14 +23,10 @@ from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import distributed as dist
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from ..utils import logging
 from ..utils.device import get_device_type
-from ..utils.import_utils import is_torch_version_greater_than
-
-
-if is_torch_version_greater_than("2.4"):
-    from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 
 if TYPE_CHECKING:
@@ -86,7 +82,7 @@ class ParallelState:
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
-    dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1"
+    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2"
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
@@ -494,7 +490,7 @@ def init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1",
+    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
@@ -537,79 +533,76 @@ def init_parallel_state(
 
     extra_parallel_fsdp_device_mesh = {f"{para_name}": None for para_name in extra_parallel_names}
 
-    if is_torch_version_greater_than("2.4"):
-        mesh_shape = []
-        mesh_dim_names = []
-        for d, name in zip(
-            [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
-            ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
-        ):
-            if d > 1 or name in ["dp_shard"]:
-                mesh_shape.append(d)
-                mesh_dim_names.append(name)
+    mesh_shape = []
+    mesh_dim_names = []
+    for d, name in zip(
+        [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
+        ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
+    ):
+        if d > 1 or name in ["dp_shard"]:
+            mesh_shape.append(d)
+            mesh_dim_names.append(name)
 
-        device_mesh = init_device_mesh(
-            device_type=device_type,
-            mesh_shape=tuple(mesh_shape),
-            mesh_dim_names=tuple(mesh_dim_names),
-        )
+    device_mesh = init_device_mesh(
+        device_type=device_type,
+        mesh_shape=tuple(mesh_shape),
+        mesh_dim_names=tuple(mesh_dim_names),
+    )
 
-        # Mesh for data loading (no communication on this mesh)
-        dp_mesh_dim_names = []
-        # Mesh for param sharding
-        dp_shard_sp_mesh_dim_names = []
-        # Mesh for loss all-reduce
-        dp_sp_mesh_dim_names = []
-        # Mesh for sequence parallel
-        sp_mesh_dim_names = []
+    # Mesh for data loading (no communication on this mesh)
+    dp_mesh_dim_names = []
+    # Mesh for param sharding
+    dp_shard_sp_mesh_dim_names = []
+    # Mesh for loss all-reduce
+    dp_sp_mesh_dim_names = []
+    # Mesh for sequence parallel
+    sp_mesh_dim_names = []
 
-        if dp_replicate_size > 1:
-            dp_mesh_dim_names.append("dp_replicate")
-            dp_sp_mesh_dim_names.append("dp_replicate")
-        if dp_shard_size >= 1:
-            dp_mesh_dim_names.append("dp_shard")
-            dp_shard_sp_mesh_dim_names.append("dp_shard")
-            dp_sp_mesh_dim_names.append("dp_shard")
-        if ulysses_size > 1:
-            dp_shard_sp_mesh_dim_names.append("ulysses")
-            sp_mesh_dim_names.append("ulysses")
-            dp_sp_mesh_dim_names.append("ulysses")
-        if cp_size > 1:
-            dp_shard_sp_mesh_dim_names.append("cp")
-            sp_mesh_dim_names.append("cp")
-            dp_sp_mesh_dim_names.append("cp")
+    if dp_replicate_size > 1:
+        dp_mesh_dim_names.append("dp_replicate")
+        dp_sp_mesh_dim_names.append("dp_replicate")
+    if dp_shard_size >= 1:
+        dp_mesh_dim_names.append("dp_shard")
+        dp_shard_sp_mesh_dim_names.append("dp_shard")
+        dp_sp_mesh_dim_names.append("dp_shard")
+    if ulysses_size > 1:
+        dp_shard_sp_mesh_dim_names.append("ulysses")
+        sp_mesh_dim_names.append("ulysses")
+        dp_sp_mesh_dim_names.append("ulysses")
+    if cp_size > 1:
+        dp_shard_sp_mesh_dim_names.append("cp")
+        sp_mesh_dim_names.append("cp")
+        dp_sp_mesh_dim_names.append("cp")
 
-        if dp_mesh_dim_names != []:
-            device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+    if dp_mesh_dim_names != []:
+        device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
 
-        if dp_shard_sp_mesh_dim_names != []:
-            device_mesh[tuple(dp_shard_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_sp")
+    if dp_shard_sp_mesh_dim_names != []:
+        device_mesh[tuple(dp_shard_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_sp")
 
-        if dp_sp_mesh_dim_names != []:
-            device_mesh[tuple(dp_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_sp")
+    if dp_sp_mesh_dim_names != []:
+        device_mesh[tuple(dp_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_sp")
 
-        if sp_mesh_dim_names != []:
-            device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
+    if sp_mesh_dim_names != []:
+        device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
 
-        for para_size, para_outside, para_name in zip(
-            extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
-        ):
-            if para_size > 1:
-                world_size = dist.get_world_size()
-                assert world_size % para_size == 0, f"{para_name}_size must be a factor of world_size"
-                para_fsdp_size = world_size // para_size
-                mesh = init_para_mesh_matrix(
-                    para_size=para_size, para_fsdp_size=para_fsdp_size, para_outside=para_outside
-                )
-                extra_parallel_fsdp_device_mesh[f"{para_name}"] = DeviceMesh(
-                    device_type=device_type,
-                    mesh=mesh,
-                    mesh_dim_names=(para_name, f"{para_name}_fsdp"),
-                )
+    for para_size, para_outside, para_name in zip(
+        extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
+    ):
+        if para_size > 1:
+            world_size = dist.get_world_size()
+            assert world_size % para_size == 0, f"{para_name}_size must be a factor of world_size"
+            para_fsdp_size = world_size // para_size
+            mesh = init_para_mesh_matrix(para_size=para_size, para_fsdp_size=para_fsdp_size, para_outside=para_outside)
+            extra_parallel_fsdp_device_mesh[f"{para_name}"] = DeviceMesh(
+                device_type=device_type,
+                mesh=mesh,
+                mesh_dim_names=(para_name, f"{para_name}_fsdp"),
+            )
 
-        logger.info_rank0(f"Device mesh: {device_mesh}")
-        for para_name in extra_parallel_names:
-            logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
+    logger.info_rank0(f"Device mesh: {device_mesh}")
+    for para_name in extra_parallel_names:
+        logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
 
     _PARALLEL_STATE = ParallelState(
         dp_size=dp_size,

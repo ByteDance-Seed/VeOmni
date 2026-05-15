@@ -46,6 +46,18 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25_omni": {"rotary_pos_emb_implementation": "eager"},
+    # qwen2 / qwen3_moe v5 patched modeling declares OpSlots for
+    # rotary_pos_emb and rms_norm but KERNEL_REGISTRY has no `npu`
+    # KernelSpec for either — only `liger_kernel` (GPU). Pin both to
+    # eager until NPU KernelSpecs are registered.
+    "qwen2": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "qwen3_moe": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
@@ -56,6 +68,14 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 # args directly (no training YAML), so we pin here as well.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+    # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
+    # by the fused Liger cross-entropy kernel materializing the full
+    # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it
+    # processes the vocab in chunks so peak allocation stays well below
+    # the ~5 GiB Liger asks for, which lets these tests survive shared
+    # L20 runners where another job is still holding part of the card.
+    "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
+    "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
 }
 
 
@@ -188,7 +208,12 @@ def build_torchrun_cmd(
         f"--model.config_path={config_path}",
         f"--data.train_path={train_path}",
         "--data.dyn_bsz_buffer_size=1",
-        "--train.global_batch_size=16",
+        # Keep micro_batch=1 (already minimum) and global=8 so the
+        # grad-accum cycles per step stay small. The qwen3_5 toy with
+        # its full 248K vocab embedding fragments the PyTorch allocator
+        # quickly; fewer fw+bw passes per step ⇒ less cache thrash and
+        # less GPU memory required on the L20 (44 GiB) runners.
+        "--train.global_batch_size=8",
         "--train.micro_batch_size=1",
         f"--train.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
@@ -230,7 +255,7 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
     This avoids downloading real model weights for CI tests.
     """
     from veomni.models.auto import build_foundation_model
-    from veomni.utils.device import get_device_type
+    from veomni.utils.device import empty_cache, get_device_type
 
     model = build_foundation_model(
         config_path=config_path,
@@ -240,6 +265,13 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
         ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
+    # The fp32 model can pin tens of GiB on the device (e.g. qwen3_5's full
+    # 248K-vocab embedding alone ≈ 4 GiB at fp32; the full model on L20 hits
+    # ~28 GiB). Subsequent torchrun children loading at bf16 then OOM the card
+    # because the pytest parent's CUDA context still holds the fp32 weights.
+    del model
+    gc.collect()
+    empty_cache()
 
 
 def run_training_config(

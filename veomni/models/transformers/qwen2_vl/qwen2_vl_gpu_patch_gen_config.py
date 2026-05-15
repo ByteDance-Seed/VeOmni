@@ -42,9 +42,9 @@ from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
+    gather_outputs,
     pad_tensor,
+    slice_input_tensor,
     sp_pad_and_slice,
 )
 from veomni.patchgen.patch_spec import PatchConfig
@@ -64,7 +64,7 @@ config.add_import("types", names=["SimpleNamespace"])
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import(
     "veomni.distributed.sequence_parallel",
-    names=["gather_heads_scatter_seq", "gather_seq_scatter_heads", "pad_tensor", "sp_pad_and_slice"],
+    names=["gather_outputs", "slice_input_tensor", "pad_tensor", "sp_pad_and_slice"],
 )
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``Qwen2VLCausalLMOutputWithLogProbs`` so the patched multimodal
@@ -166,6 +166,10 @@ def qwen2_vit_forward_patched(
     grid_thw: torch.Tensor,
     **kwargs,
 ) -> BaseModelOutputWithPooling:
+    r"""
+    grid_thw (`torch.LongTensor` of shape `(num_images, 3)`):
+        The temporal, height and width dimensions of feature shape for each image. Each row contains [t, h, w] values.
+    """
     hidden_states = self.patch_embed(hidden_states)
     rotary_pos_emb = self.rot_pos_emb(grid_thw)
     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
@@ -302,6 +306,14 @@ def qwen2vl_model_forward_patched(
     cache_position: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2VLModelOutputWithPast:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -317,18 +329,14 @@ def qwen2vl_model_forward_patched(
 
     # VeOmni SP Patch
     if get_parallel_state().sp_enabled:
-        inputs_embeds = gather_seq_scatter_heads(
-            inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 
     if pixel_values is not None:
         image_embeds = self.get_image_features(pixel_values, image_grid_thw, return_dict=True).pooler_output
 
         # VeOmni SP
         if get_parallel_state().sp_enabled:
-            image_embeds = gather_seq_scatter_heads(
-                image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
         image_embeds = image_embeds[: image_mask.sum()]
         image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -344,9 +352,7 @@ def qwen2vl_model_forward_patched(
 
         # VeOmni SP
         if get_parallel_state().sp_enabled:
-            video_embeds = gather_seq_scatter_heads(
-                video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-            )
+            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 
         video_embeds = video_embeds[: video_mask.sum()]
         video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -358,9 +364,7 @@ def qwen2vl_model_forward_patched(
         inputs_embeds = inputs_embeds + fake_embeds
 
     if get_parallel_state().sp_enabled:
-        inputs_embeds = gather_heads_scatter_seq(
-            inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-        )
+        inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
     if position_ids is None:
         position_ids = self.compute_3d_position_ids(
@@ -443,6 +447,14 @@ def qwen2vl_for_conditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2VLCausalLMOutputWithLogProbs:
+    r"""
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -491,8 +503,17 @@ def qwen2vl_for_conditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             loss, _, log_probs, entropy = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
             )
+            if log_probs is not None:
+                # log_probs path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

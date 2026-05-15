@@ -53,6 +53,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/ops/kernels/moe/_kernels/utils/device.py",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
+    "veomni/utils/lora_utils.py",
 ]
 
 # directory or file path must contain keyword "nccl"

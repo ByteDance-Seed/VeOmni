@@ -24,7 +24,6 @@ train:
   accelerator:
     fsdp_config:
       fsdp_mode: fsdp2
-      full_shard: true
       mixed_precision:
         enable: true
   gradient_checkpointing:

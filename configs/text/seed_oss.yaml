@@ -15,9 +15,8 @@ data:
 train:
   accelerator:
     fsdp_config:
-      fsdp_mode: fsdp1
-      full_shard: true
-  init_device: cpu
+      fsdp_mode: fsdp2
+  init_device: meta
   global_batch_size: 512
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007

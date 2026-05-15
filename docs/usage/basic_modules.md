@@ -88,7 +88,7 @@ init_parallel_state(
     extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
     extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
     extra_parallel_names=args.train.accelerator.extra_parallel_names,
-    mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
+    mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
     async_enabled=args.train.accelerator.enable_async, # async ulysses
 )
 
@@ -370,6 +370,42 @@ model = build_parallelize_model(
 ```
 
 ### Optimizer and LR Scheduler
+
+`build_optimizer` supports three optimizer types via `train.optimizer.type`:
+
+| Type | Description |
+|------|-------------|
+| `adamw` (default) | Standard `torch.optim.AdamW`. |
+| `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
+| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+
+Muon-specific hyperparameters live under `train.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` / `eps` continue to drive the AdamW sibling group.
+
+Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `muon_lr` | `2e-2` | Learning rate for the Muon group. Per Moonlight, ~25× the AdamW lr is a common starting point. |
+| `muon_momentum` | `0.95` | Momentum factor (Nesterov when `muon_nesterov=True`). |
+| `muon_nesterov` | `true` | Use Nesterov momentum. |
+| `muon_weight_decay` | `0.0` | Decoupled weight decay for the Muon group. |
+| `muon_ns_steps` | `5` | Number of Newton-Schulz iterations. |
+| `muon_ns_coefficients` | `[3.4445, -4.7750, 2.0315]` | Quintic NS polynomial coefficients (a, b, c). |
+| `muon_eps` | `1e-7` | Numerical-stability epsilon for the spectral-norm normalization. |
+| `muon_adjust_lr_fn` | `match_rms_adamw` | Per-matrix LR adjustment. `original` follows Keller Jordan; `match_rms_adamw` matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer. |
+| `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and silently falls back to the dim-1 + all-to-all-gather path. |
+
+For MoE training under FSDP2+EP, the Muon flow auto-classifies each parameter into one of four code paths in `DistributedMuon`:
+
+| Param layout | Path | Comm at Muon time |
+|--------------|------|-------------------|
+| plain `Tensor` / replicated `DTensor` | `local` | none |
+| 2D `DTensor` with a `Shard` | `fsdp_gather_2d` | one all-gather over the FSDP mesh |
+| 3D `DTensor` with `Shard(0)` (zero-comm backend) | `moe_local_3d` | none — batched NS runs on `_local_tensor` |
+| 3D `DTensor` with `Shard(d>0)` (default backend) | `moe_gather_3d` | one all-to-all-gather over the `ep_fsdp` mesh |
+
+See `configs/text/qwen3_moe_muon.yaml` for an end-to-end Qwen3-MoE-30B-A3B sample.
+
 ```python
 from veomni.optim import build_lr_scheduler, build_optimizer
 
