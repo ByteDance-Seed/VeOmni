@@ -18,8 +18,10 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed._tensor import Shard
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
@@ -27,15 +29,9 @@ from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
-from ..utils.import_utils import is_torch_version_greater_than
 from .checkpoint import CheckpointFunction
 from .parallel_state import get_parallel_state
 from .utils import sort_fqn_by_submodule_first
-
-
-if is_torch_version_greater_than("2.4"):
-    from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-    from torch.distributed.tensor.parallel import parallelize_module
 
 
 logger = logging.get_logger(__name__)

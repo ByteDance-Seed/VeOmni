@@ -216,7 +216,7 @@ NPU validation runs at two times:
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
-| init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"cuda"` | Device for model weight initialization. Use `"meta"` or `"cpu"` for large models (>30B). |
+| init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
@@ -312,7 +312,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp2"]` | `"ddp"` | Data parallel mode. |
+| fsdp_mode | `Literal["ddp", "fsdp2"]` | `"fsdp2"` | Data parallel mode. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |

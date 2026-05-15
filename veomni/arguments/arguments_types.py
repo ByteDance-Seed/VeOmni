@@ -277,7 +277,7 @@ class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
     fsdp_mode: Literal["ddp", "fsdp2"] = field(
-        default="ddp",
+        default="fsdp2",
         metadata={"help": "Data parallel mode."},
     )
     reshard_after_forward: bool = field(
@@ -466,9 +466,9 @@ class TrainingArguments:
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
-        default="cuda",
+        default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
