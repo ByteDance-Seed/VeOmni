@@ -14,6 +14,7 @@
 
 
 import types
+from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
@@ -381,11 +382,12 @@ def parallelize_model_fsdp2(
             )
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
+            _dt_local_split = partial(distribute_tensor, src_data_rank=None)
             load_model_weights(
                 model,
                 weights_path,
                 get_device_type(),
-                dtensor_factory=distribute_tensor,
+                dtensor_factory=_dt_local_split,
                 is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
             )
