@@ -87,9 +87,9 @@ class DeepseekV3RMSNorm(nn.Module):
     # 1. Use NPU fused RMSNorm kernel.
     # ================================================================
     def forward(self, hidden_states):
-        from veomni.ops.npu_patch import npu_fused_operator
+        from veomni.ops.kernels.rms_norm.npu import rms_norm_forward_npu
 
-        return npu_fused_operator.rms_norm_forward_npu(self, hidden_states)
+        return rms_norm_forward_npu(self, hidden_states)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -357,9 +357,9 @@ def rotate_half(x):
 # 1. Use NPU fused rotary embedding kernel.
 # ================================================================
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    from veomni.ops.npu_patch import npu_fused_operator
+    from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_npu as _apply_rotary_pos_emb_npu
 
-    return npu_fused_operator.apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids, unsqueeze_dim)
+    return _apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

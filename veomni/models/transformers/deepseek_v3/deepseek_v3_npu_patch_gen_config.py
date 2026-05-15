@@ -18,8 +18,8 @@ Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.deepseek_v3.deepseek_v3_npu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
 NPU differs from GPU in leaf-op kernels only:
-1. RMSNorm.forward uses ``npu_fused_operator.rms_norm_forward_npu``.
-2. ``apply_rotary_pos_emb`` uses ``npu_fused_operator.apply_rotary_pos_emb_npu``.
+1. RMSNorm.forward uses ``veomni.ops.kernels.rms_norm.npu.rms_norm_forward_npu``.
+2. ``apply_rotary_pos_emb`` uses ``veomni.ops.kernels.rotary.npu.apply_rotary_pos_emb_npu``.
 
 Structural patches (OpSlot-guarded fused MoE, router autocast, OpSlot-guarded
 fused CE returning ``CausalLMOutputWithLogProbs``, parallel plan) are reused
@@ -74,9 +74,9 @@ config.add_post_import_block(
     description="Use NPU fused RMSNorm kernel",
 )
 def deepseek_v3_rms_norm_forward_npu(self, hidden_states):
-    from veomni.ops.npu_patch import npu_fused_operator
+    from veomni.ops.kernels.rms_norm.npu import rms_norm_forward_npu
 
-    return npu_fused_operator.rms_norm_forward_npu(self, hidden_states)
+    return rms_norm_forward_npu(self, hidden_states)
 
 
 # ================================================================
@@ -88,9 +88,9 @@ def deepseek_v3_rms_norm_forward_npu(self, hidden_states):
     description="Use NPU fused rotary embedding kernel",
 )
 def apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    from veomni.ops.npu_patch import npu_fused_operator
+    from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_npu as _apply_rotary_pos_emb_npu
 
-    return npu_fused_operator.apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids, unsqueeze_dim)
+    return _apply_rotary_pos_emb_npu(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
 
 
 # ================================================================
