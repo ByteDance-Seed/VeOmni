@@ -20,12 +20,12 @@ This guide provides comprehensive information for using VeOmni framework with As
 
 ## Installation
 
-VeOmni supports two installation methods for Ascend NPUs: `uv` (recommended for faster installation) and `pip`. Note that ARM architecture machines only support `uv` installation.
+VeOmni supports two installation methods for Ascend NPUs: `uv` (recommended for faster installation) and `pip`. Note that ARM architecture machines only support `pip` installation.
 
 ### Installation Options
 
 - **x86 Architecture**: Supports both `uv` and `pip` installation methods
-- **ARM Architecture**: Only supports `uv` installation method
+- **ARM Architecture**: Only supports `pip` installation method
 
 ### Detailed Installation Guide
 

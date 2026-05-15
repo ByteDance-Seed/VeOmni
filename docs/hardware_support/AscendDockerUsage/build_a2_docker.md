@@ -34,8 +34,8 @@ Build the VeOmni Ascend A2 image using the appropriate Dockerfile for your archi
 ### For x86 Architecture
 
 ```bash
+# Optional proxy settings (remove if not needed)
 docker build \
-  # Optional proxy settings (remove if not needed)
   --build-arg http_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
@@ -47,8 +47,8 @@ docker build \
 ### For ARM64 Architecture
 
 ```bash
+# Optional proxy settings (remove if not needed)
 docker build \
-  # Optional proxy settings (remove if not needed)
   --build-arg http_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \

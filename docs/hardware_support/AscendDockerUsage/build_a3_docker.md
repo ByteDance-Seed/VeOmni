@@ -24,8 +24,8 @@ Build the VeOmni Ascend A3 image using the provided Dockerfile.
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
 
 ```bash
+# Optional proxy settings (remove if not needed)
 docker build \
-  # Optional proxy settings (remove if not needed)
   --build-arg http_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
