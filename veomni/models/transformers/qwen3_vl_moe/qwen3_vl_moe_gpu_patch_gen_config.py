@@ -570,7 +570,12 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
             # returns (loss, logits, log_probs, entropy); unpack to match the
             # OpSlot branch above.
             loss, logits, log_probs, entropy = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
             )
     else:
         logits = self.lm_head(hidden_states)

@@ -1361,7 +1361,7 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1993,24 +2458,55 @@
+@@ -1993,24 +2458,60 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1390,7 +1390,12 @@
 +                # returns (loss, logits, log_probs, entropy); unpack to match the
 +                # OpSlot branch above.
 +                loss, logits, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
 +        else:
 +            logits = self.lm_head(hidden_states)
@@ -1429,7 +1434,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2018,7 +2514,15 @@
+@@ -2018,7 +2519,15 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1446,7 +1451,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2577,7 @@
+@@ -2073,6 +2582,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1454,7 +1459,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2089,58 +2594,7 @@
+@@ -2089,58 +2599,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1514,7 +1519,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,37 +2610,67 @@
+@@ -2156,37 +2615,72 @@
          )
 
          hidden_states = outputs[0]
@@ -1546,7 +1551,12 @@
 +                # returns (loss, logits, log_probs, entropy); unpack to match the
 +                # OpSlot branch above.
 +                loss, logits, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.text_config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
 +        else:
 +            logits = self.lm_head(hidden_states)
@@ -1597,7 +1607,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2413,6 +2897,19 @@
+@@ -2413,6 +2907,19 @@
 
          return input_ids, model_kwargs
 

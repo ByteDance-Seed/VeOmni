@@ -2247,8 +2247,17 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             else:
                 logits = self.lm_head(hidden_states)
                 loss, _, log_probs, entropy = self.loss_function(
-                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
+                if log_probs is not None:
+                    # log_probs path empties loss/logits slots; clear the local 3D
+                    # logits so output mirrors the OpSlot branch's contract.
+                    logits = None
         else:
             logits = self.lm_head(hidden_states)
 
@@ -2430,8 +2439,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             else:
                 logits = self.lm_head(hidden_states)
                 loss, _, log_probs, entropy = self.loss_function(
-                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
+                if log_probs is not None:
+                    # log_probs path empties loss/logits slots; clear the local 3D
+                    # logits so output mirrors the OpSlot branch's contract.
+                    logits = None
         else:
             logits = self.lm_head(hidden_states)
 

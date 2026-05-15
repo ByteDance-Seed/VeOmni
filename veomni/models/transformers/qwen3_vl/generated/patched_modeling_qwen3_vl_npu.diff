@@ -1390,7 +1390,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1451,22 +1939,43 @@
+@@ -1451,22 +1939,52 @@
          )
 
          hidden_states = outputs[0]
@@ -1423,8 +1423,17 @@
 +            else:
 +                logits = self.lm_head(hidden_states)
 +                loss, _, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.text_config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
++                if log_probs is not None:
++                    # log_probs path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 +        # --- Patch.1 ---
@@ -1441,7 +1450,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1693,6 +2202,25 @@
+@@ -1693,6 +2211,25 @@
 
          return input_ids, model_kwargs
 

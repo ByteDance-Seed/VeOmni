@@ -381,7 +381,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -693,26 +756,56 @@
+@@ -693,26 +756,61 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -412,7 +412,12 @@
 +                # returns (loss, logits, log_probs, entropy); unpack to match the
 +                # OpSlot branch above.
 +                loss, logits, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
 +        else:
 +            logits = self.lm_head(hidden_states)
@@ -450,7 +455,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -720,7 +813,14 @@
+@@ -720,7 +818,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

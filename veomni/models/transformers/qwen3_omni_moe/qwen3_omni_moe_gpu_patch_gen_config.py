@@ -1372,6 +1372,8 @@ def qwen3_omni_moe_thinker_forward_patched(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
                 ignore_index=IGNORE_INDEX,
                 **kwargs,
             )

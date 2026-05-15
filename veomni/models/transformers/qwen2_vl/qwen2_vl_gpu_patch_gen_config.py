@@ -503,8 +503,17 @@ def qwen2vl_for_conditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             loss, _, log_probs, entropy = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
             )
+            if log_probs is not None:
+                # log_probs path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

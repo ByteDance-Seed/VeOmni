@@ -1349,7 +1349,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1644,29 +2137,60 @@
+@@ -1644,29 +2137,65 @@
          )
 
          hidden_states = outputs[0]
@@ -1384,7 +1384,12 @@
 +                # returns (loss, logits, log_probs, entropy); unpack to match the
 +                # OpSlot branch above.
 +                loss, logits, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.text_config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
 +        else:
 +            logits = self.lm_head(hidden_states)
@@ -1428,7 +1433,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1674,7 +2198,9 @@
+@@ -1674,7 +2203,9 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
@@ -1439,7 +1444,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1901,6 +2427,37 @@
+@@ -1901,6 +2432,37 @@
 
          return input_ids, model_kwargs
 

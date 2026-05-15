@@ -1175,7 +1175,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2227,36 @@
+@@ -1775,15 +2227,45 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1203,8 +1203,17 @@
 +            else:
 +                logits = self.lm_head(hidden_states)
 +                loss, _, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
++                if log_probs is not None:
++                    # log_probs path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 +
@@ -1216,7 +1225,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2290,38 @@
+@@ -1817,6 +2299,38 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1255,7 +1264,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1887,54 +2392,7 @@
+@@ -1887,54 +2401,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1311,7 +1320,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,22 +2408,42 @@
+@@ -1950,22 +2417,51 @@
          )
 
          hidden_states = outputs[0]
@@ -1342,8 +1351,17 @@
 +            else:
 +                logits = self.lm_head(hidden_states)
 +                loss, _, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.text_config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
++                if log_probs is not None:
++                    # log_probs path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 +
@@ -1359,7 +1377,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2192,6 +2670,13 @@
+@@ -2192,6 +2688,13 @@
 
          return input_ids, model_kwargs
 

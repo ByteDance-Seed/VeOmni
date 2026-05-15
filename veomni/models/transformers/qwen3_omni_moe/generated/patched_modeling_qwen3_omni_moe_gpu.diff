@@ -1555,7 +1555,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2235,39 +2571,76 @@
+@@ -2235,39 +2571,78 @@
              use_cache=use_cache,
              output_router_logits=output_router_logits,
              cache_position=cache_position,
@@ -1597,6 +1597,8 @@
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
 +                    ignore_index=IGNORE_INDEX,
 +                    **kwargs,
 +                )
@@ -1648,7 +1650,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2319,1548 +2692,112 @@
+@@ -2319,1548 +2694,112 @@
 
          return model_inputs
 
@@ -3293,7 +3295,7 @@
 
      def disable_talker(self):
          if hasattr(self, "talker"):
-@@ -4132,19 +3069,41 @@
+@@ -4132,19 +3071,41 @@
 
          return thinker_result.sequences, talker_wavs.float()
 

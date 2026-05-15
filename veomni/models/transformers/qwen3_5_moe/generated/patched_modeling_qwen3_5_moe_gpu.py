@@ -2537,7 +2537,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
                 # returns (loss, logits, log_probs, entropy); unpack to match the
                 # OpSlot branch above.
                 loss, logits, log_probs, entropy = self.loss_function(
-                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
         else:
             logits = self.lm_head(hidden_states)
@@ -2691,7 +2696,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                 # returns (loss, logits, log_probs, entropy); unpack to match the
                 # OpSlot branch above.
                 loss, logits, log_probs, entropy = self.loss_function(
-                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
         else:
             logits = self.lm_head(hidden_states)
