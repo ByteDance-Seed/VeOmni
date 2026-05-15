@@ -826,10 +826,12 @@ def _reset_lora_under_ep_worker():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
     from utils import build_toy, full_eager_ops
 
+    from veomni.utils.device import get_device_type
     from veomni.utils.moe_lora import apply_independent_moe_lora
 
     rank = dist.get_rank()
     world = dist.get_world_size()
+    device_type = get_device_type()
 
     torch.manual_seed(0)
     model = build_toy("qwen3_moe_toy", ops=full_eager_ops())
@@ -844,7 +846,7 @@ def _reset_lora_under_ep_worker():
     )
     assert fqns, "no MoE-LoRA wrappers installed"
 
-    mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("ep",))
+    mesh = init_device_mesh(device_type, (world,), mesh_dim_names=("ep",))
     wrapper = model.get_submodule(fqns[0])
     spec = wrapper.gate_proj
     A = spec.lora_A["default"]  # _LoraParam3D, weight shape [E, r, in_feat]
@@ -853,9 +855,16 @@ def _reset_lora_under_ep_worker():
     assert E % world == 0, f"toy E={E} not divisible by world={world}"
     e_local = E // world
 
-    # Replace LoRA-A weight with an EP-sharded zero DTensor; if reset
-    # is broken, local data stays all zeros after the call.
-    local_zeros = torch.zeros(e_local, r_, H, dtype=A.weight.dtype, device="cuda")
+    # Pre-fill LoRA-A with zeros, then ask reset_lora_parameters to
+    # re-init it. The previous bug was *silent*: the function returned
+    # cleanly (no exception) but ``kaiming_uniform_(w[e])`` wrote into
+    # a DTensor view that never propagated to the underlying
+    # ``_local_tensor``, so local storage stayed all zeros and the
+    # adapter was effectively dead (LoRA delta = 0, both grads = 0,
+    # never trains). Starting from a known-zero tensor lets the
+    # post-reset assertions below detect that silent failure mode by
+    # checking that the local shard actually got populated.
+    local_zeros = torch.zeros(e_local, r_, H, dtype=A.weight.dtype, device=device_type)
     A.weight = nn.Parameter(DTensor.from_local(local_zeros, mesh, [Shard(0)], run_check=False))
 
     wrapper.reset_lora_parameters(init_lora_weights=True)
