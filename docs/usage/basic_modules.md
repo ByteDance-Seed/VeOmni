@@ -88,7 +88,7 @@ init_parallel_state(
     extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
     extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
     extra_parallel_names=args.train.accelerator.extra_parallel_names,
-    mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp", "fsdp1", "fsdp2"
+    mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
     async_enabled=args.train.accelerator.enable_async, # async ulysses
 )
 

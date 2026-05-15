@@ -26,9 +26,7 @@ train:
     dp_replicate_size: 1
     ulysses_size: 4
     fsdp_config:
-      fsdp_mode: fsdp1
-      full_shard: true
-      offload: false
+      fsdp_mode: fsdp2
       mixed_precision:
         enable: false
     offload:
@@ -47,7 +45,7 @@ train:
     weight_decay: 0.01
     max_grad_norm: 1.0
   vit_lr: 5.0e-5
-  init_device: cuda
+  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:

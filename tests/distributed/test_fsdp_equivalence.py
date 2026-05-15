@@ -11,8 +11,8 @@ Approach:
   Both runs use the SAME VeOmni trainer (train_text_test.py) to ensure identical
   data pipeline, loss normalization (per-token via mean_global_loss), and batch
   invariant mode. The only difference is FSDP wrapping:
-  - Baseline: nproc=1, init_device=device (no FSDP, full gradient accumulation)
-  - FSDP:    nproc=2, init_device=meta   (FSDP2 sharded)
+  - Baseline: nproc=1, init_device=device, fsdp_mode=ddp (no FSDP, full grad accum)
+  - FSDP:    nproc=2, init_device=meta,   fsdp_mode=fsdp2 (sharded)
 
   We compare **grad_norm** as the primary correctness signal. With per-token loss
   normalization and the fsdp_size multiplier, the effective gradient is mathematically
@@ -79,7 +79,10 @@ def _run_single_gpu_training(model_name, config_path, model_path, train_path, ou
         task_name="single_gpu",
         nproc=1,
         init_device=get_device_type(),
-        extra_args=["--train.accelerator.fsdp_config.mixed_precision.enable=False"],
+        extra_args=[
+            "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+            "--train.accelerator.fsdp_config.mixed_precision.enable=False",
+        ],
         model_name=model_name,
     )
 

@@ -753,7 +753,7 @@ def post_process_after_weight_loading(
             _init_parameter(model, name)
 
     # we should tie embeddings after loading weights because to_empty() leads to untied weights,
-    # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
+    # except in the FSDP2 (swap tensor) context.
     if getattr(model.config, "tie_word_embeddings", True):
         try:
             input_embeddings = model.get_input_embeddings()

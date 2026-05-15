@@ -153,11 +153,9 @@ class TextDPOTrainer:
             self.reference_model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
-            enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=MixedPrecisionConfig(enable=False),  # In reference model, we will not use mixed precision
             enable_gradient_checkpointing=False,
-            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=list(
                 set(getattr(self.reference_model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),

@@ -21,9 +21,7 @@ train:
     ulysses_size: 1
     ep_size: 8
     fsdp_config:
-      fsdp_mode: fsdp1
-      full_shard: true
-      offload: false
+      fsdp_mode: fsdp2
       mixed_precision:
         enable: true
     offload:

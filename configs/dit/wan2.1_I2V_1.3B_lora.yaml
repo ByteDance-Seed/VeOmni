@@ -30,13 +30,13 @@ train:
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   dyn_bsz: false
-  init_device: cuda
+  init_device: meta
   num_train_epochs: 20
   training_task: online_training
   accelerator:
     ulysses_size: 1
     fsdp_config:
-      fsdp_mode: fsdp1
+      fsdp_mode: fsdp2
   checkpoint:
     output_dir: Wan2.1-I2V-1.3B_lora
     save_hf_weights: true

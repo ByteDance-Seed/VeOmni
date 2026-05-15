@@ -10,13 +10,13 @@ Please refer to [Installation with Ascend NPU](../get_started/installation/insta
 
 ## Supported Models
 
-| Model                               | Model Size | Support | FSDP1 | FSDP2 | EP | SP | Note |
-|-------------------------------------|------------|---------|-------|-------|----|----|------|
-| [Qwen3](../examples/qwen3.md)       | 8B         | ✅       |       | ✅     |    |    |      |
-|                                     | 30B        | ✅       |       | ✅     |    |    |      |
-| [Qwen3 VL](../examples/qwen3_vl.md) | 8B         | ✅       |       | ✅     |    | ✅  |      |
-|                                     | 30B        | ✅       |       | ✅     | ✅  | ✅  |      |
-| [Wan2.1](../examples/wan2.1.md)     | 14B        | ✅       | ✅     |       |    | ✅  |      |
+| Model                               | Model Size | Support | FSDP2 | EP | SP | Note |
+|-------------------------------------|------------|---------|-------|----|----|------|
+| [Qwen3](../examples/qwen3.md)       | 8B         | ✅       | ✅     |    |    |      |
+|                                     | 30B        | ✅       | ✅     |    |    |      |
+| [Qwen3 VL](../examples/qwen3_vl.md) | 8B         | ✅       | ✅     |    | ✅  |      |
+|                                     | 30B        | ✅       | ✅     | ✅  | ✅  |      |
+| [Wan2.1](../examples/wan2.1.md)     | 14B        | ✅       | ✅     |    | ✅  |      |
 
 ## Environment Variables
 
