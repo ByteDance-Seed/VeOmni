@@ -425,19 +425,8 @@ def toy_base_dir(tmp_path_factory):
 
 
 # ---------------------------------------------------------------------------
-# torchrun launcher -- inlined so we don't import from
-# ``tests/tools/__init__.py`` which transitively pulls ``av`` (pyav). The
-# transformers-v5 dev install does not ship pyav.
+# torchrun launcher
 # ---------------------------------------------------------------------------
-
-
-def _find_free_port() -> int:
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
 
 
 def torchrun_trainer(
@@ -450,11 +439,13 @@ def torchrun_trainer(
     """Spawn this module under torchrun; raise on non-zero exit."""
     import subprocess
 
+    from ..tools.launch_utils import find_free_port
+
     cmd = [
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={_find_free_port()}",
+        f"--master_port={find_free_port()}",
         __file__,
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",

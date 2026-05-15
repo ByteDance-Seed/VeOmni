@@ -108,6 +108,7 @@ __all__ = [
     "toy_base_dir",
     "test_ep2_trainer_integration",
     "test_moe_lora_ep_save_load_parallel_align",
+    "test_independent_reset_lora_parameters_under_ep_shard",
 ]
 
 
@@ -149,9 +150,9 @@ def _torchrun_capture(yaml_path: str, output_dir: str, extra_overrides: list[str
     EP slicing log lines (rank 0 only -- they're emitted by
     ``logger.info_rank0`` so duplicate-rank noise is already filtered).
     """
-    from .test_moe_lora_trainer import _find_free_port
+    from ..tools.launch_utils import find_free_port
 
-    # ``_find_free_port`` per-call (not a PID-derived constant) avoids
+    # ``find_free_port`` per-call (not a PID-derived constant) avoids
     # "address in use" between back-to-back ``torchrun`` launches.
     # ``test_moe_lora_ep_save_load_parallel_align`` alone fires four subprocesses
     # per parametrise variant, and Linux's ``TIME_WAIT`` keeps the c10d
@@ -161,7 +162,7 @@ def _torchrun_capture(yaml_path: str, output_dir: str, extra_overrides: list[str
         "torchrun",
         "--nnodes=1",
         f"--nproc_per_node={nproc}",
-        f"--master_port={_find_free_port()}",
+        f"--master_port={find_free_port()}",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "test_moe_lora_trainer.py")),
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",
@@ -798,3 +799,86 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     # state when a parametrise variant fails halfway).
     for d in (ep1_adapter_dir, ep2_adapter_dir, ep2_dcp_dir):
         shutil.rmtree(d, ignore_errors=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Focused regression: LoraIndependentExperts.reset_lora_parameters under
+# an EP-sharded DTensor. Catches the silent-zero init bug where indexing
+# ``w[e]`` on a Shard(0) DTensor returns a view whose in-place
+# ``kaiming_uniform_`` does not write back to the local storage,
+# leaving the entire local LoRA-A shard at zeros (and therefore the
+# adapter dead -- forward delta = 0, both grads = 0, never trains).
+# Bug surfaces only at world_size>=2 (EP=1 has E_local==E_global so the
+# bug is masked); the trainer integration tests above don't catch it
+# because (a) `test_ep2_trainer_integration` only checks slice shapes,
+# and (b) `test_moe_lora_ep_save_load_parallel_align` always runs in
+# adapter-resume mode which bypasses the fresh-init path.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _reset_lora_under_ep_worker():
+    """mp.spawn worker: build wrapper, fake-EP-shard one LoRA-A tensor, reset, assert."""
+    import torch
+    import torch.distributed as dist
+    import torch.nn as nn
+    from torch.distributed.tensor import DTensor, Shard, init_device_mesh
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from utils import build_toy, full_eager_ops
+
+    from veomni.utils.moe_lora import apply_independent_moe_lora
+
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+
+    torch.manual_seed(0)
+    model = build_toy("qwen3_moe_toy", ops=full_eager_ops())
+    fqns = apply_independent_moe_lora(
+        model,
+        target_parameter_patterns=[
+            "model.layers.*.mlp.experts.gate_up_proj",
+            "model.layers.*.mlp.experts.down_proj",
+        ],
+        r=4,
+        lora_alpha=8,
+    )
+    assert fqns, "no MoE-LoRA wrappers installed"
+
+    mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("ep",))
+    wrapper = model.get_submodule(fqns[0])
+    spec = wrapper.gate_proj
+    A = spec.lora_A["default"]  # _LoraParam3D, weight shape [E, r, in_feat]
+
+    E, r_, H = A.weight.shape
+    assert E % world == 0, f"toy E={E} not divisible by world={world}"
+    e_local = E // world
+
+    # Replace LoRA-A weight with an EP-sharded zero DTensor; if reset
+    # is broken, local data stays all zeros after the call.
+    local_zeros = torch.zeros(e_local, r_, H, dtype=A.weight.dtype, device="cuda")
+    A.weight = nn.Parameter(DTensor.from_local(local_zeros, mesh, [Shard(0)], run_check=False))
+
+    wrapper.reset_lora_parameters(init_lora_weights=True)
+
+    local_after = A.weight._local_tensor
+    assert local_after.shape == (e_local, r_, H), f"rank {rank}: local shape changed: {local_after.shape}"
+    nonzero = (local_after != 0).any().item()
+    assert nonzero, (
+        f"rank {rank}: LoRA-A local shard is ALL-ZERO after reset_lora_parameters under "
+        f"EP=Shard(0). This is the regression: indexing w[e] on a sharded DTensor returns "
+        f"a view whose in-place init does not propagate to local storage."
+    )
+    # Each per-expert slice should have non-trivial variance (kaiming).
+    per_expert_std = local_after.float().reshape(e_local, -1).std(dim=-1)
+    assert (per_expert_std > 1e-3).all(), (
+        f"rank {rank}: at least one per-expert LoRA-A slice has near-zero std after init: {per_expert_std.tolist()}"
+    )
+
+
+def test_independent_reset_lora_parameters_under_ep_shard():
+    """Regression: ``LoraIndependentExperts.reset_lora_parameters`` must
+    populate local storage when the LoRA-A weight is an EP-sharded
+    ``DTensor[Shard(0)]``. See module docstring for context."""
+    from ..tools.launch_utils import torchrun
+
+    torchrun(_reset_lora_under_ep_worker, world_size=2)

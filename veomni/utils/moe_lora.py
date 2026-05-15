@@ -612,13 +612,28 @@ class LoraSharedExperts(nn.Module):
                 if p.grad is None:
                     return
                 grad = p.grad
+                # Reach the underlying storage that the optimizer reads.
+                # ``to_local()`` returns a view of ``DTensor._local_tensor``
+                # under FSDP/DTensor; ``copy_`` propagates back through that
+                # view to grad's storage even when the view is non-contiguous.
                 local = grad.to_local() if hasattr(grad, "to_local") else grad
-                if not local.is_contiguous():
-                    local = local.contiguous()
-                    if hasattr(grad, "to_local"):
-                        grad.to_local().copy_(local)
-                        local = grad.to_local()
-                dist.all_reduce(local, op=dist.ReduceOp.SUM, group=ep_group)
+                # NCCL all_reduce requires a contiguous buffer. When the local
+                # view is non-contiguous (e.g. ``Shard(d>0)`` with d>0 strided
+                # against a row-major global), allocate a temporary contiguous
+                # buffer, run the collective on it, and copy the SUM-reduced
+                # result back through the (possibly strided) view into grad's
+                # storage. The previous "make contiguous, then re-grab the
+                # non-contiguous view before all_reduce" pattern silently ran
+                # the collective on the original non-contiguous view, which
+                # either errors or, on newer NCCL, runs on an internal temp
+                # whose result was never written back to ``p.grad`` -- shared
+                # LoRA grads would silently drift across EP ranks.
+                if local.is_contiguous():
+                    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=ep_group)
+                else:
+                    buf = local.contiguous()
+                    dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=ep_group)
+                    local.copy_(buf)
 
             return _hook
 
@@ -949,17 +964,31 @@ class LoraIndependentExperts(nn.Module):
         ``A[e]`` of shape ``[r, in_feat]`` so each expert sees the same
         textbook variance an ``nn.Linear`` would. (PEFT's standard 2-D
         path applies it once; we mirror that semantics per-expert.)
+
+        DTensor handling (EP path): under EP the LoRA-A weight is a
+        ``DTensor`` sharded along dim-0 (expert dim). DTensor indexing
+        ``w[e]`` returns a *DTensor view* whose in-place ``kaiming_uniform_``
+        does not write back to the underlying local storage (we observed
+        the local shard staying all-zeros after the loop). We therefore
+        operate on ``DTensor._local_tensor`` directly: each rank
+        initialises its own ``[E_local, r, in_feat]`` slice in-place,
+        which is correct because Mode 1 LoRA is EP-sharded along the
+        expert dim (one local LoRA per local expert). ``zeros_`` on B is
+        DTensor-safe regardless of layout.
         """
         if not init_lora_weights:
             return
+        from torch.distributed.tensor import DTensor
+
         for pname in self._lora_specs:
             spec: _LoraSpec = getattr(self, pname)
             for ad, container in spec.lora_A.items():
                 if adapter_name is not None and ad != adapter_name:
                     continue
-                w = container.weight  # [E, r, in_feat]
-                for e in range(w.shape[0]):
-                    nn.init.kaiming_uniform_(w[e], a=math.sqrt(5))
+                w = container.weight  # [E, r, in_feat]; DTensor under EP
+                local_w = w._local_tensor if isinstance(w, DTensor) else w
+                for e in range(local_w.shape[0]):
+                    nn.init.kaiming_uniform_(local_w[e], a=math.sqrt(5))
             for ad, container in spec.lora_B.items():
                 if adapter_name is not None and ad != adapter_name:
                     continue

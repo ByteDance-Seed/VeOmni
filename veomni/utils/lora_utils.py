@@ -180,23 +180,21 @@ def _init_lora_parameter(module: "nn.Module", name: str):
     """
     from .moe_lora import is_lora_moe_experts
 
-    pieces = name.split(".")
-    cursor = module
-    for piece in pieces:
-        if is_lora_moe_experts(cursor):
-            cursor.reset_lora_parameters(init_lora_weights=True)
+    for piece in name.split("."):
+        if is_lora_moe_experts(module):
+            module.reset_lora_parameters(init_lora_weights=True)
             return
         if piece.startswith("lora_"):
             break
-        cursor = getattr(cursor, piece)
+        module = getattr(module, piece)
 
-    if is_lora_moe_experts(cursor):
-        cursor.reset_lora_parameters(init_lora_weights=True)
+    if is_lora_moe_experts(module):
+        module.reset_lora_parameters(init_lora_weights=True)
         return
 
-    if "lora_A" in name and hasattr(cursor, "reset_lora_parameters"):
-        for adapter in getattr(cursor, "lora_A", {}).keys():
-            cursor.reset_lora_parameters(adapter, init_lora_weights=True)
+    if "lora_A" in name and hasattr(module, "reset_lora_parameters"):
+        for adapter in getattr(module, "lora_A", {}).keys():
+            module.reset_lora_parameters(adapter, init_lora_weights=True)
 
 
 # fsdp2 meta device rank0 load and broadcast adapter weights
