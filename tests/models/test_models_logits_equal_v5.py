@@ -646,7 +646,9 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
 
-    apply_ops_config(_make_eager_ops_config(case.attn_implementation))
+    from ..tools.training_utils import make_eager_ops_config
+
+    apply_ops_config(make_eager_ops_config(attn_implementation=case.attn_implementation))
     _save_hf_checkpoint(hf_state_dict, config, weights_dir)
 
     model = build_foundation_model(
