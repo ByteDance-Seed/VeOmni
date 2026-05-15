@@ -66,7 +66,19 @@ from .utils import (
 )
 
 
-_TOY = "qwen3_moe_toy"  # Phase 4 / Phase 6 scope: qwen3_moe (fused experts layout).
+# Models exercised by the fused-vs-eager parity tests. All entries must use
+# the v5 fused experts layout (gate_up_proj + down_proj as 3-D nn.Parameters)
+# so :class:`~veomni.utils.moe_lora.LoraSharedExperts` /
+# :class:`~veomni.utils.moe_lora.LoraIndependentExperts` can wrap them and
+# the Triton group-gemm kernel can run unmodified. ``qwen3_moe_toy`` is the
+# baseline (smallest config); ``deepseek_v3_toy`` exercises the kernel with
+# different ``num_experts`` / ``moe_intermediate_size`` shapes and the
+# DeepSeek-specific routing / grouping (n_group, topk_group, sigmoid scoring).
+_TOY_CASES = [
+    pytest.param("qwen3_moe_toy", id="qwen3_moe"),
+    pytest.param("deepseek_v3_toy", id="deepseek_v3"),
+]
+_TOY = "qwen3_moe_toy"  # Default for tests that don't parametrise on toy.
 
 # Forward and backward parity are checked via L2 relative error
 # (``||fused - eager|| / ||eager||``) instead of element-wise atol/rtol.
@@ -175,19 +187,21 @@ def _make_inputs(experts_module, batch: int = 64, top_k: int = 2):
     return h, top_k_index, top_k_weights
 
 
-def _build_wrapped(*, mode: str, fused: bool, lora_b_perturb_std: float = 0.02):
-    """Build a fresh wrapped Qwen3-MoE toy + apply the chosen LoRA mode and ops backend.
+def _build_wrapped(*, mode: str, fused: bool, lora_b_perturb_std: float = 0.02, toy: str = _TOY):
+    """Build a fresh wrapped MoE toy + apply the chosen LoRA mode and ops backend.
 
     Same RNG seed for both invocations → identical base + LoRA tensors. The
     only difference is which ``moe_implementation`` was patched at build time,
-    which determines whether the fused LoRA pointer is bound.
+    which determines whether the fused LoRA pointer is bound. ``toy`` selects
+    the toy config (defaults to qwen3_moe_toy for legacy callers); fused-vs-eager
+    parity tests parametrise it across the v5 fused-layout MoE families.
     """
     _, apply_fn, _ = _MODES[mode]
     torch.manual_seed(0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model = build_toy(_TOY, ops=fused_triton_moe_ops() if fused else None)
-    lora_cfg = load_lora_config(_TOY)
+        model = build_toy(toy, ops=fused_triton_moe_ops() if fused else None)
+    lora_cfg = load_lora_config(toy)
     _wrap_with_lora(model, lora_cfg, apply_fn=apply_fn, lora_b_perturb_std=lora_b_perturb_std)
     sample_fqn, exp = find_first_matching_module(model, experts_module_globs(lora_cfg["target_parameters"]))
     return model, sample_fqn, exp, lora_cfg
@@ -235,20 +249,26 @@ def test_wrapper_dispatch_chooses_fused_when_pointer_bound(mode):
     assert out_e.shape == h.shape
 
 
+@pytest.mark.parametrize("toy", _TOY_CASES)
 @pytest.mark.parametrize("mode", list(_MODES.keys()))
-def test_fused_vs_eager_forward_parity(mode):
-    """Forward output of the triton fused path matches the eager wrapper at bf16 tol."""
+def test_fused_vs_eager_forward_parity(mode, toy):
+    """Forward output of the triton fused path matches the eager wrapper at bf16 tol.
+
+    Parametrised across both the LoRA mode and the toy MoE family (qwen3_moe
+    + deepseek_v3) so the kernel parity check covers different
+    ``num_experts`` / ``moe_intermediate_size`` shapes and routing layouts.
+    """
     _require_cuda_with_triton()
 
     # Eager reference first (so the autouse fixture's saved pointers match the eager state).
-    model_e, fqn_e, exp_e, _ = _build_wrapped(mode=mode, fused=False, lora_b_perturb_std=0.02)
+    model_e, fqn_e, exp_e, _ = _build_wrapped(mode=mode, fused=False, lora_b_perturb_std=0.02, toy=toy)
     h, idx, w = _make_inputs(exp_e)
     wrapper_e = model_e.get_submodule(fqn_e)
     with torch.no_grad():
         out_eager = wrapper_e(h, idx, w).clone()
 
     # Fused path — rebuild so apply_veomni_fused_moe_patch("triton") binds the kernel.
-    model_f, fqn_f, _exp_f, _ = _build_wrapped(mode=mode, fused=True, lora_b_perturb_std=0.02)
+    model_f, fqn_f, _exp_f, _ = _build_wrapped(mode=mode, fused=True, lora_b_perturb_std=0.02, toy=toy)
     wrapper_f = model_f.get_submodule(fqn_f)
     # Sanity: identical seed / wrap → identical LoRA tensors → makes the parity check meaningful.
     # Iterate the wrapper's LoRA targets (gate_up_proj, down_proj — fused experts layout).
@@ -260,18 +280,19 @@ def test_fused_vs_eager_forward_parity(mode):
 
     l2 = _l2_rel(out_fused, out_eager)
     assert l2 <= _FWD_L2REL_TOL, (
-        f"[{mode}] forward parity broken: L2 relative error {l2:.4%} > {_FWD_L2REL_TOL:.2%} "
+        f"[{toy}/{mode}] forward parity broken: L2 relative error {l2:.4%} > {_FWD_L2REL_TOL:.2%} "
         f"(eager_norm={out_eager.float().norm().item():.3e})"
     )
 
 
+@pytest.mark.parametrize("toy", _TOY_CASES)
 @pytest.mark.parametrize("mode", list(_MODES.keys()))
-def test_fused_vs_eager_backward_parity(mode):
+def test_fused_vs_eager_backward_parity(mode, toy):
     """Gradients on <spec>.lora_A / <spec>.lora_B match between fused and eager at bf16 tol."""
     _require_cuda_with_triton()
 
     def _grads(*, fused: bool):
-        model, fqn, exp, _ = _build_wrapped(mode=mode, fused=fused, lora_b_perturb_std=0.02)
+        model, fqn, exp, _ = _build_wrapped(mode=mode, fused=fused, lora_b_perturb_std=0.02, toy=toy)
         wrapper = model.get_submodule(fqn)
         wrapper.train()
         h, idx, w = _make_inputs(exp)
@@ -284,7 +305,7 @@ def test_fused_vs_eager_backward_parity(mode):
     grads_fused = _grads(fused=True)
 
     assert set(grads_eager) == set(grads_fused), (
-        f"[{mode}] different param sets received grad: only-eager={set(grads_eager) - set(grads_fused)}, "
+        f"[{toy}/{mode}] different param sets received grad: only-eager={set(grads_eager) - set(grads_fused)}, "
         f"only-fused={set(grads_fused) - set(grads_eager)}"
     )
     # Spot-check the LoRA grads — these are the only ones that should be non-zero
@@ -293,13 +314,13 @@ def test_fused_vs_eager_backward_parity(mode):
     # ``<spec>.lora_A.<adapter>.weight`` / ``<spec>.lora_B.<adapter>.weight``,
     # so we filter on the canonical segment via dot-split.
     lora_param_names = sorted(n for n in grads_eager if "lora_A" in n.split(".") or "lora_B" in n.split("."))
-    assert lora_param_names, f"[{mode}] expected <spec>.lora_A/<spec>.lora_B params to receive gradients"
+    assert lora_param_names, f"[{toy}/{mode}] expected <spec>.lora_A/<spec>.lora_B params to receive gradients"
     for n in lora_param_names:
         ge, gf = grads_eager[n], grads_fused[n]
-        assert ge.shape == gf.shape, f"[{mode}] {n}: shape mismatch eager={ge.shape} fused={gf.shape}"
+        assert ge.shape == gf.shape, f"[{toy}/{mode}] {n}: shape mismatch eager={ge.shape} fused={gf.shape}"
         l2 = _l2_rel(gf, ge)
         assert l2 <= _GRAD_L2REL_TOL, (
-            f"[{mode}] {n}: grad parity broken — L2 relative error {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
+            f"[{toy}/{mode}] {n}: grad parity broken — L2 relative error {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
             f"(eager_norm={ge.float().norm().item():.3e}, max|fused-eager|={(ge - gf).abs().max().item():.3e})"
         )
 

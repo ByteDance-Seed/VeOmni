@@ -125,6 +125,7 @@ _MODEL_CASES = [
     pytest.param("qwen3_5_moe_toy", id="qwen3_5_moe"),
     pytest.param("qwen3vlmoe_toy", id="qwen3_vl_moe"),
     pytest.param("qwen3omni_toy", id="qwen3_omni_moe"),
+    pytest.param("deepseek_v3_toy", id="deepseek_v3"),
 ]
 
 _MODE_CASES = [

@@ -30,6 +30,7 @@ from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .utils import sort_fqn_by_submodule_first
 

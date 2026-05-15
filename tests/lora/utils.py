@@ -97,6 +97,10 @@ TOY_LORA_SPECS: dict[str, LoraYamlSpec] = {
         yaml="configs/multimodal/qwen3_omni/qwen3_omni_lora.yaml",
         min_transformers_version="5.2.0",
     ),
+    "deepseek_v3_toy": LoraYamlSpec(
+        yaml="configs/text/deepseek_v3_lora.yaml",
+        min_transformers_version="5.2.0",
+    ),
 }
 
 

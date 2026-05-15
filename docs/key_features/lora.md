@@ -46,8 +46,16 @@ model:
 |---|---|---|
 | `rank` | int | Rank of the decomposition matrices A and B |
 | `alpha` | int | LoRA scaling factor; effective scale = `alpha / rank` |
-| `lora_modules` | list[str] | Target linear layer name substrings (matched against module FQNs) |
+| `use_rslora` | bool (optional, default `false`) | Rank-stabilised LoRA scaling (`alpha / sqrt(r)`) |
+| `lora_modules` | list[str] | Standard PEFT target — `nn.Linear` layer name substrings (matched against module FQNs). |
+| `target_parameters` | list[str] (optional) | MoE-LoRA target — glob patterns matching the 3-D `nn.Parameter`s on a v5 MoE experts module (e.g. `model.layers.*.mlp.experts.gate_up_proj`). See §5 below. |
+| `share_expert_lora` | bool (optional, default `false`) | When `target_parameters` is set: `false` → per-expert independent LoRA; `true` → a single LoRA pair shared across all experts of a layer. See §5. |
 | `lora_adapter` | str (optional) | Path to a saved adapter directory to resume from |
+| `is_trainable` | bool (optional, default `true`) | Forwarded to `PeftModel.from_pretrained` when resuming. Set `false` to load adapters for inference only. |
+
+`lora_modules` and `target_parameters` may be set together — the former is handled by PEFT
+on `nn.Linear` layers (q/k/v/o, MLP, shared_expert, etc.), the latter by VeOmni's MoE-LoRA
+wrappers on the fused experts `nn.Parameter`s. At least one must be non-empty.
 
 For **resume training**, add the `lora_adapter` key pointing to the saved adapter directory:
 
@@ -64,10 +72,13 @@ model:
 
 ## 2. LoRA Initialization in BaseTrainer
 
-LoRA wrapping happens in `BaseTrainer._setup_lora()`, called from `_freeze_model_module()`:
+LoRA wrapping happens in `BaseTrainer._setup_lora()`, called from `_freeze_model_module()`.
+It dispatches to one of two VeOmni-flavoured PEFT entry points (`veomni/utils/moe_lora.py`)
+that transparently combine standard PEFT LoRA with VeOmni MoE-LoRA wrappers:
 
 ```python
 # veomni/trainer/base.py
+from ..utils.moe_lora import veomni_get_peft_model, veomni_peft_model_from_pretrained
 
 def _setup_lora(self):
     lora_config = self.args.model.lora_config
@@ -75,25 +86,36 @@ def _setup_lora(self):
         return
 
     lora_adapter_path = lora_config.get("lora_adapter", None)
-
     if lora_adapter_path is not None:
-        # Resume: read PEFT config from disk; weights loaded later during parallelization
-        from peft import PeftModel
-        self.model = PeftModel.from_pretrained(
-            self.model, lora_adapter_path, is_trainable=True
+        # Resume: reads the optional veomni_moe_lora.json sidecar to re-install
+        # MoE-LoRA wrappers, then delegates to PeftModel.from_pretrained.
+        self.model = veomni_peft_model_from_pretrained(
+            self.model,
+            lora_adapter_path,
+            is_trainable=lora_config.get("is_trainable", True),
         )
     else:
-        # From scratch: wrap with LoraConfig
-        from peft import LoraConfig, get_peft_model
+        # From scratch: wraps nn.Linear targets with PEFT and installs MoE-LoRA
+        # wrappers on target_parameters in one call.
+        from peft import LoraConfig
         peft_cfg = LoraConfig(
             r=lora_config["rank"],
             lora_alpha=lora_config["alpha"],
-            target_modules=lora_config["lora_modules"],
+            target_modules=lora_config.get("lora_modules"),
+            target_parameters=lora_config.get("target_parameters"),
+            use_rslora=lora_config.get("use_rslora", False),
         )
-        self.model = get_peft_model(self.model, peft_cfg)
+        self.model = veomni_get_peft_model(
+            self.model,
+            peft_cfg,
+            share_expert_lora=lora_config.get("share_expert_lora", False),
+        )
 ```
 
-After wrapping, `BaseTrainer._init_callbacks()` automatically selects `HFLoraCkptCallback`
+After both paths, the base model is fully frozen and only the LoRA parameters
+(both PEFT's linear LoRA and VeOmni's MoE-LoRA, if any) have `requires_grad=True`.
+
+`BaseTrainer._init_callbacks()` automatically selects `HFLoraCkptCallback`
 instead of `HuggingfaceCkptCallback` when `lora_config` is set:
 
 ```python
@@ -145,7 +167,10 @@ extra state) via PyTorch DCP. For LoRA training this includes both base-model pa
 1. Extracts adapter-only tensors via `get_peft_model_state_dict`.
 2. Saves them with `dcp.save` in parallel to a temporary DCP directory.
 3. Consolidates on rank 0 into `adapter_model.bin` and `adapter_config.json`.
-4. Removes the temporary DCP directory.
+4. For MoE-LoRA runs, also writes a small `veomni_moe_lora.json` sidecar that
+   records the mode (`independent` / `shared`), `target_parameters` patterns
+   and rank/alpha so resume can re-install the right wrappers.
+5. Removes the temporary DCP directory.
 
 Output structure for each checkpoint:
 
@@ -157,14 +182,150 @@ Output structure for each checkpoint:
 │       └── .metadata
 └── global_step_N/              ← HF adapter (inference / resume)
     ├── adapter_config.json
-    └── adapter_model.bin
+    ├── adapter_model.bin
+    └── veomni_moe_lora.json    ← MoE-LoRA only
 ```
 
 ---
 
-## 5. Training Examples
+## 5. MoE-LoRA
 
-### 5.1 Wan2.1-I2V-1.3B LoRA (DiT, FSDP2)
+For MoE models on transformers v5, expert weights live as fused 3-D `nn.Parameter`s on
+the experts module — not `nn.Linear`:
+
+```text
+experts.gate_up_proj  : nn.Parameter[E, 2*I, H]   # gate / up concatenated along dim-1
+experts.down_proj     : nn.Parameter[E, H,   I]
+```
+
+PEFT's `target_modules` only matches `nn.Module` subclasses (typically `nn.Linear`) and
+therefore cannot reach these parameters. VeOmni's MoE-LoRA wrappers
+(`veomni/utils/moe_lora.py`) target them via `target_parameters`, in two flavours:
+
+| Mode | Wrapper class | Per-expert LoRA shape | When to use |
+|---|---|---|---|
+| **Independent** (default) | `LoraIndependentExperts` | `[E, r, H]` / `[E, O, r]` | Each expert gets its own LoRA pair; functional drop-in for PEFT 0.19's `target_parameters` 3-D path. |
+| **Shared** | `LoraSharedExperts` | `[r, H]` / `[O, r]` | A single LoRA pair shared across all experts of a layer; ~`E×` fewer LoRA parameters. PEFT does not support this natively. |
+
+Configuration (linear LoRA + MoE-LoRA can be mixed in one `lora_config`):
+
+```yaml
+model:
+  lora_config:
+    rank: 16
+    alpha: 32
+    lora_modules: [q_proj, k_proj, v_proj, o_proj]    # PEFT linear LoRA
+    target_parameters:                                 # VeOmni MoE-LoRA
+      - model.layers.*.mlp.experts.gate_up_proj
+      - model.layers.*.mlp.experts.down_proj
+    share_expert_lora: false                           # false = Independent, true = Shared
+```
+
+For VLMs the FQN includes the wrapping `language_model.` prefix — see the
+multimodal example configs listed below.
+
+### 5.1 Two LoRAs on the fused `gate_up_proj`
+
+The wrapper does **not** allocate one rank-`r` LoRA over the fused `[E, 2I, H]` parameter.
+Because `SiLU(gate) * up` is non-linear, LoRA must be added **before activation**, not on
+the merged `gate_up`. The wrapper therefore allocates **two independent rank-`r` LoRAs** —
+one over the gate half, one over the up half:
+
+| Logical spec | Shared mode (2-D) | Independent mode (3-D) |
+|---|---|---|
+| `gate_proj` | `A:[r,H]` / `B:[I,r]` | `A:[E,r,H]` / `B:[E,I,r]` |
+| `up_proj`   | `A:[r,H]` / `B:[I,r]` | `A:[E,r,H]` / `B:[E,I,r]` |
+| `down_proj` | `A:[r,I]` / `B:[H,r]` | `A:[E,r,I]` / `B:[E,H,r]` |
+
+This costs `2r(H+I)` extra parameters vs `r(H+2I)` for a single LoRA, but doubles the
+effective joint output rank from `r` to `2r`. Users only write `gate_up_proj` in
+`target_parameters`; the wrapper auto-expands to the three logical specs.
+
+### 5.2 Supported models
+
+VeOmni MoE-LoRA wrappers require the **v5 fused experts layout** (`gate_up_proj` +
+`down_proj` as 3-D `nn.Parameter`s) and will raise on any other layout.
+
+| Model | Runtime expert layout | Notes |
+|---|---|---|
+| `qwen3_moe`        | fused `gate_up_proj` | Reference; per-expert disk → fused via on-load converter. |
+| `qwen3_5_moe`      | fused `gate_up_proj` | Disk already v5 layout. |
+| `qwen3_vl_moe`     | fused `gate_up_proj` | VLM; FQN includes `model.language_model.`. |
+| `qwen3_omni_moe`   | fused `gate_up_proj` | Thinker tower. |
+| `deepseek_v3` (v5) | fused `gate_up_proj` | Per-expert disk → fused via on-load converter. |
+
+DeepSeek-V3 also exposes **shared experts** (`mlp.shared_experts.{gate,up,down}_proj`)
+implemented as plain `nn.Linear`. Add them to `lora_modules` if you want PEFT to LoRA them
+too — they are orthogonal to the MoE-LoRA on the routed experts.
+
+### 5.3 Forward path: fused triton vs eager
+
+Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implementation`:
+
+| `moe_implementation` | non-EP | EP | Notes |
+|---|---|---|---|
+| `fused_triton` | fused triton kernel | fused triton kernel | Recommended for training. |
+| `eager` | eager loop (reference) | not supported (raises) | Reference / fallback for NPU and Quack. |
+
+The fused path lives in `veomni/ops/kernels/moe/lora_group_gemm.py` and reuses the same
+`group_gemm_same_nk` / `group_gemm_same_mn` primitives as the non-LoRA MoE forward, so it
+inherits the same EP `all-to-all` dispatch pipeline.
+
+### 5.4 Expert Parallelism (EP)
+
+When `train.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
+`ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:
+
+- **Independent mode**: LoRA tensors are 3-D `[E, ...]` and are EP-sharded along the
+  expert dim, mirroring base experts.
+- **Shared mode**: LoRA tensors are 2-D and remain **replicated** across the EP group
+  (the "shared" semantics is one LoRA per layer, not per expert). The wrapper installs a
+  post-accumulate-grad hook that runs `all_reduce(SUM)` on the shared LoRA grads across
+  the EP group, restoring the EP=1 + DP=N equivalence. The grad-norm path
+  (`extra_parallel_fsdp2_clip_grad_norm`) is also taught — via
+  `_collect_ep_replicated_lora_param_ids` in `veomni/optim/optimizer.py` — to skip the
+  EP all-reduce for these replicated params so the global grad-norm matches EP=1.
+
+Both modes work with FSDP2 + EP. EP is only supported on the `fused_triton` forward path.
+
+### 5.5 Save / load artefacts
+
+A MoE-LoRA training run writes one extra file alongside the standard PEFT artefacts:
+
+```
+<output_dir>/global_step_N/
+├── adapter_config.json     # PEFT standard
+├── adapter_model.bin       # PEFT standard — both linear LoRA and MoE-LoRA tensors
+└── veomni_moe_lora.json    # VeOmni sidecar — mode + target_parameters + r/alpha
+```
+
+The sidecar is required at resume — `veomni_peft_model_from_pretrained` reads it to
+decide which wrapper class to install (`LoraIndependentExperts` vs `LoraSharedExperts`)
+**before** delegating to PEFT's standard load. Adapters saved without a sidecar are
+treated as plain PEFT adapters and the MoE-LoRA wrappers are not installed.
+
+The MoE-LoRA tensors in `adapter_model.bin` use PEFT-aligned FQNs
+(`base_model.model.<...>.<spec>.lora_A.<adapter>.weight`), so third-party PEFT tooling
+(HuggingFace Hub, `peft.PeftModel.from_pretrained`) can also load the file — though
+without VeOmni's wrappers re-installed first, the MoE-LoRA half of the keys will be
+silently dropped as `unexpected_keys`.
+
+### 5.6 Ready-to-use configs
+
+Text-only:
+- [`configs/text/qwen3_moe_lora.yaml`](../../configs/text/qwen3_moe_lora.yaml) — Qwen3-MoE
+- [`configs/text/deepseek_v3_lora.yaml`](../../configs/text/deepseek_v3_lora.yaml) — DeepSeek-V3 (v5), with EP=8
+
+Multimodal:
+- [`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_lora.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_lora.yaml)
+- [`configs/multimodal/qwen3_vl/qwen3_vl_moe_lora.yaml`](../../configs/multimodal/qwen3_vl/qwen3_vl_moe_lora.yaml)
+- [`configs/multimodal/qwen3_omni/qwen3_omni_lora.yaml`](../../configs/multimodal/qwen3_omni/qwen3_omni_lora.yaml)
+
+---
+
+## 6. Training Examples
+
+### 6.1 Wan2.1-I2V-1.3B LoRA (DiT, FSDP2)
 
 Config: [`configs/dit/wan2.1_I2V_1.3B_lora.yaml`](../../configs/dit/wan2.1_I2V_1.3B_lora.yaml)
 
@@ -213,7 +374,7 @@ bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
 See [Wan2.1-I2V-1.3B Training Guide](../examples/wan2.1_I2V_1.3B.md) for the complete
 dataset preparation and inference workflow.
 
-### 5.2 Qwen3-0.6B LoRA (LLM, FSDP2)
+### 6.2 Qwen3-0.6B LoRA (LLM, FSDP2)
 
 Config: [`configs/text/qwen3_lora.yaml`](../../configs/text/qwen3_lora.yaml)
 
@@ -273,9 +434,63 @@ bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
     --train.checkpoint.load_path auto          # auto-picks latest DCP checkpoint
 ```
 
+### 6.3 Qwen3-MoE LoRA (FSDP2, optional EP)
+
+Config: [`configs/text/qwen3_moe_lora.yaml`](../../configs/text/qwen3_moe_lora.yaml)
+
+```yaml
+model:
+  model_path: Qwen3-30B-A3B-merge
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton    # use eager only for debugging / NPU
+  lora_config:
+    rank: 16
+    alpha: 32
+    lora_modules: [q_proj, k_proj, v_proj, o_proj]    # standard PEFT LoRA
+    target_parameters:                                 # MoE-LoRA on routed experts
+      - model.layers.*.mlp.experts.gate_up_proj
+      - model.layers.*.mlp.experts.down_proj
+    share_expert_lora: true                            # one LoRA per layer (Mode 2)
+
+train:
+  init_device: meta
+  accelerator:
+    ulysses_size: 1
+    ep_size: 1                          # set >1 to enable EP; requires fused_triton
+    fsdp_config:
+      fsdp_mode: fsdp2
+```
+
+Launch (8 GPUs):
+
+```shell
+bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
+    --model.model_path /path/to/Qwen3-30B-A3B \
+    --data.train_path  /path/to/tulu-3-sft-mixture/data \
+    --train.checkpoint.output_dir ./exp/qwen3_moe_lora \
+    --train.checkpoint.save_hf_weights true \
+    --train.checkpoint.load_path auto
+```
+
+Resume from a saved adapter (DCP path is auto-detected via `load_path: auto`; an HF
+adapter resume goes through `model.lora_config.lora_adapter`):
+
+```shell
+bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
+    --model.model_path                 /path/to/Qwen3-30B-A3B \
+    --model.lora_config.lora_adapter   ./exp/qwen3_moe_lora/global_step_500
+```
+
+DeepSeek-V3 (v5) follows the same shape — see
+[`configs/text/deepseek_v3_lora.yaml`](../../configs/text/deepseek_v3_lora.yaml), which
+sets `ep_size: 8` and additionally LoRA-wraps DeepSeek's MLA projections
+(`q_a_proj` / `q_b_proj` / `kv_a_proj_with_mqa` / `kv_b_proj` / `o_proj`) via
+`lora_modules`.
+
 ---
 
-## 6. Testing
+## 7. Testing
 
 The test suite is under `tests/lora/` and uses small MoE toy models.
 Suite layout:
