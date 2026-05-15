@@ -379,6 +379,7 @@ def test_models_patch_fwd_bwd(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
         accelerator=AcceleratorConfig(
             fsdp_config=FSDPConfig(
+                fsdp_mode="ddp",
                 mixed_precision=MixedPrecisionConfig(enable=False),
             ),
         ),
