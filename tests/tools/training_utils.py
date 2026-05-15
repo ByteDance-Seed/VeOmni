@@ -255,7 +255,7 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
     This avoids downloading real model weights for CI tests.
     """
     from veomni.models.auto import build_foundation_model
-    from veomni.utils.device import get_device_type
+    from veomni.utils.device import empty_cache, get_device_type
 
     model = build_foundation_model(
         config_path=config_path,
@@ -265,6 +265,13 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
         ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
+    # The fp32 model can pin tens of GiB on the device (e.g. qwen3_5's full
+    # 248K-vocab embedding alone ≈ 4 GiB at fp32; the full model on L20 hits
+    # ~28 GiB). Subsequent torchrun children loading at bf16 then OOM the card
+    # because the pytest parent's CUDA context still holds the fp32 weights.
+    del model
+    gc.collect()
+    empty_cache()
 
 
 def run_training_config(

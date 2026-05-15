@@ -9,22 +9,19 @@ side-by-side without an unpatch helper.
 Coverage
 --------
 Models under ``veomni/models/transformers/`` that register a patchgen-generated
-class via the ``transformers >= 5.0.0`` branch:
+class via the ``transformers >= 5.2.0`` branch (the version pinned by the
+``transformers-stable`` default group in ``pyproject.toml``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3
 - VLM via text-only sub-config
   (``*ForCausalLM`` registered):   qwen3_5, qwen3_5_moe
 - VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni thinker forward:            qwen3_omni_moe (forward on ``model.thinker``)
-
-``glm_moe_dsa`` is omitted: no toy config exists for it.
-
-The MoE families that ship a v5 runtime checkpoint converter additionally have
-an end-to-end runtime-converter case (currently ``deepseek_v3``): a per-expert
-HF safetensors checkpoint is written via ``save_pretrained`` (which emits the
-qwen2_moe-style per-expert layout for v5) and reloaded through
-``build_foundation_model`` so ``DeepseekV3CheckpointTensorConverter`` runs the
-real disk → buffered-stack → fused ``gate_up_proj`` merge.
+- Causal-LM with MLA + DSA:        glm_moe_dsa (eager + sdpa only — the
+  upstream class sets ``_supports_flash_attn = False``)
+- Causal-LM with MLA + MoE:        deepseek_v3 (eager + fp32 only — MLA SDPA
+  reshape doesn't reach bitwise parity with HF on the toy config; logit drift
+  dominates the bf16 noise floor and is tracked separately)
 
 Scope decisions
 ---------------
@@ -39,9 +36,6 @@ Scope decisions
   test fast, large enough to actually run the visual tower.
 - Omni audio is a follow-up; only the ``audio_mask`` zero-tensor is passed
   so the patched asserts succeed and the audio tower stays dark.
-- ``deepseek_v3`` covers eager+fp32 only: its MLA SDPA reshape doesn't
-  reach bitwise parity with HF on the toy config (logit drift dominates the
-  bf16 noise floor — tracked separately).
 """
 
 import copy
@@ -141,19 +135,44 @@ CASES = [
         dtype="bfloat16",
         config_overrides={"_experts_implementation": "eager"},
     ),
-    # deepseek_v3: HF v5 builds the fused ``gate_up_proj [E, 2*I, H]`` directly
-    # via ``DeepseekV3NaiveMoe`` (no ``_experts_implementation`` knob). VeOmni's
-    # PatchedDeepseekV3NaiveMoe dispatches on the ``moe_experts`` OpSlot — eager
-    # loop here because the test runs without fused-kernel bindings.
+    # ── DeepSeek-V3 (MLA + MoE) ──────────────────────────────────────────
+    # HF v5 builds the fused ``gate_up_proj [E, 2*I, H]`` directly via
+    # ``DeepseekV3NaiveMoe`` (no ``_experts_implementation`` knob — the
+    # ``naive`` path is hard-wired). VeOmni's ``PatchedDeepseekV3NaiveMoe``
+    # dispatches on the ``moe_experts`` OpSlot — eager loop here because
+    # the test runs without fused-kernel bindings.
     #
-    # eager+fp32 only: deepseek_v3 ships MLA (multi-head latent attention) with
-    # split q_a / q_b / kv_a / kv_b projections, and the patchgen-generated SDPA
-    # path doesn't currently reach bitwise parity with HF's MLA SDPA reshape on
-    # the toy config (logit drift dominates the bf16 noise floor — tracked
-    # separately). The eager+fp32 case is sufficient here to validate the
-    # patchgen modeling: it covers the MoE expert dispatch, the OpSlot-guarded
-    # cross-entropy, and the v5 ``gate_up_proj`` layout end-to-end.
+    # eager+fp32 only: deepseek_v3 ships MLA (multi-head latent attention)
+    # with split q_a / q_b / kv_a / kv_b projections, and the patchgen-
+    # generated SDPA path doesn't currently reach bitwise parity with HF's
+    # MLA SDPA reshape on the toy config (logit drift dominates the bf16
+    # noise floor — tracked separately). The eager+fp32 case is sufficient
+    # to validate the patchgen modeling: it covers the MoE expert dispatch,
+    # the OpSlot-guarded cross-entropy, and the v5 ``gate_up_proj`` layout
+    # end-to-end.
     Case("deepseek_v3-eager", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    # ── GLM-MoE-DSA (MLA + Dynamic Sparse Attention) ─────────────────────
+    # Upstream sets ``_supports_flash_attn = False``, so FA2 is not an
+    # option here — we use eager+fp32 as the RNG-init baseline and
+    # sdpa+bf16 as the closest-to-real-user path. Like every MoE case the
+    # ``@use_experts_implementation`` decorator needs ``"eager"`` so HF's
+    # ``torch._grouped_mm`` path doesn't diverge from VeOmni's eager loop.
+    Case(
+        "glm_moe_dsa-eager",
+        _toy("glm_moe_dsa_toy"),
+        "GlmMoeDsaForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    Case(
+        "glm_moe_dsa-sdpa",
+        _toy("glm_moe_dsa_toy"),
+        "GlmMoeDsaForCausalLM",
+        "causal_lm",
+        attn_implementation="sdpa",
+        dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
     # ── Qwen3.5 (text-only sub-config) ───────────────────────────────────
     Case("qwen3_5-text-eager", _toy("qwen3_5_toy"), "Qwen3_5ForCausalLM", "qwen3_5_text"),
     Case(
@@ -247,7 +266,7 @@ def _single_rank_process_group():
     """
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if not IS_CUDA_AVAILABLE or not is_transformers_version_greater_or_equal_to("5.0.0"):
+    if not IS_CUDA_AVAILABLE or not is_transformers_version_greater_or_equal_to("5.2.0"):
         yield
         return
 
@@ -452,8 +471,8 @@ def test_logits_bitwise_equal_v5(case: Case):
     """Bitwise-equal forward: pristine HF vs VeOmni patched modeling."""
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if not is_transformers_version_greater_or_equal_to("5.0.0"):
-        pytest.skip("Scope is transformers v5 model definition only.")
+    if not is_transformers_version_greater_or_equal_to("5.2.0"):
+        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
@@ -508,102 +527,203 @@ def test_logits_bitwise_equal_v5(case: Case):
         )
 
 
-# ── Runtime-converter coverage ────────────────────────────────────────────
-# End-to-end test for VeOmni's v5 MoE checkpoint converter
-# ``DeepseekV3CheckpointTensorConverter``: write a per-expert HF safetensors
-# checkpoint (which is what ``save_pretrained`` emits for v5 deepseek_v3 thanks
-# to the ``qwen2_moe`` conversion mapping), load it through
-# ``build_foundation_model`` so the converter is exercised on the real
-# safetensors-streaming load path, and assert bitwise-equal logits against the
-# pristine HF model. This is the only place where the per-expert →
-# stack-and-fuse merge logic actually runs against a real disk checkpoint;
-# in-memory tests (``test_models_patch.py`` and the sibling
-# ``test_logits_bitwise_equal_v5``) all hit HF's already-fused state dict
-# layout and never touch the merge code path.
-_RUNTIME_CONVERTER_CASES = [
-    Case("deepseek_v3-runtime-converter-eager", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+# ── runtime loader path (weights_path != None) ───────────────────────────
+#
+# The sibling test above bypasses ``build_foundation_model``'s loader by
+# setting ``weights_path=None`` and copying weights in-memory via
+# ``model.load_state_dict(...)``. That misses the path real users hit:
+# ``init_empty_weights()`` + safetensors round-trip + non-persistent buffer
+# rematerialisation. The loader test below writes the HF state-dict to a
+# tmpdir and lets ``build_foundation_model(weights_path=<dir>)`` rehydrate
+# the model — the same shape of test as v4's
+# ``test_logits_bitwise_equal_via_runtime_converter``.
+#
+# Coverage: every v5 MoE family with one ``fa2+bf16`` (or ``sdpa+bf16`` for
+# ``glm_moe_dsa``, which sets ``_supports_flash_attn = False``) representative,
+# plus an ``eager+fp32`` baseline where supported. The loader path itself is
+# largely architecture-independent, so the value of breadth here is the
+# *non-persistent buffer surface* (vision tower RoPE caches, audio tower
+# positional embeddings) and the larger state-dict that the safetensors round
+# trip has to walk — both stress what the in-memory sibling test misses.
+#
+# ``qwen3_5_moe`` is the lone v5 MoE we skip: that case extracts
+# ``full_config.text_config`` and builds a text-only model, switching
+# ``model_type`` from ``qwen3_5_moe`` to ``qwen3_5_moe_text``. VeOmni's
+# ``MODELING_REGISTRY`` keys off the parent ``model_type``, so handing the
+# extracted text-config to ``build_foundation_model(config_path=...)`` would
+# need either a synthetic wrapper config or a registry-bypass — both
+# misrepresent the real-user loader flow we want to cover.
+_LOADER_CASES = [
+    Case(
+        "qwen3_moe-eager-loader",
+        _toy("qwen3_moe_toy"),
+        "Qwen3MoeForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    Case(
+        "qwen3_moe-fa2-loader",
+        _toy("qwen3_moe_toy"),
+        "Qwen3MoeForCausalLM",
+        "causal_lm",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    # deepseek_v3 is the only v5 MoE we ship that emits a *per-expert*
+    # safetensors layout from ``save_pretrained`` (via the ``qwen2_moe``
+    # weight-conversion mapping). The loader path therefore actually fires
+    # ``DeepseekV3CheckpointTensorConverter`` here, merging per-expert
+    # tensors back into VeOmni's fused ``gate_up_proj``/``down_proj``
+    # layout. Bitwise-equal logits prove the converter's per-expert →
+    # stack-and-fuse merge yields the same parameters HF builds in-memory.
+    # Eager+fp32 only — see the ``deepseek_v3-eager`` entry in CASES for
+    # why fa2/sdpa diverge on MLA today.
+    Case("deepseek_v3-eager-loader", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    Case(
+        "glm_moe_dsa-eager-loader",
+        _toy("glm_moe_dsa_toy"),
+        "GlmMoeDsaForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    Case(
+        "glm_moe_dsa-sdpa-loader",
+        _toy("glm_moe_dsa_toy"),
+        "GlmMoeDsaForCausalLM",
+        "causal_lm",
+        attn_implementation="sdpa",
+        dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    # qwen3_vl_moe: HF init forces bf16 on the language tower, so only
+    # fa2+bf16 exercises a self-consistent dtype assignment (matches the
+    # CASES entry above).
+    Case(
+        "qwen3_vl_moe-fa2-loader",
+        _toy("qwen3vlmoe_toy"),
+        "Qwen3VLMoeForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
+    # qwen3_omni_moe: forward on ``model.thinker`` so the talker stays
+    # out of scope — same as the in-memory CASES entry. State-dict load
+    # still happens at the root, so talker / vision / audio sub-modules
+    # round-trip through safetensors with the rest.
+    Case(
+        "qwen3_omni_moe-fa2-loader",
+        _toy("qwen3omni_toy"),
+        "Qwen3OmniMoeForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
 ]
 
 
-def _build_veomni_model_via_runtime_converter(case: Case, hf_state_dict, hf_buffers, config, weights_dir: str):
-    """Build a VeOmni model by routing load through the v5 runtime converter.
+def _save_hf_checkpoint(state_dict: dict, config, dst_dir: str) -> None:
+    """Write an HF-format checkpoint that ``build_foundation_model`` can read."""
+    from safetensors.torch import save_file
 
-    Mirrors the v4 sibling that lives in ``test_models_logits_equal_v4.py``: write
-    a per-expert HF checkpoint dir, hand it to ``build_foundation_model``, and
-    let ``DeepseekV3CheckpointTensorConverter`` merge per-expert tensors into
-    the v5 fused ``gate_up_proj``/``down_proj`` layout at load time.
+    config.save_pretrained(dst_dir)
+    save_file(
+        {k: v.detach().contiguous().cpu() for k, v in state_dict.items()},
+        os.path.join(dst_dir, "model.safetensors"),
+    )
+
+
+def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers, weights_dir: str):
+    """Build a VeOmni model by routing load through the disk-backed loader.
+
+    Mirrors v4's ``_build_veomni_model_via_runtime_converter``: this is the
+    path real users hit (``build_foundation_model(weights_path=<dir>)``).
+    For v5 MoE the on-disk layout already matches VeOmni's stacked layout,
+    so no expert-stacking converter fires here — the value of this test
+    is exercising the loader pipeline itself (``init_empty_weights`` +
+    safetensors deserialisation + non-persistent buffer rematerialisation),
+    not the converter.
 
     Why we restore HF's non-persistent buffers after load
     -----------------------------------------------------
-    The rotary ``inv_freq`` is registered ``persistent=False``, so it isn't in
-    the safetensors. On the ``weights_path != None`` path, the model is built
-    under ``init_empty_weights()``, which patches ``register_parameter`` but
-    not ``register_buffer`` — so ``inv_freq`` is computed on CPU during
-    ``__init__``, snapshotted, then ``.to(device)``-copied to CUDA. That
-    CPU-computed-then-moved value differs from a directly-on-CUDA
-    ``1.0 / (base ** ...)`` by a small amount, propagating into a non-zero
-    logits delta — enough to fail ``torch.equal``. Restoring HF's buffers after
-    load keeps this test a bitwise check on the converter's *parameter*
-    loading, matching the v4 sibling's approach. A loader fix
-    (``init_empty_weights(include_buffers=True)`` + recompute on
-    ``init_device`` after ``to_empty``) is tracked separately.
-    """
-    from safetensors.torch import save_file
+    Same loader-level quirk that v4 documents on its sibling test:
+    rotary ``inv_freq`` is registered ``persistent=False``, so it isn't in
+    the safetensors. On the ``weights_path != None`` path the model is
+    built under ``init_empty_weights()``, which patches ``register_parameter``
+    but not ``register_buffer`` — so ``inv_freq`` is computed on CPU during
+    ``__init__``, snapshotted, then ``.to(device)``-copied. That value
+    differs from a directly-on-CUDA ``1.0 / (base ** ...)`` by one ULP,
+    enough to fail ``torch.equal``. Restoring HF's buffers after load
+    keeps this test a bitwise check on the loader's *parameter* path; the
+    buffer rematerialisation fix is tracked separately.
 
+    Why we hand a directory (not the in-memory config) to ``build_foundation_model``
+    -------------------------------------------------------------------------------
+    Some VeOmni models register a ``MODEL_CONFIG_REGISTRY`` hook that mutates
+    the config at build-time (e.g. qwen3_omni_moe forces
+    ``tie_word_embeddings=False`` so the loader's post-load tie step is a
+    no-op on the thinker+talker container). That hook fires inside
+    ``build_config(...)``, which is reached only when ``config_path`` is a
+    string path — passing a ``PretrainedConfig`` short-circuits it.
+    We therefore feed the on-disk directory and re-apply
+    ``case.config_overrides`` via ``config_kwargs`` so private fields
+    like ``_experts_implementation`` survive without depending on
+    ``PretrainedConfig`` JSON round-trip semantics for underscored attrs.
+    """
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
 
     from ..tools.training_utils import make_eager_ops_config
 
-    config.save_pretrained(weights_dir)
-    save_file(
-        {k: v.detach().contiguous().cpu() for k, v in hf_state_dict.items()},
-        os.path.join(weights_dir, "model.safetensors"),
-    )
-
     apply_ops_config(make_eager_ops_config(attn_implementation=case.attn_implementation))
+    _save_hf_checkpoint(hf_state_dict, config, weights_dir)
+
     model = build_foundation_model(
         config_path=weights_dir,
         weights_path=weights_dir,
+        config_kwargs=dict(case.config_overrides),
         torch_dtype=case.dtype,
         attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
     )
 
-    # Restore non-persistent buffers (e.g. rotary ``inv_freq``) that aren't in
-    # the state dict — see docstring above. Walking by FQN keeps this
-    # independent of how nested they are.
+    # Iterate VeOmni's buffers (not HF's): the VeOmni-side model can be a
+    # subset of the HF model (e.g. omni strips ``talker`` because the talker
+    # is not subclassed locally), so HF may carry buffers that have no
+    # counterpart on VeOmni — skipping those is the correct behaviour, not
+    # masking a real defect.
     persistent_keys = set(hf_state_dict.keys())
-    for name, buf in hf_buffers.items():
+    for name, ve_buf in model.named_buffers():
         if name in persistent_keys:
             continue
-        parts = name.split(".")
-        target_module = model
-        for p in parts[:-1]:
-            target_module = getattr(target_module, p)
-        target = target_module._buffers[parts[-1]]
-        target.copy_(buf.to(target.device, dtype=target.dtype))
+        src = hf_buffers.get(name)
+        if src is None:
+            continue
+        ve_buf.copy_(src.to(ve_buf.device, dtype=ve_buf.dtype))
 
     return model.eval()
 
 
-@pytest.mark.parametrize("case", _RUNTIME_CONVERTER_CASES, ids=[c.case_id for c in _RUNTIME_CONVERTER_CASES])
-def test_logits_bitwise_equal_via_runtime_converter_v5(case: Case):
-    """Smoke test: per-expert HF checkpoint -> v5 runtime converter -> bitwise-equal forward.
+@pytest.mark.parametrize("case", _LOADER_CASES, ids=[c.case_id for c in _LOADER_CASES])
+def test_logits_bitwise_equal_v5_via_loader(case: Case):
+    """Bitwise-equal forward through the disk-backed loader path.
 
-    Complements ``test_logits_bitwise_equal_v5``: that one feeds HF's
-    in-memory (already-fused) state dict directly to a VeOmni model; this one
-    writes a real per-expert HF checkpoint (``save_pretrained`` for v5
-    deepseek_v3 emits per-expert keys via the ``qwen2_moe`` conversion
-    mapping) and routes loading through ``DeepseekV3CheckpointTensorConverter``,
-    the path users hit with a vanilla HF model dir. Bitwise-equal logits prove
-    the converter's per-expert -> stacked + cat-fused merge yields the exact
-    same parameters HF builds in-memory.
+    Complements ``test_logits_bitwise_equal_v5``: that one short-circuits
+    weight loading via in-memory ``load_state_dict``; this one routes the
+    HF state-dict through ``build_foundation_model(weights_path=<dir>)``,
+    which is the path users actually hit. Bitwise-equal logits prove the
+    loader doesn't perturb any tensor on the way in.
+
+    See ``_build_veomni_model_from_disk`` for why HF's non-persistent
+    buffers are restored before the forward.
     """
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-    if not is_transformers_version_greater_or_equal_to("5.0.0"):
-        pytest.skip("Scope is transformers v5 model definition only.")
+    if not is_transformers_version_greater_or_equal_to("5.2.0"):
+        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
@@ -615,10 +735,10 @@ def test_logits_bitwise_equal_via_runtime_converter_v5(case: Case):
 
     device = get_device_type()
     target_dtype = _DTYPE_MAP[case.dtype]
+
     config = _make_config(case)
     input_ids, fwd_kwargs = _make_inputs(case, config, device, target_dtype)
 
-    # --- HF phase (must precede any veomni model build, same as the sibling test) ---
     model_hf = _build_hf_model(case, config, target_dtype)
     with torch.no_grad():
         logits_hf = (
@@ -631,10 +751,9 @@ def test_logits_bitwise_equal_via_runtime_converter_v5(case: Case):
     del model_hf
     _release()
 
-    # --- veomni phase: load the HF checkpoint through build_foundation_model ---
-    tmp_dir = tempfile.mkdtemp(prefix="veomni_v5_converter_test_")
+    tmp_dir = tempfile.mkdtemp(prefix="veomni_v5_loader_test_")
     try:
-        model_ve = _build_veomni_model_via_runtime_converter(case, hf_state_dict, hf_buffers, config, tmp_dir)
+        model_ve = _build_veomni_model_from_disk(case, config, hf_state_dict, hf_buffers, tmp_dir)
         with torch.no_grad():
             logits_ve = (
                 _forward_target(model_ve, case)(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs)
@@ -660,7 +779,7 @@ def test_logits_bitwise_equal_via_runtime_converter_v5(case: Case):
         max_abs = float(diff.max().item())
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
-            f"[{case.case_id}] logits not bitwise equal via runtime converter: "
+            f"[{case.case_id}] logits not bitwise equal via loader: "
             f"{n_mis}/{total} mismatched, max_abs_diff={max_abs:.3e}, "
             f"first_mismatch_indices={first_idx}"
         )

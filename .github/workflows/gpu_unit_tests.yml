@@ -44,6 +44,13 @@ env:
   # next 2.4 GiB request). Expandable segments coalesce the free
   # blocks so the toy training fits the 44 GiB card.
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # Disable UCX's signal-handler chain. NCCL's RDMA plugin pulls in
+  # libucs, which registers a SIGSEGV handler that itself segfaults
+  # via libnvidia-ptxjitcompiler.so.1 when a rank tears down its
+  # CUDA context (observed on test_trainer_saveload[*-8] after all
+  # weight checks pass; rank exits with -11 and torchrun reports the
+  # whole job failed even though the test logic completed).
+  UCX_HANDLE_ERRORS: "none"
 
 jobs:
   lint:
