@@ -188,6 +188,17 @@ jobs:
       - name: Install LoRA extra [transformers-v5]
         run: |
           uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --extra lora --group dev
-      - name: Run LoRA e2e test [transformers-v5]
+      - name: Run LoRA e2e tests [transformers-v5]
+        # MoE-LoRA suite supersedes the deleted dense-only test_lora_trainer_saveload.py:
+        #   - eager: wrapper layout + autograd parity (Mode 1 + Mode 2, all v5 MoE configs)
+        #   - fused: triton kernel parity vs eager (forward + backward, EP autograd classes)
+        #   - trainer: production save/load/resume round-trip (DCP shard + HF adapter,
+        #     bit-exact LoRA reload, also covers linear LoRA on q_proj/v_proj since the
+        #     yaml enables both lora_modules and target_parameters)
+        #   - ep2: EP=1 vs EP=2 trainer-driven integration + per-step loss/grad_norm alignment
+        # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
         run: |
-          uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_fused.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py

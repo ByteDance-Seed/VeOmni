@@ -262,6 +262,42 @@ def save_lora_adapter_with_dcp(
 
     lora_state = get_peft_model_state_dict(model)
     lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
+
+    # Restore the EP shard dim before DCP sees the LoRA tensors. After
+    # ``ParallelPlan.apply`` the EP-sharded params are stored as plain
+    # local tensors (then wrapped by FSDP only along the FSDP mesh), so
+    # ``get_peft_model_state_dict`` returns FSDP-only DTensors whose
+    # data is the EP-local chunk. DCP would happily save these as-is
+    # and ``ckpt_to_state_dict`` would consolidate only across FSDP,
+    # leaving each rank's per-expert LoRA at ``[E_local, ...]`` instead
+    # of the global ``[E, ...]``. Re-wrap every Shard()-placed tensor
+    # as a 2-D (FSDP+EP) DTensor so DCP gathers both dimensions.
+    # Mirrors what ``ModelState.get_state_dict_with_extra_parallel_dim_preprocess``
+    # does for the regular checkpoint path.
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
+    if fqn2spec_info is not None:
+        from torch.distributed._tensor import Shard as _ShardPlacement
+
+        from ..checkpoint.dcp_checkpointer import restore_extra_parallel_dim
+
+        # ``get_peft_model_state_dict`` strips the adapter name from keys
+        # (``...gate_proj.lora_A.default.weight`` -> ``...gate_proj.lora_A.weight``)
+        # while ``_fqn2spec_info`` is built from ``model.named_parameters()``
+        # and keeps the adapter name. Re-insert it (matching the save's
+        # ``adapter_name``) when looking up the spec, otherwise no LoRA
+        # tensor matches and the EP gather is silently skipped.
+        for name in list(lora_state):
+            spec = fqn2spec_info.get(name)
+            if spec is None and name.endswith(".weight"):
+                spec_key = f"{name[: -len('.weight')]}.{adapter_name}.weight"
+                spec = fqn2spec_info.get(spec_key)
+            if spec is not None and isinstance(spec.placement, _ShardPlacement) and spec.para_fsdp_mesh is not None:
+                lora_state[name] = restore_extra_parallel_dim(
+                    lora_state[name],
+                    spec.para_fsdp_mesh,
+                    spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
+                )
+
     # ckpt_to_state_dict's DCP conversion path only recognizes keys starting with "model.".
     # Prefix LoRA keys temporarily for DCP save so consolidation can reuse existing conversion logic.
     dcp_lora_state = {k if k.startswith("model.") else f"model.{k}": v for k, v in lora_state.items()}

@@ -32,7 +32,7 @@ Uses the same :func:`build_toy` + :func:`load_lora_config` machinery as
 ``fused_triton`` (kernel path) and ``eager`` (reference) and compares:
 
 1. forward outputs at small bf16 tolerance, and
-2. d/dlora_A_*, d/dlora_B_* at small bf16 tolerance.
+2. d/d<spec>.lora_A, d/d<spec>.lora_B at small bf16 tolerance.
 
 The EP-class single-rank parity test reproduces the non-EP class's
 ``preprocess`` + ``scatter`` machinery in-process so the EP autograd
@@ -149,7 +149,11 @@ def _wrap_with_lora(model, lora_cfg, *, apply_fn, lora_b_perturb_std: float = 0.
     if lora_b_perturb_std > 0:
         with torch.no_grad():
             for n, p in model.named_parameters():
-                if "lora_B_" in n:
+                # PEFT-aligned MoE-LoRA layout: LoRA B lives at
+                # ``...<spec>.lora_B.<adapter>.weight``. Substring check
+                # with surrounding dots avoids matching unrelated
+                # ``lora_b_*`` named tensors elsewhere in the model.
+                if ".lora_B." in n:
                     p.add_(torch.randn_like(p) * lora_b_perturb_std)
 
 
@@ -263,7 +267,7 @@ def test_fused_vs_eager_forward_parity(mode):
 
 @pytest.mark.parametrize("mode", list(_MODES.keys()))
 def test_fused_vs_eager_backward_parity(mode):
-    """Gradients on lora_A_* / lora_B_* match between fused and eager at bf16 tol."""
+    """Gradients on <spec>.lora_A / <spec>.lora_B match between fused and eager at bf16 tol."""
     _require_cuda_with_triton()
 
     def _grads(*, fused: bool):
@@ -285,8 +289,11 @@ def test_fused_vs_eager_backward_parity(mode):
     )
     # Spot-check the LoRA grads — these are the only ones that should be non-zero
     # (base is frozen, perturbed lora_B → kaiming A still gets gradient via B).
-    lora_param_names = sorted(n for n in grads_eager if n.startswith("lora_A_") or n.startswith("lora_B_"))
-    assert lora_param_names, f"[{mode}] expected lora_A_*/lora_B_* params to receive gradients"
+    # PEFT-aligned wrapper layout: param names within the wrapper are
+    # ``<spec>.lora_A.<adapter>.weight`` / ``<spec>.lora_B.<adapter>.weight``,
+    # so we filter on the canonical segment via dot-split.
+    lora_param_names = sorted(n for n in grads_eager if "lora_A" in n.split(".") or "lora_B" in n.split("."))
+    assert lora_param_names, f"[{mode}] expected <spec>.lora_A/<spec>.lora_B params to receive gradients"
     for n in lora_param_names:
         ge, gf = grads_eager[n], grads_fused[n]
         assert ge.shape == gf.shape, f"[{mode}] {n}: shape mismatch eager={ge.shape} fused={gf.shape}"

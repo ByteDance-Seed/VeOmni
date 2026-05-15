@@ -41,6 +41,7 @@ from .fsdp import (
     parallel_load_safetensors,
     register_checkpoint_extension,
 )
+from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .utils import (
     get_module_from_path,
@@ -107,7 +108,7 @@ def parallelize_model_fsdp1(
     parallel_state = get_parallel_state()
 
     if parallel_state.any_extra_parallel_enabled:
-        parallel_plan = model.get_parallel_plan()
+        parallel_plan = get_runtime_parallel_plan(model)
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
 
         fsdp_no_shard_states_fqn_to_module, fsdp_no_shard_states_fqn_to_para = parallel_plan.get_fsdp_no_shard_info(
@@ -346,7 +347,7 @@ def parallelize_model_fsdp2(
     #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
     #        Apply embed parallelism (slice embed tensors [64,H] -> [16,H])
     if parallel_state.any_extra_parallel_enabled:
-        parallel_plan = model.get_parallel_plan()
+        parallel_plan = get_runtime_parallel_plan(model)
         assert parallel_plan is not None, (
             "ExtraParallel needs parallel plan defined in the model! \
             Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \

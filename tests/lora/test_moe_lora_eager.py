@@ -26,8 +26,8 @@ What this exercises (per ``mode`` × per toy):
    ``down_proj`` — see :func:`veomni.utils.moe_lora._validate_fused_layout`)
    and matches the yaml-declared ``target_parameters``.
 2. The wrapper is a true no-op at init (per-expert kaiming-uniform A, zero B).
-3. Backward only flows through ``lora_A_*`` / ``lora_B_*`` parameters; the
-   base experts module is fully frozen.
+3. Backward only flows through ``<spec>.lora_A`` / ``<spec>.lora_B`` parameters
+   (PEFT-aligned per-spec sub-modules); the base experts module is fully frozen.
 4. End-to-end save/reload round-trip via PEFT + the
    ``veomni_moe_lora.json`` sidecar produces a model whose forward output
    is bit-identical to the in-memory trained model — exercised for both
@@ -244,7 +244,7 @@ def test_eager_forward_no_op_at_init(toy_dir: str, mode: str):
 @pytest.mark.parametrize("mode", _MODE_CASES)
 @pytest.mark.parametrize("toy_dir", _MODEL_CASES)
 def test_backward_isolates_to_lora_params(toy_dir: str, mode: str):
-    """Backward through a wrapped experts module must only fill grads for ``lora_A_*`` / ``lora_B_*``."""
+    """Backward through a wrapped experts module must only fill grads for ``<spec>.lora_A`` / ``<spec>.lora_B``."""
     model, lora_cfg = _select_yaml_then_build(toy_dir)
     patterns = lora_cfg["target_parameters"]
     sample_fqn, exp = find_first_matching_module(model, experts_module_globs(patterns))
@@ -268,14 +268,20 @@ def test_backward_isolates_to_lora_params(toy_dir: str, mode: str):
     out = wrapper(h, top_k_index, top_k_weights)
     out.float().pow(2).sum().backward()
 
+    # PEFT-aligned wrapper layout: LoRA params live at
+    # ``<spec>.lora_A.<adapter>.weight`` / ``<spec>.lora_B.<adapter>.weight``,
+    # base params at ``<spec>.base_layer.weight``. We classify by checking
+    # for the canonical ``lora_A`` / ``lora_B`` / ``base_layer`` segment in
+    # the dot-split path so the check is robust to any FSDP renaming.
     n_lora_with_grad = 0
     n_base_with_grad = 0
     for n, p in wrapper.named_parameters():
         if p.grad is None or p.grad.abs().sum().item() == 0:
             continue
-        if n.startswith("lora_A_") or n.startswith("lora_B_"):
+        parts = n.split(".")
+        if "lora_A" in parts or "lora_B" in parts:
             n_lora_with_grad += 1
-        elif n.startswith("base_layer."):
+        elif "base_layer" in parts:
             n_base_with_grad += 1
     # At init lora_B == 0 ⇒ dL/dlora_A = 0 (chain through B). So only lora_B
     # params gain grad. The seed-style fused experts layout has three logical
@@ -304,7 +310,7 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
 
     * Init delta vs base is < 1e-3 (kaiming-A / zero-B no-op modulo activation
       checkpointing rounding).
-    * After perturbing ``lora_B_*`` (so the LoRA contribution is non-trivial),
+    * After perturbing ``<spec>.lora_B`` (so the LoRA contribution is non-trivial),
       reloading from disk produces a *bit-identical* forward + state-dict for
       every saved LoRA tensor.
     """
@@ -392,9 +398,11 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
     delta = (reload_out - trained_out).abs().max().item()
     assert delta == 0.0, f"{mode}: reload parity broken: max|reload-trained|={delta}"
 
-    # Bit-identical LoRA parameter tensors.
+    # Bit-identical LoRA parameter tensors. Under the PEFT-aligned wrapper
+    # layout every LoRA key contains ``.lora_A.<adapter>.`` / ``.lora_B.<adapter>.``
+    # so a single substring check covers both linear-PEFT and MoE-LoRA.
     s1, s2 = wrapped_model.state_dict(), reloaded.state_dict()
     for k in s1:
-        if "lora_A_" in k or "lora_B_" in k or "lora_A.default" in k or "lora_B.default" in k:
+        if ".lora_A." in k or ".lora_B." in k:
             assert k in s2, f"{mode}: missing in reload: {k}"
             assert torch.equal(s1[k], s2[k]), f"{mode}: value mismatch: {k}"

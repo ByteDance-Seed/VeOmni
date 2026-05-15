@@ -296,16 +296,37 @@ bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
 
 ## 6. Testing
 
-The test suite is under `tests/lora/` and verifies save/load correctness using a
-two-layer toy Qwen3 model:
+The test suite is under `tests/lora/` and uses a small Qwen3-MoE toy model.
+Suite layout:
+
+| Test | Coverage |
+|------|----------|
+| `test_moe_lora_eager.py` | Wrapper layout + autograd parity for both Mode 1 (independent) and Mode 2 (shared); covers all v5 MoE configs (qwen3_moe / qwen3_5_moe / qwen3_vl_moe / qwen3_omni_moe). |
+| `test_moe_lora_fused.py` | Triton fused MoE-LoRA kernel parity vs eager (forward + backward) and EP autograd-class parity vs non-EP under controlled inputs. |
+| `test_moe_lora_trainer.py` | Production save/load/resume round-trip: writer (DCP shard + HF adapter) → DCP-resume subprocess → adapter-resume subprocess; bit-exact LoRA reload assertion. The yaml enables both `lora_modules` (linear LoRA on `q_proj`/`v_proj`) and `target_parameters` (MoE-LoRA wrappers), so both LoRA flavors round-trip end-to-end. |
+| `test_moe_lora_ep2.py` | Trainer-driven EP=2 coverage: (a) integration assertions that the EP plumbing engages (plan-bridge fires, EP slicing happens at the right ratio, DCP consolidates EP shards before HF save); (b) `test_moe_lora_ep_save_load_parallel_align` -- one EP=2 seeder writes both an HF adapter (full `[E, r, H]`) and DCP shards, then three resumer subprocesses validate cross-EP adapter parity (EP=1 vs EP=2 adapter-load trajectories match) and EP=2 DCP round-trip parity (DCP-resumer trajectory matches the seeder's tail). |
+
+Quick run (all four; ~10 min total on 4 GPUs):
 
 ```shell
-torchrun --nproc_per_node=4 tests/lora/test_lora_trainer_saveload.py \
-    tests/lora/qwen3_toy_lora.yaml
+pytest -s tests/lora/
 ```
 
-**What the test verifies:**
-1. Train 3 steps with LoRA on a dummy dataset (FSDP2, meta device).
-2. After step 1: snapshot LoRA weights and save DCP checkpoint.
-3. Continue training (steps 2–3 mutate adapter weights).
-4. Reload the step-1 checkpoint; assert every LoRA tensor is bit-identical to the snapshot.
+Run just the production-shaped save/load/resume round-trip:
+
+```shell
+pytest -s -v tests/lora/test_moe_lora_trainer.py::test_save_load_resume_round_trip
+```
+
+Or as a manual torchrun against either `independent` or `shared`:
+
+```shell
+torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
+    tests/lora/qwen3_moe_toy_lora_independent.yaml \
+    --train.checkpoint.output_dir /tmp/test_moe_lora_run
+```
+
+**What the round-trip test verifies:**
+1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and HF LoRA adapter (+ `veomni_moe_lora.json` sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
+2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
+3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).
