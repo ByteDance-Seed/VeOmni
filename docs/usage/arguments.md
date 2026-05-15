@@ -13,8 +13,8 @@ train:
     project: VeOmni
   accelerator:
     fsdp_config:
-      fsdp_mode: fsdp1
-      full_shard: true
+      fsdp_mode: fsdp2
+  init_device: meta
   checkpoint:
     manager: dcp
 ```
@@ -312,12 +312,10 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp1", "fsdp2"]` | `"ddp"` | Data parallel mode. |
+| fsdp_mode | `Literal["ddp", "fsdp2"]` | `"ddp"` | Data parallel mode. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
-| full_shard | `bool` | `True` | Enable full sharding — equivalent to ZeRO-3. |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
-| offload | `bool` | `False` | Enable CPU offload (FSDP1 only). |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
@@ -328,10 +326,9 @@ NPU validation runs at two times:
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `True` | Enable mixed precision training. |
-| param_dtype | `str` | `"bfloat16"` | Dtype for the unsharded parameter (DDP, FSDP1). |
-| reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1). |
-| buffer_dtype | `str` | `None` | Dtype for the buffer (DDP, FSDP1). |
-| output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (DDP, FSDP1). |
+| param_dtype | `str` | `"bfloat16"` | Dtype for the unsharded parameter. |
+| reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce). |
+| output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (FSDP2). |
 | cast_forward_inputs | `bool` | `True` | Enable mixed precision cast forward inputs (FSDP2). |
 
 

@@ -15,8 +15,7 @@ veomni/
 │   ├── parallel_state.py   init_parallel_state(), ParallelState, device mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
-│   ├── fsdp/           FSDP (v1) — LEGACY, will be removed
-│   ├── fsdp2/          FSDP2 (composable fully_shard) — PRIMARY, gradient clipping
+│   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
 ├── models/             Model loading and patching
@@ -130,7 +129,7 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Parallelization Flow
 
-FSDP1 is legacy and will be removed. All new development uses FSDP2.
+VeOmni uses FSDP2 exclusively.
 
 1. `init_parallel_state()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
 2. Model-specific `parallel_plan.py` -> define EP/embedding weight sharding via `ParallelPlan`

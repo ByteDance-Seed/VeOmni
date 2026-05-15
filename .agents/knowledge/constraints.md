@@ -33,7 +33,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
 
 ## Distributed Training
 
-VeOmni supports FSDP1 and FSDP2, but **FSDP1 is legacy and will be removed**. All new development must use FSDP2.
+VeOmni uses FSDP2 exclusively. FSDP1 has been removed.
 
 Core entry points:
 - `veomni/distributed/parallel_state.py` — `init_parallel_state()`, `ParallelState` dataclass
