@@ -18,10 +18,8 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed._tensor import Shard
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
@@ -29,9 +27,15 @@ from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
+from ..utils.import_utils import is_torch_version_greater_than
 from .checkpoint import CheckpointFunction
 from .parallel_state import get_parallel_state
 from .utils import sort_fqn_by_submodule_first
+
+
+if is_torch_version_greater_than("2.4"):
+    from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+    from torch.distributed.tensor.parallel import parallelize_module
 
 
 logger = logging.get_logger(__name__)
@@ -419,7 +423,7 @@ def build_parallelize_model(
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
-            raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
+            raise ValueError("Only FSDP training supports `init_device=meta`.")
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
@@ -457,6 +461,6 @@ def build_parallelize_model(
                 **kwargs,
             )
         else:
-            model = DDP(model, device_ids=[parallel_state.local_rank])
+            model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
 
     return model
