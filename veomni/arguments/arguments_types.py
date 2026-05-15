@@ -247,15 +247,11 @@ class MixedPrecisionConfig:
     )
     param_dtype: str = field(
         default="bfloat16",
-        metadata={"help": "Dtype for the unsharded parameter (DDP, FSDP1, FSDP2)."},
+        metadata={"help": "Dtype for the unsharded parameter."},
     )
     reduce_dtype: str = field(
         default="float32",
-        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce) (DDP, FSDP1, FSDP2)."},
-    )
-    buffer_dtype: str = field(
-        default=None,
-        metadata={"help": "Dtype for the buffer (DDP, FSDP1)."},
+        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce)."},
     )
     output_dtype: str = field(
         default=None,
@@ -273,7 +269,6 @@ class MixedPrecisionConfig:
 
         _check_dtype(self.param_dtype)
         _check_dtype(self.reduce_dtype)
-        _check_dtype(self.buffer_dtype)
         _check_dtype(self.output_dtype)
 
 
@@ -281,7 +276,7 @@ class MixedPrecisionConfig:
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp1", "fsdp2"] = field(
+    fsdp_mode: Literal["ddp", "fsdp2"] = field(
         default="ddp",
         metadata={"help": "Data parallel mode."},
     )
@@ -293,17 +288,9 @@ class FSDPConfig:
         default=True,
         metadata={"help": "Enable reshard after backward for FSDP2."},
     )
-    full_shard: bool = field(
-        default=True,
-        metadata={"help": "Enable fully shard for FSDP training (ZeRO-3)."},
-    )
     forward_prefetch: bool = field(
         default=True,
         metadata={"help": "Enable forward prefetch."},
-    )
-    offload: bool = field(
-        default=False,
-        metadata={"help": "Enable CPU offload for FSDP1."},
     )
     max_load_broadcast_size: float = field(
         default=20.0,
@@ -312,6 +299,13 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+
+    def __post_init__(self):
+        if self.fsdp_mode not in ("ddp", "fsdp2"):
+            raise ValueError(
+                f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
+                "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
+            )
 
 
 @dataclass
@@ -613,9 +607,6 @@ class TrainingArguments:
             logger.info_rank0(f"Set gradient accumulation to {self.gradient_accumulation_steps}.")
         else:
             raise ValueError(f"`global_batch_size` should be a multiple of {self.micro_batch_size * acc.dp_size}.")
-
-        if self.gradient_accumulation_steps > 1 and acc.fsdp_config.offload:
-            raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # dataloader batch size
         if self.dyn_bsz:

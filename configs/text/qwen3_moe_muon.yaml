@@ -24,8 +24,6 @@ train:
     ep_size: 8
     fsdp_config:
       fsdp_mode: fsdp2
-      full_shard: true
-      offload: false
       mixed_precision:
         enable: true
     offload:
