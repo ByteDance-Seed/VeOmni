@@ -119,6 +119,10 @@ def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     dit_latents_seqlens = []
     for latents in micro_batch["latents"]:
         latent_shape = latents.shape
+        if len(latent_shape) == 3:
+            B, seq_len, _C = latent_shape
+            dit_latents_seqlens.append(B * seq_len)
+            continue
         if len(latent_shape) == 5:
             B = latent_shape[0]
         else:

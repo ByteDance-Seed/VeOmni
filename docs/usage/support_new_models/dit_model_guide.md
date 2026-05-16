@@ -132,6 +132,21 @@ pipe.to("cuda")
 output = pipe(prompt="...", ...)
 ```
 
+### Qwen-Image Reference
+
+Qwen-Image follows the same condition/transformer split as Wan, with a
+text-to-image condition model and a trainable `QwenImageTransformer2DModel`
+wrapper:
+
+- `veomni/models/diffusers/qwen_image/qwen_image_condition/`
+- `veomni/models/diffusers/qwen_image/qwen_image_transformer/`
+- `configs/dit/qwen_image_sft.yaml`
+
+The first Qwen-Image integration supports GPU FSDP2 full-parameter training with
+`ulysses_size: 1`. Ulysses SP for Qwen-Image requires a dedicated patch for its
+dual-stream joint attention and should be added separately from the baseline
+training path.
+
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
 `to_diffuser_dict()` uses Python's `inspect` module to extract exactly the
