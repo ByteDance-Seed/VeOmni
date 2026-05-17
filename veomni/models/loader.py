@@ -254,40 +254,18 @@ class CustomizedModelingLoader(BaseModelLoader):
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)
 
-            # We should tie embeddings after loading weights because
-            # init_empty_weights() leads to untied weights.
-            #
-            # Read the tie flag from the inner text/decoder config rather
-            # than the outer model.config: nested ImageTextToText / multimodal
-            # configs (e.g. InternVLConfig) often leave the OUTER
-            # ``tie_word_embeddings`` at PretrainedConfig's True default while
-            # the actual lm_head <-> embed_tokens tying is governed by the
-            # INNER decoder config (e.g. ``text_config``). Reading the OUTER
-            # flag would force-tie even when the checkpoint stores
-            # ``lm_head.weight`` as a distinct tensor, silently clobbering it
-            # with the input embedding's value at load time.
-            # ``PretrainedConfig.get_text_config(decoder=True)`` returns the
-            # decoder text config for nested layouts and falls back to ``self``
-            # for plain text configs -- the same lookup HF's
-            # ``PreTrainedModel.tie_embeddings_and_encoder_decoder`` uses (see
-            # transformers ``modeling_utils.py``).
+            # init_empty_weights() leaves embeddings untied; re-tie if requested.
+            # Check both outer and inner text configs: nested multimodal layouts
+            # can disable tying on either side (InternVL on inner, Qwen3VLMoe on
+            # outer with the inner missing the attribute entirely).
             text_config = (
                 model.config.get_text_config(decoder=True)
                 if hasattr(model.config, "get_text_config")
                 else model.config
             )
-            # Prefer the inner text_config's flag when it is explicitly set
-            # (e.g. InternVL leaves the OUTER default at True while the INNER
-            # decoder config says False). When the inner text_config does not
-            # define the attribute (e.g. Qwen3VLMoeTextConfig under
-            # transformers v5), fall back to the OUTER config, which is the
-            # authoritative source -- defaulting to True here would otherwise
-            # silently tie and clobber a separately-stored ``lm_head.weight``.
-            if hasattr(text_config, "tie_word_embeddings"):
-                should_tie = text_config.tie_word_embeddings
-            else:
-                should_tie = getattr(model.config, "tie_word_embeddings", False)
-            if should_tie:
+            if getattr(model.config, "tie_word_embeddings", True) and getattr(
+                text_config, "tie_word_embeddings", True
+            ):
                 try:
                     input_embeddings = model.get_input_embeddings()
                     output_embeddings = model.get_output_embeddings()
