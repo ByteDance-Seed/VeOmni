@@ -276,7 +276,18 @@ class CustomizedModelingLoader(BaseModelLoader):
                 if hasattr(model.config, "get_text_config")
                 else model.config
             )
-            if getattr(text_config, "tie_word_embeddings", True):
+            # Prefer the inner text_config's flag when it is explicitly set
+            # (e.g. InternVL leaves the OUTER default at True while the INNER
+            # decoder config says False). When the inner text_config does not
+            # define the attribute (e.g. Qwen3VLMoeTextConfig under
+            # transformers v5), fall back to the OUTER config, which is the
+            # authoritative source -- defaulting to True here would otherwise
+            # silently tie and clobber a separately-stored ``lm_head.weight``.
+            if hasattr(text_config, "tie_word_embeddings"):
+                should_tie = text_config.tie_word_embeddings
+            else:
+                should_tie = getattr(model.config, "tie_word_embeddings", False)
+            if should_tie:
                 try:
                     input_embeddings = model.get_input_embeddings()
                     output_embeddings = model.get_output_embeddings()
