@@ -140,6 +140,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
+          uv run --frozen pytest -s -x tests/models/test_model_forward_no_implicit_sync.py
           uv run --frozen pytest -s -x tests/models/test_checkpoint_tensor_converter.py
           uv run --frozen pytest -s -x tests/models/test_return_log_probs_e2e.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests
