@@ -176,7 +176,10 @@ _SYNC_RE = re.compile(r"called a synchronizing")
 def _is_generated_path(filename: str) -> bool:
     """True if ``filename`` lives under ``veomni/models/transformers/*/generated/``."""
     norm = filename.replace(os.sep, "/")
-    return "/veomni/models/transformers/" in norm and "/generated/" in norm
+    # No leading slash on the first substring: ``WarningMessage.filename`` is
+    # almost always absolute, but relative-path edge cases (zip imports,
+    # custom loaders) shouldn't silently bypass the gate.
+    return "veomni/models/transformers/" in norm and "/generated/" in norm
 
 
 # NCCL bootstrap env so this module is runnable on its own (``pytest
@@ -293,7 +296,10 @@ def test_no_implicit_sync_in_generated_forward(case):
             with torch.no_grad():
                 target(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs)
         for w in wlist:
-            if w.category is UserWarning and _SYNC_RE.search(str(w.message)):
+            # Filter by message text only — the regex is specific to torch's
+            # sync warning, and an exact-category check would silently drop
+            # the warning if torch ever switches to a UserWarning subclass.
+            if _SYNC_RE.search(str(w.message)):
                 captured.append((w.filename, w.lineno, str(w.message)))
     finally:
         torch.cuda.set_sync_debug_mode(prev_mode)
