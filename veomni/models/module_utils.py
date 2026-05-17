@@ -795,7 +795,9 @@ def post_process_after_weight_loading(
     # configs -- the same lookup HF's
     # ``PreTrainedModel.tie_embeddings_and_encoder_decoder`` uses (see
     # transformers ``modeling_utils.py``).
-    text_config = model.config.get_text_config(decoder=True)
+    text_config = (
+        model.config.get_text_config(decoder=True) if hasattr(model.config, "get_text_config") else model.config
+    )
     if getattr(text_config, "tie_word_embeddings", True):
         try:
             input_embeddings = model.get_input_embeddings()
