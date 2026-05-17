@@ -1,8 +1,24 @@
 """Implicit CUDA-sync gate for VeOmni-patched v5 modeling code.
 
 Runs each model's forward under ``torch.cuda.set_sync_debug_mode("warn")``
-and fails if any implicit host<->device sync originates from
+and fails if any new implicit host<->device sync site shows up in
 ``veomni/models/transformers/<model>/generated/``.
+
+The principle
+-------------
+We are gating **VeOmni's patches** (the code we wrote), not HF upstream.
+``generated/`` files are mostly HF source copied verbatim with imports
+resolved; only the bits marked ``[PATCHED CLASS]`` / ``[MODIFIED CLASS]
+Methods patched: ...`` are ours. The patchgen ``.diff`` next to each
+generated file is the authoritative ours-vs-HF view.
+
+The test inevitably observes warnings from *all* code in the generated
+file (patched and verbatim alike), so the allowlist exists to mark
+HF-verbatim sites as "not ours, leave alone". Concretely:
+
+  - **VeOmni-patched code introducing a sync** → fix the patch.
+  - **HF-verbatim code that syncs** → allowlist with reason "HF-verbatim;
+    out of scope". Do not try to improve upstream HF here.
 
 Why this matters
 ----------------
@@ -14,10 +30,9 @@ under SP/EP and small micro-batches, and can cascade into NCCL watchdog
 timeouts. See the ``debug-cuda-sync`` skill for the manual investigation
 flow against real weights.
 
-This test is the *unit-level ratchet* for the same property: it runs on
-toy configs (so only catches sync sites reachable from a tiny forward),
-but it's cheap and catches "someone added a ``.item()`` to a patch" at
-PR time. Real-model SP/EP coverage stays with the skill.
+This test is the *unit-level ratchet*: it runs on toy configs (so only
+catches sync sites reachable from a tiny forward) and is cheap enough
+to gate PRs. Real-model SP/EP coverage stays with the skill.
 
 Extending to more models
 ------------------------
@@ -28,19 +43,17 @@ counterpart, e.g. fused-MoE on the production path). Add a
 ``_MOE_IMPL_BY_CASE`` entry to override the default ``"eager"``
 backend for MoE cases.
 
-Acknowledging a necessary sync
-------------------------------
-``_ALLOWED_SYNCS`` is a per-case dict from ``(basename, lineno)`` to a
-short reason string — pre-existing acknowledged syncs (HF-inherited
-code paths, eager-only fallback loops, EP dispatch with data-dependent
-split sizes). The semantics are *ratchet*: the test fails if a new
-``(file, lineno)`` shows up in generated/ that isn't in the allowlist.
-Removing a site (by fixing the patch) is encouraged.
+When a new model's first run surfaces sync sites, decide each:
+- Read the surrounding code in the generated file and check the patchgen
+  ``.diff`` next to it. If the lines are unchanged from HF, allowlist
+  with ``"HF-verbatim: <one-line description>"``.
+- If the lines were added or modified by a VeOmni patch, fix the patch
+  to derive the value host-side.
 
-Line numbers are into the **generated** file, so if patchgen
-regenerates and shifts lines, the allowlist must be re-checked. Treat
-this the same as the checked-in ``.diff`` snapshot under each model's
-``generated/`` — both are line-aware.
+Line numbers are into the **generated** file, so a ``make patchgen``
+that shifts lines requires re-checking the allowlist. Dead allowlist
+entries (listed but no longer observed) also fail the test, so drift
+can't silently rot the gate.
 """
 
 import importlib
@@ -97,13 +110,21 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
 # logits test forces for HF parity, and we want to drop SDPA in favour of
 # FA2. To extend, add a ``Case`` here (and optionally a ``_MOE_IMPL_BY_CASE``
 # entry for fused-MoE coverage).
+#
+# ``qwen3_5_moe-text-eager`` is intentionally absent: the eager experts
+# loop is HF-verbatim and not the production path (production uses
+# ``veomni_moe_experts_forward`` via OpSlot, exercised by the fa2-fused
+# case below). Gating MoE on that case alone keeps the allowlist focused
+# on VeOmni-patched code.
 CASES = [
-    # qwen3_5 (non-MoE, text-only sub-config) — both attention paths.
+    # qwen3_5 (non-MoE, text-only sub-config) — both attention paths through
+    # our patched Qwen3_5Model.forward.
     _logits_case("qwen3_5-text-eager"),
     _logits_case("qwen3_5-text-fa2"),
-    # qwen3_5_moe-text — eager path (kept for non-MoE-code coverage) and
-    # the production FA2 + fused-Triton MoE path.
-    _logits_case("qwen3_5_moe-text-eager"),
+    # qwen3_5_moe-text — production FA2 + fused-Triton MoE. The fused
+    # short-circuit (line ~1044 in patched_modeling_qwen3_5_moe_gpu.py)
+    # is VeOmni's; the HF eager loop body that it bypasses is verbatim
+    # and not exercised in this case.
     Case(
         "qwen3_5_moe-text-fa2-fused",
         _toy("qwen3_5_moe_toy"),
@@ -114,49 +135,35 @@ CASES = [
     ),
 ]
 
-# Pre-existing acknowledged sync sites in generated/. Keyed by
-# ``Case.case_id``; value maps ``(basename, lineno)`` -> reason.
+# Acknowledged sync sites in generated/ that are **HF-verbatim** (not
+# touched by any VeOmni patch). Keyed by ``Case.case_id``; value maps
+# ``(basename, lineno)`` -> one-line reason.
 #
-# Two flavours show up in the current baseline:
-#   - ``_update_linear_attn_mask`` (HF-inherited): a Python ``if`` on a
-#     GPU scalar (``cache_position[0]``) plus ``torch.all(mask == 1)``.
-#     The patch doesn't touch this method; the toy config forces all
-#     layers to ``full_attention`` so the linear-attention branch is
-#     unreachable, but the guard still evaluates each forward.
-#   - Eager expert loop in ``Qwen3_5MoeExperts.forward``: ``.nonzero()``
-#     → Python ``for`` over GPU tensor → ``if expert_idx == N`` →
-#     ``torch.where`` indexing. Production dispatches via
-#     ``veomni_moe_experts_forward`` and skips this path; the loop is
-#     only reachable under ``_experts_implementation="eager"`` (which
-#     the test forces for determinism).
-_LINEAR_ATTN_REASON = (
-    "HF-inherited _update_linear_attn_mask: `if cache_position[0] > 0 or "
-    "torch.all(mask == 1)`; unreachable under toy full_attention config."
-)
-_EAGER_EXPERTS_REASON = (
-    "Eager Qwen3_5MoeExperts.forward fallback loop (.nonzero() + Python for "
-    "over experts); production runs fused via veomni_moe_experts_forward."
+# Rule: every entry here MUST be HF-verbatim code. If a sync sits inside
+# a class or method that VeOmni patches, fix the patch instead. Verify
+# via the patchgen ``.diff`` next to the generated file — unchanged
+# lines are HF, changed lines are ours.
+#
+# Current entries are all the same upstream HF method:
+# ``_update_linear_attn_mask``. Both qwen3_5 and qwen3_5_moe inherit it
+# from the same upstream class hierarchy; both ``Qwen3_5{,Moe}Model``
+# are MODIFIED CLASSes but ``_update_linear_attn_mask`` is not in their
+# ``Methods patched`` list. The method does ``if cache_position[0] > 0
+# or torch.all(attention_mask == 1)`` — two implicit syncs (0-D GPU
+# scalar in Python ``if`` + full-tensor reduction). Out of scope.
+_HF_VERBATIM_LINEAR_ATTN = (
+    "HF-verbatim _update_linear_attn_mask: `if cache_position[0] > 0 or "
+    "torch.all(mask == 1)`; method not in VeOmni's patched-methods list."
 )
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     "qwen3_5-text-eager": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _LINEAR_ATTN_REASON,
+        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_VERBATIM_LINEAR_ATTN,
     },
     "qwen3_5-text-fa2": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _LINEAR_ATTN_REASON,
+        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_VERBATIM_LINEAR_ATTN,
     },
-    "qwen3_5_moe-text-eager": {
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1052): _EAGER_EXPERTS_REASON,
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1056): _EAGER_EXPERTS_REASON,
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1058): _EAGER_EXPERTS_REASON,
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1060): _EAGER_EXPERTS_REASON,
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1062): _EAGER_EXPERTS_REASON,
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _LINEAR_ATTN_REASON,
-    },
-    # qwen3_5_moe-text-fa2-fused: production path (fused_triton MoE
-    # bypasses the eager expert loop). Only the HF-inherited
-    # linear-attention guard remains.
     "qwen3_5_moe-text-fa2-fused": {
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _LINEAR_ATTN_REASON,
+        ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _HF_VERBATIM_LINEAR_ATTN,
     },
 }
 
@@ -313,14 +320,16 @@ def test_no_implicit_sync_in_generated_forward(case):
             unique = {(os.path.basename(f), ln): m.splitlines()[0] for (f, ln, m) in offending}
             formatted = "\n".join(f"  {f}:{ln}  ::  {m}" for (f, ln), m in sorted(unique.items()))
             problems.append(
-                f"{len(unique)} new implicit CUDA sync site(s) in patched modeling:\n"
+                f"{len(unique)} new implicit CUDA sync site(s) in generated modeling:\n"
                 f"{formatted}\n"
-                f"Each line is into the generated modeling file. Fix the patch to derive the "
-                f"value host-side (typical sources: 0-D GPU tensor used as a shape/index arg, "
-                f".item() for a Python int, repeat_interleave with GPU repeats, if/bool on a "
-                f"GPU scalar). If the sync is genuinely needed (e.g. EP dispatch sizes), add "
-                f"the (basename, lineno) to _ALLOWED_SYNCS[{case.case_id!r}] with a one-line "
-                f"reason."
+                f"Each line is into the generated file. Read the line and check the patchgen "
+                f".diff next to it:\n"
+                f"  - VeOmni-patched code (changed in the .diff) -> fix the patch to derive "
+                f"the value host-side (typical: 0-D GPU tensor used as a shape/index arg, "
+                f".item() for a Python int, repeat_interleave with GPU repeats, if/bool on "
+                f"a GPU scalar).\n"
+                f"  - HF-verbatim code (unchanged in the .diff) -> add (basename, lineno) to "
+                f"_ALLOWED_SYNCS[{case.case_id!r}] with reason 'HF-verbatim: <description>'."
             )
         if dead:
             dead_fmt = "\n".join(f"  {f}:{ln}" for (f, ln) in dead)
