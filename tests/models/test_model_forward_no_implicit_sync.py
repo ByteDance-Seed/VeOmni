@@ -4,21 +4,43 @@ Runs each model's forward under ``torch.cuda.set_sync_debug_mode("warn")``
 and fails if any new implicit host<->device sync site shows up in
 ``veomni/models/transformers/<model>/generated/``.
 
-The principle
--------------
-We are gating **VeOmni's patches** (the code we wrote), not HF upstream.
-``generated/`` files are mostly HF source copied verbatim with imports
-resolved; only the bits marked ``[PATCHED CLASS]`` / ``[MODIFIED CLASS]
-Methods patched: ...`` are ours. The patchgen ``.diff`` next to each
-generated file is the authoritative ours-vs-HF view.
+The principle — two axes
+------------------------
+For each surfaced sync site, decide along two independent axes:
 
-The test inevitably observes warnings from *all* code in the generated
-file (patched and verbatim alike), so the allowlist exists to mark
-HF-verbatim sites as "not ours, leave alone". Concretely:
+  1. **Owner** — VeOmni-patched (the line appears in the patchgen ``.diff``)
+     vs HF-verbatim (the line is unchanged from upstream HF, even though it
+     lives inside generated/).
+  2. **Path** — production (code runs every real training/inference step,
+     no override above it) vs eager-only fallback (code only runs under a
+     specific dev/fallback setting; production bypasses it via an OpSlot
+     or other VeOmni override above).
 
-  - **VeOmni-patched code introducing a sync** → fix the patch.
-  - **HF-verbatim code that syncs** → allowlist with reason "HF-verbatim;
-    out of scope". Do not try to improve upstream HF here.
+The rule:
+
+  - Production-path + VeOmni-patched  →  fix the patch (derive host-side,
+    precompute in the collator, etc.).
+  - Production-path + HF-verbatim     →  add an ``override_method`` patch
+    and fix there (now becomes ours). **Don't leave a production sync in
+    just because the line originated upstream** — that's an unreasonable
+    cost in our hot path.
+  - Eager-only fallback + HF-verbatim (production bypasses via OpSlot/
+    override)                          →  leave alone, allowlist if needed.
+  - Algorithm-essential (EP dispatch sizes, variable per-rank counts) →
+    accept.
+
+``_ALLOWED_SYNCS`` therefore holds two flavours of entries, distinguished
+by a tag prefix in the reason string:
+
+  - ``"HF-eager-only: ..."``          — accepted long-term; production
+                                        bypasses this code.
+  - ``"HF-prod-pending-fix: ..."``    — production-path HF-verbatim site
+                                        currently tracked for a fix
+                                        (follow-up PR named in the reason).
+  - ``"algorithm-essential: ..."``    — accepted by design.
+
+The dead-entry detection ensures the pending-fix entries get cleaned up
+when the fix lands.
 
 Why this matters
 ----------------
@@ -43,12 +65,18 @@ counterpart, e.g. fused-MoE on the production path). Add a
 ``_MOE_IMPL_BY_CASE`` entry to override the default ``"eager"``
 backend for MoE cases.
 
-When a new model's first run surfaces sync sites, decide each:
-- Read the surrounding code in the generated file and check the patchgen
-  ``.diff`` next to it. If the lines are unchanged from HF, allowlist
-  with ``"HF-verbatim: <one-line description>"``.
-- If the lines were added or modified by a VeOmni patch, fix the patch
-  to derive the value host-side.
+When a new model's first run surfaces sync sites, classify each per the
+two-axis rule above:
+
+- VeOmni-patched line (appears in the patchgen ``.diff``) → fix the patch.
+- HF-verbatim line on a production path (code runs unconditionally, no
+  VeOmni override above) → add an ``override_method`` patch to fix it;
+  in the meantime allowlist with ``"HF-prod-pending-fix: ..."`` and
+  reference the follow-up.
+- HF-verbatim line on an eager-only fallback path that production
+  bypasses (e.g. inside the eager experts loop, when production
+  dispatches to the fused MoE OpSlot) → allowlist with
+  ``"HF-eager-only: ..."``.
 
 Line numbers are into the **generated** file, so a ``make patchgen``
 that shifts lines requires re-checking the allowlist. Dead allowlist
@@ -135,35 +163,50 @@ CASES = [
     ),
 ]
 
-# Acknowledged sync sites in generated/ that are **HF-verbatim** (not
-# touched by any VeOmni patch). Keyed by ``Case.case_id``; value maps
-# ``(basename, lineno)`` -> one-line reason.
+# Acknowledged sync sites in generated/. Keyed by ``Case.case_id``;
+# value maps ``(basename, lineno)`` -> one-line reason.
 #
-# Rule: every entry here MUST be HF-verbatim code. If a sync sits inside
-# a class or method that VeOmni patches, fix the patch instead. Verify
-# via the patchgen ``.diff`` next to the generated file — unchanged
-# lines are HF, changed lines are ours.
+# Reasons MUST start with one of the category tags below — see the
+# module docstring's "principle" section for the two-axis triage. The
+# gate's pass/fail behaviour is the same across categories; the tags
+# encode follow-up state:
 #
-# Current entries are all the same upstream HF method:
-# ``_update_linear_attn_mask``. Both qwen3_5 and qwen3_5_moe inherit it
-# from the same upstream class hierarchy; both ``Qwen3_5{,Moe}Model``
-# are MODIFIED CLASSes but ``_update_linear_attn_mask`` is not in their
-# ``Methods patched`` list. The method does ``if cache_position[0] > 0
-# or torch.all(attention_mask == 1)`` — two implicit syncs (0-D GPU
-# scalar in Python ``if`` + full-tensor reduction). Out of scope.
-_HF_VERBATIM_LINEAR_ATTN = (
-    "HF-verbatim _update_linear_attn_mask: `if cache_position[0] > 0 or "
-    "torch.all(mask == 1)`; method not in VeOmni's patched-methods list."
+#   "HF-eager-only: ..."           accepted long-term; production
+#                                  bypasses this code via an OpSlot or
+#                                  override above.
+#   "HF-prod-pending-fix: ..."     production-path HF-verbatim site
+#                                  currently tracked for a fix; the
+#                                  reason names the follow-up branch /
+#                                  PR. Dead-entry detection forces
+#                                  cleanup once the fix lands.
+#   "algorithm-essential: ..."     accepted by design (EP dispatch
+#                                  sizes, variable per-rank counts).
+#
+# Current entries are all the same upstream HF method
+# ``_update_linear_attn_mask`` (called once per forward from
+# ``Qwen3_5{,Moe}Model.forward`` — production path, fires every step in
+# real Qwen3.5 since half its layers are linear_attention). Both Model
+# classes are MODIFIED CLASSes but ``_update_linear_attn_mask`` is not
+# in either's ``Methods patched`` list, so the line is HF-verbatim.
+# Per the two-axis rule (production + HF-verbatim → add an override
+# patch), it's tracked as ``HF-prod-pending-fix`` and the fix lives on
+# branch ``tingyang/fix/qwen3_5_key_fix``.
+_HF_PROD_PENDING_LINEAR_ATTN = (
+    "HF-prod-pending-fix: _update_linear_attn_mask runs unconditionally in "
+    "Qwen3_5{,Moe}Model.forward (no OpSlot above it). Two syncs: 0-D GPU "
+    "scalar `cache_position[0] > 0` in Python `if`, plus full-tensor "
+    "`torch.all(attention_mask == 1)`. Fix planned via patchgen "
+    "override_method on branch tingyang/fix/qwen3_5_key_fix."
 )
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     "qwen3_5-text-eager": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_VERBATIM_LINEAR_ATTN,
+        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_PROD_PENDING_LINEAR_ATTN,
     },
     "qwen3_5-text-fa2": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_VERBATIM_LINEAR_ATTN,
+        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_PROD_PENDING_LINEAR_ATTN,
     },
     "qwen3_5_moe-text-fa2-fused": {
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _HF_VERBATIM_LINEAR_ATTN,
+        ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _HF_PROD_PENDING_LINEAR_ATTN,
     },
 }
 
@@ -328,14 +371,22 @@ def test_no_implicit_sync_in_generated_forward(case):
             problems.append(
                 f"{len(unique)} new implicit CUDA sync site(s) in generated modeling:\n"
                 f"{formatted}\n"
-                f"Each line is into the generated file. Read the line and check the patchgen "
-                f".diff next to it:\n"
-                f"  - VeOmni-patched code (changed in the .diff) -> fix the patch to derive "
-                f"the value host-side (typical: 0-D GPU tensor used as a shape/index arg, "
-                f".item() for a Python int, repeat_interleave with GPU repeats, if/bool on "
-                f"a GPU scalar).\n"
-                f"  - HF-verbatim code (unchanged in the .diff) -> add (basename, lineno) to "
-                f"_ALLOWED_SYNCS[{case.case_id!r}] with reason 'HF-verbatim: <description>'."
+                f"Each line is into the generated file. Triage along two axes (owner + path):\n"
+                f"  1. Check the patchgen .diff next to the generated file.\n"
+                f"     Line is *in the .diff* (added/modified by VeOmni) -> ours.\n"
+                f"     Line is *unchanged from HF* -> HF-verbatim.\n"
+                f"  2. Check whether the code is on the production path or only on an\n"
+                f"     eager/fallback path that production bypasses (e.g. via an OpSlot).\n"
+                f"Then act:\n"
+                f"  - Production + VeOmni-patched -> fix the patch (derive host-side,\n"
+                f"    precompute in the collator).\n"
+                f"  - Production + HF-verbatim -> add an override_method patch and fix\n"
+                f"    there. Don't leave a production sync in because it came from upstream.\n"
+                f"    In the meantime, allowlist with reason 'HF-prod-pending-fix: ...'.\n"
+                f"  - Eager-only fallback + HF-verbatim -> allowlist with reason\n"
+                f"    'HF-eager-only: ...'.\n"
+                f"Add the (basename, lineno) to _ALLOWED_SYNCS[{case.case_id!r}] with the\n"
+                f"appropriate tag prefix."
             )
         if dead:
             dead_fmt = "\n".join(f"  {f}:{ln}" for (f, ln) in dead)
