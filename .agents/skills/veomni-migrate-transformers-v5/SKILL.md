@@ -21,9 +21,9 @@ self-contained generated modeling path.
 
 Scenarios differ by *v4-coexistence* vs *v5-only* — pick the closest example:
 
-- **v4↔v5 coexist, text LLM** — `veomni/models/transformers/qwen3/`
-  - `__init__.py` — registry dispatch splits on `is_transformers_version_greater_or_equal_to("5.0.0")`; v4 branch imports `modeling_<m>.py` and calls `apply_veomni_<m>_patch()`.
-  - `qwen3_gpu_patch_gen_config.py` — Liger + SP + fused-CE patches.
+- **v4↔v5 coexist, text LLM** — `veomni/models/transformers/qwen3/`, `veomni/models/transformers/llama/`
+  - `__init__.py` — registry dispatch splits on `is_transformers_version_greater_or_equal_to("5.0.0")`; v4 branch imports `modeling_<m>.py` and calls `apply_veomni_<m>_patch()`. (Llama uses the `"5.2.0"` gate per the standardized current pin; existing qwen3 / qwen2 entries pinned to `"5.0.0"` will be aligned separately.)
+  - `qwen3_gpu_patch_gen_config.py` / `llama_gpu_patch_gen_config.py` — Liger + SP + fused-CE patches. Llama is the minimal reference (5 OpSlot patches: RMSNorm, MLP, RoPE, ForCausalLM, ForSequenceClassification — no SP or MoE specifics).
 - **v4↔v5 coexist, MoE** — `veomni/models/transformers/qwen3_moe/`
   - `__init__.py` — additionally attaches `_create_checkpoint_tensor_converter` as a `staticmethod` on every v5 model class.
   - `qwen3_moe_gpu_patch_gen_config.py` — replaces `Qwen3MoeExperts` with fused-MoE layout + overrides `get_parallel_plan`.
@@ -922,6 +922,42 @@ Extra e2e gotchas:
   `(bs, seq_len, head_dim)` → `gather_dim=1`. Don't blindly copy `gather_dim`
   from a sibling model; read the upstream RoPE path first.
 - **Skipping `check_patchgen`** → CI will fail on PR. Always run it locally.
+- **Empty class body written as `: ...` instead of `: pass`** — when the upstream
+  HF source defines an empty class via inline Ellipsis (e.g.
+  `class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...`)
+  rather than the multi-line `pass` form, `_replace_method_body_with_preserved`
+  in `veomni/patchgen/codegen.py` is responsible for both stripping the inline
+  `: ...` tail and re-opening the class header so the injected `forward` indents
+  correctly. This is wired up since the Llama migration. If a future HF refactor
+  introduces a *new* empty-body syntax the helper doesn't recognize, the
+  generated file will emit
+  `class Foo(...): ...\n    def forward(...): ...` — invalid Python — and
+  `import` will fail with `IndentationError: unexpected indent`. In transformers
+  4.57.3, 8 modeling files use this inline form: llama, mistral, nemotron,
+  persimmon, phimoe, qwen2_moe, stablelm, jetmoe. When migrating any of these
+  via `override_method` on a synthetic class (e.g.
+  `LlamaForSequenceClassification`), verify the generated file imports cleanly
+  before declaring victory.
+- **New v5 text/MoE models silently fail on NPU CI with `KeyError: "Unknown
+  kernel 'npu' for op='rotary_pos_emb'/'rms_norm'"`** — the new `KERNEL_REGISTRY`
+  (used by the OpSlot path in patchgen-generated modeling) registers only the
+  `liger_kernel` GPU backend for `rotary_pos_emb/full` and `rms_norm/standard`,
+  even though the legacy `BackendSpec` registry (used by v4 `device_patch.py`)
+  does have NPU entries (`veomni/ops/kernels/rotary/npu.py`,
+  `veomni/ops/kernels/rms_norm/npu.py`). Until those NPU `KernelSpec`s are
+  registered in the new system, every v5-migrated text/MoE model that runs on
+  NPU CI must be pinned to eager via `_NPU_PER_MODEL_OVERRIDES` in
+  `tests/tools/training_utils.py`:
+  ```python
+  "<model_name>": {
+      "rms_norm_implementation": "eager",
+      "rotary_pos_emb_implementation": "eager",
+  },
+  ```
+  Match the `model_name` exactly to the key used in `test_e2e_parallel.py`'s
+  parametrize (e.g. `"qwen2"`, `"qwen3_moe"`, `"llama3.1"`). Skipping this step
+  is the canonical "I migrated the model and GPU CI is green but NPU CI explodes
+  at model build" symptom.
 - **`pytest -k` mismatch on e2e** — `test_e2e_parallel.py` uses the first
   positional arg (`model_name`) as id, not the registry `<m>` id. For VL
   models that's the HF short name (`qwen25vl`, `qwen3vl`, `qwen3vlmoe`, …),
