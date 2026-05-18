@@ -16,9 +16,7 @@ from types import SimpleNamespace
 from typing import Callable, Optional
 
 import torch
-from transformers.modeling_flash_attention_utils import (
-    _flash_attention_forward as _transformers_flash_attention_forward,
-)
+from transformers.modeling_flash_attention_utils import _flash_attention_forward as hf_flash_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ....distributed.parallel_state import get_parallel_state
@@ -31,7 +29,12 @@ from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 logger = logging.get_logger(__name__)
-_flash_attention_forward = None
+
+# Module-level patch slot for the underlying flash-attention forward.
+# Defaults to HuggingFace's ``_flash_attention_forward``; overwrite this
+# attribute (``veomni.ops.kernels.attention._flash_attention_forward = <fn>``)
+# to plug in a custom FA kernel without subclassing the VeOmni SP wrapper.
+_flash_attention_forward: Callable = hf_flash_attention_forward
 _original_load_and_register_attn_kernel: Callable | None = None
 _veomni_hub_kernel_loader_patch_applied = False
 
@@ -93,17 +96,16 @@ def _patch_transformers_hub_kernel_loader_for_veomni():
     See docs/transformers_v5/veomni_flash_attention_kernel_adapter.md for
     background, failure mode, and design details.
 
-    Transformers>=5 routes unrecognised flash-attention names through
+    Transformers routes unrecognised flash-attention names through
     `transformers.integrations.hub_kernels.load_and_register_attn_kernel`,
     which tries to fetch them from the Hugging Face hub.  VeOmni custom names
     (e.g. ``veomni_flash_attention_4_with_sp``) are not hub identifiers, so
     we monkey-patch that function to intercept VeOmni names and load the
     corresponding local FA2/FA3/FA4 kernel functions instead.
 
-    This patch is only needed for Transformers>=5.  FA2 and FA3 are handled by
-    explicit branches inside ``_lazy_imports`` in both v4 and v5, so they never
-    reach the hub-kernel path.  FA4 has no such branch and always goes through
-    the hub-kernel fallback in v5, which is why the patch matters for FA4.
+    FA2 and FA3 are handled by explicit branches inside ``_lazy_imports`` and
+    never reach the hub-kernel path.  FA4 has no such branch and always goes
+    through the hub-kernel fallback, which is why the patch matters for FA4.
     """
     global _veomni_hub_kernel_loader_patch_applied
     global _original_load_and_register_attn_kernel
@@ -144,38 +146,6 @@ def _patch_transformers_hub_kernel_loader_for_veomni():
 
     hub_kernels.load_and_register_attn_kernel = _veomni_load_and_register_attn_kernel
     _veomni_hub_kernel_loader_patch_applied = True
-
-
-def transformers_flash_attention_forward(
-    query,
-    key,
-    value,
-    attention_mask,
-    **kwargs,
-):
-    """
-    Thin shim that forwards to Transformers' ``_flash_attention_forward`` while
-    explicitly passing the ``implementation`` keyword.
-
-    VeOmni's ``flash_attention_forward`` stores the resolved kernel name in
-    ``kwargs["attn_implementation"]`` and passes it here.  We pop it and
-    re-inject it as ``implementation=`` so Transformers knows which FA backend
-    to load via ``lazy_import_flash_attention``.
-
-    Note: passing ``implementation`` explicitly is required for Transformers
-    v4.57.3 due to a bug where the parameter is not forwarded correctly
-    otherwise.  It is harmless on v5.
-    """
-    attn_implementation = kwargs.pop("attn_implementation")
-
-    return _transformers_flash_attention_forward(
-        query,
-        key,
-        value,
-        attention_mask,
-        implementation=attn_implementation,  # TODO(szl): bug in 4.57.3, update to 5.0 to remove this patch
-        **kwargs,
-    )
 
 
 def flash_attention_forward(
@@ -312,23 +282,20 @@ def flash_attention_forward(
 
     # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
     #
-    # FA2 and FA3 have dedicated branches in _lazy_imports (both v4 and v5), so we use
-    # the plain transformers names and they are resolved without hitting the hub-kernel path.
+    # FA2 and FA3 have dedicated branches in transformers' _lazy_imports, so we
+    # use the plain transformers names and they are resolved without hitting the
+    # hub-kernel path.
     #
-    # FA4 has no such branch; in Transformers v5 unrecognised names fall through to the
-    # hub-kernel loader.  By keeping the VeOmni name here, our monkey-patch of
-    # load_and_register_attn_kernel intercepts it and loads flash_attn.cute locally.
+    # FA4 has no such branch; unrecognised names fall through to the hub-kernel
+    # loader. By keeping the VeOmni name here, our monkey-patch of
+    # ``load_and_register_attn_kernel`` intercepts it and loads
+    # ``flash_attn.cute`` locally.
     if module.config._attn_implementation == "veomni_flash_attention_2_with_sp":
         fa_kernel_implementation = "flash_attention_2"
     elif module.config._attn_implementation == "veomni_flash_attention_3_with_sp":
         fa_kernel_implementation = "flash_attention_3"
     elif module.config._attn_implementation == "veomni_flash_attention_4_with_sp":
-        if is_transformers_version_greater_or_equal_to("5.0.0"):
-            fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
-        else:
-            # Transformers v4 has no hub-kernel fallback but supports module objects
-            # in _lazy_imports' kernels-fallback branch via getattr().
-            fa_kernel_implementation = _load_veomni_local_flash_kernel("veomni_flash_attention_4_with_sp")
+        fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
     else:
         raise ValueError(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
@@ -370,26 +337,17 @@ def apply_veomni_attention_patch():
     Register VeOmni attention implementations and apply any necessary patches.
 
     Must be called once at startup (via ``apply_ops_patch``) before any model
-    forward pass.  It performs two actions:
+    forward pass. It performs two actions:
 
     1. Registers ``flash_attention_forward`` for every VeOmni custom attention
        name in Transformers' ``ALL_ATTENTION_FUNCTIONS`` so that model code
        that looks up ``self.config._attn_implementation`` finds the right function.
 
-    2. On Transformers>=5, monkey-patches ``load_and_register_attn_kernel`` so
-       that VeOmni custom names (especially FA4) are resolved locally rather
-       than fetched from the Hugging Face hub.
-
-    The module-level ``_flash_attention_forward`` is set here (rather than at
-    import time) to avoid a circular-import: ``transformers_flash_attention_forward``
-    references ``_transformers_flash_attention_forward`` which is imported at the
-    top of the file, but the global used inside ``flash_attention_forward`` needs
-    to point to our shim, not directly to the Transformers function.
+    2. Monkey-patches ``load_and_register_attn_kernel`` so that VeOmni custom
+       names (especially FA4) are resolved locally rather than fetched from the
+       Hugging Face hub.
     """
-    if is_transformers_version_greater_or_equal_to("5.0.0"):
-        _patch_transformers_hub_kernel_loader_for_veomni()
+    _patch_transformers_hub_kernel_loader_for_veomni()
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", flash_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_4_with_sp", flash_attention_forward)
-    global _flash_attention_forward
-    _flash_attention_forward = transformers_flash_attention_forward
