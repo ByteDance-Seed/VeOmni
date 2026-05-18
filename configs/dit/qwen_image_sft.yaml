@@ -21,9 +21,7 @@ data:
   max_seq_len: 4096
   text_keys: text
   dyn_bsz_buffer_size: 200
-  mm_configs:
-    source_name: Qwen-Image
-
+  source_name: Qwen-Image
 train:
   accelerator:
     dp_replicate_size: 1
