@@ -103,6 +103,7 @@ from .test_models_logits_equal_v5 import (
     _make_config,
     _make_inputs,
     _release,
+    _toy,
 )
 from .test_models_logits_equal_v5 import (
     CASES as _ALL_CASES,
@@ -115,12 +116,6 @@ def _logits_case(case_id: str) -> Case:
         if c.case_id == case_id:
             return c
     raise KeyError(f"{case_id!r} not in test_models_logits_equal_v5.CASES")
-
-
-def _toy(name: str) -> str:
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tests", "toy_config", name
-    )
 
 
 # Per-case ``moe_implementation`` for VeOmni's ``apply_ops_config``. Defaults
