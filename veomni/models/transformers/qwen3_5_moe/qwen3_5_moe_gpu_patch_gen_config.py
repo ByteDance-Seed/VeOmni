@@ -60,6 +60,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
     qwen3_5_text_model_update_linear_attn_mask,
+    qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
