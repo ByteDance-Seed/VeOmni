@@ -18,9 +18,9 @@ from .utils import prepare_exec_cmd
 
 # transformers v5 only — the v4 CI lane was retired together with the
 # broader transformers v4 wind-down. v4-only models that have not yet
-# been migrated to patchgen (currently llama3.1 and qwen2_5_omni) are
-# commented out in their respective case lists with a TODO; uncomment
-# once the corresponding model gains a v5 patchgen path.
+# been migrated to patchgen (currently qwen2_5_omni) are commented out
+# in their respective case lists with a TODO; uncomment once the
+# corresponding model gains a v5 patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
 # Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
 # non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
@@ -108,16 +108,14 @@ _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
 text_test_cases = [
-    # TODO(transformers v5 migration): re-enable llama3.1 once it is
-    # ported to the patchgen pipeline (currently v4-only).
-    # pytest.param(
-    #     "llama3.1",
-    #     "./tests/toy_config/llama31_toy",
-    #     False,  # is_moe
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     None,  # max_sp_size
-    # ),
+    pytest.param(
+        "llama3.1",
+        "./tests/toy_config/llama31_toy",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+    ),
     pytest.param(
         "qwen2",
         "./tests/toy_config/qwen2_toy/config.json",
