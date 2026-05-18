@@ -19,6 +19,8 @@
 #      Remove unnecessary split operation to maintain contiguous memory layout.
 #    - method_override: Qwen3_5MoeModel.get_placeholder_mask
 #      Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.
+#    - method_override: Qwen3_5MoeVisionModel.rot_pos_emb
+#      Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.
 #    - method_override: Qwen3_5MoeVisionModel.fast_pos_embed_interpolate
 #      Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.
 #    - method_override: Qwen3_5MoeVisionModel.forward
@@ -1475,7 +1477,7 @@ class Qwen3_5MoeVisionBlock(GradientCheckpointingLayer):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeVisionModel
-# Methods patched: fast_pos_embed_interpolate, forward, dummy_forward
+# Methods patched: rot_pos_emb, fast_pos_embed_interpolate, forward, dummy_forward
 # ======================================================================
 
 
@@ -1513,9 +1515,15 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
 
         self.post_init()
 
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    def rot_pos_emb(self, grid_thw) -> torch.Tensor:
         merge_size = self.spatial_merge_size
-        grid_thw_list = grid_thw.tolist()
+
+        # Modification: reuse the host-materialized grid metadata from the caller when available.
+        # The upstream body always starts with `grid_thw.tolist()`, which means the patched ViT
+        # forward was synchronizing the same tensor twice per call after its own
+        # `grid_thw_list = grid_thw.tolist()`. Accept a Python list directly and fall back to
+        # `.tolist()` only for non-patched callers that still pass the raw tensor.
+        grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
 
         max_hw = max(max(h, w) for _, h, w in grid_thw_list)
         freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
@@ -1649,8 +1657,9 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         # GPU `grid_thw` tensor — `torch.repeat_interleave(..., grid_thw[:, 0]).cumsum(0)` (GPU-tensor
         # `repeats` -> sync to size the output), `rotary_pos_emb.reshape(cu_seqlens[-1])` and
         # `pad_seq_len = ... - total_seq_len.item()` (0-D GPU scalar -> sync) — and iterating the GPU
-        # tensor in `fast_pos_embed_interpolate` forced several `.item()`s per image. Now the ViT
-        # forward issues one `grid_thw` host-device sync here (plus the one still inside `rot_pos_emb`).
+        # tensor in `fast_pos_embed_interpolate` forced several `.item()`s per image. `rot_pos_emb`
+        # now accepts the same host materialization too, so the ViT forward only synchronizes once
+        # at `grid_thw.tolist()` here.
         # TODO(perf): `pos_embeds` / `rotary_pos_emb` / `cu_seqlens` / `total_seq_len` are a pure
         # function of `grid_thw`, which is already known in the data collator. Precomputing the vision
         # rotary position ids + cu_seqlens there and threading them in as model inputs would make the
@@ -1694,7 +1703,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb = self.rot_pos_emb(grid_thw_list)
 
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
@@ -1710,6 +1719,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
+        pad_seq_len = 0
         if get_parallel_state().sp_enabled:
             # --- Patch.3: Sequence parallel padding and slicing for sin/cos rotary embeddings ---
             cos, sin = position_embeddings
@@ -1759,7 +1769,8 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         #       and sdpa paths in the consumer pop+discard the kwarg, so the
         #       host sync would be wasted.
         if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
-            kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+            max_frame_len = max((h * w for _, h, w in grid_thw_list), default=0)
+            kwargs["vision_max_seqlen"] = max(max_frame_len, pad_seq_len)
         # --- Patch.5 ---
 
         for blk in self.blocks:

@@ -48,6 +48,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -425,6 +426,13 @@ config.override_method(
     "Qwen3_5Model.get_placeholder_mask",
     replacement=qwen3_5_model_get_placeholder_mask,
     description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+
+
+config.override_method(
+    "Qwen3_5VisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
 )
 
 

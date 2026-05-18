@@ -646,6 +646,57 @@ def qwen3_5_model_get_placeholder_mask(self, input_ids: torch.LongTensor, **kwar
 
 
 @config.override_method(
+    "Qwen3_5VisionModel.rot_pos_emb",
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
+)
+def qwen3_5_vision_model_rot_pos_emb(self, grid_thw) -> torch.Tensor:
+    merge_size = self.spatial_merge_size
+
+    # Modification: reuse the host-materialized grid metadata from the caller when available.
+    # The upstream body always starts with `grid_thw.tolist()`, which means the patched ViT
+    # forward was synchronizing the same tensor twice per call after its own
+    # `grid_thw_list = grid_thw.tolist()`. Accept a Python list directly and fall back to
+    # `.tolist()` only for non-patched callers that still pass the raw tensor.
+    grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
+
+    max_hw = max(max(h, w) for _, h, w in grid_thw_list)
+    freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+    device = freq_table.device
+
+    total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
+    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+    offset = 0
+    for num_frames, height, width in grid_thw_list:
+        merged_h, merged_w = height // merge_size, width // merge_size
+
+        block_rows = torch.arange(merged_h, device=device)  # block row indices
+        block_cols = torch.arange(merged_w, device=device)  # block col indices
+        intra_row = torch.arange(merge_size, device=device)  # intra-block row offsets
+        intra_col = torch.arange(merge_size, device=device)  # intra-block col offsets
+
+        # Compute full-resolution positions
+        row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
+        col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
+
+        row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+        col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+
+        coords = torch.stack((row_idx, col_idx), dim=-1)
+
+        if num_frames > 1:
+            coords = coords.repeat(num_frames, 1)
+
+        num_tokens = coords.shape[0]
+        pos_ids[offset : offset + num_tokens] = coords
+        offset += num_tokens
+
+    embeddings = freq_table[pos_ids]  # lookup rotary embeddings
+    embeddings = embeddings.flatten(1)
+    return embeddings
+
+
+@config.override_method(
     "Qwen3_5VisionModel.fast_pos_embed_interpolate",
     description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
 )
@@ -748,8 +799,9 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # GPU `grid_thw` tensor — `torch.repeat_interleave(..., grid_thw[:, 0]).cumsum(0)` (GPU-tensor
     # `repeats` -> sync to size the output), `rotary_pos_emb.reshape(cu_seqlens[-1])` and
     # `pad_seq_len = ... - total_seq_len.item()` (0-D GPU scalar -> sync) — and iterating the GPU
-    # tensor in `fast_pos_embed_interpolate` forced several `.item()`s per image. Now the ViT
-    # forward issues one `grid_thw` host-device sync here (plus the one still inside `rot_pos_emb`).
+    # tensor in `fast_pos_embed_interpolate` forced several `.item()`s per image. `rot_pos_emb`
+    # now accepts the same host materialization too, so the ViT forward only synchronizes once
+    # at `grid_thw.tolist()` here.
     # TODO(perf): `pos_embeds` / `rotary_pos_emb` / `cu_seqlens` / `total_seq_len` are a pure
     # function of `grid_thw`, which is already known in the data collator. Precomputing the vision
     # rotary position ids + cu_seqlens there and threading them in as model inputs would make the
@@ -793,7 +845,7 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
         dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
     )
 
-    rotary_pos_emb = self.rot_pos_emb(grid_thw)
+    rotary_pos_emb = self.rot_pos_emb(grid_thw_list)
 
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
@@ -809,6 +861,7 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
 
+    pad_seq_len = 0
     if get_parallel_state().sp_enabled:
         # --- Patch.3: Sequence parallel padding and slicing for sin/cos rotary embeddings ---
         cos, sin = position_embeddings
@@ -858,7 +911,8 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     #       and sdpa paths in the consumer pop+discard the kwarg, so the
     #       host sync would be wasted.
     if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
-        kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        max_frame_len = max((h * w for _, h, w in grid_thw_list), default=0)
+        kwargs["vision_max_seqlen"] = max(max_frame_len, pad_seq_len)
     # --- Patch.5 ---
 
     for blk in self.blocks:
