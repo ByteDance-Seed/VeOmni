@@ -396,18 +396,6 @@ def load_model_weights(
             parallel_plan=parallel_plan,
         )
 
-    if is_peft_model and adapter_path:
-        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
-        from ..utils.lora_utils import load_lora_model_weights
-
-        load_lora_model_weights(
-            model,
-            adapter_path,
-            init_device,
-            dtensor_factory,
-            parameter_names_to_load=parameter_names_to_load,
-        )
-
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
 

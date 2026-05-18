@@ -1,3 +1,4 @@
+import itertools
 import math
 from typing import List
 
@@ -155,11 +156,17 @@ def extra_parallel_fsdp2_clip_grad_norm(
             logger.debug_rank0(f"{para} replicated total grad norm: {para_total}")
 
     if math.isinf(norm_type):
-        total_norm = torch.maximum(
-            non_extra_parallel_total,
-            *extra_parallel_total.values(),
-            *extra_parallel_replicated_total.values(),
-        )
+        # ``torch.maximum`` is a 2-arg elementwise op, not variadic. Unpacking
+        # ``*extra_parallel_total.values(), *extra_parallel_replicated_total.values()``
+        # silently worked only when the combined dict size was 1 (single
+        # ``extra_parallel_names`` entry + only one of the two buckets
+        # populated). Reduce iteratively so the path holds for any number
+        # of parallelism axes (``ep`` + ``emb`` + ...) and for the Mode-2
+        # shared-LoRA case where both ``extra_parallel_total["ep"]`` and
+        # ``extra_parallel_replicated_total["ep"]`` are populated.
+        total_norm = non_extra_parallel_total
+        for t in itertools.chain(extra_parallel_total.values(), extra_parallel_replicated_total.values()):
+            total_norm = torch.maximum(total_norm, t)
     else:
         total_norm = (
             non_extra_parallel_total

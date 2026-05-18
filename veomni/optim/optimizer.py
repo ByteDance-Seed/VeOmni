@@ -61,7 +61,24 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     Detection by class name (``LoraSharedExperts``) so this stays free of
     a circular import (``veomni.utils.moe_lora`` already imports from
     ``veomni.distributed.parallel_state``).
+
+    Call-order requirement
+    ----------------------
+    Must run after FSDP wrapping has converted params to DTensors, hence
+    after :func:`build_parallelize_model`. Otherwise the snapshotted
+    ``id(p)`` values point at the pre-wrap ``nn.Parameter`` objects, which
+    get replaced by new DTensor-backed parameters when ``fully_shard``
+    rewraps the wrapper module -- the snapshot then goes stale (Python may
+    reuse those addresses for unrelated objects, causing false positives
+    in :func:`extra_parallel_fsdp2_clip_grad_norm`).
+
+    ``id(p)`` stability after this point is guaranteed because
+    ``build_optimizer`` populates ``model._extra_parallel_param_groups``
+    from the same post-wrap Parameter objects in the same call, and those
+    lists hold long-lived references that prevent garbage collection.
     """
+    from torch.distributed._tensor import DTensor
+
     out: set[int] = set()
     for mod in model.modules():
         # Walk the MRO so we still match after FSDP2's ``fully_shard`` rebases the
@@ -69,9 +86,21 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
         # (see torch's ``_fully_shard``); a bare ``__class__.__name__`` check
         # would silently skip every wrapper post-FSDP.
         if any(b.__name__ == "LoraSharedExperts" for b in type(mod).__mro__):
-            for _, p in mod.named_parameters(recurse=True):
-                if p.requires_grad:
-                    out.add(id(p))
+            for n, p in mod.named_parameters(recurse=True):
+                if not p.requires_grad:
+                    continue
+                # Catches wrong call-order misuse: if any matched LoRA param
+                # is still a plain ``nn.Parameter`` (not a DTensor) at this
+                # point, FSDP2 hasn't wrapped yet -- ``build_optimizer`` was
+                # invoked before ``build_parallelize_model``. The snapshot
+                # we are about to take would be stale immediately.
+                assert isinstance(p, DTensor), (
+                    f"_collect_ep_replicated_lora_param_ids: LoRA param {n!r} on a "
+                    f"LoraSharedExperts wrapper is not a DTensor -- call "
+                    f"build_parallelize_model before build_optimizer so FSDP2 has "
+                    f"converted these params to DTensors before we snapshot id(p)."
+                )
+                out.add(id(p))
     return out
 
 

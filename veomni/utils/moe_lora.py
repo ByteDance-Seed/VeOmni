@@ -607,33 +607,41 @@ class LoraSharedExperts(nn.Module):
 
         ep_group = ps.ep_group
 
+        # Local import so this module stays importable on torch builds where
+        # ``torch.distributed.tensor`` is absent (already true everywhere we
+        # support, but mirrors the pattern used in ``reset_lora_parameters``
+        # below to keep the hook self-contained).
+        from torch.distributed.tensor import DTensor
+
         def _make_hook():
             def _hook(p: torch.Tensor) -> None:
                 if p.grad is None:
                     return
                 grad = p.grad
                 # Reach the underlying storage that the optimizer reads.
-                # ``to_local()`` returns a view of ``DTensor._local_tensor``
-                # under FSDP/DTensor; ``copy_`` propagates back through that
-                # view to grad's storage even when the view is non-contiguous.
-                local = grad.to_local() if hasattr(grad, "to_local") else grad
+                # ``DTensor._local_tensor`` is the actual ``torch.Tensor``
+                # backing the local shard -- always writable, always aliases
+                # grad's storage. ``to_local()`` only guarantees "the local
+                # component"; for ``Replicate`` / ``Partial`` placements after
+                # a redistribute it may legally return a fresh copy whose
+                # ``copy_`` would not propagate back. Today's shared-LoRA
+                # path uses ``Shard(dim=1)`` on the ``ep_fsdp`` mesh so
+                # ``to_local()`` happens to be a view, but pinning to
+                # ``_local_tensor`` makes the writability invariant explicit
+                # and future-proofs against placement changes.
+                local_storage = grad._local_tensor if isinstance(grad, DTensor) else grad
                 # NCCL all_reduce requires a contiguous buffer. When the local
-                # view is non-contiguous (e.g. ``Shard(d>0)`` with d>0 strided
-                # against a row-major global), allocate a temporary contiguous
-                # buffer, run the collective on it, and copy the SUM-reduced
-                # result back through the (possibly strided) view into grad's
-                # storage. The previous "make contiguous, then re-grab the
-                # non-contiguous view before all_reduce" pattern silently ran
-                # the collective on the original non-contiguous view, which
-                # either errors or, on newer NCCL, runs on an internal temp
-                # whose result was never written back to ``p.grad`` -- shared
-                # LoRA grads would silently drift across EP ranks.
-                if local.is_contiguous():
-                    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=ep_group)
+                # storage is non-contiguous (e.g. ``Shard(d>0)`` with d>0
+                # strided against a row-major global), allocate a temporary
+                # contiguous buffer, run the collective on it, and copy the
+                # SUM-reduced result back into the (possibly strided)
+                # underlying storage.
+                if local_storage.is_contiguous():
+                    dist.all_reduce(local_storage, op=dist.ReduceOp.SUM, group=ep_group)
                 else:
-                    buf = local.contiguous()
+                    buf = local_storage.contiguous()
                     dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=ep_group)
-                    local.copy_(buf)
+                    local_storage.copy_(buf)
 
             return _hook
 
