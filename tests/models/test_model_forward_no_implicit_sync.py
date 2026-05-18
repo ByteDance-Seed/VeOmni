@@ -177,33 +177,11 @@ CASES = [
 #   "algorithm-essential: ..."     accepted by design (EP dispatch
 #                                  sizes, variable per-rank counts).
 #
-# Current entries are all the same upstream HF method
-# ``_update_linear_attn_mask`` (called once per forward from
-# ``Qwen3_5{,Moe}Model.forward`` — production path, fires every step in
-# real Qwen3.5 since half its layers are linear_attention). Both Model
-# classes are MODIFIED CLASSes but ``_update_linear_attn_mask`` is not
-# in either's ``Methods patched`` list, so the line is HF-verbatim.
-# Per the two-axis rule (production + HF-verbatim → add an override
-# patch), it's tracked as ``HF-prod-pending-fix`` and the fix lives on
-# branch ``tingyang/fix/qwen3_5_key_fix``.
-_HF_PROD_PENDING_LINEAR_ATTN = (
-    "HF-prod-pending-fix: _update_linear_attn_mask runs unconditionally in "
-    "Qwen3_5{,Moe}Model.forward (no OpSlot above it). Two syncs: 0-D GPU "
-    "scalar `cache_position[0] > 0` in Python `if`, plus full-tensor "
-    "`torch.all(attention_mask == 1)`. Fix planned via patchgen "
-    "override_method on branch tingyang/fix/qwen3_5_key_fix."
-)
-_ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
-    "qwen3_5-text-eager": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_PROD_PENDING_LINEAR_ATTN,
-    },
-    "qwen3_5-text-fa2": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_PROD_PENDING_LINEAR_ATTN,
-    },
-    "qwen3_5_moe-text-fa2-fused": {
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _HF_PROD_PENDING_LINEAR_ATTN,
-    },
-}
+# Currently empty: the previous ``HF-prod-pending-fix`` entries for
+# ``_update_linear_attn_mask`` in qwen3_5 / qwen3_5_moe were cleared by
+# the override_method patch in this branch (the method is now
+# VeOmni-patched and host-side, no sync).
+_ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {}
 
 
 # torch's implicit-sync warning message; emitted by
