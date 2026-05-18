@@ -1519,7 +1519,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         # Modification: iterate t/h/w as Python ints, never as 0-D GPU scalars (which would make
         # `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)` and
         # `combined.expand(t, ...)` each force an implicit `.item()` — several host-device syncs per
-        # image; under `torch.cuda.set_sync_debug_mode` this loop was the single largest source of
+        # image; under `set_sync_debug_mode("warn")` this loop was the single largest source of
         # implicit syncs in the Qwen3.5-VL step). `Qwen3_5VisionModel.forward` now materializes the
         # one `grid_thw.tolist()` and shares it with both this helper and the `cu_seqlens` build, so
         # accept a list directly; fall back to `.tolist()` if a raw tensor is still passed in.
