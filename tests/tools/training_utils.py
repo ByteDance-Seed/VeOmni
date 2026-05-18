@@ -46,7 +46,7 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25_omni": {"rotary_pos_emb_implementation": "eager"},
-    # qwen2 / qwen3_moe v5 patched modeling declares OpSlots for
+    # qwen2 / qwen3_moe / llama3.1 v5 patched modeling declares OpSlots for
     # rotary_pos_emb and rms_norm but KERNEL_REGISTRY has no `npu`
     # KernelSpec for either — only `liger_kernel` (GPU). Pin both to
     # eager until NPU KernelSpecs are registered.
@@ -55,6 +55,10 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rotary_pos_emb_implementation": "eager",
     },
     "qwen3_moe": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "llama3.1": {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
