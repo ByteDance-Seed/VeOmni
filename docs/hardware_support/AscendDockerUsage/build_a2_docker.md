@@ -1,51 +1,84 @@
-# Ascend A3 Docker Image Build and Usage Guide
+# Ascend A2 Docker Image Build and Usage Guide
 
 ## Overview
-This guide provides step-by-step instructions for building and using the Ascend A3 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A3 accelerators.
+This guide provides step-by-step instructions for building and using the Ascend A2 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A2 accelerators.
+
+**Note**: Ascend A2 supports both x86 and ARM64 architectures, with different environment management approaches for each:
+- **x86 Architecture**: Uses `uv` for dependency management, requires virtual environment activation
+- **ARM64 Architecture**: Uses `pip` for dependency management, no virtual environment required
 
 ## Prerequisites
 - Docker installed on your system
-- Access to Ascend A3 hardware accelerators
+- Access to Ascend A2 hardware accelerators
 - Network access to pull the base image and install dependencies
 - Proxy configuration (if required in your environment)
 
 ## Step 1: Pull the Base Image
-First, pull the Huawei Ascend CANN base image. **Note: This image is for ARM64 architecture machines only.**
+First, pull the Huawei Ascend CANN base image. This image supports both x86 and ARM64 architectures.
 
 You can find the latest official Ascend CANN images at: [Ascend Hub](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)
 
 ```bash
-docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+# for arm
+docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
+
+# for x86
+docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
 ```
 
 ## Step 2: Build the Custom Image
-Build the VeOmni Ascend A3 image using the provided Dockerfile.
+Build the VeOmni Ascend A2 image using the appropriate Dockerfile for your architecture.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
 
+### For x86 Architecture
+
 ```bash
+# Optional proxy settings (remove if not needed)
 docker build \
-  # Optional proxy settings (remove if not needed)
   --build-arg http_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
-  -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3rc2_a3 \
+  -t ascend-a2-env:v1 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
   .
 ```
 
-Without proxy (simplified):
+### For ARM64 Architecture
+
+```bash
+# Optional proxy settings (remove if not needed)
+docker build \
+  --build-arg http_proxy=http://<user>:<pass>@<host>:<port> \
+  --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
+  --build-arg no_proxy=localhost,127.0.0.1 \
+  -t ascend-a2-env:v1 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
+  .
+```
+
+### Without proxy (simplified)
+
+For x86:
 ```bash
 docker build \
-  -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3rc2_a3 \
+  -t ascend-a2-env:v1 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
+  .
+```
+
+For ARM64:
+```bash
+docker build \
+  -t ascend-a2-env:v1 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
   .
 ```
 
 ### Image Components
 The built image includes:
 - Ubuntu 22.04 with Python 3.11
-- Ascend CANN 8.3.rc2 runtime
+- Ascend CANN 9.0.0 runtime
 - VeOmni framework with NPU support
 - TorchCodec for efficient video processing
 - All necessary development tools and dependencies
@@ -66,8 +99,8 @@ docker run --runtime=runc -it \
   -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
   -v /usr/local/Ascend/driver/tools:/usr/local/Ascend/driver/tools:ro \
   -v /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro \
-  --name ascend-a3-container \
-  ascend-a3-env:v1 \
+  --name ascend-a2-container \
+  ascend-a2-env:v1 \
   /bin/bash
 ```
 
@@ -124,16 +157,28 @@ docker run --runtime=runc -it \
   -v /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro \
   -v /path/to/your/checkpoints:/app/ckpt/:ro \
   -v /path/to/your/dataset:/app/dataset/:ro \
-  --name ascend-a3-container \
-  ascend-a3-env:v1 \
+  --name ascend-a2-container \
+  ascend-a2-env:v1 \
   /bin/bash
 ```
 
 ## Step 4: Run Training Inside the Container
-After starting the container with appropriate mounts, you can run training commands. Here's an example for Qwen3-VL training using generic paths:
+
+### Environment Activation (x86 Architecture Only)
+
+For x86 architecture, you need to activate the virtual environment created by `uv` before running training commands:
 
 ```bash
-bash train.sh tasks/deprecated_task/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+# Activate the virtual environment (x86 only)
+source /app/.venv/bin/activate
+```
+
+### Training Command Example
+
+After starting the container with appropriate mounts (and activating the environment for x86), you can run training commands. Here's an example for Qwen3-VL training using generic paths:
+
+```bash
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --model.model_path /app/ckpt/your-model-checkpoint \
     --data.train_path /app/dataset/your-dataset.json \
     --data.datasets_type iterable \
@@ -148,10 +193,19 @@ bash train.sh tasks/deprecated_task/train_qwen_vl.py configs/multimodal/qwen3_vl
 When you're done, stop and remove the container:
 
 ```bash
-docker stop ascend-a3-container && docker rm ascend-a3-container
+docker stop ascend-a2-container && docker rm ascend-a2-container
 ```
 
 ## Important Notes
+
+### Architecture Differences
+
+| Feature | x86 Architecture | ARM64 Architecture |
+|---------|-----------------|--------------------|
+| Dependency Manager | uv | pip |
+| Virtual Environment | Required | Not Required |
+| Activation Command | `source /app/.venv/bin/activate` | N/A |
+| Installation Command | `uv sync --locked --all-packages --extra npu --extra audio --dev` | `pip install -e .[npu_aarch64]` |
 
 ### Device Access
 The container requires access to all Ascend devices for proper functionality. The `--device` flags in the run command grant access to these devices.
@@ -166,10 +220,18 @@ The container requires access to all Ascend devices for proper functionality. Th
 Update the proxy settings in both the build and run commands to match your environment. Remove the proxy arguments if not needed.
 
 ### Dockerfile Details
-The Dockerfile performs the following operations:
+
+#### x86 Dockerfile (Dockerfile.ascend_9.0.0_a2)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
-3. Installs VeOmni framework with NPU support
+3. Installs and configures `uv` for dependency management
+4. Uses `uv` to install VeOmni framework with NPU support
+5. Sets up the virtual environment
+
+#### ARM64 Dockerfile (Dockerfile.ascend_9.0.0_a2.arm)
+1. Sets up the Ubuntu 22.04 base with Ascend CANN
+2. Configures system dependencies and development tools
+3. Uses `pip` to install VeOmni framework with NPU support
 4. Clones and builds TorchCodec for video processing
 5. Sets up the working environment
 
@@ -189,6 +251,10 @@ The Dockerfile performs the following operations:
 - Check network connectivity for pulling dependencies
 - Ensure sufficient disk space is available
 - Review the full build log for specific error messages
+
+### Environment Activation Issues (x86 Only)
+- If you encounter "command not found" errors, ensure you've activated the virtual environment with `source /app/.venv/bin/activate`
+- Verify the virtual environment directory exists at `/app/.venv/`
 
 ## Support
 For additional help, please refer to:

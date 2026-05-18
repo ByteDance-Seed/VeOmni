@@ -31,6 +31,15 @@ def clip_grad_norm(
             foreach=foreach,
         )
 
+    if getattr(model, "_fsdp_cpu_offload_enabled", False):
+        return _cpu_offload_fsdp2_clip_grad_norm(
+            model,
+            max_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=error_if_nonfinite,
+            foreach=foreach,
+        )
+
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.parameters(),
         max_norm,
@@ -41,6 +50,25 @@ def clip_grad_norm(
     if isinstance(grad_norm, DTensor):
         grad_norm = grad_norm.full_tensor()
     return grad_norm
+
+
+@torch.no_grad()
+def _cpu_offload_fsdp2_clip_grad_norm(
+    model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
+) -> torch.Tensor:
+    ps = get_parallel_state()
+    params = [p for p in model.parameters() if p.grad is not None]
+    total_norm_or_pth_sum = _fsdp2_reduce_group(
+        params=params,
+        norm_type=norm_type,
+        reduce_groups=[("fsdp", ps.fsdp_group)],
+    )
+    total_norm = _finalize_total_norm(total_norm_or_pth_sum, norm_type)
+    _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
+
+    torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=foreach)
+
+    return total_norm
 
 
 @torch.no_grad()
@@ -168,11 +196,14 @@ def extra_parallel_fsdp2_clip_grad_norm(
         for t in itertools.chain(extra_parallel_total.values(), extra_parallel_replicated_total.values()):
             total_norm = torch.maximum(total_norm, t)
     else:
-        total_norm = (
+        total_norm = _finalize_total_norm(
             non_extra_parallel_total
             + sum(extra_parallel_total.values())
-            + sum(extra_parallel_replicated_total.values())
-        ) ** (1.0 / float(norm_type))
+            + sum(extra_parallel_replicated_total.values()),
+            norm_type,
+        )
+
+    _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
 
     # Apply the same clip coefficient to all groups
     for para in ps.extra_parallel_names:
@@ -185,6 +216,23 @@ def extra_parallel_fsdp2_clip_grad_norm(
     return total_norm
 
 
+def _finalize_total_norm(total_norm_or_pth_sum: torch.Tensor, norm_type: float) -> torch.Tensor:
+    if math.isinf(norm_type):
+        return total_norm_or_pth_sum
+    return total_norm_or_pth_sum ** (1.0 / float(norm_type))
+
+
+def _raise_if_nonfinite(total_norm: torch.Tensor, norm_type: float, error_if_nonfinite: bool) -> None:
+    if not error_if_nonfinite:
+        return
+    if bool((~torch.isfinite(total_norm)).item()):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, "
+            "so it cannot be clipped. To disable this error and scale the gradients by the non-finite norm anyway, "
+            "set `error_if_nonfinite=False`"
+        )
+
+
 # compute local sum of param gard norm
 def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
     grads = [p.grad for p in params if p.grad is not None]
@@ -193,23 +241,23 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
         for g in grads
     ]
 
-    default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
-    res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
+    reduce_device = torch.device(get_device_type())
+    res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
     with torch.no_grad():
         grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
         for (device, _), ([device_grads_local], _) in grouped_grads_local.items():
             if _has_foreach_support(device_grads_local, device) or _device_has_foreach_support(device):
                 out = torch._foreach_pow_(torch._foreach_norm(device_grads_local, p), p)
-                res += torch.sum(torch.stack(out)).to(default_device)
+                res += torch.sum(torch.stack(out)).to(reduce_device)
             else:
                 for grad_local in device_grads_local:
                     gn = torch.norm(grad_local, p=p)
-                    res = res + (gn**p).to(default_device)
+                    res = res + (gn**p).to(reduce_device)
     return res
 
 
 def _local_max(params: List[torch.nn.Parameter]) -> torch.Tensor:
-    dev = None
+    reduce_device = torch.device(get_device_type())
     mx = None
     for q in params:
         g = q.grad
@@ -219,14 +267,12 @@ def _local_max(params: List[torch.nn.Parameter]) -> torch.Tensor:
             g_local = g.to_local()
         else:
             g_local = g
-        if dev is None:
-            dev = g_local.device
-            mx = torch.tensor(0.0, device=dev, dtype=torch.float32)
+        if mx is None:
+            mx = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
         gn = torch.max(torch.abs(g_local.detach().to(torch.float32)))
-        mx = torch.maximum(mx, gn)
+        mx = torch.maximum(mx, gn.to(reduce_device))
     if mx is None:
-        dev = torch.device(get_device_type())
-        mx = torch.tensor(0.0, device=dev, dtype=torch.float32)
+        mx = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
     return mx
 
 

@@ -292,6 +292,10 @@ class FSDPConfig:
         default=True,
         metadata={"help": "Enable forward prefetch."},
     )
+    offload: bool = field(
+        default=False,
+        metadata={"help": "Enable CPU offload for FSDP2."},
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
