@@ -1229,11 +1229,11 @@ def qwen2_5_omni_for_conditional_generation_init_patched(self, config):
     self.speaker_map = {}
     self.post_init()
     # --- Patch.2 ---
-    self._no_split_modules = {
+    self._no_split_modules = [
         "Qwen2_5OmniDecoderLayer",
         "Qwen2_5OmniVisionBlock",
         "Qwen2_5OmniAudioEncoderLayer",
-    }
+    ]
     # --- Patch.2 ---
 
     # --- Patch.3 ---

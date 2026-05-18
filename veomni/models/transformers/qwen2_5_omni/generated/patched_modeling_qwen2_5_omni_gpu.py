@@ -2518,11 +2518,11 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         self.speaker_map = {}
         self.post_init()
         # --- Patch.2 ---
-        self._no_split_modules = {
+        self._no_split_modules = [
             "Qwen2_5OmniDecoderLayer",
             "Qwen2_5OmniVisionBlock",
             "Qwen2_5OmniAudioEncoderLayer",
-        }
+        ]
         # --- Patch.2 ---
 
         # --- Patch.3 ---
