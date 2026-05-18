@@ -1,6 +1,6 @@
 ---
 name: veomni-migrate-transformers-v5
-description: "Use this skill when migrating an existing VeOmni model under veomni/models/transformers/<model>/ to the transformers v5 (patchgen + generated modeling) path — whether coexisting with v4 (qwen3/qwen3_moe style) or v5-only (qwen3_5/qwen3_5_moe/glm_moe_dsa style), GPU-only or GPU+NPU. Covers: creating <model>_{gpu,npu}_patch_gen_config.py, porting v4 patches to patchgen decorators (replace_class/override_method/replace_function/modify_init/add_post_import_block/drop_import_names), reusing sibling-model patches via name_map, handling MoE weight-loading (CheckpointTensorConverter + fused gate_up_proj layout), multimodal/VLM forward with Ulysses SP, selecting the right __init__.py pattern and min-transformers-version gate, running codegen, and adding v5 test cases. Trigger: 'migrate model to transformers v5', 'port <model> to v5', 'add v5 patchgen for <model>', 'transformers v5 migration', 'convert monkey patch to patchgen', 'add NPU patchgen'. Do NOT edit files under generated/ manually — always regenerate via patchgen."
+description: "Use this skill when migrating an existing VeOmni model under veomni/models/transformers/<model>/ to the transformers v5 (patchgen + generated modeling) path — whether coexisting with v4 (qwen3/qwen3_moe/qwen2_5_omni style) or v5-only (qwen3_5/qwen3_5_moe/glm_moe_dsa style), GPU-only or GPU+NPU, dense or MoE, text-only / VLM / Omni-thinker+talker. Covers: creating <model>_{gpu,npu}_patch_gen_config.py, porting v4 patches to patchgen decorators (replace_class/override_method/replace_function/modify_init/add_post_import_block/drop_import_names), reusing sibling-model patches via name_map, handling MoE weight-loading (CheckpointTensorConverter + fused gate_up_proj layout), multimodal/VLM forward with Ulysses SP, excluding speech/vocoder subtrees in Omni models (talker/token2wav/DiT/BigVGAN), selecting the right __init__.py pattern and min-transformers-version gate, running codegen, and adding v5 test cases. Trigger: 'migrate model to transformers v5', 'port <model> to v5', 'add v5 patchgen for <model>', 'transformers v5 migration', 'convert monkey patch to patchgen', 'add NPU patchgen'. Do NOT edit files under generated/ manually — always regenerate via patchgen."
 ---
 
 # VeOmni Transformers v5 Migration Protocol
@@ -37,6 +37,10 @@ Scenarios differ by *v4-coexistence* vs *v5-only* — pick the closest example:
   - `__init__.py` — registry dispatch on transformers version; v4 branch keeps the monkey patch, v5 branch branches on `IS_NPU_AVAILABLE` between `patched_modeling_qwen3_vl_{gpu,npu}`.
   - `qwen3_vl_gpu_patch_gen_config.py` — full VLM forward with Ulysses SP, async Ulysses text attention, deepstack, precomputed mrope via `get_position_id_func`, and a SP-aware `dummy_forward`.
   - `qwen3_vl_npu_patch_gen_config.py` — demonstrates the **NPU-inherits-GPU** pattern: a thin NPU config that extends `gpu_config.helpers` / `gpu_config.post_import_blocks` / `gpu_config.additional_imports` and only overrides RMSNorm / rotary with `torch_npu.npu_rms_norm` / `torch_npu.npu_rotary_mul`. Avoids duplicating ~1K lines of shared VLM SP/deepstack patches.
+- **v4↔v5 coexist, Omni (thinker+talker subtree, non-MoE)** — `veomni/models/transformers/qwen2_5_omni/`
+  - `__init__.py` — Pattern B with the `"5.2.0"` gate. The v5 branch imports `Qwen2_5OmniForConditionalGeneration` / `Qwen2_5OmniThinkerForConditionalGeneration` from the generated module **and** `Qwen2_5OmniTalkerModel` / `Qwen2_5OmniTalkerForConditionalGeneration` directly from `transformers.models.qwen2_5_omni.modeling_qwen2_5_omni` (talker classes are excluded from the generated file but the registry still needs to return them when `architecture` mentions `Talker...`). The v4 branch keeps the old `apply_veomni_qwen25omni_patch()` monkey patch. `MODEL_CONFIG_REGISTRY` no longer raises on v5 — it just applies the `tie_word_embeddings=False` config patch on both branches.
+  - `qwen2_5_omni_gpu_patch_gen_config.py` — the canonical **non-MoE Omni** template. Same shape as qwen3_omni_moe (excludes talker + token2wav + DiT + BigVGAN subtrees, overrides `_init_weights` to drop excluded `UpSample1d`/`DownSample1d` branches, overrides `ForConditionalGeneration.__init__` to force `has_talker=False` and pin `_no_split_modules={DecoderLayer, VisionBlock, AudioEncoderLayer}`, registers a load-state-dict pre-hook to strip `talker.*`/`token2wav.*` keys, overrides `enable_talker`/`generate` to raise `NotImplementedError`, and forwards `ForConditionalGeneration.forward` to thinker only) **minus** all MoE/EP machinery (no `replace_class("…Experts")`, no `parallel_plan.py`, no `checkpoint_tensor_converter.py`). Thinker uses `Qwen2_5OmniThinkerCausalLMOutputWithLogProbs` from `veomni.utils.model_outputs` to carry `log_probs`/`entropy` as constructor fields (same FSDP2 unshard-hook rationale as qwen3_omni_moe). Audio encoder uses 1D convs (`conv1`/`conv2`) — pull dummy-forward dtype from `self.conv1.weight.dtype`, not `self.conv2d1` (that's qwen3_omni_moe-specific).
+  - **No `parallel_plan.py` / no `checkpoint_tensor_converter.py`** — qwen2.5-Omni's thinker text model is dense (Qwen2-class MLP, not MoE), so neither EP nor fused-expert weight conversion applies. If you start from the qwen3_omni_moe template and forget to delete these, you'll get import errors from dangling references.
 - **v4↔v5 coexist, VLM + MoE + GPU+NPU** — `veomni/models/transformers/qwen3_vl_moe/`
   - `__init__.py` — Pattern B with three classes: `_create_checkpoint_tensor_converter` attached as `staticmethod` on `Qwen3VLMoeForConditionalGeneration`, `Qwen3VLMoeModel`, **and** `Qwen3VLMoeTextModel` (the inner text submodel is also loadable standalone and must carry the converter).
   - `qwen3_vl_moe_gpu_patch_gen_config.py` — minimal config that imports *most* VLM SP / deepstack / async-Ulysses / dummy_forward patches from `qwen3_vl` via `name_map={"Qwen3VL": "Qwen3VLMoe"}`, and only writes MoE-specific deltas: `replace_class("Qwen3VLMoeExperts")` with fused layout, `override_method("Qwen3VLMoeModel.__init__")` to propagate `_moe_implementation` into `config.text_config`, a hand-cloned `Qwen3VLMoeModel.forward` (see below), `Qwen3VLMoeForConditionalGeneration.forward` with fused loss + aux_loss, and `get_parallel_plan`. This is the canonical template for any new VLM+MoE migration. **Exception — do NOT reuse `Model.forward` via name_map**: `Qwen3VLMoeModelOutputWithPast` carries an extra `router_logits` field absent from the dense `Qwen3VLModelOutputWithPast`; rewriting class names at the AST level keeps the dense constructor's argument list, silently dropping `router_logits` and collapsing MoE routing. Clone the forward body and hand-author the return.
@@ -105,6 +109,13 @@ Things to watch for in that diff:
 
 - New/removed `@can_return_tuple`, `@capture_outputs`, `@merge_with_config_defaults`,
   `@auto_docstring` decorators → affects behavior of your `override_method`.
+  When you `override_method` on a `@auto_docstring`-decorated method, **every
+  parameter you declare in the new signature must also appear in the patched
+  docstring's `Args:` block** — otherwise `auto_docstring` will emit warnings
+  at import time about "undocumented parameter". For Omni-style overrides that
+  add params like `audio_feature_lengths`, `feature_lens`, `aftercnn_lens`,
+  `rope_deltas`, `image_grid_thw`, `video_grid_thw`, etc., copy the original
+  upstream docstring and append minimal one-line entries for every new param.
 - Method signature churn: e.g. `get_placeholder_mask` in v5 takes
   `inputs_embeds` + `image_features` / `video_features`; v4 did not.
 - Return-shape churn: e.g. v5 `get_{image,video}_features` `.pooler_output` is
@@ -181,6 +192,7 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
    - Text-only LLM → reference `qwen3/`
    - MoE → reference `qwen3_moe/` (plus converter work in Phase 3)
    - VLM / Omni MoE → reference `qwen3_5_moe/` (multimodal forward + SP scatter, ViT dummy forward, Flash-attn kwargs popping, `get_position_id_func`)
+   - Omni (non-MoE thinker + speech subtree to exclude) → reference `qwen2_5_omni/` (audio/vision SP + dummy_forward, talker/token2wav/BigVGAN exclusion, `log_probs`/`entropy` output dataclass, no parallel_plan/converter)
 7. Check transformers v5 upstream source (`from transformers.models.<m> import modeling_<m>`).
    Confirm class/function names still exist; MoE expert layouts especially diverge
    between sibling models — see `transformers_v5_moe_weight_loading.md`.
@@ -251,11 +263,39 @@ or `import` will fail on the regenerated output:
   private helpers and add them to `exclude_from_output` too. Example:
   `SnakeBeta` is only referenced by `Qwen3OmniMoeCode2WavDecoderResidualUnit`;
   excluding Code2Wav without also excluding `SnakeBeta` leaves ~40 lines of
-  dead code in `generated/`.
+  dead code in `generated/`. For qwen2_5_omni's BigVGAN vocoder,
+  `UpSample1d`/`DownSample1d` are referenced **both** by Token2Wav residual
+  blocks (caught by exclusion) **and** by the base `_init_weights` method
+  via `isinstance` checks (NOT caught — `ast.walk` doesn't trace
+  `isinstance` strings). After excluding the speech subtree, always
+  `rg "isinstance\(.*<excluded_class>" generated/` and override the methods
+  that still reference excluded names.
+- **`_init_weights` referencing excluded classes** — base `PreTrainedModel._init_weights`
+  often has `isinstance(module, <SpeechHeadClass>)` / `<UpSample1d>` /
+  `<SnakeBeta>` branches that init excluded modules. These do not generate a
+  patchgen warning but explode at first model build with `NameError: name 'X'
+  is not defined` (ruff also flags as `F821`). Always override `_init_weights`
+  to drop branches that touch excluded classes — see qwen2_5_omni's override
+  that strips `UpSample1d`/`DownSample1d` branches.
+- **Upstream `generate()` with mutable default arg** — Omni models like
+  qwen2_5_omni define `generate(..., talker_eos_token_id: list[int] = [8292, 8294], ...)`
+  which `ruff B006` rejects when copied verbatim into the generated file.
+  Since the speech path is excluded anyway, override `<M>ForConditionalGeneration.generate`
+  to raise `NotImplementedError("...generate is disabled in the VeOmni
+  training modeling (talker / token2wav are excluded). Use upstream
+  transformers for TTS generation.")`. This double-serves to kill the lint
+  and make the contract explicit.
 
-See `qwen3_omni_moe_gpu_patch_gen_config.py` for the canonical template
-(excludes the whole talker + code2wav subtree plus the dead-after-exclusion
-`SnakeBeta` activation, overrides `_init_weights` and `enable_talker`).
+See `qwen3_omni_moe_gpu_patch_gen_config.py` (MoE thinker) and
+`qwen2_5_omni_gpu_patch_gen_config.py` (dense thinker) for the canonical
+templates. Both exclude the whole speech subtree plus the dead-after-exclusion
+activations (`SnakeBeta` for qwen3_omni_moe; `UpSample1d`/`DownSample1d` for
+qwen2_5_omni's BigVGAN), override `_init_weights` to drop the excluded-module
+branches, override `enable_talker` to raise, and (for qwen2_5_omni) also
+override `ForConditionalGeneration.generate` to raise `NotImplementedError`
+— upstream's `generate(...)` signature has a mutable default arg
+(`talker_eos_token_id: list[int] = [...]`) that trips `ruff B006` in the
+generated file, and the TTS path is excluded anyway.
 
 **Cross-config reuse pattern** (qwen3_5_moe reusing qwen3_5):
 
@@ -904,10 +944,16 @@ Extra e2e gotchas:
   text-only rank crashes with "Input type (float) and bias type
   (c10::BFloat16) should be the same", while the multimodal rank hangs on the
   collective — masquerading as an NCCL hang. Always look up dtype from a live
-  parameter at call time (e.g. `dtype = self.conv2d1.weight.dtype`,
-  `dtype = self.patch_embed.proj.weight.dtype`) and don't cache dummy tensors
-  across calls. See `qwen3_omni_moe_gpu_patch_gen_config.py`'s audio / vision
-  `dummy_forward` patches.
+  parameter at call time and don't cache dummy tensors across calls. The
+  exact attribute is **model-specific** and copy-pasting the wrong one is a
+  classic-silently-broken bug:
+  - qwen3_omni_moe audio: `dtype = self.conv2d1.weight.dtype` (2D conv front-end)
+  - qwen2_5_omni audio: `dtype = self.conv1.weight.dtype` (1D conv front-end —
+    qwen3_omni_moe-style `conv2d1` does not exist on this model)
+  - qwen2_5_omni / qwen3_omni_moe vision: `dtype = self.patch_embed.proj.weight.dtype`
+  See the audio / vision `dummy_forward` patches in
+  `qwen2_5_omni_gpu_patch_gen_config.py` and
+  `qwen3_omni_moe_gpu_patch_gen_config.py`.
 - **FSDP2 "hang" may be a rank-asymmetric crash** — when one rank crashes
   inside a collective-spanning forward (dtype mismatch, shape mismatch,
   unexpected `None`), the surviving ranks block on the never-completing
@@ -938,6 +984,19 @@ Extra e2e gotchas:
   via `override_method` on a synthetic class (e.g.
   `LlamaForSequenceClassification`), verify the generated file imports cleanly
   before declaring victory.
+- **`TypeError: expected string or buffer` when manually exercising
+  `MODEL_CONFIG_REGISTRY` before `MODELING_REGISTRY` (Omni models with patched
+  configs)** — calling `MODEL_CONFIG_REGISTRY.get("<m>")()` *before*
+  `MODELING_REGISTRY.get("<m>")()` causes the config-registration monkey patch
+  to fire first; transformers' `@auto_docstring` then tries to read the patched
+  config class's source via `CONFIG_MAPPING` and gets a live Python object
+  instead of a source string. This blows up inside upstream
+  `transformers/utils/auto_docstring.py`. **Not a real bug** — the natural model
+  build order (`build_foundation_model_from_config(...)` → `MODELING_REGISTRY`
+  first, which imports modeling and triggers the config import transitively)
+  hits the right order and the error never fires. Only matters if your smoke
+  test calls the registries directly in the wrong order. Confirmed on
+  qwen2_5_omni / qwen3_omni_moe.
 - **New v5 text/MoE models silently fail on NPU CI with `KeyError: "Unknown
   kernel 'npu' for op='rotary_pos_emb'/'rms_norm'"`** — the new `KERNEL_REGISTRY`
   (used by the OpSlot path in patchgen-generated modeling) registers only the
@@ -955,9 +1014,12 @@ Extra e2e gotchas:
   },
   ```
   Match the `model_name` exactly to the key used in `test_e2e_parallel.py`'s
-  parametrize (e.g. `"qwen2"`, `"qwen3_moe"`, `"llama3.1"`). Skipping this step
-  is the canonical "I migrated the model and GPU CI is green but NPU CI explodes
-  at model build" symptom.
+  parametrize (e.g. `"qwen2"`, `"qwen3_moe"`, `"llama3.1"`, `"qwen2_5_omni"`).
+  Skipping this step is the canonical "I migrated the model and GPU CI is
+  green but NPU CI explodes at model build" symptom. Multimodal/Omni models
+  often need the override on **both** `rms_norm_implementation` and
+  `rotary_pos_emb_implementation` because the audio/vision encoders pull the
+  same OpSlots as the text tower.
 - **`pytest -k` mismatch on e2e** — `test_e2e_parallel.py` uses the first
   positional arg (`model_name`) as id, not the registry `<m>` id. For VL
   models that's the HF short name (`qwen25vl`, `qwen3vl`, `qwen3vlmoe`, …),

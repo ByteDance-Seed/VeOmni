@@ -147,9 +147,12 @@ Additional per-directory helpers:
 | MoE implementation | `eager`, `fused` (MoE models only) |
 | Liger kernel | `True`, `False` (VeOmni only) |
 
-**Models covered**:
-- Transformers v4: llama3.1, qwen2.5, qwen3, qwen3_moe, seed_oss, deepseek_v3, qwen2vl, qwen2.5vl, qwen3vl, qwen3vlmoe, qwen2.5_omni, qwen3_omni_moe
-- Transformers v5: qwen3_5, qwen3_5_moe, qwen2vl (v5)
+**Models covered** (transformers v5 only — the v4 monkey-patch lane was
+retired together with the v4 CI; v4-only models that have not yet been
+migrated to patchgen are not exercised here):
+- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3
+- VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
+- Omni: qwen2_5_omni, qwen3_omni_moe
 
 **GPU**: 1 GPU, runs serially per model mode.
 
@@ -159,7 +162,7 @@ Additional per-directory helpers:
 
 **Purpose**: Smoke test that `freeze_vit=True/False` correctly freezes/unfreezes the vision tower.
 
-**Models**: qwen2vl, qwen2.5vl, qwen3vl (v4); qwen3_5 (v5)
+**Models** (transformers v5 only): qwen2_vl, qwen3_5, qwen3_5_moe, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 
 **GPU**: CPU only (builds model but no forward pass).
 
@@ -209,7 +212,9 @@ Additional per-directory helpers:
 
 **Purpose**: Verify that asymmetric multimodal batches (some ranks text-only, others with images/video/audio) don't cause NCCL hangs under FSDP2. Tests that `dummy_forward()` is correctly invoked so all ranks participate in FSDP collectives.
 
-**Models**: VLM (qwen3_vl, qwen2_vl, qwen2.5_vl); Omni (qwen2.5_omni, qwen3_omni_moe)
+**Models** (all `_v5_only` — the legacy v4 lane was retired):
+- VLM: qwen2_5_vl, qwen3_vl, qwen3_vl_moe
+- Omni: qwen2_5_omni, qwen3_omni_moe
 
 **GPU**: 2 GPUs.
 
