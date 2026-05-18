@@ -29,11 +29,29 @@ class QwenImageConditionModel(PreTrainedModel):
         self.vae = None
         self.scheduler = None
         self._timesteps_ready = False
+        self._timesteps_image_seq_len: int | None = None
         self.meta_init = meta_init
         self.seed = config.seed
         self.generator = torch.Generator(device=torch.device(get_device_type()))
         self.generator.manual_seed((self.seed or 0) + get_parallel_state().dp_rank)
         self._load_components()
+
+    @staticmethod
+    def _calculate_shift(
+        image_seq_len: int,
+        base_seq_len: int = 256,
+        max_seq_len: int = 4096,
+        base_shift: float = 0.5,
+        max_shift: float = 1.15,
+    ) -> float:
+        if max_seq_len == base_seq_len:
+            raise ValueError(
+                "FlowMatchEulerDiscreteScheduler config has equal base_image_seq_len and "
+                f"max_image_seq_len (={base_seq_len}); cannot derive dynamic-shift `mu`."
+            )
+        m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+        b = base_shift - m * base_seq_len
+        return image_seq_len * m + b
 
     @property
     def _execution_device(self):
@@ -244,9 +262,34 @@ class QwenImageConditionModel(PreTrainedModel):
         encoder_hidden_states_mask_list = self._as_list(encoder_hidden_states_mask, len(latents_list))
         img_shapes_list = self._as_list(img_shapes, len(latents_list))
 
-        if not self._timesteps_ready:
-            self.scheduler.set_timesteps(self.config.num_train_timesteps, device=self.generator.device)
+        image_seq_len = int(latents_list[0].shape[1])
+        for idx, sample_latents in enumerate(latents_list[1:], start=1):
+            if int(sample_latents.shape[1]) != image_seq_len:
+                # ``mu`` shifts the FlowMatchEulerDiscreteScheduler schedule based on the
+                # packed image sequence length; a single ``set_timesteps`` call therefore
+                # encodes one resolution. Mixing packed lengths in one micro-batch would
+                # silently train later samples against the wrong schedule.
+                raise ValueError(
+                    "Qwen-Image condition expects all samples in a micro-batch to share the "
+                    f"same packed image sequence length; got {image_seq_len} at index 0 and "
+                    f"{int(sample_latents.shape[1])} at index {idx}."
+                )
+        if (not self._timesteps_ready) or (self._timesteps_image_seq_len != image_seq_len):
+            scheduler_cfg = self.scheduler.config
+            mu = self._calculate_shift(
+                image_seq_len,
+                scheduler_cfg.get("base_image_seq_len", 256),
+                scheduler_cfg.get("max_image_seq_len", 4096),
+                scheduler_cfg.get("base_shift", 0.5),
+                scheduler_cfg.get("max_shift", 1.15),
+            )
+            self.scheduler.set_timesteps(
+                self.config.num_train_timesteps,
+                device=self.generator.device,
+                mu=mu,
+            )
             self._timesteps_ready = True
+            self._timesteps_image_seq_len = image_seq_len
 
         packed_conditions: dict[str, list[Any]] = {
             "hidden_states": [],

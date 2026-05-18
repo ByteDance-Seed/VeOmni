@@ -106,6 +106,8 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         guidance_list = self._as_list(guidance, sample_count)
         additional_t_cond_list = self._as_list(additional_t_cond, sample_count)
 
+        param_dtype = self.dtype
+
         per_sample_losses = []
         predictions = []
         for (
@@ -127,6 +129,8 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
             guidance_list,
             additional_t_cond_list,
         ):
+            sample_hs = sample_hs.to(dtype=param_dtype)
+            sample_enc_hs = sample_enc_hs.to(dtype=param_dtype)
             prediction = _QwenImageTransformer2DModel.forward(
                 self,
                 hidden_states=sample_hs,
