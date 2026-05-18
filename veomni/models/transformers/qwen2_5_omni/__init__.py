@@ -23,9 +23,8 @@ def register_qwen2_5_omni_config():
     # the default True, which would drive post_process_after_weight_loading
     # into an unresolvable get_input_embeddings fallback. See
     # configuration_qwen2_5_omni.py for the full rationale.
-    from .configuration_qwen2_5_omni import Qwen2_5OmniConfig, apply_veomni_qwen25_omni_patch
+    from .configuration_qwen2_5_omni import Qwen2_5OmniConfig
 
-    apply_veomni_qwen25_omni_patch()
     return Qwen2_5OmniConfig
 
 
@@ -63,7 +62,6 @@ def register_qwen2_5_omni_processor():
     # modalities, while upstream's signature is `audio=` (singular) with
     # `if audio is not None` checks. These are data-format patches, independent
     # of transformers version.
-    from .processing_qwen2_5_omni import Qwen2_5OmniProcessor, apply_veomni_qwen25_omni_patch
+    from .processing_qwen2_5_omni import Qwen2_5OmniProcessor
 
-    apply_veomni_qwen25_omni_patch()
     return Qwen2_5OmniProcessor

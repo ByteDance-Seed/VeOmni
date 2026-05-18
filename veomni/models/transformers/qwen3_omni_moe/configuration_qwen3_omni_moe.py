@@ -14,7 +14,6 @@
 # limitations under the License.
 
 
-import transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe as hf_qwen3_omni_moe
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeConfig as _Qwen3OmniMoeConfig,
 )
@@ -33,10 +32,6 @@ class Qwen3OmniMoeConfig(_Qwen3OmniMoeConfig):
         """
         kwargs.pop("tie_word_embeddings", None)
         super().__init__(tie_word_embeddings=False, **kwargs)
-
-
-def apply_veomni_qwen3_omni_moe_patch():
-    hf_qwen3_omni_moe.Qwen3OmniMoeConfig = Qwen3OmniMoeConfig
 
 
 __all__ = ["Qwen3OmniMoeConfig"]

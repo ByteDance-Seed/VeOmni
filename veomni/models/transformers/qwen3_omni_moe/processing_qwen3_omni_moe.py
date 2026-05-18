@@ -19,7 +19,6 @@ Processor class for Qwen3OmniMoe.
 import re
 
 import numpy as np
-import transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe as hf_qwen3_omni_moe
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor as _Qwen3OmniMoeProcessor,
@@ -209,10 +208,6 @@ class Qwen3OmniMoeProcessor(_Qwen3OmniMoeProcessor):
             sample = sample.replace("<|video_placeholder|>", self.video_token)
             processed_text.append(sample)
         return processed_text
-
-
-def apply_veomni_qwen3_omni_moe_patch():
-    hf_qwen3_omni_moe.Qwen3OmniMoeProcessor = Qwen3OmniMoeProcessor
 
 
 __all__ = ["Qwen3OmniMoeProcessor"]

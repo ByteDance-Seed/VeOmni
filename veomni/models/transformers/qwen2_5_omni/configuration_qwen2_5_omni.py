@@ -14,7 +14,6 @@
 # limitations under the License.
 
 
-import transformers.models.qwen2_5_omni.configuration_qwen2_5_omni as hf_qwen25omni
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniConfig as _Qwen2_5OmniConfig
 
 
@@ -25,10 +24,6 @@ class Qwen2_5OmniConfig(_Qwen2_5OmniConfig):
     ):
         kwargs.pop("tie_word_embeddings", None)
         super().__init__(tie_word_embeddings=False, **kwargs)
-
-
-def apply_veomni_qwen25_omni_patch():
-    hf_qwen25omni.Qwen2_5OmniConfig = Qwen2_5OmniConfig
 
 
 __all__ = ["Qwen2_5OmniConfig"]

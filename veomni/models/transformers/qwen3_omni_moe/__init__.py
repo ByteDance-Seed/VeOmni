@@ -23,9 +23,8 @@ def register_qwen3_omni_moe_config():
     # True, which would drive post_process_after_weight_loading into an
     # unresolvable get_input_embeddings fallback. See
     # configuration_qwen3_omni_moe.py for the rationale.
-    from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig, apply_veomni_qwen3_omni_moe_patch
+    from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 
-    apply_veomni_qwen3_omni_moe_patch()
     return Qwen3OmniMoeConfig
 
 
@@ -75,7 +74,6 @@ def register_qwen3_omni_moe_processor():
     # modalities, while upstream's signature is `audio=` (singular) with
     # `if audio is not None` checks. These are data-format patches, independent
     # of transformers version.
-    from .processing_qwen3_omni_moe import Qwen3OmniMoeProcessor, apply_veomni_qwen3_omni_moe_patch
+    from .processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
 
-    apply_veomni_qwen3_omni_moe_patch()
     return Qwen3OmniMoeProcessor
