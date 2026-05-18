@@ -37,6 +37,7 @@ from transformers.utils import TransformersKwargs
 from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 config = PatchConfig(
@@ -54,6 +55,7 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 # ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
 config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
 config.drop_import_names("MoeCausalLMOutputWithPast")
+config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 
 config.add_post_import_block(
     """
@@ -333,7 +335,12 @@ def qwen3_moe_forcausallm_forward_patched(
             # returns (loss, logits, log_probs, entropy); unpack to match the
             # OpSlot branch above.
             loss, logits, log_probs, entropy = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
             )
     else:
         logits = self.lm_head(hidden_states)
@@ -379,3 +386,35 @@ def qwen3_moe_get_parallel_plan_patched(self):
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
+
+
+@config.override_method(
+    "Qwen3MoeSparseMoeBlock.forward",
+    description="Call maybe_replay_indices so RL frameworks can record / replay MoE routing decisions",
+)
+def qwen3_moe_sparse_moe_block_forward_patched(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+    router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+    # MoE router replay: when an RL framework has installed a manager via
+    # ``set_active_replay``, the manager may substitute ``selected_experts``
+    # with previously recorded target indices. The manager's sole
+    # responsibility is choosing indices; all model-specific post-topk
+    # weight math (softmax recompute, gather, renorm, dtype cast) is
+    # replicated here so the cross-framework controller stays
+    # model-agnostic. After upstream #715, ``Qwen3MoeTopKRouter`` returns
+    # pre-softmax ``router_logits`` for HF's load_balancing_loss_func
+    # consistency and discards its internal post-softmax matrix after
+    # top-k, so we recompute ``softmax`` here to feed the RR contract.
+    # The guarded block runs only when a manager is installed — the
+    # default training path pays zero extra compute.
+    if get_active_replay() is not None:
+        target_dtype = routing_weights.dtype
+        routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
+        routing_weights = routing_scores.gather(1, selected_experts)
+        if self.gate.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+        routing_weights = routing_weights.to(target_dtype)
+    final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+    return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)

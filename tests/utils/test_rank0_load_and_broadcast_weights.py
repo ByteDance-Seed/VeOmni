@@ -191,9 +191,23 @@ def _write_checkpoint(checkpoint_dir: Path, is_parallel: bool) -> str:
 def _clone_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
     if DTensor is not None and isinstance(tensor, DTensor):
         assert Replicate is not None
+        local_tensor = tensor.to_local()
+        if local_tensor.device.type == "cpu":
+            mesh_device_type = tensor.device_mesh.device_type
+            if mesh_device_type == "cpu":
+                raise RuntimeError("CPU DTensor gather is not supported in this test helper.")
+            tensor = tensor.to(mesh_device_type)
         placements = [Replicate()] * tensor.device_mesh.ndim
         tensor = tensor.redistribute(tensor.device_mesh, placements).to_local()
     return tensor.detach().cpu().clone()
+
+
+def _assert_model_parameters_on_device(model: nn.Module, expected_device_type: str) -> None:
+    for name, param in model.named_parameters():
+        local_param = param.to_local() if DTensor is not None and isinstance(param, DTensor) else param
+        assert local_param.device.type == expected_device_type, (
+            f"Expected {name} to be on {expected_device_type}, got {local_param.device.type}."
+        )
 
 
 def run_rank0_broadcast_test(args: Arguments) -> None:
@@ -221,6 +235,8 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
     dtensor_factory = distribute_tensor if distribute_tensor is not None else None
     if dtensor_factory is None:
         raise RuntimeError("torch.distributed.tensor.distribute_tensor is required for fsdp2 weight loading test")
+    dtensor_to_cpu = args.train.accelerator.fsdp_config.offload
+    load_device = "cpu" if dtensor_to_cpu else get_device_type()
 
     try:
         rank0_load_model = ToyMoeAndEmbedModel()
@@ -262,6 +278,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
             init_device=args.train.init_device,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=False,
+            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=[],
             broadcast_model_weights_from_rank0=True,
         )
@@ -274,7 +291,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         rank0_load_and_broadcast_weights(
             rank0_load_model,
             str(weights_path),
-            init_device=get_device_type(),
+            init_device=load_device,
             dtensor_factory=dtensor_factory,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=0.0,
@@ -287,6 +304,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
             init_device=args.train.init_device,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=False,
+            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=[],
             broadcast_model_weights_from_rank0=False,
         )
@@ -295,9 +313,12 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         load_model_weights(
             all_rank_load_model,
             str(weights_path),
-            init_device=get_device_type(),
+            init_device=load_device,
             dtensor_factory=dtensor_factory,
         )
+        if dtensor_to_cpu:
+            _assert_model_parameters_on_device(rank0_load_model, "cpu")
+            _assert_model_parameters_on_device(all_rank_load_model, "cpu")
         torch.testing.assert_close(
             rank0_load_model.get_input_embeddings().weight,
             all_rank_load_model.get_input_embeddings().weight,
@@ -379,7 +400,8 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
-def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: bool) -> None:
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=True)
 
@@ -408,6 +430,8 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path) -> None:
         f"--test.backend={get_dist_comm_backend()}",
         "--test.mode=broadcast",
     ]
+    if cpu_offload:
+        command.append("--train.accelerator.fsdp_config.offload=True")
 
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
@@ -452,6 +476,7 @@ def run_load_weights_test(args: Arguments) -> None:
             init_device=args.train.init_device,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=False,
+            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=[],
         )
         """
@@ -478,6 +503,9 @@ def run_load_weights_test(args: Arguments) -> None:
         reference_model = ToyModel().to(get_device_type())
         load_model_weights(reference_model, str(weights_path), init_device=get_device_type())
         reference_model = reference_model.cpu()
+
+        if args.train.accelerator.fsdp_config.offload:
+            _assert_model_parameters_on_device(fsdp_model, "cpu")
 
         torch.testing.assert_close(
             _clone_to_cpu(fsdp_model.get_input_embeddings().weight),
@@ -539,7 +567,8 @@ def run_load_weights_test(args: Arguments) -> None:
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
-def test_load_weights_no_scatter(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     """
     Regression test for https://github.com/ByteDance-Seed/VeOmni/issues/637.
 
@@ -571,6 +600,8 @@ def test_load_weights_no_scatter(tmp_path: Path) -> None:
         f"--test.backend={get_dist_comm_backend()}",
         "--test.mode=load_weights",
     ]
+    if cpu_offload:
+        command.append("--train.accelerator.fsdp_config.offload=True")
 
     result = subprocess.run(command, check=True)
     assert result.returncode == 0

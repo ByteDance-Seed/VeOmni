@@ -35,70 +35,38 @@ permissions:
 env:
   IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
   NCCL_DEBUG: "WARN"
+  # uv's default 30s timeout is too short for the ~617 MiB
+  # nvidia-cudnn-cu12 wheel on the CN runners; bump to 5 min so a
+  # transient slow link doesn't fail the whole sync.
+  UV_HTTP_TIMEOUT: "300"
+  # qwen3_5's full 248K vocab embedding fragments the PyTorch allocator
+  # on the L20 (9+ GiB ends up reserved-but-unallocated, OOMing the
+  # next 2.4 GiB request). Expandable segments coalesce the free
+  # blocks so the toy e2e fits the 44 GiB card.
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # Disable UCX's signal-handler chain — see gpu_unit_tests.yml for
+  # rationale (NCCL's RDMA plugin pulls in libucs, whose SIGSEGV
+  # handler trips libnvidia-ptxjitcompiler.so.1 on rank teardown).
+  UCX_HANDLE_ERRORS: "none"
 
 jobs:
   lint:
     uses: ./.github/workflows/check_pr_lint.yml
 
-  # gpu_e2e_tests_v4 and gpu_e2e_tests_v5 run in parallel on separate l20-8
-  # runners. They share identical runner/container/env config; only the
-  # dependency sync (transformers stable vs. transformers5-exp) and the test
-  # set differ. Keep the two jobs in sync when modifying shared parts.
-
-  gpu_e2e_tests_v4:
-    if: github.repository_owner == 'ByteDance-Seed'
-    needs: lint
-    # Self-hosted L20-8 fleet managed by github_runner/ (ansible). See
-    # github_runner/README.md for the full label scheme.
-    runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60 # Increase this timeout value as needed
-    container:
-      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
-      volumes:
-        # Shared CI asset NFS (see gpu_unit_tests.yml for details).
-        - /mnt/veomni_ci:/mnt/veomni_ci:ro
-      options: >-
-        --gpus all
-        --ipc host
-        --shm-size 32g
-    env:
-      # hf-mirror is a safety net; actual model data should come from the NFS
-      # share via CI_HF_MODELS_DIR (see tests/tools/__init__::hf_local_or_remote).
-      NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
-      HF_ENDPOINT: "https://hf-mirror.com"
-      HF_HUB_ENABLE_HF_TRANSFER: "0" # hf-mirror does not support hf_transfer
-      NCCL_DEBUG: "WARN"
-      # Shared NFS paths (see workflow container.volumes above).
-      CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
-      CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
-      CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
-
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      - name: Sync dependencies
-        run: |
-          uv sync --frozen --extra gpu --extra audio --group dev
-      - name: Run e2e training test
-        run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
-      - name: Run FSDP equivalence tests
-        run: |
-          uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
-      - name: Sync dependencies [diffusers]
-        run: |
-          uv sync --frozen --extra gpu --extra dit --group dev
-      - name: Run tests [diffusers]
-        run: |
-          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
+  # The v4 (transformers 4.57.3) job has been retired — v5 is now the
+  # default install and v4 is sunset (see pyproject.toml comments). The
+  # diffusers e2e step (test_wan_dit_parallel_align) has been moved
+  # into the v5 job below; it ran under v4 historically because the
+  # diffusers extra wasn't yet validated against v5.
 
   gpu_e2e_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: lint
-    # Same runner/container/env as gpu_e2e_tests_v4 above; see comments there.
+    # Self-hosted L20-8 fleet managed by github_runner/ (ansible).
     runs-on: [self-hosted, l20-8]
-    timeout-minutes: 60
+    # Bumped to 120m to fit the diffusers e2e step merged from the former
+    # v4 job.
+    timeout-minutes: 120
     container:
       image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
       volumes:
@@ -120,15 +88,48 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-      - name: Sync dependencies [transformers-v5]
+      - name: Free shared L20 GPU
+        # Some prior CI runs on this physical host leak Python/torchrun
+        # processes that keep tens of GiB pinned on the GPUs even after
+        # their sibling container exits. Safe here: L20-8 self-hosted
+        # runners are 1-job-per-physical-host and ``--gpus all`` claims
+        # the whole card.
         run: |
-          uv sync --frozen --no-group transformers-stable --extra transformers5-exp --extra gpu --extra audio --group dev
-      - name: Run e2e tests [transformers-v5]
-        # TODO: Run the following tests with proper `--no-group transformers-stable --extra transformers5-exp` to enable transformers v5.
-        # Currently those tests are effectively skipped (but it's not straightforward to enable due to L20 OOM).
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
+      - name: Sync dependencies
+        run: |
+          uv sync --frozen --extra gpu --extra audio --group dev
+      - name: Run e2e tests
         run: |
           uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py
-      - name: Run FSDP equivalence tests [transformers-v5]
+      - name: Free GPUs between test steps
+        # pytest's mp.spawn / torchrun workers sometimes outlive the pytest
+        # session — they hold tens of GiB on GPU 0 and OOM the next test.
+        # Sweep again between test steps; the job-start cleanup alone
+        # isn't enough.
+        if: always()
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
+      - name: Run FSDP equivalence tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
-      # TODO: Run other tests in transformers v5 env as well.
+      - name: Sync dependencies [diffusers]
+        run: |
+          uv sync --frozen --extra gpu --extra dit --group dev
+      - name: Run diffusers tests
+        run: |
+          uv run --frozen pytest -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align

@@ -218,25 +218,16 @@ def main():
         collate_fn_kwargs=collate_fn_kwargs,
     )
 
-    freeze_any = False
     if args.train.freeze_encoder:
         if args.train.freeze_encoder_all:
             model.encoder.requires_grad_(False)
         else:
             model.encoder.set_projector_trainable_only()
-        freeze_any = True
     if args.train.freeze_decoder:
         model.decoder.set_projector_trainable_only()
-        freeze_any = True
     if args.train.freeze_foundation:
         model.foundation.requires_grad_(False)
-        freeze_any = True
     pretty_print_trainable_parameters(model)
-
-    fsdp_kwargs = {}
-    if freeze_any:
-        if args.train.accelerator.fsdp_config.fsdp_mode == "fsdp1":
-            fsdp_kwargs["use_orig_params"] = True
 
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
@@ -257,16 +248,14 @@ def main():
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
-        enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
         mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         init_device=args.train.init_device,
-        enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
-        fsdp_kwargs=fsdp_kwargs,
         basic_modules=model._no_split_modules,
         enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
         enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+        enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
         broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
         cpu_load_param_name=cpu_load_param_name,
         max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,

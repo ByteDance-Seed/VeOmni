@@ -41,7 +41,7 @@ jobs:
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
     runs-on: [self-hosted, 910b-8]
-    timeout-minutes: 60 # Increase this timeout value as needed
+    timeout-minutes: 90
     container:
       image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
       volumes:
@@ -83,6 +83,10 @@ jobs:
       CI_HF_MODELS_DIR: "/mnt/veomni_ci/models"
       CI_SAMPLES_DIR: "/mnt/veomni_ci/datasets/custom_data/samples"
       CI_DATASET_DIR: "/mnt/veomni_ci/datasets"
+      # uv's default 30s timeout fires intermittently on the CN runners
+      # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
+      # 5 min so a slow link doesn't fail the whole sync.
+      UV_HTTP_TIMEOUT: "300"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
@@ -126,6 +130,8 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
+      # Default (transformers v5) only. The v4 dependency path is sunset
+      # and no longer exercised in CI.
       - name: Sync dependencies
         run: |
           uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
@@ -136,14 +142,5 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py
       - name: Run FSDP equivalence tests
-        run: |
-          uv run --frozen pytest -v -s -x tests/distributed/test_fsdp_equivalence.py
-      - name: Sync dependencies [transformers-v5]
-        run: |
-          uv sync --frozen --python 3.11 --no-group transformers-stable --extra transformers5-exp --extra npu --extra audio --group dev
-      - name: Run e2e tests [transformers-v5]
-        run: |
-          uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py
-      - name: Run FSDP equivalence tests [transformers-v5]
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_fsdp_equivalence.py

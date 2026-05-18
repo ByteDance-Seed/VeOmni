@@ -5,9 +5,9 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "docker/ascend/Dockerfile.ascend_8.3.rc2_a2"
-      - "docker/ascend/Dockerfile.ascend_8.3.rc2_a2.arm"
-      - ".github/workflows/docker-build-ascend-a2-double.yml"
+      - "docker/ascend/Dockerfile.ascend_9.0.0_a2.x86"
+      - "docker/ascend/Dockerfile.ascend_9.0.0_a2.arm"
+      - ".github/workflows/docker-build-ascend-a2.yml"
   release:
     types: [ published ]
 
@@ -31,11 +31,11 @@ jobs:
           - arch: linux/amd64
             runner: ubuntu-latest
             tag: amd64
-            dockerfile: ./docker/ascend/Dockerfile.ascend_8.3.rc2_a2
+            dockerfile: ./docker/ascend/Dockerfile.ascend_9.0.0_a2.x86
           - arch: linux/arm64
             runner: ubuntu-22.04-arm
             tag: arm64
-            dockerfile: ./docker/ascend/Dockerfile.ascend_8.3.rc2_a2.arm
+            dockerfile: ./docker/ascend/Dockerfile.ascend_9.0.0_a2.arm
 
     steps:
       - name: Free disk space
@@ -113,7 +113,7 @@ jobs:
       - name: Get base image name & tag
         id: base_image
         run: |
-          BASE_IMAGE_FULL=$(grep '^FROM' ./docker/ascend/Dockerfile.ascend_8.3.rc2_a2 | head -1 | cut -d' ' -f2)
+          BASE_IMAGE_FULL=$(grep '^FROM' ./docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 | head -1 | cut -d' ' -f2)
           BASE_IMAGE_TAG=$(echo "$BASE_IMAGE_FULL" | cut -d':' -f2)
           NEW_IMAGE_NAME="veomni-$BASE_IMAGE_TAG"
           echo "base_image_tag=$BASE_IMAGE_TAG" >> "$GITHUB_OUTPUT"
@@ -122,15 +122,31 @@ jobs:
       - name: Compute final tag
         id: version
         run: |
-          BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's/^refs\/(heads|tags)\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
-          BASE_NAME="${{ steps.base_image.outputs.new_image_name }}"
+          BRANCH_NAME=$(echo "${{ github.ref }}" | sed -E 's/^refs\/(heads|tags)\///g' | sed 's/[^a-zA-Z0-9._-]/_/g')
+          BASE_IMAGE_NAME="${{ steps.base_image.outputs.new_image_name }}"
+          QUAY_REPO="quay.io/ascend/veomni"
           if [ "${{ github.event_name }}" = "release" ]; then
             RELEASE_TAG="${{ github.event.release.tag_name }}"
-            echo "tag=$BASE_NAME-$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            VERSION_CORE=$(echo "$RELEASE_TAG" | sed 's/^v//g')
+            TAG_PREFIX="${BASE_IMAGE_NAME}-${VERSION_CORE}"
+            EXISTING_TAGS=$(skopeo list-tags "docker://${QUAY_REPO}" | jq -r '.Tags[]' 2>/dev/null || echo "")
+            if [ -n "$EXISTING_TAGS" ]; then
+              HAS_BASE_TAG=$(echo "$EXISTING_TAGS" | grep -c "^${TAG_PREFIX}$")
+              POST_COUNT=$(echo "$EXISTING_TAGS" | grep -c "${TAG_PREFIX}.post")
+              if [ $HAS_BASE_TAG -gt 0 ] || [ $POST_COUNT -gt 0 ]; then
+                POST_NUM=$((POST_COUNT + 1))
+                FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}.post${POST_NUM}"
+              else
+                FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}"
+              fi
+            else
+              FINAL_TAG="${BASE_IMAGE_NAME}-${RELEASE_TAG}"
+            fi
+            echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
           elif [ "$BRANCH_NAME" = "main" ]; then
-            echo "tag=$BASE_NAME-latest" >> "$GITHUB_OUTPUT"
+            echo "tag=$BASE_IMAGE_NAME-latest" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=$BASE_NAME-$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+            echo "tag=$BASE_IMAGE_NAME-$BRANCH_NAME" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Login to Quay

@@ -42,7 +42,7 @@ from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from ..utils.device import synchronize
+from ..utils.device import get_device_type, synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.import_utils import is_diffusers_available
 from .checkpoint_tensor_loading import get_checkpoint_tensor_converter, maybe_convert_checkpoint_tensor
@@ -176,6 +176,7 @@ def _dispatch_parameter(
     tensor: "torch.Tensor",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     parallel_plan: Optional["ParallelPlan"] = None,
+    dtensor_to_cpu: bool = False,
 ) -> None:
     """
     Assigns parameter to an empty model.
@@ -190,15 +191,17 @@ def _dispatch_parameter(
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
-    tensor = tensor.to(orig_tensor)
     if hasattr(orig_tensor, "device_mesh"):  # dtensor
-        if orig_tensor.device.type == "cpu":
-            raise ValueError("Cannot load dtensor on CPU.")
-
+        if dtensor_factory is None:
+            raise ValueError("dtensor parameter requires a dtensor_factory.")
         device_mesh = orig_tensor.device_mesh
         placements = orig_tensor.placements
-        module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+        sharded_tensor = dtensor_factory(tensor.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        if dtensor_to_cpu:
+            sharded_tensor = sharded_tensor.to("cpu")
+        module._parameters[local_name].data.copy_(sharded_tensor)
     else:  # not dtensor
+        tensor = tensor.to(orig_tensor)
         module._parameters[local_name].data.copy_(tensor)
 
 
@@ -207,6 +210,7 @@ def _dispatch_buffer(
     name: str,
     buffer: "torch.Tensor",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    dtensor_to_cpu: bool = False,
 ) -> None:
     """
     Assigns buffer to an empty model.
@@ -220,9 +224,18 @@ def _dispatch_buffer(
 
         device_mesh = orig_tensor.device_mesh
         placements = orig_tensor.placements
-        module._buffers[name] = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        sharded_buffer = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        if dtensor_to_cpu:
+            sharded_buffer = sharded_buffer.to("cpu")
+        module._buffers[name] = sharded_buffer
     else:
         module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
+
+
+def _get_communication_device(init_device: Literal["cpu", "cuda", "npu"]) -> torch.device:
+    if init_device == "cpu":
+        return torch.device(get_device_type())
+    return torch.device(init_device)
 
 
 def _init_parameter(
@@ -233,6 +246,11 @@ def _init_parameter(
     Initializes parameter in model.
     """
     pieces = name.split(".")
+    if any(p.startswith("lora_") for p in pieces):
+        from ..utils.lora_utils import _init_lora_parameter
+
+        _init_lora_parameter(module, name)
+        return
     init_func = None
     for piece in pieces[:-1]:
         if not hasattr(module, piece):
@@ -288,6 +306,7 @@ def load_model_weights(
     weights_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    **kwargs,
 ) -> None:
     """
     Loads pre-trained model states in transformers' format.
@@ -295,11 +314,23 @@ def load_model_weights(
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
+    dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
+
+    # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
+    # Maps bare base-model param names to PEFT-namespaced FQNs, e.g.:
+    #   "layers.0.self_attn.q_proj.weight" -> "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
+    # Keys not found in the map receive a plain "base_model.model." prefix.
+    is_peft_model = kwargs.get("is_peft_model", False)
+    adapter_path = kwargs.get("adapter_path", None)
+    if is_peft_model:
+        from ..utils.lora_utils import build_lora_key_overrides
+
+        lora_key_overrides = build_lora_key_overrides(model)
 
     converter = get_checkpoint_tensor_converter(model)
     state_dict_iterators = _load_state_dict(weights_path)
@@ -309,7 +340,7 @@ def load_model_weights(
             buffer_dict[name] = tensor.clone()
         elif name in parameter_names_to_load:
             parameter_names_to_load.remove(name)
-            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
         else:
             logger.info_rank0(f"Unexpected key in state dict: {name}.")
 
@@ -318,6 +349,8 @@ def load_model_weights(
     ):
         for name, tensor in state_dict_iterator:
             name = _convert_weight_key(name, model)
+            if is_peft_model:
+                name = lora_key_overrides.get(name, "base_model.model." + name)
             converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
             if converted is None:
                 continue
@@ -330,7 +363,21 @@ def load_model_weights(
         for result in converter.finalize():
             _dispatch_kv(result.name, result.tensor)
 
-    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
+    if is_peft_model and adapter_path:
+        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
+        from ..utils.lora_utils import load_lora_model_weights
+
+        load_lora_model_weights(
+            model,
+            adapter_path,
+            init_device,
+            dtensor_factory,
+            parameter_names_to_load=parameter_names_to_load,
+        )
+
+    post_process_after_weight_loading(
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+    )
 
 
 @torch.no_grad()
@@ -341,6 +388,7 @@ def rank0_load_and_broadcast_weights(
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     cpu_load_param_name: List[str] = None,
     max_load_broadcast_size: float = 20.0,  # in GB
+    **kwargs,
 ):
     """
     This functions serves as the same purpose as `load_model_weights`
@@ -349,20 +397,31 @@ def rank0_load_and_broadcast_weights(
     """
     if not dist.is_available() or not dist.is_initialized():
         logger.warning_once("Distributed environment not initialized, falling back to load_model_weights.")
-        return load_model_weights(model, weights_path, init_device, dtensor_factory)
+        return load_model_weights(model, weights_path, init_device, dtensor_factory, **kwargs)
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
     model.to_empty(device=init_device)
+    dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
 
+    # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
+    # non-lora-layer: xxx.xxx -> base_model.model.xxx.xxx
+    # lora-layer: xxx.xxx.weight -> base_model.model.xxx.xxx.base_layer.weight
+    is_peft_model = kwargs.get("is_peft_model", False)
+    adapter_path = kwargs.get("adapter_path", None)
+    if is_peft_model:
+        from ..utils.lora_utils import build_lora_key_overrides
+
+        lora_key_overrides = build_lora_key_overrides(model)
+
     converter = get_checkpoint_tensor_converter(model)
     global_rank = get_parallel_state().global_rank
-    torch_device = torch.device(init_device)
+    torch_device = _get_communication_device(init_device)
 
     def _broadcast_and_dispatch(name, shape, dtype, tensor):
         """Broadcast a single (name, tensor) from rank0 and dispatch it."""
@@ -382,7 +441,7 @@ def rank0_load_and_broadcast_weights(
             buffer_dict[name] = tensor.detach().clone()
         elif name in parameter_names_to_load:
             parameter_names_to_load.discard(name)
-            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
         else:
             if global_rank == 0:
                 logger.info_rank0(f"Unexpected key in state dict: {name}.")
@@ -489,22 +548,23 @@ def rank0_load_and_broadcast_weights(
 
             chunk_loaded_data = list(tensor.chunk(para_size, dim=0))
 
-        assert shard_tensor.is_cuda, "Shard parameter should be on CUDA."
         is_shard_tensor_dtensor = hasattr(shard_tensor, "device_mesh")
         if is_shard_tensor_dtensor:
             device_mesh = shard_tensor.device_mesh
             placements = shard_tensor.placements
+            shard_comm_device = torch.device(device_mesh.device_type)
         else:
             device_mesh = None
             placements = None
+            shard_comm_device = _get_communication_device(init_device)
 
         broadcast_buffer = torch.empty(
             shard_tensor.shape,
             dtype=shard_tensor.dtype,
-            device=shard_tensor.device,
+            device=shard_comm_device,
         )
         shard_dst_ranks = _get_extra_parallel_shard_dst_ranks(
-            parallel_state, para_group_name, para_size, shard_tensor.device
+            parallel_state, para_group_name, para_size, shard_comm_device
         )
         for chunk_id in range(para_size):
             # For example:
@@ -532,9 +592,12 @@ def rank0_load_and_broadcast_weights(
 
                 if global_rank in dst_ranks:
                     if is_shard_tensor_dtensor:
-                        shard_tensor.copy_(dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous())
+                        chunk_tensor = dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous()
+                        if dtensor_to_cpu:
+                            chunk_tensor = chunk_tensor.to("cpu")
+                        shard_tensor.copy_(chunk_tensor)
                     else:
-                        shard_tensor.copy_(broadcast_buffer.contiguous())
+                        shard_tensor.copy_(broadcast_buffer.to(shard_tensor.device).contiguous())
 
             elif global_rank in send_seq:
                 if is_shard_tensor_dtensor:
@@ -546,9 +609,12 @@ def rank0_load_and_broadcast_weights(
                 dist.recv(broadcast_buffer, src=0, tag=tag)
 
                 if is_shard_tensor_dtensor:
-                    shard_tensor.copy_(dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous())
+                    chunk_tensor = dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous()
+                    if dtensor_to_cpu:
+                        chunk_tensor = chunk_tensor.to("cpu")
+                    shard_tensor.copy_(chunk_tensor)
                 else:
-                    shard_tensor.copy_(broadcast_buffer.contiguous())
+                    shard_tensor.copy_(broadcast_buffer.to(shard_tensor.device).contiguous())
 
         logger.info_rank0(
             f"{name=}, {shape=}, {dtype=}, chunk and broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
@@ -597,6 +663,8 @@ def rank0_load_and_broadcast_weights(
                     try:
                         key, tensor = next(iterator)  # type: ignore[arg-type]
                         key = _convert_weight_key(key, model)
+                        if is_peft_model:
+                            key = lora_key_overrides.get(key, "base_model.model." + key)
                         converted = maybe_convert_checkpoint_tensor(key, tensor, converter)
                         if converted is None:
                             continue
@@ -675,7 +743,21 @@ def rank0_load_and_broadcast_weights(
                 raise RuntimeError("Received incomplete broadcast metadata from finalize.")
             _broadcast_and_dispatch(name, shape, dtype, tensor)
 
-    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
+    if is_peft_model and adapter_path:
+        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
+        from ..utils.lora_utils import rank0_load_and_broadcast_adapter_weights
+
+        rank0_load_and_broadcast_adapter_weights(
+            model,
+            adapter_path,
+            init_device,
+            dtensor_factory,
+            parameter_names_to_load=parameter_names_to_load,
+        )
+
+    post_process_after_weight_loading(
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+    )
 
 
 def post_process_after_weight_loading(
@@ -683,6 +765,7 @@ def post_process_after_weight_loading(
     buffer_dict,
     parameter_names_left: Optional[set[str]] = None,
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    dtensor_to_cpu: bool = False,
 ):
     """
     shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights.
@@ -690,16 +773,26 @@ def post_process_after_weight_loading(
     parameter_names_left = parameter_names_left or set()
 
     for name, buffer in buffer_dict.items():
-        _dispatch_buffer(model, name, buffer, dtensor_factory)
-
+        _dispatch_buffer(model, name, buffer, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu)
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
-        for name in parameter_names_left:
+        for name in sorted(parameter_names_left):
             _init_parameter(model, name)
 
-    # we should tie embeddings after loading weights because to_empty() leads to untied weights,
-    # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
-    if getattr(model.config, "tie_word_embeddings", True):
+    # to_empty() leaves embeddings untied (except under FSDP2 swap-tensor);
+    # re-tie only when the config asks for it. Nested multimodal layouts can
+    # disable tying on either side (InternVL on inner, Qwen3VLMoe on outer with
+    # inner silent), so AND both. Treat unset as True so a silent side does not
+    # override an explicit True, but require at least one side to set the flag
+    # -- if neither does, default to False (matches HF v5).
+    text_config = (
+        model.config.get_text_config(decoder=True) if hasattr(model.config, "get_text_config") else model.config
+    )
+    if (
+        (hasattr(model.config, "tie_word_embeddings") or hasattr(text_config, "tie_word_embeddings"))
+        and getattr(model.config, "tie_word_embeddings", True)
+        and getattr(text_config, "tie_word_embeddings", True)
+    ):
         try:
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
@@ -905,172 +998,3 @@ class GradientCheckpointingLayer(nn.Module):
         if self.gradient_checkpointing and self.training:
             return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
         return super().__call__(*args, **kwargs)
-
-
-# ------------------------------------------------------------------
-# Lora-related load utils
-# ------------------------------------------------------------------
-
-
-@torch.no_grad()
-def rank0_broadcast_adapter_weights(
-    model: Union["nn.Module", "PreTrainedModel"],
-    adapter_sd: Dict[str, "torch.Tensor"],
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
-) -> None:
-    """
-    Broadcast pre-loaded adapter (LoRA) weights from rank 0 to all ranks.
-
-    Only rank 0 needs ``adapter_sd`` populated with real tensors; other ranks
-    may pass an empty dict.  The function first broadcasts the key count and
-    then iterates exactly like ``rank0_load_and_broadcast_weights``: metadata
-    broadcast → tensor broadcast → ``_dispatch_parameter``.
-    """
-    if not dist.is_available() or not dist.is_initialized():
-        for name, tensor in adapter_sd.items():
-            _dispatch_parameter(model, name, tensor, dtensor_factory)
-        return
-
-    global_rank = get_parallel_state().global_rank
-    torch_device = torch.device(init_device)
-
-    # Broadcast the number of adapter keys so all ranks know the loop count
-    count_tensor = torch.tensor(
-        [len(adapter_sd)],
-        dtype=torch.int64,
-        device=torch_device if torch_device.type != "cpu" else torch.device("cpu"),
-    )
-    dist.broadcast(count_tensor, src=0)
-    num_keys = int(count_tensor.item())
-
-    if num_keys == 0:
-        return
-
-    sorted_keys = sorted(adapter_sd.keys()) if global_rank == 0 else [None] * num_keys
-
-    for i in range(num_keys):
-        if global_rank == 0:
-            name = sorted_keys[i]
-            tensor = adapter_sd[name].to(torch_device, non_blocking=True)
-            metadata = BroadcastMetadata(False, name, tensor.shape, tensor.dtype)
-        else:
-            metadata = BroadcastMetadata(False, None, None, None)
-
-        metadata_list = [metadata]
-        dist.broadcast_object_list(metadata_list, src=0)
-        metadata = metadata_list[0]
-
-        name = metadata.name
-        shape = metadata.shape
-        dtype = metadata.dtype
-
-        if global_rank != 0:
-            tensor = torch.empty(shape, dtype=dtype, device=torch_device)
-
-        dist.broadcast(tensor, src=0)
-        _dispatch_parameter(model, name, tensor, dtensor_factory)
-        del tensor
-
-    logger.info_rank0(f"rank0_broadcast_adapter_weights: loaded {num_keys} adapter param(s)")
-
-
-def _read_adapter_name(adapter_path: str) -> str:
-    """Read the adapter name from adapter_config.json, defaulting to 'default'."""
-    import json
-    import os
-
-    config_path = os.path.join(adapter_path, "adapter_config.json")
-    if os.path.isfile(config_path):
-        with open(config_path) as f:
-            cfg = json.load(f)
-        return cfg.get("adapter_name", "default") or "default"
-    return "default"
-
-
-def _remap_adapter_key(key: str, adapter_name: str) -> str:
-    """Remap a PEFT-saved key to model FQN format.
-
-    PEFT saves ``lora_A.weight`` but the model FQN is ``lora_A.<adapter_name>.weight``.
-    """
-    parts = key.split(".")
-    new_parts = []
-    for p in parts:
-        new_parts.append(p)
-        if p in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
-            new_parts.append(adapter_name)
-    return ".".join(new_parts)
-
-
-@torch.no_grad()
-def load_model_lora_weights(
-    model: Union["nn.Module", "PreTrainedModel"],
-    adapter_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
-) -> None:
-    """Load PEFT adapter (LoRA) weights from disk into the model on every rank.
-
-    Mirrors ``load_model_weights`` but targets adapter files.  Each rank reads
-    ``adapter_model.safetensors`` (or ``.bin``) directly, remaps PEFT key names
-    to model FQN format, and dispatches tensors into the (potentially sharded) model.
-    Use when every rank has access to the checkpoint (e.g. shared filesystem).
-    For single-reader + broadcast, use ``load_adapter_state_dict_rank0`` +
-    ``rank0_broadcast_adapter_weights`` instead.
-    """
-    from peft import load_peft_weights
-
-    adapter_name = _read_adapter_name(adapter_path)
-    logger.info_rank0(f"load_model_lora_weights: loading from {adapter_path} (adapter_name={adapter_name!r})")
-
-    raw_sd = load_peft_weights(adapter_path, device=init_device)
-    for name, tensor in raw_sd.items():
-        _dispatch_parameter(model, _remap_adapter_key(name, adapter_name), tensor, dtensor_factory)
-
-    logger.info_rank0("load_model_lora_weights: done")
-
-
-def load_adapter_state_dict_rank0(adapter_path: str) -> Dict[str, "torch.Tensor"]:
-    """Rank-0 loads PEFT adapter weights from disk and remaps keys to model FQN format.
-
-    PEFT saves keys as ``lora_A.weight`` but the model FQN is ``lora_A.default.weight``.
-    Only rank 0 reads the file; other ranks return an empty dict.
-    Tensors are broadcast to all ranks later via ``rank0_broadcast_adapter_weights``.
-    """
-    global_rank = dist.get_rank() if dist.is_initialized() else 0
-
-    if global_rank != 0:
-        return {}
-
-    from peft import load_peft_weights
-
-    adapter_name = _read_adapter_name(adapter_path)
-    raw_sd = load_peft_weights(adapter_path, device="cpu")
-    remapped = {_remap_adapter_key(k, adapter_name): v for k, v in raw_sd.items()}
-
-    if remapped:
-        first_raw = next(iter(raw_sd))
-        first_remapped = next(iter(remapped))
-        logger.info_rank0(
-            f"Loaded {len(remapped)} adapter weight(s) from {adapter_path}, "
-            f"key remap example: {first_raw} -> {first_remapped}"
-        )
-
-    return remapped
-
-
-@torch.no_grad()
-def rank0_load_and_broadcast_adapter_weights(
-    model: Union["nn.Module", "PreTrainedModel"],
-    adapter_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
-) -> None:
-    """Rank-0 loads PEFT adapter weights from disk then broadcasts to all ranks.
-
-    Combines ``load_adapter_state_dict_rank0`` and
-    ``rank0_broadcast_adapter_weights`` into one call, mirroring the base-model
-    ``rank0_load_and_broadcast_weights``.
-    """
-    adapter_sd = load_adapter_state_dict_rank0(adapter_path)
-    rank0_broadcast_adapter_weights(model, adapter_sd, init_device, dtensor_factory)

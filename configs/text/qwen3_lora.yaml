@@ -1,0 +1,57 @@
+model:
+  model_path: Qwen3-0.6B-Base
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 64
+    alpha: 32
+    lora_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  num_train_epochs: 1
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: Qwen3-0.6B-Base-lora-tulu
+    manager: dcp
+    save_steps: 0
+    save_epochs: 1
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: Qwen3-0.6B-Base-lora-tulu

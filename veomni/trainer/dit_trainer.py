@@ -39,8 +39,6 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
-from ..utils.lora_utils import patch_fsdp_lora_weight_loading
-from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
 
 
@@ -188,7 +186,7 @@ class DiTTrainer:
         # rewrite _build_model, build condition model & dit model
         self._build_model()
 
-        # rewrite _freeze_model_module, freeze condition model & add lora for dit model
+        # rewrite _freeze_model_module, freeze condition model
         self._freeze_model_module()
 
         # rewrite _build_model_assets to support processor of condition model
@@ -207,7 +205,7 @@ class DiTTrainer:
         self._build_dataloader()
 
         if self.training_task != "offline_embedding":
-            self._build_parallelized_model()
+            self.base._build_parallelized_model()
             self.base._build_optimizer()
             self.base._build_lr_scheduler()
             self.base._build_training_context()
@@ -296,57 +294,10 @@ class DiTTrainer:
             logger.info_rank0("Condition model loaded.")
 
     def _freeze_model_module(self):
-        args: VeOmniDiTArguments = self.base.args
-        lora_config = args.model.lora_config
         self.condition_model.requires_grad_(False)
 
         if self.training_task == "offline_training" or self.training_task == "online_training":
-            if bool(lora_config):
-                lora_adapter_path = lora_config.get("lora_adapter", None)
-                if lora_adapter_path is not None:
-                    logger.info_rank0(f"Load lora_adapter from {lora_adapter_path}.")
-                    import warnings
-
-                    from peft import PeftModel
-
-                    # When init_device="meta" the base model params are meta tensors.
-                    # PEFT's from_pretrained tries to copy loaded weights into the meta
-                    # adapter params, which is a no-op that PyTorch warns about.
-                    # The actual adapter weights are loaded later via adapter_path in
-                    # parallelize_model_fsdp2 (rank0 broadcast or per-rank read).
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore", message="copying from a non-meta parameter")
-                        self.base.model = PeftModel.from_pretrained(
-                            self.base.model, lora_adapter_path, is_trainable=lora_config.get("is_trainable", True)
-                        )
-                else:
-                    from peft import LoraConfig, get_peft_model
-
-                    lora_config: LoraConfig = LoraConfig(
-                        r=lora_config["rank"],
-                        lora_alpha=lora_config["alpha"],
-                        target_modules=lora_config["lora_modules"],
-                    )
-                    logger.info_rank0(f"Init lora: {lora_config.to_dict()}.")
-                    self.base.model = get_peft_model(self.base.model, lora_config)
-
-                self.base.model.print_trainable_parameters()
-
-                if args.train.init_device == "meta":
-                    patch_fsdp_lora_weight_loading(self.base.model)
-
-            pretty_print_trainable_parameters(self.base.model)
-            helper.print_device_mem_info("VRAM usage after building model")
-
-    def _build_parallelized_model(self):
-        """Override base to inject adapter_path into FSDP2 parallelization kwargs."""
-        parallel_kwargs = {}
-        args: VeOmniDiTArguments = self.base.args
-        if bool(args.model.lora_config):
-            lora_adapter_path = args.model.lora_config.get("lora_adapter", None)
-            if lora_adapter_path is not None:
-                parallel_kwargs["adapter_path"] = lora_adapter_path
-        self.base._build_parallelized_model(**parallel_kwargs)
+            self.base._freeze_model_module()
 
     def _build_model_assets(self):
         if self.training_task == "offline_training" or self.training_task == "online_training":

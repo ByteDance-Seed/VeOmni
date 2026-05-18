@@ -90,7 +90,14 @@ class MoeCausalLMOutputWithLogProbs(MoeCausalLMOutputWithPast):
 
 @dataclass
 class Qwen2VLCausalLMOutputWithLogProbs(Qwen2VLCausalLMOutputWithPast):
-    """``Qwen2VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+    """``Qwen2VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``.
+    """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
@@ -98,7 +105,14 @@ class Qwen2VLCausalLMOutputWithLogProbs(Qwen2VLCausalLMOutputWithPast):
 
 @dataclass
 class Qwen2_5_VLCausalLMOutputWithLogProbs(Qwen2_5_VLCausalLMOutputWithPast):
-    """``Qwen2_5_VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+    """``Qwen2_5_VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``.
+    """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
@@ -106,7 +120,14 @@ class Qwen2_5_VLCausalLMOutputWithLogProbs(Qwen2_5_VLCausalLMOutputWithPast):
 
 @dataclass
 class Qwen3VLCausalLMOutputWithLogProbs(Qwen3VLCausalLMOutputWithPast):
-    """``Qwen3VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+    """``Qwen3VLCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``.
+    """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
@@ -114,7 +135,14 @@ class Qwen3VLCausalLMOutputWithLogProbs(Qwen3VLCausalLMOutputWithPast):
 
 @dataclass
 class Qwen3VLMoeCausalLMOutputWithLogProbs(Qwen3VLMoeCausalLMOutputWithPast):
-    """``Qwen3VLMoeCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+    """``Qwen3VLMoeCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``.
+    """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
@@ -122,7 +150,14 @@ class Qwen3VLMoeCausalLMOutputWithLogProbs(Qwen3VLMoeCausalLMOutputWithPast):
 
 @dataclass
 class Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(Qwen3OmniMoeThinkerCausalLMOutputWithPast):
-    """``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields."""
+    """``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``.
+    """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None

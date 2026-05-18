@@ -254,8 +254,22 @@ class CustomizedModelingLoader(BaseModelLoader):
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)
 
-            # we should tie embeddings after loading weights because init_empty_weights() leads to untied weights,
-            if getattr(model.config, "tie_word_embeddings", True):
+            # init_empty_weights() leaves embeddings untied; re-tie only when
+            # the config asks for it. Nested multimodal layouts can disable tying
+            # on either side (InternVL on inner, Qwen3VLMoe on outer with inner
+            # silent), so AND both. Treat unset as True so a silent side does not
+            # override an explicit True, but require at least one side to set the
+            # flag -- if neither does, default to False (matches HF v5).
+            text_config = (
+                model.config.get_text_config(decoder=True)
+                if hasattr(model.config, "get_text_config")
+                else model.config
+            )
+            if (
+                (hasattr(model.config, "tie_word_embeddings") or hasattr(text_config, "tie_word_embeddings"))
+                and getattr(model.config, "tie_word_embeddings", True)
+                and getattr(text_config, "tie_word_embeddings", True)
+            ):
                 try:
                     input_embeddings = model.get_input_embeddings()
                     output_embeddings = model.get_output_embeddings()

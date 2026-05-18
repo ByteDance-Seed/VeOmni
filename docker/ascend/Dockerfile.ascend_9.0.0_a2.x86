@@ -1,7 +1,10 @@
 # docker hub: https://hub.docker.com/layers/ascendai/cann/8.3.rc2-910b-ubuntu22.04-py3.11/images/sha256-9efee6a0bb1e8cb6d5dd5170a4a51837d3783e79e2c57c6f4cb5b9ed58598e3e
 # cann web: https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884
 # git repo: https://gitcode.com/Ascend/pytorch
-FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
+
+# Set default pip index
+ARG PIP_INDEX=https://pypi.org/simple
 
 # Define environments
 ENV MAX_JOBS=16

@@ -2,6 +2,7 @@ import math
 import subprocess
 from dataclasses import dataclass, field
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor, Shard
@@ -131,7 +132,6 @@ def main():
         model,
         init_device=args.train.init_device,
         weights_path=None,
-        enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
         mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
         enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
@@ -273,104 +273,51 @@ def main():
     dist.destroy_process_group()
 
 
-def test_clip_grad_norm_fsdp2_no_extra_parallel():
+def _run_clip_grad_norm_fsdp2_test(ep_size: int, emb_size: int, cpu_offload: bool) -> None:
     command = [
         "torchrun",
         "--nnodes=1",
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        "--train.accelerator.ep_size=1",
+        f"--train.accelerator.ep_size={ep_size}",
         "--train.accelerator.ep_outside=False",
-        "--train.accelerator.extra_parallel_sizes=1",
+        f"--train.accelerator.extra_parallel_sizes={emb_size}",
         "--train.accelerator.extra_parallel_placement_innermost=False",
         "--train.accelerator.extra_parallel_names=emb",
         "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
         "--train.init_device=meta",
         "--train.checkpoint.output_dir='debug'",
     ]
+    if cpu_offload:
+        command.append("--train.accelerator.fsdp_config.offload=True")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
 
-def test_clip_grad_norm_fsdp2_ep4():
-    command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        "--train.accelerator.ep_size=4",
-        "--train.accelerator.ep_outside=False",
-        "--train.accelerator.extra_parallel_sizes=1",
-        "--train.accelerator.extra_parallel_placement_innermost=False",
-        "--train.accelerator.extra_parallel_names=emb",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.checkpoint.output_dir='debug'",
-    ]
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_fsdp2_no_extra_parallel(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=1, cpu_offload=cpu_offload)
 
 
-def test_clip_grad_norm_fsdp2_ep8():
-    command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        "--train.accelerator.ep_size=8",
-        "--train.accelerator.ep_outside=False",
-        "--train.accelerator.extra_parallel_sizes=1",
-        "--train.accelerator.extra_parallel_placement_innermost=False",
-        "--train.accelerator.extra_parallel_names=emb",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.checkpoint.output_dir='debug'",
-    ]
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_fsdp2_ep4(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=cpu_offload)
 
 
-def test_clip_grad_norm_fsdp2_emb8():
-    command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        "--train.accelerator.ep_size=1",
-        "--train.accelerator.ep_outside=False",
-        "--train.accelerator.extra_parallel_sizes=8",
-        "--train.accelerator.extra_parallel_placement_innermost=False",
-        "--train.accelerator.extra_parallel_names=emb",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.checkpoint.output_dir='debug'",
-    ]
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_fsdp2_ep8(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=8, emb_size=1, cpu_offload=cpu_offload)
 
 
-def test_clip_grad_norm_fsdp2_ep2_emb4():
-    command = [
-        "torchrun",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        "--master_port=4321",
-        "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        "--train.accelerator.ep_size=2",
-        "--train.accelerator.ep_outside=False",
-        "--train.accelerator.extra_parallel_sizes=4",
-        "--train.accelerator.extra_parallel_placement_innermost=False",
-        "--train.accelerator.extra_parallel_names=emb",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.checkpoint.output_dir='debug'",
-    ]
-    result = subprocess.run(command, check=True)
-    assert result.returncode == 0
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_fsdp2_emb8(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=8, cpu_offload=cpu_offload)
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_fsdp2_ep2_emb4(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload)
 
 
 if __name__ == "__main__":

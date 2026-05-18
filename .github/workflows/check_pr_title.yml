@@ -23,7 +23,7 @@ jobs:
               'misc', 'ci', 'config', 'docs', 'data', 'dist',
               'omni', 'logging', 'model', 'optim', 'ckpt',
               'release', 'task', 'perf', 'ops', 'parallel',
-              'docker', 'trainer', 'agent'
+              'docker', 'trainer', 'agent', 'lora'
             ]);
 
             // 2. Allowed Types

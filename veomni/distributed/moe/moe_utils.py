@@ -65,11 +65,11 @@ def unpermute(
     tokens = tokens * tokens_weight.unsqueeze(-1)
     hidden_dim = hidden_states_shape[-1]
 
-    unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=tokens.dtype)
-
-    # Scatter add the permuted_input back to the original positions
-    unpermuted_tokens.scatter_add_(0, permutation_mapping.unsqueeze(1).expand(-1, hidden_dim), tokens)
-    return unpermuted_tokens
+    # Accumulate in FP32 to match the non-EP moe_gather kernel which also uses FP32
+    # accumulation internally, reducing top-k rounding error from BF16 scatter_add_.
+    unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=torch.float32)
+    unpermuted_tokens.scatter_add_(0, permutation_mapping.unsqueeze(1).expand(-1, hidden_dim), tokens.float())
+    return unpermuted_tokens.to(tokens.dtype)
 
 
 def generate_weights_idx(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts) -> torch.Tensor:

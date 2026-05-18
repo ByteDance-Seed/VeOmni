@@ -70,10 +70,9 @@ from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_world_size,
+    slice_input_tensor,
     sp_pad_and_slice,
 )
 from veomni.distributed.sequence_parallel.async_ulysses import (
@@ -1448,6 +1447,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_grid_thw: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithDeepstackFeatures:
+        r"""
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        """
         pixel_values = pixel_values.type(self.visual.dtype)
         vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
             pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
@@ -1518,9 +1521,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
     # ================================================================
     # Patch: Qwen3VLModel.forward
-    # 1. Ulysses SP scatter/gather around the visual-embed masked_scatter
-    #    (gather_seq_scatter_heads on inputs_embeds + image/video embeds;
-    #    gather_heads_scatter_seq after fill-back); slice image/video mask
+    # 1. Ulysses SP gather around the visual-embed masked_scatter
+    #    (gather_outputs on inputs_embeds + image/video embeds;
+    #    slice_input_tensor after fill-back); slice image/video mask
     #    + deepstack embeds to the per-rank range
     # 2. precomputed image/video masks: use kwargs["image_mask"/"video_mask"]
     #    from the VeOmni data pipeline; otherwise all-gather input_ids
@@ -1550,6 +1553,12 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3VLModelOutputWithPast:
+        r"""
+        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+            The temporal, height and width of feature shape of each image in LLM.
+        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+            The temporal, height and width of feature shape of each video in LLM.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1578,9 +1587,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         fake_deepstack = None
@@ -1594,9 +1601,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
-                image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_image_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_image_embeds
@@ -1646,9 +1651,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
             # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
-                video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
-                )
+                video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_video_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_video_embeds
@@ -1691,9 +1694,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
-            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
         visual_pos_masks = None
@@ -1932,8 +1933,17 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             else:
                 logits = self.lm_head(hidden_states)
                 loss, _, log_probs, entropy = self.loss_function(
-                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
+                if log_probs is not None:
+                    # log_probs path empties loss/logits slots; clear the local 3D
+                    # logits so output mirrors the OpSlot branch's contract.
+                    logits = None
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.1 ---

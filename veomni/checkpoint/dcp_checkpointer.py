@@ -61,8 +61,6 @@ class ModelState(Stateful):
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
-        # For FSDP1, it is implemented by FSDPExtension and state_dict hooks
-        # which is aumatically triggered by get_model_state_dict
         self.parallel_state = get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
