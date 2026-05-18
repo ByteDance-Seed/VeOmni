@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast
+from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniThinkerCausalLMOutputWithPast
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLCausalLMOutputWithPast
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLCausalLMOutputWithPast
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerCausalLMOutputWithPast
@@ -136,6 +137,21 @@ class Qwen3VLCausalLMOutputWithLogProbs(Qwen3VLCausalLMOutputWithPast):
 @dataclass
 class Qwen3VLMoeCausalLMOutputWithLogProbs(Qwen3VLMoeCausalLMOutputWithPast):
     """``Qwen3VLMoeCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
+
+    Args:
+        log_probs (`torch.FloatTensor`, *optional*):
+            Non-positive actual log-probabilities ``log p(y_t)``.
+        entropy (`torch.FloatTensor`, *optional*):
+            Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``.
+    """
+
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
+
+
+@dataclass
+class Qwen2_5OmniThinkerCausalLMOutputWithLogProbs(Qwen2_5OmniThinkerCausalLMOutputWithPast):
+    """``Qwen2_5OmniThinkerCausalLMOutputWithPast`` extended with per-token ``log_probs`` / ``entropy`` fields.
 
     Args:
         log_probs (`torch.FloatTensor`, *optional*):

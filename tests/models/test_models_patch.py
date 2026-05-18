@@ -228,9 +228,9 @@ _DEFAULT_ATOL = 1e-2
 
 # transformers v5 only — VeOmni's v4 monkey-patch path was retired together
 # with the v4 CI lane. v4-only models that have not yet been migrated to
-# patchgen (currently qwen2_5_omni) are *not* covered here; they keep their
-# v4-style modeling code in-tree but no longer have an fwd/bwd parity test.
-# Migrate them to v5 to bring them back into this list.
+# patchgen are *not* covered here; they keep their v4-style modeling code
+# in-tree but no longer have an fwd/bwd parity test. Migrate them to v5
+# to bring them back into this list.
 TEST_CASES = [
     pytest.param(
         "./tests/toy_config/llama31_toy/config.json",
@@ -294,6 +294,13 @@ TEST_CASES = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_vl_moe",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen25omni_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2_5_omni",
     ),
     pytest.param(
         "./tests/toy_config/qwen3omni_toy/config.json",

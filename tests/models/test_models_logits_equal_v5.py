@@ -17,7 +17,7 @@ class via the ``transformers >= 5.2.0`` branch (the version pinned by the
 - VLM via text-only sub-config
   (``*ForCausalLM`` registered):   qwen3_5, qwen3_5_moe
 - VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
-- Omni thinker forward:            qwen3_omni_moe (forward on ``model.thinker``)
+- Omni thinker forward:            qwen2_5_omni, qwen3_omni_moe (forward on ``model.thinker``)
 - Causal-LM with MLA + DSA:        glm_moe_dsa (eager + sdpa only — the
   upstream class sets ``_supports_flash_attn = False``)
 - Causal-LM with MLA + MoE:        deepseek_v3 (eager + fp32 only — MLA SDPA
@@ -238,6 +238,15 @@ CASES = [
         config_overrides={"_experts_implementation": "eager"},
     ),
     # ── Omni (forward on ``model.thinker`` so talker stays out of scope) ──
+    Case(
+        "qwen2_5_omni-fa2",
+        _toy("qwen25omni_toy"),
+        "Qwen2_5OmniForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
+    ),
     Case(
         "qwen3_omni_moe-fa2",
         _toy("qwen3omni_toy"),
@@ -609,10 +618,19 @@ _LOADER_CASES = [
         dtype="bfloat16",
         config_overrides={"_experts_implementation": "eager"},
     ),
-    # qwen3_omni_moe: forward on ``model.thinker`` so the talker stays
-    # out of scope — same as the in-memory CASES entry. State-dict load
-    # still happens at the root, so talker / vision / audio sub-modules
-    # round-trip through safetensors with the rest.
+    # qwen2_5_omni / qwen3_omni_moe: forward on ``model.thinker`` so the
+    # talker stays out of scope — same as the in-memory CASES entries.
+    # State-dict load still happens at the root, so talker / vision /
+    # audio sub-modules round-trip through safetensors with the rest.
+    Case(
+        "qwen2_5_omni-fa2-loader",
+        _toy("qwen25omni_toy"),
+        "Qwen2_5OmniForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
+    ),
     Case(
         "qwen3_omni_moe-fa2-loader",
         _toy("qwen3omni_toy"),

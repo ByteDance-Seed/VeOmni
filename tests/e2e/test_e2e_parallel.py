@@ -18,9 +18,9 @@ from .utils import prepare_exec_cmd
 
 # transformers v5 only — the v4 CI lane was retired together with the
 # broader transformers v4 wind-down. v4-only models that have not yet
-# been migrated to patchgen (currently qwen2_5_omni) are commented out
-# in their respective case lists with a TODO; uncomment once the
-# corresponding model gains a v5 patchgen path.
+# been migrated to patchgen are commented out in their respective case
+# lists with a TODO; uncomment once the corresponding model gains a v5
+# patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
 # Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
 # non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
@@ -204,18 +204,14 @@ qwen3vl_test_cases = [
     ),
 ]
 
-# TODO(transformers v5 migration): re-enable qwen2_5_omni once it is
-# ported to the patchgen pipeline (currently v4-only). The
-# ``test_qwen2omni_parallel_align`` test below collects 0 items until
-# this list has at least one entry.
 qwen2omni_test_cases = [
-    # pytest.param(
-    #     "qwen25_omni",
-    #     "./tests/toy_config/qwen25omni_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    # ),
+    pytest.param(
+        "qwen2_5_omni",
+        "./tests/toy_config/qwen25omni_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
 ]
 
 qwen3omni_test_cases = [
