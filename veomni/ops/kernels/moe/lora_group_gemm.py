@@ -59,7 +59,7 @@ LoRA delta math (all four classes, per-half ``side`` ∈ {gate, up}):
 * fc1[side]: ``Δfc1_side_e = (S_e @ A_side_e.T) @ B_side_e.T * scale_side``,
   where ``S_e`` is the per-expert input row block (scattered hidden state
   non-EP / the permuted token block under EP).
-* fc2: ``Δfc2_e = (W_e @ A_dn_e.T) @ B_dn_e.T * scale_dn``, where
+* fc2: ``Δfc2_e = (W_e @ A_down_e.T) @ B_down_e.T * scale_down``, where
   ``W_e`` is ``mid_e * routing_weight_e`` non-EP, and just ``mid_e`` under
   EP (the routing weight is applied later by ``tokens_post_all2all``).
   Both base ``down`` and the LoRA delta are linear in ``W``, so the two
@@ -116,9 +116,9 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             (``[r, H]`` / ``[I, r]``).
         lora_a_up / lora_b_up: shared LoRA pair on the up half
             (``[r, H]`` / ``[I, r]``).
-        lora_a_dn / lora_b_dn: shared LoRA pair on down
+        lora_a_down / lora_b_down: shared LoRA pair on down
             (``[r, I]`` / ``[H, r]``).
-        lora_scale_gate / lora_scale_up / lora_scale_dn: per-spec scaling
+        lora_scale_gate / lora_scale_up / lora_scale_down: per-spec scaling
             (typically all equal to ``alpha / r`` or ``alpha / sqrt(r)``;
             kept separate so per-spec scales are future-proof).
 
@@ -139,11 +139,11 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         lora_b_gate,
         lora_a_up,
         lora_b_up,
-        lora_a_dn,
-        lora_b_dn,
+        lora_a_down,
+        lora_b_down,
         lora_scale_gate,
         lora_scale_up,
-        lora_scale_dn,
+        lora_scale_down,
     ):
         splits = expert_histogram(expert_index, num_experts)
         scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
@@ -195,9 +195,9 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         )
 
         # LoRA fc2 delta on down (shared across experts).
-        tmp_dn = torch.nn.functional.linear(fc1_weighted_output, lora_a_dn)  # [T, r]
-        lora_delta_dn = torch.nn.functional.linear(tmp_dn, lora_b_dn) * lora_scale_dn  # [T, H]
-        fc2_output = fc2_output + lora_delta_dn
+        tmp_down = torch.nn.functional.linear(fc1_weighted_output, lora_a_down)  # [T, r]
+        lora_delta_down = torch.nn.functional.linear(tmp_down, lora_b_down) * lora_scale_down  # [T, H]
+        fc2_output = fc2_output + lora_delta_down
 
         expert_output = moe_gather(fc2_output, scatter_index)
         output = expert_output.reshape(hidden_states.shape)
@@ -205,7 +205,7 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
-        ctx.lora_scale_dn = lora_scale_dn
+        ctx.lora_scale_down = lora_scale_down
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -223,11 +223,11 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         )
 
         return output
@@ -251,15 +251,15 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         ) = ctx.saved_tensors
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
-        scale_dn = ctx.lora_scale_dn
+        scale_down = ctx.lora_scale_down
 
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
@@ -269,13 +269,13 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         grad_fc2_output = moe_scatter(grad_output, scatter_index)  # [T, H]
 
         # ---- LoRA fc2 backward (closed form). ---------------------------
-        # Forward: lora_delta_dn = tmp_dn @ lora_b_dn.T * scale_dn,
-        #          tmp_dn        = fc1_weighted_output @ lora_a_dn.T.
-        # grad_lora_delta_dn = grad_fc2_output (it was added into fc2_output).
-        grad_tmp_dn = torch.nn.functional.linear(grad_fc2_output, lora_b_dn.t()) * scale_dn  # [T, r]
-        grad_lora_b_dn = grad_fc2_output.t().to(tmp_dn.dtype) @ tmp_dn * scale_dn  # [H, r]
-        grad_lora_a_dn = grad_tmp_dn.t().to(fc1_weighted_output.dtype) @ fc1_weighted_output  # [r, I]
-        grad_fc1_weighted_output_lora = torch.nn.functional.linear(grad_tmp_dn, lora_a_dn.t())  # [T, I]
+        # Forward: lora_delta_down = tmp_down @ lora_b_down.T * scale_down,
+        #          tmp_down        = fc1_weighted_output @ lora_a_down.T.
+        # grad_lora_delta_down = grad_fc2_output (it was added into fc2_output).
+        grad_tmp_down = torch.nn.functional.linear(grad_fc2_output, lora_b_down.t()) * scale_down  # [T, r]
+        grad_lora_b_down = grad_fc2_output.t().to(tmp_down.dtype) @ tmp_down * scale_down  # [H, r]
+        grad_lora_a_down = grad_tmp_down.t().to(fc1_weighted_output.dtype) @ fc1_weighted_output  # [r, I]
+        grad_fc1_weighted_output_lora = torch.nn.functional.linear(grad_tmp_down, lora_a_down.t())  # [T, I]
 
         # MoE step 9 (base) — dgrad of fc2 wrt fc1_weighted_output.
         grad_fc1_weighted_output = group_gemm_same_nk(
@@ -378,11 +378,11 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             grad_lora_b_gate,  # lora_b_gate
             grad_lora_a_up,  # lora_a_up
             grad_lora_b_up,  # lora_b_up
-            grad_lora_a_dn,  # lora_a_dn
-            grad_lora_b_dn,  # lora_b_dn
+            grad_lora_a_down,  # lora_a_down
+            grad_lora_b_down,  # lora_b_down
             None,  # lora_scale_gate
             None,  # lora_scale_up
-            None,  # lora_scale_dn
+            None,  # lora_scale_down
         )
 
 
@@ -505,9 +505,9 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             (``[E, r, H]`` / ``[E, I, r]``).
         lora_a_up / lora_b_up: per-expert LoRA pair on the up half
             (``[E, r, H]`` / ``[E, I, r]``).
-        lora_a_dn / lora_b_dn: per-expert LoRA pair on down
+        lora_a_down / lora_b_down: per-expert LoRA pair on down
             (``[E, r, I]`` / ``[E, H, r]``).
-        lora_scale_gate / lora_scale_up / lora_scale_dn: per-spec scaling
+        lora_scale_gate / lora_scale_up / lora_scale_down: per-spec scaling
             (``alpha / r`` or ``alpha / sqrt(r)`` for rsLoRA).
 
     Output:
@@ -527,11 +527,11 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         lora_b_gate,
         lora_a_up,
         lora_b_up,
-        lora_a_dn,
-        lora_b_dn,
+        lora_a_down,
+        lora_b_down,
         lora_scale_gate,
         lora_scale_up,
-        lora_scale_dn,
+        lora_scale_down,
     ):
         splits = expert_histogram(expert_index, num_experts)
         scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
@@ -593,22 +593,22 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         )
 
         # LoRA fc2 delta on down (per-expert).
-        tmp_dn = group_gemm_same_nk(
+        tmp_down = group_gemm_same_nk(
             a=fc1_weighted_output,
-            b=lora_a_dn,  # [E, r, I] → N=r, K=I
+            b=lora_a_down,  # [E, r, I] → N=r, K=I
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=True,
         )  # [T, r]
-        lora_delta_dn = group_gemm_same_nk(
-            a=tmp_dn,
-            b=lora_b_dn,  # [E, H, r] → N=H, K=r
+        lora_delta_down = group_gemm_same_nk(
+            a=tmp_down,
+            b=lora_b_down,  # [E, H, r] → N=H, K=r
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=True,
         )  # [T, H]
-        lora_delta_dn = lora_delta_dn * lora_scale_dn
-        fc2_output = fc2_output + lora_delta_dn
+        lora_delta_down = lora_delta_down * lora_scale_down
+        fc2_output = fc2_output + lora_delta_down
 
         expert_output = moe_gather(fc2_output, scatter_index)
         output = expert_output.reshape(hidden_states.shape)
@@ -616,7 +616,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         ctx.num_experts = num_experts
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
-        ctx.lora_scale_dn = lora_scale_dn
+        ctx.lora_scale_down = lora_scale_down
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -634,11 +634,11 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         )
 
         return output
@@ -662,15 +662,15 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         ) = ctx.saved_tensors
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
-        scale_dn = ctx.lora_scale_dn
+        scale_down = ctx.lora_scale_down
 
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
@@ -680,15 +680,15 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         grad_fc2_output = moe_scatter(grad_output, scatter_index)  # [T, H]
 
         # ---- LoRA fc2 backward (per-expert closed form). ----------------
-        grad_lora_a_dn, grad_lora_b_dn, grad_fc1_weighted_output_lora = _per_expert_lora_half_backward(
+        grad_lora_a_down, grad_lora_b_down, grad_fc1_weighted_output_lora = _per_expert_lora_half_backward(
             grad_delta=grad_fc2_output,
             inp=fc1_weighted_output,
-            tmp=tmp_dn,
-            lora_a=lora_a_dn,
-            lora_b=lora_b_dn,
+            tmp=tmp_down,
+            lora_a=lora_a_down,
+            lora_b=lora_b_down,
             cumsum=cumsum_t,
             max_t=max_t,
-            scale=scale_dn,
+            scale=scale_down,
         )
 
         # MoE step 9 (base) — dgrad of fc2 wrt fc1_weighted_output.
@@ -798,11 +798,11 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
             grad_lora_b_gate,  # lora_b_gate
             grad_lora_a_up,  # lora_a_up
             grad_lora_b_up,  # lora_b_up
-            grad_lora_a_dn,  # lora_a_dn
-            grad_lora_b_dn,  # lora_b_dn
+            grad_lora_a_down,  # lora_a_down
+            grad_lora_b_down,  # lora_b_down
             None,  # lora_scale_gate
             None,  # lora_scale_up
-            None,  # lora_scale_dn
+            None,  # lora_scale_down
         )
 
 
@@ -834,9 +834,9 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             (``[r, H]`` / ``[I, r]``, rank-invariant).
         lora_a_up / lora_b_up: shared LoRA pair on the up half
             (``[r, H]`` / ``[I, r]``).
-        lora_a_dn / lora_b_dn: shared LoRA pair on down
+        lora_a_down / lora_b_down: shared LoRA pair on down
             (``[r, I]`` / ``[H, r]``).
-        lora_scale_gate / lora_scale_up / lora_scale_dn: per-spec scaling.
+        lora_scale_gate / lora_scale_up / lora_scale_down: per-spec scaling.
 
     Output:
         ``[T_local, H]`` — same shape as ``permute_tokens``.
@@ -853,11 +853,11 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
         lora_b_gate,
         lora_a_up,
         lora_b_up,
-        lora_a_dn,
-        lora_b_dn,
+        lora_a_down,
+        lora_b_down,
         lora_scale_gate,
         lora_scale_up,
-        lora_scale_dn,
+        lora_scale_down,
     ):
         max_t = permute_tokens.shape[0]
 
@@ -896,13 +896,13 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
         )
 
         # Shared LoRA delta on down.
-        tmp_dn = torch.nn.functional.linear(fc1_act, lora_a_dn)  # [T_local, r]
-        lora_delta_dn = torch.nn.functional.linear(tmp_dn, lora_b_dn) * lora_scale_dn  # [T_local, H]
-        fc2_output = fc2_output + lora_delta_dn
+        tmp_down = torch.nn.functional.linear(fc1_act, lora_a_down)  # [T_local, r]
+        lora_delta_down = torch.nn.functional.linear(tmp_down, lora_b_down) * lora_scale_down  # [T_local, H]
+        fc2_output = fc2_output + lora_delta_down
 
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
-        ctx.lora_scale_dn = lora_scale_dn
+        ctx.lora_scale_down = lora_scale_down
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -915,11 +915,11 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         )
 
         return fc2_output
@@ -940,23 +940,23 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         ) = ctx.saved_tensors
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
-        scale_dn = ctx.lora_scale_dn
+        scale_down = ctx.lora_scale_down
 
         max_t = grad_output.shape[0]
 
         # ---- LoRA fc2 backward (closed form). ---------------------------
-        grad_tmp_dn = torch.nn.functional.linear(grad_output, lora_b_dn.t()) * scale_dn  # [T_local, r]
-        grad_lora_b_dn = grad_output.t().to(tmp_dn.dtype) @ tmp_dn * scale_dn  # [H, r]
-        grad_lora_a_dn = grad_tmp_dn.t().to(fc1_act.dtype) @ fc1_act  # [r, I]
-        grad_fc1_act_lora = torch.nn.functional.linear(grad_tmp_dn, lora_a_dn.t())  # [T_local, I]
+        grad_tmp_down = torch.nn.functional.linear(grad_output, lora_b_down.t()) * scale_down  # [T_local, r]
+        grad_lora_b_down = grad_output.t().to(tmp_down.dtype) @ tmp_down * scale_down  # [H, r]
+        grad_lora_a_down = grad_tmp_down.t().to(fc1_act.dtype) @ fc1_act  # [r, I]
+        grad_fc1_act_lora = torch.nn.functional.linear(grad_tmp_down, lora_a_down.t())  # [T_local, I]
 
         # Base fc2 dgrad → grad_fc1_act, then accumulate LoRA contribution.
         grad_fc1_act = group_gemm_same_nk(
@@ -1039,11 +1039,11 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             grad_lora_b_gate,  # lora_b_gate
             grad_lora_a_up,  # lora_a_up
             grad_lora_b_up,  # lora_b_up
-            grad_lora_a_dn,  # lora_a_dn
-            grad_lora_b_dn,  # lora_b_dn
+            grad_lora_a_down,  # lora_a_down
+            grad_lora_b_down,  # lora_b_down
             None,  # lora_scale_gate
             None,  # lora_scale_up
-            None,  # lora_scale_dn
+            None,  # lora_scale_down
         )
 
 
@@ -1069,9 +1069,9 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             (``[E_local, r, H]`` / ``[E_local, I, r]``).
         lora_a_up / lora_b_up: per-local-expert LoRA pair on up
             (``[E_local, r, H]`` / ``[E_local, I, r]``).
-        lora_a_dn / lora_b_dn: per-local-expert LoRA pair on down
+        lora_a_down / lora_b_down: per-local-expert LoRA pair on down
             (``[E_local, r, I]`` / ``[E_local, H, r]``).
-        lora_scale_gate / lora_scale_up / lora_scale_dn: per-spec scaling.
+        lora_scale_gate / lora_scale_up / lora_scale_down: per-spec scaling.
 
     Output:
         ``[T_local, H]`` — same shape as ``permute_tokens``.
@@ -1088,11 +1088,11 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
         lora_b_gate,
         lora_a_up,
         lora_b_up,
-        lora_a_dn,
-        lora_b_dn,
+        lora_a_down,
+        lora_b_down,
         lora_scale_gate,
         lora_scale_up,
-        lora_scale_dn,
+        lora_scale_down,
     ):
         max_t = permute_tokens.shape[0]
 
@@ -1143,26 +1143,26 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
         )
 
         # Per-local-expert LoRA delta on down.
-        tmp_dn = group_gemm_same_nk(
+        tmp_down = group_gemm_same_nk(
             a=fc1_act,
-            b=lora_a_dn,  # [E_local, r, I] → N=r, K=I
+            b=lora_a_down,  # [E_local, r, I] → N=r, K=I
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=True,
         )  # [T_local, r]
-        lora_delta_dn = group_gemm_same_nk(
-            a=tmp_dn,
-            b=lora_b_dn,  # [E_local, H, r] → N=H, K=r
+        lora_delta_down = group_gemm_same_nk(
+            a=tmp_down,
+            b=lora_b_down,  # [E_local, H, r] → N=H, K=r
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=True,
         )  # [T_local, H]
-        lora_delta_dn = lora_delta_dn * lora_scale_dn
-        fc2_output = fc2_output + lora_delta_dn
+        lora_delta_down = lora_delta_down * lora_scale_down
+        fc2_output = fc2_output + lora_delta_down
 
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
-        ctx.lora_scale_dn = lora_scale_dn
+        ctx.lora_scale_down = lora_scale_down
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -1175,11 +1175,11 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         )
 
         return fc2_output
@@ -1198,28 +1198,28 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             lora_b_gate,
             lora_a_up,
             lora_b_up,
-            lora_a_dn,
-            lora_b_dn,
+            lora_a_down,
+            lora_b_down,
             tmp_gate,
             tmp_up,
-            tmp_dn,
+            tmp_down,
         ) = ctx.saved_tensors
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
-        scale_dn = ctx.lora_scale_dn
+        scale_down = ctx.lora_scale_down
 
         max_t = grad_output.shape[0]
 
         # ---- LoRA fc2 backward (per-local-expert closed form). ----------
-        grad_lora_a_dn, grad_lora_b_dn, grad_fc1_act_lora = _per_expert_lora_half_backward(
+        grad_lora_a_down, grad_lora_b_down, grad_fc1_act_lora = _per_expert_lora_half_backward(
             grad_delta=grad_output,
             inp=fc1_act,
-            tmp=tmp_dn,
-            lora_a=lora_a_dn,
-            lora_b=lora_b_dn,
+            tmp=tmp_down,
+            lora_a=lora_a_down,
+            lora_b=lora_b_down,
             cumsum=cumsum,
             max_t=max_t,
-            scale=scale_dn,
+            scale=scale_down,
         )
 
         # Base fc2 dgrad + LoRA contribution.
@@ -1312,11 +1312,11 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
             grad_lora_b_gate,  # lora_b_gate
             grad_lora_a_up,  # lora_a_up
             grad_lora_b_up,  # lora_b_up
-            grad_lora_a_dn,  # lora_a_dn
-            grad_lora_b_dn,  # lora_b_dn
+            grad_lora_a_down,  # lora_a_down
+            grad_lora_b_down,  # lora_b_down
             None,  # lora_scale_gate
             None,  # lora_scale_up
-            None,  # lora_scale_dn
+            None,  # lora_scale_down
         )
 
 
