@@ -925,10 +925,15 @@ class ModelingCodeGenerator:
             )
             # ``class Foo(...): ...`` keeps the empty marker on the same line as the
             # class header. Rewriting only the marker leaves ``class Foo(...):`` open
-            # and inserts the new method below it.
+            # and inserts the new method below it. The post-colon segment is stripped
+            # of any trailing ``# comment`` before the {"pass", "..."} membership check,
+            # otherwise an annotated empty body like ``class Foo: ...  # placeholder``
+            # would fall through to the else-branch and delete the entire header line
+            # (since ``empty_start`` points at the header for the inline form).
             class_header_line = source_lines[empty_start]
             colon_idx = class_header_line.rfind(":")
-            if colon_idx != -1 and class_header_line[colon_idx + 1 :].strip() in {"pass", "..."}:
+            after_colon_no_comment = class_header_line[colon_idx + 1 :].split("#", 1)[0] if colon_idx != -1 else ""
+            if colon_idx != -1 and after_colon_no_comment.strip() in {"pass", "..."}:
                 header_only = class_header_line[: colon_idx + 1].rstrip()
                 new_source_lines = (
                     source_lines[:empty_start] + [header_only] + indented_preserved_lines + source_lines[empty_end:]
