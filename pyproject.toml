@@ -25,9 +25,9 @@ dependencies = [
   "tiktoken>=0.9.0",
   # Comment out transformers version so pip users do not accidentally pull in a
   # version that conflicts with the uv-managed setup.
-  # For uv user: The actual version is controlled by the "transformers-stable" default
-  # dependency-group (==5.2.0) or by the "transformers-v4-legacy" optional extra (==4.57.3).
-  # For pip user: please install 5.2.0 manually via pip install transformers==5.2.0.
+  # For uv user: the actual version is pinned by the "transformers-stable"
+  # default dependency-group (==5.2.0).
+  # For pip user: please install 5.2.0 manually via `pip install transformers==5.2.0`.
   # "transformers==5.2.0",
   "psutil",
   "timm",
@@ -125,15 +125,6 @@ flash-qla = [
   "flash-qla"
 ]
 
-# Legacy escape hatch to pin transformers 4.57.3.
-# The default install ships transformers 5.2.0 via the `transformers-stable`
-# dependency group. This extra exists for users still on v4 code paths; it will
-# be removed once all v4 compatibility code is dropped.
-# Usage: `uv sync --no-group transformers-stable --extra transformers-v4-legacy --extra <other extra>`.
-transformers-v4-legacy = [
-  "transformers==4.57.3"
-]
-
 [dependency-groups]
 # Follow the best practice in https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies
 # to manage dev dependencies (i.e., dependencies that are only used in development) like
@@ -151,17 +142,13 @@ test = [
   "pytest",
   "expecttest",
 ]
-# Pin the default transformers version via a dependency group.
-# This is a default group (see default-groups below), so `uv sync` will
-# always install transformers==5.2.0 unless the user opts out with
-# `--no-group transformers-stable` (and opts in to `--extra transformers-v4-legacy`).
+# Pin the default transformers version via a dependency group. This is a
+# default group (see default-groups below), so `uv sync` always installs
+# transformers==5.2.0.
 #
-# Why a dependency group instead of override-dependencies?
-# uv's override-dependencies replaces ALL occurrences of a package name globally.
-# When using `extra` markers in overrides (e.g. `extra != 'transformers-v4-legacy'`),
-# uv converts them to impossible markers like `python_version < '0'`, which
-# silently removes transformers from the dependency tree entirely.
-# See: https://github.com/astral-sh/uv/issues/11153
+# Why a dependency group instead of `[project.dependencies]`? It keeps the
+# transformers version out of the wheel metadata so pip users are not forced
+# into a specific 5.x patch release.
 transformers-stable = [
   "transformers==5.2.0"
 ]
@@ -181,8 +168,6 @@ no-build-isolation-package = [
 
 # The "transformers-stable" dependency group is synced by default, ensuring
 # that `uv sync` (with no extra flags) installs transformers==5.2.0.
-# To use legacy transformers 4.57.3, run:
-#   uv sync --no-group transformers-stable --extra transformers-v4-legacy
 default-groups = ["transformers-stable"]
 
 override-dependencies = [
@@ -205,12 +190,6 @@ override-dependencies = [
     "torchvision==0.22.1+cpu; (extra == 'npu')",
     "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
 
-    # NOTE: The transformers overrides that were previously here have been removed.
-    # They used `extra != 'transformers-v4-legacy'`-style markers which uv converts to
-    # `python_version < '0'` (always false), silently removing transformers
-    # from the dependency tree. The version pinning is now handled by the
-    # "transformers-stable" default dependency group + conflicts declaration.
-
     # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
     # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
     # TODO: remove this override after we upgrade to torch 2.10.
@@ -222,13 +201,6 @@ conflicts = [
     { extra = "gpu" },
     { extra = "npu" },
     { extra = "npu_aarch64" },
-  ],
-  # transformers version conflicts: the "transformers-stable" dependency group
-  # pins to 5.x while the "transformers-v4-legacy" extra pins to 4.x.
-  # Declaring them as conflicting allows uv to resolve both forks independently.
-  [
-    { group = "transformers-stable" },
-    { extra = "transformers-v4-legacy" },
   ],
 ]
 

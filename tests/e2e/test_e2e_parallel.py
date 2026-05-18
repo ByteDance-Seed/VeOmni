@@ -16,9 +16,7 @@ from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
 
-# transformers v5 only — the v4 CI lane was retired together with the
-# broader transformers v4 wind-down. v4-only models that have not yet
-# been migrated to patchgen are commented out in their respective case
+# Models without a patchgen path are commented out in their respective case
 # lists with a TODO; uncomment once the corresponding model gains a v5
 # patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")

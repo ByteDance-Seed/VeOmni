@@ -14,7 +14,7 @@ Before implementing, check which areas your change affects:
 | `veomni/distributed/` | FSDP2 + ExtraParallel/MoE/SP paths | Shared distributed code is used by many downstream modalities |
 | `veomni/models/auto.py`, `loader.py` | Model registry, import-time side effects | `MODELING_REGISTRY` is populated at import time; moving registrations breaks loading |
 | `configs/` | YAML config keys | Renaming config keys breaks existing training configs silently |
-| `veomni/models/transformers/*/` | `__init__.py` version gates | Models have v4/v5 transformers branches; changes must work on both |
+| `veomni/models/transformers/*/` | `__init__.py` registration entry points | All models ship a patchgen-generated v5 path under `generated/`; never import or call legacy `modeling_<m>.py` or `apply_veomni_<m>_patch()` (these no longer exist) |
 
 ## Refactoring Safety Rules
 

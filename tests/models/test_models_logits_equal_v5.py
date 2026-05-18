@@ -1,17 +1,15 @@
 """Bitwise logits-equal tests for transformers v5 models.
 
-v5 ships self-contained generated modeling under
+Every VeOmni-supported model ships self-contained generated modeling under
 ``veomni/models/transformers/<model>/generated/``, so pristine
 ``transformers.*`` classes stay untouched and HF + VeOmni can be built
-side-by-side without an unpatch helper. The transformers v4 lane (and its
-sibling logits-equal file) was retired — v4-only models that have not yet
-been migrated to patchgen no longer have logits-equal coverage.
+side-by-side without an unpatch helper.
 
 Coverage
 --------
 Models under ``veomni/models/transformers/`` that register a patchgen-generated
-class via the ``transformers >= 5.2.0`` branch (the version pinned by the
-``transformers-stable`` default group in ``pyproject.toml``):
+class (``transformers-stable`` default group in ``pyproject.toml`` pins
+``transformers==5.2.0``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3
 - VLM via text-only sub-config
@@ -274,9 +272,7 @@ def _single_rank_process_group():
     Only init/teardown if we created the group; gated on the same skip
     conditions as the test bodies so a skip-only run doesn't pay the cost.
     """
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-    if not IS_CUDA_AVAILABLE or not is_transformers_version_greater_or_equal_to("5.2.0"):
+    if not IS_CUDA_AVAILABLE:
         yield
         return
 
@@ -479,10 +475,6 @@ def _forward_target(model, case: Case):
 @pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
 def test_logits_bitwise_equal_v5(case: Case):
     """Bitwise-equal forward: pristine HF vs VeOmni patched modeling."""
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-    if not is_transformers_version_greater_or_equal_to("5.2.0"):
-        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
@@ -739,10 +731,6 @@ def test_logits_bitwise_equal_v5_via_loader(case: Case):
     See ``_build_veomni_model_from_disk`` for why HF's non-persistent
     buffers are restored before the forward.
     """
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-    if not is_transformers_version_greater_or_equal_to("5.2.0"):
-        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):

@@ -18,12 +18,7 @@ import torch.distributed as dist
 
 from veomni.arguments import MixedPrecisionConfig
 from veomni.utils.device import empty_cache
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
-
-_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.2.0")
-_v4_only = pytest.mark.skipif(_is_transformers_v5, reason="Not compatible with transformers >= 5.2.0")
-_v5_only = pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.2.0")
 
 _TEXT_SEQ_LEN = 64
 _VOCAB_SIZE = 1024
@@ -208,22 +203,19 @@ _vlm_cases = [
         "qwen2_5_vl",
         "./tests/toy_config/qwen25vl_toy",
         partial(_vlm_batch, patch_size=14),
-        id="qwen2_5_vl_v5",
-        marks=_v5_only,
+        id="qwen2_5_vl",
     ),
     pytest.param(
         "qwen3_vl",
         "./tests/toy_config/qwen3vl_toy",
         partial(_vlm_batch, patch_size=16),
-        id="qwen3_vl_v5",
-        marks=_v5_only,
+        id="qwen3_vl",
     ),
     pytest.param(
         "qwen3_vl_moe",
         "./tests/toy_config/qwen3vlmoe_toy",
         partial(_vlm_batch, patch_size=16),
-        id="qwen3_vl_moe_v5",
-        marks=_v5_only,
+        id="qwen3_vl_moe",
     ),
 ]
 
@@ -248,15 +240,13 @@ _omni_cases = [
         "qwen2_5_omni",
         "./tests/toy_config/qwen25omni_toy",
         partial(_omni_batch, patch_size=14, is_qwen3_omni=False),
-        id="qwen2_5_omni_v5",
-        marks=_v5_only,
+        id="qwen2_5_omni",
     ),
     pytest.param(
         "qwen3_omni_moe",
         "./tests/toy_config/qwen3omni_toy",
         partial(_omni_batch, patch_size=16, is_qwen3_omni=True),
-        id="qwen3_omni_moe_v5",
-        marks=_v5_only,
+        id="qwen3_omni_moe",
     ),
 ]
 

@@ -184,9 +184,7 @@ def _run_fsdp_equivalence(
 
 # --- Text model test cases ---
 
-# transformers v5 only — the v4 CI lane was retired together with the
-# broader transformers v4 wind-down. v4-only models that have not yet
-# been migrated to patchgen are commented out below; uncomment a case
+# Models without a patchgen path are commented out below; uncomment a case
 # once the corresponding model gains a v5 patchgen path.
 #
 # NOTE: these tests use ``*_fsdp_equiv_toy`` configs (vocab_size=2048)

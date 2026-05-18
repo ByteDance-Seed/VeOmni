@@ -14,11 +14,6 @@ from veomni.trainer.vlm_trainer import (
 from ..tools.training_utils import make_eager_ops_config
 
 
-# transformers v5 scope. Models in the list either require transformers
-# >= 5.0.0 (qwen3_5*, qwen2_5_vl, qwen3_vl*) or are dual-version with v5
-# as the preferred path (qwen2_vl). The v4 CI lane was retired together
-# with the broader transformers v4 wind-down, so v4 coverage on the
-# dual-version models is no longer exercised.
 _FREEZE_VIT_VLM_CASES = [
     pytest.param("./tests/toy_config/qwen2vl_toy/config.json", id="qwen2_vl"),
     pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),

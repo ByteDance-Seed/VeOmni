@@ -62,8 +62,10 @@ Phase 5: Knowledge capture           -> pending
 5. **If a package version upgrade is suspected**, create isolated uv environments to bisect:
    ```bash
    # Create a separate env with the old version
-   uv venv .venv-legacy
-   VIRTUAL_ENV=.venv-legacy uv sync --no-group transformers-stable --extra transformers-v4-legacy --extra gpu --dev
+   uv venv .venv-experimental
+   VIRTUAL_ENV=.venv-experimental uv sync --no-group transformers-stable --extra gpu --dev
+   # Then install whatever transformers version you want to test against:
+   # VIRTUAL_ENV=.venv-experimental uv pip install transformers==X.Y.Z
 
    # Create a separate env with the default (v5)
    uv venv .venv-new

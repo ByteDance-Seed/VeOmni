@@ -35,17 +35,11 @@ from veomni.utils.device import (
     get_dist_comm_backend,
     get_torch_device,
 )
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 SEED = 4242
 EP_SIZE = 2  # world_size = 4 -> ep_fsdp_size = 4 // 2 = 2.
 QWEN3_MOE_TOY_CFG = "tests/toy_config/qwen3_moe_toy"
-
-pytestmark = pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.0.0"),
-    reason="Muon training support is transformers v5-only.",
-)
 
 
 def _stable_hash(s: str) -> int:

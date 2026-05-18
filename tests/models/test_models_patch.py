@@ -166,13 +166,11 @@ class TrainerTest(BaseTrainer):
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
         # Sync weights — every model that test_models_patch covers ships a
-        # VeOmni v5 layout that matches HF's in-memory state dict, so a
-        # straight ``load_state_dict`` is sufficient. The per-model
-        # ``weight_sync_adapters.py`` shim was retired with the v4 wind-down.
-        # When loading from a real on-disk HF safetensors checkpoint, the
-        # per-expert → fused merge still happens, but at the runtime-
-        # converter layer (e.g. ``DeepseekV3CheckpointTensorConverter``);
-        # that path is exercised by
+        # patchgen layout that matches HF's in-memory state dict, so a
+        # straight ``load_state_dict`` is sufficient. When loading from a real
+        # on-disk HF safetensors checkpoint, the per-expert → fused merge
+        # still happens, but at the runtime-converter layer (e.g.
+        # ``DeepseekV3CheckpointTensorConverter``); that path is exercised by
         # ``test_logits_bitwise_equal_v5_via_loader`` in
         # ``test_models_logits_equal.py``.
         self.model.load_state_dict(state_dict)
@@ -226,11 +224,8 @@ class TrainerTest(BaseTrainer):
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
-# transformers v5 only — VeOmni's v4 monkey-patch path was retired together
-# with the v4 CI lane. v4-only models that have not yet been migrated to
-# patchgen are *not* covered here; they keep their v4-style modeling code
-# in-tree but no longer have an fwd/bwd parity test. Migrate them to v5
-# to bring them back into this list.
+# Models without a patchgen path are not covered here. Migrate them via
+# ``/veomni-migrate-transformers-v5`` to bring them back into this list.
 TEST_CASES = [
     pytest.param(
         "./tests/toy_config/llama31_toy/config.json",

@@ -37,19 +37,12 @@ try:
 except ImportError:
     AutoModelForVision2Seq = AutoModelForImageTextToText
 
+from transformers.initialization import no_init_weights
+
 from ..utils import logging
 from ..utils.env import get_env
-from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from ..utils.registry import Registry
 from .module_utils import init_empty_weights, load_model_weights
-
-
-# `no_init_weights` was moved to `transformers.initialization` in:
-# https://github.com/huggingface/transformers/pull/42957
-if is_transformers_version_greater_or_equal_to("5.0.0"):
-    from transformers.initialization import no_init_weights
-else:
-    from transformers.modeling_utils import no_init_weights
 
 
 MODELING_REGISTRY = Registry("Modeling")
@@ -59,18 +52,16 @@ MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
 logger = logging.get_logger(__name__)
 
 
-def raise_if_not_migrated_to_v5(model_name: str) -> None:
-    # Gate for models whose VeOmni path is a v4-style monkey-patch and has NOT been ported
-    # to the patchgen/generated flow. `get_model_class` in this module short-circuits when
-    # MODELING_BACKEND=hf, so this function is only reached when the caller wants VeOmni's
-    # patched classes — under transformers>=5.0.0 those patches are almost certainly broken
-    # against v5's rewritten modeling layer, so fail loudly instead of silently corrupting.
-    if is_transformers_version_greater_or_equal_to("5.0.0"):
-        raise RuntimeError(
-            f"{model_name} has not been migrated to transformers v5 in VeOmni. "
-            f"Set MODELING_BACKEND=hf to bypass VeOmni patches and load upstream "
-            f"HuggingFace classes directly, or pin transformers<5.0.0."
-        )
+def raise_unsupported_veomni_modeling(model_name: str) -> None:
+    # Gate for models whose VeOmni modeling path has NOT been ported to the
+    # patchgen/generated flow. ``get_model_class`` in this module short-circuits
+    # when MODELING_BACKEND=hf, so this function is only reached when the caller
+    # wants VeOmni's patched classes — fail loudly instead of returning a stub
+    # that would silently produce broken graphs.
+    raise RuntimeError(
+        f"{model_name} does not have a VeOmni modeling path. Set MODELING_BACKEND=hf "
+        f"to bypass VeOmni patches and load upstream HuggingFace classes directly."
+    )
 
 
 def get_model_config(config_path: str, **kwargs):

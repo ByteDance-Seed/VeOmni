@@ -147,9 +147,7 @@ Additional per-directory helpers:
 | MoE implementation | `eager`, `fused` (MoE models only) |
 | Liger kernel | `True`, `False` (VeOmni only) |
 
-**Models covered** (transformers v5 only — the v4 monkey-patch lane was
-retired together with the v4 CI; v4-only models that have not yet been
-migrated to patchgen are not exercised here):
+**Models covered**:
 - Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3
 - VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni: qwen2_5_omni, qwen3_omni_moe
@@ -162,7 +160,7 @@ migrated to patchgen are not exercised here):
 
 **Purpose**: Smoke test that `freeze_vit=True/False` correctly freezes/unfreezes the vision tower.
 
-**Models** (transformers v5 only): qwen2_vl, qwen3_5, qwen3_5_moe, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
+**Models**: qwen2_vl, qwen3_5, qwen3_5_moe, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 
 **GPU**: CPU only (builds model but no forward pass).
 
@@ -202,7 +200,7 @@ migrated to patchgen are not exercised here):
 3. Run FSDP2 training (nproc=2+, init_device=meta)
 4. Assert grad_norm matches (loss may differ due to micro-batch splitting)
 
-**Models**: qwen3, qwen3_moe, llama3.1 (v4); qwen3_5, qwen3_5_moe (v5)
+**Models**: qwen3, qwen3_moe, llama3.1, qwen3_5, qwen3_5_moe
 
 **GPU**: 2+ GPUs.
 
@@ -212,7 +210,7 @@ migrated to patchgen are not exercised here):
 
 **Purpose**: Verify that asymmetric multimodal batches (some ranks text-only, others with images/video/audio) don't cause NCCL hangs under FSDP2. Tests that `dummy_forward()` is correctly invoked so all ranks participate in FSDP collectives.
 
-**Models** (all `_v5_only` — the legacy v4 lane was retired):
+**Models**:
 - VLM: qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
@@ -292,7 +290,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | Step | Test File | What to Do |
 |---|---|---|
 | 1. **Create toy config** | `tests/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
-| 2. **Model patch (fwd/bwd)** | `tests/models/test_models_patch.py` | Add entry to `_TEST_CASES_TRANSFORMERS_V5` (or v4 list). Filter unsupported attn/MoE modes if needed. |
+| 2. **Model patch (fwd/bwd)** | `tests/models/test_models_patch.py` | Add a `pytest.param(...)` entry to the model parametrize. Filter unsupported attn/MoE modes if needed. |
 | 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel.py` | Add entry to `text_test_cases` (text) or the appropriate VLM/omni list. Set `max_sp_size=1` if SP not yet supported. |
 | 4. **FSDP equivalence** | `tests/distributed/test_fsdp_equivalence.py` | Add entry to verify single-GPU vs FSDP2 grad_norm matches. |
 

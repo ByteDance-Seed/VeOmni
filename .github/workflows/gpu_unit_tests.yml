@@ -56,12 +56,6 @@ jobs:
   lint:
     uses: ./.github/workflows/check_pr_lint.yml
 
-  # The v4 (transformers 4.57.3) job has been retired — v5 is now the
-  # default install and v4 is sunset (see pyproject.toml comments). All
-  # previously v4-only test invocations have been moved into the v5
-  # job below; tests that are gated by a transformers-v4 check skip
-  # themselves on v5 and become no-ops.
-
   gpu_unit_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: lint
@@ -69,9 +63,8 @@ jobs:
     # `l20-8` runner is picked; use `[self-hosted, l20-N]` to pin to a specific
     # box. See github_runner/README.md for the full label scheme.
     runs-on: [self-hosted, l20-8]
-    # Bumped to 120m after merging the former v4 job's test steps into this
-    # job — the combined suite (parallel/ulysses, data, ops, fsdp utils,
-    # checkpoint callback, etc.) doesn't fit the previous 90m budget.
+    # 120m budget covers the combined suite (parallel/ulysses, data, ops,
+    # fsdp utils, checkpoint callback, etc.).
     timeout-minutes: 120
     container:
       image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9

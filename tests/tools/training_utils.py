@@ -45,9 +45,9 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
-    # qwen2 / qwen3_moe / llama3.1 / qwen2_5_omni v5 patched modeling
+    # qwen2 / qwen3_moe / llama3.1 / qwen2_5_omni patchgen-generated modeling
     # declares OpSlots for rotary_pos_emb and rms_norm but KERNEL_REGISTRY
-    # has no `npu` KernelSpec for either — only `liger_kernel` (GPU). Pin
+    # has no ``npu`` KernelSpec for either — only ``liger_kernel`` (GPU). Pin
     # both to eager until NPU KernelSpecs are registered.
     "qwen2": {
         "rms_norm_implementation": "eager",
@@ -61,7 +61,7 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
-    # qwen2_5_omni inherits the same v5 KERNEL_REGISTRY gap; mm RoPE has no
+    # qwen2_5_omni inherits the same KERNEL_REGISTRY gap; mm RoPE has no
     # NPU backend either, so pinning both keeps the thinker text path on
     # eager kernels on NPU.
     "qwen2_5_omni": {

@@ -210,7 +210,7 @@ The generated file includes:
     #  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
     # ==============================================================================
     #  Source: transformers.models.qwen3.modeling_qwen3
-    #  Based on: transformers==4.57.3
+    #  Based on: transformers==5.2.0
     #
     #  Patches applied:
     #    - class_replacement: Qwen3RMSNorm

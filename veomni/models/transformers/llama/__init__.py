@@ -11,24 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("llama")
 def register_llama_modeling(architecture: str):
-    if is_transformers_version_greater_or_equal_to("5.2.0"):
-        from .generated.patched_modeling_llama_gpu import (
-            LlamaForCausalLM,
-            LlamaForSequenceClassification,
-            LlamaModel,
-        )
-    else:
-        from transformers import LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
-
-        from .modeling_llama import apply_veomni_llama_patch
-
-        apply_veomni_llama_patch()
+    from .generated.patched_modeling_llama_gpu import (
+        LlamaForCausalLM,
+        LlamaForSequenceClassification,
+        LlamaModel,
+    )
 
     if "ForCausalLM" in architecture:
         return LlamaForCausalLM

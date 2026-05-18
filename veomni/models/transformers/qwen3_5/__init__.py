@@ -12,32 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
-# qwen3_5 is added in transformers 5.2.0.
-if is_transformers_version_greater_or_equal_to("5.2.0"):
+@MODELING_REGISTRY.register("qwen3_5")
+def register_qwen3_5_modeling(architecture: str):
+    if IS_CUDA_AVAILABLE:
+        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
+    elif IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
 
-    @MODELING_REGISTRY.register("qwen3_5")
-    def register_qwen3_5_modeling(architecture: str):
-        if IS_CUDA_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
-        elif IS_NPU_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
+    if "ForConditionalGeneration" in architecture:
+        return Qwen3_5ForConditionalGeneration
+    elif "Model" in architecture:
+        return Qwen3_5Model
+    else:
+        return Qwen3_5ForConditionalGeneration
 
-        if "ForConditionalGeneration" in architecture:
-            return Qwen3_5ForConditionalGeneration
-        elif "Model" in architecture:
-            return Qwen3_5Model
-        else:
-            return Qwen3_5ForConditionalGeneration
 
-    @MODELING_REGISTRY.register("qwen3_5_text")
-    def register_qwen3_5_text_modeling(architecture: str):
-        if IS_CUDA_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForCausalLM
-        elif IS_NPU_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForCausalLM
+@MODELING_REGISTRY.register("qwen3_5_text")
+def register_qwen3_5_text_modeling(architecture: str):
+    if IS_CUDA_AVAILABLE:
+        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForCausalLM
+    elif IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForCausalLM
 
-        return Qwen3_5ForCausalLM
+    return Qwen3_5ForCausalLM

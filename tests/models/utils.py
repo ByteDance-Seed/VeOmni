@@ -235,13 +235,6 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
                 raise AssertionError(f"{key} not match") from e
 
 
-# `apply_veomni_hf_unpatch` lives in a sibling module that does not import
-# ``veomni.data`` so test files that only need it (e.g. the converter logits
-# smoke test) don't pull in optional video/audio dependencies. Re-exported
-# here for backwards compatibility with existing call sites.
-from .hf_unpatch import apply_veomni_hf_unpatch  # noqa: F401, E402
-
-
 def apply_veomni_loss_unpatch():
     from transformers.loss.loss_utils import (
         LOSS_MAPPING,
