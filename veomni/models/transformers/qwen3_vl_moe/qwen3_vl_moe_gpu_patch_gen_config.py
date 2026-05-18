@@ -334,12 +334,12 @@ def qwen3_vl_moe_model_forward_patched(
             ]
         # --- Patch.1 ---
 
-        n_image_tokens = image_mask.sum().long().item()
         embeds_image_mask = (
             image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-        image_embeds = image_embeds[:n_image_tokens]
-        deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
+        # `masked_scatter` consumes exactly `image_mask.sum()` leading rows; data collator pads
+        # vision sequence only at the end. No `image_embeds[:n]` slice needed → no
+        # `image_mask.sum().item()` host-device sync. Same for the deepstack list.
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
@@ -384,12 +384,11 @@ def qwen3_vl_moe_model_forward_patched(
             ]
         # --- Patch.1 ---
 
-        n_video_tokens = video_mask.sum().long().item()
         embeds_video_mask = (
             video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-        video_embeds = video_embeds[:n_video_tokens]
-        deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
+        # Same as image branch above: drop the `[:n_video_tokens]` slice + the
+        # `.item()` sync.
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
