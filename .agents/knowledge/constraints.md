@@ -126,6 +126,34 @@ Core files:
     - Audio: `librosa` at configurable `sample_rate` (default 16kHz).
     - Placeholder IDs: `TYPE2INDEX` maps modality tokens (e.g. image input → `-200`, output → `-201`). `mask_input_ids()` replaces these with `0` for text embedding and exposes `{modality}_{input|output}_mask`.
 
+## DeepSpeed
+
+23. **DeepSpeed mode requires `init_device: cpu` and a matching checkpoint manager**
+    - Set `train.accelerator.fsdp_config.fsdp_mode: deepspeed` and `train.init_device: cpu`.
+    - FSDP2 requires `init_device: meta`; DeepSpeed requires `init_device: cpu` — the validator in `TrainingArguments.__post_init__` enforces this and will raise on mismatch.
+    - Set `train.checkpoint.manager: deepspeed` to use `DeepSpeedCheckpointer` (`veomni/checkpoint/ds_checkpointer.py`). The DCP checkpointer (`manager: dcp`) only supports `ddp` and `fsdp2` backends and will raise if paired with DeepSpeed.
+
+24. **Optimizer and lr_scheduler must be built before DeepSpeed engine initialization**
+    - In `BaseTrainer.__init__`, when `_is_deepspeed_mode` is True, `_build_optimizer()` and `_build_lr_scheduler()` are called *before* `_build_parallelized_model()` (which calls `init_deepspeed_engine()`).
+    - This is the reverse of the FSDP2 order. Do not reorder these calls.
+
+25. **DeepSpeed engine owns the optimizer step — do not call it manually**
+    - `engine.backward(loss)` replaces `loss.backward()`.
+    - `engine.step()` atomically handles grad clipping + `optimizer.step()` + `lr_scheduler.step()` + `optimizer.zero_grad()`.
+    - Calling `optimizer.step()` / `lr_scheduler.step()` separately in DeepSpeed mode causes double-stepping.
+
+26. **Sequence parallelism (Ulysses) and expert parallelism are FSDP2-only**
+    - DeepSpeed mode is incompatible with SP (`ulysses_size > 1`) and EP (`ep_size > 1`).
+    - These features rely on the FSDP2 device mesh and DTensor; they have no DeepSpeed code paths.
+
+27. **`offload_param` requires `zero_stage: 3`**
+    - `DeepSpeedConfig.__post_init__` validates this; setting `offload_param` with stage 1 or 2 raises immediately.
+    - NVMe offload (`offload_optimizer: nvme` or `offload_param: nvme`) also requires `nvme_path` to be a valid directory.
+
+28. **`config_path` overrides all other `train.deepspeed.*` fields**
+    - If `train.deepspeed.config_path` is set, the JSON file is loaded verbatim and only `train_batch_size` / `gradient_accumulation_steps` are patched in.
+    - All other `DeepSpeedConfig` fields (`zero_stage`, `offload_*`, `overlap_comm`, etc.) are ignored.
+
 ## Checkpoint
 
 16. **DCP checkpoint keys must match model state dict**
