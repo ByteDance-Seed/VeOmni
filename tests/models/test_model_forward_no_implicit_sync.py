@@ -130,6 +130,8 @@ def _toy(name: str) -> str:
 # Triton kernel call — no Python-level sync sites.
 _MOE_IMPL_BY_CASE: dict[str, str] = {
     "qwen3_5_moe-text-fa2-fused": "fused_triton",
+    "qwen3_vl_moe-fa2-fused": "fused_triton",
+    "qwen3_omni_moe-fa2-fused": "fused_triton",
 }
 
 
@@ -139,11 +141,11 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
 # FA2. To extend, add a ``Case`` here (and optionally a ``_MOE_IMPL_BY_CASE``
 # entry for fused-MoE coverage).
 #
-# ``qwen3_5_moe-text-eager`` is intentionally absent: the eager experts
-# loop is HF-verbatim and not the production path (production uses
+# Eager-MoE cases are intentionally absent: the eager experts loop body is
+# HF-verbatim and not the production path (production uses
 # ``veomni_moe_experts_forward`` via OpSlot, exercised by the fa2-fused
-# case below). Gating MoE on that case alone keeps the allowlist focused
-# on VeOmni-patched code.
+# cases below). Gating MoE on the fused path alone keeps the allowlist
+# focused on VeOmni-patched code.
 CASES = [
     # qwen3_5 (non-MoE, text-only sub-config) — both attention paths through
     # our patched Qwen3_5Model.forward.
@@ -160,6 +162,30 @@ CASES = [
         "qwen3_5_text",
         attn_implementation="flash_attention_2",
         dtype="bfloat16",
+    ),
+    # qwen3_vl (non-MoE VLM) — full multimodal forward with a dummy 2x2
+    # image patch; exercises patched ``Qwen3VLModel.forward`` +
+    # ``get_image_features`` + the vision tower.
+    _logits_case("qwen3_vl-fa2"),
+    # qwen3_vl_moe — production FA2 + fused-Triton MoE on the VLM path.
+    Case(
+        "qwen3_vl_moe-fa2-fused",
+        _toy("qwen3vlmoe_toy"),
+        "Qwen3VLMoeForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    # qwen3_omni_moe — forward on ``model.thinker`` (talker stays out of
+    # scope); production FA2 + fused-Triton MoE.
+    Case(
+        "qwen3_omni_moe-fa2-fused",
+        _toy("qwen3omni_toy"),
+        "Qwen3OmniMoeForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
     ),
 ]
 
@@ -191,6 +217,12 @@ CASES = [
 # Per the two-axis rule (production + HF-verbatim → add an override
 # patch), it's tracked as ``HF-prod-pending-fix`` and the fix lives on
 # branch ``tingyang/fix/qwen3_5_key_fix``.
+#
+# qwen3_vl / qwen3_vl_moe / qwen3_omni_moe entries are intentionally
+# absent — those cases are in ``_PENDING_FIX_CASES`` below and skipped
+# until the VeOmni-touched syncs they surface are fixed in a follow-up
+# PR. Once fixes land, re-run, then populate this dict with whatever
+# HF-verbatim sites remain (with the appropriate tag per the principle).
 _HF_PROD_PENDING_LINEAR_ATTN = (
     "HF-prod-pending-fix: _update_linear_attn_mask runs unconditionally in "
     "Qwen3_5{,Moe}Model.forward (no OpSlot above it). Two syncs: 0-D GPU "
@@ -208,6 +240,37 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     "qwen3_5_moe-text-fa2-fused": {
         ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _HF_PROD_PENDING_LINEAR_ATTN,
     },
+}
+
+# Cases that are *declared* in CASES but skipped at runtime because they
+# currently surface VeOmni-touched sync sites we haven't fixed yet.
+# Under the gate's principle (VeOmni-patched syncs get fixed, not
+# allowlisted), it would be misleading to add these to ``_ALLOWED_SYNCS``;
+# the skip keeps the case visible in pytest output as a reminder.
+#
+# Follow-up: a separate PR (a) fixes the patches listed below, then
+# (b) removes the case_id from this dict and (c) populates
+# ``_ALLOWED_SYNCS`` with whatever HF-verbatim sites remain after the
+# fix.
+#
+# VeOmni-touched sites currently observed (file:line in def method):
+#   qwen3_vl-fa2 (9 sites):
+#     patched_modeling_qwen3_vl_gpu.py:117,119          rot_pos_ids (add_helper)
+#     patched_modeling_qwen3_vl_gpu.py:909              rot_pos_emb
+#     patched_modeling_qwen3_vl_gpu.py:942,943,973,976  fast_pos_embed_interpolate
+#     patched_modeling_qwen3_vl_gpu.py:1029             Qwen3VLVisionModel.forward
+#     patched_modeling_qwen3_vl_gpu.py:1611             Qwen3VLModel.forward
+#   qwen3_vl_moe-fa2-fused (9 sites): same shape, mirror file
+#     patched_modeling_qwen3_vl_moe_gpu.py:147,149,953,986,987,1017,1020,1073,1792
+#   qwen3_omni_moe-fa2-fused (3 sites):
+#     patched_modeling_qwen3_omni_moe_gpu.py:1351,1362,2406  forward paths
+_PENDING_FIX_CASES: dict[str, str] = {
+    "qwen3_vl-fa2": (
+        "9 VeOmni-touched sync sites in rot_pos_ids / rot_pos_emb / "
+        "fast_pos_embed_interpolate / Vision+Model forward — pending fix."
+    ),
+    "qwen3_vl_moe-fa2-fused": ("9 VeOmni-touched sync sites (mirror of qwen3_vl-fa2) — pending fix."),
+    "qwen3_omni_moe-fa2-fused": "3 VeOmni-touched sync sites in forward paths — pending fix.",
 }
 
 
@@ -308,6 +371,8 @@ def test_no_implicit_sync_in_generated_forward(case):
 
         if not is_fused_moe_available():
             pytest.skip("fused_triton MoE requires triton + CUDA SM70+.")
+    if case.case_id in _PENDING_FIX_CASES:
+        pytest.skip(f"Pending fix: {_PENDING_FIX_CASES[case.case_id]}")
 
     _apply_determinism()
 
