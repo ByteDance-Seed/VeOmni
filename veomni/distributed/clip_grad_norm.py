@@ -13,6 +13,10 @@ def veomni_clip_grad_norm(
         grad_norm = fsdp2_clip_grad_norm(model, max_norm, norm_type, error_if_nonfinite, foreach)
     elif dp_mode == "ddp":
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, foreach=foreach)
+    elif dp_mode == "deepspeed":
+        # DeepSpeed handles gradient clipping internally via config.
+        # The norm is retrieved from engine.get_global_grad_norm() in the trainer.
+        return 0.0
     else:
         raise RuntimeError(f"Unknown dp mode {dp_mode}")
 

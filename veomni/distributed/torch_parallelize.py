@@ -467,5 +467,7 @@ def build_parallelize_model(
             )
         else:
             model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+    elif parallel_state.dp_mode == "deepspeed":
+        logger.info_rank0("DeepSpeed mode: skipping FSDP/DDP wrapping. Engine init deferred to trainer.")
 
     return model

@@ -276,7 +276,7 @@ class MixedPrecisionConfig:
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp2"] = field(
+    fsdp_mode: Literal["ddp", "fsdp2", "deepspeed"] = field(
         default="fsdp2",
         metadata={"help": "Data parallel mode."},
     )
@@ -305,11 +305,52 @@ class FSDPConfig:
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
     def __post_init__(self):
-        if self.fsdp_mode not in ("ddp", "fsdp2"):
+        if self.fsdp_mode not in ("ddp", "fsdp2", "deepspeed"):
             raise ValueError(
-                f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
-                "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
+                f"Unsupported fsdp_mode={self.fsdp_mode!r}. "
+                "switch to fsdp_mode='fsdp2' (with train.init_device='meta'), 'ddp', or 'deepspeed'."
             )
+
+
+@dataclass
+class DeepSpeedConfig:
+    """train.deepspeed.* — DeepSpeed ZeRO configuration."""
+
+    zero_stage: Literal[1, 2, 3] = field(
+        default=3,
+        metadata={"help": "ZeRO optimization stage (1, 2, or 3)."},
+    )
+    offload_optimizer: Optional[Literal["cpu", "nvme"]] = field(
+        default=None,
+        metadata={"help": "Offload optimizer state to 'cpu' or 'nvme'. None = no offload."},
+    )
+    offload_param: Optional[Literal["cpu", "nvme"]] = field(
+        default=None,
+        metadata={"help": "Offload parameters to 'cpu' or 'nvme' (ZeRO-3 only). None = no offload."},
+    )
+    nvme_path: str = field(
+        default="",
+        metadata={"help": "Directory path for NVMe offload. Required when offload to 'nvme'."},
+    )
+    overlap_comm: bool = field(
+        default=True,
+        metadata={"help": "Overlap communication with computation in ZeRO."},
+    )
+    contiguous_gradients: bool = field(
+        default=True,
+        metadata={"help": "Use contiguous gradient buffers in ZeRO."},
+    )
+    config_path: str = field(
+        default="",
+        metadata={"help": "Path to a custom DeepSpeed JSON config. Overrides all other ds_* fields."},
+    )
+
+    def __post_init__(self):
+        if self.offload_param is not None and self.zero_stage != 3:
+            raise ValueError(f"ds_offload_param={self.offload_param!r} requires zero_stage=3, got {self.zero_stage}.")
+        if "nvme" in (self.offload_optimizer, self.offload_param):
+            if not self.nvme_path or not os.path.isdir(self.nvme_path):
+                raise ValueError(f"NVMe offload requires a valid ds_nvme_path directory, got: '{self.nvme_path}'.")
 
 
 @dataclass
@@ -529,6 +570,7 @@ class TrainingArguments:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
 
     def __post_init__(self):
         self._train_steps = -1
@@ -590,6 +632,8 @@ class TrainingArguments:
         )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
+        elif acc.fsdp_config.fsdp_mode == "deepspeed":
+            assert self.init_device == "cpu", "Please use init_device: cpu for DeepSpeed training"
         else:
             if self.broadcast_model_weights_from_rank0:
                 logger.warning_rank0(

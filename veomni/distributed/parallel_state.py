@@ -82,7 +82,7 @@ class ParallelState:
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
-    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2"
+    dp_mode: Literal["ddp", "fsdp2", "deepspeed"] = "fsdp2"
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
@@ -154,6 +154,9 @@ class ParallelState:
     # ------------------------------ DP ------------------------------ #
     @property
     def dp_group(self) -> Optional["ProcessGroup"]:
+        if self.dp_mode == "deepspeed":
+            return dist.group.WORLD
+
         if self.device_mesh is not None:
             return self.device_mesh.get_group("dp")
 
@@ -269,7 +272,7 @@ class ParallelState:
 
     @property
     def fsdp_enabled(self) -> bool:
-        return self.fsdp_size > 1
+        return self.dp_mode != "deepspeed" and self.fsdp_size > 1
 
     @property
     def fsdp_size(self) -> int:
@@ -490,7 +493,7 @@ def init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
+    dp_mode: Literal["ddp", "fsdp2", "deepspeed"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
@@ -508,6 +511,31 @@ def init_parallel_state(
 
     if device_type is None:
         device_type = get_device_type()
+
+    # ── DeepSpeed shortcut: no DeviceMesh, no sharding ──
+    if dp_mode == "deepspeed":
+        logger.info_rank0(
+            f"DeepSpeed mode: skipping DeviceMesh. dp_size={dp_size}, dp_replicate_size={dp_replicate_size}, "
+            f"dp_shard_size={dp_shard_size}"
+        )
+        _PARALLEL_STATE = ParallelState(
+            dp_size=dp_size,
+            dp_replicate_size=dp_replicate_size,
+            dp_shard_size=dp_shard_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            cp_size=cp_size,
+            ulysses_size=ulysses_size,
+            dp_mode="deepspeed",
+            device_type=device_type,
+            include_sp_in_fsdp=include_sp_in_fsdp,
+            device_mesh=None,
+            extra_parallel_names=extra_parallel_names,
+            extra_parallel_sizes=dict(zip(extra_parallel_names, extra_parallel_sizes)),
+            extra_parallel_fsdp_device_mesh=dict.fromkeys(extra_parallel_names, None),
+            async_enabled=async_enabled,
+        )
+        return
 
     # Set dp_shard_size to dp_size if dp_shard_size and dp_replicate_size are not set when dp enabled
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:

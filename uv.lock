@@ -743,6 +743,24 @@ wheels = [
 ]
 
 [[package]]
+name = "deepspeed"
+version = "0.19.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "hjson" },
+    { name = "msgpack" },
+    { name = "ninja" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "py-cpuinfo" },
+    { name = "pydantic" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/15/fc/3396276f0b5088051d07459ca69cf0a21f5b91401f52d9456e7ec5cb9e9b/deepspeed-0.19.0.tar.gz", hash = "sha256:3934044178af8161be6c13475da8c49fd7185cbb0563a4ba43486dc178e7f70b", size = 1687115, upload-time = "2026-05-06T21:47:57.861Z" }
+
+[[package]]
 name = "deprecation"
 version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1054,6 +1072,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/dd/7ac658d54b9fb7999a0ccb07ad863b413cbaf5cf172f48ebcd9497ec7263/hf_xet-1.2.0-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:4c1428c9ae73ec0939410ec73023c4f842927f39db09b063b9482dac5a3bb737", size = 3413812, upload-time = "2025-10-24T19:04:24.585Z" },
     { url = "https://files.pythonhosted.org/packages/92/68/89ac4e5b12a9ff6286a12174c8538a5930e2ed662091dd2572bbe0a18c8a/hf_xet-1.2.0-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a55558084c16b09b5ed32ab9ed38421e2d87cf3f1f89815764d1177081b99865", size = 3508920, upload-time = "2025-10-24T19:04:26.927Z" },
     { url = "https://files.pythonhosted.org/packages/cb/44/870d44b30e1dcfb6a65932e3e1506c103a8a5aea9103c337e7a53180322c/hf_xet-1.2.0-cp37-abi3-win_amd64.whl", hash = "sha256:e6584a52253f72c9f52f9e549d5895ca7a471608495c4ecaa6cc73dba2b24d69", size = 2905735, upload-time = "2025-10-24T19:04:35.928Z" },
+]
+
+[[package]]
+name = "hjson"
+version = "3.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/82/e5/0b56d723a76ca67abadbf7fb71609fb0ea7e6926e94fcca6c65a85b36a0e/hjson-3.1.0.tar.gz", hash = "sha256:55af475a27cf83a7969c808399d7bccdec8fb836a07ddbd574587593b9cdcf75", size = 40541, upload-time = "2022-08-13T02:53:01.919Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1f/7f/13cd798d180af4bf4c0ceddeefba2b864a63c71645abc0308b768d67bb81/hjson-3.1.0-py3-none-any.whl", hash = "sha256:65713cdcf13214fb554eb8b4ef803419733f4f5e551047c9b711098ab7186b89", size = 54018, upload-time = "2022-08-13T02:52:59.899Z" },
 ]
 
 [[package]]
@@ -1647,6 +1674,32 @@ wheels = [
 ]
 
 [[package]]
+name = "ninja"
+version = "1.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/73/79a0b22fc731989c708068427579e840a6cf4e937fe7ae5c5d0b7356ac22/ninja-1.13.0.tar.gz", hash = "sha256:4a40ce995ded54d9dc24f8ea37ff3bf62ad192b547f6c7126e7e25045e76f978", size = 242558, upload-time = "2025-08-11T15:10:19.421Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/74/d02409ed2aa865e051b7edda22ad416a39d81a84980f544f8de717cab133/ninja-1.13.0-py3-none-macosx_10_9_universal2.whl", hash = "sha256:fa2a8bfc62e31b08f83127d1613d10821775a0eb334197154c4d6067b7068ff1", size = 310125, upload-time = "2025-08-11T15:09:50.971Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/de/6e1cd6b84b412ac1ef327b76f0641aeb5dcc01e9d3f9eee0286d0c34fd93/ninja-1.13.0-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3d00c692fb717fd511abeb44b8c5d00340c36938c12d6538ba989fe764e79630", size = 177467, upload-time = "2025-08-11T15:09:52.767Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/83/49320fb6e58ae3c079381e333575fdbcf1cca3506ee160a2dcce775046fa/ninja-1.13.0-py3-none-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:be7f478ff9f96a128b599a964fc60a6a87b9fa332ee1bd44fa243ac88d50291c", size = 187834, upload-time = "2025-08-11T15:09:54.115Z" },
+    { url = "https://files.pythonhosted.org/packages/56/c7/ba22748fb59f7f896b609cd3e568d28a0a367a6d953c24c461fe04fc4433/ninja-1.13.0-py3-none-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:60056592cf495e9a6a4bea3cd178903056ecb0943e4de45a2ea825edb6dc8d3e", size = 202736, upload-time = "2025-08-11T15:09:55.745Z" },
+    { url = "https://files.pythonhosted.org/packages/79/22/d1de07632b78ac8e6b785f41fa9aad7a978ec8c0a1bf15772def36d77aac/ninja-1.13.0-py3-none-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:1c97223cdda0417f414bf864cfb73b72d8777e57ebb279c5f6de368de0062988", size = 179034, upload-time = "2025-08-11T15:09:57.394Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/de/0e6edf44d6a04dabd0318a519125ed0415ce437ad5a1ec9b9be03d9048cf/ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:fb46acf6b93b8dd0322adc3a4945452a4e774b75b91293bafcc7b7f8e6517dfa", size = 180716, upload-time = "2025-08-11T15:09:58.696Z" },
+    { url = "https://files.pythonhosted.org/packages/54/28/938b562f9057aaa4d6bfbeaa05e81899a47aebb3ba6751e36c027a7f5ff7/ninja-1.13.0-py3-none-manylinux_2_28_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:4be9c1b082d244b1ad7ef41eb8ab088aae8c109a9f3f0b3e56a252d3e00f42c1", size = 146843, upload-time = "2025-08-11T15:10:00.046Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/fb/d06a3838de4f8ab866e44ee52a797b5491df823901c54943b2adb0389fbb/ninja-1.13.0-py3-none-manylinux_2_31_riscv64.whl", hash = "sha256:6739d3352073341ad284246f81339a384eec091d9851a886dfa5b00a6d48b3e2", size = 154402, upload-time = "2025-08-11T15:10:01.657Z" },
+    { url = "https://files.pythonhosted.org/packages/31/bf/0d7808af695ceddc763cf251b84a9892cd7f51622dc8b4c89d5012779f06/ninja-1.13.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:11be2d22027bde06f14c343f01d31446747dbb51e72d00decca2eb99be911e2f", size = 552388, upload-time = "2025-08-11T15:10:03.349Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/70/c99d0c2c809f992752453cce312848abb3b1607e56d4cd1b6cded317351a/ninja-1.13.0-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:aa45b4037b313c2f698bc13306239b8b93b4680eb47e287773156ac9e9304714", size = 472501, upload-time = "2025-08-11T15:10:04.735Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/43/c217b1153f0e499652f5e0766da8523ce3480f0a951039c7af115e224d55/ninja-1.13.0-py3-none-musllinux_1_2_i686.whl", hash = "sha256:5f8e1e8a1a30835eeb51db05cf5a67151ad37542f5a4af2a438e9490915e5b72", size = 638280, upload-time = "2025-08-11T15:10:06.512Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/45/9151bba2c8d0ae2b6260f71696330590de5850e5574b7b5694dce6023e20/ninja-1.13.0-py3-none-musllinux_1_2_ppc64le.whl", hash = "sha256:3d7d7779d12cb20c6d054c61b702139fd23a7a964ec8f2c823f1ab1b084150db", size = 642420, upload-time = "2025-08-11T15:10:08.35Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/fb/95752eb635bb8ad27d101d71bef15bc63049de23f299e312878fc21cb2da/ninja-1.13.0-py3-none-musllinux_1_2_riscv64.whl", hash = "sha256:d741a5e6754e0bda767e3274a0f0deeef4807f1fec6c0d7921a0244018926ae5", size = 585106, upload-time = "2025-08-11T15:10:09.818Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/31/aa56a1a286703800c0cbe39fb4e82811c277772dc8cd084f442dd8e2938a/ninja-1.13.0-py3-none-musllinux_1_2_s390x.whl", hash = "sha256:e8bad11f8a00b64137e9b315b137d8bb6cbf3086fbdc43bf1f90fd33324d2e96", size = 707138, upload-time = "2025-08-11T15:10:11.366Z" },
+    { url = "https://files.pythonhosted.org/packages/34/6f/5f5a54a1041af945130abdb2b8529cbef0cdcbbf9bcf3f4195378319d29a/ninja-1.13.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:b4f2a072db3c0f944c32793e91532d8948d20d9ab83da9c0c7c15b5768072200", size = 581758, upload-time = "2025-08-11T15:10:13.295Z" },
+    { url = "https://files.pythonhosted.org/packages/95/97/51359c77527d45943fe7a94d00a3843b81162e6c4244b3579fe8fc54cb9c/ninja-1.13.0-py3-none-win32.whl", hash = "sha256:8cfbb80b4a53456ae8a39f90ae3d7a2129f45ea164f43fadfa15dc38c4aef1c9", size = 267201, upload-time = "2025-08-11T15:10:15.158Z" },
+    { url = "https://files.pythonhosted.org/packages/29/45/c0adfbfb0b5895aa18cec400c535b4f7ff3e52536e0403602fc1a23f7de9/ninja-1.13.0-py3-none-win_amd64.whl", hash = "sha256:fb8ee8719f8af47fed145cced4a85f0755dd55d45b2bddaf7431fa89803c5f3e", size = 309975, upload-time = "2025-08-11T15:10:16.697Z" },
+    { url = "https://files.pythonhosted.org/packages/df/93/a7b983643d1253bb223234b5b226e69de6cda02b76cdca7770f684b795f5/ninja-1.13.0-py3-none-win_arm64.whl", hash = "sha256:3c0b40b1f0bba764644385319028650087b4c1b18cdfa6f45cb39a3669b81aa9", size = 290806, upload-time = "2025-08-11T15:10:18.018Z" },
+]
+
+[[package]]
 name = "nodeenv"
 version = "1.9.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1707,11 +1760,7 @@ version = "12.8.3.14"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
-    "python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
     "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
-    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ed/63/684a6f72f52671ea222c12ecde9bdf748a0ba025e2ad3ec374e466c26eb6/nvidia_cublas_cu12-12.8.3.14-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:93a4e0e386cc7f6e56c822531396de8170ed17068a1e18f987574895044cd8c3", size = 604900717, upload-time = "2025-01-23T17:52:55.486Z" },
@@ -1724,10 +1773,30 @@ name = "nvidia-cublas-cu12"
 version = "12.9.1.4"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and sys_platform != 'linux'",
-    "python_full_version < '3.12' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and sys_platform != 'linux'",
+    "python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version >= '3.12' and sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
+    "python_full_version < '3.12' and sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra != 'extra-6-veomni-transformers-v4-legacy' and extra != 'group-6-veomni-transformers-stable'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/82/6c/90d3f532f608a03a13c1d6c16c266ffa3828e8011b1549d3b61db2ad59f5/nvidia_cublas_cu12-12.9.1.4-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:7a950dae01add3b415a5a5cdc4ec818fb5858263e9cca59004bb99fdbbd3a5d6", size = 575006342, upload-time = "2025-06-05T20:04:16.902Z" },
@@ -1824,8 +1893,8 @@ name = "nvidia-cudnn-cu12"
 version = "9.15.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
-    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-gpu' or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (sys_platform == 'linux' and extra != 'extra-6-veomni-npu-aarch64' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or extra == 'extra-6-veomni-gpu'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fe/d8/448f16a767828d3fa76ac2b16d150febde5c9c2f8baa962a35976dde29c8/nvidia_cudnn_cu12-9.15.1.9-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:2520692ef9d7804f4f02c8f3a127b24d568bb944ab1ccee0ab946a64699acf36", size = 646656709, upload-time = "2025-11-12T20:21:46.842Z" },
@@ -1842,7 +1911,7 @@ resolution-markers = [
     "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/72/95/6157cb45a49f5090a470de42353a22a0ed5b13077886dca891b4b0e350fe/nvidia_cufft_cu12-11.3.3.41-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:68509dcd7e3306e69d0e2d8a6d21c8b25ed62e6df8aac192ce752f17677398b5", size = 193108626, upload-time = "2025-01-23T17:55:49.192Z" },
@@ -1859,7 +1928,7 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9b/2b/76445b0af890da61b501fde30650a1a4bd910607261b209cccb5235d3daa/nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1a28c9b12260a1aa7a8fd12f5ebd82d027963d635ba82ff39a1acfa7c4c0fbcf", size = 200822453, upload-time = "2025-06-05T20:05:27.889Z" },
@@ -1930,9 +1999,9 @@ resolution-markers = [
     "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
-    { name = "nvidia-cusparse-cu12", version = "12.5.7.53", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cublas-cu12", version = "12.8.3.14", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusparse-cu12", version = "12.5.7.53", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8c/ce/4214a892e804b20bf66d04f04a473006fc2d3dac158160ef85f1bc906639/nvidia_cusolver_cu12-11.7.2.55-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:0fd9e98246f43c15bee5561147ad235dfdf2d037f5d07c9d41af3f7f72feb7cc", size = 260094827, upload-time = "2025-01-23T17:58:17.586Z" },
@@ -1949,9 +2018,9 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cusparse-cu12", version = "12.5.10.65", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cublas-cu12", version = "12.9.1.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-cusparse-cu12", version = "12.5.10.65", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/03/99/686ff9bf3a82a531c62b1a5c614476e8dfa24a9d89067aeedf3592ee4538/nvidia_cusolver_cu12-11.7.5.82-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:62efa83e4ace59a4c734d052bb72158e888aa7b770e1a5f601682f16fe5b4fd2", size = 337869834, upload-time = "2025-06-05T20:06:53.125Z" },
@@ -1968,7 +2037,7 @@ resolution-markers = [
     "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.61", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux') or (sys_platform != 'linux' and extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2e/a2/313db0453087f5324a5900380ca2e57e050c8de76f407b5e11383dc762ae/nvidia_cusparse_cu12-12.5.7.53-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d869c6146ca80f4305b62e02d924b4aaced936f8173e3cef536a67eed2a91af1", size = 291963692, upload-time = "2025-01-23T17:59:40.325Z" },
@@ -1985,7 +2054,7 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-nvjitlink-cu12", version = "12.9.86", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5e/6f/8710fbd17cdd1d0fc3fea7d36d5b65ce1933611c31e1861da330206b253a/nvidia_cusparse_cu12-12.5.10.65-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:221c73e7482dd93eda44e65ce567c031c07e2f93f6fa0ecd3ba876a195023e83", size = 366359408, upload-time = "2025-06-05T20:07:42.501Z" },
@@ -2383,6 +2452,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/79/87/157c8e7959ec39ced1b11cc93c730c4fb7f9d408569a6c59dbd92ceb35db/psutil-7.1.0-cp37-abi3-win32.whl", hash = "sha256:09ad740870c8d219ed8daae0ad3b726d3bf9a028a198e7f3080f6a1888b99bca", size = 244812, upload-time = "2025-09-17T20:15:07.462Z" },
     { url = "https://files.pythonhosted.org/packages/bf/e9/b44c4f697276a7a95b8e94d0e320a7bf7f3318521b23de69035540b39838/psutil-7.1.0-cp37-abi3-win_amd64.whl", hash = "sha256:57f5e987c36d3146c0dd2528cd42151cf96cd359b9d67cfff836995cc5df9a3d", size = 247965, upload-time = "2025-09-17T20:15:09.673Z" },
     { url = "https://files.pythonhosted.org/packages/26/65/1070a6e3c036f39142c2820c4b52e9243246fcfc3f96239ac84472ba361e/psutil-7.1.0-cp37-abi3-win_arm64.whl", hash = "sha256:6937cb68133e7c97b6cc9649a570c9a18ba0efebed46d8c5dae4c07fa1b67a07", size = 244971, upload-time = "2025-09-17T20:15:12.262Z" },
+]
+
+[[package]]
+name = "py-cpuinfo"
+version = "9.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/37/a8/d832f7293ebb21690860d2e01d8115e5ff6f2ae8bbdc953f0eb0fa4bd2c7/py-cpuinfo-9.0.0.tar.gz", hash = "sha256:3cdbbf3fac90dc6f118bfd64384f309edeadd902d7c8fb17f02ffa1fc3f49690", size = 104716, upload-time = "2022-10-25T20:38:06.303Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/a9/023730ba63db1e494a271cb018dcd361bd2c917ba7004c3e49d5daf795a2/py_cpuinfo-9.0.0-py3-none-any.whl", hash = "sha256:859625bc251f64e21f077d099d4162689c762b5d6a4c3c97553d56241c9674d5", size = 22335, upload-time = "2022-10-25T20:38:27.636Z" },
 ]
 
 [[package]]
@@ -3630,7 +3708,7 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "setuptools", marker = "sys_platform != 'darwin' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
+    { name = "setuptools", marker = "sys_platform == 'linux' or (extra == 'extra-6-veomni-transformers-v4-legacy' and extra == 'group-6-veomni-transformers-stable')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/21/2f/3e56ea7b58f80ff68899b1dbe810ff257c9d177d288c6b0f55bf2fe4eb50/triton-3.3.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b31e3aa26f8cb3cc5bf4e187bf737cbacf17311e1112b781d4a059353dfd731b", size = 155689937, upload-time = "2025-05-29T23:39:44.182Z" },
@@ -3771,6 +3849,9 @@ audio = [
     { name = "librosa" },
     { name = "soundfile" },
 ]
+deepspeed = [
+    { name = "deepspeed" },
+]
 dev = [
     { name = "expecttest" },
     { name = "pre-commit" },
@@ -3883,6 +3964,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=2.20.0,<=2.21.0" },
     { name = "decorator", marker = "extra == 'npu'", specifier = ">=5.2.1" },
     { name = "decorator", marker = "extra == 'npu-aarch64'", specifier = ">=5.2.1" },
+    { name = "deepspeed", marker = "extra == 'deepspeed'", specifier = ">=0.15.0" },
     { name = "diffusers", marker = "extra == 'dit'", specifier = "==0.36.0" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "expecttest", marker = "extra == 'dev'", specifier = ">=0.3.0,<0.4" },
@@ -3943,7 +4025,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'trl'", specifier = "<=0.9.6" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "audio", "video", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl", "lora", "fa4", "flash-qla", "transformers-v4-legacy"]
+provides-extras = ["dev", "audio", "deepspeed", "video", "dit", "npu-aarch64", "npu", "gpu", "megatron", "trl", "lora", "fa4", "flash-qla", "transformers-v4-legacy"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -1,4 +1,6 @@
-# VeOmni Development Guide
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > Instructions for AI coding agents working on this repository.
 
@@ -56,7 +58,73 @@ make commit         # style + quality
 make patchgen       # regenerate model patches
 pytest tests/       # all tests
 pytest tests/<mod>/ # specific module
+pytest tests/models/test_models_patch.py -k <model_name>  # single model patch test
+pytest --collect-only -k <model_name>                     # list tests for a model
+python3 scripts/ci/check_doc_task_paths.py                # validate doc task paths after renaming tasks/
 ```
+
+When moving/renaming scripts under `tasks/`, search `docs/` for old paths and update them.
+
+---
+
+## Testing by Change Area
+
+| Changed module | Test command |
+|---|---|
+| `veomni/models/` | `pytest tests/models/` |
+| `veomni/data/` | `pytest tests/data/` |
+| `veomni/ops/` | `pytest tests/ops/` |
+| `veomni/distributed/` | `pytest tests/parallel/` |
+| `veomni/checkpoint/` | `pytest tests/checkpoints/` |
+| `veomni/utils/` | `pytest tests/utils/` |
+| `veomni/trainer/` | `pytest tests/e2e/` |
+
+Distributed tests (`tests/parallel/`, `tests/e2e/`, `tests/distributed/`) require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`. See `docs/testing.md` for the full test catalog and new-model onboarding checklist.
+
+---
+
+## DeepSpeed ZeRO
+
+DeepSpeed is a third parallelism backend alongside `ddp` and `fsdp2`. Key differences from FSDP2:
+
+**YAML config skeleton:**
+
+```yaml
+train:
+  init_device: cpu          # required (FSDP2 uses meta)
+  accelerator:
+    fsdp_config:
+      fsdp_mode: deepspeed
+  checkpoint:
+    manager: deepspeed      # required (dcp only works with ddp/fsdp2)
+  deepspeed:
+    zero_stage: 3           # 1 | 2 | 3 (default 3)
+    offload_optimizer: cpu  # "cpu" | "nvme" | null
+    offload_param: cpu      # "cpu" | "nvme" | null  — zero_stage 3 only
+    nvme_path: /mnt/nvme    # required when offload target is "nvme"
+    overlap_comm: true
+    contiguous_gradients: true
+    config_path: ""         # set to load a raw JSON config (overrides all fields above)
+```
+
+**Hard constraints** (see `.agents/knowledge/constraints.md` §DeepSpeed for full detail):
+
+- `init_device: cpu` is mandatory — the argument validator raises if `fsdp_mode: deepspeed` is paired with `init_device: meta`.
+- `checkpoint.manager: deepspeed` is mandatory — `manager: dcp` rejects `dist_backend=deepspeed`.
+- Optimizer and lr_scheduler are built *before* `init_deepspeed_engine()`, opposite to FSDP2 order (`veomni/trainer/base.py:196`).
+- `engine.step()` handles grad clip + optimizer.step + lr_scheduler.step + zero_grad atomically; never call these separately.
+- `offload_param` requires `zero_stage: 3`; the `DeepSpeedConfig` validator enforces this.
+- SP (Ulysses) and EP are FSDP2-only — `ulysses_size > 1` or `ep_size > 1` with `fsdp_mode: deepspeed` is unsupported.
+- `config_path` (a raw DeepSpeed JSON file) overrides all `train.deepspeed.*` fields; only `train_batch_size` and `gradient_accumulation_steps` are patched in from `TrainingArguments`.
+
+**Key files:**
+
+| File | Role |
+|---|---|
+| `veomni/distributed/deepspeed_init.py` | `build_ds_config()`, `init_deepspeed_engine()` |
+| `veomni/checkpoint/ds_checkpointer.py` | `DeepSpeedCheckpointer` (engine.save/load_checkpoint) |
+| `veomni/arguments/arguments_types.py` | `DeepSpeedConfig` dataclass (`train.deepspeed.*`) |
+| `veomni/trainer/base.py:315` | `_is_deepspeed_mode` property; build-order and step logic |
 
 ---
 
@@ -64,8 +132,12 @@ pytest tests/<mod>/ # specific module
 
 Title: `[{modules}] {type}: {description}`
 
-- Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (the CI source of truth).
-- Breaking: prepend `[BREAKING]`
+**Allowed modules**: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `docker`, `trainer`, `agent`, `lora`
+
+**Allowed types**: `feat`, `fix`, `refactor`, `chore`, `test`
+
+Multiple modules: `[parallel, model] feat: ...`  
+Breaking change: `[BREAKING][model] feat: ...`
 
 ---
 

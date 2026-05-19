@@ -18,6 +18,7 @@ from .arguments_types import (
     CheckpointConfig,
     DataArguments,
     DataloaderConfig,
+    DeepSpeedConfig,
     FSDPConfig,
     GradientCheckpointingConfig,
     InferArguments,

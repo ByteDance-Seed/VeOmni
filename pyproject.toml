@@ -50,6 +50,9 @@ audio = [
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14"
 ]
+deepspeed = [
+  "deepspeed>=0.15.0",
+]
 # Alias for audio extra - includes both video and audio processing dependencies
 video = [
   "torchcodec",

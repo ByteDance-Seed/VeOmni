@@ -193,10 +193,15 @@ class BaseTrainer(Stateful, ABC):
         self._build_dataloader()
 
         # Parallelize model
+        if self._is_deepspeed_mode:
+            # DeepSpeed needs optimizer + lr_scheduler before engine init.
+            self._build_optimizer()
+            self._build_lr_scheduler()
         self._build_parallelized_model()
-        # Build optimizer and lr scheduler
-        self._build_optimizer()
-        self._build_lr_scheduler()
+        if not self._is_deepspeed_mode:
+            # Build optimizer and lr scheduler
+            self._build_optimizer()
+            self._build_lr_scheduler()
         # Build training context
         self._build_training_context()
         # Initialize callbacks
@@ -306,6 +311,15 @@ class BaseTrainer(Stateful, ABC):
 
         self.model.print_trainable_parameters()
 
+    @property
+    def _is_deepspeed_mode(self) -> bool:
+        return self.args.train.accelerator.fsdp_config.fsdp_mode == "deepspeed"
+
+    @property
+    def engine(self):
+        """Return the DeepSpeed engine, or None if not using DeepSpeed."""
+        return getattr(self, "_deepspeed_engine", None)
+
     def _freeze_model_module(self):
         self._setup_lora()
         pretty_print_trainable_parameters(self.model)
@@ -402,6 +416,16 @@ class BaseTrainer(Stateful, ABC):
             muon_expert_zero_comm=muon_expert_zero_comm,
             **kwargs,
         )
+
+        if self._is_deepspeed_mode:
+            from ..distributed.deepspeed_init import build_ds_config, init_deepspeed_engine
+
+            ds_config = build_ds_config(args.train)
+            self._deepspeed_engine, self.optimizer, self.lr_scheduler = init_deepspeed_engine(
+                self.model, self.optimizer, self.lr_scheduler, args.train, ds_config
+            )
+            self.model = self._deepspeed_engine
+
         self.model.train()
 
     def _build_optimizer(self):
@@ -546,14 +570,20 @@ class BaseTrainer(Stateful, ABC):
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
         # Backward pass
-        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            loss.backward()
+        if self._is_deepspeed_mode:
+            self.engine.backward(loss)
+        else:
+            with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict
 
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""
+        if self._is_deepspeed_mode:
+            return
+
         args: VeOmniArguments = self.args
         if (
             args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
@@ -598,13 +628,16 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
-
-        # Optimizer and scheduler step
-        self.optimizer.step()
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        # Gradient clipping + optimizer step
+        if self._is_deepspeed_mode:
+            # DeepSpeed handles grad clipping + optimizer.step + zero_grad internally
+            grad_norm = self.engine.get_global_grad_norm()
+            self.engine.step()
+        else:
+            grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 

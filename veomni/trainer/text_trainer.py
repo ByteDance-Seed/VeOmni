@@ -133,13 +133,15 @@ class TextTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
-
-        # Optimizer and scheduler step
-        self.base.optimizer.step()
-        self.base.lr_scheduler.step()
-        self.base.optimizer.zero_grad()
+        # Gradient clipping + optimizer step
+        if self.base._is_deepspeed_mode:
+            grad_norm = self.base.engine.get_global_grad_norm()
+            self.base.engine.step()
+        else:
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            self.base.optimizer.step()
+            self.base.lr_scheduler.step()
+            self.base.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 

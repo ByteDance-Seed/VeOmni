@@ -88,3 +88,12 @@ def dcp_ckpt_to_state_dict(save_checkpoint_path: Union[str, os.PathLike], **kwar
     from .dcp_checkpointer import dcp_to_torch_state_dict
 
     return dcp_to_torch_state_dict(save_checkpoint_path)
+
+
+@CHECKPOINTER_REGISTRY.register("deepspeed")
+def ds_checkpointer(dist_backend: str):
+    if dist_backend != "deepspeed":
+        raise ValueError(f"DeepSpeed checkpointer requires dist_backend='deepspeed', got '{dist_backend}'")
+    from .ds_checkpointer import DeepSpeedCheckpointer
+
+    return DeepSpeedCheckpointer
