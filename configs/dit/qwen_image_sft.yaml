@@ -51,10 +51,10 @@ train:
   checkpoint:
     output_dir: qwen-image-sft
     manager: dcp
-    save_epochs: 20
+    save_epochs: 1
     save_hf_weights: true
   max_steps: 500
-  num_train_epochs: 100
+  num_train_epochs: 3
   wandb:
     enable: false
     project: Qwen-Image
