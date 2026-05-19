@@ -17,10 +17,17 @@ Patch configuration for Llama GPU OpSlot-based kernel replacements.
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.llama.llama_gpu_patch_gen_config -o veomni/models/transformers/llama/generated
 
-This mirrors the runtime GPU patch in
-veomni/models/transformers/llama/device_patch.py.
+Patches:
+- OpSlot guards for RMSNorm, SwiGLU MLP, RoPE, and (sequence-classification +
+  causal) cross-entropy loss. Each guard falls through to the original HF eager
+  code when no fused kernel is bound, so the generated file is safe to import
+  even when ``_bind_veomni_ops()`` does not run (e.g. seed_omni wrappers).
+- ``LlamaForCausalLM.forward`` returns the unified
+  ``CausalLMOutputWithLogProbs`` dataclass so callers can surface per-token
+  log-probs / entropy alongside the loss.
 
-This file itself is not runnable. It's used to generate the runnable explicitly patched modeling file
+This file itself is not runnable — it is the declarative source of truth for
+the runnable explicitly-patched modeling file
 "generated/patched_modeling_llama_gpu.py".
 """
 

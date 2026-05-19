@@ -17,9 +17,19 @@ Patch configuration for SeedOss NPU fused-operator replacements.
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.seed_oss.seed_oss_npu_patch_gen_config -o veomni/models/transformers/seed_oss/generated
 
-This mirrors the runtime NPU patch in
-veomni/models/transformers/seed_oss/npu_patch.py and the fused-CE patch in
-veomni/models/transformers/seed_oss/modeling_seed_oss.py.
+Patches:
+- ``apply_rotary_pos_emb`` -> ``veomni.ops.kernels.rotary.npu.apply_rotary_pos_emb_npu``
+  (NPU fused rotary embedding).
+- ``SeedOssRMSNorm.forward`` -> ``veomni.ops.kernels.rms_norm.npu.rms_norm_forward_npu``
+  (NPU fused RMSNorm).
+- ``SeedOssForCausalLM.forward``: OpSlot guard for fused cross-entropy loss
+  (falls through to the eager HF loss path when no fused kernel is bound) and
+  returns the unified ``CausalLMOutputWithLogProbs`` dataclass so callers can
+  surface per-token log-probs / entropy alongside the loss.
+
+This file itself is not runnable — it is the declarative source of truth for
+the runnable explicitly-patched modeling file
+"generated/patched_modeling_seed_oss_npu.py".
 """
 
 from typing import Optional

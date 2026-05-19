@@ -11,16 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODELING_REGISTRY
+
+
+# NPU branch is opt-in; everything else (CUDA, CPU-only) falls back to the GPU
+# generated file. The GPU generated module imports cleanly without an active
+# CUDA device, so a CPU-only environment (e.g. CI lint, doc build) can still
+# register the class.
 
 
 @MODELING_REGISTRY.register("qwen3_5")
 def register_qwen3_5_modeling(architecture: str):
-    if IS_CUDA_AVAILABLE:
-        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
-    elif IS_NPU_AVAILABLE:
+    if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
+    else:
+        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForConditionalGeneration, Qwen3_5Model
 
     if "ForConditionalGeneration" in architecture:
         return Qwen3_5ForConditionalGeneration
@@ -32,9 +38,9 @@ def register_qwen3_5_modeling(architecture: str):
 
 @MODELING_REGISTRY.register("qwen3_5_text")
 def register_qwen3_5_text_modeling(architecture: str):
-    if IS_CUDA_AVAILABLE:
-        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForCausalLM
-    elif IS_NPU_AVAILABLE:
+    if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_npu import Qwen3_5ForCausalLM
+    else:
+        from .generated.patched_modeling_qwen3_5_gpu import Qwen3_5ForCausalLM
 
     return Qwen3_5ForCausalLM
