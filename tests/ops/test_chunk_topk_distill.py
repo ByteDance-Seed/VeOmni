@@ -389,9 +389,7 @@ def test_matches_verl_compute_forward_kl_topk():
     # labels by construction. Only the three top-k tensors are checked
     # here; the per-token NLL / entropy slots are exercised by the
     # sibling tests.
-    _, _, distill, smass, tmass = ctkd.chunk_topk_distill_function(
-        h, w, labels, ids, tlp, chunk_size=10_000
-    )
+    _, _, distill, smass, tmass = ctkd.chunk_topk_distill_function(h, w, labels, ids, tlp, chunk_size=10_000)
     # Strip the trailing pad slot to align with verl's output shape.
     torch.testing.assert_close(distill[..., :-1], verl_out["distillation_losses"], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(smass[..., :-1], verl_out["student_mass"], rtol=1e-5, atol=1e-5)
