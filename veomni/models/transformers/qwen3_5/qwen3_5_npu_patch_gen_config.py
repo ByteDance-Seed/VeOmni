@@ -555,3 +555,6 @@ class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
 
     log_probs: torch.FloatTensor | None = None
     entropy: torch.FloatTensor | None = None
+    distillation_losses: torch.FloatTensor | None = None
+    student_mass: torch.FloatTensor | None = None
+    teacher_mass: torch.FloatTensor | None = None

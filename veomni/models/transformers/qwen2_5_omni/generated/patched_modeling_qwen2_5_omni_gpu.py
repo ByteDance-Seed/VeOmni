@@ -2136,7 +2136,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     #    order.
     # 5. [Loss] Delegate loss to OpSlot-guarded `veomni_causal_lm_loss` first,
     #    then fall back to `self.loss_function` (VeOmni's patched LOSS_MAPPING
-    #    returns `(loss, logits, log_probs, entropy)`).
+    #    returns `(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`).
     # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
     #    for videos without audio) before forwarding the audio tower.
     # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -2326,25 +2326,30 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         logits = None
         log_probs = None
         entropy = None
+        distillation_losses = None
+        student_mass = None
+        teacher_mass = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss (chunked fused CE
             # when bound, falls back to ``self.loss_function`` otherwise).
             if veomni_causal_lm_loss.use_non_eager_impl:  # noqa: F821 — declared via add_post_import_block
-                loss, logits, log_probs, entropy = veomni_causal_lm_loss(  # noqa: F821
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.get_text_config().vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    ignore_index=IGNORE_INDEX,
-                    **kwargs,
+                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
+                    veomni_causal_lm_loss(  # noqa: F821
+                        logits=logits,
+                        labels=labels,
+                        vocab_size=self.config.get_text_config().vocab_size,
+                        hidden_states=hidden_states,
+                        weights=self.lm_head.weight,
+                        ignore_index=IGNORE_INDEX,
+                        **kwargs,
+                    )
                 )
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched ``loss_function`` (via
-                # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy)``;
+                # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)``;
                 # unpack to match the OpSlot branch above.
-                loss, logits, log_probs, entropy = self.loss_function(
+                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.get_text_config().vocab_size,
@@ -2367,6 +2372,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             rope_deltas=self.rope_deltas,
             log_probs=log_probs,
             entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
         )
         # --- Patch.7 ---
 
