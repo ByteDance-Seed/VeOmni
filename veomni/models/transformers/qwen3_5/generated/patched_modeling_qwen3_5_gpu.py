@@ -2187,7 +2187,6 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
-                mm_token_type_ids=mm_token_type_ids,
             )
         else:
             # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---

@@ -1251,11 +1251,9 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1689,7 +2187,20 @@
-                 inputs_embeds=inputs_embeds,
+@@ -1690,6 +2188,18 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
-+                mm_token_type_ids=mm_token_type_ids,
              )
 +        else:
 +            # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
@@ -1272,7 +1270,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1705,6 +2216,12 @@
+@@ -1705,6 +2215,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1285,7 +1283,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2292,45 @@
+@@ -1775,15 +2291,45 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1335,7 +1333,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2364,43 @@
+@@ -1817,6 +2363,43 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1379,7 +1377,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1887,54 +2471,7 @@
+@@ -1887,54 +2470,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1435,7 +1433,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,22 +2487,51 @@
+@@ -1950,22 +2486,51 @@
          )
 
          hidden_states = outputs[0]
@@ -1492,7 +1490,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2192,6 +2758,13 @@
+@@ -2192,6 +2757,13 @@
 
          return input_ids, model_kwargs
 
