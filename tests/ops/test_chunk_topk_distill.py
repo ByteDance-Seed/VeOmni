@@ -305,7 +305,15 @@ def test_backward_matches_dense_reference():
 
 
 def test_backward_with_clamp_matches_reference():
-    """Same backward equivalence holds when ``log_prob_min_clamp`` is active."""
+    """Same backward equivalence holds when ``log_prob_min_clamp`` is active.
+
+    Constructs the teacher distribution so several top-k entries fall
+    **below** the clamp. The teacher coefficient in the closed-form
+    backward (``p_t_k = exp(clamp(log_p_t,k))``) then has to match the
+    forward's clamped value — passing here pins that consistency. A
+    prior buggy revision that used unclamped ``tlp`` in the backward
+    would fail this assertion.
+    """
     torch.manual_seed(0)
     h, w, labels, ids, tlp = _make_inputs(B=1, L=8, H=4, V=16, K=3, dtype=torch.float64, seed=5)
     h.requires_grad_(True)
@@ -314,6 +322,16 @@ def test_backward_with_clamp_matches_reference():
     w_ref = w.detach().clone().requires_grad_(True)
 
     clamp = -3.0
+    # Force the clamp to trip on the teacher side: pull about half the
+    # top-k log-prob entries below ``clamp`` by subtracting a large
+    # constant. After this nudge, ``tlp`` is **not** a valid
+    # ``log_softmax`` output (rows no longer sum to 1) — which is fine,
+    # the kernel and the reference both treat it as opaque log-prob
+    # data; we're checking gradient equivalence, not distributional
+    # properties.
+    tlp[..., 1::2] -= 5.0
+    assert (tlp < clamp).any(), "clamp must trip on the teacher side for this test to be meaningful"
+
     grad_distill = torch.randn_like(labels, dtype=torch.float64)
 
     _, _, distill, _, _ = ctkd.chunk_topk_distill_function(
@@ -368,8 +386,10 @@ def test_matches_verl_compute_forward_kl_topk():
     )
     # verl masks at IGN inside its own loss combinator (not in
     # compute_forward_kl_topk), so for this equivalence we use all-valid
-    # labels by construction.
-    log_probs, entropy, distill, smass, tmass = ctkd.chunk_topk_distill_function(
+    # labels by construction. Only the three top-k tensors are checked
+    # here; the per-token NLL / entropy slots are exercised by the
+    # sibling tests.
+    _, _, distill, smass, tmass = ctkd.chunk_topk_distill_function(
         h, w, labels, ids, tlp, chunk_size=10_000
     )
     # Strip the trailing pad slot to align with verl's output shape.

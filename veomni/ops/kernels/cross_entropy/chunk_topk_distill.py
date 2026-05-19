@@ -264,26 +264,33 @@ class _ChunkedLinearTopkDistill(torch.autograd.Function):
                 dlogits = dlogits + probs * (log_probs_full + entropy_full.unsqueeze(-1)) * (-masked_dent)
 
             # ── top-k distillation gradient path ─────────────────────────
-            # L_l = Σ_k exp(log_p_t,k) · (log_p_t,k - log_q_s,k).
-            # log_q_s,k depends on logits via log_softmax, so
-            # ∂L_l/∂logits[v] = -Σ_k p_t,k · (δ(v == ids_k) - softmax[v])
-            #                 = -p_t_sparse[v] + teacher_mass · softmax[v]
-            # where p_t_sparse[v] = Σ_k p_t,k · δ(v == ids_k) is the dense
-            # version of the teacher top-k probability vector. The
-            # ``log_prob_min_clamp`` applies to log_q_s,k (the variable we
-            # differentiate against logits); positions where the clamp is
-            # active have zero gradient on that ``k`` entry because the
-            # clamp gates the upstream dependence.
+            # L_l = Σ_k exp(clamp(log_p_t,k)) · (clamp(log_p_t,k) - clamp(log_q_s,k)).
+            # Only log_q_s,k depends on logits (through log_softmax); the
+            # clamp on log_p_t,k is a no-op wrt logits. So
+            # ∂L_l/∂logits[v] = -Σ_k exp(clamp(log_p_t,k)) · ∂clamp(log_q_s,k)/∂logits[v]
+            # where ∂clamp(log_q_s,k)/∂logits[v] is 0 when the clamp is
+            # active at k (log_q_s,k <= floor) and otherwise equals
+            # δ(v == ids_k) - softmax[v]. This collapses to:
+            # ∂L_l/∂logits[v] = -p_t_sparse[v] + teacher_mass_eff · softmax[v]
+            # where p_t_sparse[v] = Σ_k exp(clamp(log_p_t,k)) · δ(v == ids_k)
+            # gated by ``active`` so positions with active student clamp
+            # contribute zero. The teacher coefficient must use the
+            # **clamped** tlp to stay consistent with the forward.
             if ddist_chunk is not None:
-                tlp_f32 = tlp_chunk.float()
                 if ctx.log_prob_min_clamp is not None:
                     # Recompute the same student top-k log-probs as forward
                     # so we know which entries the clamp masked off.
                     student_log_probs = logits.log_softmax(dim=-1)
                     student_topk_lp = student_log_probs.gather(dim=-1, index=ids_chunk)
                     active = (student_topk_lp >= ctx.log_prob_min_clamp).float()
+                    # Teacher coefficient: ``exp(clamp(log_p_t,k))`` — must
+                    # match the forward's ``tlp_clamped`` so the gradient
+                    # is consistent. Floor-clamping log-probs floors the
+                    # exponentiated mass at ``exp(log_prob_min_clamp)``.
+                    tlp_f32 = tlp_chunk.clamp_min(ctx.log_prob_min_clamp).float()
                 else:
                     active = None
+                    tlp_f32 = tlp_chunk.float()
 
                 # Dense ``p_t[v]`` via scatter_add (handles duplicate ids
                 # by summing — the chance verl emits duplicates is zero
