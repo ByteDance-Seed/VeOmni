@@ -537,8 +537,7 @@ def test_logits_bitwise_equal_v5(case: Case):
 # ``init_empty_weights()`` + safetensors round-trip + non-persistent buffer
 # rematerialisation. The loader test below writes the HF state-dict to a
 # tmpdir and lets ``build_foundation_model(weights_path=<dir>)`` rehydrate
-# the model — the same shape of test as v4's
-# ``test_logits_bitwise_equal_via_runtime_converter``.
+# the model end-to-end through the on-disk loader pipeline.
 #
 # Coverage: every v5 MoE family with one ``fa2+bf16`` (or ``sdpa+bf16`` for
 # ``glm_moe_dsa``, which sets ``_supports_flash_attn = False``) representative,
@@ -650,9 +649,9 @@ def _save_hf_checkpoint(state_dict: dict, config, dst_dir: str) -> None:
 def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers, weights_dir: str):
     """Build a VeOmni model by routing load through the disk-backed loader.
 
-    Mirrors v4's ``_build_veomni_model_via_runtime_converter``: this is the
-    path real users hit (``build_foundation_model(weights_path=<dir>)``).
-    For v5 MoE the on-disk layout already matches VeOmni's stacked layout,
+    This is the path real users hit
+    (``build_foundation_model(weights_path=<dir>)``).
+    For MoE the on-disk layout already matches VeOmni's stacked layout,
     so no expert-stacking converter fires here — the value of this test
     is exercising the loader pipeline itself (``init_empty_weights`` +
     safetensors deserialisation + non-persistent buffer rematerialisation),
@@ -660,8 +659,8 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
 
     Why we restore HF's non-persistent buffers after load
     -----------------------------------------------------
-    Same loader-level quirk that v4 documents on its sibling test:
-    rotary ``inv_freq`` is registered ``persistent=False``, so it isn't in
+    Loader-level quirk: rotary ``inv_freq`` is registered
+    ``persistent=False``, so it isn't in
     the safetensors. On the ``weights_path != None`` path the model is
     built under ``init_empty_weights()``, which patches ``register_parameter``
     but not ``register_buffer`` — so ``inv_freq`` is computed on CPU during

@@ -83,9 +83,8 @@ class MoeCausalLMOutputWithLogProbs(MoeCausalLMOutputWithPast):
 #
 # These mirror the HF base classes (preserving ``rope_deltas`` and other
 # model-specific fields) and add ``log_probs`` / ``entropy`` as constructor
-# fields. The subclasses live here (rather than inline in the patchgen config)
-# because they are needed in BOTH the patchgen-generated GPU/NPU forward AND
-# the hand-written transformers-v4 ``modeling_<arch>.py``.
+# fields. They live here (rather than inline in each patchgen config) so the
+# GPU and NPU generated modeling files can share one definition.
 # ──────────────────────────────────────────────────────────────────────────────
 
 

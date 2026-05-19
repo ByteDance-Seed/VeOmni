@@ -4,6 +4,16 @@
 
 This document walks through the specific patches applied to integrate **Qwen3-VL MoE** into VeOmni. It is a concrete example of the patterns described in [guide_and_checklist.md](./guide_and_checklist.md), covering FSDP, Sequence Parallelism, Expert Parallelism, and model registration.
 
+> **Scope note:** VeOmni now ships patchgen-generated modeling files under
+> `veomni/models/transformers/<model>/generated/`, so the actual code lives in
+> [veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py](../../../veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py)
+> rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
+> patterns (FSDP dummy forward, SP slicing, fused MoE, EP plan) are unchanged;
+> what has changed is *where* the patches are declared (in the patchgen config
+> and emitted into `generated/`) rather than applied at import time. See
+> [docs/transformers_v5/patchgen.md](../../transformers_v5/patchgen.md) and
+> the `veomni-migrate-transformers-v5` agent skill for the current flow.
+
 ---
 
 ## 1. FSDP: Dummy ViT Forward

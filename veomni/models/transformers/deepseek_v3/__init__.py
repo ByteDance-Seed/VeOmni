@@ -18,14 +18,14 @@ from ...loader import MODELING_REGISTRY
 @MODELING_REGISTRY.register("deepseek_v3")
 def register_deepseek_v3_modeling(architecture: str):
     from .checkpoint_tensor_converter import create_deepseek_v3_checkpoint_tensor_converter
-    from .device_patch import apply_veomni_deepseek_v3_v5_device_patch
+    from .device_patch import apply_veomni_deepseek_v3_device_patch
 
     if IS_NPU_AVAILABLE:
         from .generated import patched_modeling_deepseek_v3_npu as gen
     else:
         from .generated import patched_modeling_deepseek_v3_gpu as gen
 
-    apply_veomni_deepseek_v3_v5_device_patch(gen)
+    apply_veomni_deepseek_v3_device_patch(gen)
 
     DeepseekV3ForCausalLM = gen.DeepseekV3ForCausalLM
     DeepseekV3ForSequenceClassification = gen.DeepseekV3ForSequenceClassification

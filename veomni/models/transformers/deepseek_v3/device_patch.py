@@ -76,7 +76,7 @@ _TRITON_RMS_NORM_BACKEND = BackendSpec(
 )
 
 
-def apply_veomni_deepseek_v3_v5_device_patch(gen_module):
+def apply_veomni_deepseek_v3_device_patch(gen_module):
     """Backend selection for the patchgen-generated module.
 
     Only ``rotary_pos_emb`` and ``rms_norm`` are patched here. ``swiglu_mlp``

@@ -35,7 +35,7 @@ Examples grouped by complexity / capability — pick the closest one and adapt:
   - `parallel_plan.py` — single `get_parallel_plan()` sharding the fused `gate_up_proj`.
 - **MoE + NPU patchgen** — `veomni/models/transformers/deepseek_v3/`
   - Sibling `deepseek_v3_{gpu,npu}_patch_gen_config.py`; both generated files committed.
-  - Runtime kernel choice (deterministic Triton RoPE + batch-invariant RMSNorm) is wired in `__init__.py` via `apply_veomni_deepseek_v3_v5_device_patch(gen_module)` for actor/rollout numerical parity. No Liger kernels in the generated file itself.
+  - Runtime kernel choice (deterministic Triton RoPE + batch-invariant RMSNorm) is wired in `__init__.py` via `apply_veomni_deepseek_v3_device_patch(gen_module)` for actor/rollout numerical parity. No Liger kernels in the generated file itself.
 - **VLM (non-MoE) + GPU+NPU patchgen** — `veomni/models/transformers/qwen3_vl/`
   - `__init__.py` — registers the patchgen-generated classes, branching on `IS_NPU_AVAILABLE` between `patched_modeling_qwen3_vl_{gpu,npu}`.
   - `qwen3_vl_gpu_patch_gen_config.py` — full VLM forward with Ulysses SP, async Ulysses text attention, deepstack, precomputed mrope via `get_position_id_func`, and a SP-aware `dummy_forward`.
