@@ -398,3 +398,147 @@ def test_return_log_probs_backward_flows_gradients(toy_path, family):
 
     del model, out, log_probs, scalar
     _release()
+
+
+@pytest.mark.parametrize("toy_path,family", _MODELS)
+def test_return_log_probs_with_topk_distill_populates_three_fields(toy_path, family):
+    """Pin the **distillation consumer contract** on the plain model forward path.
+
+    The integration story for verl's VeOmni engine: it calls
+    ``self.module(..., return_log_probs=True, teacher_topk_ids=...,
+    teacher_topk_log_probs=...)`` directly — no helper imports, no
+    engine override — and the ``build_foundation_model``-installed
+    wrapper routes through ``chunk_topk_distill_function`` and assigns
+    ``output.distillation_losses`` / ``output.student_mass`` /
+    ``output.teacher_mass`` automatically.
+
+    This test pins exactly that contract end-to-end on a real toy model
+    (both text and VLM families):
+
+    1. The three new ``output`` fields are populated, finite, and have
+       the same shape as the existing ``log_probs`` / ``entropy``.
+    2. ``output.distillation_losses >= 0`` (forward KL is non-negative).
+    3. ``output.student_mass`` and ``output.teacher_mass`` are in
+       ``[0, 1]`` (sums of softmax probabilities on the top-k support).
+    4. ``output.student_mass`` and ``output.teacher_mass`` are detached
+       (``requires_grad=False``) — verl reports them as metrics.
+    5. ``output.distillation_losses`` matches the same kernel computed
+       on the model's penultimate hidden state directly — bitwise on
+       fp32 under determinism. Proves the per-model patchgen wiring is
+       correct.
+    6. Backward through ``output.distillation_losses`` flows gradients
+       into ``model.lm_head.weight``.
+    """
+    _skip_unless_cuda(toy_path)
+    _apply_determinism()
+
+    from veomni.ops.kernels.cross_entropy.chunk_topk_distill import chunk_topk_distill_function
+
+    torch.manual_seed(0)
+    model = _build_model(toy_path, ce_impl="chunk_loss").train()
+    model.zero_grad(set_to_none=True)
+
+    B, L, K = 2, 16, 4
+    # VLM configs nest vocab_size under config.text_config; pull it from
+    # the lm_head weight to stay model-family-agnostic.
+    V = model.lm_head.weight.shape[0]
+    input_ids = torch.randint(0, 32000, (B, L), device=model.device, dtype=torch.long)
+    labels = input_ids.clone()
+    labels[0, 0] = IGNORE_INDEX
+    labels[1, ::5] = IGNORE_INDEX
+
+    # Teacher tensors: derive from a fresh logits draw + log_softmax + topk
+    # so the per-position teacher_mass sums to <= 1 (matches verl's source
+    # which gets them from a real teacher forward).
+    teacher_logits = torch.randn(B, L, V, device=model.device, dtype=torch.float32)
+    teacher_log_probs = teacher_logits.log_softmax(dim=-1)
+    teacher_topk_log_probs, teacher_topk_ids = teacher_log_probs.topk(K, dim=-1)
+    teacher_topk_log_probs = teacher_topk_log_probs.contiguous()
+    teacher_topk_ids = teacher_topk_ids.contiguous()
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        use_cache=False,
+        return_log_probs=True,
+        teacher_topk_ids=teacher_topk_ids,
+        teacher_topk_log_probs=teacher_topk_log_probs,
+    )
+
+    # 1) Three new fields populated, finite, correct shape.
+    assert out.distillation_losses is not None, f"[{family}] distillation_losses must be populated"
+    assert out.student_mass is not None, f"[{family}] student_mass must be populated"
+    assert out.teacher_mass is not None, f"[{family}] teacher_mass must be populated"
+    for name, t in [
+        ("distillation_losses", out.distillation_losses),
+        ("student_mass", out.student_mass),
+        ("teacher_mass", out.teacher_mass),
+    ]:
+        assert t.shape == labels.shape, f"[{family}] {name} shape {tuple(t.shape)} != labels {tuple(labels.shape)}"
+        assert torch.isfinite(t).all(), f"[{family}] {name} has non-finite values"
+
+    # 2) Forward KL is non-negative.
+    assert (out.distillation_losses >= 0).all(), (
+        f"[{family}] distillation_losses must be >= 0; got min={out.distillation_losses.min().item():.3e}"
+    )
+
+    # 3) Mass values live on [0, 1].
+    assert (out.student_mass >= 0).all() and (out.student_mass <= 1 + 1e-5).all(), (
+        f"[{family}] student_mass out of [0, 1]; "
+        f"got [{out.student_mass.min().item():.3e}, {out.student_mass.max().item():.3e}]"
+    )
+    assert (out.teacher_mass >= 0).all() and (out.teacher_mass <= 1 + 1e-5).all(), (
+        f"[{family}] teacher_mass out of [0, 1]; "
+        f"got [{out.teacher_mass.min().item():.3e}, {out.teacher_mass.max().item():.3e}]"
+    )
+
+    # 4) Mass tensors detached.
+    assert not out.student_mass.requires_grad, f"[{family}] student_mass must be detached"
+    assert not out.teacher_mass.requires_grad, f"[{family}] teacher_mass must be detached"
+
+    # 5) Bitwise equivalence vs the same kernel called directly on the
+    #    model's penultimate hidden state. Best-effort hidden-state extraction
+    #    via output_hidden_states=True; if a model family hides the lm_head
+    #    input we just skip this check (the forward-population coverage from
+    #    steps 1-4 already proves the dispatch wiring).
+    with torch.no_grad():
+        hidden_out = model(
+            input_ids=input_ids,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+    last_hidden = getattr(hidden_out, "hidden_states", None)
+    if last_hidden is not None and len(last_hidden) >= 1:
+        last_hidden_t = last_hidden[-1]  # [B, L, H]
+        ref_lp, ref_ent, ref_dist, ref_smass, ref_tmass = chunk_topk_distill_function(
+            last_hidden_t,
+            model.lm_head.weight,
+            labels,
+            teacher_topk_ids,
+            teacher_topk_log_probs,
+        )
+        torch.testing.assert_close(
+            out.distillation_losses,
+            ref_dist,
+            rtol=0,
+            atol=0,
+            msg=lambda m: f"[{family}] distillation_losses != kernel direct: {m}",
+        )
+        torch.testing.assert_close(
+            out.student_mass, ref_smass, rtol=0, atol=0, msg=lambda m: f"[{family}] student_mass != kernel direct: {m}"
+        )
+        torch.testing.assert_close(
+            out.teacher_mass, ref_tmass, rtol=0, atol=0, msg=lambda m: f"[{family}] teacher_mass != kernel direct: {m}"
+        )
+
+    # 6) Backward through distillation_losses reaches lm_head.weight.
+    mask = (labels != IGNORE_INDEX).float()
+    scalar = (out.distillation_losses * mask).sum() / mask.sum().clamp_min(1)
+    scalar.backward()
+    lm_head_grad = model.lm_head.weight.grad
+    assert lm_head_grad is not None, f"[{family}] lm_head.weight.grad must be populated by distillation backward"
+    assert torch.isfinite(lm_head_grad).all(), f"[{family}] lm_head.weight.grad has non-finite values"
+    assert lm_head_grad.abs().max().item() > 0, f"[{family}] lm_head.weight.grad is all zero"
+
+    del model, out
+    _release()
