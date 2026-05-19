@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....transformers.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniThinkerConfig
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniThinkerConfig
+
 from ..base import BaseFoundationConfigMixin
 
 

@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from .....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from ....transformers.qwen2_vl.modeling_qwen2_vl import (
+from ....transformers.qwen2_vl.generated.patched_modeling_qwen2_vl_gpu import (
     Qwen2VLCausalLMOutputWithPast,
     Qwen2VLForConditionalGeneration,
     Qwen2VLModel,

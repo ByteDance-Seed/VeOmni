@@ -7,6 +7,7 @@ import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.models.qwen3_moe.modeling_qwen3_moe import MoeCausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 
 from .....distributed.parallel_state import get_parallel_state
@@ -14,13 +15,12 @@ from .....distributed.sequence_parallel import reduce_sequence_parallel_loss
 from .....utils import logging
 from .....utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from .....utils.import_utils import is_liger_kernel_available
-from ....transformers.qwen2_5_omni.modeling_qwen2_5_omni import (
+from ....transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
     Qwen2_5OmniThinkerForConditionalGeneration,
     apply_multimodal_rotary_pos_emb,
 )
-from ....transformers.qwen3_moe import modeling_qwen3_moe as qwen3_moe
-from ....transformers.qwen3_moe.modeling_qwen3_moe import (
-    MoeCausalLMOutputWithPast,
+from ....transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as qwen3_moe
+from ....transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
     MoeModelOutputWithPast,
     Qwen3MoeForCausalLM,
     Qwen3MoeModel,
@@ -29,7 +29,9 @@ from ....transformers.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeRotaryEmbedding,
     load_balancing_loss_func,
 )
-from ....transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer as OriginalQwen3MoeDecoderLayer
+from ....transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
+    Qwen3MoeDecoderLayer as OriginalQwen3MoeDecoderLayer,
+)
 from ..base import BaseFoundationModelMixin
 from .configuration_qwen3_moe_foundation import Qwen3MoeFoundationConfig
 

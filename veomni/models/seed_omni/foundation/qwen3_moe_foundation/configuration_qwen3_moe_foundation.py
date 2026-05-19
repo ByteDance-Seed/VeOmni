@@ -1,4 +1,4 @@
-from ....transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 
 class Qwen3MoeFoundationConfig(Qwen3MoeConfig):

@@ -1,4 +1,5 @@
-from ....transformers.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniAudioEncoderConfig
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniAudioEncoderConfig
+
 from ..base import BaseEncoderConfigMixin
 
 

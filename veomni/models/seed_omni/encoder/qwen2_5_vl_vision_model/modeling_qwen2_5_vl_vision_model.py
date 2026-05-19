@@ -3,7 +3,9 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from ....transformers.qwen2_5vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransformerPretrainedModel
+from ....transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+    Qwen2_5_VisionTransformerPretrainedModel,
+)
 from ...projector import build_feature_projector
 from ..base import BaseEncoderModelMixin
 from .configuration_qwen2_5_vl_vision_model import Qwen25VLVisionModelConfig
