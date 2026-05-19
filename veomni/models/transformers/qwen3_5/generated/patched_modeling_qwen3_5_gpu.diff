@@ -1283,7 +1283,7 @@
 
 
  @auto_docstring
-@@ -1775,15 +2291,45 @@
+@@ -1775,15 +2291,53 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1294,23 +1294,28 @@
 +        logits = None
 +        log_probs = None
 +        entropy = None
++        distillation_losses = None
++        student_mass = None
++        teacher_mass = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 -
 -        return CausalLMOutputWithPast(
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
-+                    logits=logits,
-+                    labels=labels,
-+                    vocab_size=self.config.vocab_size,
-+                    hidden_states=hidden_states,
-+                    weights=self.lm_head.weight,
-+                    **kwargs,
++                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
++                    veomni_causal_lm_loss(
++                        logits=logits,
++                        labels=labels,
++                        vocab_size=self.config.vocab_size,
++                        hidden_states=hidden_states,
++                        weights=self.lm_head.weight,
++                        **kwargs,
++                    )
 +                )
 +            else:
 +                logits = self.lm_head(hidden_states)
-+                loss, _, log_probs, entropy = self.loss_function(
++                loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.vocab_size,
@@ -1330,10 +1335,13 @@
              logits=logits,
 +            log_probs=log_probs,
 +            entropy=entropy,
++            distillation_losses=distillation_losses,
++            student_mass=student_mass,
++            teacher_mass=teacher_mass,
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1817,6 +2363,43 @@
+@@ -1817,6 +2371,46 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1368,6 +1376,9 @@
 +
 +    log_probs: torch.FloatTensor | None = None
 +    entropy: torch.FloatTensor | None = None
++    distillation_losses: torch.FloatTensor | None = None
++    student_mass: torch.FloatTensor | None = None
++    teacher_mass: torch.FloatTensor | None = None
 +
 +
 +# ======================================================================
@@ -1377,7 +1388,7 @@
 
 
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-@@ -1887,54 +2470,7 @@
+@@ -1887,54 +2481,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1433,7 +1444,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1950,22 +2486,51 @@
+@@ -1950,22 +2497,59 @@
          )
 
          hidden_states = outputs[0]
@@ -1447,23 +1458,28 @@
 +        logits = None
 +        log_probs = None
 +        entropy = None
++        distillation_losses = None
++        student_mass = None
++        teacher_mass = None
          if labels is not None:
 -            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 -
 -        return Qwen3_5CausalLMOutputWithPast(
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
-+                    logits=logits,
-+                    labels=labels,
-+                    vocab_size=self.config.text_config.vocab_size,
-+                    hidden_states=hidden_states,
-+                    weights=self.lm_head.weight,
-+                    **kwargs,
++                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
++                    veomni_causal_lm_loss(
++                        logits=logits,
++                        labels=labels,
++                        vocab_size=self.config.text_config.vocab_size,
++                        hidden_states=hidden_states,
++                        weights=self.lm_head.weight,
++                        **kwargs,
++                    )
 +                )
 +            else:
 +                logits = self.lm_head(hidden_states)
-+                loss, _, log_probs, entropy = self.loss_function(
++                loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -1487,10 +1503,13 @@
              rope_deltas=outputs.rope_deltas,
 +            log_probs=log_probs,
 +            entropy=entropy,
++            distillation_losses=distillation_losses,
++            student_mass=student_mass,
++            teacher_mass=teacher_mass,
          )
 
      def prepare_inputs_for_generation(
-@@ -2192,6 +2757,13 @@
+@@ -2192,6 +2776,13 @@
 
          return input_ids, model_kwargs
 
