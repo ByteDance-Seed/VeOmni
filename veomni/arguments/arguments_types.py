@@ -781,11 +781,8 @@ class OpsImplementationConfig:
         },
     )
     rotary_pos_emb_vision_implementation: str = field(
-        default="liger_kernel",
-        metadata={
-            "help": "Rotary positional embedding in vision part. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
-        },
+        default="eager",
+        metadata={"help": "Rotary positional embedding in vision part. 'npu' | 'eager' (default)."},
     )
     load_balancing_loss_implementation: str = field(
         default="triton",
