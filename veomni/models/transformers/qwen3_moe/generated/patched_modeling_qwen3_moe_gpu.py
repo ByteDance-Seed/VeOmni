@@ -329,12 +329,14 @@ class Qwen3MoeTopKRouter(nn.Module):
         router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        # Modification: keep ``router_top_value`` in the softmax's fp32 dtype to
-        # match HF's reference path (HF re-binds ``router_logits`` to the post-
-        # softmax fp32 tensor and then casts back to that dtype, which is a
-        # no-op). The fused MoE call site casts to ``final_hidden_states.dtype``
-        # itself, so leaving fp32 here is harmless.
-        router_top_value = router_top_value.to(routing_weights.dtype)
+        # Cast ``router_top_value`` back to the raw-logits dtype, matching HF's
+        # reference ``Qwen3MoeTopKRouter.forward``: transformers v5.8 keeps
+        # ``router_logits`` bound to the pre-softmax ``F.linear`` output (it no
+        # longer re-binds it to the fp32 post-softmax tensor), so this cast lands
+        # on the model dtype rather than being a no-op. The fused MoE call site
+        # casts to ``final_hidden_states.dtype`` regardless; matching HF here
+        # keeps the generated modeling bitwise-equal to vanilla HF.
+        router_top_value = router_top_value.to(router_logits.dtype)
         return router_logits, router_top_value, router_indices
 
 
