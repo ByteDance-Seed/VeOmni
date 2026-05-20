@@ -797,7 +797,7 @@ class OpsImplementationConfig:
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the VeOmni NPUFusedRMSNormGated."
         },
     )
     causal_conv1d_implementation: str = field(

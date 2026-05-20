@@ -22,6 +22,7 @@ Models can register a ``triton`` backend via ``extra_backends`` in their
 """
 
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
 register_op(
@@ -42,5 +43,43 @@ register_op(
                 replace_forward=True,
             ),
         },
+    )
+)
+
+# ── rms_norm (Torch_npu) ───────────────────────────────────
+
+
+def _npu_standard_rms_norm_factory():
+    from .npu import standard_rms_norm_forward_npu
+
+    return standard_rms_norm_forward_npu
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rms_norm",
+        variant="standard",
+        factory=_npu_standard_rms_norm_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="standard fused RMSNorm on NPU",
+    )
+)
+
+
+def _npu_qwen3_5_rms_norm_factory():
+    from .npu import qwen3_5_rms_norm_forward_npu
+
+    return qwen3_5_rms_norm_forward_npu
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rms_norm",
+        variant="qwen3_5",
+        factory=_npu_qwen3_5_rms_norm_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="Qwen3.5 fused RMSNorm on NPU",
     )
 )

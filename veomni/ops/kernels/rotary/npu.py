@@ -22,6 +22,8 @@ Two variants are exposed:
 * ``apply_rotary_pos_emb_npu`` – standard text-token RoPE (``[B, H, S, D]``).
 * ``apply_rotary_pos_emb_vision_npu`` – vision tower RoPE (``[S, H, D]``)
   used by Qwen3-VL and friends.
+* ``partial_apply_rotary_pos_emb_npu`` – partial RoPE (``[B, H, S, D]``).
+  used by Qwen3.5 and friends.
 """
 
 import torch
