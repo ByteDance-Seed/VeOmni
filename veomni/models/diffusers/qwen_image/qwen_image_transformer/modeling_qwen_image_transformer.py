@@ -10,7 +10,7 @@ from diffusers import QwenImageTransformer2DModel as _QwenImageTransformer2DMode
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from .configuration_qwen_image_transformer import QwenImageTransformer2DModelConfig
+from .configuration_qwen_image_transformer import QWEN_IMAGE_INIT_SIGNATURE, QwenImageTransformer2DModelConfig
 
 
 @dataclass
@@ -158,4 +158,12 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
-        return _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
+        diffusers_model = _QwenImageTransformer2DModel.from_pretrained(path, **kwargs)
+        diffusers_model.__class__ = cls
+
+        valid_keys = set(QWEN_IMAGE_INIT_SIGNATURE.parameters) - {"self"}
+        diffusers_cfg = dict(diffusers_model.config)
+        veomni_cfg = cls.config_class(**{k: v for k, v in diffusers_cfg.items() if k in valid_keys})
+        diffusers_model.config = veomni_cfg
+        diffusers_model.config.tie_word_embeddings = False
+        return diffusers_model

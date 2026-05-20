@@ -1,5 +1,5 @@
 model:
-  model_path: Qwen/Qwen-Image
+  model_path: Qwen/Qwen-Image/transformer
   condition_model_path: Qwen/Qwen-Image
   config_path: ./configs/model_configs/qwen_image/qwen_image_20b.json
   condition_model_cfg:

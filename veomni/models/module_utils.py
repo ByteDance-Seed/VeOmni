@@ -153,23 +153,6 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
             shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
             return [StateDictIterator(shard_file) for shard_file in shard_files]
 
-        diffusers_transformer_kwargs = {**kwargs, "subfolder": "transformer"}
-        diffusers_transformer_cache_kwargs = {**cache_kwargs, "subfolder": "transformer"}
-        resolved_weight_file = cached_file(
-            weights_path, DIFFUSERS_SAFETENSORS_WEIGHTS_NAME, **diffusers_transformer_cache_kwargs
-        )
-        if resolved_weight_file:
-            return [StateDictIterator(resolved_weight_file)]
-
-        resolved_weight_file = cached_file(
-            weights_path, DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME, **diffusers_transformer_cache_kwargs
-        )
-        if resolved_weight_file:
-            shard_files, _ = get_checkpoint_shard_files(
-                weights_path, resolved_weight_file, **diffusers_transformer_kwargs
-            )
-            return [StateDictIterator(shard_file) for shard_file in shard_files]
-
     raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
 
 
