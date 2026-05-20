@@ -296,22 +296,22 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     # `tolist` / `torch.tensor(host_list, device=cuda)` patterns from this
     # branch's perf fix to the vision forward + fast_pos_embed_interpolate.
     "qwen3_omni_moe-fa2-fused": {
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1220): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1225): (
             "algorithm-essential: D2H `grid_thw.tolist()` for rot_pos_emb host-side loop."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1259): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1264): (
             "algorithm-essential: D2H `grid_thw.tolist()` for fast_pos_embed_interpolate."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1301): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1306): (
             "algorithm-essential: `torch.tensor(idx_list, device=cuda)` H2D copy; over-reported."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1302): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1307): (
             "algorithm-essential: `torch.tensor(weight_list, device=cuda)` H2D copy; over-reported."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1345): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1350): (
             "algorithm-essential: D2H `grid_thw.tolist()` per ViT forward (one-shot)."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1365): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1370): (
             "algorithm-essential: `torch.tensor(cu_seqlens_list, device=cuda)` H2D copy."
         ),
     },
