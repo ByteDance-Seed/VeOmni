@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE transformers>=5.2.0 code generation.
+Patch configuration for Qwen3-VL-MoE transformers>=5.8.1 code generation.
 
 Reuses the full set of qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
 (vision SP, deepstack, async Ulysses attention, precomputed position-ids, fused

@@ -9,7 +9,7 @@ Coverage
 --------
 Models under ``veomni/models/transformers/`` that register a patchgen-generated
 class (``transformers-stable`` default group in ``pyproject.toml`` pins
-``transformers==5.2.0``):
+``transformers==5.8.1``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3
 - VLM via text-only sub-config

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen2.5-Omni transformers>=5.2.0 code generation.
+Patch configuration for Qwen2.5-Omni transformers>=5.8.1 code generation.
 
 Covers the thinker training path (text + vision + audio, dense — no MoE):
   - PreTrained.get_rope_index with per-video use_audio_in_video derived from
