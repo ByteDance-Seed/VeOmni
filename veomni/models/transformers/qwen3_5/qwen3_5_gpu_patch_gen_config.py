@@ -38,7 +38,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutp
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Config,
-    Qwen3_5DynamicCache,
     Qwen3_5Model,
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
@@ -306,7 +305,7 @@ def qwen3_5_gated_deltanet_get_local_conv1d_weight(
 def qwen3_5_gated_deltanet_forward_patched(
     self,
     hidden_states: torch.Tensor,
-    cache_params: Qwen3_5DynamicCache | None = None,
+    cache_params: Cache | None = None,
     cache_position: torch.LongTensor | None = None,
     attention_mask: torch.Tensor | None = None,
     # Modification: plumb varlen sequence metadata to FLA kernels.

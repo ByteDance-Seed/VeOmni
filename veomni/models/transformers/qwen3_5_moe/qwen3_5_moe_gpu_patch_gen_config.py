@@ -42,7 +42,6 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
-    Qwen3_5MoeDynamicCache,
     Qwen3_5MoeModel,
     Qwen3_5MoeModelOutputWithPast,
     Qwen3_5MoeTextModel,
@@ -716,7 +715,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
     input_ids: torch.LongTensor | None = None,
     attention_mask: torch.Tensor | None = None,
     position_ids: torch.LongTensor | None = None,
-    past_key_values: Qwen3_5MoeDynamicCache | None = None,
+    past_key_values: Cache | None = None,
     inputs_embeds: torch.FloatTensor | None = None,
     labels: torch.LongTensor | None = None,
     use_cache: bool | None = None,
