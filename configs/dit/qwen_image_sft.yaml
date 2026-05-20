@@ -1,0 +1,61 @@
+model:
+  model_path: Qwen/Qwen-Image/transformer
+  condition_model_path: Qwen/Qwen-Image
+  config_path: ./configs/model_configs/qwen_image/qwen_image_20b.json
+  condition_model_cfg:
+    max_sequence_length: 512
+    height: 1024
+    width: 1024
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+
+data:
+  train_path: qwen_image_train
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: iterable
+  data_type: diffusion
+  max_seq_len: 4096
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+  source_name: Qwen-Image
+train:
+  accelerator:
+    dp_replicate_size: 1
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: qwen-image-sft
+    manager: dcp
+    save_epochs: 1
+    save_hf_weights: true
+  max_steps: 500
+  num_train_epochs: 3
+  wandb:
+    enable: false
+    project: Qwen-Image
+    name: sft_qwen_image

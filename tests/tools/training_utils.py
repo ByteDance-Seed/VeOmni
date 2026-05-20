@@ -78,6 +78,10 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 # args directly (no training YAML), so we pin here as well.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+    # Diffusers currently gates QwenImageTransformer2DModel out of FA2, and
+    # the baseline VeOmni integration does not yet add an SP/FA2 attention
+    # patch for its dual-stream joint attention.
+    "qwen_image": {"attn_implementation": "eager", "rotary_pos_emb_implementation": "eager"},
     # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
     # by the fused Liger cross-entropy kernel materializing the full
     # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it
