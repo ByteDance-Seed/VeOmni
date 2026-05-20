@@ -28,6 +28,8 @@ from ..utils import logging
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
+    from ..distributed.parallel_plan import ParallelPlan
+
 logger = logging.get_logger(__name__)
 
 
@@ -41,6 +43,18 @@ def build_lora_key_overrides(model: "nn.Module") -> "Dict[str, str]":
 
         "layers.0.self_attn.q_proj.weight"
         -> "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
+
+    For VeOmni MoE-LoRA wrappers (:class:`~veomni.utils.moe_lora.LoraSharedExperts`
+    / :class:`~veomni.utils.moe_lora.LoraIndependentExperts`), the lifted base
+    parameter (e.g. fused ``gate_up_proj``) lives inside a per-spec
+    ``_LoraSpec`` sub-module under ``base_layer.weight``. Because the original
+    checkpoint key was a *bare* ``nn.Parameter`` on the experts module (no
+    ``.weight`` suffix in the saved key), the holder marks itself with
+    ``_is_bare_param_holder = True`` so this function can emit the bare->wrapped
+    mapping with no suffix on the source side, e.g.::
+
+        "layers.0.mlp.experts.gate_up_proj"
+        -> "base_model.model.layers.0.mlp.experts.gate_up_proj.base_layer.weight"
 
     Keys absent from the returned dict should receive a plain
     ``"base_model.model."`` prefix.
@@ -58,6 +72,12 @@ def build_lora_key_overrides(model: "nn.Module") -> "Dict[str, str]":
         inner = fqn[len("base_model.model.") :] if fqn.startswith("base_model.model.") else fqn
         inner_dot = inner + ("." if inner else "")
         wrap_dot = fqn + ("." if fqn else "") + "base_layer."
+        # MoE-LoRA bare-Param case: the checkpoint key for the wrapped base is
+        # the wrapper-spec FQN itself (no `.weight` because the original module
+        # exposed an `nn.Parameter` directly, not a Linear).
+        if getattr(module.base_layer, "_is_bare_param_holder", False):
+            overrides[inner] = wrap_dot + "weight"
+            continue
         for pname, _ in module.base_layer.named_parameters():
             overrides[inner_dot + pname] = wrap_dot + pname
         for bname, _ in module.base_layer.named_buffers():
@@ -77,16 +97,27 @@ def _read_adapter_name(adapter_path: str) -> str:
     return "default"
 
 
+_LORA_EXACT_PARTS = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
+
+
 def _remap_adapter_key(key: str, adapter_name: str) -> str:
     """Remap a PEFT-saved key to model FQN format.
 
     PEFT saves ``lora_A.weight`` but the model FQN is ``lora_A.<adapter_name>.weight``.
+    Both standard PEFT layers and VeOmni's MoE-LoRA wrappers
+    (:class:`~veomni.utils.moe_lora.LoraSharedExperts` /
+    :class:`~veomni.utils.moe_lora.LoraIndependentExperts`) follow this
+    exact convention: per-spec sub-modules expose ``lora_A`` / ``lora_B``
+    ``nn.ModuleDict`` containers keyed by adapter name, so a single
+    insertion of ``adapter_name`` after the ``lora_A`` / ``lora_B`` segment
+    suffices. Multiple LoRA segments per key (uncommon) all get the
+    adapter name inserted, matching PEFT's symmetric behaviour.
     """
     parts = key.split(".")
     new_parts = []
     for p in parts:
         new_parts.append(p)
-        if p in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+        if p in _LORA_EXACT_PARTS:
             new_parts.append(adapter_name)
     return ".".join(new_parts)
 
@@ -99,6 +130,7 @@ def load_lora_model_weights(
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     parameter_names_to_load: Optional[set] = None,
+    parallel_plan: Optional["ParallelPlan"] = None,
 ) -> None:
     """Load PEFT adapter (LoRA) weights from disk into the model on every rank.
 
@@ -111,6 +143,11 @@ def load_lora_model_weights(
         parameter_names_to_load: If provided, each successfully loaded parameter
             name is discarded from this set so that ``post_process_after_weight_loading``
             does not re-initialise adapter weights that have already been loaded.
+        parallel_plan: Optional ExtraParallel plan; same role as in
+            :func:`rank0_load_and_broadcast_adapter_weights` -- forwarded to
+            ``_dispatch_parameter`` so EP-sharded LoRA tensors are sliced
+            from the disk-side full ``[E, ...]`` shape down to the local
+            ``[E_local, ...]`` shape before the DTensor copy.
     """
     from peft import load_peft_weights
 
@@ -118,23 +155,46 @@ def load_lora_model_weights(
     raw_sd = load_peft_weights(adapter_path, device=init_device)
     for name, tensor in raw_sd.items():
         name = _remap_adapter_key(name, adapter_name)
-        _dispatch_parameter(model, name, tensor, dtensor_factory)
+        _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan=parallel_plan)
         if parameter_names_to_load is not None:
             parameter_names_to_load.discard(name)
 
 
 # fsdp2 init lora parameters during post_process_after_weight_loading
 def _init_lora_parameter(module: "nn.Module", name: str):
-    pieces = name.split(".")
-    lora_layer = module
-    for piece in pieces:
+    """Dispatch ``reset_lora_parameters`` for one LoRA tensor name.
+
+    Walks the module tree along ``name``'s pieces and reacts to two cases:
+
+    * **MoE-LoRA wrapper**: when an ancestor is a
+      :class:`~veomni.utils.moe_lora.LoraSharedExperts` /
+      :class:`~veomni.utils.moe_lora.LoraIndependentExperts`, dispatch
+      ``reset_lora_parameters(init_lora_weights=True)`` on the wrapper.
+      The wrapper re-initialises every adapter on every spec idempotently
+      so we dispatch once and return — avoids the per-adapter loop that
+      would re-init the same tensors many times when iterated key-by-key.
+    * **Standard PEFT LoRA layer**: when the immediate ``lora_A`` /
+      ``lora_B`` parent has ``reset_lora_parameters``, loop over its
+      adapters and reset each. ``lora_B`` is reset implicitly by the
+      ``lora_A`` reset, so we only need to dispatch on ``lora_A`` keys.
+    """
+    from .moe_lora import is_lora_moe_experts
+
+    for piece in name.split("."):
+        if is_lora_moe_experts(module):
+            module.reset_lora_parameters(init_lora_weights=True)
+            return
         if piece.startswith("lora_"):
             break
-        lora_layer = getattr(lora_layer, piece)
-    if "lora_A" in name and hasattr(lora_layer, "reset_lora_parameters"):
-        for adapter in getattr(lora_layer, "lora_A", {}).keys():
-            lora_layer.reset_lora_parameters(adapter, init_lora_weights=True)
-    # lora_B is initialized during lora_A reset_lora_parameters
+        module = getattr(module, piece)
+
+    if is_lora_moe_experts(module):
+        module.reset_lora_parameters(init_lora_weights=True)
+        return
+
+    if "lora_A" in name and hasattr(module, "reset_lora_parameters"):
+        for adapter in getattr(module, "lora_A", {}).keys():
+            module.reset_lora_parameters(adapter, init_lora_weights=True)
 
 
 # fsdp2 meta device rank0 load and broadcast adapter weights
@@ -145,6 +205,7 @@ def rank0_load_and_broadcast_adapter_weights(
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     parameter_names_to_load: Optional[set] = None,
+    parallel_plan: Optional["ParallelPlan"] = None,
 ) -> None:
     """Rank-0 loads PEFT adapter weights from disk then broadcasts to all ranks.
 
@@ -152,6 +213,15 @@ def rank0_load_and_broadcast_adapter_weights(
         parameter_names_to_load: If provided, each successfully loaded parameter
             name is discarded from this set so that ``post_process_after_weight_loading``
             does not re-initialise adapter weights that have already been loaded.
+        parallel_plan: Optional ExtraParallel plan. When set, ``_dispatch_parameter``
+            calls ``parallel_plan.shard_tensor`` on each broadcast adapter tensor
+            so EP-sharded LoRA params (those registered by
+            :func:`~veomni.distributed.parallel_plan._extend_plan_for_moe_lora_independent`
+            for :class:`~veomni.utils.moe_lora.LoraIndependentExperts`) get
+            sliced from the disk-side full ``[E, ...]`` shape down to the
+            local ``[E_local, ...]`` shape before the DTensor ``.copy_()``.
+            Without this the copy fails with a sharding-propagation error
+            (full-shape source vs sliced-shape destination).
     """
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -173,7 +243,7 @@ def rank0_load_and_broadcast_adapter_weights(
 
     if not dist.is_available() or not dist.is_initialized():
         for name, tensor in adapter_sd.items():
-            _dispatch_parameter(model, name, tensor, dtensor_factory)
+            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan=parallel_plan)
         return
 
     global_rank = get_parallel_state().global_rank
@@ -219,7 +289,7 @@ def rank0_load_and_broadcast_adapter_weights(
         logger.info_rank0(
             f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
         )
-        _dispatch_parameter(model, name, tensor, dtensor_factory)
+        _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan=parallel_plan)
         if parameter_names_to_load is not None:
             parameter_names_to_load.discard(name)
         del tensor
