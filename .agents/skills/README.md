@@ -37,6 +37,7 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 | `veomni-review` | Pre-commit code review via subagent (mandatory gate) |
 | `veomni-new-model` | Adding a new model to VeOmni (patchgen, parallel plan, registry) |
 | `veomni-migrate-transformers-v5` | Migrate an existing `veomni/models/transformers/<model>/` from v4 monkey-patches to v5 patchgen + generated modeling (text + MoE) |
+| `seedomni-v2` | Add or modify modules / graphs inside `veomni/models/seed_omni/` — OmniModule mixin (HF/diffusers + multi-inherit), `nodes`/`edges`/`end`/`training_graph`/`generation_graph` wiring, configuration_xxx triplet + MODULE_MIXIN_REGISTRY, split-checkpoint script + per-module callback (subfolder), visualization + tests |
 | `veomni-new-op` | Adding a new optimized kernel/operator to veomni/ops/ |
 | `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
 | `create-pr` | Create a pull request — handles uncommitted changes, generates CI-compliant title and description |

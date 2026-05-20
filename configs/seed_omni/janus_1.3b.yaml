@@ -1,142 +1,223 @@
 # OmniModel V2 — Janus-1.3B demo configuration
 #
+# Schema highlights (see design.md):
+#   * `model_type` is NOT specified per-module — the trainer reads it from each
+#     module's own `config.json` via HuggingFace AutoConfig.from_pretrained().
+#   * `tokenizer_path` is the ONE global asset; all other processors live
+#     inside their owning module's checkpoint subfolder.
+#   * `nodes:` and `edges:` are independent pools sharing one namespace; each
+#     name must be unique across both.
+#   * Every node MUST appear on at least one edge — leaf nodes flow into the
+#     reserved `end` keyword (virtual sink).  No orphans, no cycles.
+#   * `training_graph.edges` lists only edge names; active nodes are *derived*
+#     from those endpoints (excluding `end`).  Topological sort produces the
+#     forward queue.
+#   * `generation_graph.states.<name>.body` also lists only edge names.  Per-
+#     iteration: walk body in order, execute each unique endpoint on first
+#     encounter, route ctx[output]→ctx[as] along each edge.
+#
 # Split checkpoint first:
 #   python scripts/split_janus.py \
 #     --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
 #
-# Parallelism
-# -----------
-# All sub-modules are wrapped by build_parallelize_model using the global
-# `train.accelerator.fsdp_config.fsdp_mode` (ddp / fsdp1 / fsdp2) set in the
-# trainer YAML. SP for ar_llm is auto-applied by its pre_forward / post_forward
-# hooks when the global parallel_state has sp_enabled.
-#
-# Micro-batch sizes
-# -----------------
-# Global batch B must be divisible by every module's micro_batch_size:
-#   B % vision_encoder.micro_batch_size == 0
-#   B % vq_decoder.micro_batch_size     == 0
-#   B % ar_llm.micro_batch_size         == 0
-# Example: B=8, vision_encoder=4, vq_decoder=4, ar_llm=2  → all divide evenly.
+# Why a separate `text_embed` module?
+# -----------------------------------
+# The word-token embedding (`wte`) and the LM head are vocabulary-dependent
+# layers that conceptually mirror a discrete-image VQ codec — they are the
+# pre-stage and post-stage of the LLM backbone.  Pulling them out of
+# `janus_llama` into a generic `text_embed` OmniModule lets the graph treat
+# text and image symmetrically (both have `encode` / `decode` call-sites)
+# and lets the LLM backbone be reused across vocab sizes.
+
+# ── Global asset (the only one) ───────────────────────────────────────────────
+tokenizer_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/tokenizer
 
 # ── Module registry ───────────────────────────────────────────────────────────
 modules:
   vision_encoder:
-    model_type: janus_vision_encoder
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/vision_encoder
-    # Micro-batch: process 4 images at a time through the vision tower
     micro_batch_size: 4
 
-  vq_decoder:
-    model_type: janus_vq_decoder
-    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/vq_decoder
+  vqvae:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/vqvae
     freeze_vqvae: true
-    # Micro-batch: process 4 images at a time through VQVAE encode
     micro_batch_size: 4
 
-  ar_llm:
-    model_type: janus_llm
-    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/ar_llm
+  text_embed:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/text_embed
+    # vocab_size / hidden_size / tie_word_embeddings come from text_embed/config.json
+    # (written by scripts/split_janus.py).  Janus uses an untied LLaMA head, so
+    # encode and decode hold two separate parameter matrices.
+
+  janus_llama:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_llama
     image_token_id: 100577      # <und_img> placeholder in tokenizer
     gen_image_token_id: 100578  # <gen_img> placeholder in tokenizer
-    # Micro-batch: process 2 sequences per forward call
-    # (keep this <= vision_encoder.micro_batch_size and ensure B % 2 == 0)
     micro_batch_size: 2
 
-# ── Named connection pool (each is one atomic edge) ───────────────────────────
-connections:
-  # ── execute AR-LLM (text / multimodal understanding)
-  run_ar:
-    module: ar_llm
+# ── Graph nodes (call-sites) ──────────────────────────────────────────────────
+nodes:
+  vision_encode:                       # vision_encoder.forward
+    module: vision_encoder
 
-  # ── vision_encoder → ar_llm  (understanding images)
+  vae_encode:                          # vqvae.encode: pixels → gen_embeds + vq_token_ids
+    module: vqvae.encode
+
+  vae_decode:                          # vqvae.decode — unified VQ head
+    module: vqvae.decode               #   training:        hidden + gt_token_ids → _loss
+                                       #   inference (FSM): hidden → sample → vq_token_id + embed
+                                       #   inference (alt): token_id → embed (codebook lookup only)
+
+  tok_encode:                          # text_embed.encode: input_ids → inputs_embeds (wte)
+    module: text_embed.encode
+
+  tok_decode:                          # text_embed.decode — unified text head
+    module: text_embed.decode          #   training:  hidden_states + labels → _loss
+                                       #   inference: hidden_states → sample → next token (input_ids)
+
+  janus_llama:                         # janus_llama.forward (training) / .generate_step (FSM)
+    module: janus_llama                # backbone — no wte, no lm_head — produces hidden_states
+
+# ── Graph edges (data dependencies) ───────────────────────────────────────────
+edges:
+  # ── Training edges
   vision_to_ar:
-    from: vision_encoder
+    from: vision_encode
     output: image_embeds
-    to: ar_llm
+    to: janus_llama
     as: und_image_embeds
 
-  # ── vq_decoder → ar_llm  (generation teacher-forcing embeddings)
   vae_enc_to_ar:
-    from: vq_decoder
+    from: vae_encode
     output: gen_embeds
-    to: ar_llm
+    to: janus_llama
     as: gen_image_embeds
 
-  # ── ar_llm → vq_decoder  (VQ token ID → codebook embed, during inference)
-  ar_to_vq:
-    from: ar_llm
-    output: vq_token_id
-    to: vq_decoder
-    as: token_id
+  tok_enc_to_ar:
+    from: tok_encode
+    output: inputs_embeds
+    to: janus_llama
+    as: inputs_embeds
 
-  # ── vq_decoder → ar_llm  (codebook embed → next LLM input, during inference)
-  vq_dec_to_ar:
-    from: vq_decoder
+  ar_to_tok_decode:
+    from: janus_llama
+    output: hidden_states
+    to: tok_decode
+    as: hidden_states
+
+  ar_to_vae_decode:
+    from: janus_llama
+    output: hidden_states
+    to: vae_decode
+    as: hidden_states
+
+  vae_token_to_decode:
+    from: vae_encode
+    output: vq_token_ids
+    to: vae_decode
+    as: gt_token_ids
+
+  # Leaf-node sinks (no real downstream — virtual `end` keyword).
+  tok_decode_sink:
+    from: tok_decode
+    to: end
+
+  vae_decode_sink:
+    from: vae_decode
+    to: end
+
+  # ── Inference-only feedback edge (cyclic; not in training subset).
+  vae_decode_to_ar:
+    from: vae_decode
     output: embed
-    to: ar_llm
+    to: janus_llama
     as: inputs_embeds
 
 # ── Training DAG ──────────────────────────────────────────────────────────────
-# Scenario A: Text + image understanding SFT  (vision_encoder → ar_llm)
+# Default = Janus joint understanding + image-generation SFT.
+#
+# Active nodes are derived from these edges' endpoints (excluding `end`):
+#   sources : vision_encode, vae_encode, tok_encode
+#   middle  : janus_llama
+#   sinks   : tok_decode, vae_decode  (both flow to `end`)
+#
+# Each module's `_loss` (single key per node, token-mean reduced inside the
+# module) is summed by OmniModel:
+#   vision_encode/_loss   — none (pure encoder)
+#   vae_encode/_loss      — VQVAE embedding loss when vqvae unfrozen
+#   janus_llama/_loss     — none (sees no labels; CE done in heads)
+#   tok_decode/_loss      — text CE
+#   vae_decode/_loss      — image-VQ CE
 training_graph:
-  connections:
+  edges:
     - vision_to_ar
-    - run_ar
+    - vae_enc_to_ar
+    - tok_enc_to_ar
+    - ar_to_tok_decode
+    - ar_to_vae_decode
+    - vae_token_to_decode
+    - tok_decode_sink
+    - vae_decode_sink
 
-# Alternative scenarios (switch training_graph.connections to activate):
+# Alternative training scenarios (replace training_graph.edges to activate):
 #
-# Scenario B: Image generation SFT  (vq_decoder → ar_llm)
-#   connections: [vae_enc_to_ar, run_ar]
+# A) Understanding-only SFT (no image generation)
+#      edges: [vision_to_ar, tok_enc_to_ar, ar_to_tok_decode, tok_decode_sink]
 #
-# Scenario C: Joint understanding + generation SFT
-#   connections: [vision_to_ar, vae_enc_to_ar, run_ar]
+# B) Generation-only SFT (skip vision understanding side)
+#      edges: [vae_enc_to_ar, tok_enc_to_ar, ar_to_tok_decode, ar_to_vae_decode,
+#              vae_token_to_decode, tok_decode_sink, vae_decode_sink]
 #
-# Scenario D: Generate VQ embeddings only (offline embedding)
-#   connections: [vision_to_ar]      # no run_ar; trainer saves vision_encoder output
-#
-# Scenario E: Train only ar_llm with pre-cached embeddings
-#   connections: [run_ar]            # batch already has und_image_embeds from disk
+# C) Train only janus_llama + text_embed with pre-cached image embeddings
+#      edges: [tok_enc_to_ar, ar_to_tok_decode, tok_decode_sink]
+#    Batch already carries und_image_embeds / gen_image_embeds from disk.
 
 # ── Inference FSM ─────────────────────────────────────────────────────────────
-generation_states:
+# Each FSM iteration walks the body's edges in order; nodes execute on first
+# encounter (default method `forward` → `generate_step`, otherwise direct
+# dispatch).
+generation_graph:
   initial: text_ar
-  done_state: done   # special terminal state
+  done_state: done
 
   states:
     text_ar:
+      # tok_encode → janus_llama → tok_decode  (variable, until transition fires).
+      # tok_decode writes input_ids/last_token_id back into ctx so the next
+      # iteration's tok_encode reads them automatically.
       body:
-        - run_ar
+        - tok_enc_to_ar      # tok_encode → janus_llama
+        - ar_to_tok_decode   # janus_llama → tok_decode
       token_length:
         type: variable
       transitions:
         - condition:
             type: token_match
-            token_id: 100577   # <und_img> → should not appear in generation; skip
+            token_id: 100577           # <und_img>: shouldn't appear during gen — self-loop
           next_state: text_ar
         - condition:
             type: token_match
-            token_id: 100578   # <gen_img> → switch to VQ image generation
+            token_id: 100578           # <gen_img>: switch to VQ image generation
           next_state: image_vq
         - condition:
             type: token_match
-            token_id: 2        # </s> EOS → done
+            token_id: 2                # </s>
           next_state: done
 
     image_vq:
-      # AR-LLM generates one VQ token per step; VQ decoder converts it to embed
-      # that feeds back as the next LLM input.  576 tokens = 24×24 VQ grid.
+      # janus_llama → vae_decode → feedback loop into next iter's janus_llama.
+      # 576 = 24 × 24 VQ grid.  vae_decode in inference mode samples from its
+      # generation head AND looks up the codebook embedding in one call.
       body:
-        - run_ar       # generate next VQ token ID from LLM
-        - ar_to_vq     # route vq_token_id → vq_decoder
-        - vq_dec_to_ar # route embed → ar_llm.inputs_embeds
+        - ar_to_vae_decode   # janus_llama → vae_decode
+        - vae_decode_to_ar   # vae_decode.embed → next-iter janus_llama.inputs_embeds
       token_length:
         type: fixed
         value: 576
       transitions:
         - condition:
-            type: steps_complete   # 576 steps done → back to text
+            type: steps_complete
           next_state: text_ar
 
     done:

@@ -1,288 +1,172 @@
 """
-OmniModule: abstract base class for all composable modules in OmniModel.
+OmniModule — the *mixin* every SeedOmni V2 component multi-inherits from.
 
-Each OmniModule:
-  - Implements `forward(**kwargs) -> dict` for training (DAG execution).
-  - Optionally overrides `generate_step(**kwargs) -> dict` for inference (FSM execution).
-  - Optionally overrides `get_parallel_plan()` for per-module FSDP/EP/SP config.
-  - Optionally overrides `pre_forward` / `post_forward` for packing and SP slice/gather.
+Why a mixin?
+------------
+A real SeedOmni component is almost always a HuggingFace ``transformers`` /
+``diffusers`` model — e.g. ``LlamaModel``, ``SiglipVisionModel``, a custom
+``DiT``.  Forcing those into a deep abstract base class would mean wrapping or
+re-deriving them, which fights the upstream patchgen / monkey-patch flow.
 
-Return convention:
-  - Any key ending with ``_loss`` in the return dict is treated as a training loss
-    and collected by OmniModel.forward().
-  - Keys used as outputs in connections must be present in the return dict.
+Instead, ``OmniModule`` is a *plain mixin* with **zero required overrides**.
+Real classes mix it in alongside their HF base::
 
-Build lifecycle
----------------
-Each OmniModule subclass is responsible for its own build lifecycle, identical
-to what a BaseTrainer does for a monolithic model:
+    class JanusVisionEncoder(OmniModule, SiglipVisionModel):
+        def forward(self, **kwargs) -> dict:
+            ...
+        def get_parallel_plan(self) -> ParallelPlan | None:
+            ...
 
-  1. ``_build_nn_module(cfg, init_device)`` — parse the raw config dict,
-     construct the ``nn.Module`` on the given device (cpu / meta / cuda).
-  2. ``build(cfg, build_args)``            — call ``_build_nn_module``, then
-     call :func:`build_parallelize_model` to apply DDP / FSDP1 / FSDP2
-     based on the global ``parallel_state.dp_mode``.  Returns the wrapped
-     module ready for training.
-  3. ``get_assets()``                      — return any model assets
-     (tokenizer, processor, chat template) produced during build.
-     Called by :meth:`OmniModel.collect_assets` after all modules are built.
+The graph runtime calls a small list of *optional* hooks (described below).
+Each hook has a sensible default so a minimal module — say a pure feature
+extractor — can implement only ``forward`` and skip everything else.
 
-pre_forward / post_forward contract
--------------------------------------
+Optional hooks
+--------------
+``forward(**kwargs) -> dict``
+    Training entry.  Return a dict whose keys feed downstream graph edges.
+    May contain at most one ``_loss`` key (scalar, already token-mean-reduced
+    across all micro-batches consumed inside this call).  See
+    "Loss protocol" below.
+
+``generate_step(**kwargs) -> dict``
+    Inference entry.  Default delegates to :meth:`forward`.  Override when
+    sampling logic differs (e.g. a DiT runs a denoising loop here but a
+    diffusion-loss in ``forward``; an LM head samples a token here but
+    computes CE in ``forward``).
+
 ``pre_forward(**kwargs) -> dict``
-    Called with a single *micro-batch* of inputs (already sliced from the full
-    batch by OmniModel).  Responsible for:
-
-    * **Packing** — reshaping variable-arity inputs (e.g. flattening
-      ``(B, N_images, C, H, W)`` → ``(B*N_images, C, H, W)`` for vision
-      encoders, or computing ``cu_seqlens`` for packed text sequences).
-    * **SP slice** (LLM only) — splitting the sequence dimension across SP
-      ranks using :func:`veomni.distributed.sequence_parallel.data.sp_pad_and_slice`.
-
-    Default implementation: identity (returns kwargs unchanged).
+    Per-micro-batch packing / SP slice / data-routing prep.  Default:
+    identity.  Called by the runtime *before* ``forward``.
 
 ``post_forward(outputs: dict) -> dict``
-    Called immediately after ``forward``.  Responsible for:
+    Per-call post-processing — e.g. SP gather of routed tensors, computing
+    the final ``_loss`` mean across micro-batches.  Default: identity.
 
-    * **SP gather** — all-gathering the sequence dimension from SP ranks so
-      that connection-routed tensors (e.g. ``hidden_states``) are always
-      *full* sequences when consumed by the next module.
+``get_parallel_plan() -> Any | None``
+    Per-module FSDP / EP / SP plan.  Default: ``None`` (inherit OmniModel
+    defaults).
 
-    Default implementation: identity.
+``get_assets() -> list``
+    Module-owned tooling that should be saved alongside the module weights
+    (vision processor, audio feature extractor, codebook lookup tables, ...).
+    The global tokenizer lives at ``OmniConfig.tokenizer_path`` and is NOT
+    returned here.  Default: ``[]``.
+
+Loss protocol (single ``_loss`` key)
+------------------------------------
+* A module may emit *at most one* loss term per node.
+* The loss key MUST be exactly ``"_loss"`` (no ``"text_loss"``,
+  ``"gen_loss"`` etc — module identity is already disambiguating because
+  ``OmniModel`` indexes by node name).
+* The value MUST be a **token-level mean** computed inside ``forward``
+  /``post_forward`` — i.e. the module is responsible for summing per-token
+  CE across all its micro-batches and dividing by the matching valid-token
+  count.  Returning a per-batch mean breaks gradient correctness when token
+  counts differ across micro-batches.
+* ``OmniModel.forward`` collects every node's ``_loss`` and sums them into
+  the total scalar.  Modules that produce no loss return a dict without
+  ``_loss``.
+
+Build / save lifecycle
+----------------------
+``build_*`` and ``CheckpointCallback`` are wired by ``OmniModel`` /
+``OmniTrainer`` — they walk every module and call:
+
+  1. :func:`veomni.distributed.torch_parallelize.build_foundation_model`
+     ``(module_cfg, init_device)`` — meta-device or eager construction.
+  2. :func:`veomni.distributed.torch_parallelize.build_parallelize_model`
+     ``(model, weights_path=cfg["weights_path"], plan=module.get_parallel_plan(), ...)``
+  3. Per-module :class:`~veomni.trainer.callbacks.CheckpointCallback` writes
+     to ``<ckpt_root>/<module_name>/{model.safetensors, config.json,
+     <assets...>}`` — each module's directory is self-contained.
+
+These functions are imported lazily by the trainer; the mixin itself stays
+import-safe in a torch-free / cpu-only environment so ``test_print_flow.py``
+can exercise the graph runtime without GPUs.
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import torch.nn as nn
 
+class OmniModule:
+    """Mixin for SeedOmni V2 modules.
 
-@dataclass
-class OmniBuildArgs:
-    """Lightweight build config passed to :meth:`OmniModule.build`.
+    Multi-inherit alongside the real HF / diffusers backbone class::
 
-    Created by :class:`~veomni.trainer.omni_trainer.OmniTrainer` from the
-    full ``VeOmniArguments`` and forwarded to every module's ``build()``.
-    Mirrors the subset of arguments used by ``build_parallelize_model``.
+        class JanusVisionEncoder(OmniModule, SiglipVisionModel):
+            ...
+
+    Only the hooks the module actually needs must be overridden.  All
+    defaults below are safe identity passes.
     """
 
-    # Device / dtype used to allocate the raw nn.Module before parallelisation.
-    # ``"meta"`` is recommended so no memory is wasted before weight loading.
-    init_device: str = "cpu"
-    torch_dtype: str = "bfloat16"
+    # ── Training hooks ────────────────────────────────────────────────────────
 
-    # ── FSDP / DDP ────────────────────────────────────────────────────────────
-    enable_full_shard: bool = True
-    enable_reshard_after_forward: bool = True
-    mixed_precision: Any = None  # MixedPrecisionConfig instance or None
-    enable_gradient_checkpointing: bool = True
-    enable_fsdp_offload: bool = False
-    enable_reentrant: bool = False
-    enable_forward_prefetch: bool = True
-    broadcast_model_weights_from_rank0: bool = False
-    max_load_broadcast_size: float = 20.0
-    cpu_load_param_name: Optional[str] = None
+    def pre_forward(self, **kwargs: Any) -> Dict[str, Any]:
+        """Pre-process inputs before :meth:`forward`.
 
-    # Extra module class names added to every module's ``_no_split_modules``
-    # list (merged with the module's own list before passing to
-    # ``build_parallelize_model``).
-    extra_basic_modules: List[str] = field(default_factory=list)
+        Override to add packing (reshape multi-image pixel_values, compute
+        cu_seqlens, build chat-template-aware position_ids, ...) and/or SP
+        slicing.
 
-
-class OmniModule(nn.Module, ABC):
-    """Abstract base class for all OmniModel sub-modules.
-
-    Subclasses must implement :meth:`forward`.  The ``generate_step`` method
-    defaults to delegating to ``forward``, which is correct for encoder-style
-    modules and for the AR-LLM in teacher-forcing mode.  Modules that need
-    different sampling logic (e.g. a DiT denoising step) should override
-    ``generate_step``.
-
-    Build lifecycle
-    ---------------
-    Override :meth:`_build_nn_module` to parse the raw config dict and
-    construct the typed ``OmniModule`` instance.  The default :meth:`build`
-    classmethod then wraps it with :func:`build_parallelize_model`.  Override
-    :meth:`build` for non-standard build patterns (e.g. partial weight tying,
-    custom freeze logic).
-
-    Loss convention
-    ---------------
-    ``forward`` should return a :class:`dict`.  Any key whose name ends with
-    ``_loss`` (e.g. ``"lm_loss"``, ``"diffusion_loss"``) is automatically
-    aggregated by :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
-
-    Parallel plan
-    -------------
-    Override :meth:`get_parallel_plan` to return a VeOmni ``ParallelPlan``
-    (or equivalent) if this module requires non-default FSDP / SP / EP
-    sharding.  Returning ``None`` means default sharding inherited from the
-    OmniModel level.
-
-    Micro-batch execution
-    ---------------------
-    OmniModel splits the global batch into micro-batches sized by
-    ``module_config["micro_batch_size"]`` and calls each module as::
-
-        inputs = module.pre_forward(**micro_batch_inputs)
-        outputs = module(**inputs)
-        outputs = module.post_forward(outputs)
-
-    Override ``pre_forward`` / ``post_forward`` to add packing and SP logic.
-    """
-
-    # ── Build lifecycle ────────────────────────────────────────────────────────
-
-    @classmethod
-    def build(cls, cfg: Dict[str, Any], build_args: OmniBuildArgs) -> nn.Module:
-        """Build and parallelize this module from its raw config dict.
-
-        Default implementation:
-
-        1. Allocates the raw ``OmniModule`` on ``build_args.init_device`` by
-           calling :meth:`_build_nn_module`.
-        2. Wraps it with :func:`~veomni.distributed.torch_parallelize.build_parallelize_model`,
-           which selects DDP / FSDP1 / FSDP2 based on the global
-           ``parallel_state.dp_mode``.  ``cfg["weights_path"]`` is used for
-           per-module weight loading.
-
-        Subclasses may override to add custom logic such as partial freezing,
-        weight tying, or multi-source weight loading.
-
-        Parameters
-        ----------
-        cfg:
-            Raw module config dict from ``OmniConfig.modules[name]``.
-            Must contain at least ``"model_type"``.  May contain
-            ``"weights_path"`` for weight loading.
-        build_args:
-            Parallelisation settings forwarded from the trainer.
-
-        Returns
-        -------
-        The wrapped (DDP / FSDP2) module, ready for training.
-        """
-        from veomni.distributed.torch_parallelize import build_parallelize_model
-
-        module = cls._build_nn_module(cfg, build_args.init_device)
-
-        basic_modules = list(
-            set(getattr(module, "_no_split_modules", None) or []) | set(build_args.extra_basic_modules)
-        )
-        cpu_load_param_name = build_args.cpu_load_param_name
-        if cpu_load_param_name is None and hasattr(module, "get_parallel_plan"):
-            plan = module.get_parallel_plan()
-            cpu_load_param_name = getattr(plan, "cpu_load_param_name", None)
-
-        wrapped = build_parallelize_model(
-            module,
-            init_device=build_args.init_device,
-            weights_path=cfg.get("weights_path"),
-            enable_full_shard=build_args.enable_full_shard,
-            enable_reshard_after_forward=build_args.enable_reshard_after_forward,
-            mixed_precision=build_args.mixed_precision,
-            enable_gradient_checkpointing=build_args.enable_gradient_checkpointing,
-            enable_fsdp_offload=build_args.enable_fsdp_offload,
-            basic_modules=basic_modules,
-            enable_reentrant=build_args.enable_reentrant,
-            enable_forward_prefetch=build_args.enable_forward_prefetch,
-            broadcast_model_weights_from_rank0=build_args.broadcast_model_weights_from_rank0,
-            max_load_broadcast_size=build_args.max_load_broadcast_size,
-            cpu_load_param_name=cpu_load_param_name,
-        )
-        wrapped.train()
-        return wrapped
-
-    @classmethod
-    def _build_nn_module(cls, cfg: Dict[str, Any], init_device: str = "cpu") -> "OmniModule":
-        """Parse the raw config dict and instantiate the OmniModule.
-
-        Called by :meth:`build` before parallelisation.  Subclasses must
-        override this to convert ``cfg`` into a typed config object and call
-        ``__init__``.  Use ``init_device`` to control allocation::
-
-            with torch.device(init_device):
-                return cls(MyModuleConfig(...))
-
-        Using ``init_device="meta"`` avoids allocating actual memory before
-        ``build_parallelize_model`` loads and shards the weights.
-        """
-        raise NotImplementedError(f"{cls.__name__} must implement _build_nn_module(cfg, init_device)")
-
-    def get_assets(self) -> List[Any]:
-        """Return model assets produced during :meth:`build`.
-
-        Override in subclasses that own a tokenizer or processor, e.g.::
-
-            def get_assets(self):
-                return [self._tokenizer]
-
-        The list is collected by :meth:`OmniModel.collect_assets` and exposed
-        via :attr:`OmniTrainer.base.model_assets`.
-        """
-        return []
-
-    # ── Training hooks ─────────────────────────────────────────────────────────
-
-    def pre_forward(self, **kwargs) -> Dict[str, Any]:
-        """Pre-process a single micro-batch before ``forward``.
-
-        Default: identity pass-through.  Override to add packing (reshape
-        multi-image pixel_values, compute cu_seqlens, etc.) and/or SP slice.
-
-        Args:
-            **kwargs: Micro-batch inputs as assembled by OmniGraph.
-
-        Returns:
-            Processed kwargs passed directly to :meth:`forward`.
+        Default: identity pass-through.
         """
         return kwargs
 
-    @abstractmethod
-    def forward(self, **kwargs) -> Dict[str, Any]:
+    def forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
         """Training forward pass.
 
-        Args:
-            **kwargs: Processed micro-batch fields from ``pre_forward``.
+        Override to provide module-specific behaviour.  The default raises —
+        any module that participates in the *training* graph must implement
+        this.  Inference-only modules may override only :meth:`generate_step`
+        and leave ``forward`` un-implemented.
 
-        Returns:
-            dict with arbitrary keys.  Keys ending in ``_loss`` are treated
-            as scalar loss terms and summed into the total training loss.
+        Returns
+        -------
+        dict
+            Arbitrary keys consumed by downstream edges.  May contain at
+            most one ``_loss`` scalar (token-mean reduced across all
+            micro-batches consumed in this call).
         """
+        raise NotImplementedError(
+            f"{type(self).__name__}.forward(**kwargs) is not implemented. "
+            "Override it on the OmniModule mixin if this module appears in the training graph."
+        )
 
     def post_forward(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Post-process ``forward`` outputs before they are stored.
+        """Post-process :meth:`forward` outputs.
 
-        Default: identity pass-through.  Override to add SP gather so that
-        downstream connections always receive full-sequence tensors.
+        Override to add SP gather, final token-mean reduction of ``_loss``,
+        cleanup of book-keeping fields, etc.
 
-        Args:
-            outputs: The dict returned by :meth:`forward`.
-
-        Returns:
-            Processed outputs dict (full-sequence tensors).
+        Default: identity.
         """
         return outputs
 
-    def generate_step(self, **kwargs) -> Dict[str, Any]:
-        """Single auto-regressive or diffusion generation step.
+    def generate_step(self, **kwargs: Any) -> Dict[str, Any]:
+        """Single FSM-driven generation step.
 
-        Defaults to calling :meth:`forward`.  Override for modules where
-        inference and training behave differently (e.g. a DiT that runs a
-        full denoising loop during generation but computes diffusion loss
-        during training, or a sampling-based next-token predictor).
-
-        Args:
-            **kwargs: Generation context accumulated by the FSM, including
-                the raw request dict and all outputs produced so far in the
-                current state body.
-
-        Returns:
-            dict that is merged back into the FSM context for the next step.
+        Default: delegate to :meth:`forward`.  Override when inference logic
+        differs from training — e.g. a DiT runs its denoising loop here, an
+        LM head samples a token here.
         """
         return self.forward(**kwargs)
+
+    # ── Parallelism / assets ──────────────────────────────────────────────────
 
     def get_parallel_plan(self) -> Optional[Any]:
         """Return a per-module VeOmni parallel plan, or ``None`` for default."""
         return None
+
+    def get_assets(self) -> List[Any]:
+        """Module-owned auxiliary artefacts to save alongside the weights.
+
+        Vision / audio processors, codebooks, BPE pieces, etc.  The global
+        tokenizer is stored at ``OmniConfig.tokenizer_path`` and is *not*
+        returned here.  Default: ``[]``.
+        """
+        return []
+
+
+__all__ = ["OmniModule"]

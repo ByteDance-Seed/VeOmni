@@ -1,180 +1,153 @@
 """
-OmniGraph: derives the module execution order for the training DAG.
+Shared pool data types for the SeedOmni V2 graph.
 
-A *connection* is a named, atomic edge definition stored in ``OmniConfig.connections``.
-Two forms are supported:
+`OmniConfig` declares two parallel top-level pools:
 
-  ``{module: X}``
-      Execute module X.  No data is explicitly routed; X reads directly from
-      the global raw-batch context (all previous module outputs are also
-      available).
+- ``nodes``  — graph nodes (a.k.a. call-sites).  Each maps a node name to one
+  ``module.method`` pair::
 
-  ``{from: A, output: k, to: B, as: m}``
-      Take key ``k`` from module A's output dict and pass it to module B as
-      kwarg ``m``, then execute B.
+      {module: <name>}              # runs <name>.forward(**kwargs)
+      {module: <name>.<method>}     # runs <name>.<method>(**kwargs)
 
-``OmniGraph`` is given the full connections pool plus the *active* list for the
-current training run (``training_graph.connections``).  It builds a DAG,
-performs a topological sort, and exposes:
+  The same underlying ``nn.Module`` may appear under multiple node names — for
+  example a VQ module with both an ``encode`` node (pixels → embeds) and a
+  ``decode`` node (LLM hidden → CE loss / token_id → embed).  These are
+  independent graph nodes that happen to share weights.
 
-  - ``execution_order`` — list of module names in dependency order.
-  - ``collect_inputs(module_name, module_outputs, raw_batch)`` — merge raw
-    batch + connection-routed tensors for a given module.
+- ``edges`` — graph edges (data dependencies).  Each routes one output key
+  from a source node into one kwarg of a destination node::
+
+      {from: A, output: k, to: B, as: m}
+
+  ``from``/``to`` reference node names; for convenience a *module name* is
+  accepted when that module has exactly one active node (alias shorthand).
+
+Reserved sink keyword
+---------------------
+The string ``"end"`` (exposed as the :data:`END` constant) is a virtual sink:
+``to: end`` declares that a node's output flows nowhere — it just makes the
+node visible to the active subset.  Every node MUST appear on at least one
+edge (no orphans); leaf nodes use ``to: end`` to satisfy that invariant.
+
+The ``end`` keyword is reserved — it cannot appear as a real node or edge
+name in either pool, and it cannot appear in the ``from`` field of any edge.
+
+Two execution views consume these pools (see ``training_graph.py`` and
+``generation_graph.py``):
+
+- ``TrainingGraph``  — DAG view.  Active nodes are derived from the endpoints
+  of ``OmniConfig.training_graph.edges`` (excluding the virtual ``end`` node).
+  Topological sort over those nodes produces the forward execution order.
+- ``GenerationGraph`` — FSM view.  Each ``state.body`` is also a list of edge
+  names; the unique nodes appearing as endpoints (excluding ``end``) execute
+  once per FSM step in declaration order.
+
+See ``design.md`` §1 for the full schema.
 """
 
-from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Dict, Optional
+
+
+END: str = "end"
+"""Reserved virtual sink node name.
+
+Used as ``to: end`` on edges whose source node has no real successor.  Treated
+as a sentinel in graph construction; never appears in execution orders.
+"""
+
+
+def is_end(name: Optional[str]) -> bool:
+    """Return True iff *name* refers to the virtual ``end`` sink."""
+    return name == END
 
 
 @dataclass
-class ConnectionDef:
-    """Parsed representation of a single named connection."""
+class NodeDef:
+    """Parsed graph node — one ``module.method`` call-site."""
 
     name: str
-    # {module: X} form
-    module: Optional[str] = None
-    # {from: A, output: k, to: B, as: m} form
-    from_: Optional[str] = None
+    module: str
+    method: str = "forward"
+
+    @classmethod
+    def parse(cls, name: str, spec: Dict) -> "NodeDef":
+        if name == END:
+            raise ValueError(f"Node name '{END}' is reserved as the virtual sink and cannot appear in `nodes`.")
+        if not isinstance(spec, dict) or "module" not in spec:
+            raise ValueError(f"Node '{name}': missing required `module` field. Got: {spec!r}")
+
+        if "from" in spec or "to" in spec:
+            raise ValueError(
+                f"Node '{name}' is a graph node but contains edge fields (`from`/`to`). "
+                "Move it into the `edges` pool, or remove the edge fields. "
+                f"Got: {spec!r}"
+            )
+
+        mod_spec = spec["module"]
+        explicit_method = spec.get("method")
+        if "." in mod_spec:
+            if explicit_method is not None:
+                raise ValueError(
+                    f"Node '{name}': cannot specify both dotted form `module: {mod_spec}` "
+                    f"and `method: {explicit_method}`."
+                )
+            module, method = mod_spec.split(".", 1)
+        else:
+            module = mod_spec
+            method = explicit_method or "forward"
+
+        if not module or not method:
+            raise ValueError(f"Node '{name}': module/method must be non-empty (got {spec!r}).")
+
+        return cls(name=name, module=module, method=method)
+
+
+@dataclass
+class EdgeDef:
+    """Parsed graph edge — routes ``output_key`` of ``from_`` into ``to``'s ``as_`` kwarg.
+
+    ``to`` may be the reserved keyword :data:`END` (``"end"``) to mark the edge
+    as a virtual sink.  ``from`` must always reference a real node name (or an
+    unambiguous module alias resolved at TrainingGraph build time).
+    """
+
+    name: str
+    from_: str
+    to: str
     output_key: Optional[str] = None
-    to: Optional[str] = None
     as_: Optional[str] = None
 
     @classmethod
-    def parse(cls, name: str, spec: Dict) -> "ConnectionDef":
-        if "module" in spec:
-            return cls(name=name, module=spec["module"])
-        elif "from" in spec:
-            return cls(
-                name=name,
-                from_=spec["from"],
-                output_key=spec.get("output"),
-                to=spec["to"],
-                as_=spec.get("as"),
-            )
-        else:
+    def parse(cls, name: str, spec: Dict) -> "EdgeDef":
+        if name == END:
+            raise ValueError(f"Edge name '{END}' is reserved and cannot appear in `edges`.")
+        if not isinstance(spec, dict):
+            raise ValueError(f"Edge '{name}': spec must be a dict. Got: {spec!r}")
+
+        if "module" in spec or "method" in spec:
             raise ValueError(
-                f"Connection '{name}' must have either 'module' or 'from'/'to' keys. Got: {spec}"
+                f"Edge '{name}' is a graph edge but contains node fields (`module`/`method`). "
+                "Move it into the `nodes` pool, or remove the node fields. "
+                f"Got: {spec!r}"
             )
 
-    @property
-    def target_module(self) -> Optional[str]:
-        """The module that will be *executed* by this connection."""
-        return self.module or self.to
+        if "from" not in spec or "to" not in spec:
+            raise ValueError(f"Edge '{name}' must declare both `from` and `to`. Got: {spec!r}")
 
-    @property
-    def source_module(self) -> Optional[str]:
-        """The module whose output is consumed by this connection (if any)."""
-        return self.from_
+        from_ = spec["from"]
+        to = spec["to"]
+        if from_ == END:
+            raise ValueError(f"Edge '{name}': `from: {END}` is forbidden. The virtual sink may only appear on `to`.")
 
+        return cls(
+            name=name,
+            from_=from_,
+            to=to,
+            output_key=spec.get("output"),
+            as_=spec.get("as"),
+        )
 
-class OmniGraph:
-    """Training DAG built from the active subset of named connections.
-
-    Parameters
-    ----------
-    connections:
-        Full pool of named connection definitions (``OmniConfig.connections``).
-    training_connections:
-        Ordered list of connection names that are active for this training run
-        (``OmniConfig.training_graph.connections``).
-
-    Topological sort
-    ----------------
-    Two modules are ordered when there exists a data-transfer connection
-    ``{from: A, to: B}`` between them — A must execute before B.
-    ``{module: X}`` connections contribute X to the module set but carry no
-    ordering constraint beyond what other connections impose.
-    """
-
-    def __init__(self, connections: Dict[str, Dict], training_connections: List[str]):
-        self._pool: Dict[str, ConnectionDef] = {
-            n: ConnectionDef.parse(n, spec) for n, spec in connections.items()
-        }
-        self._active: List[ConnectionDef] = [self._pool[n] for n in training_connections]
-        self._execution_order: List[str] = self._topological_sort()
-
-    # ── public API ────────────────────────────────────────────────────────────
-
-    @property
-    def execution_order(self) -> List[str]:
-        """Module names in dependency-safe execution order."""
-        return list(self._execution_order)
-
-    def collect_inputs(
-        self,
-        module_name: str,
-        module_outputs: Dict[str, Dict[str, Any]],
-        raw_batch: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Build the ``**kwargs`` dict for *module_name*'s forward call.
-
-        Priority (last wins):
-          1. raw_batch (globally transparent to every module).
-          2. Connection-routed values from earlier modules' outputs.
-
-        Parameters
-        ----------
-        module_name:
-            The module about to be executed.
-        module_outputs:
-            ``{module_name: output_dict}`` for all already-executed modules.
-        raw_batch:
-            The original training batch dict.
-        """
-        kwargs: Dict[str, Any] = dict(raw_batch)
-        for conn in self._active:
-            if conn.to == module_name and conn.from_ is not None:
-                src_out = module_outputs.get(conn.from_)
-                if src_out is None:
-                    continue
-                val = src_out.get(conn.output_key)
-                if val is not None and conn.as_ is not None:
-                    kwargs[conn.as_] = val
-        return kwargs
-
-    def active_connections(self) -> List[ConnectionDef]:
-        return list(self._active)
-
-    # ── internal ──────────────────────────────────────────────────────────────
-
-    def _topological_sort(self) -> List[str]:
-        """Kahn's algorithm over the module dependency graph."""
-        # Collect all modules mentioned in active connections
-        all_modules: set = set()
-        for conn in self._active:
-            if conn.module:
-                all_modules.add(conn.module)
-            if conn.from_:
-                all_modules.add(conn.from_)
-            if conn.to:
-                all_modules.add(conn.to)
-
-        # Build dependency map: module → set of modules it depends on
-        deps: Dict[str, set] = defaultdict(set)
-        for conn in self._active:
-            if conn.from_ and conn.to:
-                deps[conn.to].add(conn.from_)
-
-        in_degree: Dict[str, int] = {m: len(deps[m]) for m in all_modules}
-        queue: deque = deque(sorted(m for m in all_modules if in_degree[m] == 0))
-        order: List[str] = []
-
-        while queue:
-            m = queue.popleft()
-            order.append(m)
-            for other in sorted(all_modules):
-                if m in deps[other]:
-                    deps[other].discard(m)
-                    in_degree[other] -= 1
-                    if in_degree[other] == 0:
-                        queue.append(other)
-
-        if len(order) != len(all_modules):
-            cycle = all_modules - set(order)
-            raise ValueError(
-                f"Circular dependency detected in training_graph connections. "
-                f"Involved modules: {cycle}"
-            )
-
-        return order
+    def is_sink(self) -> bool:
+        """True iff this edge terminates at the virtual ``end`` sink."""
+        return self.to == END

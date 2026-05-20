@@ -13,7 +13,7 @@
 #      points to the split sub-module directories above.
 
 model:
-  # Path to the OmniModel YAML that defines modules / connections / graphs.
+  # Path to the OmniModel YAML that defines modules / nodes / edges / graphs.
   omni_config_path: configs/seed_omni/janus_1.3b.yaml
 
   # Tokenizer is the LLaMA tokenizer bundled with Janus.

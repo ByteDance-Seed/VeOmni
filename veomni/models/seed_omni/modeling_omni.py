@@ -1,170 +1,202 @@
 """
-OmniModel V2 — composable multi-modal training + inference model.
+OmniModel V2 — composable multi-modal model driven by config-specified graphs.
+
+This file holds the *minimal* runtime — graph traversal for training, FSM
+walk for inference, and a single ``_loss`` aggregation step.  It deliberately
+contains **no** build / weight-loading / FSDP wiring; that lives in
+``OmniTrainer`` (yet to be migrated) which calls
+:func:`veomni.distributed.torch_parallelize.build_foundation_model` and
+:func:`...build_parallelize_model` per module and hands the resulting dict
+to :class:`OmniModel`.
 
 Architecture
 ------------
+``OmniModel`` carries:
 
-  OmniModel
-  ├── modules: nn.ModuleDict[str, OmniModule]   (one entry per named module)
-  ├── graph:   OmniGraph                         (training DAG, topo-sorted)
-  └── fsm:     GenerationStateMachine            (inference FSM, optional)
+* ``modules_dict``      — :class:`nn.ModuleDict` of named OmniModule instances.
+* ``training_graph``    — :class:`TrainingGraph` (DAG over node/edge pools).
+* ``generation_graph``  — :class:`GenerationGraph` (FSM, optional).
 
-Training (forward)
-------------------
-  1. OmniGraph.execution_order gives the topological ordering.
-  2. For each module, collect_inputs() merges raw-batch + connection-routed
-     tensors from earlier modules.
-  3. The global batch is split into micro-batches of size
-     ``module_config["micro_batch_size"]`` (default: full batch).
-  4. For each micro-batch:
-       a. module.pre_forward(**inputs)   — packing + SP slice
-       b. module(**processed_inputs)     — computation
-       c. module.post_forward(outputs)   — SP gather
-  5. Micro-batch outputs are aggregated (tensors concatenated along dim 0,
-     ``*_loss`` keys averaged).
-  6. Any key ending in ``_loss`` in the aggregated output is summed into
-     total loss.
-  7. Return {"loss": total_loss, **all_module_outputs_flat}.
+Loss protocol (single ``_loss`` key per module)
+-----------------------------------------------
+Each module's ``forward`` returns at most one ``_loss`` scalar — a *token-
+level* mean already reduced across every micro-batch the module consumed
+internally.  ``OmniModel.forward`` simply sums those scalars across nodes::
 
-Inference (generate)
---------------------
-  1. GenerationStateMachine.reset(request) initialises the FSM.
-  2. Loop: fsm.step(modules, context) → execute current state's body.
-  3. fsm.maybe_transition(context) → check & apply state transitions.
-  4. Stop when fsm.is_done() or a caller-supplied stop condition fires.
+    losses[node] = out["_loss"]   # if present
+    total = sum(losses.values())  # zero-dim tensor
 
-Per-module parallelism
-----------------------
-Each module's config dict (in OmniConfig.modules) may include:
+No aliasing, no per-batch averaging at the OmniModel level — that responsibility
+sits with each module's ``post_forward`` (so token counts stay correct when
+micro-batch sizes differ across modules).
 
-  ``micro_batch_size``: int, how many samples per forward call (default: full batch)
-  ``weights_path``: optional per-module weight path (loaded by ``build_parallelize_model``).
+Training
+--------
+For each node in ``training_graph.execution_order``:
 
-OmniModel itself is NOT wrapped as a monolith.  Use
-:meth:`OmniModel.build_from_args`, which calls :meth:`OmniModule.build` per
-sub-module and delegates to :func:`veomni.distributed.torch_parallelize.build_parallelize_model`
-for DDP / FSDP1 / FSDP2 wrapping (driven by the global ``parallel_state.dp_mode``).
+  1. Look up the OmniModule via ``training_graph.module_of(node)``.
+  2. ``training_graph.collect_inputs(node, outputs, batch)`` assembles
+     kwargs (raw_batch + edge-routed values from earlier nodes).
+  3. Dispatch on ``training_graph.method_of(node)``:
+       * ``forward`` → call the (possibly FSDP-wrapped) module so backward
+         hooks fire correctly.
+       * any other  → call ``getattr(module, method)`` directly (FSDP2 with
+         DTensor params handles partial-param-use transparently).
+  4. Store the output dict under the node name.  If it carries ``_loss``,
+     accumulate.
+
+Returns ``{"loss": scalar_or_None, "losses": {node: scalar}, "outputs": {node: dict}}``.
+
+Inference
+---------
+``generate(request, context, max_new_tokens)`` resets the FSM, then loops:
+
+  * ``ctx = fsm.step(modules_dict, ctx)`` — one iteration of the current state.
+  * ``fsm.maybe_transition(ctx)`` — first matching condition wins.
+  * Stop when ``fsm.is_done()`` or ``max_new_tokens`` exhausts.
+
+Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
+print-driven flow tests collect the visit log from there to assert the
+expected node order and transition timing.
 """
 
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from .configuration_seed_omni import OmniConfig
-from .generation import GenerationStateMachine
-from .graph import OmniGraph
-from .module import OmniBuildArgs, OmniModule
+from .generation_graph import GenerationGraph
+from .module import OmniModule
+from .training_graph import TrainingGraph
 
 
-_DEFAULT_MICRO_BS = 2**31  # effectively "full batch" when not configured
+_LOSS_KEY: str = "_loss"
 
 
 class OmniModel(nn.Module):
-    """Composable multi-modal model driven by config-specified graphs.
+    """Pure runtime over already-built sub-modules.
 
     Parameters
     ----------
     config:
-        :class:`OmniConfig` instance.
-    module_factory:
-        Callable ``(module_name: str, module_cfg: dict) -> OmniModule``.
-        Receives the raw module config dict (including ``model_type``).
-        Used to instantiate each sub-module.  If ``None``, sub-modules are
-        *not* built (useful when loading a pre-saved OmniModel checkpoint
-        that already contains ``self.modules``).
+        :class:`OmniConfig` with ``modules`` / ``nodes`` / ``edges`` /
+        ``training_graph`` / ``generation_graph`` populated.
+    modules:
+        ``{module_name: OmniModule-mixin instance}`` — already constructed
+        (and parallelised, if running under FSDP).  ``OmniTrainer`` is
+        responsible for building these via ``build_foundation_model`` /
+        ``build_parallelize_model``.  The print-flow tests pass plain
+        :class:`OmniModule` subclasses here.
+
+    Notes
+    -----
+    The runtime never instantiates modules itself — that contract belongs
+    to the trainer.  Keeping the runtime free of build logic means it stays
+    importable in cpu-only / torch-free contexts (the tests rely on this).
     """
 
     config_class = OmniConfig
 
-    def __init__(
-        self,
-        config: OmniConfig,
-        module_factory: Optional[Any] = None,
-    ):
+    def __init__(self, config: OmniConfig, modules: Mapping[str, nn.Module]):
         super().__init__()
         self.config = config
 
-        # ── Build sub-modules ────────────────────────────────────────
-        if module_factory is not None:
-            built = {}
-            for name in config.module_names:
-                mod_cfg = config.module_config(name)
-                built[name] = module_factory(name, mod_cfg)
-            self.modules_dict = nn.ModuleDict(built)
-        else:
-            self.modules_dict = nn.ModuleDict()
+        missing = [n for n in config.module_names if n not in modules]
+        if missing:
+            raise KeyError(
+                f"OmniModel: modules dict missing entries declared in config: {missing}. "
+                f"Provided: {sorted(modules)}; expected: {config.module_names}."
+            )
+        self.modules_dict = nn.ModuleDict(dict(modules))
 
-        # ── Build training graph ─────────────────────────────────────
-        self.graph = OmniGraph(
-            connections=config.connections,
-            training_connections=config.training_connections,
+        self.training_graph = TrainingGraph(
+            nodes=config.nodes,
+            edges=config.edges,
+            training_edges=config.training_edges,
         )
 
-        # ── Build inference FSM (optional) ───────────────────────────
-        if config.has_generation_states():
-            self.fsm = GenerationStateMachine(
-                fsm_config=config.generation_states,
-                connections=config.connections,
+        self.generation_graph = (
+            GenerationGraph(
+                fsm_config=config.generation_graph,
+                nodes=config.nodes,
+                edges=config.edges,
             )
-        else:
-            self.fsm = None
+            if config.has_generation_graph()
+            else None
+        )
 
     # ── Training ──────────────────────────────────────────────────────────────
 
-    def forward(self, **batch) -> Dict[str, Any]:
-        """Execute the training DAG with per-module micro-batch loops.
+    def forward(
+        self,
+        *,
+        trace: Optional[List[str]] = None,
+        **batch: Any,
+    ) -> Dict[str, Any]:
+        """Execute the training DAG once over the full ``batch``.
 
-        For each module in topological order:
-          1. ``collect_inputs`` assembles the full-batch inputs.
-          2. The batch is chunked into micro-batches of ``micro_batch_size``.
-          3. Each chunk runs ``pre_forward → forward → post_forward``.
-          4. Chunk outputs are aggregated (concat tensors, mean losses).
-          5. The aggregated output is stored for downstream connection routing.
+        Each module is invoked exactly once and is responsible for any
+        internal micro-batch chunking (token-mean reduction included).
+
+        Parameters
+        ----------
+        trace:
+            Optional list to which one ``"forward:<node>"`` token is
+            appended per executed node — used by the print-flow tests.
+        **batch:
+            Raw batch fields, transparently visible to every node.
 
         Returns
         -------
-        dict with at least ``"loss"`` (scalar) and ``"loss_dict"``
-        (per-module breakdown), plus ``"{module_name}_out"`` for each module.
+        dict with keys:
+        * ``"loss"``    : scalar tensor (sum of all node ``_loss`` values),
+                          or ``None`` if no node emitted a loss.
+        * ``"losses"``  : ``{node_name: scalar tensor}``.
+        * ``"outputs"`` : ``{node_name: full output dict}`` (includes
+                          tensors routed by edges plus any extras).
         """
-        module_outputs: Dict[str, Dict[str, Any]] = {}
-        total_loss: Optional[torch.Tensor] = None
-        loss_dict: Dict[str, torch.Tensor] = {}
+        node_outputs: Dict[str, Dict[str, Any]] = {}
+        losses: Dict[str, torch.Tensor] = {}
 
-        for module_name in self.graph.execution_order:
+        for node_name in self.training_graph.execution_order:
+            module_name = self.training_graph.module_of(node_name)
+            method = self.training_graph.method_of(node_name)
             module = self.modules_dict[module_name]
-            # Unwrap DDP to access OmniModule hooks; forward() still goes through
-            # the wrapper so DDP's gradient all-reduce fires correctly.
-            omni_mod = _unwrap_module(module)
-            full_inputs = self.graph.collect_inputs(module_name, module_outputs, batch)
+            raw_module = _unwrap_module(module)
 
-            micro_bs = self._get_micro_batch_size(module_name)
-            batch_size = _infer_batch_size(full_inputs)
+            kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
+            kwargs = raw_module.pre_forward(**kwargs) if isinstance(raw_module, OmniModule) else kwargs
 
-            chunk_outputs: List[Dict[str, Any]] = []
-            for start in range(0, batch_size, micro_bs):
-                end = min(start + micro_bs, batch_size)
-                chunk_inputs = _slice_batch(full_inputs, start, end)
+            if method == "forward":
+                # Through the FSDP wrapper so backward hooks fire.
+                out = module(**kwargs)
+            else:
+                fn = getattr(raw_module, method, None)
+                if fn is None:
+                    raise AttributeError(
+                        f"Node '{node_name}' requires {module_name}.{method}() "
+                        f"but {type(raw_module).__name__} has no such method."
+                    )
+                out = fn(**kwargs)
 
-                chunk_inputs = omni_mod.pre_forward(**chunk_inputs)
-                out = module(**chunk_inputs)  # DDP wrapper → triggers all-reduce
-                out = omni_mod.post_forward(out)
-                chunk_outputs.append(out)
+            if isinstance(raw_module, OmniModule):
+                out = raw_module.post_forward(out)
 
-            agg_out = _aggregate_outputs(chunk_outputs)
-            module_outputs[module_name] = agg_out
+            if not isinstance(out, dict):
+                raise TypeError(
+                    f"Node '{node_name}' ({module_name}.{method}) returned {type(out).__name__}; expected dict."
+                )
+            node_outputs[node_name] = out
 
-            # Collect losses (already averaged across micro-batches)
-            for key, val in agg_out.items():
-                if key.endswith("_loss") and isinstance(val, torch.Tensor):
-                    loss_key = f"{module_name}/{key}"
-                    loss_dict[loss_key] = val
-                    total_loss = val if total_loss is None else total_loss + val
+            if _LOSS_KEY in out and out[_LOSS_KEY] is not None:
+                losses[node_name] = out[_LOSS_KEY]
 
-        result: Dict[str, Any] = {"loss": total_loss, "loss_dict": loss_dict}
-        for name, out in module_outputs.items():
-            result[f"{name}_out"] = out
-        return result
+            if trace is not None:
+                trace.append(f"forward:{node_name}")
+
+        total = _sum_losses(losses)
+        return {"loss": total, "losses": losses, "outputs": node_outputs}
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -174,228 +206,106 @@ class OmniModel(nn.Module):
         context: Optional[Dict[str, Any]] = None,
         max_new_tokens: int = 512,
         stop_token_ids: Optional[List[int]] = None,
+        *,
+        trace: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Run inference using the FSM.
 
         Parameters
         ----------
         request:
-            Generation request dict (e.g. ``{"input_ids": ..., "max_new_tokens": 512}``).
-            Passed to the FSM for ``token_length.from_request`` resolution.
+            Generation request dict (used for ``token_length.from_request``).
         context:
-            Initial generation context.  If ``None``, starts from ``request``.
+            Initial generation context (input_ids, attention_mask, ...).  If
+            ``None``, starts from a copy of ``request``.
         max_new_tokens:
-            Hard upper bound on total generation steps across all states.
+            Hard upper bound on total FSM iterations across all states.
         stop_token_ids:
-            Token IDs that unconditionally stop generation.
-
-        Returns
-        -------
-        Final context dict containing all generated outputs.
+            Token ids that unconditionally stop generation regardless of FSM
+            state (e.g. ``</s>``).
+        trace:
+            Optional list — receives FSM step / transition log for testing.
         """
-        if self.fsm is None:
+        if self.generation_graph is None:
             raise RuntimeError(
-                "OmniModel has no GenerationStateMachine. Set generation_states in OmniConfig to enable inference."
+                "OmniModel has no GenerationGraph. Set generation_graph in OmniConfig to enable inference."
             )
 
-        self.fsm.reset(request=request)
-        ctx: Dict[str, Any] = dict(context or request)
+        self.generation_graph.reset(request=request)
+        ctx: Dict[str, Any] = dict(context if context is not None else request)
 
-        modules = dict(self.modules_dict)
+        modules = {name: _unwrap_module(mod) for name, mod in self.modules_dict.items()}
+
         total_steps = 0
-
-        while not self.fsm.is_done() and total_steps < max_new_tokens:
-            ctx = self.fsm.step(modules, ctx)
+        while not self.generation_graph.is_done() and total_steps < max_new_tokens:
+            ctx = self.generation_graph.step(modules, ctx, trace=trace)
             total_steps += 1
 
-            # Hard stop on special tokens
             if stop_token_ids:
                 last_id = ctx.get("last_token_id")
                 if last_id is not None and last_id in stop_token_ids:
+                    if trace is not None:
+                        trace.append(f"stop:{last_id}")
                     break
 
-            self.fsm.maybe_transition(ctx)
+            self.generation_graph.maybe_transition(ctx, trace=trace)
 
         return ctx
-
-    # ── Factory: build from trainer args ──────────────────────────────────────
-
-    @classmethod
-    def build_from_args(cls, config: OmniConfig, build_args: OmniBuildArgs) -> "OmniModel":
-        """Build OmniModel with all sub-modules constructed and parallelized.
-
-        This is the primary entry point for trainer-side construction.  For each
-        module named in ``config``:
-
-        1. Look up the ``OmniModule`` subclass from the global
-           :data:`~veomni.models.seed_omni.modules.MODULE_REGISTRY` using
-           ``config.modules[name]["model_type"]``.
-        2. Call :meth:`OmniModule.build` which handles weight loading and
-           parallelisation via :func:`build_parallelize_model`.
-
-        The resulting ``OmniModel`` has fully parallelized modules in
-        ``modules_dict`` — no separate parallelisation step is needed.
-
-        Parameters
-        ----------
-        config:
-            Parsed :class:`OmniConfig` (e.g. from ``janus_1.3b.yaml``).
-        build_args:
-            Parallelisation settings from :class:`OmniBuildArgs`.
-
-        Returns
-        -------
-        A fully built and parallelized :class:`OmniModel`.
-        """
-        from veomni.utils import logging as ve_logging
-
-        from .modules import MODULE_REGISTRY
-
-        logger = ve_logging.get_logger(__name__)
-
-        model = cls.__new__(cls)
-        super(OmniModel, model).__init__()
-        model.config = config
-
-        built = {}
-        for name in config.module_names:
-            mod_cfg = config.module_config(name)
-            model_type = mod_cfg.get("model_type", "")
-            module_cls = MODULE_REGISTRY.get(model_type)
-            if module_cls is None:
-                raise ValueError(
-                    f"Unknown model_type {model_type!r} for module '{name}'. Available: {list(MODULE_REGISTRY)}"
-                )
-            logger.info_rank0(f"Building module [{name}] (model_type={model_type})")
-            built[name] = module_cls.build(mod_cfg, build_args)
-
-        model.modules_dict = nn.ModuleDict(built)
-        model.graph = OmniGraph(
-            connections=config.connections,
-            training_connections=config.training_connections,
-        )
-        model.fsm = (
-            GenerationStateMachine(
-                fsm_config=config.generation_states,
-                connections=config.connections,
-            )
-            if config.has_generation_states()
-            else None
-        )
-        return model
-
-    def collect_assets(self) -> List[Any]:
-        """Collect model assets from all sub-modules.
-
-        Iterates over ``modules_dict``, unwrapping DDP/FSDP wrappers, and
-        calls :meth:`OmniModule.get_assets` on each raw ``OmniModule``.
-        Returns the concatenated list of all assets (tokenizers, processors).
-        """
-        assets = []
-        for mod in self.modules_dict.values():
-            raw = _unwrap_module(mod)
-            if isinstance(raw, OmniModule):
-                assets.extend(raw.get_assets())
-        return assets
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def named_omni_modules(self) -> Iterator[Tuple[str, OmniModule]]:
-        """Yield (name, module) for every OmniModule in modules_dict."""
+        """Yield ``(name, raw_module)`` for every entry whose unwrapped form
+        is an :class:`OmniModule` mixin instance."""
         for name, mod in self.modules_dict.items():
-            if isinstance(mod, OmniModule):
-                yield name, mod
+            raw = _unwrap_module(mod)
+            if isinstance(raw, OmniModule):
+                yield name, raw  # type: ignore[misc]
 
-    def get_module(self, name: str) -> OmniModule:
+    def get_module(self, name: str) -> nn.Module:
         mod = self.modules_dict.get(name)
         if mod is None:
             raise KeyError(f"Module '{name}' not found in OmniModel")
         return mod
 
-    def _get_micro_batch_size(self, module_name: str) -> int:
-        """Read ``micro_batch_size`` from module config, default to full batch."""
-        cfg = self.config.modules.get(module_name, {})
-        return int(cfg.get("micro_batch_size", _DEFAULT_MICRO_BS))
+    def collect_assets(self) -> List[Any]:
+        """Collect per-module assets (vision/audio processors, codebooks).
 
-    # ── nn.Module overrides ───────────────────────────────────────────────────
+        The global tokenizer (``OmniConfig.tokenizer_path``) is *not*
+        returned here — it is loaded by ``OmniTrainer`` and saved at the
+        checkpoint root, separate from per-module subfolders.
+        """
+        assets: List[Any] = []
+        for _, raw in self.named_omni_modules():
+            assets.extend(raw.get_assets())
+        return assets
 
-    def parameters(self, recurse: bool = True):
-        return self.modules_dict.parameters(recurse=recurse)
 
-    def named_parameters(self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True):
-        return self.modules_dict.named_parameters(prefix=prefix, recurse=recurse, remove_duplicate=remove_duplicate)
-
-
-# ── Module-level batch helpers ────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _unwrap_module(mod: nn.Module) -> nn.Module:
-    """Return the underlying OmniModule, unwrapping DDP if necessary.
+    """Strip DDP / FSDP wrappers so mixin hooks (pre/post_forward) reach the raw module.
 
-    ``pre_forward`` / ``post_forward`` must be called on the raw OmniModule,
-    not on the DDP wrapper.  The DDP wrapper is still used for the actual
-    ``forward()`` call so that gradient all-reduce fires correctly.
+    FSDP2 (DTensor params) does not wrap; DDP exposes ``.module``.  We treat
+    anything else as already-raw.
     """
-    from torch.nn.parallel import DistributedDataParallel as DDP
-
-    if isinstance(mod, DDP):
-        return mod.module
+    inner = getattr(mod, "module", None)
+    if inner is not None and isinstance(inner, nn.Module) and inner is not mod:
+        # DDP-style wrapper.
+        return inner
     return mod
 
 
-def _infer_batch_size(inputs: Dict[str, Any]) -> int:
-    """Return the batch dimension (dim 0) from the first tensor found in inputs."""
-    for v in inputs.values():
-        if isinstance(v, torch.Tensor) and v.ndim >= 1:
-            return v.size(0)
-    return 1
+def _sum_losses(losses: Mapping[str, torch.Tensor]) -> Optional[torch.Tensor]:
+    """Sum a per-node ``{name: scalar}`` dict into one scalar (or ``None``)."""
+    if not losses:
+        return None
+    it = iter(losses.values())
+    total = next(it)
+    for v in it:
+        total = total + v
+    return total
 
 
-def _slice_batch(inputs: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
-    """Slice all tensors in *inputs* along dim 0 to ``[start:end]``.
-
-    Each slice is cloned so it does not share storage with the original tensor.
-    This prevents version-counter conflicts when in-place operations inside a
-    module's forward (e.g. LayerNorm, dropout) would otherwise increment the
-    version of the original tensor and break backward through earlier chunks.
-
-    Non-tensor values (scalars, strings, None, lists) are passed through as-is.
-    """
-    sliced: Dict[str, Any] = {}
-    for k, v in inputs.items():
-        if isinstance(v, torch.Tensor) and v.ndim >= 1:
-            sliced[k] = v[start:end].clone()
-        else:
-            sliced[k] = v
-    return sliced
-
-
-def _aggregate_outputs(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate micro-batch output chunks.
-
-    * Tensors → concatenated along dim 0 (batch dimension).
-    * ``*_loss`` scalars → averaged (mean reduction across micro-batches).
-    * Other scalars / non-tensors → taken from the last chunk.
-    """
-    if not chunks:
-        return {}
-    if len(chunks) == 1:
-        return chunks[0]
-
-    keys = chunks[0].keys()
-    agg: Dict[str, Any] = {}
-    for k in keys:
-        vals = [c[k] for c in chunks if k in c]
-        if not vals:
-            continue
-        sample = vals[0]
-        if isinstance(sample, torch.Tensor):
-            if sample.ndim == 0 or k.endswith("_loss"):
-                # Scalar losses: mean
-                agg[k] = torch.stack(vals).mean()
-            else:
-                # Batched tensors: concat on dim 0
-                agg[k] = torch.cat(vals, dim=0)
-        else:
-            agg[k] = sample  # non-tensor: last/first chunk value
-    return agg
+__all__ = ["OmniModel"]

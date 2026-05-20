@@ -5,17 +5,50 @@ Corresponds to JanusModel.vqmodel, JanusModel.generation_embeddings,
 JanusModel.generation_aligner and JanusModel.generation_head in the original
 JanusForConditionalGeneration checkpoint.
 
+Call-site methods (graph entry points)
+--------------------------------------
+This module exposes three call-site methods that map 1-to-1 to YAML
+``nodes:`` entries of the form ``module: vq_decoder.<method>``:
+
+  ``encode``       — VQVAE encode (training + inference setup):
+                     ``gen_image_patches`` → ``gen_embeds`` + ``vq_token_ids`` (+ ``vq_loss``).
+  ``decode``       — Unified VQ head; one node covers both training loss and
+                     inference sampling+feedback.  Three paths dispatched by
+                     inputs:
+                       * Training (``hidden_states`` + ``gt_token_ids``):
+                         ``gen_loss`` (via ``generation_head`` + CE).
+                       * Inference sample (``hidden_states`` only, no
+                         ``gt_token_ids``): project last position via
+                         ``generation_head``, sample → ``vq_token_id``,
+                         then codebook lookup → ``embed`` (next-step
+                         ``inputs_embeds``).  This is the path the FSM
+                         ``image_vq`` state takes — sampling lives here
+                         (not in ar_llm) because the VQ vocab is local to
+                         this module.
+                       * Inference lookup (``token_id`` only): pure codebook
+                         lookup → ``embed``.  Useful when the caller
+                         pre-sampled the VQ id from another source.
+                     Paths are mutually exclusive at runtime — present-input
+                     → run, absent-input → skip.
+  ``decode_pixels``— image rendering (post-FSM): ``vq_token_ids`` → pixels.
+
+``forward`` aliases ``encode`` (the most common training default).
+
 VQ generation loop (inside the FSM ``image_vq`` state)
 ------------------------------------------------------
-The AR-LLM generates one VQ token ID per step.  For each step:
+The AR backbone produces hidden states; sampling and embedding lookup both
+happen inside this module (the AR LLM has no lm_head).  For each step:
 
-  1. ``ar_llm`` generates the next VQ token ID: ``vq_token_id`` (int).
-  2. Connection ``ar_to_vq``: ``{from: ar_llm, output: vq_token_id, to: vq_decoder, as: token_id}``
-  3. ``vq_decoder.generate_step(token_id=vq_token_id)`` →
-       • looks up the codebook embedding for ``token_id``
-       • projects it to LLM hidden size via ``generation_aligner``
-       • returns ``embed`` (shape: ``(1, 1, llm_hidden)``)
-  4. Connection ``vq_dec_to_ar``: ``{from: vq_decoder, output: embed, to: ar_llm, as: inputs_embeds}``
+  1. Node ``run_ar`` (``ar_llm.generate_step``) → ``hidden_states``.
+  2. Edge ``ar_to_vq_decode``: routes ``hidden_states`` → ``hidden_states``.
+  3. Node ``vq_decode`` (``vq_decoder.decode(hidden_states=...)``)
+       • projects the last position via ``generation_head`` and samples
+         → ``vq_token_id``
+       • looks up the codebook embedding for the sampled id and projects
+         to LLM hidden size via ``generation_aligner``
+       • returns ``embed`` (shape: ``(B, 1, llm_hidden)``) plus
+         ``vq_token_id``.
+  4. Edge ``vq_decode_to_ar``: routes ``embed`` → ``inputs_embeds``.
   5. ``ar_llm`` uses ``inputs_embeds`` as its next-step input.
 
 After 576 VQ steps the FSM transitions back to ``text_ar``.
@@ -37,13 +70,19 @@ are trained).
 
 Connection outputs
 ------------------
-Training forward:
-  ``gen_embeds``      Projected generation embeddings (teacher forcing inputs).
+``encode``:
+  ``gen_embeds``      Projected generation embeddings (teacher-forcing inputs).
   ``vq_token_ids``    Ground-truth VQ token IDs (shift targets for LLM loss).
-  ``vq_loss``         VQVAE embedding / commitment loss.
+  ``vq_loss``         VQVAE embedding / commitment loss (when ``vqmodel`` unfrozen).
 
-generate_step (single VQ lookup):
-  ``embed``           Shape ``(B, 1, llm_hidden)`` — next-step input for the LLM.
+``decode``:
+  ``gen_loss``        Image-generation CE (training; when ``hidden_states`` +
+                      ``gt_token_ids`` are routed in).
+  ``vq_token_id``     Sampled VQ id, shape ``(B,)`` (inference sample path,
+                      when ``hidden_states`` alone is routed in).
+  ``embed``           Shape ``(B, 1, llm_hidden)`` — next-step input for the
+                      LLM (inference: emitted by both the sample and the
+                      pre-sampled ``token_id`` paths).
 """
 
 from typing import Any, Dict, Optional
@@ -121,14 +160,24 @@ class JanusVQDecoder(OmniModule):
             kwargs["_gpatch_batch_n_images"] = (b, n)
         return dict(gen_image_patches=gen_image_patches, **kwargs)
 
-    def forward(
+    # ── Call-site methods ─────────────────────────────────────────────────────
+    # Each YAML node of the form ``module: vq_decoder.<method>`` invokes the
+    # matching method below.  ``forward`` is the OmniModule abstract entry and
+    # aliases to :meth:`encode` (the most common default).
+
+    def forward(self, **kwargs) -> Dict[str, Any]:
+        """Default forward — alias for :meth:`encode`."""
+        return self.encode(**kwargs)
+
+    def encode(
         self,
         gen_image_patches: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Training forward.
+        """VQVAE encode pass: pixels → ground-truth tokens + teacher-forcing embeds.
 
-        If ``gen_image_patches`` (float, shape ``(B, 3, H, W)``) is present,
+        Used by the ``vq_encode`` call-site during training.  If
+        ``gen_image_patches`` (float, shape ``(B, 3, H, W)``) is present,
         encode them with the VQVAE to get token IDs + generation embeddings.
         Otherwise returns an empty dict (text-only batch).
         """
@@ -162,34 +211,72 @@ class JanusVQDecoder(OmniModule):
             out["vq_loss"] = vq_loss
         return out
 
-    def generate_step(
+    def decode(
         self,
+        hidden_states: Optional[torch.Tensor] = None,
+        gt_token_ids: Optional[torch.Tensor] = None,
         token_id: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Single VQ token → LLM embedding lookup.
+        """Unified VQ head — covers training loss + inference sample + lookup.
 
-        Called by the FSM for each step of the ``image_vq`` state body.
+        Three input-driven dispatch paths:
 
-        Parameters
-        ----------
-        token_id:
-            Long tensor of shape ``(B,)`` or ``(B, 1)`` — the VQ token ID
-            produced by ``ar_llm.generate_step`` in the same FSM step.
+          * **Training** (``hidden_states`` + ``gt_token_ids``):
+              ``logits = generation_head(hidden_states)``, then CE w.r.t.
+              ``gt_token_ids``.  Returns ``{"gen_loss": scalar}``.
+              Caller must pre-slice both tensors to gen-image positions
+              and apply the next-token shift; this method does not
+              inspect the LLM input sequence to discover gen positions.
 
-        Returns
-        -------
-        ``{"embed": (B, 1, llm_hidden)}`` for injection into AR-LLM.
+          * **Inference sample** (``hidden_states`` alone, no
+            ``gt_token_ids``): project the last position via
+            ``generation_head``, sample with multinomial, then codebook
+            lookup + ``generation_aligner`` for the next embed.
+            Returns ``{"vq_token_id", "embed"}`` — the FSM
+            ``image_vq`` body uses this path, sampling lives here because
+            the VQ vocab is local to this module.
+
+          * **Inference lookup** (``token_id``, when the caller already
+            sampled): codebook lookup via ``generation_embeddings``, then
+            project to LLM hidden size via ``generation_aligner``.
+            Returns ``{"embed"}`` — useful for non-AR sampling strategies
+            (e.g. classifier-free guidance) that produce ``token_id``
+            outside the FSM body.
+
+        The branches are mutually exclusive at runtime: present-input → run,
+        absent-input → skip — so a single YAML node serves both training and
+        inference.
         """
-        if token_id is None:
-            return {}
+        out: Dict[str, Any] = {}
 
-        if token_id.ndim == 1:
-            token_id = token_id.unsqueeze(1)  # (B, 1)
+        if hidden_states is not None and gt_token_ids is not None:
+            logits = self.generation_head(hidden_states)
+            out["gen_loss"] = nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                gt_token_ids.reshape(-1).long(),
+                ignore_index=-100,
+            )
+            return out
 
-        embed_raw = self.generation_embeddings(token_id)  # (B, 1, embed_dim)
-        embed = self.generation_aligner(embed_raw)  # (B, 1, llm_hidden)
-        return {"embed": embed}
+        if hidden_states is not None:
+            # Inference sample path: hidden_states → next vq_token_id → embed
+            last_logits = self.generation_head(hidden_states[:, -1:, :])  # (B, 1, V)
+            probs = torch.softmax(last_logits.squeeze(1), dim=-1)
+            sampled = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            embed_raw = self.generation_embeddings(sampled)  # (B, 1, embed_dim)
+            out["vq_token_id"] = sampled.squeeze(-1)  # (B,) for FSM transition checks
+            out["embed"] = self.generation_aligner(embed_raw)  # (B, 1, llm_hidden)
+            return out
+
+        if token_id is not None:
+            if token_id.ndim == 1:
+                token_id = token_id.unsqueeze(1)  # (B, 1)
+            embed_raw = self.generation_embeddings(token_id)  # (B, 1, embed_dim)
+            out["embed"] = self.generation_aligner(embed_raw)  # (B, 1, llm_hidden)
+            return out
+
+        return out
 
     def decode_pixels(self, vq_token_ids: torch.Tensor) -> torch.Tensor:
         """Decode a sequence of VQ token IDs to pixel values.

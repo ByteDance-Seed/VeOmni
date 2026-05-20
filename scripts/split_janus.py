@@ -1,5 +1,5 @@
 """
-Split a Janus-1.3B checkpoint into three OmniModule sub-module checkpoints.
+Split a Janus-1.3B checkpoint into four OmniModule sub-module checkpoints.
 
 Usage
 -----
@@ -16,9 +16,12 @@ Output structure
     vq_decoder/
       config.json          (JanusVQDecoderConfig)
       model.safetensors    (vqmodel + gen_embeddings + gen_aligner + gen_head)
+    text_embed/
+      config.json          (TextEmbedConfig — vocab/hidden/tie_word_embeddings)
+      model.safetensors    (embed_tokens + (optional) lm_head)
     ar_llm/
-      config.json          (JanusLLMConfig)
-      model.safetensors    (language_model + lm_head weights)
+      config.json          (JanusLLMConfig — backbone-only, no wte / no lm_head)
+      model.safetensors    (language_model.* excluding embed_tokens)
     tokenizer/             (copy of original tokenizer files)
 
 After splitting, set the following paths in janus_1.3b.yaml:
@@ -27,8 +30,19 @@ After splitting, set the following paths in janus_1.3b.yaml:
       weights_path: <output_dir>/vision_encoder
     vq_decoder:
       weights_path: <output_dir>/vq_decoder
+    text_embed:
+      weights_path: <output_dir>/text_embed
     ar_llm:
       weights_path: <output_dir>/ar_llm
+
+Why a separate ``text_embed``?
+-------------------------------
+``embed_tokens`` and ``lm_head`` are vocabulary-dependent and conceptually
+belong with the tokenizer side of the model — not the LLM backbone.
+Pulling them out as a generic :class:`TextEmbed` OmniModule lets the same
+graph treat text-vocab encode/decode and image-VQ encode/decode
+symmetrically (both have ``encode`` / ``decode`` call-site methods).  See
+``veomni/models/seed_omni/modules/text/modeling_text_embed.py``.
 """
 
 import argparse
@@ -48,7 +62,7 @@ def _save_state_dict(state_dict: dict, output_dir: str) -> None:
         save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
     except ImportError:
         torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
-        print(f"  [warn] safetensors not available; saved as pytorch_model.bin")
+        print("  [warn] safetensors not available; saved as pytorch_model.bin")
 
 
 def _save_config(cfg_dict: dict, output_dir: str) -> None:
@@ -62,9 +76,7 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     from transformers import JanusForConditionalGeneration
 
     torch_dtype = getattr(torch, dtype)
-    model = JanusForConditionalGeneration.from_pretrained(
-        model_path, torch_dtype=torch_dtype, device_map="cpu"
-    )
+    model = JanusForConditionalGeneration.from_pretrained(model_path, torch_dtype=torch_dtype, device_map="cpu")
     model.eval()
     cfg = model.config
     inner = model.model
@@ -110,15 +122,47 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     _save_config(vq_config, vq_dir)
     print(f"  saved {len(vq_state)} tensors → {vq_dir}")
 
-    # ── 3. ar_llm (language_model + lm_head) ────────────────────────────────
+    # ── 3. text_embed (language_model.embed_tokens + lm_head) ────────────────
+    # Generic, model-family-agnostic: any LLM with an embed-tokens layer + a
+    # vocab projection can reuse this module via the same TextEmbedConfig.
+    print("Extracting text_embed ...")
+    text_cfg = cfg.text_config
+    text_cfg_dict = text_cfg.to_dict() if hasattr(text_cfg, "to_dict") else vars(text_cfg)
+    tie = bool(text_cfg_dict.get("tie_word_embeddings", False))
+
+    te_state = {}
+    for k, v in inner.language_model.embed_tokens.state_dict().items():
+        te_state[f"embed_tokens.{k}"] = v
+    if not tie:
+        # When weights are NOT tied, the original `lm_head` is a separate
+        # nn.Linear (LLaMA / Janus default).  Persist it under the same
+        # name TextEmbed expects.  When tied (e.g. Qwen-1.5 small, GPT-2),
+        # ``decode`` reuses ``embed_tokens.weight`` directly — nothing else
+        # to save here.
+        for k, v in model.lm_head.state_dict().items():
+            te_state[f"lm_head.{k}"] = v
+
+    te_config = {
+        "model_type": "text_embed",
+        "vocab_size": text_cfg_dict.get("vocab_size"),
+        "hidden_size": text_cfg_dict.get("hidden_size"),
+        "tie_word_embeddings": tie,
+        # LLaMA / Janus convention: lm_head has no bias.
+        "lm_head_bias": False,
+    }
+    te_dir = os.path.join(output_dir, "text_embed")
+    _save_state_dict(te_state, te_dir)
+    _save_config(te_config, te_dir)
+    print(f"  saved {len(te_state)} tensors → {te_dir} (tie_word_embeddings={tie})")
+
+    # ── 4. ar_llm (language_model backbone, no embed_tokens / no lm_head) ────
     print("Extracting ar_llm ...")
     llm_state = {}
     for k, v in inner.language_model.state_dict().items():
+        if k.startswith("embed_tokens."):
+            continue  # owned by text_embed now
         llm_state[f"language_model.{k}"] = v
-    for k, v in model.lm_head.state_dict().items():
-        llm_state[f"lm_head.{k}"] = v
 
-    text_cfg_dict = cfg.text_config.to_dict() if hasattr(cfg.text_config, "to_dict") else vars(cfg.text_config)
     llm_config = {
         "model_type": "janus_llm",
         "text_config": text_cfg_dict,
@@ -128,9 +172,9 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     llm_dir = os.path.join(output_dir, "ar_llm")
     _save_state_dict(llm_state, llm_dir)
     _save_config(llm_config, llm_dir)
-    print(f"  saved {len(llm_state)} tensors → {llm_dir}")
+    print(f"  saved {len(llm_state)} tensors → {llm_dir} (excluded embed_tokens / lm_head)")
 
-    # ── 4. copy tokenizer ─────────────────────────────────────────────────────
+    # ── 5. copy tokenizer ─────────────────────────────────────────────────────
     print("Copying tokenizer ...")
     tok_dir = os.path.join(output_dir, "tokenizer")
     os.makedirs(tok_dir, exist_ok=True)
@@ -143,6 +187,7 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     print("Use the following in your janus_1.3b.yaml:")
     print(f"  vision_encoder weights_path: {ve_dir}")
     print(f"  vq_decoder    weights_path: {vq_dir}")
+    print(f"  text_embed    weights_path: {te_dir}")
     print(f"  ar_llm        weights_path: {llm_dir}")
 
 
