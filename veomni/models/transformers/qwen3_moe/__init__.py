@@ -18,6 +18,7 @@ from ...loader import MODELING_REGISTRY
 @MODELING_REGISTRY.register("qwen3_moe")
 def register_qwen3_moe_modeling(architecture: str):
     from .checkpoint_tensor_converter import create_qwen3_moe_checkpoint_tensor_converter
+
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_moe_npu import (
             Qwen3MoeForCausalLM,

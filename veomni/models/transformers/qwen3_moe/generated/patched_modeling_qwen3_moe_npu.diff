@@ -99,7 +99,7 @@
 +
 +# Additional imports for patches
 +from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
-+import torch_npu
++from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 +
 +# Additional import blocks for patches
 +# ── OpSlot declarations ──────────────────────────────────────────────────
@@ -370,7 +370,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -693,26 +737,56 @@
+@@ -693,26 +737,61 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -401,7 +401,12 @@
 +                # returns (loss, logits, log_probs, entropy); unpack to match the
 +                # OpSlot branch above.
 +                loss, logits, log_probs, entropy = self.loss_function(
-+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
 +                )
 +        else:
 +            logits = self.lm_head(hidden_states)
@@ -439,7 +444,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -720,7 +794,14 @@
+@@ -720,7 +799,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -455,7 +460,7 @@
 
 
  class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3MoePreTrainedModel):
-@@ -742,4 +823,4 @@
+@@ -742,4 +828,4 @@
      "Qwen3MoePreTrainedModel",
      "Qwen3MoeForSequenceClassification",
      "Qwen3MoeForTokenClassification",
