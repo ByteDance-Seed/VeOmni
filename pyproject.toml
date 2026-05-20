@@ -150,7 +150,7 @@ test = [
 # transformers version out of the wheel metadata so pip users are not forced
 # into a specific 5.x patch release.
 transformers-stable = [
-  "transformers==5.2.0"
+  "transformers==5.8.1"
 ]
 
 [tool.uv]

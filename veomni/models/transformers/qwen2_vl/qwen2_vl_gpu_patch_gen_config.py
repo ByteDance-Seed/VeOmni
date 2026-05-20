@@ -323,6 +323,9 @@ def qwen2vl_model_forward_patched(
     # Extract image and video masks from kwargs
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
 
     if inputs_embeds is None:
         inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -367,6 +370,17 @@ def qwen2vl_model_forward_patched(
         inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
     if position_ids is None:
+        # v5 `compute_3d_position_ids` raises unless `mm_token_type_ids` is
+        # supplied alongside multimodal grids; derive it from `input_ids`
+        # (text=0, image=1, video=2) when the caller did not pass it.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[input_ids == self.config.image_token_id] = 1
+            mm_token_type_ids[input_ids == self.config.video_token_id] = 2
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -374,6 +388,7 @@ def qwen2vl_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
     # Use VeOmni precomputed position ids
     else:
@@ -413,6 +428,14 @@ def qwen2vl_model_forward_patched(
 )
 def qwen2vl_get_position_id_func_patched(self):
     def get_position_id(main_func, self, **kwargs):
+        # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
+        # `input_ids` (text=0, image=1, video=2) when not passed explicitly.
+        if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
+            ids = kwargs["input_ids"]
+            mm_token_type_ids = torch.zeros_like(ids)
+            mm_token_type_ids[ids == self.config.image_token_id] = 1
+            mm_token_type_ids[ids == self.config.video_token_id] = 2
+            kwargs["mm_token_type_ids"] = mm_token_type_ids
         position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, 1, l), rope_deltas (1, 1)
         return {"position_ids": position_ids.squeeze(1), "rope_deltas": rope_deltas.squeeze(0)}
 

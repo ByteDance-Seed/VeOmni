@@ -246,53 +246,51 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     # `_ALG_ESSENTIAL_VL_GET_ROPE_INDEX` for why the in-place override was
     # reverted and the collator-side fix that's tracked as follow-up).
     "qwen3_vl-fa2": {
-        ("patched_modeling_qwen3_vl_gpu.py", 909): (
+        ("patched_modeling_qwen3_vl_gpu.py", 927): (
             "algorithm-essential: one D2H `grid_thw.tolist()` materialises shape metadata for "
             "the host-side rot_pos_emb loop; replaces ~5 per-image syncs inside the loop."
         ),
-        ("patched_modeling_qwen3_vl_gpu.py", 919): (
+        ("patched_modeling_qwen3_vl_gpu.py", 937): (
             "algorithm-essential: `rot_pos_ids(...).to(device)` is an H2D copy of a CPU "
             "tensor returned by the lru_cached helper; over-reported by torch sync-debug mode."
         ),
-        ("patched_modeling_qwen3_vl_gpu.py", 1027): (
+        ("patched_modeling_qwen3_vl_gpu.py", 1045): (
             "algorithm-essential: one D2H `grid_thw.tolist()` per ViT forward; reused for "
             "fast_pos_embed_interpolate + host-side cu_seqlens build (replaces ~5 syncs)."
         ),
-        ("patched_modeling_qwen3_vl_gpu.py", 1049): (
+        ("patched_modeling_qwen3_vl_gpu.py", 1067): (
             "algorithm-essential: `torch.tensor(cu_seqlens_list, device=cuda)` H2D copy; "
             "not a wait-on-device sync per debug-cuda-sync skill gotchas."
         ),
-        ("patched_modeling_qwen3_vl_gpu.py", 1384): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1405): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1407): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1411): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1415): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1453): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1455): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1418): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1419): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1420): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1498): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1521): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1528): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_vl_moe-fa2-fused: mirrors qwen3_vl (the moe config imports the
     # vision forward / rot_pos_emb / fast_pos_embed_interpolate helpers from
     # qwen3_vl and registers its own Model.forward + get_rope_index).
     "qwen3_vl_moe-fa2-fused": {
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 954): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 909 (rot_pos_emb tolist)."
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 967): (
+            "algorithm-essential: see qwen3_vl-fa2 entry for line 927 (rot_pos_emb tolist)."
         ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 964): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 919 (rot_pos_ids H2D copy)."
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 977): (
+            "algorithm-essential: see qwen3_vl-fa2 entry for line 937 (rot_pos_ids H2D copy)."
         ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1072): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 1027 (ViT forward tolist)."
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1085): (
+            "algorithm-essential: see qwen3_vl-fa2 entry for line 1045 (ViT forward tolist)."
         ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1094): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 1049 (cu_seqlens H2D copy)."
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1107): (
+            "algorithm-essential: see qwen3_vl-fa2 entry for line 1067 (cu_seqlens H2D copy)."
         ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1574): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1595): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1597): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1601): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1603): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1604): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         ("patched_modeling_qwen3_vl_moe_gpu.py", 1605): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1643): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1645): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1683): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1706): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1713): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_omni_moe-fa2-fused: all 6 remaining sites are algorithm-essential
     # `tolist` / `torch.tensor(host_list, device=cuda)` patterns from this

@@ -234,8 +234,26 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
 
 @config.add_helper
+def mm_token_type_ids_from_input_ids(input_ids, config):
+    # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
+    # RoPE (M-RoPE): text=0, image=1, video=2 per token. HF's processor emits
+    # it, but VeOmni's data pipeline carries modality only via the multimodal
+    # token ids inside `input_ids`, so derive the type ids from those here.
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[input_ids == config.image_token_id] = 1
+    mm_token_type_ids[input_ids == config.video_token_id] = 2
+    return mm_token_type_ids
+
+
+@config.add_helper
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
+    # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
+    # `input_ids` when the data pipeline did not pass it explicitly.
+    if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
+        kwargs["mm_token_type_ids"] = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+            kwargs["input_ids"], self.config
+        )
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
@@ -866,6 +884,9 @@ def qwen3_vl_model_forward_patched(
     # --- Patch.2 ---
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     if video_mask is None and image_mask is None:
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
@@ -1044,6 +1065,17 @@ def qwen3_vl_model_forward_patched(
                 "is enabled; multimodal position_ids must be precomputed via "
                 "`get_position_id_func` in the VeOmni data pipeline."
             )
+        # v5 `compute_3d_position_ids` raises unless `mm_token_type_ids` is
+        # supplied alongside multimodal grids; derive it from `input_ids`
+        # when the caller did not pass it.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                input_ids, self.config
+            )
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -1051,6 +1083,7 @@ def qwen3_vl_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask_tensor,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
         # --- Patch.5 ---
     else:
