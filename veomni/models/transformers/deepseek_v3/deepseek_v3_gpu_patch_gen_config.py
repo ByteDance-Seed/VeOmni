@@ -230,10 +230,13 @@ def deepseek_v3_forcausallm_forward_patched(
     logits = None
     log_probs = None
     entropy = None
+    distillation_losses = None
+    student_mass = None
+    teacher_mass = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -246,11 +249,11 @@ def deepseek_v3_forcausallm_forward_patched(
             # Modification: VeOmni's patched ``loss_function`` (via LOSS_MAPPING,
             # installed by ``install_loss_mapping`` in
             # ``veomni/ops/kernels/cross_entropy/__init__.py``) returns
-            # ``(loss, logits, log_probs, entropy)`` — *not* HF's stock single
+            # ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`` — *not* HF's stock single
             # ``Tensor``. Unpack 4 values to match the OpSlot branch above; we
             # discard the wrapper's flattened ``logits`` and keep the ones we
             # already computed at full shape.
-            loss, _, log_probs, entropy = self.loss_function(
+            loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -271,6 +274,9 @@ def deepseek_v3_forcausallm_forward_patched(
         logits=logits,
         log_probs=log_probs,
         entropy=entropy,
+        distillation_losses=distillation_losses,
+        student_mass=student_mass,
+        teacher_mass=teacher_mass,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

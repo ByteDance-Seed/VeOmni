@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model output dataclass for the per-token log-probs path.
+"""Model output dataclass for the per-token log-probs and top-k distillation paths.
 
 A patched ``*ForCausalLM.forward`` returns this dataclass when called
 with ``return_log_probs=True``: ``log_probs`` carries per-token actual
 log-probabilities (non-positive), ``entropy`` carries per-token softmax
-entropy (non-negative); ``logits`` and ``loss`` are ``None``. Imports
-are kept light (no ``veomni.data`` dependency) so external integrators
-(verl) can pull the dataclass without paying the data-pipeline import
-cost.
+entropy (non-negative); ``logits`` and ``loss`` are ``None``. When the
+caller additionally passes ``teacher_topk_ids`` and
+``teacher_topk_log_probs``, the wrapper short-circuits to the top-k
+forward-KL distillation kernel and the three trailing fields
+(``distillation_losses``, ``student_mass``, ``teacher_mass``) carry
+verl's per-token distillation tensors. Imports are kept light (no
+``veomni.data`` dependency) so external integrators (verl) can pull the
+dataclass without paying the data-pipeline import cost.
 """
 
 from dataclasses import dataclass
@@ -38,11 +42,11 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeCau
 
 @dataclass
 class CausalLMOutputWithLogProbs(CausalLMOutputWithPast):
-    """``CausalLMOutputWithPast`` extended with per-token ``log_probs`` and ``entropy`` fields.
+    """``CausalLMOutputWithPast`` extended with per-token log-probs / distillation fields.
 
-    Both tensors share the input ``labels`` shape (``[B, L]`` or packed
-    ``[L]``) and are zero at IGNORE_INDEX positions and the trailing
-    pad slot.
+    All five tensors share the input ``labels`` shape (``[B, L]`` or
+    packed ``[L]``) and are zero at IGNORE_INDEX positions and the
+    trailing pad slot.
 
     - ``log_probs``: non-positive — actual log-probabilities ``log p(y_t)``,
       matches HF / verl conventions.
@@ -50,19 +54,29 @@ class CausalLMOutputWithLogProbs(CausalLMOutputWithPast):
       ``H[p] = -Σ_v p_v log p_v``, matches verl's
       ``CausalLMOutputForPPO.entropy`` so the dataclass drops directly
       into verl's ``prepare_model_outputs`` consumer.
+    - ``distillation_losses``: non-negative — top-k forward KL
+      ``Σ_k exp(log p_t,k) (log p_t,k - log q_s,k)``, matching verl's
+      ``compute_forward_kl_topk`` output key. Carries gradient back to
+      the lm_head + hidden_states.
+    - ``student_mass`` / ``teacher_mass``: non-negative metric tensors,
+      ``Σ_k exp(log q_s,k)`` / ``Σ_k exp(log p_t,k)``. Detached — verl
+      uses them for clamp monitoring and reporting, not for backprop.
     """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None
 
 
 @dataclass
 class MoeCausalLMOutputWithLogProbs(MoeCausalLMOutputWithPast):
-    """``MoeCausalLMOutputWithPast`` extended with per-token ``log_probs`` and ``entropy`` fields.
+    """``MoeCausalLMOutputWithPast`` extended with per-token log-probs / distillation fields.
 
-    Both tensors share the input ``labels`` shape (``[B, L]`` or packed
-    ``[L]``) and are zero at IGNORE_INDEX positions and the trailing
-    pad slot.
+    All five tensors share the input ``labels`` shape (``[B, L]`` or
+    packed ``[L]``) and are zero at IGNORE_INDEX positions and the
+    trailing pad slot.
 
     Args:
         log_probs (`torch.FloatTensor`, *optional*):
@@ -72,10 +86,23 @@ class MoeCausalLMOutputWithLogProbs(MoeCausalLMOutputWithPast):
             Non-negative softmax entropy ``H[p] = -Σ_v p_v log p_v``, matching
             verl's ``CausalLMOutputForPPO.entropy`` so the dataclass drops
             directly into verl's ``prepare_model_outputs`` consumer.
+        distillation_losses (`torch.FloatTensor`, *optional*):
+            Per-token top-k forward KL, matches verl's
+            ``compute_forward_kl_topk`` output. Backprops through the
+            lm_head + hidden_states.
+        student_mass (`torch.FloatTensor`, *optional*):
+            Detached metric: student's probability mass on the teacher's
+            top-k support.
+        teacher_mass (`torch.FloatTensor`, *optional*):
+            Detached metric: teacher's probability mass on its own top-k
+            support (clamp-aware when ``log_prob_min_clamp`` is set).
     """
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,6 +128,9 @@ class Qwen2VLCausalLMOutputWithLogProbs(Qwen2VLCausalLMOutputWithPast):
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -116,6 +146,9 @@ class Qwen2_5_VLCausalLMOutputWithLogProbs(Qwen2_5_VLCausalLMOutputWithPast):
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -131,6 +164,9 @@ class Qwen3VLCausalLMOutputWithLogProbs(Qwen3VLCausalLMOutputWithPast):
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -146,6 +182,9 @@ class Qwen3VLMoeCausalLMOutputWithLogProbs(Qwen3VLMoeCausalLMOutputWithPast):
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -161,6 +200,9 @@ class Qwen2_5OmniThinkerCausalLMOutputWithLogProbs(Qwen2_5OmniThinkerCausalLMOut
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -176,3 +218,6 @@ class Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(Qwen3OmniMoeThinkerCausalLMO
 
     log_probs: Optional[torch.Tensor] = None
     entropy: Optional[torch.Tensor] = None
+    distillation_losses: Optional[torch.Tensor] = None
+    student_mass: Optional[torch.Tensor] = None
+    teacher_mass: Optional[torch.Tensor] = None

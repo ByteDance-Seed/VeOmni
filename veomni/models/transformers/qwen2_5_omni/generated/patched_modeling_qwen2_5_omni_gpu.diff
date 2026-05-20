@@ -1081,7 +1081,7 @@
 +    #    order.
 +    # 5. [Loss] Delegate loss to OpSlot-guarded `veomni_causal_lm_loss` first,
 +    #    then fall back to `self.loss_function` (VeOmni's patched LOSS_MAPPING
-+    #    returns `(loss, logits, log_probs, entropy)`).
++    #    returns `(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`).
 +    # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
 +    #    for videos without audio) before forwarding the audio tower.
 +    # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -1342,7 +1342,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2045,34 +2296,59 @@
+@@ -2045,34 +2296,67 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1362,6 +1362,9 @@
 +        logits = None
 +        log_probs = None
 +        entropy = None
++        distillation_losses = None
++        student_mass = None
++        teacher_mass = None
          if labels is not None:
 -            loss = self.loss_function(
 -                logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
@@ -1375,21 +1378,23 @@
 +            # Modification: OpSlot guard for cross-entropy loss (chunked fused CE
 +            # when bound, falls back to ``self.loss_function`` otherwise).
 +            if veomni_causal_lm_loss.use_non_eager_impl:  # noqa: F821 — declared via add_post_import_block
-+                loss, logits, log_probs, entropy = veomni_causal_lm_loss(  # noqa: F821
-+                    logits=logits,
-+                    labels=labels,
-+                    vocab_size=self.config.get_text_config().vocab_size,
-+                    hidden_states=hidden_states,
-+                    weights=self.lm_head.weight,
-+                    ignore_index=IGNORE_INDEX,
-+                    **kwargs,
++                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
++                    veomni_causal_lm_loss(  # noqa: F821
++                        logits=logits,
++                        labels=labels,
++                        vocab_size=self.config.get_text_config().vocab_size,
++                        hidden_states=hidden_states,
++                        weights=self.lm_head.weight,
++                        ignore_index=IGNORE_INDEX,
++                        **kwargs,
++                    )
 +                )
 +            else:
 +                logits = self.lm_head(hidden_states)
 +                # Modification: VeOmni's patched ``loss_function`` (via
-+                # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy)``;
++                # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)``;
 +                # unpack to match the OpSlot branch above.
-+                loss, logits, log_probs, entropy = self.loss_function(
++                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.get_text_config().vocab_size,
@@ -1413,12 +1418,15 @@
 -        )
 +            log_probs=log_probs,
 +            entropy=entropy,
++            distillation_losses=distillation_losses,
++            student_mass=student_mass,
++            teacher_mass=teacher_mass,
 +        )
 +        # --- Patch.7 ---
 
      def prepare_inputs_for_generation(
          self,
-@@ -2123,925 +2399,32 @@
+@@ -2123,925 +2407,32 @@
 
          return model_inputs
 
@@ -2370,7 +2378,7 @@
 
 
  # Modified from Llama with a different rotate function, will fixed in next release
-@@ -3078,708 +2461,10 @@
+@@ -3078,708 +2469,10 @@
      return q_embed, k_embed
 
 
@@ -3083,7 +3091,7 @@
 
 
  ############################
-@@ -3806,22 +2491,74 @@
+@@ -3806,22 +2499,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3168,7 +3176,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3883,244 +2620,49 @@
+@@ -3883,244 +2628,49 @@
 
          return model
 
