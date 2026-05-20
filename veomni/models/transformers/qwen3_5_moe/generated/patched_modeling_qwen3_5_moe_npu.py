@@ -985,27 +985,19 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # ``set_active_replay``, the manager may substitute ``selected_experts``
         # with previously recorded target indices. The manager's sole
         # responsibility is choosing indices; all model-specific post-topk
-        # weight math (gather, renorm, dtype cast) is replicated here so the
-        # cross-framework controller stays model-agnostic.
-        #
-        # ASYMMETRY with qwen3_moe: Qwen3.5-MoE's ``TopKRouter.forward``
-        # reassigns its local ``router_logits`` variable to
-        # ``softmax(router_logits)`` before returning (the same latent
-        # double-softmax quirk that upstream fixed in Qwen3-MoE via #715). So
-        # the value bound here is ALREADY the post-softmax probability matrix
-        # required by the RR contract; we pass it through directly as
-        # ``routing_scores``. Recomputing ``softmax`` here would produce
-        # ``softmax(softmax(logits))`` and silently corrupt replay weights.
-        # If Qwen3.5-MoE is ever fixed the same way as qwen3_moe, switch this
-        # to the qwen3_moe form (recompute softmax from raw logits).
-        #
-        # Qwen3.5-MoE's native router always renormalizes top-k probs (see the
-        # ``router_top_value /= router_top_value.sum(...)`` in its TopKRouter),
-        # so we always renorm the gathered weights, no conditional.
+        # weight math (softmax recompute, gather, renorm, dtype cast) is
+        # replicated here so the cross-framework controller stays
+        # model-agnostic. transformers v5.8 fixed Qwen3.5-MoE's ``TopKRouter``
+        # the same way as Qwen3-MoE (#715): it now returns pre-softmax
+        # ``router_logits`` and discards its internal post-softmax matrix after
+        # top-k, so we recompute ``softmax`` here to feed the RR contract.
+        # Qwen3.5-MoE's native router always renormalizes the top-k probs, so
+        # the gathered weights are renormalized unconditionally.
         if get_active_replay() is not None:
             target_dtype = routing_weights.dtype
-            selected_experts = maybe_replay_indices(self.gate, router_logits, selected_experts)
-            routing_weights = router_logits.gather(1, selected_experts)
+            routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+            selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
+            routing_weights = routing_scores.gather(1, selected_experts)
             routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
             routing_weights = routing_weights.to(target_dtype)
         expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
@@ -2337,6 +2329,17 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         # --- Patch.1 ---
 
         if position_ids is None:
+            # v5 `compute_3d_position_ids` raises unless `mm_token_type_ids` is
+            # supplied alongside multimodal grids; derive it from `input_ids`
+            # when the caller did not pass it.
+            if (
+                mm_token_type_ids is None
+                and input_ids is not None
+                and (image_grid_thw is not None or video_grid_thw is not None)
+            ):
+                mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                    input_ids, self.config
+                )
             position_ids = self.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
@@ -2344,6 +2347,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
             )
         else:
             # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---

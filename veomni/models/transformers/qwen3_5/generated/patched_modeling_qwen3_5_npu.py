@@ -1982,6 +1982,9 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         # via all_gather to compute them locally.
         image_mask = kwargs.get("image_mask", None)
         video_mask = kwargs.get("video_mask", None)
+        # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+        # language model. Derived from input_ids below when not supplied.
+        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
 
         # if None, calculate mask
         if video_mask is None and image_mask is None:
@@ -2100,6 +2103,17 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         # --- Patch.1 ---
 
         if position_ids is None:
+            # v5 `compute_3d_position_ids` raises unless `mm_token_type_ids` is
+            # supplied alongside multimodal grids; derive it from `input_ids`
+            # when the caller did not pass it.
+            if (
+                mm_token_type_ids is None
+                and input_ids is not None
+                and (image_grid_thw is not None or video_grid_thw is not None)
+            ):
+                mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                    input_ids, self.config
+                )
             position_ids = self.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
@@ -2107,6 +2121,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
             )
         else:
             # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---

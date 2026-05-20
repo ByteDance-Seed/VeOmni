@@ -635,7 +635,7 @@
  class Qwen3_5MoeSparseMoeBlock(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -789,18 +975,55 @@
+@@ -789,18 +975,47 @@
          self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
          self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -650,27 +650,19 @@
 +        # ``set_active_replay``, the manager may substitute ``selected_experts``
 +        # with previously recorded target indices. The manager's sole
 +        # responsibility is choosing indices; all model-specific post-topk
-+        # weight math (gather, renorm, dtype cast) is replicated here so the
-+        # cross-framework controller stays model-agnostic.
-+        #
-+        # ASYMMETRY with qwen3_moe: Qwen3.5-MoE's ``TopKRouter.forward``
-+        # reassigns its local ``router_logits`` variable to
-+        # ``softmax(router_logits)`` before returning (the same latent
-+        # double-softmax quirk that upstream fixed in Qwen3-MoE via #715). So
-+        # the value bound here is ALREADY the post-softmax probability matrix
-+        # required by the RR contract; we pass it through directly as
-+        # ``routing_scores``. Recomputing ``softmax`` here would produce
-+        # ``softmax(softmax(logits))`` and silently corrupt replay weights.
-+        # If Qwen3.5-MoE is ever fixed the same way as qwen3_moe, switch this
-+        # to the qwen3_moe form (recompute softmax from raw logits).
-+        #
-+        # Qwen3.5-MoE's native router always renormalizes top-k probs (see the
-+        # ``router_top_value /= router_top_value.sum(...)`` in its TopKRouter),
-+        # so we always renorm the gathered weights, no conditional.
++        # weight math (softmax recompute, gather, renorm, dtype cast) is
++        # replicated here so the cross-framework controller stays
++        # model-agnostic. transformers v5.8 fixed Qwen3.5-MoE's ``TopKRouter``
++        # the same way as Qwen3-MoE (#715): it now returns pre-softmax
++        # ``router_logits`` and discards its internal post-softmax matrix after
++        # top-k, so we recompute ``softmax`` here to feed the RR contract.
++        # Qwen3.5-MoE's native router always renormalizes the top-k probs, so
++        # the gathered weights are renormalized unconditionally.
 +        if get_active_replay() is not None:
 +            target_dtype = routing_weights.dtype
-+            selected_experts = maybe_replay_indices(self.gate, router_logits, selected_experts)
-+            routing_weights = router_logits.gather(1, selected_experts)
++            routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
++            selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
++            routing_weights = routing_scores.gather(1, selected_experts)
 +            routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
 +            routing_weights = routing_weights.to(target_dtype)
          expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
@@ -692,7 +684,7 @@
 
 
  class Qwen3_5MoeRMSNorm(nn.Module):
-@@ -813,14 +1036,16 @@
+@@ -813,14 +1028,16 @@
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
      def forward(self, x):
@@ -714,7 +706,7 @@
 
 
  class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
-@@ -836,6 +1061,7 @@
+@@ -836,6 +1053,7 @@
          self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -722,7 +714,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -843,18 +1069,29 @@
+@@ -843,18 +1061,29 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -752,7 +744,7 @@
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -863,6 +1100,7 @@
+@@ -863,6 +1092,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -760,7 +752,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -877,7 +1115,6 @@
+@@ -877,7 +1107,6 @@
          if isinstance(hidden_states, tuple):
              hidden_states, _ = hidden_states
          hidden_states = residual + hidden_states
@@ -768,7 +760,7 @@
          return hidden_states
 
 
-@@ -965,17 +1202,20 @@
+@@ -965,17 +1194,20 @@
          return x
 
 
@@ -797,7 +789,7 @@
      return q_embed, k_embed
 
 
-@@ -1096,6 +1336,12 @@
+@@ -1096,6 +1328,12 @@
          return hidden_states
 
 
@@ -810,7 +802,7 @@
  class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
      config: Qwen3_5MoeVisionConfig
      input_modalities = ("image", "video")
-@@ -1131,9 +1377,15 @@
+@@ -1131,9 +1369,15 @@
 
          self.post_init()
 
@@ -828,7 +820,7 @@
 
          max_hw = max(max(h, w) for _, h, w in grid_thw_list)
          freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
-@@ -1172,67 +1424,79 @@
+@@ -1172,67 +1416,79 @@
          return embeddings
 
      def fast_pos_embed_interpolate(self, grid_thw):
@@ -968,7 +960,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1249,26 +1513,127 @@
+@@ -1249,26 +1505,127 @@
          """
          hidden_states = self.patch_embed(hidden_states)
 
@@ -1108,7 +1100,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -1284,6 +1649,34 @@
+@@ -1284,6 +1641,34 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1143,7 +1135,7 @@
 
 
  @auto_docstring(
-@@ -1340,6 +1733,39 @@
+@@ -1340,6 +1725,39 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1183,7 +1175,7 @@
 
 
  class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-@@ -1425,19 +1851,42 @@
+@@ -1425,19 +1843,42 @@
              past_key_values=past_key_values,
          )
 
@@ -1237,7 +1229,7 @@
 
 
  @auto_docstring
-@@ -1448,7 +1897,19 @@
+@@ -1448,7 +1889,19 @@
      config: Qwen3_5MoeConfig
      _no_split_modules = ["Qwen3_5MoeDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
@@ -1257,7 +1249,7 @@
          super().__init__(config)
          self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
          self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
-@@ -1633,68 +2094,38 @@
+@@ -1633,68 +2086,38 @@
 
      @can_return_tuple
      @auto_docstring
@@ -1348,7 +1340,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1760,6 +2191,7 @@
+@@ -1760,6 +2183,7 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1356,7 +1348,7 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
          r"""
-@@ -1767,34 +2199,142 @@
+@@ -1767,36 +2191,155 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1506,12 +1498,23 @@
 +        # --- Patch.1 ---
 
          if position_ids is None:
++            # v5 `compute_3d_position_ids` raises unless `mm_token_type_ids` is
++            # supplied alongside multimodal grids; derive it from `input_ids`
++            # when the caller did not pass it.
++            if (
++                mm_token_type_ids is None
++                and input_ids is not None
++                and (image_grid_thw is not None or video_grid_thw is not None)
++            ):
++                mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
++                    input_ids, self.config
++                )
              position_ids = self.compute_3d_position_ids(
-@@ -1804,8 +2344,18 @@
-                 inputs_embeds=inputs_embeds,
-                 attention_mask=attention_mask,
+                 input_ids=input_ids,
+                 image_grid_thw=image_grid_thw,
+@@ -1806,6 +2349,17 @@
                  past_key_values=past_key_values,
--                mm_token_type_ids=mm_token_type_ids,
+                 mm_token_type_ids=mm_token_type_ids,
              )
 +        else:
 +            # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
@@ -1527,7 +1530,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1813,6 +2363,7 @@
+@@ -1813,6 +2367,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1535,7 +1538,7 @@
              **kwargs,
          )
 
-@@ -1904,6 +2455,12 @@
+@@ -1904,6 +2459,12 @@
      return overall_loss * num_experts
 
 
@@ -1548,7 +1551,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1924,6 +2481,7 @@
+@@ -1924,6 +2485,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1556,7 +1559,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1936,9 +2494,10 @@
+@@ -1936,9 +2498,10 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -1568,7 +1571,7 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1975,30 +2534,67 @@
+@@ -1975,30 +2538,67 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -1648,7 +1651,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2006,7 +2602,15 @@
+@@ -2006,7 +2606,15 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1665,7 +1668,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2061,6 +2665,7 @@
+@@ -2061,6 +2669,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1673,7 +1676,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2074,107 +2679,91 @@
+@@ -2074,107 +2683,91 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1834,7 +1837,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2400,6 +2989,19 @@
+@@ -2400,6 +2993,19 @@
 
          return input_ids, model_kwargs
 
