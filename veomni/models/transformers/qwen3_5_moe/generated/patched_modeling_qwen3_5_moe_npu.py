@@ -56,9 +56,10 @@
 #
 # ==============================================================================
 
-# Additional imports for patches
-import copy
 from collections.abc import Callable
+
+# Additional imports for patches
+from copy import copy
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace

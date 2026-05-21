@@ -60,7 +60,7 @@ config = PatchConfig(
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
 
-config.add_import("copy", is_from_import=False)
+config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
