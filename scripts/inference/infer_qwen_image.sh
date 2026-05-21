@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Example inference invocation for Qwen-Image (T2I) using scripts/inference/infer_dit.py.
+# Example inference invocation for Qwen-Image (T2I) using scripts/inference/infer_omni.py.
 #
 # Usage:
 #   bash scripts/inference/infer_qwen_image.sh
@@ -31,7 +31,7 @@ if [[ -n "${TRANSFORMER_PATH}" ]]; then
     EXTRA_ARGS+=(--transformer_path "${TRANSFORMER_PATH}")
 fi
 
-python "${REPO_ROOT}/scripts/inference/infer_dit.py" \
+python "${REPO_ROOT}/scripts/inference/infer_omni.py" \
     --model_path "${MODEL_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
     --prompts "${PROMPTS[@]}" \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Example inference invocation for Wan2.1-T2V (text-to-video) using
-# scripts/inference/infer_dit.py.
+# scripts/inference/infer_omni.py.
 #
 # Wan inference currently requires a newer transformers than the project
 # pin (``transformers==5.2.0`` from the ``transformers-stable`` group in
@@ -24,7 +24,7 @@
 #       bash scripts/inference/infer_wan.sh
 #
 # For Wan2.1 I2V, see the commented block at the bottom of this file: switch
-# the model path and add --input_image; the same infer_dit.py CLI handles it.
+# the model path and add --input_image; the same infer_omni.py CLI handles it.
 
 set -euo pipefail
 
@@ -68,7 +68,7 @@ else
     LAUNCHER=(python)
 fi
 
-"${LAUNCHER[@]}" "${REPO_ROOT}/scripts/inference/infer_dit.py" \
+"${LAUNCHER[@]}" "${REPO_ROOT}/scripts/inference/infer_omni.py" \
     --model_path "${MODEL_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
     --prompts "${PROMPTS[@]}" \
@@ -87,7 +87,7 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 # I2V (image-to-video) variant — uncomment to use, requires --input_image:
 #
-# "${LAUNCHER[@]}" "${REPO_ROOT}/scripts/inference/infer_dit.py" \
+# "${LAUNCHER[@]}" "${REPO_ROOT}/scripts/inference/infer_omni.py" \
 #     --model_path /mnt/hdfs/veomni/models/Wan-AI/Wan2.1-I2V-14B-480P \
 #     --output_dir "${OUTPUT_DIR%/}/_i2v" \
 #     --prompts "the cat slowly stretches and yawns" \

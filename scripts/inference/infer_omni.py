@@ -29,7 +29,7 @@ Examples
 
 Baseline T2I (pretrained Qwen-Image):
 
-    python scripts/inference/infer_dit.py \\
+    python scripts/inference/infer_omni.py \\
         --model_path /mnt/hdfs/veomni/models/Qwen/Qwen-Image \\
         --output_dir ./inference_outputs/baseline \\
         --prompts "a corgi wearing a tiny astronaut helmet, studio lighting" \\
@@ -38,7 +38,7 @@ Baseline T2I (pretrained Qwen-Image):
 
 T2I with a VeOmni-fine-tuned transformer swapped in:
 
-    python scripts/inference/infer_dit.py \\
+    python scripts/inference/infer_omni.py \\
         --model_path /mnt/hdfs/veomni/models/Qwen/Qwen-Image \\
         --transformer_path ./qwen-image-sft/checkpoints/global_step_200/hf_ckpt \\
         --output_dir ./inference_outputs/ft_step200 \\
@@ -47,7 +47,7 @@ T2I with a VeOmni-fine-tuned transformer swapped in:
 
 T2V (Wan2.1 T2V) with a VeOmni-trained LoRA adapter:
 
-    python scripts/inference/infer_dit.py \\
+    python scripts/inference/infer_omni.py \\
         --model_path ./Wan2.1-T2V-1.3B-Diffusers \\
         --lora_path ./exp/Wan_lora/checkpoints/global_step_200 \\
         --lora_weight 1.0 \\
@@ -58,7 +58,7 @@ T2V (Wan2.1 T2V) with a VeOmni-trained LoRA adapter:
 
 I2V (Wan2.1 I2V) with the same fine-tuned LoRA and a conditioning frame:
 
-    python scripts/inference/infer_dit.py \\
+    python scripts/inference/infer_omni.py \\
         --model_path ./Wan2.1-I2V-14B-480P \\
         --lora_path ./exp/Wan_i2v_lora/checkpoints/global_step_500 \\
         --input_image ./first_frame.png \\
