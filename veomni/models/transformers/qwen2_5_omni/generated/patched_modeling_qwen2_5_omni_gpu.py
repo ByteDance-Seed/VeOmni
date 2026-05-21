@@ -101,7 +101,7 @@ from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 # are inference-only speech paths excluded from the generated file).
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -2370,11 +2370,13 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
+            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+                log_probs=log_probs,
+                entropy=entropy,
+                distillation_losses=distillation_losses,
+                student_mass=student_mass,
+                teacher_mass=teacher_mass,
+            ),
         )
         # --- Patch.7 ---
 

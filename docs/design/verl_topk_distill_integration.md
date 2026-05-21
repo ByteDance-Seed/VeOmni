@@ -17,25 +17,35 @@ teacher_topk_log_probs: torch.Tensor    # [B, L, K] fp32
 log_prob_min_clamp: float | None = None # optional, matches DistillationLossConfig
 ```
 
-When both teacher tensors are present and `return_log_probs=True`, the
-output dataclass carries three new optional fields:
+When `return_log_probs=True`, the output dataclass exposes a single
+`fused_linear_aux: Optional[FusedLinearAuxOutput]` field carrying the
+per-token tensors:
 
-| Field | Shape | dtype | Sign / range | Grad |
-|-------|-------|-------|--------------|------|
+| `output.fused_linear_aux.*` | Shape | dtype | Sign / range | Grad |
+|-----------------------------|-------|-------|--------------|------|
+| `log_probs` | `[B, L]` | fp32 | `<= 0` | flows |
+| `entropy` | `[B, L]` | fp32 | `>= 0` | flows |
 | `distillation_losses` | `[B, L]` | fp32 | `>= 0` | flows |
 | `student_mass` | `[B, L]` | fp32 | `[0, 1]` | detached |
 | `teacher_mass` | `[B, L]` | fp32 | `[0, 1]` | detached |
 
-All three are `0` at `IGNORE_INDEX` positions and the trailing pad
-slot — same masking as `log_probs` / `entropy`. The KL formula is
-verbatim verl's: `Σ_k exp(log_p_t,k) · (log_p_t,k - log_q_s,k)` on the
-top-k support (with optional clamp on both terms).
+`fused_linear_aux is None` on the plain loss path (no
+`return_log_probs`). All five tensors are `0` at `IGNORE_INDEX`
+positions and the trailing pad slot. KL formula is verbatim verl's:
+`Σ_k exp(log_p_t,k) · (log_p_t,k - log_q_s,k)` on the top-k support
+(with optional clamp on both terms). The nested-payload shape (rather
+than flat `output.log_probs` / `output.entropy` / `output.distillation_losses`
+as top-level fields) means future per-token metrics extend
+`FusedLinearAuxOutput` only, not every `*WithLogProbs` subclass.
 
 ## verl-side changes (two patches, ~30 lines total)
 
-Both are pure additive — symmetric with how
-`output.log_probs` / `output.entropy` are already handled, no impact
-on the non-fused path or any non-distillation flow.
+Both are pure additive — symmetric with how the existing fused-kernel
+reads work, no impact on the non-fused path or any non-distillation
+flow. Note the read path moves one level down:
+`output.log_probs` → `output.fused_linear_aux.log_probs` etc. (the
+fused-linear payload nests under one field to avoid growing every
+`*WithLogProbs` subclass when new per-token tensors land later).
 
 ### 1. Thread teacher tensors into `model_inputs`
 
@@ -69,12 +79,20 @@ existing `if use_fused_kernels:` branch of
 `entropy_rmpad` reads:
 
 ```python
+# Replace existing top-level reads:
+#   log_probs = output.log_probs.squeeze(0)
+#   entropy_rmpad = output.entropy.squeeze(0)
+# with the nested fused_linear_aux reads:
+aux = output.fused_linear_aux
+log_probs = aux.log_probs.squeeze(0)
+entropy_rmpad = aux.entropy.squeeze(0)
+
 if distillation_use_topk:
     cu_seqlens = input_ids.offsets()
     for k, src in (
-        ("distillation_losses", output.distillation_losses),
-        ("student_mass", output.student_mass),
-        ("teacher_mass", output.teacher_mass),
+        ("distillation_losses", aux.distillation_losses),
+        ("student_mass", aux.student_mass),
+        ("teacher_mass", aux.teacher_mass),
     ):
         v = src.squeeze(0)
         assert v.shape == log_probs.shape
@@ -100,4 +118,5 @@ if distillation_use_topk:
 | Test | What it pins |
 |------|--------------|
 | `tests/ops/test_chunk_topk_distill.py` (10 tests) | Forward / backward numerics vs dense reference (encodes verl's KL formula), chunk-size invariance, IGN masking, clamp consistency between forward & backward, temperature path |
-| `tests/models/test_return_log_probs_e2e.py::test_return_log_probs_with_topk_distill_populates_three_fields` (qwen3-text, qwen3_vl-vlm) | The full `model.forward(..., teacher_topk_*=...)` → `outputs.distillation_losses` path on a real toy model. Asserts: fields populated with right shape/range, mass tensors detached, **bitwise-equal to the kernel called directly on `model.lm_head.weight`**, backward reaches `lm_head.weight.grad` |
+| `tests/models/test_return_log_probs_e2e.py::test_return_log_probs_with_topk_distill_populates_three_fields` (qwen3-text, qwen3_vl-vlm) | The full `model.forward(..., teacher_topk_*=...)` → `outputs.fused_linear_aux.distillation_losses` path on a real toy model. Asserts: fields populated with right shape/range, mass tensors detached, **bitwise-equal to the kernel called directly on `model.lm_head.weight`**, backward reaches `lm_head.weight.grad` |
+| `tests/ops/test_chunk_topk_distill.py::test_chunk_topk_distill_saves_memory_vs_eager` (CUDA) | Peak GPU memory of the fused kernel vs the eager `h @ w.T → log_softmax → gather` path on a large-V case (V=64k). Pins that we never materialize `[T, V]` student logits — the whole point of the kernel for verl. |

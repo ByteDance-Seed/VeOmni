@@ -36,7 +36,7 @@ from transformers.utils import TransformersKwargs
 
 from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
@@ -53,7 +53,10 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 # bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward unshard
 # hook on ``lm_head`` and triggering ``setStorage … storage of size 0`` in
 # ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
-config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+)
 config.drop_import_names("MoeCausalLMOutputWithPast")
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 
@@ -376,11 +379,13 @@ def qwen3_moe_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
-        log_probs=log_probs,
-        entropy=entropy,
-        distillation_losses=distillation_losses,
-        student_mass=student_mass,
-        teacher_mass=teacher_mass,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
     )
 
 

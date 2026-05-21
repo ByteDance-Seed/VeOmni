@@ -213,9 +213,10 @@ class TextDPOTrainer:
         chunked CE log-probs path by passing ``return_log_probs=True``
         to the model — the wrapper installed by
         ``build_foundation_model`` promotes per-token NLL into
-        ``output.log_probs`` (actual log-probabilities, non-positive)
-        without materializing the ``[B, L, V]`` logits tensor that
-        the previous gather-on-logits path OOMed on at long context.
+        ``output.fused_linear_aux.log_probs`` (actual log-probabilities,
+        non-positive) without materializing the ``[B, L, V]`` logits
+        tensor that the previous gather-on-logits path OOMed on at long
+        context.
         This is the same entry point external integrators (verl) and
         the future PPO trainer use. Even-indexed sequences are
         chosen; odd are rejected.
@@ -226,11 +227,11 @@ class TextDPOTrainer:
         model_inputs = {k: v for k, v in micro_batch.items() if k not in _NON_MODEL_KEYS}
         outputs = model(**model_inputs, return_log_probs=True, use_cache=False)
 
-        # ``outputs.log_probs`` is shape [1, packed_L] (actual
-        # log-probabilities; sign already flipped). PostCollator only
-        # knows about ``outputs.logits``, so we replicate its
+        # ``outputs.fused_linear_aux.log_probs`` is shape [1, packed_L]
+        # (actual log-probabilities; sign already flipped). PostCollator
+        # only knows about ``outputs.logits``, so we replicate its
         # SP-gather + per-seq split inline against the log_probs field.
-        log_probs_packed = outputs.log_probs.squeeze(0)  # [packed_L]
+        log_probs_packed = outputs.fused_linear_aux.log_probs.squeeze(0)  # [packed_L]
         seq_lens = self.post_forward.compute_seqlens_func(micro_batch)
         if self.sp_enabled:
             log_probs_packed = gather_outputs(log_probs_packed, gather_dim=0, group=get_parallel_state().sp_group)

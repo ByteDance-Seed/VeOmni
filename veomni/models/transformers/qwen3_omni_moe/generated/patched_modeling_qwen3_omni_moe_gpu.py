@@ -113,7 +113,7 @@ from veomni.ops import fused_moe_forward
 # are inference-only speech paths excluded from the generated file).
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
@@ -2763,11 +2763,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             past_key_values=outputs.past_key_values,
             router_logits=getattr(outputs, "router_logits", None),
             rope_deltas=self.rope_deltas,
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
+            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+                log_probs=log_probs,
+                entropy=entropy,
+                distillation_losses=distillation_losses,
+                student_mass=student_mass,
+                teacher_mass=teacher_mass,
+            ),
         )
 
     def prepare_inputs_for_generation(

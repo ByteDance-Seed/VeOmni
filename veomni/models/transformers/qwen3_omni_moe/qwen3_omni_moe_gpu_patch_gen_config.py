@@ -77,7 +77,7 @@ from veomni.utils.constants import (
     IMAGE_INPUT_INDEX,
     VIDEO_INPUT_INDEX,
 )
-from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -115,7 +115,10 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 # breaking FSDP2's pre-backward unshard hook on ``lm_head`` and triggering
 # ``setStorage … storage of size 0`` in ``chunk_logprobs.backward`` (parallels
 # VeOmni #731's qwen3_5_moe fix).
-config.add_import("veomni.utils.model_outputs", names=["Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs"],
+)
 config.drop_import_names("Qwen3OmniMoeThinkerCausalLMOutputWithPast")
 
 config.add_post_import_block(
@@ -1526,11 +1529,13 @@ def qwen3_omni_moe_thinker_forward_patched(
         past_key_values=outputs.past_key_values,
         router_logits=getattr(outputs, "router_logits", None),
         rope_deltas=self.rope_deltas,
-        log_probs=log_probs,
-        entropy=entropy,
-        distillation_losses=distillation_losses,
-        student_mass=student_mass,
-        teacher_mass=teacher_mass,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
     )
 
 

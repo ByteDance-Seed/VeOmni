@@ -160,7 +160,7 @@
 +# are inference-only speech paths excluded from the generated file).
 +from veomni.ops.dispatch import OpSlot
 +from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-+from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
++from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 +
 +
 +veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
@@ -1559,7 +1559,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2235,39 +2575,86 @@
+@@ -2235,39 +2575,88 @@
              use_cache=use_cache,
              output_router_logits=output_router_logits,
              cache_position=cache_position,
@@ -1654,15 +1654,17 @@
              past_key_values=outputs.past_key_values,
 +            router_logits=getattr(outputs, "router_logits", None),
              rope_deltas=self.rope_deltas,
-+            log_probs=log_probs,
-+            entropy=entropy,
-+            distillation_losses=distillation_losses,
-+            student_mass=student_mass,
-+            teacher_mass=teacher_mass,
++            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
++                log_probs=log_probs,
++                entropy=entropy,
++                distillation_losses=distillation_losses,
++                student_mass=student_mass,
++                teacher_mass=teacher_mass,
++            ),
          )
 
      def prepare_inputs_for_generation(
-@@ -2319,1548 +2706,112 @@
+@@ -2319,1548 +2708,112 @@
 
          return model_inputs
 
@@ -3307,7 +3309,7 @@
 
      def disable_talker(self):
          if hasattr(self, "talker"):
-@@ -4132,19 +3083,41 @@
+@@ -4132,19 +3085,41 @@
 
          return thinker_result.sequences, talker_wavs.float()
 

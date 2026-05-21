@@ -56,7 +56,7 @@ from transformers.utils import TransformersKwargs
 from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpSlot
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutput
 
 
 # ── OpSlot declarations ──────────────────────────────────────────────────────
@@ -79,7 +79,10 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` can return per-token log-probs in the unified output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)
 
 config.add_post_import_block(
     """
@@ -272,11 +275,13 @@ def deepseek_v3_forcausallm_forward_patched(
     return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
-        log_probs=log_probs,
-        entropy=entropy,
-        distillation_losses=distillation_losses,
-        student_mass=student_mass,
-        teacher_mass=teacher_mass,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

@@ -113,8 +113,10 @@ from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.model_outputs import (
-    Qwen3VLCausalLMOutputWithLogProbs,  # noqa: F401  surfaced for forward log_probs path
+from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log_probs path
+    FusedLinearAuxOutput,
+    FusedLinearAuxOutputMixin,
+    Qwen3VLCausalLMOutputWithLogProbs,
     Qwen3VLMoeCausalLMOutputWithLogProbs,
 )
 
@@ -2386,11 +2388,13 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
             router_logits=getattr(outputs, "router_logits", None),
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
+            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+                log_probs=log_probs,
+                entropy=entropy,
+                distillation_losses=distillation_losses,
+                student_mass=student_mass,
+                teacher_mass=teacher_mass,
+            ),
         )
 
     def prepare_inputs_for_generation(

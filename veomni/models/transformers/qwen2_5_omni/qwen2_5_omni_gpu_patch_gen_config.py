@@ -81,7 +81,7 @@ from veomni.utils.constants import (
     IMAGE_INPUT_INDEX,
     VIDEO_INPUT_INDEX,
 )
-from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -116,7 +116,10 @@ config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_A
 # constructor would bypass ``ModelOutput`` pytree flattening, breaking FSDP2's
 # pre-backward unshard hook on ``lm_head`` and triggering
 # ``setStorage … storage of size 0`` in ``chunk_logprobs.backward``.
-config.add_import("veomni.utils.model_outputs", names=["Qwen2_5OmniThinkerCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2_5OmniThinkerCausalLMOutputWithLogProbs"],
+)
 config.drop_import_names("Qwen2_5OmniThinkerCausalLMOutputWithPast")
 
 config.add_post_import_block(
@@ -1213,11 +1216,13 @@ def qwen2_5_omni_thinker_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=self.rope_deltas,
-        log_probs=log_probs,
-        entropy=entropy,
-        distillation_losses=distillation_losses,
-        student_mass=student_mass,
-        teacher_mass=teacher_mass,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
     )
     # --- Patch.7 ---
 

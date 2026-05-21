@@ -49,7 +49,10 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` (reused from the GPU config) can return per-token log-probs in
 # the unified output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)
 
 # Mirror the GPU config's OpSlot declarations: the patched experts.forward and
 # ForCausalLM.forward look these up as module-global names, so the generated

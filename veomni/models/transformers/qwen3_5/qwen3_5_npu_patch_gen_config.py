@@ -52,6 +52,10 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
+    FusedLinearAuxOutput,
+    FusedLinearAuxOutputMixin,
+)
 
 
 config = PatchConfig(
@@ -81,7 +85,10 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
 # from the GPU config) can return per-token log-probs in the unified output
 # dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)  # noqa: F401
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -544,7 +551,7 @@ config.override_method(
 # for why @auto_docstring is intentionally skipped here.
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
-class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
+class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
     """``Qwen3_5CausalLMOutputWithPast`` extended with per-token log-prob fields.
 
     log_probs (`torch.FloatTensor`, *optional*):
@@ -552,9 +559,3 @@ class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
     entropy (`torch.FloatTensor`, *optional*):
         Per-token softmax entropy returned by VeOmni's fused loss path.
     """
-
-    log_probs: torch.FloatTensor | None = None
-    entropy: torch.FloatTensor | None = None
-    distillation_losses: torch.FloatTensor | None = None
-    student_mass: torch.FloatTensor | None = None
-    teacher_mass: torch.FloatTensor | None = None

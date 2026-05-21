@@ -150,7 +150,7 @@
 +# are inference-only speech paths excluded from the generated file).
 +from veomni.ops.dispatch import OpSlot
 +from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-+from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
++from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 +
 +
 +veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -1342,7 +1342,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2045,34 +2296,67 @@
+@@ -2045,34 +2296,69 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1416,17 +1416,19 @@
              attentions=outputs.attentions,
              rope_deltas=self.rope_deltas,
 -        )
-+            log_probs=log_probs,
-+            entropy=entropy,
-+            distillation_losses=distillation_losses,
-+            student_mass=student_mass,
-+            teacher_mass=teacher_mass,
++            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
++                log_probs=log_probs,
++                entropy=entropy,
++                distillation_losses=distillation_losses,
++                student_mass=student_mass,
++                teacher_mass=teacher_mass,
++            ),
 +        )
 +        # --- Patch.7 ---
 
      def prepare_inputs_for_generation(
          self,
-@@ -2123,925 +2407,32 @@
+@@ -2123,925 +2409,32 @@
 
          return model_inputs
 
@@ -2378,7 +2380,7 @@
 
 
  # Modified from Llama with a different rotate function, will fixed in next release
-@@ -3078,708 +2469,10 @@
+@@ -3078,708 +2471,10 @@
      return q_embed, k_embed
 
 
@@ -3091,7 +3093,7 @@
 
 
  ############################
-@@ -3806,22 +2499,74 @@
+@@ -3806,22 +2501,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3176,7 +3178,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3883,244 +2628,49 @@
+@@ -3883,244 +2630,49 @@
 
          return model
 
