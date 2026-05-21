@@ -161,6 +161,20 @@ CASES = [
         attn_implementation="flash_attention_2",
         dtype="bfloat16",
     ),
+    # qwen3_5_vl (non-MoE VLM) — exercises the qwen3_5-family ViT
+    # (``Qwen3_5VisionModel.forward`` + ``fast_pos_embed_interpolate`` +
+    # ``rot_pos_emb``) and the VLM path of ``Qwen3_5Model.forward``. The
+    # qwen3_5-text-* cases above are text-only sub-configs and never reach
+    # the vision tower, so this case is what gates the qwen3_5 ViT precompute
+    # consumer. qwen3_5_moe's ViT forward is the *same* imported function, so
+    # one non-MoE case covers the shared ViT.
+    #
+    # SDPA (not FA2) here: FA2+bf16 produces NaN on the qwen3_5 toy config
+    # (an upstream FA-on-tiny-shape issue — see test_models_logits_equal_v5).
+    # The ViT metadata syncs this case gates (cu_seqlens build, .tolist(),
+    # rot_pos_emb) are attention-implementation-independent, so SDPA covers
+    # them exactly as well.
+    _logits_case("qwen3_5_vl-sdpa"),
     # qwen3_vl (non-MoE VLM) — full multimodal forward with a dummy 2x2
     # image patch; exercises patched ``Qwen3VLModel.forward`` +
     # ``get_image_features`` + the vision tower.
@@ -242,11 +256,34 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
 # allowlist, and each entry reads as the function it accepts. One entry
 # therefore covers *all* the sync sites inside that function.
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
-    # qwen3_vl-fa2: Stage 1 (multimodal_metadata_precompute) wired the ViT
-    # forward to read precomputed `vit_image_cu_seqlens` / `vit_image_max_seqlen`
-    # / `image_grid_thw_list`, so the toy test (via _attach_multimodal_metadata
-    # above) skips the fallback `.tolist()` + host-side cu_seqlens build that
-    # used to fire ~4 syncs. What remains:
+    # qwen3_5_vl-sdpa: like qwen3_vl-fa2 below, the ViT forward consumes the
+    # precomputed multimodal metadata (fast path) — so the ViT's own
+    # `.tolist()` + host-side cu_seqlens build do not appear here. What remains:
+    #  - Qwen3_5VisionAttention.forward: the non-FA varlen-attention branch
+    #    does `torch.split(t, lengths.tolist(), ...)`, an HF-verbatim D2H.
+    #    This is eager/SDPA-only — production qwen3_5-VL uses FA2 (the
+    #    `is_flash_attention_requested` branch, which hands cu_seqlens to
+    #    flash_attn_varlen_func directly, no `.tolist()`). This case is forced
+    #    onto SDPA only because FA2 NaNs on the toy config, so the sync is on
+    #    a path production bypasses → tagged HF-eager-only.
+    #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    "qwen3_5_vl-sdpa": {
+        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5VisionAttention.forward"): (
+            "HF-eager-only: the non-FA branch's `torch.split(t, lengths.tolist(), ...)` "
+            "varlen split is an HF-verbatim D2H. Production qwen3_5-VL uses FA2, which "
+            "passes cu_seqlens to flash_attn_varlen_func directly and bypasses this; the "
+            "case runs SDPA only because FA2 NaNs on the toy config."
+        ),
+        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+    },
+    # qwen3_vl-fa2: the ViT forward consumes the precomputed multimodal
+    # metadata — Model.forward selects the per-modality `vit_metadata` sub-dict
+    # from `multimodal_metadata` (which the toy test injects via
+    # _attach_multimodal_metadata above) and threads it to the ViT. So this
+    # case runs the precompute *fast path* and skips the fallback `.tolist()`
+    # + host-side cu_seqlens build that would otherwise fire ~4 syncs. The
+    # entries below are therefore the residual syncs that survive even on the
+    # fast path — not eliminable by precompute:
     #  - rot_pos_emb: an algorithm-essential `rot_pos_ids(...).to(device)` H2D
     #    copy (CPU-side lru_cached helper output, over-reported by sync-debug).
     #  - get_rope_index: the HF-verbatim mrope algorithm; see the long comment
@@ -304,6 +341,7 @@ _PENDING_FIX_CASES: dict[str, str] = {}
 # would emit in real training, so the consumer fast path is exercised
 # and the corresponding fallback-path syncs disappear from the allowlist.
 _MM_METADATA_WIRED_CASES: set[str] = {
+    "qwen3_5_vl-sdpa",
     "qwen3_vl-fa2",
     "qwen3_vl_moe-fa2-fused",
     "qwen3_omni_moe-fa2-fused",
