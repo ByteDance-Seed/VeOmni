@@ -224,15 +224,18 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
             # makes ``model(..., return_log_probs=True)`` return
             # ``output.fused_linear_aux.log_probs`` (actual log-probabilities, sign already
             # flipped) and ``output.fused_linear_aux.entropy`` (per-token softmax entropy)
-            # and clear ``output.logits``. ``chunk_size=L+1`` forces a
-            # single chunk so the matmul boundary matches the reference
-            # forward exactly.
+            # and clear ``output.logits``. ``chunk_size=B*L+1`` forces a
+            # single chunk over the whole packed batch so the matmul
+            # boundary matches the reference forward exactly — using
+            # ``L+1`` alone would split B=2 into 2 chunks and surface
+            # fp32 epsilon drift from cuBLAS algorithm selection at the
+            # chunk boundary (qwen3_vl-vlm hits this; text doesn't).
             out = model(
                 input_ids=input_ids,
                 labels=labels,
                 use_cache=False,
                 return_log_probs=True,
-                chunk_size=L + 1,
+                chunk_size=B * L + 1,
             )
     finally:
         if bi_ctx is not None:
