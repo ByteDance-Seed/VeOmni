@@ -477,7 +477,13 @@ def test_return_log_probs_with_topk_distill_populates_three_fields(toy_path, fam
         assert t.shape == labels.shape, f"[{family}] {name} shape {tuple(t.shape)} != labels {tuple(labels.shape)}"
         assert torch.isfinite(t).all(), f"[{family}] {name} has non-finite values"
 
-    # 2) Forward KL is non-negative.
+    # 2) Forward KL is non-negative *in this synthetic setting*. Top-k
+    #    forward KL on truncated support is only guaranteed >= 0 in the
+    #    full-support limit; here we condition on (peaky teacher
+    #    log_softmax topk) vs (random-init student near log(1/V)) so
+    #    log p_t,k > log q_s,k holds per top-k slot. This both pins the
+    #    expected sign and surfaces a regression if the kernel ever
+    #    flips the (log p_t - log q_s) sign convention.
     assert (out.distillation_losses >= 0).all(), (
         f"[{family}] distillation_losses must be >= 0; got min={out.distillation_losses.min().item():.3e}"
     )

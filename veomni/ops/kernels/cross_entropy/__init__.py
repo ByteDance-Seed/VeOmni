@@ -127,6 +127,7 @@ def ForCausalLMLoss(
     teacher_topk_ids = kwargs.pop("teacher_topk_ids", None)
     teacher_topk_log_probs = kwargs.pop("teacher_topk_log_probs", None)
     log_prob_min_clamp = kwargs.pop("log_prob_min_clamp", None)
+    chunk_size = kwargs.pop("chunk_size", 1024)
 
     assert hidden_states is not None or logits is not None, "hidden_states or logits must be provided."
 
@@ -151,6 +152,7 @@ def ForCausalLMLoss(
                 labels,
                 teacher_topk_ids,
                 teacher_topk_log_probs,
+                chunk_size=chunk_size,
                 ignore_index=ignore_index,
                 shift_labels=shift_labels,
                 temperature=temperature,
@@ -161,6 +163,7 @@ def ForCausalLMLoss(
             hidden_states,
             weights,
             labels,
+            chunk_size=chunk_size,
             ignore_index=ignore_index,
             shift_labels=shift_labels,
             temperature=temperature,
@@ -282,6 +285,7 @@ def ForSequenceClassificationLoss(
     kwargs.pop("teacher_topk_ids", None)
     kwargs.pop("teacher_topk_log_probs", None)
     kwargs.pop("log_prob_min_clamp", None)
+    kwargs.pop("chunk_size", None)
 
     if hidden_states is None and logits is None:
         raise ValueError("Either hidden_states or logits must be provided.")
@@ -393,6 +397,7 @@ def _chunk_loss_dispatch(
     teacher_topk_ids = kwargs.pop("teacher_topk_ids", None)
     teacher_topk_log_probs = kwargs.pop("teacher_topk_log_probs", None)
     log_prob_min_clamp = kwargs.pop("log_prob_min_clamp", None)
+    chunk_size = kwargs.pop("chunk_size", 1024)
 
     if return_log_probs:
         hidden_states = kwargs.get("hidden_states")
@@ -412,6 +417,7 @@ def _chunk_loss_dispatch(
                 labels,
                 teacher_topk_ids,
                 teacher_topk_log_probs,
+                chunk_size=chunk_size,
                 ignore_index=kwargs.get("ignore_index", -100),
                 shift_labels=kwargs.get("shift_labels"),
                 temperature=temperature,
@@ -422,6 +428,7 @@ def _chunk_loss_dispatch(
             hidden_states,
             weights,
             labels,
+            chunk_size=chunk_size,
             ignore_index=kwargs.get("ignore_index", -100),
             shift_labels=kwargs.get("shift_labels"),
             temperature=temperature,
