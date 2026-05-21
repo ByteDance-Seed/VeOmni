@@ -388,6 +388,12 @@ def _def_spans(path: str) -> tuple[tuple[int, int, str], ...]:
                 walk(child, qualname + ".")  # nested defs / closures
             elif isinstance(child, ast.ClassDef):
                 walk(child, prefix + child.name + ".")
+            else:
+                # Recurse through non-def blocks (``if`` / ``try`` / ``with``
+                # version gates, etc.) keeping the same prefix — a def inside
+                # them is still at the enclosing scope, and missing it would
+                # misattribute its syncs to ``<module>``.
+                walk(child, prefix)
 
     walk(tree, "")
     return tuple(spans)
@@ -421,6 +427,10 @@ def test_enclosing_qualname_resolution(tmp_path):
         "        def inner():\n"  # 9  Foo.bar.inner
         "            return 0\n"  # 10 Foo.bar.inner
         "        return inner()\n"  # 11 Foo.bar
+        "\n"  # 12
+        "if True:\n"  # 13
+        "    def gated():\n"  # 14 gated (def inside an `if` block)
+        "        return 1\n"  # 15 gated
     )
     f = str(tmp_path / "m.py")
     with open(f, "w", encoding="utf-8") as fh:
@@ -429,6 +439,8 @@ def test_enclosing_qualname_resolution(tmp_path):
     assert _enclosing_qualname(f, 4) == "helper"
     assert _enclosing_qualname(f, 10) == "Foo.bar.inner"  # innermost def wins
     assert _enclosing_qualname(f, 11) == "Foo.bar"
+    # def inside an `if` block: still resolved (not misattributed to <module>).
+    assert _enclosing_qualname(f, 15) == "gated"
 
 
 # NCCL bootstrap env so this module is runnable on its own (``pytest
