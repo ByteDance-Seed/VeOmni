@@ -1,0 +1,65 @@
+# LoRA fine-tuning config for Qwen3-VL-MoE.
+#
+# Experts FQN nests under `model.language_model.layers.*`; the vision tower is
+# left untouched (set `freeze_vit: false` to also train it without LoRA).
+
+model:
+  model_path: Qwen3-VL-30B-A3B-Instruct
+  ops_implementation:
+    moe_implementation: eager
+    attn_implementation: flash_attention_2
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 16
+    alpha: 32
+    use_rslora: false
+    lora_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    target_parameters:
+      - model.language_model.layers.*.mlp.experts.gate_up_proj
+      - model.language_model.layers.*.mlp.experts.down_proj
+    share_expert_lora: true
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  chat_template: qwen3vl
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_max_pixels: 602112
+    video_max_pixels: 602112
+    video_total_pixels: 2889523
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
+
+train:
+  accelerator:
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable_reentrant: false
+  freeze_vit: true
+  optimizer:
+    lr: 1.0e-4
+    lr_decay_style: cosine
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_steps: 500
+  init_device: meta
+  checkpoint:
+    output_dir: qwen3_vl_moe_lora
+    manager: dcp
+  wandb:
+    enable: false
+    project: qwen3_vl_moe
+    name: qwen3_vl_moe_lora

@@ -222,7 +222,16 @@ class OptimizerState(Stateful):
             if id(param) in optim_param_ids:
                 fqn_to_param[fqn] = param
 
-        expected_fqns = set(fqn_to_param.keys())
+        # ``get_optimizer_state_dict`` (via ``_get_fqns``) strips the FSDP
+        # internal ``_fsdp_wrapped_module.`` prefix from every key, but
+        # ``model.named_parameters()`` on an FSDP1-wrapped model includes it.
+        # Normalize the expected FQNs to match the format used by the optimizer
+        # state dict, otherwise every param inside an FSDP unit would appear
+        # "missing" even though it has real optimizer state.
+        _FSDP_PREFIX = "_fsdp_wrapped_module."
+        normalized_fqn_to_param = {fqn.replace(_FSDP_PREFIX, ""): param for fqn, param in fqn_to_param.items()}
+
+        expected_fqns = set(normalized_fqn_to_param.keys())
         missing = expected_fqns - optim_fqns
 
         if not missing:
@@ -238,7 +247,7 @@ class OptimizerState(Stateful):
         template = sd["state"][template_fqn]
 
         for fqn in missing:
-            param = fqn_to_param[fqn]
+            param = normalized_fqn_to_param[fqn]
             placeholder = {}
             for key, val in template.items():
                 if isinstance(val, torch.Tensor):
@@ -604,6 +613,9 @@ def _normalize_key(key: str) -> Optional[str]:
     Conversion rules:
     - "model.model.*" -> "model.*" (remove first "model." prefix)
     - "model.lm_head.weight" -> "lm_head.weight" (special case)
+    - "model.base_model.*" -> "base_model.*" (PEFT LoRA adapter case;
+      ``save_lora_adapter_with_dcp`` re-prefixes already-PEFT-prefixed keys
+      with ``model.`` so DCP keeps them, and we strip that here on read)
     - Other "model.*" keys -> log warning and strip "model." prefix
     """
     if not key.startswith("model."):
@@ -615,6 +627,14 @@ def _normalize_key(key: str) -> Optional[str]:
     elif key == "model.lm_head.weight":
         # Special case: model.lm_head.weight -> lm_head.weight
         return "lm_head.weight"
+    elif key.startswith("model.base_model."):
+        # PEFT LoRA adapter save: ``save_lora_adapter_with_dcp`` writes keys
+        # of the form ``model.base_model.model.<...>.lora_A.weight`` so the
+        # DCP-side ``model.`` filter keeps them. The HF-side adapter file is
+        # the standard PEFT layout ``base_model.model.<...>.lora_A.weight``,
+        # which is exactly ``key[6:]``. This is a known, expected pattern
+        # — silent strip, no warning.
+        return key[6:]
     else:
         # Other keys with single "model." prefix - log and strip prefix
         logger.warning(

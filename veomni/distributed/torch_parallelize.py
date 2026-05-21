@@ -31,6 +31,7 @@ from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .utils import sort_fqn_by_submodule_first
 
@@ -127,7 +128,7 @@ def parallelize_model_fsdp2(
     #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
     #        Apply embed parallelism (slice embed tensors [64,H] -> [16,H])
     if parallel_state.any_extra_parallel_enabled:
-        parallel_plan = model.get_parallel_plan()
+        parallel_plan = get_runtime_parallel_plan(model)
         assert parallel_plan is not None, (
             "ExtraParallel needs parallel plan defined in the model! \
             Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
