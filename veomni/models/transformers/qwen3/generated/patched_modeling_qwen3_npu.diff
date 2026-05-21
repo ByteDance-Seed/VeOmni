@@ -1,5 +1,5 @@
 --- a/transformers/models/qwen3/modeling_qwen3.py
-+++ b/patched_modeling_qwen3_gpu.py
++++ b/patched_modeling_qwen3_npu.py
 @@ -1,49 +1,66 @@
 -#                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 -#           This file was automatically generated from src/transformers/models/qwen3/modular_qwen3.py.
@@ -29,11 +29,11 @@
 -# limitations under the License.
 +#  Patches applied:
 +#    - method_override: Qwen3RMSNorm.forward
-+#      OpSlot guard for Liger fused RMSNorm (standard formulation)
++#      OpSlot guard for NPU fused RMSNorm (standard formulation)
 +#    - method_override: Qwen3MLP.forward
-+#      OpSlot guard for Liger fused SwiGLU MLP
++#      OpSlot guard for NPU fused SwiGLU MLP
 +#    - function_replacement: apply_rotary_pos_emb
-+#      OpSlot guard for Liger fused RoPE
++#      OpSlot guard for NPU fused RoPE
 +#    - method_override: Qwen3ForCausalLM.forward
 +#      OpSlot guard for fused cross entropy in Qwen3ForCausalLM.forward
 +#    - method_override: Qwen3ForSequenceClassification.forward
@@ -169,7 +169,7 @@
 -    """
 +# ======================================================================
 +# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: OpSlot guard for Liger fused RoPE
++# Reason: OpSlot guard for NPU fused RoPE
 +# Source: veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
 +# ======================================================================
 +# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
