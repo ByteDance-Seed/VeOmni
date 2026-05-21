@@ -44,9 +44,11 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_forward,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -68,6 +70,7 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
+
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
 config.add_import(
@@ -406,6 +409,13 @@ config.override_method(
 
 
 config.override_method(
+    "Qwen3_5TextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
+)
+
+
+config.override_method(
     "Qwen3_5Model.get_image_features",
     replacement=qwen3_5_model_get_image_features,
     description="Remove unnecessary split operation to maintain contiguous memory layout.",
@@ -416,6 +426,13 @@ config.override_method(
     "Qwen3_5Model.get_placeholder_mask",
     replacement=qwen3_5_model_get_placeholder_mask,
     description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+
+
+config.override_method(
+    "Qwen3_5VisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
 )
 
 

@@ -3,7 +3,7 @@ from typing import Tuple, Union
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from ....transformers.llama.modeling_llama import LlamaForCausalLM
+from ....transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
 from ..base import BaseFoundationModelMixin
 from .configuration_janus_foundation import JanusFoundationConfig
 

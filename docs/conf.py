@@ -5,7 +5,7 @@ import sys
 sys.path.insert(0, os.path.abspath("../.."))
 
 # -- Project information -----------------------------------------------------
-version_file = "../veomni/__init__.py"
+version_file = "../veomni/_version.py"
 with open(version_file, encoding="utf-8") as f:
     try:
         version_line = next(line for line in f if line.startswith("__version__"))

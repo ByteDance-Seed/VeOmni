@@ -509,6 +509,42 @@ def qwen3_5_gated_deltanet_forward_patched(
 
 
 @config.override_method(
+    "Qwen3_5TextModel._update_linear_attn_mask",
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
+)
+def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, cache_position):
+    """
+    Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
+
+    Upstream returns ``None`` — disabling the per-token zeroing in ``apply_mask_to_padding_states``
+    — when ``cache_position[0] > 0`` (a cached forward) or ``torch.all(attention_mask == 1)`` (the
+    batch has no padding). Both predicates read a 0-D GPU tensor and force an implicit ``.item()``
+    / host-device sync on *every* forward, which serialises the host against the device in
+    VeOmni's otherwise sync-free training step.
+
+    We keep the cached-forward branch — it is a correctness guard, not just an optimization:
+    ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
+    cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
+    only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
+    a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
+    ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
+    than reading ``cache_position[0]``, so no sync.
+
+    The all-ones short-circuit is the one we drop: returning the all-ones mask makes
+    ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
+    while avoiding the ``torch.all`` reduction + sync. A genuinely padded mask is still returned and
+    correctly zeroed.
+    """
+    if attention_mask is None:
+        return None
+    # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
+    # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
+    if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
+        return None
+    return attention_mask
+
+
+@config.override_method(
     "Qwen3_5DecoderLayer.forward",
     description="Extract and pass cu_seq_lens_q for varlen linear attention in Qwen3_5DecoderLayer.forward",
 )
@@ -610,6 +646,57 @@ def qwen3_5_model_get_placeholder_mask(self, input_ids: torch.LongTensor, **kwar
 
 
 @config.override_method(
+    "Qwen3_5VisionModel.rot_pos_emb",
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
+)
+def qwen3_5_vision_model_rot_pos_emb(self, grid_thw) -> torch.Tensor:
+    merge_size = self.spatial_merge_size
+
+    # Modification: reuse the host-materialized grid metadata from the caller when available.
+    # The upstream body always starts with `grid_thw.tolist()`, which means the patched ViT
+    # forward was synchronizing the same tensor twice per call after its own
+    # `grid_thw_list = grid_thw.tolist()`. Accept a Python list directly and fall back to
+    # `.tolist()` only for non-patched callers that still pass the raw tensor.
+    grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
+
+    max_hw = max(max(h, w) for _, h, w in grid_thw_list)
+    freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+    device = freq_table.device
+
+    total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
+    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+    offset = 0
+    for num_frames, height, width in grid_thw_list:
+        merged_h, merged_w = height // merge_size, width // merge_size
+
+        block_rows = torch.arange(merged_h, device=device)  # block row indices
+        block_cols = torch.arange(merged_w, device=device)  # block col indices
+        intra_row = torch.arange(merge_size, device=device)  # intra-block row offsets
+        intra_col = torch.arange(merge_size, device=device)  # intra-block col offsets
+
+        # Compute full-resolution positions
+        row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
+        col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
+
+        row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+        col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+
+        coords = torch.stack((row_idx, col_idx), dim=-1)
+
+        if num_frames > 1:
+            coords = coords.repeat(num_frames, 1)
+
+        num_tokens = coords.shape[0]
+        pos_ids[offset : offset + num_tokens] = coords
+        offset += num_tokens
+
+    embeddings = freq_table[pos_ids]  # lookup rotary embeddings
+    embeddings = embeddings.flatten(1)
+    return embeddings
+
+
+@config.override_method(
     "Qwen3_5VisionModel.fast_pos_embed_interpolate",
     description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
 )
@@ -632,13 +719,14 @@ def qwen3_5_vision_model_fast_pos_embed_interpolate(self, grid_thw):
 
     outputs = []
     dtype = self.pos_embed.weight.dtype
-    # Modification: materialize grid_thw to a CPU list once to eliminate the
-    # per-iteration host-device sync that dominated the training step under
-    # profiling (~3000 implicit `.item()` syncs/step). Iterating a GPU tensor
-    # with `for t, h, w in grid_thw` yields 0-D GPU tensors; using h/w/t as
-    # ints in `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)`
-    # and `combined.expand(t, ...)` forces an implicit `.item()` per call.
-    grid_thw_list = grid_thw.tolist()
+    # Modification: iterate t/h/w as Python ints, never as 0-D GPU scalars (which would make
+    # `torch.linspace(steps=h, ...)`, `combined.reshape(h // m_size, ...)` and
+    # `combined.expand(t, ...)` each force an implicit `.item()` — several host-device syncs per
+    # image; under `set_sync_debug_mode("warn")` this loop was the single largest source of
+    # implicit syncs in the Qwen3.5-VL step). `Qwen3_5VisionModel.forward` now materializes the
+    # one `grid_thw.tolist()` and shares it with both this helper and the `cu_seqlens` build, so
+    # accept a list directly; fall back to `.tolist()` if a raw tensor is still passed in.
+    grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
     for t, h, w in grid_thw_list:
         h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
         w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
@@ -705,7 +793,22 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     """
     hidden_states = self.patch_embed(hidden_states)
 
-    pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+    # Modification: materialize `grid_thw` to a host list once, and reuse it for everything that
+    # needs t/h/w as Python ints (`fast_pos_embed_interpolate` and the `cu_seqlens` /
+    # `total_seq_len` build below). The unpatched paths derive shape metadata straight off the
+    # GPU `grid_thw` tensor — `torch.repeat_interleave(..., grid_thw[:, 0]).cumsum(0)` (GPU-tensor
+    # `repeats` -> sync to size the output), `rotary_pos_emb.reshape(cu_seqlens[-1])` and
+    # `pad_seq_len = ... - total_seq_len.item()` (0-D GPU scalar -> sync) — and iterating the GPU
+    # tensor in `fast_pos_embed_interpolate` forced several `.item()`s per image. `rot_pos_emb`
+    # now accepts the same host materialization too, so the ViT forward only synchronizes once
+    # at `grid_thw.tolist()` here.
+    # TODO(perf): `pos_embeds` / `rotary_pos_emb` / `cu_seqlens` / `total_seq_len` are a pure
+    # function of `grid_thw`, which is already known in the data collator. Precomputing the vision
+    # rotary position ids + cu_seqlens there and threading them in as model inputs would make the
+    # ViT forward host-device-sync-free (1 -> 0). See .pr-drafts/tingyang-fix-qwen3_5_key_fix.md.
+    grid_thw_list = grid_thw.tolist()
+
+    pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
     # --- Patch.1: Sequence parallel padding and slicing for position embeddings ---
     if get_parallel_state().sp_enabled:
@@ -721,33 +824,44 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
 
     hidden_states = hidden_states + pos_embeds
 
-    cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-        dim=0,
+    # Modification: build cu_seqlens on the host from `grid_thw_list` (was
+    # `torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(0)`, whose
+    # GPU-tensor `repeats` argument forces a host-device sync to size the output). `total_seq_len`
+    # likewise becomes a plain Python int rather than `cu_seqlens[-1]` (a 0-D GPU scalar that
+    # syncs when used as a `reshape` arg / in the SP padding math below).
+    cu_seqlens_list = [0]
+    for t, h, w in grid_thw_list:
+        frame_len = h * w
+        for _ in range(t):
+            cu_seqlens_list.append(cu_seqlens_list[-1] + frame_len)
+    total_seq_len = cu_seqlens_list[-1]
+    cu_seqlens = torch.tensor(
+        cu_seqlens_list,
+        device=hidden_states.device,
         # Select dtype based on the following factors:
         #  - FA2 requires that cu_seqlens_q must have dtype int32
         #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
         # See https://github.com/huggingface/transformers/pull/34852 for more information
         dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
     )
-    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-    rotary_pos_emb = self.rot_pos_emb(grid_thw)
+    rotary_pos_emb = self.rot_pos_emb(grid_thw_list)
 
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
 
     # --- Patch.2: Flatten full-sequence rotary embeddings using the actual total sequence length ---
     # In Sequence Parallelism, hidden_states.size(0) only represents the local shard length.
-    # We must use cu_seqlens[-1] (derived from unpadded grid_thw) to flatten the global
+    # We must use total_seq_len (derived from unpadded grid_thw) to flatten the global
     # rotary_pos_emb. This ensures the embeddings cover the entire original sequence
     # before they are padded and sliced in Patch 3 to match the sharded hidden_states.
-    total_seq_len = cu_seqlens[-1]
     rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
     # --- Patch.2 ---
 
     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
 
+    pad_seq_len = 0
     if get_parallel_state().sp_enabled:
         # --- Patch.3: Sequence parallel padding and slicing for sin/cos rotary embeddings ---
         cos, sin = position_embeddings
@@ -768,7 +882,8 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
         # Parallel operations (e.g., All-to-All).
         sp_size = get_parallel_state().sp_size
         # Calculate global padding: (local_seq_len * num_ranks) - original_total_len
-        pad_seq_len = seq_len * sp_size - total_seq_len.item()
+        # (total_seq_len is already a host int — no `.item()` sync needed here.)
+        pad_seq_len = seq_len * sp_size - total_seq_len
         if pad_seq_len > 0:
             # Append a new entry to cu_seqlens to include the padding tokens as a final segment
             new_cumsum = cu_seqlens[-1] + pad_seq_len
@@ -796,7 +911,8 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     #       and sdpa paths in the consumer pop+discard the kwarg, so the
     #       host sync would be wasted.
     if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
-        kwargs["vision_max_seqlen"] = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        max_frame_len = max((h * w for _, h, w in grid_thw_list), default=0)
+        kwargs["vision_max_seqlen"] = max(max_frame_len, pad_seq_len)
     # --- Patch.5 ---
 
     for blk in self.blocks:
@@ -1011,12 +1127,14 @@ def qwen3_5_model_forward(
         if get_parallel_state().sp_enabled:
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
             image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-        n_image_tokens = image_mask.sum().long().item()
         embeds_image_mask = (
             image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-        # Slice tensor to drop any padded image tokens
-        image_embeds = image_embeds[:n_image_tokens]
+        # `masked_scatter` consumes exactly `image_mask.sum()` elements from `image_embeds`, taking the
+        # leading rows in order — image-placeholder positions in `input_ids` are laid out in the same
+        # order as their vision tokens, and the data collator pads the vision sequence only at the
+        # *end*. So any padded vision rows are trailing and simply go unused; no `image_embeds[:n]`
+        # slice is needed, which also removes the `image_mask.sum().item()` host-device sync.
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
@@ -1052,13 +1170,12 @@ def qwen3_5_model_forward(
         if get_parallel_state().sp_enabled:
             # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
             video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-        n_video_tokens = video_mask.sum().long().item()
         embeds_video_mask = (
             video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-
-        # Slice tensor to drop any padded video tokens
-        video_embeds = video_embeds[:n_video_tokens]
+        # As with `image_embeds` above: `masked_scatter` uses exactly `video_mask.sum()` leading rows,
+        # any collator-padded vision rows are trailing and unused — no `video_embeds[:n]` slice (and no
+        # `video_mask.sum().item()` host-device sync) needed.
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
@@ -1098,7 +1215,6 @@ def qwen3_5_model_forward(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            mm_token_type_ids=mm_token_type_ids,
         )
     else:
         # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
@@ -1236,8 +1352,13 @@ def qwen3_5_forcausallm_forward_patched(
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
 class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
-    """``Qwen3_5CausalLMOutputWithPast`` extended with per-token log-prob fields.
-
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
     log_probs (`torch.FloatTensor`, *optional*):
         Per-token log probabilities returned by VeOmni's fused loss path.
     entropy (`torch.FloatTensor`, *optional*):

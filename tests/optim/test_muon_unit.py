@@ -32,13 +32,6 @@ from veomni.optim.muon import (  # noqa: E402
     batched_newton_schulz,
     split_muon_adamw_params,
 )
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to  # noqa: E402
-
-
-pytestmark = pytest.mark.skipif(
-    not is_transformers_version_greater_or_equal_to("5.0.0"),
-    reason="Muon training support is transformers v5-only.",
-)
 
 
 def _toy_model() -> nn.Module:
@@ -198,14 +191,6 @@ class TestNumerics:
 
 
 class TestBuildOptimizer:
-    def test_build_muon_requires_transformers_v5(self, monkeypatch):
-        import veomni.optim.optimizer as optimizer_mod
-
-        monkeypatch.setattr(optimizer_mod, "is_transformers_version_greater_or_equal_to", lambda _: False)
-
-        with pytest.raises(RuntimeError, match="transformers>=5.0.0"):
-            optimizer_mod.build_optimizer(_toy_model(), optimizer_type="muon", muon_kwargs={"lr": 1e-3})
-
     def test_build_returns_multi_optimizer(self):
         from veomni.optim import build_optimizer
         from veomni.optim.optimizer import MultiOptimizer

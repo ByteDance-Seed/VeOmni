@@ -20,7 +20,6 @@ import re
 from typing import Optional, Union
 
 import numpy as np
-import transformers.models.qwen2_5_omni.processing_qwen2_5_omni as hf_qwen25omni
 from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import (
     AudioInput,
     BatchFeature,
@@ -236,10 +235,6 @@ class Qwen2_5OmniProcessor(_Qwen2_5OmniProcessor):
             sample = sample.replace("<|video_placeholder|>", self.video_token)
             processed_text.append(sample)
         return processed_text
-
-
-def apply_veomni_qwen25_omni_patch():
-    hf_qwen25omni.Qwen2_5OmniProcessor = Qwen2_5OmniProcessor
 
 
 __all__ = ["Qwen2_5OmniProcessor"]

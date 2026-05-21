@@ -17,15 +17,15 @@ Patch configuration for DeepseekV3 GPU patched modeling generation.
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
-v5 patches:
+Patches:
 1. ``DeepseekV3NaiveMoe`` — drops upstream ``@use_experts_implementation``
-   (which otherwise routes around our fused MoE kernel) and adopts the v5
+   (which otherwise routes around our fused MoE kernel) and adopts the
    stacked ``gate_up_proj [E, 2*I, H]`` / ``down_proj [E, H, I]`` layout.
    Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``): non-eager →
-   ``fused_moe_forward``; eager → per-expert loop. This matches the v4
-   monkey-patch and qwen3_moe v5 dispatch shape (a previous draft keyed on a
-   hand-rolled ``config._moe_implementation`` attribute that was never wired,
-   so EP runs always took the eager loop and crashed on EP-sharded
+   ``fused_moe_forward``; eager → per-expert loop. This matches the
+   qwen3_moe dispatch shape (a previous draft keyed on a hand-rolled
+   ``config._moe_implementation`` attribute that was never wired, so EP runs
+   always took the eager loop and crashed on EP-sharded
    ``gate_up_proj[expert_idx]`` lookups for global expert ids).
 2. ``DeepseekV3TopkRouter.forward`` restores ``torch.autocast(enabled=False)``
    around the fp32 router F.linear — required for VeRL actor/rollout parity.
@@ -37,7 +37,7 @@ v5 patches:
 Liger kernels (RMSNorm / SwiGLU MLP / rotary) are intentionally NOT baked into
 the generated file: DeepseekV3 runs on deterministic Triton RoPE + batch-invariant
 RMSNorm wired at runtime from ``__init__.py`` (via
-``apply_veomni_deepseek_v3_v5_device_patch`` in ``device_patch.py``) for
+``apply_veomni_deepseek_v3_device_patch`` in ``device_patch.py``) for
 actor/rollout numerical parity, and ``LigerSwiGLUMLP`` rejects the
 ``intermediate_size`` kwarg used by ``DeepseekV3MoE.shared_experts``.
 """

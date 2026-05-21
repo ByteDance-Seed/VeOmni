@@ -3,7 +3,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from ....transformers.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAudioEncoder
+from ....transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import Qwen2_5OmniAudioEncoder
 from ...projector import build_feature_projector
 from ..base import BaseEncoderModelMixin
 from .configuration_qwen2_5_omni_audio_model import Qwen25OmniAudioModelConfig

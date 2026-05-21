@@ -26,10 +26,6 @@ from veomni.data.data_transform import (
 )
 from veomni.models import build_foundation_model, build_processor
 from veomni.utils.device import get_device_type
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-
-_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
 
 # Mapping from function name to actual function
@@ -91,34 +87,20 @@ def hf_process_sample(config: ModelTestConfig, hf_processor, hf_model):
         },
     ]
 
-    if _is_transformers_v5:
-        inputs = hf_processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            return_mm_token_type_ids=True,
-        )
-        position_ids, rope_deltas = hf_model.model.get_rope_index(
-            input_ids=inputs["input_ids"],
-            mm_token_type_ids=inputs["mm_token_type_ids"],
-            image_grid_thw=inputs.get("image_grid_thw"),
-            video_grid_thw=inputs.get("video_grid_thw"),
-            attention_mask=inputs["attention_mask"],
-        )
-    else:
-        inputs = hf_processor.apply_chat_template(
-            conversation,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        position_ids, rope_deltas = hf_model.model.get_rope_index(
-            input_ids=inputs["input_ids"],
-            image_grid_thw=inputs.get("image_grid_thw"),
-            video_grid_thw=inputs.get("video_grid_thw"),
-            attention_mask=inputs["attention_mask"],
-        )
+    inputs = hf_processor.apply_chat_template(
+        conversation,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        return_mm_token_type_ids=True,
+    )
+    position_ids, rope_deltas = hf_model.model.get_rope_index(
+        input_ids=inputs["input_ids"],
+        mm_token_type_ids=inputs["mm_token_type_ids"],
+        image_grid_thw=inputs.get("image_grid_thw"),
+        video_grid_thw=inputs.get("video_grid_thw"),
+        attention_mask=inputs["attention_mask"],
+    )
 
     output = inputs
     output["position_ids"] = position_ids
@@ -223,7 +205,6 @@ def veomni_process_sample(
                 chat_template_name="qwen3vl",
             ),
             True,  # check_mm_token_type_ids
-            marks=pytest.mark.skipif(not _is_transformers_v5, reason="Requires transformers >= 5.0.0"),
             id="qwen3_5",
         ),
     ],

@@ -42,18 +42,16 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/module_utils.py",
     "veomni/models/seed_omni/auto.py",
     "veomni/models/transformers/flux/encode_flux.py",
-    "veomni/models/transformers/llama/modeling_llama.py",
-    "veomni/models/transformers/qwen2/modeling_qwen2.py",
-    "veomni/models/transformers/qwen2_5_omni/modeling_qwen2_5_omni.py",
-    "veomni/models/transformers/qwen2_5vl/modeling_qwen2_5_vl.py",
-    "veomni/models/transformers/qwen2_vl/modeling_qwen2_vl.py",
-    "veomni/models/transformers/qwen3/modeling_qwen3.py",
-    "veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py",
     "veomni/arguments/arguments_types.py",
     "veomni/ops/kernels/moe/_kernels/utils/device.py",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
     "veomni/utils/lora_utils.py",
+    # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
+    # directly because the API is intrinsically CUDA-only and has no
+    # ``veomni.utils.device`` equivalent; the test is gated on
+    # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
+    "tests/models/test_model_forward_no_implicit_sync.py",
 ]
 
 # directory or file path must contain keyword "nccl"

@@ -141,8 +141,6 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
-      # Default (transformers v5) only. The v4 dependency path is sunset
-      # and no longer exercised in CI.
       - name: Sync dependencies
         run: |
           uv sync --frozen --python 3.11 --extra npu --extra audio --group dev

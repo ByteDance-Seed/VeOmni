@@ -17,11 +17,17 @@ Patch configuration for SeedOss GPU LigerKernel replacements.
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config -o veomni/models/transformers/seed_oss/generated
 
-This mirrors the runtime GPU patch in
-veomni/models/transformers/seed_oss/gpu_patch.py and the fused-CE patch in
-veomni/models/transformers/seed_oss/modeling_seed_oss.py.
+Patches:
+- ``SeedOssRMSNorm`` -> ``LigerRMSNorm`` (functional fused RMSNorm).
+- ``SeedOssMLP`` -> ``LigerSwiGLUMLP`` (functional fused SwiGLU MLP).
+- ``apply_rotary_pos_emb`` -> Liger ``liger_rotary_pos_emb``.
+- ``SeedOssForCausalLM.forward``: OpSlot guard for fused cross-entropy loss
+  (falls through to the eager HF loss path when no fused kernel is bound) and
+  returns the unified ``CausalLMOutputWithLogProbs`` dataclass so callers can
+  surface per-token log-probs / entropy alongside the loss.
 
-This file itself is not runnable. It's used to generate the runnable explicitly patched modeling file
+This file itself is not runnable — it is the declarative source of truth for
+the runnable explicitly-patched modeling file
 "generated/patched_modeling_seed_oss_gpu.py".
 """
 

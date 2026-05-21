@@ -301,6 +301,22 @@ def get_class_method_ast(class_node: ast.ClassDef, method_name: str) -> Optional
     return None
 
 
+def _is_empty_class_body_node(node: ast.AST) -> bool:
+    """Whether ``node`` is the lone body member of an "empty" class definition.
+
+    Recognizes both ``class Foo: pass`` and the v5-style inline ``class Foo(...): ...``
+    (where the body is a single ``Expr(Constant(Ellipsis))``). Method-injection paths
+    treat both the same: replace the empty body with the patched method instead of
+    appending after it (which would produce ``class Foo: ...    def bar(...):`` — a
+    syntax error).
+    """
+    if isinstance(node, ast.Pass):
+        return True
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and node.value.value is Ellipsis:
+        return True
+    return False
+
+
 def create_comment_node(comment: str) -> ast.Expr:
     """Create an AST node representing a comment (as a string expression)."""
     return ast.Expr(value=ast.Constant(value=f"# {comment}"))
@@ -721,11 +737,12 @@ class ModelingCodeGenerator:
         modified_class = replacer.visit(class_node)
         applied = replacer.replaced
 
-        # If the target method does not exist in the source class (e.g., class body is `pass`),
-        # inject the method into the class so override_method still works for newer HF refactors.
+        # If the target method does not exist in the source class (e.g., class body is `pass`
+        # or `...`), inject the method into the class so override_method still works for newer
+        # HF refactors.
         if not replacer.replaced:
             new_method.name = method_name
-            if len(modified_class.body) == 1 and isinstance(modified_class.body[0], ast.Pass):
+            if len(modified_class.body) == 1 and _is_empty_class_body_node(modified_class.body[0]):
                 modified_class.body = [new_method]
             else:
                 modified_class.body.append(new_method)
@@ -893,17 +910,36 @@ class ModelingCodeGenerator:
             return "\n".join(new_source_lines)
 
         # If the method does not exist, inject it while preserving class formatting.
-        # Prefer replacing a single `pass` body when present.
-        pass_node = next((item for item in class_def.body if isinstance(item, ast.Pass)), None)
+        # Prefer replacing an empty body when present: either ``pass`` or the v5-style
+        # inline ``class X(...): ...`` Ellipsis literal (``ast.Expr(Constant(Ellipsis))``).
+        empty_body_node = next((item for item in class_def.body if _is_empty_class_body_node(item)), None)
         method_indent = class_indent + 4
         indented_preserved_lines = self._indent_preserved_source(preserved_source, method_indent)
 
-        if pass_node is not None:
-            pass_start = pass_node.lineno - 1
-            pass_end = (
-                pass_node.end_lineno if hasattr(pass_node, "end_lineno") and pass_node.end_lineno else pass_start + 1
+        if empty_body_node is not None:
+            empty_start = empty_body_node.lineno - 1
+            empty_end = (
+                empty_body_node.end_lineno
+                if hasattr(empty_body_node, "end_lineno") and empty_body_node.end_lineno
+                else empty_start + 1
             )
-            new_source_lines = source_lines[:pass_start] + indented_preserved_lines + source_lines[pass_end:]
+            # ``class Foo(...): ...`` keeps the empty marker on the same line as the
+            # class header. Rewriting only the marker leaves ``class Foo(...):`` open
+            # and inserts the new method below it. The post-colon segment is stripped
+            # of any trailing ``# comment`` before the {"pass", "..."} membership check,
+            # otherwise an annotated empty body like ``class Foo: ...  # placeholder``
+            # would fall through to the else-branch and delete the entire header line
+            # (since ``empty_start`` points at the header for the inline form).
+            class_header_line = source_lines[empty_start]
+            colon_idx = class_header_line.rfind(":")
+            after_colon_no_comment = class_header_line[colon_idx + 1 :].split("#", 1)[0] if colon_idx != -1 else ""
+            if colon_idx != -1 and after_colon_no_comment.strip() in {"pass", "..."}:
+                header_only = class_header_line[: colon_idx + 1].rstrip()
+                new_source_lines = (
+                    source_lines[:empty_start] + [header_only] + indented_preserved_lines + source_lines[empty_end:]
+                )
+            else:
+                new_source_lines = source_lines[:empty_start] + indented_preserved_lines + source_lines[empty_end:]
             return "\n".join(new_source_lines)
 
         # Otherwise append to the class body.

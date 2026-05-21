@@ -120,9 +120,9 @@ python -c "import transformers; print(transformers.__version__)"
 uv sync --locked --extra npu --extra audio --group dev
 
 # Or install using pip
-pip install transformers==4.57.3
+pip install transformers==5.2.0
 ```
 
 **Version Recommendations**:
-- VeOmni recommends Transformers 4.57.3 for most use cases
-- Use Transformers 5.3.0 for the latest models
+- VeOmni pins Transformers `5.2.0` (see `pyproject.toml`). Other v5 minor
+  versions may work but are not exercised in CI.

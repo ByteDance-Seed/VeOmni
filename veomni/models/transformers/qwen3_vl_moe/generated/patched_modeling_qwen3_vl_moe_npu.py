@@ -971,15 +971,21 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         # --- Patch.1 ---
         merge_size = self.spatial_merge_size
 
-        max_hw = int(grid_thw[:, 1:].max().item())
+        # Modification: materialise grid_thw to a host list once and derive everything from it.
+        # Unpatched path forced ~5 syncs/forward: `grid_thw[:, 1:].max().item()`,
+        # `torch.prod(grid_thw, dim=1).sum().item()`, `for ... in grid_thw` (iterating GPU tensor),
+        # `if num_frames > 1` (0-D GPU `if`), plus the `int(h.item())` calls inside rot_pos_ids when
+        # passed GPU 0-D scalars. Now all derived from Python ints — 0 syncs.
+        grid_thw_list = grid_thw.tolist()
+        max_hw = max(max(h, w) for _, h, w in grid_thw_list)
         freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
         device = freq_table.device
 
-        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
+        total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
         pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
 
         offset = 0
-        for num_frames, height, width in grid_thw:
+        for num_frames, height, width in grid_thw_list:
             coords = rot_pos_ids(height, width, merge_size).to(device)  # noqa: F821 defined via add_post_import_block
             if num_frames > 1:
                 coords = coords.repeat(num_frames, 1)
@@ -1007,7 +1013,14 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
 
         outputs = []
         dtype = self.pos_embed.weight.dtype
-        for t, h, w in grid_thw:
+        # Modification: iterate t/h/w as Python ints, never as 0-D GPU scalars
+        # (iterating the GPU tensor would force `torch.linspace(steps=h)`,
+        # `combined.reshape(h // m_size, ...)` and `combined.expand(t, ...)` to each
+        # `.item()` per call — several host-device syncs per image). The ViT
+        # `forward` below now materialises one `grid_thw.tolist()` and passes it
+        # in directly; fall back to `.tolist()` if a raw tensor is still passed.
+        grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
+        for t, h, w in grid_thw_list:
             h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
             w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
 
@@ -1073,7 +1086,17 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
     ) -> BaseModelOutputWithDeepstackFeatures:
         hidden_states = self.patch_embed(hidden_states)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        # Modification: materialise `grid_thw` to a host list once and reuse for everything that
+        # needs t/h/w as Python ints (`fast_pos_embed_interpolate` and the `cu_seqlens` /
+        # `total_seq_len` build below). Unpatched paths derive shape metadata straight off the GPU
+        # `grid_thw` tensor — `torch.repeat_interleave(..., grid_thw[:, 0]).cumsum(0)` (GPU `repeats`
+        # → sync), `rotary_pos_emb.reshape(cu_seqlens[-1])` and
+        # `pad_seq_len = ... - total_seq_len.item()` (0-D GPU scalar → sync) — and iterating the GPU
+        # tensor in `fast_pos_embed_interpolate` forced several `.item()`s per image. After this:
+        # one `grid_thw.tolist()` here, plus the one still inside `rot_pos_emb`.
+        grid_thw_list = grid_thw.tolist()
+
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
@@ -1082,11 +1105,22 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
 
         hidden_states = hidden_states + pos_embeds
 
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0,
+        # Modification: build cu_seqlens on the host from `grid_thw_list` (was
+        # `torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(0)`, whose
+        # GPU-tensor `repeats` argument forces a sync to size the output). `total_seq_len` becomes a
+        # plain Python int rather than `cu_seqlens[-1]` (a 0-D GPU scalar that syncs when used as a
+        # `reshape` arg / in the SP padding math below).
+        cu_seqlens_list = [0]
+        for t, h, w in grid_thw_list:
+            frame_len = h * w
+            for _ in range(t):
+                cu_seqlens_list.append(cu_seqlens_list[-1] + frame_len)
+        total_seq_len = cu_seqlens_list[-1]
+        cu_seqlens = torch.tensor(
+            cu_seqlens_list,
+            device=hidden_states.device,
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
@@ -1094,13 +1128,14 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         hidden_states = hidden_states.reshape(seq_len, -1)
 
         # --- Patch.2 ---
-        total_seq_len = cu_seqlens[-1]
+        # total_seq_len is already a Python int — no sync to use it as a shape arg.
         rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
         # --- Patch.2 ---
 
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
+        sp_pad_seq_len = 0
         if get_parallel_state().sp_enabled:
             # --- Patch.1 ---
             cos, sin = position_embeddings
@@ -1111,16 +1146,22 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
 
             # --- Patch.3 ---
             sp_size = get_parallel_state().sp_size
-            pad_seq_len = seq_len * sp_size - total_seq_len.item()
-            if pad_seq_len > 0:
-                new_cumsum = cu_seqlens[-1] + pad_seq_len
+            # total_seq_len is already a host int — no `.item()` sync needed here.
+            sp_pad_seq_len = seq_len * sp_size - total_seq_len
+            if sp_pad_seq_len > 0:
+                new_cumsum = cu_seqlens[-1] + sp_pad_seq_len
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
             # --- Patch.3 ---
 
         deepstack_feature_lists = []
 
         # --- Patch.4 ---
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        # Modification: compute max_seqlen from the host-side cu_seqlens_list (was
+        # `(cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()` which forces a sync). The
+        # SP-padded tail (when appended above) is also a host int.
+        max_seqlen = max(cu_seqlens_list[i + 1] - cu_seqlens_list[i] for i in range(len(cu_seqlens_list) - 1))
+        if sp_pad_seq_len > 0:
+            max_seqlen = max(max_seqlen, sp_pad_seq_len)
         # --- Patch.4 ---
 
         # --- Patch.5 ---
@@ -1814,12 +1855,12 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                 ]
             # --- Patch.1 ---
 
-            n_image_tokens = image_mask.sum().long().item()
             embeds_image_mask = (
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-            image_embeds = image_embeds[:n_image_tokens]
-            deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
+            # `masked_scatter` consumes exactly `image_mask.sum()` leading rows; data collator pads
+            # vision sequence only at the end. No `image_embeds[:n]` slice needed → no
+            # `image_mask.sum().item()` host-device sync. Same for the deepstack list.
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
@@ -1864,12 +1905,11 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                 ]
             # --- Patch.1 ---
 
-            n_video_tokens = video_mask.sum().long().item()
             embeds_video_mask = (
                 video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-            video_embeds = video_embeds[:n_video_tokens]
-            deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
+            # Same as image branch above: drop the `[:n_video_tokens]` slice + the
+            # `.item()` sync.
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 

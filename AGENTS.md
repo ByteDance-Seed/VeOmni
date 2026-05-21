@@ -34,15 +34,14 @@ On session start, read the following:
 ## Setup
 
 ```bash
-# Default (transformers 5.2.0)
 uv sync --extra gpu --extra audio --dev
 source .venv/bin/activate
-
-# Legacy escape hatch for transformers 4.57.3 (sunset path):
-uv sync --no-group transformers-stable --extra transformers-v4-legacy --extra gpu --extra audio --dev
 ```
 
-Always activate `.venv/` before running any commands. New code must target transformers v5 and FSDP2. See `.agents/knowledge/constraints.md` for details.
+This installs `transformers==5.2.0` (pinned by the `transformers-stable`
+default dependency group in `pyproject.toml`). Always activate `.venv/`
+before running any commands. New code must target transformers v5 and FSDP2.
+See `.agents/knowledge/constraints.md` for details.
 
 ---
 

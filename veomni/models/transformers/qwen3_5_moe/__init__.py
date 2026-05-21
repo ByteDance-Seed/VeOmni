@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
+from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODELING_REGISTRY
 
 
@@ -22,35 +21,39 @@ from ...loader import MODELING_REGISTRY
 # KERNEL_REGISTRY.resolve's HardwareRequirement check; the varlen
 # (dyn_bsz=True) caveat is documented in docs/usage/arguments.md and on the
 # OpsImplementationConfig field metadata.
+#
+# NPU branch is opt-in; everything else (CUDA, CPU-only) falls back to the GPU
+# generated file. The GPU generated module imports cleanly without an active
+# CUDA device, so a CPU-only environment (e.g. CI lint, doc build) can still
+# register the class.
 
-# qwen3_5_moe is added in transformers 5.2.0.
-if is_transformers_version_greater_or_equal_to("5.2.0"):
 
-    @MODELING_REGISTRY.register("qwen3_5_moe")
-    def register_qwen3_5_moe_modeling(architecture: str):
-        if IS_CUDA_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_moe_gpu import (
-                Qwen3_5MoeForCausalLM,
-                Qwen3_5MoeForConditionalGeneration,
-            )
-        elif IS_NPU_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_moe_npu import (
-                Qwen3_5MoeForCausalLM,
-                Qwen3_5MoeForConditionalGeneration,
-            )
+@MODELING_REGISTRY.register("qwen3_5_moe")
+def register_qwen3_5_moe_modeling(architecture: str):
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_5_moe_npu import (
+            Qwen3_5MoeForCausalLM,
+            Qwen3_5MoeForConditionalGeneration,
+        )
+    else:
+        from .generated.patched_modeling_qwen3_5_moe_gpu import (
+            Qwen3_5MoeForCausalLM,
+            Qwen3_5MoeForConditionalGeneration,
+        )
 
-        if "ForCausalLM" in architecture:
-            return Qwen3_5MoeForCausalLM
-        elif "ForConditionalGeneration" in architecture:
-            return Qwen3_5MoeForConditionalGeneration
-        else:
-            return Qwen3_5MoeForCausalLM
-
-    @MODELING_REGISTRY.register("qwen3_5_moe_text")
-    def register_qwen3_5_moe_text_modeling(architecture: str):
-        if IS_CUDA_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM
-        elif IS_NPU_AVAILABLE:
-            from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM
-
+    if "ForCausalLM" in architecture:
         return Qwen3_5MoeForCausalLM
+    elif "ForConditionalGeneration" in architecture:
+        return Qwen3_5MoeForConditionalGeneration
+    else:
+        return Qwen3_5MoeForCausalLM
+
+
+@MODELING_REGISTRY.register("qwen3_5_moe_text")
+def register_qwen3_5_moe_text_modeling(architecture: str):
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM
+    else:
+        from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM
+
+    return Qwen3_5MoeForCausalLM

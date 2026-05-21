@@ -16,10 +16,10 @@ from veomni.models import save_model_weights
 
 _DEPRECATION_MESSAGE = (
     "scripts/moe_ckpt_merge/moe_merge.py is deprecated: VeOmni now stacks per-expert "
-    "weights on-the-fly at model load time for both transformers v4 and v5, so you can "
-    "pass the original HuggingFace checkpoint directly to training. This script will be "
-    "removed in a future release. Pre-merging is still useful for very large checkpoints "
-    "(e.g. Qwen3-235B) when you want to amortize the stacking cost across many runs."
+    "weights on-the-fly at model load time, so you can pass the original HuggingFace "
+    "checkpoint directly to training. This script will be removed in a future release. "
+    "Pre-merging is still useful for very large checkpoints (e.g. Qwen3-235B) when you "
+    "want to amortize the stacking cost across many runs."
 )
 
 

@@ -12,50 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ....utils.device import IS_NPU_AVAILABLE
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("deepseek_v3")
 def register_deepseek_v3_modeling(architecture: str):
-    if is_transformers_version_greater_or_equal_to("5.2.0"):
-        from .checkpoint_tensor_converter import create_deepseek_v3_checkpoint_tensor_converter
-        from .device_patch import apply_veomni_deepseek_v3_v5_device_patch
+    from .checkpoint_tensor_converter import create_deepseek_v3_checkpoint_tensor_converter
+    from .device_patch import apply_veomni_deepseek_v3_device_patch
 
-        if IS_NPU_AVAILABLE:
-            from .generated import patched_modeling_deepseek_v3_npu as gen
-        else:
-            from .generated import patched_modeling_deepseek_v3_gpu as gen
-
-        apply_veomni_deepseek_v3_v5_device_patch(gen)
-
-        DeepseekV3ForCausalLM = gen.DeepseekV3ForCausalLM
-        DeepseekV3ForSequenceClassification = gen.DeepseekV3ForSequenceClassification
-        DeepseekV3Model = gen.DeepseekV3Model
-
-        for model_cls in (DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification, DeepseekV3Model):
-            model_cls._create_checkpoint_tensor_converter = staticmethod(
-                create_deepseek_v3_checkpoint_tensor_converter
-            )
+    if IS_NPU_AVAILABLE:
+        from .generated import patched_modeling_deepseek_v3_npu as gen
     else:
-        from transformers import (
-            DeepseekV3ForCausalLM,
-            DeepseekV3ForSequenceClassification,
-            DeepseekV3Model,
-        )
+        from .generated import patched_modeling_deepseek_v3_gpu as gen
 
-        from .checkpoint_tensor_converter_v4 import create_deepseek_v3_v4_checkpoint_tensor_converter
-        from .modeling_deepseek_v3 import apply_veomni_deepseek_v3_patch
+    apply_veomni_deepseek_v3_device_patch(gen)
 
-        apply_veomni_deepseek_v3_patch()
+    DeepseekV3ForCausalLM = gen.DeepseekV3ForCausalLM
+    DeepseekV3ForSequenceClassification = gen.DeepseekV3ForSequenceClassification
+    DeepseekV3Model = gen.DeepseekV3Model
 
-        # Stack per-expert HF weights into v4's three 3-D nn.Parameters at load time
-        # (PatchDeepseekV3NaiveMoe.gate_proj/up_proj/down_proj). Skips the first
-        # `first_k_dense_replace` layers automatically (regex won't match dense layers).
-        for model_cls in (DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification, DeepseekV3Model):
-            model_cls._create_checkpoint_tensor_converter = staticmethod(
-                create_deepseek_v3_v4_checkpoint_tensor_converter
-            )
+    for model_cls in (DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification, DeepseekV3Model):
+        model_cls._create_checkpoint_tensor_converter = staticmethod(create_deepseek_v3_checkpoint_tensor_converter)
 
     if "ForCausalLM" in architecture:
         return DeepseekV3ForCausalLM

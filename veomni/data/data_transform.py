@@ -18,11 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 import torch
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 from veomni.utils.registry import Registry
-
-
-_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
 
 if TYPE_CHECKING:
@@ -279,7 +275,6 @@ def _process_sample_qwen_vl_base(
     processor: "ProcessorMixin",
     chat_template: "ChatTemplate",
     position_id_func: "Callable",
-    use_mm_token_type_ids: bool = False,
     **kwargs,
 ):
     from .multimodal import conv_preprocess
@@ -344,12 +339,11 @@ def _process_sample_qwen_vl_base(
         "attention_mask": attention_mask.unsqueeze(0),
     }
 
-    if use_mm_token_type_ids:
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        mm_token_type_ids[tokenized_example["image_mask"]] = 1
-        mm_token_type_ids[tokenized_example["video_mask"]] = 2
-        tokenized_example["mm_token_type_ids"] = mm_token_type_ids
-        position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[tokenized_example["image_mask"]] = 1
+    mm_token_type_ids[tokenized_example["video_mask"]] = 2
+    tokenized_example["mm_token_type_ids"] = mm_token_type_ids
+    position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
 
     tokenized_example["position_ids"] = position_id_func(**position_id_func_kwargs)["position_ids"]
     tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
@@ -385,7 +379,6 @@ def process_sample_qwen_vl(
         processor,
         chat_template,
         position_id_func,
-        use_mm_token_type_ids=_is_transformers_v5,
         **kwargs,
     )
 

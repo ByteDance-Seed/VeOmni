@@ -210,7 +210,7 @@ The generated file includes:
     #  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
     # ==============================================================================
     #  Source: transformers.models.qwen3.modeling_qwen3
-    #  Based on: transformers==4.57.3
+    #  Based on: transformers==5.2.0
     #
     #  Patches applied:
     #    - class_replacement: Qwen3RMSNorm
@@ -453,6 +453,13 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 - Generated code may need manual adjustment for complex patches
 - Some HF decorators (e.g., `@use_kernel_forward_from_hub`) may need special handling
 - Does not handle dynamic/conditional patches (use config flags in patches instead)
+- Empty class bodies written as `class Foo(Bar): ...` (inline ellipsis) and
+  `class Foo(Bar):\n    pass` are both supported by `override_method` since the
+  Llama migration. If a HF release introduces a *new* empty-body syntax the
+  codegen helper `_is_empty_class_body_node` does not recognize, the generated
+  file will fail to import with `IndentationError`. Models in the HF tree that
+  currently use the inline ellipsis form include `llama`, `mistral`, `nemotron`,
+  `persimmon`, `phimoe`, `qwen2_moe`, `stablelm`, `jetmoe`.
 
 ## Contributing
 

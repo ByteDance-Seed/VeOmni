@@ -156,8 +156,9 @@ class VLMTrainer:
                 self.base.model.thinker.visual.requires_grad_(False)
                 self.base.model.thinker.visual.merger.requires_grad_(True)
             else:
-                # Resolve both paths so freeze_vit works for the transformers v4-style Back Compatible alias
-                # and the nested layout used by the v5-style Qwen3.5 models.
+                # Resolve both flat and nested visual-module layouts to cover
+                # both the plain `model.visual` shape and Qwen3.5-VL's nested
+                # layout.
                 visual = _get_vlm_visual_module(self.base.model)
                 if visual is None:
                     raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")

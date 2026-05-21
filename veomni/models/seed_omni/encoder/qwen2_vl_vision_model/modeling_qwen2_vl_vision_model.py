@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ....transformers.qwen2_vl.modeling_qwen2_vl import Qwen2VisionTransformerPretrainedModel
+from ....transformers.qwen2_vl.generated.patched_modeling_qwen2_vl_gpu import Qwen2VisionTransformerPretrainedModel
 from ...projector import build_feature_projector
 from ..base import BaseEncoderModelMixin
 from .configuration_qwen2_vl_vision_model import Qwen2VLVisionModelConfig
