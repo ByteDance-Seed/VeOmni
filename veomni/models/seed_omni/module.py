@@ -53,6 +53,41 @@ Optional hooks
     The global tokenizer lives at ``OmniConfig.tokenizer_path`` and is NOT
     returned here.  Default: ``[]``.
 
+``dummy_inputs(*, batch_size, device, dtype) -> dict``
+    Zero-tensor placeholders the trainer fills in **during training** for
+    micro-batches that are missing one of this module's inputs (e.g. a
+    text-only sample missing ``pixel_values``).  This is the
+    "training-side dummy forward" mechanism — every active node must
+    forward on every micro-batch to keep FSDP DP/SP graphs aligned (see
+    invariant 10).  Inference runners do NOT call this; they let the
+    model fast-skip via ``if x is None: return {}`` and rely on
+    permissive edge routing (an absent ``ctx[output]`` simply skips the
+    edge).  Default: ``{}`` (no dummies — the trainer raises if a
+    required input is missing).
+
+Training vs. inference "no input" semantics
+-------------------------------------------
+The two runtimes treat a missing optional input differently — by design:
+
+* **Training** (FSDP).  Every active node MUST forward on every
+  micro-batch or DP/SP all-reduce hangs.  The trainer asks each module
+  for ``dummy_inputs(...)`` and fills missing kwargs with zero tensors
+  *before* dispatch.  The model's ``forward``/``encode``/``decode``
+  therefore never sees ``None`` for a required input during training —
+  the ``if x is None: return {}`` short-circuit is an inference-only
+  fast path.  Important corner case: when the dummy zero output flows
+  through ``masked_scatter`` with an all-False mask (no real placeholder
+  positions), autograd drops the gradient back to the upstream module
+  and FSDP grad-sync may mismatch.  The downstream backbone must add a
+  ``+ x.sum() * 0.0`` "anchor" term in its ``pre_forward`` to force a
+  zero-gradient path through the upstream module; see ``JanusLlama``.
+
+* **Inference** (no FSDP).  No grad sync, no DP alignment.  The runtime
+  does **not** fill dummies; ``GenerationGraph.step`` permissively
+  skips an edge whose source produced an empty ``{}``.  The destination
+  node still executes (with ``None`` for the absent kwarg) so its other
+  inputs route normally.
+
 Loss protocol (single ``_loss`` key)
 ------------------------------------
 * A module may emit *at most one* loss term per node.
@@ -167,6 +202,26 @@ class OmniModule:
         returned here.  Default: ``[]``.
         """
         return []
+
+    def dummy_inputs(self, *, batch_size: int, device: Any, dtype: Any) -> Dict[str, Any]:
+        """Zero-tensor placeholders for training-side dummy forward.
+
+        Called by the trainer (Step 2 ``OmniTrainer`` hook) when a
+        micro-batch is missing one of this module's required inputs.
+        Override to return zero tensors with the **right shape** so the
+        full forward path runs and FSDP DP/SP graphs stay aligned across
+        ranks (see module-doc "Training vs. inference no input
+        semantics").
+
+        Inference runners do NOT call this; they let the model
+        ``return {}`` and rely on permissive edge routing.
+
+        Default: ``{}`` (no dummies — appropriate for modules whose
+        inputs always come from upstream nodes inside the graph; the
+        upstream node's own ``dummy_inputs`` populates the kwargs that
+        eventually reach this module).
+        """
+        return {}
 
 
 __all__ = ["OmniModule"]

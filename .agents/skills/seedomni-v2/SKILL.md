@@ -15,10 +15,12 @@ description: "Use this skill when adding or modifying anything inside `veomni/mo
 2. `veomni/models/seed_omni/module.py` — the `OmniModule` mixin contract.
 3. `veomni/models/seed_omni/graph.py` + `training_graph.py` + `generation_graph.py` — `NodeDef` / `EdgeDef` schema and the DAG / FSM views.
 4. An existing module that matches your shape:
-   - **Generic / cross-family** → `modules/base/modeling_text_embed.py`, `modules/base/modeling_mlp_adapter.py`.
-   - **Vision encoder** → `modules/janus/modeling_janus_siglip.py`.
-   - **VQ codec** (encode + decode) → `modules/janus/modeling_janus_vqvae.py`.
-   - **AR backbone (no vocab layers)** → `modules/janus/modeling_janus_llama.py`.
+   - **Generic / cross-family** → `modules/base/text_embed/modeling.py` (and the planned `modules/base/mlp_adapter/modeling.py`).
+   - **Vision encoder** → `modules/janus/siglip/modeling.py`.
+   - **VQ codec** (encode + decode) → `modules/janus/vqvae/modeling.py`.
+   - **AR backbone (no vocab layers)** → `modules/janus/llama/modeling.py`.
+
+   File layout convention: `modules/<family>/<sub_module>/(configuration.py, modeling.py[, processing.py])`. The folder name carries the namespace, so the inner files use the short `configuration.py` / `modeling.py` / `processing.py` names rather than re-spelling the family + sub-module in every filename. Cross-family lightweight modules live under `modules/base/<sub_module>/` with the same shape.
 
 ## Data flow (read this once)
 
@@ -38,6 +40,44 @@ When adding a new modality you typically:
 
 You **do not** add a chat-template variant, a modality registry, or any other framework-level switch.
 
+## Training vs. inference — "no input" semantics
+
+The two runtimes treat a missing optional input differently — by design. This is the **only** asymmetry between them and it's the source of most bugs when porting code:
+
+| Phase | What happens when `module.forward(foo=None, ...)` is called | Why |
+|---|---|---|
+| **Training (FSDP)** | The trainer fills missing kwargs from `module.dummy_inputs(...)` *before* dispatch. The `if foo is None: return {}` short-circuit is **never reached** during training. | Every active node MUST forward on every micro-batch or DP/SP all-reduce hangs. Dummy zero tensors keep the FSDP graph aligned across DP ranks; backbone scatter on a placeholder mask matched zero times is a no-op (gradients are zero but the graph traverses). |
+| **Inference (no FSDP)** | The model `return {}` immediately. The `GenerationGraph` then **permissively skips** any outgoing edge whose `output:` key isn't in ctx — the destination still executes when its other inputs land. | No FSDP, no DP alignment. Skipping an empty forward saves real compute. Permissive routing handles text-only prompts in a multimodal FSM (e.g. `infer_understanding.yaml#prompt_to_text` with no `pixel_values`). |
+
+What you must implement:
+
+1. **Inference fast-skip** in every model's `forward` / `encode` / `decode`:
+   ```python
+   def forward(self, foo=None, **_):
+       if foo is None:
+           return {}        # inference fast path; trainer never sees this branch
+       ...
+   ```
+
+2. **Per-module `dummy_inputs`** (optional, but required for any module whose primary input is loaded from raw_batch — e.g. vision encoders that consume `pixel_values`):
+   ```python
+   def dummy_inputs(self, *, batch_size, device, dtype):
+       return {"foo": torch.zeros(batch_size, ..., device=device, dtype=dtype)}
+   ```
+   Modules whose inputs always come from upstream nodes (e.g. an AR backbone consuming `inputs_embeds` from sibling encoders) can leave the default `{}` — the upstream's own `dummy_inputs` populates the kwargs that eventually reach this module.
+
+3. **FSDP grad-sync anchor** in any backbone that scatters dummy upstream outputs through `masked_scatter` (or any equivalent op that drops gradients when its mask is empty):
+   ```python
+   def pre_forward(self, inputs_embeds, und_image_embeds=None, ...):
+       if und_image_embeds is not None and self.training:
+           inputs_embeds = inputs_embeds + und_image_embeds.sum() * 0.0   # zero-valued autograd anchor
+   ```
+   Without this, `masked_scatter` on an all-False mask produces an output that's algebraically independent of `und_image_embeds` — autograd drops the gradient back to the upstream encoder, FSDP grad-reduce mismatches across DP ranks, and training silently diverges or hangs. The anchor adds a zero contribution that *is* part of the autograd graph, forcing a (zero) gradient through the upstream module so DP ranks stay synced.
+
+4. **Permissive edge routing** is implemented in `GenerationGraph.step`; you don't need to do anything in YAML to opt in. An edge whose `output:` key isn't in ctx (or is `None`) silently skips. The destination's fan-in counter still decrements regardless of whether the route succeeded — so multi-source nodes (e.g. `janus_llama` in `prompt_to_text` consuming both `und_image_embeds` and `inputs_embeds`) execute exactly once after the LAST in-body fan-in edge has been processed.
+
+Common pitfall: `if foo is None: return {}` works during inference but breaks training under FSDP unless the trainer fills dummies. The `dummy_inputs` method is the contract by which the trainer knows what zero tensors to fill — if you forget it, the trainer falls back to passing `None` and your `return {}` triggers the FSDP hang.
+
 ## SeedOmni V2 — 14 Hard Invariants
 
 These rules are enforced by the framework. Violate them and you'll fight the design.
@@ -54,7 +94,7 @@ These rules are enforced by the framework. Violate them and you'll fight the des
 7. **No orphan, no cycle.** Every node has at least one outgoing edge. If the node is a sink (e.g. produces only `*_loss`), add an explicit `{from: X, output: <loss>, to: end}` edge. Self-loops or any cycle are rejected by `TrainingGraph` construction (cycles in inference go in `generation_graph` only).
 8. **`training_graph` / `generation_graph` only list `edges`** (subset of `edges:` pool). Active nodes are the union of `from` / `to` endpoints. The execution order is derived by topo sort — never write it manually.
 9. **Loss collection is by `_loss` suffix (single key).** Each module's `forward` internally iterates all micro-batches; `post_forward` computes the token-level mean (sum_loss / sum_tokens) and emits a single scalar `<name>_loss`. `OmniModel.forward()` collects all `_loss`-suffixed scalars and sums them. **No `*_loss_token_count` companion key, no per-batch mean-then-mean** (which would batch-weight the loss when token counts vary). Loss is NOT routed via edges — `to: end` is just a topology marker.
-10. **Dummy forward is mandatory.** Any node listed in `training_graph.edges` MUST run a forward pass on every micro-batch (FSDP backward hangs otherwise). When inputs are missing, build a zero-tensor of the expected shape, run the path, and emit a 0 loss. Don't `return {}` early.
+10. **Dummy forward in training; permissive skip in inference.** Any node listed in `training_graph.edges` MUST run a forward pass on every micro-batch (FSDP backward hangs otherwise). The trainer fills missing kwargs from each module's `dummy_inputs(...)` before dispatch, so the `if x is None: return {}` short-circuit is never reached during training. Inference is the opposite: the model `return {}`, edge routing permissively skips, the destination still executes. See "Training vs. inference — no input semantics" for the full contract including the FSDP grad-sync anchor.
 11. **One module instance, possibly many nodes.** Same module under multiple node names is the canonical pattern for "encode + decode" or "round-trip" use cases. Parameters are shared; gradients accumulate naturally.
 12. **One module type, one instance per OmniModel.** RL scenarios with reference + actor models build two OmniModels; within a single OmniModel a model_type maps to exactly one `nn.Module`.
 13. **SP slicing is a backbone-internal concern.** SP `pad_and_slice` happens in the backbone's `pre_forward`; SP `gather` happens in its `post_forward`. Pre-LLM nodes (e.g. `tok_encode`) and post-LLM nodes (e.g. `tok_decode`, `vae_decode`) operate on full-length tensors — they are SP-agnostic.
@@ -236,7 +276,42 @@ The `text_embed` extraction in `scripts/split_janus.py` (especially the `tie_wor
 
 ## Phase 5 — Wire into the YAML graph
 
-Edit the relevant `configs/seed_omni/<model>.yaml`:
+### YAML organisation: training file vs. inference file(s)
+
+V2 splits configuration into a master **training YAML** and one or more **inference YAMLs** under `configs/seed_omni/<model>/`. The training YAML carries the master vocabulary (`tokenizer_path`, `modules`, `nodes`, `edges`, `training_graph` — including any inference-only nodes / edges); each inference YAML carries **only** a `generation_graph` block for one inference scenario.
+
+```
+configs/seed_omni/janus_1.3b/
+├── train_joint.yaml          # master vocabulary; the only file that defines tokenizer_path / modules / nodes / edges / training_graph
+├── infer_interleave.yaml     # generation_graph only — T2T+T2I mid-stream image generation
+├── infer_t2i.yaml            # generation_graph only — T2I-only (no preceding text)
+└── infer_understanding.yaml  # generation_graph only — I2T / VQA (uni-directional)
+```
+
+Loading rules:
+
+- **Training only**: load just `train_joint.yaml`.
+- **Inference**: load `train_joint.yaml` + the chosen `infer_<scenario>.yaml`. Use `OmniConfig.from_yamls(*paths)` — the second-and-later files **deep-merge** over the first (dict-vs-dict recurse, scalars/lists replace wholesale, `None` is a no-op).
+
+```python
+cfg = OmniConfig.from_yamls(
+    "configs/seed_omni/janus_1.3b/train_joint.yaml",
+    "configs/seed_omni/janus_1.3b/infer_interleave.yaml",
+)
+```
+
+Naming conventions:
+
+| Pattern | Example | Purpose |
+|---|---|---|
+| `train_<scope>.yaml` | `train_joint.yaml`, `train_und_only.yaml` | Master file — defines vocabulary AND a specific `training_graph.edges` subset |
+| `infer_<scenario>.yaml` | `infer_interleave.yaml`, `infer_t2i.yaml`, `infer_understanding.yaml` | Scenario-specific FSM — `generation_graph` only |
+
+**Don't hide inference-only nodes / edges in the inference YAML.** They live in the master training YAML's `nodes` / `edges` pool (the inference YAML cannot add new ones to the pool because deep-merge over an absent key is a no-op for nested dicts only — and even then, having all nodes / edges in one place is a readability win). The training YAML simply omits them from `training_graph.edges`.
+
+### What goes in each YAML
+
+Editing `train_<scope>.yaml`:
 
 1. **Top of file** — `tokenizer_path: /path/to/tokenizer` (global, exactly one).
 
@@ -247,7 +322,7 @@ Edit the relevant `configs/seed_omni/<model>.yaml`:
      bar_foo: {weights_path: /path/to/bar_foo}
    ```
 
-3. **`nodes:`** — add one entry per call-site:
+3. **`nodes:`** — add one entry per call-site, including inference-only ones (e.g. `emit_image_start`, `emit_image_end`):
 
    ```yaml
    nodes:
@@ -256,14 +331,15 @@ Edit the relevant `configs/seed_omni/<model>.yaml`:
      # or just `{module: bar_foo}` for default forward/generate_step
    ```
 
-4. **`edges:`** — add data routes. Conventions:
+4. **`edges:`** — add data routes, including inference-only ones (feedback edges for VQ loops, boundary-token bridge edges, body-terminal sinks like `ar_run_sink`). Conventions:
    - `from`/`to` reference **node** names (or `end` for sinks).
    - `output:` is the dict key returned by the source node.
    - `as:` is the kwarg name on the destination node.
    - Every node MUST have at least one outgoing edge. Sinks → `to: end`.
+   - **Body terminal edges** (`<node>_run_sink: {from: <node>, to: end}`) are required for FSM bodies where a node executes but has no same-body consumer (e.g. `janus_llama` in `image_vq_start` updates its KV cache; its output is consumed by the *next* state). The runtime triggers `from_` execution via the body walk; no body sink → the node never runs.
    - Loss values DON'T need to flow via edges (collected by suffix), but you SHOULD still add a `to: end` sink edge to keep topology complete.
 
-5. **`training_graph:`** — list the active edges only:
+5. **`training_graph:`** — list the active edges only (excluding inference-only ones):
 
    ```yaml
    training_graph:
@@ -272,9 +348,13 @@ Edit the relevant `configs/seed_omni/<model>.yaml`:
 
    Active nodes are derived from edge endpoints. Execution order is topo-sorted from edges.
 
-6. **`generation_graph:`** — extend the FSM if the module participates in inference. Each `state.body` is an ordered list of edge names; `from` nodes are executed on first hit (default method → `generate_step`; explicit method → direct dispatch); edges route ctx.
+6. **Comment the DAG layout** at the top of the YAML (ASCII diagram or short description) — this is the canonical reference for readers.
 
-7. **Comment the DAG layout** at the top of the YAML (ASCII diagram or short description) — this is the canonical reference for readers.
+Editing `infer_<scenario>.yaml`:
+
+7. **`generation_graph:`** — only this block. Each `state.body` is an ordered list of edge names from the master pool; `from` nodes are executed on first encounter (default method → `generate_step`; explicit method → direct dispatch); edges route ctx (permissively — see below).
+
+8. Reference the master YAML for vocabulary; never redeclare `tokenizer_path` / `modules` / `nodes` / `edges` / `training_graph` in an `infer_*.yaml` (deep-merge would let it work, but it makes the file a fragile partial copy).
 
 ## Phase 6 — Validate
 
@@ -283,9 +363,12 @@ Run all four checks in order. Failing any one means stop and fix before continui
 ```bash
 source .venv/bin/activate
 
-# 1. Topo sort + FSM body resolution (no torch needed for this).
-python scripts/visualize_omni_graph.py configs/seed_omni/<model>.yaml --only train
-python scripts/visualize_omni_graph.py configs/seed_omni/<model>.yaml --only fsm
+# 1. Topo sort + FSM body resolution (no torch needed for this).  Pass the master
+#    training YAML first; subsequent files deep-merge over it.
+python scripts/visualize_omni_graph.py configs/seed_omni/<model>/train_<scope>.yaml --only train
+python scripts/visualize_omni_graph.py \
+    configs/seed_omni/<model>/train_<scope>.yaml \
+    configs/seed_omni/<model>/infer_<scenario>.yaml --only fsm
 
 # 2. Functional smoke test of the new module (training + inference paths, dummy fallback).
 python -c "from veomni.models.seed_omni import BarFoo, BarFooConfig; ..."

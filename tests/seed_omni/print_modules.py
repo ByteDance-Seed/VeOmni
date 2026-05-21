@@ -62,11 +62,22 @@ def _scalar_loss(value: float = 0.5) -> torch.Tensor:
 
 
 class PrintVisionEncoder(_PrintBase):
-    """Single-method module: ``forward(pixel_values)`` → ``image_embeds``."""
+    """Single-method module: ``forward(pixel_values)`` → ``image_embeds``.
+
+    Mirrors the inference fast-skip contract: when ``pixel_values`` is
+    ``None`` the module returns ``{}`` and the FSM's permissive routing
+    silently drops the outgoing edge.  Training-side dummy forward (the
+    other path) is the trainer's responsibility — Step 2 territory.
+    """
 
     def forward(self, **kwargs: Any) -> Dict[str, Any]:
         self._record("forward", **kwargs)
+        if kwargs.get("pixel_values") is None:
+            return {}
         return {"image_embeds": "<vis_embeds>"}
+
+    def generate_step(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.forward(**kwargs)
 
 
 # ── VQVAE: encode (training) + decode (training & inference) ─────────────────
@@ -144,6 +155,21 @@ class PrintTextEmbed(_PrintBase):
     def reset_cursor(self) -> None:
         """Reset the token-script cursor.  Call between independent generate runs."""
         self._cursor = 0
+
+    # ── Janus boundary-token emitters (mirrors JanusTextEmbed) ───────────────
+    def emit_image_start(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._emit("boi", 100016, **kwargs)
+
+    def emit_image_end(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._emit("eoi", 100593, **kwargs)
+
+    def _emit(self, label: str, token_id: int, **kwargs: Any) -> Dict[str, Any]:
+        self._record(f"emit_{label}", **kwargs)
+        return {
+            "input_ids": token_id,
+            "inputs_embeds": f"<wte:{label}>",
+            "last_token_id": token_id,
+        }
 
 
 # ── AR backbone — has both forward (training) and generate_step (inference) ──

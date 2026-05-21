@@ -68,7 +68,8 @@ YAML structure (maps 1-to-1 to this class):
 """
 
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 from transformers import PretrainedConfig
 
@@ -132,6 +133,76 @@ class OmniConfig(PretrainedConfig):
     def from_dict(cls, config_dict: Dict, **kwargs) -> "OmniConfig":
         accepted = {k: v for k, v in config_dict.items() if k in cls.__init__.__code__.co_varnames}
         return cls(**accepted, **kwargs)
+
+    @classmethod
+    def from_yamls(cls, *paths: Union[str, Path], **kwargs) -> "OmniConfig":
+        """Load + deep-merge multiple YAML configs (later overrides earlier).
+
+        SeedOmni V2 splits configuration into a **training YAML** that
+        carries the master vocabulary (``tokenizer_path``, ``modules``,
+        ``nodes``, ``edges``, ``training_graph``) and one or more
+        **inference YAMLs** that only carry a ``generation_graph`` for a
+        specific scenario (interleave / T2I-only / understanding).  See
+        ``configs/seed_omni/janus_1.3b/`` for the canonical layout.
+
+        Merge semantics
+        ---------------
+        Top-level keys are merged depth-first:
+
+        * **Dict-vs-dict**: recursive merge.  ``modules.foo.weights_path``
+          in the inference YAML overrides the training YAML's value while
+          keeping every other ``modules.foo.*`` field intact.
+        * **List-vs-list / scalar-vs-scalar**: later wins outright (no
+          element-wise merge — that would be ambiguous for ordered
+          ``training_graph.edges``).
+        * **None-vs-anything**: anything wins; ``None`` never overwrites
+          a real value.
+
+        Examples
+        --------
+        Load training-only (single file)::
+
+            cfg = OmniConfig.from_yamls("configs/seed_omni/janus_1.3b/train_joint.yaml")
+
+        Load training + an inference scenario (paint a generation_graph
+        on top)::
+
+            cfg = OmniConfig.from_yamls(
+                "configs/seed_omni/janus_1.3b/train_joint.yaml",
+                "configs/seed_omni/janus_1.3b/infer_interleave.yaml",
+            )
+        """
+        import yaml
+
+        if not paths:
+            raise ValueError("OmniConfig.from_yamls requires at least one path.")
+
+        merged: Dict[str, Any] = {}
+        for p in paths:
+            text = Path(p).read_text()
+            data = yaml.safe_load(text) or {}
+            if not isinstance(data, dict):
+                raise TypeError(f"YAML at '{p}' must be a top-level mapping; got {type(data).__name__}.")
+            merged = _deep_merge(merged, data)
+        return cls.from_dict(merged, **kwargs)
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge ``override`` into a deep-copy of ``base`` and return it.
+
+    Dict values merge recursively; non-dict values from ``override``
+    replace the base wholesale.  ``None`` in ``override`` does NOT clear
+    the base — use an explicit empty dict / list / scalar to override.
+    """
+    out: Dict[str, Any] = deepcopy(base)
+    for k, v in override.items():
+        if v is None:
+            continue
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = deepcopy(v)
+    return out
 
 
 __all__ = ["OmniConfig"]

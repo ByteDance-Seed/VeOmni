@@ -1,0 +1,82 @@
+# Janus-1.3B inference — image understanding (I2T / VQA).  Uni-directional;
+# never emits an image mid-stream.
+#
+# Use::
+#
+#   OmniConfig.from_yamls(
+#       "configs/seed_omni/janus_1.3b/train_joint.yaml",
+#       "configs/seed_omni/janus_1.3b/infer_understanding.yaml",
+#   )
+#
+# Flow
+# ----
+#   prompt_to_text  (1 step: read both `pixel_values` and `input_ids`.
+#                   siglip_encode produces understanding image embeddings;
+#                   tok_encode produces text embeds; janus_llama consumes
+#                   BOTH via masked_scatter at the image-placeholder
+#                   positions, runs once, and tok_decode samples the
+#                   first reply token.)
+#     → text_ar
+#
+#   text_ar         (variable length: tok_encode → janus_llama → tok_decode.
+#                   tok_decode writes input_ids/last_token_id back into
+#                   ctx so each iteration's tok_encode reads them.)
+#     ├─ token == </s> → done
+#     └─ otherwise     → text_ar (continue)
+#
+# Multi-source initial state
+# --------------------------
+# `prompt_to_text` is the first FSM state that exercises the topological
+# body-execution rule: `janus_llama` has TWO incoming routing edges
+# (`vision_to_ar` and `tok_enc_to_ar`).  The runtime decrements the
+# fan-in counter on each routing edge and only executes `janus_llama`
+# after the second one has been processed — both kwargs are present in
+# ctx by the time the backbone runs.
+#
+# Permissive routing for text-only prompts
+# ----------------------------------------
+# When the user submits a text-only prompt (no image), `pixel_values` is
+# absent from the initial context.  `siglip_encode` returns `{}` — its
+# `forward` short-circuits on `pixel_values is None`.  The
+# `vision_to_ar` edge then permissively skips routing (no
+# `image_embeds` to copy) and `janus_llama` runs without
+# `und_image_embeds`.  Its `pre_forward` skips the masked_scatter
+# branch when `und_image_embeds is None`.  No errors, no special-cased
+# YAML — just permissive edges + model-side `is None` guards.
+
+generation_graph:
+  initial: prompt_to_text
+  done_state: done
+
+  states:
+    prompt_to_text:
+      # Multi-source: siglip_encode + tok_encode both feed janus_llama.
+      # The order in `body` defines edge processing order; janus_llama
+      # only executes after both `vision_to_ar` and `tok_enc_to_ar` have
+      # been processed (topological execution rule).  ar_to_tok_decode
+      # then samples the first reply token.
+      body:
+        - vision_to_ar          # siglip_encode → janus_llama (und_image_embeds)
+        - tok_enc_to_ar         # tok_encode    → janus_llama (inputs_embeds)
+        - ar_to_tok_decode      # janus_llama   → tok_decode  (hidden_states)
+        - tok_decode_sink
+      token_length: { type: fixed, value: 1 }
+      transitions:
+        - { condition: { type: token_match, token_id: 100001 }, next_state: done }   # </s> on first token
+        - { condition: { type: steps_complete }, next_state: text_ar }
+
+    text_ar:
+      # Same body shape as `infer_interleave.yaml#text_ar`, but transitions
+      # only allow termination (no <begin_of_image> path).
+      body:
+        - tok_enc_to_ar
+        - ar_to_tok_decode
+        - tok_decode_sink
+      token_length: { type: variable }
+      transitions:
+        - { condition: { type: token_match, token_id: 100001 }, next_state: done }   # </s>
+
+    done:
+      body: []
+      token_length: { type: fixed, value: 0 }
+      transitions: []

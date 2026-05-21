@@ -1,0 +1,178 @@
+# OmniModel V2 — Janus-1.3B master training YAML.
+#
+# This YAML defines the **vocabulary** the rest of the configs are built on:
+#
+#   * `tokenizer_path`     — the only global asset; raw conversation hits this
+#                            before any module sees a tensor.
+#   * `modules`            — every OmniModule the framework needs to build,
+#                            with weights paths and per-module knobs.
+#   * `nodes`              — every call-site (`module.method`) the graph
+#                            engine can dispatch to, INCLUDING ones that
+#                            only fire during inference (`emit_image_start`,
+#                            `emit_image_end`).  Inference YAMLs reference
+#                            these by name; they don't redeclare them.
+#   * `edges`              — every data-routing edge available to either
+#                            graph view (DAG / FSM).  Same rule as `nodes`:
+#                            inference-only edges live here too.
+#   * `training_graph`     — the active subset of `edges` for training; this
+#                            file selects the **joint understanding +
+#                            generation** SFT setup by default.
+#
+# This is the file used standalone for training.  For inference, also load
+# one of the sibling `infer_*.yaml` files via:
+#
+#     OmniConfig.from_yamls("train_joint.yaml", "infer_<scenario>.yaml")
+#
+# The merge is deep — the inference YAML's `generation_graph` simply paints
+# on top of the training vocabulary.  See `OmniConfig.from_yamls` for the
+# merge rules.
+#
+# Split the upstream Janus checkpoint first (creates the four sub-folders
+# referenced by `modules.*.weights_path`)::
+#
+#   python scripts/split_janus.py \
+#     --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
+#
+# Why a separate `text_embed` (model_type=janus_text_embed) module?
+# -----------------------------------------------------------------
+# * Word-token embedding (`wte`) and the LM head are vocabulary-dependent —
+#   they conceptually mirror the discrete-image VQ codec on the text side.
+#   Pulling them out of `janus_llama` lets the same graph treat text and
+#   image symmetrically (both have `encode` / `decode` nodes).
+# * Janus also needs to *emit* `<begin_of_image>` / `<end_of_image>`
+#   boundary tokens around a VQ image span.  That knowledge is
+#   model-specific (vocabulary IDs differ across model families), so the
+#   `JanusTextEmbed` subclass adds two more call-site methods —
+#   `emit_image_start` and `emit_image_end` — used by the inference
+#   bridge states (`image_vq_start` / `image_vq_end`).  The framework FSM
+#   has zero special-cased behaviour around boundary tokens.
+
+# ── Global asset (the only one) ───────────────────────────────────────────────
+tokenizer_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/tokenizer
+
+# ── Module registry ───────────────────────────────────────────────────────────
+# Module names match the registered HF model_type strings:
+#   janus_siglip / janus_vqvae / janus_llama / janus_text_embed
+# At build-time the trainer resolves each `weights_path/config.json` →
+# model_type → MODULE_MIXIN_REGISTRY[model_type] and instantiates via
+# HF `from_pretrained`.  See `veomni/models/seed_omni/modules/__init__.py`.
+modules:
+  janus_siglip:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_siglip
+    micro_batch_size: 4
+
+  janus_vqvae:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_vqvae
+    freeze_vqvae: true
+    micro_batch_size: 4
+
+  text_embed:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/text_embed
+    # `vocab_size` / `hidden_size` / `tie_word_embeddings` come from
+    # `text_embed/config.json` (written by `scripts/split_janus.py`).
+    # The split script also writes `begin_of_image_token_id` /
+    # `end_of_image_token_id` read from the actual tokenizer.
+
+  janus_llama:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_llama
+    # `image_token_id` / `gen_image_token_id` come from janus_llama/config.json
+    # (Janus 1.3B uses 100581 for both understanding and generation slots).
+    micro_batch_size: 2
+
+# ── Graph nodes (call-sites) ──────────────────────────────────────────────────
+# The same module may back multiple nodes (different methods).  Inference-only
+# nodes are declared here too — the training graph just doesn't activate them.
+nodes:
+  # ── Training & inference: shared
+  siglip_encode: { module: janus_siglip }                   # forward (training) / generate_step (inference) — both alias to encode
+
+  vae_encode: { module: janus_vqvae.encode }                # pixels → gen_embeds + vq_token_ids   (training)
+  vae_decode: { module: janus_vqvae.decode }                # unified VQ head:
+                                                            #   training:        hidden + gt_token_ids → _loss
+                                                            #   inference (FSM): hidden → sample → vq_token_id + embed
+                                                            #   inference (alt): token_id → embed (codebook lookup only)
+
+  tok_encode: { module: text_embed.encode }                 # input_ids → inputs_embeds (wte)
+  tok_decode: { module: text_embed.decode }                 # unified text head:
+                                                            #   training:  hidden_states + labels → _loss
+                                                            #   inference: hidden_states → sample → next token (input_ids)
+
+  janus_llama: { module: janus_llama }                      # backbone — no wte, no lm_head
+
+  # ── Inference-only: Janus-specific boundary-token emitters.
+  emit_image_start: { module: text_embed.emit_image_start } # produces <begin_of_image> token (id from janus_text_embed config)
+  emit_image_end:   { module: text_embed.emit_image_end }   # produces <end_of_image> token
+
+# ── Graph edges (data dependencies) ───────────────────────────────────────────
+edges:
+  # ── Training (and shared with inference where it makes sense)
+  vision_to_ar:        { from: siglip_encode, output: image_embeds, to: janus_llama, as: und_image_embeds }
+  vae_enc_to_ar:       { from: vae_encode,    output: gen_embeds,   to: janus_llama, as: gen_image_embeds }
+  tok_enc_to_ar:       { from: tok_encode,    output: inputs_embeds, to: janus_llama, as: inputs_embeds }
+  ar_to_tok_decode:    { from: janus_llama,   output: hidden_states, to: tok_decode,  as: hidden_states }
+  ar_to_vae_decode:    { from: janus_llama,   output: hidden_states, to: vae_decode,  as: hidden_states }
+  vae_token_to_decode: { from: vae_encode,    output: vq_token_ids,  to: vae_decode,  as: gt_token_ids }
+  tok_decode_sink:     { from: tok_decode,    to: end }
+  vae_decode_sink:     { from: vae_decode,    to: end }
+
+  # ── Inference-only (cyclic; not in training subset).
+  vae_decode_to_ar:    { from: vae_decode,    output: embed,         to: janus_llama, as: inputs_embeds }
+
+  # ── Inference bridge edges: emit boundary token + feed it into the LLM.
+  emit_start_to_ar:    { from: emit_image_start, output: inputs_embeds, to: janus_llama, as: inputs_embeds }
+  emit_end_to_ar:      { from: emit_image_end,   output: inputs_embeds, to: janus_llama, as: inputs_embeds }
+  emit_start_sink:     { from: emit_image_start, to: end }
+  emit_end_sink:       { from: emit_image_end,   to: end }
+
+  # ── Inference body sinks: trigger janus_llama as a body terminal in
+  #    states where the LLM updates its KV cache without any downstream
+  #    consumer in the same body (`image_vq_start`, `image_vq_end`,
+  #    `prompt_to_image`).  In training the backbone already has real
+  #    consumers (tok_decode / vae_decode), so this edge is unused
+  #    there.  Same pattern as `tok_decode_sink` / `vae_decode_sink`.
+  ar_run_sink:         { from: janus_llama, to: end }
+
+# ── Training DAG ──────────────────────────────────────────────────────────────
+# Default = Janus joint understanding + image-generation SFT.
+#
+# Active nodes are derived from these edges' endpoints (excluding `end`):
+#   sources : siglip_encode, vae_encode, tok_encode
+#   middle  : janus_llama
+#   sinks   : tok_decode, vae_decode  (both flow to `end`)
+#
+# Each module emits at most one `_loss` (token-mean over its own micro-
+# batches); OmniModel.forward sums them.  See design.md §9.
+#
+# Training-side dummy forward
+# ---------------------------
+# Every active node MUST forward on every micro-batch, including ones where
+# its primary input is missing (text-only sample → no pixel_values).  The
+# trainer fills missing kwargs from each module's `dummy_inputs(...)`
+# before dispatch, keeping FSDP DP/SP graphs aligned across ranks.  This
+# is the *only* asymmetry between training and inference: inference
+# permits empty `{}` returns and lets edge routing skip silently.
+training_graph:
+  edges:
+    - vision_to_ar
+    - vae_enc_to_ar
+    - tok_enc_to_ar
+    - ar_to_tok_decode
+    - ar_to_vae_decode
+    - vae_token_to_decode
+    - tok_decode_sink
+    - vae_decode_sink
+
+# Alternative training scenarios (override `training_graph.edges` in a
+# sibling YAML to activate a different subset):
+#
+#   A) Understanding-only SFT (no image generation)
+#        edges: [vision_to_ar, tok_enc_to_ar, ar_to_tok_decode, tok_decode_sink]
+#
+#   B) Generation-only SFT (skip vision understanding side)
+#        edges: [vae_enc_to_ar, tok_enc_to_ar, ar_to_tok_decode, ar_to_vae_decode,
+#                vae_token_to_decode, tok_decode_sink, vae_decode_sink]
+#
+#   C) Train only janus_llama + text_embed with pre-cached image embeddings
+#        edges: [tok_enc_to_ar, ar_to_tok_decode, tok_decode_sink]
+#      Batch already carries und_image_embeds / gen_image_embeds from disk.

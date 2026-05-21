@@ -1,0 +1,36 @@
+---
+title: janus_1.3b — training
+---
+flowchart TD
+    raw_batch[(raw batch)]:::io
+    losses[(losses)]:::io
+    siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::source
+    vae_encode["vae_encode<br/><i>janus_vqvae.encode</i>"]:::source
+    tok_encode["tok_encode<br/><i>text_embed.encode</i>"]:::source
+    janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::middle
+    tok_decode["tok_decode<br/><i>text_embed.decode</i>"]:::sink
+    vae_decode["vae_decode<br/><i>janus_vqvae.decode</i>"]:::sink
+    end_sink(("end")):::end_sink
+    raw_batch -.-> siglip_encode
+    raw_batch -.-> tok_encode
+    raw_batch -.-> vae_encode
+    siglip_encode -->|"image_embeds → und_image_embeds"| janus_llama
+    vae_encode -->|"gen_embeds → gen_image_embeds"| janus_llama
+    tok_encode -->|"inputs_embeds"| janus_llama
+    janus_llama -->|"hidden_states"| tok_decode
+    janus_llama -->|"hidden_states"| vae_decode
+    vae_encode -->|"vq_token_ids → gt_token_ids"| vae_decode
+    tok_decode --> end_sink
+    vae_decode --> end_sink
+    siglip_encode -.-> losses
+    vae_encode -.-> losses
+    tok_encode -.-> losses
+    janus_llama -.-> losses
+    tok_decode -.-> losses
+    vae_decode -.-> losses
+    classDef source fill:#dff,stroke:#06c,stroke-width:2px
+    classDef sink fill:#fdd,stroke:#c06,stroke-width:2px
+    classDef both fill:#efe,stroke:#693,stroke-width:2px
+    classDef middle fill:#fff,stroke:#666
+    classDef io fill:#eef,stroke:#669,stroke-dasharray:3 3
+    classDef end_sink fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3

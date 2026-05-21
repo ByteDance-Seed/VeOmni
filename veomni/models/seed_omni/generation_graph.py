@@ -5,17 +5,38 @@ The FSM drives multi-modal generation by cycling through *named states*.
 Each state specifies:
 
   body
-      An ordered list of **edge** names from the pool.  At each FSM step:
+      An ordered list of **edge** names from the pool.  Per FSM step the
+      runtime walks the body in **topological order**:
 
-      1. Every unique node appearing as ``from`` or ``to`` of an edge in
-         ``body`` (excluding the virtual :data:`~.graph.END` sink) is
-         executed exactly once, in **first-appearance order**.
-      2. Edges drive data routing: when consuming ``ctx`` for node X, every
-         edge in ``body`` with ``to: X`` injects ``ctx[edge.output] →
-         ctx[edge.as]`` from the producing node's freshly-emitted output.
-      3. Each node's output is also merged into ``ctx`` so that subsequent
-         steps (and subsequent state-iterations within the same state) see
-         it.
+      1. Pre-compute, per node ``X`` appearing in body, the count of
+         body edges with ``to: X`` (its in-body fan-in).
+      2. Walk the body edges in declaration order.  For each edge ``e``:
+
+         a. Ensure ``e.from_`` is executed.  If it has any unprocessed
+            in-body fan-in, that's a body-ordering bug — error.
+         b. Apply edge routing **permissively**: ``ctx[e.output] →
+            ctx[e.as_]`` only if ``e.output`` is currently in ``ctx``.
+            When the source node returned ``{}`` (e.g. SigLIP with no
+            ``pixel_values`` on a text-only inference prompt) the
+            routing silently skips — the destination still executes.
+         c. Decrement ``e.to``'s pending fan-in.  When it hits zero
+            (i.e. all body edges into ``e.to`` have been processed),
+            execute ``e.to``.
+
+      This rule generalises "first-encounter execution":
+
+        * For purely linear bodies (e.g. ``text_ar`` =
+          ``tok_enc → llama → tok_dec``) it executes every node exactly
+          once, in declaration order.
+        * For multi-source nodes (e.g. understanding/I2T where
+          ``janus_llama`` consumes both ``inputs_embeds`` and
+          ``und_image_embeds``) the backbone executes only after the
+          last incoming routing edge has fired — both inputs are
+          present in ``ctx`` first.
+        * For self-feedback bodies (``image_vq`` =
+          ``ar_to_vae_dec, vae_dec_to_ar``) the second edge re-routes
+          ``vae_decode``'s output back into ``inputs_embeds`` for the
+          next iteration's ``janus_llama`` call.
 
       An edge with ``to: end`` is purely declarative — it pins the producing
       node into the active set without routing anywhere.
@@ -282,26 +303,36 @@ class GenerationGraph:
     ) -> Dict[str, Any]:
         """Execute one iteration of the current state.
 
-        Per the design doc (§5 "FSM 一步执行规则"):
+        Algorithm (topological body execution, see module-doc §"body"):
 
-          1. Walk ``state.body`` edges in declaration order.
-          2. The first time we encounter an edge endpoint (``from_`` then
-             ``to``), execute that node — passing the **current ctx** as
-             kwargs.  Merge its returned dict back into ``ctx`` so all
-             subsequent edges and subsequent iterations observe it.
-          3. After (or in lieu of) executing the ``from_`` node, apply the
-             edge routing ``ctx[output] → ctx[as]`` so the ``to`` node sees
-             a properly-renamed kwarg.
-          4. ``end`` is a virtual sink and is never executed.
-          5. The same node never re-executes within one step — repeat
-             encounters only contribute routing.
+        1. Compute ``pending[X]`` = number of body edges with ``to: X``
+           for every node ``X`` in the body's node sequence.  Nodes with
+           ``pending == 0`` are body sources — they execute on first
+           sight as ``edge.from_``.
+        2. Walk ``state.body`` edges in declaration order.  For each
+           edge ``e``:
+
+           a. If ``e.from_`` hasn't been executed yet, execute it now.
+              (If it still has unprocessed in-body fan-in, that's a
+              body-ordering bug — raise.)
+           b. Apply permissive routing: ``ctx[e.output] → ctx[e.as_]``
+              **only if** ``e.output`` is in ``ctx``.  An absent key
+              means the source returned ``{}`` (e.g. SigLIP with no
+              ``pixel_values``); the routing silently skips and the
+              destination still executes when its other inputs land.
+           c. Decrement ``pending[e.to]``.  When it reaches zero (and
+              ``e.to`` is not ``end`` and not yet executed), execute it.
+
+        ``end`` is a virtual sink and is never executed; an edge with
+        ``to: end`` only pins its ``from_`` node into the active set.
+        The same node never re-executes within one step.
 
         Method dispatch: a node whose declared method is ``forward``
         invokes ``module.generate_step``; any other method name dispatches
-        as-is (e.g. ``vqvae.decode``).  This keeps the same node usable for
-        both the training DAG (``forward``/explicit method) and the
-        inference FSM (``generate_step``/explicit method) without YAML
-        duplication.
+        as-is (e.g. ``vqvae.decode``, ``text_embed.emit_image_start``).
+        This keeps the same node usable for both the training DAG
+        (``forward``/explicit method) and the inference FSM
+        (``generate_step``/explicit method) without YAML duplication.
 
         Parameters
         ----------
@@ -326,9 +357,45 @@ class GenerationGraph:
         state = self._current_state
         executed: set = set()
 
+        # Per-node first appearance as `from_` in body — distinguishes
+        # **feed-forward** edges (with `to: X` *before* X's first `from_`
+        # position; these must complete before X runs) from
+        # **post-execution feedback** edges (after; they only update ctx
+        # for the next iteration / state).  Nodes that never appear as
+        # `from_` in body get ``len(body)`` so every incoming edge
+        # counts as feed-forward — this is the "to-only sink" case
+        # (e.g. ``run_ar`` in ``image_vq_start`` whose body is
+        # ``[emit_start_to_ar, ar_run_sink]`` — ``ar_run_sink`` triggers
+        # ``run_ar``).
+        first_from_idx: Dict[str, int] = {}
+        for i, e in enumerate(state.body):
+            if not is_end(e.from_) and e.from_ not in first_from_idx:
+                first_from_idx[e.from_] = i
+
+        # Feed-forward fan-in count per node (only edges before the
+        # node's first `from_` appearance).  Used to gate execution and
+        # to detect body-order bugs (a node about to run as `from_`
+        # whose pending > 0 means an upstream feed-forward edge appears
+        # later than expected).
+        pending: Dict[str, int] = dict.fromkeys(state.node_sequence, 0)
+        for i, e in enumerate(state.body):
+            if is_end(e.to):
+                continue
+            fi = first_from_idx.get(e.to, len(state.body))
+            if i < fi:
+                pending[e.to] += 1
+
         def _run(node_name: str) -> None:
             if is_end(node_name) or node_name in executed:
                 return
+            if pending.get(node_name, 0) > 0:
+                raise RuntimeError(
+                    f"FSM step (state '{state.name}'): node '{node_name}' is being "
+                    f"executed before all of its feed-forward in-body inputs have "
+                    f"been routed (pending={pending[node_name]}). Re-order the body "
+                    f"so every edge feeding '{node_name}' precedes its first "
+                    f"appearance as a source."
+                )
             node = self._node_pool[node_name]
             module = modules.get(node.module)
             if module is None:
@@ -348,11 +415,31 @@ class GenerationGraph:
             ctx.update(out)
             executed.add(node_name)
 
-        for edge in state.body:
+        for i, edge in enumerate(state.body):
+            # 1. Execute the source node (idempotent for repeated `from_`).
             _run(edge.from_)
-            if edge.output_key is not None and edge.as_ is not None and edge.output_key in ctx:
+
+            # 2. Permissive routing — skip if the source returned no such
+            #    key (or returned None for it; downstream treats both as
+            #    absent).  This is the "no input → empty dict" inference
+            #    fast-path: e.g. SigLIP with no `pixel_values` returns
+            #    ``{}``; the routing edge silently drops; the destination
+            #    still executes when its other inputs land.
+            if (
+                edge.output_key is not None
+                and edge.as_ is not None
+                and edge.output_key in ctx
+                and ctx[edge.output_key] is not None
+            ):
                 ctx[edge.as_] = ctx[edge.output_key]
-            _run(edge.to)
+
+            # 3. Decrement the destination's feed-forward pending count;
+            #    if the node has no later appearance as a source (it's a
+            #    body sink), trigger it now once all its inputs are in.
+            if not is_end(edge.to):
+                fi = first_from_idx.get(edge.to, len(state.body))
+                if i < fi:
+                    pending[edge.to] -= 1
 
         self._steps_in_state += 1
         return ctx

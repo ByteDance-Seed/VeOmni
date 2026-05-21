@@ -1,0 +1,74 @@
+# Janus-1.3B inference — text-to-image only (no preceding text generation).
+#
+# Use::
+#
+#   OmniConfig.from_yamls(
+#       "configs/seed_omni/janus_1.3b/train_joint.yaml",
+#       "configs/seed_omni/janus_1.3b/infer_t2i.yaml",
+#   )
+#
+# Flow
+# ----
+#   prompt_to_image  (1 step: encode prompt input_ids, run AR once on the
+#                    *full* prompt, no token sampling — the next state
+#                    consumes the AR's hidden states directly.)
+#     → image_vq_start (1 step: emit <begin_of_image>, AR once)
+#     → image_vq       (576 steps: AR ↔ vae_decode feedback)
+#     → image_vq_end   (1 step: emit <end_of_image>, AR once)
+#     → done           (no subsequent text generation in T2I-only mode)
+#
+# The user prompt is provided as `input_ids` in the initial generation
+# context; `prompt_to_image` runs `tok_encode → janus_llama` once over the
+# whole prompt to populate the KV cache, then the bridge state appends
+# the boundary token and the FSM enters the VQ loop.
+
+generation_graph:
+  initial: prompt_to_image
+  done_state: done
+
+  states:
+    prompt_to_image:
+      # One pass over the user prompt: tok_encode → janus_llama.  We DO NOT
+      # decode here — the goal is to seed the LLM's KV cache with the
+      # prompt before the first <begin_of_image> token.  ar_to_tok_decode
+      # is intentionally absent; ar_run_sink triggers janus_llama as a
+      # body terminal.
+      body:
+        - tok_enc_to_ar       # tok_encode  → janus_llama
+        - ar_run_sink         # leaf — triggers janus_llama
+      token_length: { type: fixed, value: 1 }
+      transitions:
+        - { condition: { type: steps_complete }, next_state: image_vq_start }
+
+    image_vq_start:
+      body:
+        - emit_start_to_ar    # emit_image_start → janus_llama
+        - emit_start_sink
+        - ar_run_sink         # leaf — triggers janus_llama
+      token_length: { type: fixed, value: 1 }
+      transitions:
+        - { condition: { type: steps_complete }, next_state: image_vq }
+
+    image_vq:
+      body:
+        - ar_to_vae_decode
+        - vae_decode_to_ar
+      token_length: { type: fixed, value: 576 }
+      transitions:
+        - { condition: { type: steps_complete }, next_state: image_vq_end }
+
+    image_vq_end:
+      # Janus T2I-only: emit <end_of_image> for symmetry, then stop.  No
+      # transition back to text_ar (this scenario never produces text).
+      body:
+        - emit_end_to_ar
+        - emit_end_sink
+        - ar_run_sink
+      token_length: { type: fixed, value: 1 }
+      transitions:
+        - { condition: { type: steps_complete }, next_state: done }
+
+    done:
+      body: []
+      token_length: { type: fixed, value: 0 }
+      transitions: []

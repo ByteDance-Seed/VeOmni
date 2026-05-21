@@ -1,7 +1,7 @@
 """
 Visualize an OmniModel config as Mermaid diagrams.
 
-Two diagrams are produced from a single OmniConfig:
+Two diagrams are produced from one or more OmniConfig YAMLs:
 
 * **Training graph**: ``TrainingGraph.to_mermaid()`` — a ``flowchart TD`` over
   active call-site nodes and edges.  Active nodes are derived from the
@@ -11,29 +11,39 @@ Two diagrams are produced from a single OmniConfig:
   ``stateDiagram-v2`` over generation states.  Each state's label lists the
   derived node-execution sequence (unique edge endpoints, excluding
   ``end``, in declaration order).  Skipped when ``generation_graph`` is
-  absent from the config.
+  absent from the merged config.
+
+YAML composition
+----------------
+SeedOmni V2 splits configuration into a master training YAML and (optional)
+inference YAMLs that only carry a ``generation_graph``.  Pass them in
+order — later files deep-merge over earlier ones (``OmniConfig.from_yamls``).
 
 Usage
 -----
-  # Print Mermaid syntax to stdout (paste into https://mermaid.live to view).
-  # Both diagrams are emitted, separated by a blank line.
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b.yaml
+  # Training-only (single file): renders the DAG; FSM is skipped if absent.
+  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/train_joint.yaml
+
+  # Training + inference scenario (renders both DAG and FSM).
+  python scripts/visualize_omni_graph.py \\
+      configs/seed_omni/janus_1.3b/train_joint.yaml \\
+      configs/seed_omni/janus_1.3b/infer_interleave.yaml
 
   # Render a standalone HTML file (open in any browser) — both diagrams stacked.
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b.yaml -o /tmp/janus.html
+  python scripts/visualize_omni_graph.py train.yaml infer.yaml -o /tmp/janus.html
 
   # Save to .md (two fenced blocks) or .mmd (single mermaid; also writes a
   # sibling .fsm.mmd when an FSM is present).
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b.yaml -o graph.mmd
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b.yaml -o graph.md
+  python scripts/visualize_omni_graph.py train.yaml infer.yaml -o graph.mmd
+  python scripts/visualize_omni_graph.py train.yaml infer.yaml -o graph.md
 
   # Compact view without the dashed raw_batch / losses pseudo-nodes (training
   # graph only — FSM diagram is unaffected).
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b.yaml --no-io
+  python scripts/visualize_omni_graph.py train.yaml --no-io
 
   # Restrict to one diagram.
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b.yaml --only train
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b.yaml --only fsm
+  python scripts/visualize_omni_graph.py train.yaml infer.yaml --only train
+  python scripts/visualize_omni_graph.py train.yaml infer.yaml --only fsm
 """
 
 from __future__ import annotations
@@ -42,8 +52,6 @@ import argparse
 import sys
 from pathlib import Path
 from typing import List, Tuple
-
-import yaml
 
 from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
 from veomni.models.seed_omni.generation_graph import GenerationGraph
@@ -91,9 +99,14 @@ _HTML_SECTION = """  <h2>{heading}</h2>
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "config",
+        "configs",
         type=Path,
-        help="Path to OmniModel config YAML (with modules / nodes / edges / training_graph / generation_graph)",
+        nargs="+",
+        help=(
+            "One or more OmniModel YAML paths. Pass the master training YAML first; "
+            "subsequent YAMLs deep-merge over it (typically `infer_*.yaml` files that "
+            "only carry a `generation_graph`)."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -107,7 +120,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Compact view: drop the dashed raw_batch and losses pseudo-nodes (training graph only).",
     )
-    parser.add_argument("--title", type=str, default=None, help="Diagram title (default: config file stem).")
+    parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Diagram title (default: stem of the last YAML, joined with '+').",
+    )
     parser.add_argument(
         "--only",
         choices=("train", "fsm", "both"),
@@ -119,18 +137,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
-    cfg_path: Path = args.config
-    if not cfg_path.exists():
-        sys.exit(f"config not found: {cfg_path}")
+    cfg_paths: List[Path] = list(args.configs)
+    for p in cfg_paths:
+        if not p.exists():
+            sys.exit(f"config not found: {p}")
 
-    cfg = OmniConfig.from_dict(yaml.safe_load(cfg_path.read_text()))
+    cfg = OmniConfig.from_yamls(*cfg_paths)
     graph = TrainingGraph(
         nodes=cfg.nodes,
         edges=cfg.edges,
         training_edges=cfg.training_edges,
     )
 
-    title = args.title or cfg_path.stem
+    title = args.title or "+".join(p.stem for p in cfg_paths)
 
     diagrams: List[Tuple[str, str]] = []  # (heading, mermaid_body)
 
