@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-Omni-MoE transformers>=5.2.0 code generation.
+Patch configuration for Qwen3-Omni-MoE transformers>=5.8.1 code generation.
 
 Covers the thinker training path (text + vision + audio + MoE):
   - Vision SP slicing with pad_scale=4 + varlen-aware attention

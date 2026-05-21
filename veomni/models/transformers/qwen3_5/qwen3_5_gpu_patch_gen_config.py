@@ -38,7 +38,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutp
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Config,
-    Qwen3_5DynamicCache,
     Qwen3_5Model,
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
@@ -306,7 +305,7 @@ def qwen3_5_gated_deltanet_get_local_conv1d_weight(
 def qwen3_5_gated_deltanet_forward_patched(
     self,
     hidden_states: torch.Tensor,
-    cache_params: Qwen3_5DynamicCache | None = None,
+    cache_params: Cache | None = None,
     cache_position: torch.LongTensor | None = None,
     attention_mask: torch.Tensor | None = None,
     # Modification: plumb varlen sequence metadata to FLA kernels.
@@ -1090,6 +1089,9 @@ def qwen3_5_model_forward(
     # via all_gather to compute them locally.
     image_mask = kwargs.get("image_mask", None)
     video_mask = kwargs.get("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
 
     # if None, calculate mask
     if video_mask is None and image_mask is None:
@@ -1208,6 +1210,17 @@ def qwen3_5_model_forward(
     # --- Patch.1 ---
 
     if position_ids is None:
+        # v5 `compute_3d_position_ids` raises unless `mm_token_type_ids` is
+        # supplied alongside multimodal grids; derive it from `input_ids`
+        # when the caller did not pass it.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                input_ids, self.config
+            )
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -1215,6 +1228,7 @@ def qwen3_5_model_forward(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
     else:
         # --- Patch.3: Transpose pre-computed position_ids if they follow VeOmni collation format ---
@@ -1370,8 +1384,30 @@ class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
 
 
 @config.add_helper
+def mm_token_type_ids_from_input_ids(input_ids, config):
+    # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
+    # RoPE (M-RoPE): text=0, image=1, video=2 per token. HF's processor emits
+    # it; VeOmni's data pipeline carries modality only via the multimodal
+    # token ids inside `input_ids`, so derive the type ids from those here.
+    # `config` selects the token-id namespace and must match `input_ids`: the
+    # live model config on the `forward` path, the IMAGE/VIDEO_INPUT_INDEX fake
+    # config in the `get_position_id` precompute path. Do not unify the two
+    # call sites onto one config.
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[input_ids == config.image_token_id] = 1
+    mm_token_type_ids[input_ids == config.video_token_id] = 2
+    return mm_token_type_ids
+
+
+@config.add_helper
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
+    # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
+    # `input_ids` when the data pipeline did not pass it explicitly.
+    if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
+        kwargs["mm_token_type_ids"] = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+            kwargs["input_ids"], self.config
+        )
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 

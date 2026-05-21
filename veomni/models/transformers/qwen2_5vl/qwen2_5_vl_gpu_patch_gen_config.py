@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen2.5-VL transformers>=5.2.0 code generation.
+Patch configuration for Qwen2.5-VL transformers>=5.8.1 code generation.
 
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen2_5vl.qwen2_5_vl_gpu_patch_gen_config -o veomni/models/transformers/qwen2_5vl/generated --diff

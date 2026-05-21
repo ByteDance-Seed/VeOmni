@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE transformers>=5.2.0 code generation.
+Patch configuration for Qwen3-VL-MoE transformers>=5.8.1 code generation.
 
 Reuses the full set of qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
 (vision SP, deepstack, async Ulysses attention, precomputed position-ids, fused
@@ -294,6 +294,9 @@ def qwen3_vl_moe_model_forward_patched(
     # --- Patch.2 ---
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     if video_mask is None and image_mask is None:
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
@@ -460,6 +463,17 @@ def qwen3_vl_moe_model_forward_patched(
                 "is enabled; multimodal position_ids must be precomputed via "
                 "`get_position_id_func` in the VeOmni data pipeline."
             )
+        # v5 `compute_3d_position_ids` raises unless `mm_token_type_ids` is
+        # supplied alongside multimodal grids; derive it from `input_ids`
+        # when the caller did not pass it.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                input_ids, self.config
+            )
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -467,6 +481,7 @@ def qwen3_vl_moe_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask_tensor,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
         # --- Patch.5 ---
     else:
