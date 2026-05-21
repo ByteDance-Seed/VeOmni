@@ -25,6 +25,7 @@ python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qw
 import torch
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
@@ -143,6 +144,12 @@ config.override_method(
     replacement=qwen3_vl_get_position_id_func_patched,
     name_map=_NAME_MAP,
     description="Use VeOmni precomputed position-id function and unified multimodal token ids",
+)
+config.override_method(
+    "Qwen3VLMoeForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_vl_get_metadata_collate_func_patched,
+    name_map=_NAME_MAP,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 
 # MoE-specific patches reused verbatim from the GPU config.

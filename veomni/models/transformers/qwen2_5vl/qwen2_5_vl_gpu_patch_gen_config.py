@@ -224,6 +224,18 @@ def qwen2_5_vit_forward_patched(
     grid_thw: torch.Tensor,
     **kwargs,
 ) -> BaseModelOutputWithPooling:
+    # qwen2_5_vl ViT has a window-attention path (cu_window_seqlens) on top
+    # of the cu_seqlens path. Its cu_window_seqlens depends on the
+    # spatial-merge window index and isn't trivially collator-derivable, so
+    # this ViT doesn't yet consume the precomputed multimodal_metadata. Pop
+    # the vit_* kwargs here so they don't leak into the per-block call
+    # below; ignoring them is safe because the in-forward derivation is the
+    # same value the collator would produce.
+    # See .agents/knowledge/multimodal_metadata.md.
+    kwargs.pop("vit_grid_thw_list", None)
+    kwargs.pop("vit_cu_seqlens", None)
+    kwargs.pop("vit_max_seqlen", None)
+
     hidden_states = self.patch_embed(hidden_states)
     rotary_pos_emb = self.rot_pos_emb(grid_thw)
     window_index, cu_window_seqlens = self.get_window_index(grid_thw)
@@ -519,6 +531,16 @@ def qwen2_5_vl_model_forward_patched(
         if key in kwargs:
             flash_attn_kwargs[key] = kwargs.pop(key)
     # --- Patch.3 ---
+
+    # --- Patch.7 ---
+    # Drain ``multimodal_metadata`` from kwargs even though qwen2_5_vl's ViT
+    # doesn't yet consume the precomputed cu_seqlens (its window-attention
+    # path adds complexity that's deferred to a follow-up). Popping here
+    # prevents the dict from leaking through ``**kwargs`` into downstream
+    # transformers code that doesn't expect it.
+    # See .agents/knowledge/multimodal_metadata.md.
+    kwargs.pop("multimodal_metadata", None)
+    # --- Patch.7 ---
 
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:

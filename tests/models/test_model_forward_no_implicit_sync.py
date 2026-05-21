@@ -237,84 +237,66 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
     "the data collator and skip the call; out-of-scope for this PR."
 )
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
-    # qwen3_vl-fa2: 4 algorithm-essential sites from this branch's perf fix
-    # (one D2H `grid_thw.tolist()` per call replaces ~5 per-image syncs; the
-    # `torch.tensor(host_list, device=cuda)` calls are H2D copies that PyTorch's
-    # sync-debug mode over-reports per the debug-cuda-sync skill's notes) plus
-    # 7 algorithm-essential `get_rope_index` sites (HF-verbatim but inherent to
-    # the variable-shape mrope algorithm; see the long comment above
-    # `_ALG_ESSENTIAL_VL_GET_ROPE_INDEX` for why the in-place override was
-    # reverted and the collator-side fix that's tracked as follow-up).
+    # qwen3_vl-fa2: Stage 1 (multimodal_metadata_precompute) wired the ViT
+    # forward to read precomputed `vit_image_cu_seqlens` / `vit_image_max_seqlen`
+    # / `image_grid_thw_list`, so the toy test (via _attach_multimodal_metadata
+    # above) skips the fallback `.tolist()` + host-side cu_seqlens build that
+    # used to fire ~4 syncs. What remains:
+    #  - 1 algorithm-essential `rot_pos_ids(...).to(device)` H2D copy in
+    #    rot_pos_emb (CPU-side lru_cached helper output, over-reported by
+    #    sync-debug mode per the debug-cuda-sync skill notes).
+    #  - 6 algorithm-essential `get_rope_index` sites (HF-verbatim mrope
+    #    algorithm; see the long comment above _ALG_ESSENTIAL_VL_GET_ROPE_INDEX
+    #    for why the in-place override was reverted and the collator-side fix
+    #    tracked as follow-up).
     "qwen3_vl-fa2": {
-        ("patched_modeling_qwen3_vl_gpu.py", 909): (
-            "algorithm-essential: one D2H `grid_thw.tolist()` materialises shape metadata for "
-            "the host-side rot_pos_emb loop; replaces ~5 per-image syncs inside the loop."
+        ("patched_modeling_qwen3_vl_gpu.py", 983): (
+            "algorithm-essential: `rot_pos_ids(...).to(device)` H2D copy of a CPU tensor "
+            "returned by the lru_cached helper; over-reported by torch sync-debug mode."
         ),
-        ("patched_modeling_qwen3_vl_gpu.py", 919): (
-            "algorithm-essential: `rot_pos_ids(...).to(device)` is an H2D copy of a CPU "
-            "tensor returned by the lru_cached helper; over-reported by torch sync-debug mode."
-        ),
-        ("patched_modeling_qwen3_vl_gpu.py", 1027): (
-            "algorithm-essential: one D2H `grid_thw.tolist()` per ViT forward; reused for "
-            "fast_pos_embed_interpolate + host-side cu_seqlens build (replaces ~5 syncs)."
-        ),
-        ("patched_modeling_qwen3_vl_gpu.py", 1049): (
-            "algorithm-essential: `torch.tensor(cu_seqlens_list, device=cuda)` H2D copy; "
-            "not a wait-on-device sync per debug-cuda-sync skill gotchas."
-        ),
-        ("patched_modeling_qwen3_vl_gpu.py", 1384): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1405): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1407): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1411): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1415): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1453): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1455): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1465): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1486): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1488): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1492): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1496): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1534): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1536): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_vl_moe-fa2-fused: mirrors qwen3_vl (the moe config imports the
     # vision forward / rot_pos_emb / fast_pos_embed_interpolate helpers from
     # qwen3_vl and registers its own Model.forward + get_rope_index).
     "qwen3_vl_moe-fa2-fused": {
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 954): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 909 (rot_pos_emb tolist)."
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1028): (
+            "algorithm-essential: see qwen3_vl-fa2 (rot_pos_ids H2D copy)."
         ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 964): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 919 (rot_pos_ids H2D copy)."
-        ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1072): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 1027 (ViT forward tolist)."
-        ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1094): (
-            "algorithm-essential: see qwen3_vl-fa2 entry for line 1049 (cu_seqlens H2D copy)."
-        ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1574): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1595): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1597): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1601): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1605): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1643): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1645): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1655): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1676): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1678): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1682): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1686): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1724): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1726): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
-    # qwen3_omni_moe-fa2-fused: all 6 remaining sites are algorithm-essential
-    # `tolist` / `torch.tensor(host_list, device=cuda)` patterns from this
-    # branch's perf fix to the vision forward + fast_pos_embed_interpolate.
+    # qwen3_omni_moe-fa2-fused: Stage 2 (multimodal_metadata_precompute) wired
+    # the omni ViT forward to consume the precomputed cu_seqlens / max_seqlen,
+    # so the ViT's own `.tolist()` + `torch.tensor(cu_seqlens_list)` fallback
+    # syncs are gone. The omni ViT still calls upstream-HF
+    # `fast_pos_embed_interpolate` / `rot_pos_emb` with the GPU `grid_thw`
+    # tensor (those helpers were not migrated to the host list — unlike
+    # qwen3_vl), so 4 algorithm-essential D2H/H2D sites remain, documented
+    # in PR #764. Full omni ViT-helper migration is tracked as follow-up.
     "qwen3_omni_moe-fa2-fused": {
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1220): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1282): (
             "algorithm-essential: D2H `grid_thw.tolist()` for rot_pos_emb host-side loop."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1259): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1321): (
             "algorithm-essential: D2H `grid_thw.tolist()` for fast_pos_embed_interpolate."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1301): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1363): (
             "algorithm-essential: `torch.tensor(idx_list, device=cuda)` H2D copy; over-reported."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1302): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1364): (
             "algorithm-essential: `torch.tensor(weight_list, device=cuda)` H2D copy; over-reported."
-        ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1345): (
-            "algorithm-essential: D2H `grid_thw.tolist()` per ViT forward (one-shot)."
-        ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1365): (
-            "algorithm-essential: `torch.tensor(cu_seqlens_list, device=cuda)` H2D copy."
         ),
     },
 }
@@ -342,6 +324,57 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
 #   qwen3_omni_moe-fa2-fused (3 sites):
 #     patched_modeling_qwen3_omni_moe_gpu.py:1351,1362,2406  forward paths
 _PENDING_FIX_CASES: dict[str, str] = {}
+
+
+# Cases that have been wired to consume ``multimodal_metadata`` via the
+# patched ViT / Model forwards (see
+# .agents/knowledge/multimodal_metadata.md). For these, the test attaches
+# a metadata dict to ``fwd_kwargs`` mirroring what VeOmni's MainCollator
+# would emit in real training, so the consumer fast path is exercised
+# and the corresponding fallback-path syncs disappear from the allowlist.
+_MM_METADATA_WIRED_CASES: set[str] = {
+    "qwen3_vl-fa2",
+    "qwen3_vl_moe-fa2-fused",
+    "qwen3_omni_moe-fa2-fused",
+}
+
+
+def _attach_multimodal_metadata(case: Case, fwd_kwargs: dict) -> None:
+    """Inject a synthetic ``multimodal_metadata`` dict for opted-in cases.
+
+    Builds the same fields the model's ``collate_multimodal_metadata``
+    hook (returned by ``get_metadata_collate_func``) would produce for the
+    toy single-image input used by ``_make_inputs`` (1 image with
+    ``grid_thw == [[1, m, m]]``). No-op for cases that haven't been wired
+    in their model patches yet.
+    """
+    if case.case_id not in _MM_METADATA_WIRED_CASES:
+        return
+    image_grid_thw = fwd_kwargs.get("image_grid_thw")
+    if image_grid_thw is None:
+        return
+    # ``_make_inputs`` builds an image-only toy multimodal input (dummy 2x2
+    # image, no video). This helper therefore only synthesises the
+    # ``vit_image_*`` keys. If a future toy input adds ``pixel_values_videos``
+    # the video ViT path would silently take the runtime fallback — assert
+    # the invariant so that change can't pass unnoticed.
+    assert "pixel_values_videos" not in fwd_kwargs, (
+        "_attach_multimodal_metadata only synthesises image metadata; "
+        "extend it for vit_video_* before adding a video toy input."
+    )
+    image_grid_thw_list = image_grid_thw.tolist()
+    cu_list = [0]
+    max_hw = 0
+    for t, h, w in image_grid_thw_list:
+        hw = h * w
+        max_hw = max(max_hw, hw)
+        for _ in range(t):
+            cu_list.append(cu_list[-1] + hw)
+    fwd_kwargs["multimodal_metadata"] = {
+        "image_grid_thw_list": image_grid_thw_list,
+        "vit_image_cu_seqlens": torch.tensor(cu_list, dtype=torch.int32, device=image_grid_thw.device),
+        "vit_image_max_seqlen": max_hw,
+    }
 
 
 # torch's implicit-sync warning message; emitted by
@@ -450,6 +483,15 @@ def test_no_implicit_sync_in_generated_forward(case):
     dtype = _DTYPE_MAP[case.dtype]
     config = _make_config(case)
     input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+    # Augment toy inputs with the multimodal_metadata that VeOmni's
+    # MainCollator would produce in real training. This exercises the
+    # precompute consumer path in patched Model.forward / ViT.forward,
+    # mirroring the contract documented in
+    # .agents/knowledge/multimodal_metadata.md. Cases that opt in here
+    # have their corresponding ViT-side fallback syncs removed from the
+    # allowlist below; cases that haven't been wired in patch_gen_config
+    # yet keep the fallback entries in ``_ALLOWED_SYNCS``.
+    _attach_multimodal_metadata(case, fwd_kwargs)
 
     model = _build_veomni_model(case, config)
     target = _forward_target(model, case)
