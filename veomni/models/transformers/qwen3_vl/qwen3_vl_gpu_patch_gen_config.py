@@ -240,6 +240,61 @@ def get_position_id(main_func, self, **kwargs):
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
+@config.add_helper
+def collate_multimodal_metadata(batch, sp_pad):
+    """Derive ``multimodal_metadata`` for the Qwen3-VL-family ViT.
+
+    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
+    collator as a picklable callable (mirrors ``get_position_id``). Runs
+    purely on CPU inside the collator after SP padding — every value it
+    produces (CPU int tensors / Python ints / lists) is consumed by the ViT
+    forward without a host-device sync.
+
+    ``batch`` is the packed (+ SP-padded) batch dict; ``sp_pad`` maps
+    ``pixel_values`` / ``pixel_values_videos`` to the number of patch rows
+    the SP collator appended. Mutates ``batch`` in place, writing
+    ``batch["multimodal_metadata"]``.
+    """
+    md = {}
+    # *_grid_thw_list: Python list[[t, h, w]] flattened across the batch by
+    # PackingCollator. Carried through verbatim for the ViT / Model forward.
+    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
+        if list_key in batch:
+            md[list_key] = batch.pop(list_key)
+
+    # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
+    # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.
+    for modality, list_key, pad_key in (
+        ("image", "image_grid_thw_list", "pixel_values"),
+        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    ):
+        grid_list = md.get(list_key)
+        if not grid_list:
+            continue
+        cu = [0]
+        max_hw = 0
+        for t, h, w in grid_list:
+            hw = h * w
+            max_hw = max(max_hw, hw)
+            for _ in range(t):
+                cu.append(cu[-1] + hw)
+        # SP-pad tail: the collator zero-pads pixel_values to SP-divisible;
+        # those patches become one synthetic "image" so varlen attention
+        # treats them as an independent sequence (mirrors the position_ids==0
+        # text-side SP-pad convention). Discarded after the per-rank slice.
+        pad = sp_pad.get(pad_key, 0)
+        if pad > 0:
+            cu.append(cu[-1] + pad)
+            max_hw = max(max_hw, pad)
+        # device='cpu': this runs in CPU dataloader workers — pin to CPU so a
+        # global torch.set_default_device('cuda') can't misallocate it.
+        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        md[f"vit_{modality}_max_seqlen"] = max_hw
+
+    if md:
+        batch["multimodal_metadata"] = md
+
+
 # ================================================================
 # Patch: Qwen3VLVisionAttention.forward
 # 1. accept precomputed max_seqlen from outer forward so the
@@ -363,16 +418,20 @@ def qwen3_vl_vision_block_forward_patched(
     "Qwen3VLVisionModel.rot_pos_emb",
     description="Use lru_cached rot_pos_ids helper (vllm-style) to avoid per-image Python loops",
 )
-def qwen3_vl_vision_rot_pos_emb_patched(self, grid_thw: torch.Tensor) -> torch.Tensor:
+def qwen3_vl_vision_rot_pos_emb_patched(self, grid_thw) -> torch.Tensor:
     # --- Patch.1 ---
     merge_size = self.spatial_merge_size
 
-    # Modification: materialise grid_thw to a host list once and derive everything from it.
-    # Unpatched path forced ~5 syncs/forward: `grid_thw[:, 1:].max().item()`,
-    # `torch.prod(grid_thw, dim=1).sum().item()`, `for ... in grid_thw` (iterating GPU tensor),
-    # `if num_frames > 1` (0-D GPU `if`), plus the `int(h.item())` calls inside rot_pos_ids when
-    # passed GPU 0-D scalars. Now all derived from Python ints — 0 syncs.
-    grid_thw_list = grid_thw.tolist()
+    # Modification: derive everything from a host list. Accepts either a
+    # Python list (the patched ViT `forward` passes one in directly — sourced
+    # from `multimodal_metadata["image_grid_thw_list"]` or, fallback, a
+    # one-shot `.tolist()` at the top of the ViT forward) or a tensor (for
+    # external callers — unit tests, ad-hoc scripts). Unpatched path forced
+    # ~5 syncs/forward (`grid_thw[:, 1:].max().item()`,
+    # `torch.prod(grid_thw, dim=1).sum().item()`, `for ... in grid_thw`,
+    # `if num_frames > 1`, plus per-image `int(h.item())` inside rot_pos_ids
+    # when passed GPU 0-D scalars). Now: 0 syncs.
+    grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
     max_hw = max(max(h, w) for _, h, w in grid_thw_list)
     freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
     device = freq_table.device
@@ -488,17 +547,20 @@ def qwen3_vl_vision_forward_patched(
     grid_thw: torch.Tensor,
     **kwargs: Unpack[TransformersKwargs],
 ) -> BaseModelOutputWithDeepstackFeatures:
+    # Precomputed metadata, unpacked by Model.forward from `multimodal_metadata`.
+    # All optional with runtime fallback (third-party callers / ad-hoc tests).
+    # See .agents/knowledge/multimodal_metadata.md for the contract.
+    precomputed_grid_thw_list = kwargs.pop("vit_grid_thw_list", None)
+    precomputed_cu_seqlens = kwargs.pop("vit_cu_seqlens", None)
+    precomputed_max_seqlen = kwargs.pop("vit_max_seqlen", None)
+
     hidden_states = self.patch_embed(hidden_states)
 
-    # Modification: materialise `grid_thw` to a host list once and reuse for everything that
-    # needs t/h/w as Python ints (`fast_pos_embed_interpolate` and the `cu_seqlens` /
-    # `total_seq_len` build below). Unpatched paths derive shape metadata straight off the GPU
-    # `grid_thw` tensor — `torch.repeat_interleave(..., grid_thw[:, 0]).cumsum(0)` (GPU `repeats`
-    # → sync), `rotary_pos_emb.reshape(cu_seqlens[-1])` and
-    # `pad_seq_len = ... - total_seq_len.item()` (0-D GPU scalar → sync) — and iterating the GPU
-    # tensor in `fast_pos_embed_interpolate` forced several `.item()`s per image. After this:
-    # one `grid_thw.tolist()` here, plus the one still inside `rot_pos_emb`.
-    grid_thw_list = grid_thw.tolist()
+    # Prefer the precomputed Python list (emitted by data pipeline). Fallback
+    # `grid_thw.tolist()` covers callers that bypass MainCollator.
+    grid_thw_list = precomputed_grid_thw_list
+    if grid_thw_list is None:
+        grid_thw_list = grid_thw.tolist()
 
     pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
@@ -509,24 +571,33 @@ def qwen3_vl_vision_forward_patched(
 
     hidden_states = hidden_states + pos_embeds
 
-    # Modification: build cu_seqlens on the host from `grid_thw_list` (was
-    # `torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(0)`, whose
-    # GPU-tensor `repeats` argument forces a sync to size the output). `total_seq_len` becomes a
-    # plain Python int rather than `cu_seqlens[-1]` (a 0-D GPU scalar that syncs when used as a
-    # `reshape` arg / in the SP padding math below).
-    cu_seqlens_list = [0]
-    for t, h, w in grid_thw_list:
-        frame_len = h * w
-        for _ in range(t):
-            cu_seqlens_list.append(cu_seqlens_list[-1] + frame_len)
-    total_seq_len = cu_seqlens_list[-1]
-    cu_seqlens = torch.tensor(
-        cu_seqlens_list,
-        device=hidden_states.device,
-        dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-    )
+    # `total_seq_len` is the patch count BEFORE any SP-pad — used to size the
+    # rotary embedding reshape below. Derived from `grid_thw_list` so it's a
+    # plain Python int regardless of whether cu_seqlens is precomputed.
+    total_seq_len = sum(t * h * w for t, h, w in grid_thw_list)
 
-    rotary_pos_emb = self.rot_pos_emb(grid_thw)
+    # Prefer precomputed cu_seqlens (already includes any sp-pad tail entry —
+    # the model's `collate_multimodal_metadata` collate hook appends it).
+    # Fallback builds host-side and handles sp-pad inline further down.
+    if precomputed_cu_seqlens is not None:
+        cu_seqlens = precomputed_cu_seqlens.to(
+            hidden_states.device,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            non_blocking=True,
+        )
+    else:
+        cu_seqlens_list = [0]
+        for t, h, w in grid_thw_list:
+            frame_len = h * w
+            for _ in range(t):
+                cu_seqlens_list.append(cu_seqlens_list[-1] + frame_len)
+        cu_seqlens = torch.tensor(
+            cu_seqlens_list,
+            device=hidden_states.device,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+
+    rotary_pos_emb = self.rot_pos_emb(grid_thw_list)
 
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
@@ -552,7 +623,10 @@ def qwen3_vl_vision_forward_patched(
         sp_size = get_parallel_state().sp_size
         # total_seq_len is already a host int — no `.item()` sync needed here.
         sp_pad_seq_len = seq_len * sp_size - total_seq_len
-        if sp_pad_seq_len > 0:
+        # If cu_seqlens came in precomputed it ALREADY has the sp-pad tail
+        # entry appended (by the model's ``collate_multimodal_metadata`` hook);
+        # only the fallback path needs to extend it here.
+        if sp_pad_seq_len > 0 and precomputed_cu_seqlens is None:
             new_cumsum = cu_seqlens[-1] + sp_pad_seq_len
             cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
         # --- Patch.3 ---
@@ -560,12 +634,14 @@ def qwen3_vl_vision_forward_patched(
     deepstack_feature_lists = []
 
     # --- Patch.4 ---
-    # Modification: compute max_seqlen from the host-side cu_seqlens_list (was
-    # `(cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()` which forces a sync). The
-    # SP-padded tail (when appended above) is also a host int.
-    max_seqlen = max(cu_seqlens_list[i + 1] - cu_seqlens_list[i] for i in range(len(cu_seqlens_list) - 1))
-    if sp_pad_seq_len > 0:
-        max_seqlen = max(max_seqlen, sp_pad_seq_len)
+    # Prefer precomputed max_seqlen (already accounts for sp-pad if applicable).
+    # Fallback computes from cu_seqlens differences host-side.
+    if precomputed_max_seqlen is not None:
+        max_seqlen = precomputed_max_seqlen
+    else:
+        max_seqlen = max((c2 - c1 for c1, c2 in zip(cu_seqlens_list, cu_seqlens_list[1:])), default=0)
+        if sp_pad_seq_len > 0:
+            max_seqlen = max(max_seqlen, sp_pad_seq_len)
     # --- Patch.4 ---
 
     # --- Patch.5 ---
@@ -659,7 +735,24 @@ def qwen3_vl_vision_dummy_forward_patched(self):
         pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
     # --- Patch.3 ---
 
-    return self(hidden_states=pixel_values, grid_thw=grid_thw)
+    # --- Patch.4 ---
+    # Precompute the ViT metadata host-side and pass it straight to forward.
+    # dummy_forward runs *inside* Model.forward (FSDP path for ranks with no
+    # real images), so the collator can't precompute it — but t / h / w are
+    # Python ints right here, so the dummy ViT forward skips the
+    # `grid_thw.tolist()` + cu_seqlens build it would otherwise sync on. The
+    # dummy grid is constructed SP-divisible, so there is no sp-pad tail.
+    cu = [0]
+    for _ in range(t):
+        cu.append(cu[-1] + h * w)
+    vit_kwargs = {
+        "vit_grid_thw_list": [[t, h, w]],
+        "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+        "vit_max_seqlen": h * w,
+    }
+    # --- Patch.4 ---
+
+    return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
     # --- Patch.1 ---
 
 
@@ -876,6 +969,26 @@ def qwen3_vl_model_forward_patched(
         image_mask, video_mask = self.get_placeholder_mask(input_ids_full)
     # --- Patch.2 ---
 
+    # --- Patch.6 ---
+    # Unpack the per-modality ViT kwargs from `multimodal_metadata` (collator-
+    # precomputed; see .agents/knowledge/multimodal_metadata.md). Each
+    # `self.get_image_features` / `self.get_video_features` call gets the
+    # subset that matches its modality; the patched ViT.forward consumes
+    # `vit_grid_thw_list` / `vit_cu_seqlens` / `vit_max_seqlen` via kwargs
+    # (with runtime fallback when absent).
+    multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+    image_vit_kwargs = {
+        "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+        "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+        "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+    }
+    video_vit_kwargs = {
+        "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+        "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+        "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+    }
+    # --- Patch.6 ---
+
     # --- Patch.3 ---
     flash_attn_kwargs = {}
     for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
@@ -892,7 +1005,7 @@ def qwen3_vl_model_forward_patched(
 
     if pixel_values is not None:
         image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True
+            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
         )
         image_embeds = image_outputs.pooler_output
         deepstack_image_embeds = image_outputs.deepstack_features
@@ -946,7 +1059,7 @@ def qwen3_vl_model_forward_patched(
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
         )
         video_embeds = video_outputs.pooler_output
         deepstack_video_embeds = video_outputs.deepstack_features
@@ -1106,6 +1219,25 @@ def qwen3_vl_get_position_id_func_patched(self):
     fake_model = SimpleNamespace(config=fake_config)
     return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)  # noqa: F821 defined via add_post_import_block
     # --- Patch.1 ---
+
+
+# ================================================================
+# Patch: Qwen3VLForConditionalGeneration.get_metadata_collate_func (new)
+# Expose the ViT metadata derivation (cu_seqlens / max_seqlen) to VeOmni's
+# collator as a picklable callable, mirroring get_position_id_func. The
+# collator invokes it after SP padding; deriving the metadata CPU-side off
+# the GPU critical path eliminates the host-device syncs the ViT.forward
+# would otherwise pay. See .agents/knowledge/multimodal_metadata.md.
+# ================================================================
+@config.override_method(
+    "Qwen3VLForConditionalGeneration.get_metadata_collate_func",
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+def qwen3_vl_get_metadata_collate_func_patched(self):
+    # collate_multimodal_metadata is a module-level helper (added via
+    # add_helper) — a bare function reference is already picklable for the
+    # DataLoader workers; the Qwen3-VL-family formula needs no model config.
+    return collate_multimodal_metadata  # noqa: F821 defined via add_helper
 
 
 # ================================================================

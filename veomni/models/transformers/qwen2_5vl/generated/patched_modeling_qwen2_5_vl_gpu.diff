@@ -249,7 +249,7 @@
 
 
  class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
-@@ -441,21 +525,26 @@
+@@ -441,21 +525,38 @@
 
          return window_index, cu_window_seqlens
 
@@ -285,10 +285,22 @@
 +        grid_thw: torch.Tensor,
 +        **kwargs,
 +    ) -> BaseModelOutputWithPooling:
++        # qwen2_5_vl ViT has a window-attention path (cu_window_seqlens) on top
++        # of the cu_seqlens path. Its cu_window_seqlens depends on the
++        # spatial-merge window index and isn't trivially collator-derivable, so
++        # this ViT doesn't yet consume the precomputed multimodal_metadata. Pop
++        # the vit_* kwargs here so they don't leak into the per-block call
++        # below; ignoring them is safe because the in-forward derivation is the
++        # same value the collator would produce.
++        # See .agents/knowledge/multimodal_metadata.md.
++        kwargs.pop("vit_grid_thw_list", None)
++        kwargs.pop("vit_cu_seqlens", None)
++        kwargs.pop("vit_max_seqlen", None)
++
          hidden_states = self.patch_embed(hidden_states)
          rotary_pos_emb = self.rot_pos_emb(grid_thw)
          window_index, cu_window_seqlens = self.get_window_index(grid_thw)
-@@ -465,6 +554,22 @@
+@@ -465,6 +566,22 @@
              dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
          )
          cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
@@ -311,7 +323,7 @@
 
          seq_len, _ = hidden_states.size()
          hidden_states = hidden_states.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
-@@ -474,39 +579,103 @@
+@@ -474,39 +591,103 @@
          rotary_pos_emb = rotary_pos_emb[window_index, :, :]
          rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
          emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
@@ -426,7 +438,7 @@
 
 
  @dataclass
-@@ -990,6 +1159,12 @@
+@@ -990,6 +1171,12 @@
              hidden_states=all_hidden_states,
              attentions=all_self_attns,
          )
@@ -439,7 +451,7 @@
 
 
  @auto_docstring
-@@ -1183,12 +1358,19 @@
+@@ -1183,12 +1370,19 @@
          """
          pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
@@ -463,7 +475,7 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
-@@ -1205,51 +1387,27 @@
+@@ -1205,51 +1399,27 @@
          """
          pixel_values = pixel_values.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
@@ -528,7 +540,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1291,6 +1449,25 @@
+@@ -1291,6 +1461,25 @@
              position_ids = None
          return position_ids
 
@@ -554,7 +566,7 @@
      @auto_docstring
      def forward(
          self,
-@@ -1322,7 +1499,6 @@
+@@ -1322,7 +1511,6 @@
          second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
              The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
          """
@@ -562,7 +574,7 @@
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
              output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-@@ -1332,21 +1508,78 @@
+@@ -1332,21 +1520,88 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -584,6 +596,16 @@
 +            if key in kwargs:
 +                flash_attn_kwargs[key] = kwargs.pop(key)
 +        # --- Patch.3 ---
++
++        # --- Patch.7 ---
++        # Drain ``multimodal_metadata`` from kwargs even though qwen2_5_vl's ViT
++        # doesn't yet consume the precomputed cu_seqlens (its window-attention
++        # path adds complexity that's deferred to a follow-up). Popping here
++        # prevents the dict from leaking through ``**kwargs`` into downstream
++        # transformers code that doesn't expect it.
++        # See .agents/knowledge/multimodal_metadata.md.
++        kwargs.pop("multimodal_metadata", None)
++        # --- Patch.7 ---
 +
 +        # --- Patch.1 ---
 +        if get_parallel_state().sp_enabled:
@@ -649,7 +671,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1358,6 +1591,15 @@
+@@ -1358,6 +1613,15 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -665,7 +687,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1410,6 +1652,12 @@
+@@ -1410,6 +1674,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -678,7 +700,7 @@
 
 
  class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
-@@ -1466,6 +1714,16 @@
+@@ -1466,6 +1736,16 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -695,7 +717,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1488,12 +1746,8 @@
+@@ -1488,12 +1768,8 @@
          second_per_grid_ts: torch.Tensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -709,7 +731,7 @@
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-@@ -1502,50 +1756,13 @@
+@@ -1502,50 +1778,13 @@
              The rope index difference between sequence length and multimodal rope.
          second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
              The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
@@ -761,7 +783,7 @@
              input_ids=input_ids,
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
-@@ -1564,25 +1781,53 @@
+@@ -1564,25 +1803,53 @@
              **kwargs,
          )
 
@@ -825,7 +847,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1803,5 +2048,25 @@
+@@ -1803,5 +2070,25 @@
 
          return input_ids, model_kwargs
 

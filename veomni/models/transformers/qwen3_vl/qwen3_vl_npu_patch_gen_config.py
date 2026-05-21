@@ -28,6 +28,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
 )
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_for_conditional_generation_forward_patched,
+    qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_forward_patched,
     qwen3_vl_model_get_image_features_patched,
@@ -125,6 +126,11 @@ config.override_method(
     "Qwen3VLForConditionalGeneration.get_position_id_func",
     replacement=qwen3_vl_get_position_id_func_patched,
     description="Use VeOmni precomputed position-id function and unified multimodal token ids",
+)
+config.override_method(
+    "Qwen3VLForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_vl_get_metadata_collate_func_patched,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 config.override_method(
     "Qwen3VLForConditionalGeneration.forward",

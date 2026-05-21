@@ -38,6 +38,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_decoder_layer_forward_patched,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forconditional_generation_forward_patched,
+    qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
@@ -480,6 +481,41 @@ def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
+def collate_multimodal_metadata(batch, sp_pad):
+    \"\"\"Derive ``multimodal_metadata`` for the Qwen3.5-VL ViT (CPU-side).
+
+    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
+    collator as a picklable callable. See the GPU config for the full
+    rationale. Mutates ``batch`` in place, writing ``multimodal_metadata``.
+    \"\"\"
+    md = {}
+    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
+        if list_key in batch:
+            md[list_key] = batch.pop(list_key)
+    for modality, list_key, pad_key in (
+        ("image", "image_grid_thw_list", "pixel_values"),
+        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    ):
+        grid_list = md.get(list_key)
+        if not grid_list:
+            continue
+        cu = [0]
+        max_hw = 0
+        for t, h, w in grid_list:
+            hw = h * w
+            max_hw = max(max_hw, hw)
+            for _ in range(t):
+                cu.append(cu[-1] + hw)
+        pad = sp_pad.get(pad_key, 0)
+        if pad > 0:
+            cu.append(cu[-1] + pad)
+            max_hw = max(max_hw, pad)
+        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        md[f"vit_{modality}_max_seqlen"] = max_hw
+    if md:
+        batch["multimodal_metadata"] = md
 """)
 
 
@@ -487,6 +523,13 @@ config.override_method(
     "Qwen3_5ForConditionalGeneration.get_position_id_func",
     replacement=qwen3_5_forconditional_generation_get_position_id_func,
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
+)
+
+
+config.override_method(
+    "Qwen3_5ForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_5_forconditional_generation_get_metadata_collate_func,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 
 

@@ -371,6 +371,23 @@ def qwen3_5_moe_model_forward_patched(
             flash_attn_kwargs[key] = kwargs.pop(key)
     # --- Patch.4 ---
 
+    # --- Patch.6 ---
+    # Mirror of qwen3_5: unpack per-modality ViT kwargs from
+    # `multimodal_metadata` (collator-precomputed) so the patched ViT
+    # forward can skip the in-forward .tolist() / cu_seqlens build.
+    multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+    image_vit_kwargs = {
+        "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+        "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+        "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+    }
+    video_vit_kwargs = {
+        "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+        "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+        "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+    }
+    # --- Patch.6 ---
+
     # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
     if get_parallel_state().sp_enabled:
         # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
@@ -383,7 +400,7 @@ def qwen3_5_moe_model_forward_patched(
 
     if pixel_values is not None:
         image_outputs: BaseModelOutputWithPooling = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True
+            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
         )
         image_embeds = image_outputs.pooler_output
 
@@ -426,7 +443,7 @@ def qwen3_5_moe_model_forward_patched(
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithPooling = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
         )
         video_embeds = video_outputs.pooler_output
 
@@ -541,6 +558,61 @@ def get_position_id(main_func, self, **kwargs):
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
+@config.add_helper
+def collate_multimodal_metadata(batch, sp_pad):
+    """Derive ``multimodal_metadata`` for the Qwen3.5-VL-MoE ViT.
+
+    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
+    collator as a picklable callable (mirrors ``get_position_id``). Runs
+    purely on CPU inside the collator after SP padding — every value it
+    produces (CPU int tensors / Python ints / lists) is consumed by the ViT
+    forward without a host-device sync.
+
+    ``batch`` is the packed (+ SP-padded) batch dict; ``sp_pad`` maps
+    ``pixel_values`` / ``pixel_values_videos`` to the number of patch rows
+    the SP collator appended. Mutates ``batch`` in place, writing
+    ``batch["multimodal_metadata"]``.
+    """
+    md = {}
+    # *_grid_thw_list: Python list[[t, h, w]] flattened across the batch by
+    # PackingCollator. Carried through verbatim for the ViT / Model forward.
+    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
+        if list_key in batch:
+            md[list_key] = batch.pop(list_key)
+
+    # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
+    # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.
+    for modality, list_key, pad_key in (
+        ("image", "image_grid_thw_list", "pixel_values"),
+        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    ):
+        grid_list = md.get(list_key)
+        if not grid_list:
+            continue
+        cu = [0]
+        max_hw = 0
+        for t, h, w in grid_list:
+            hw = h * w
+            max_hw = max(max_hw, hw)
+            for _ in range(t):
+                cu.append(cu[-1] + hw)
+        # SP-pad tail: the collator zero-pads pixel_values to SP-divisible;
+        # those patches become one synthetic "image" so varlen attention
+        # treats them as an independent sequence (mirrors the position_ids==0
+        # text-side SP-pad convention). Discarded after the per-rank slice.
+        pad = sp_pad.get(pad_key, 0)
+        if pad > 0:
+            cu.append(cu[-1] + pad)
+            max_hw = max(max_hw, pad)
+        # device='cpu': this runs in CPU dataloader workers — pin to CPU so a
+        # global torch.set_default_device('cuda') can't misallocate it.
+        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        md[f"vit_{modality}_max_seqlen"] = max_hw
+
+    if md:
+        batch["multimodal_metadata"] = md
+
+
 @config.override_method(
     "Qwen3_5MoeForConditionalGeneration.get_position_id_func",
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
@@ -551,6 +623,17 @@ def qwen3_5_moe_forconditional_generation_get_position_id_func(self):
     fake_config.video_token_id = VIDEO_INPUT_INDEX
     fake_model = SimpleNamespace(config=fake_config)
     return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)  # noqa: F821
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func",
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+def qwen3_5_moe_forconditional_generation_get_metadata_collate_func(self):
+    # collate_multimodal_metadata is a module-level helper (added via
+    # add_helper) — a bare function reference is picklable for the DataLoader
+    # workers; the Qwen3.5-VL-MoE ViT formula needs no model config.
+    return collate_multimodal_metadata  # noqa: F821 defined via add_helper
 
 
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────

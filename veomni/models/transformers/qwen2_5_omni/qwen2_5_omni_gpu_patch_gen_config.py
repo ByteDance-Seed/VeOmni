@@ -775,6 +775,15 @@ def qwen2_5_omni_vision_forward_patched(
     Returns:
         `BaseModelOutputWithPooling`: last_hidden_state and pooler_output.
     """
+    # qwen2_5_omni ViT has the same window-attention layout as qwen2_5_vl,
+    # so it doesn't yet consume the precomputed multimodal_metadata; the
+    # in-forward cu_seqlens / cu_window_seqlens build stays as-is. Pop the
+    # vit_* kwargs so they don't leak into per-block kwargs below.
+    # See .agents/knowledge/multimodal_metadata.md.
+    kwargs.pop("vit_grid_thw_list", None)
+    kwargs.pop("vit_cu_seqlens", None)
+    kwargs.pop("vit_max_seqlen", None)
+
     hidden_states = self.patch_embed(hidden_states)
     rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
@@ -1032,6 +1041,15 @@ def qwen2_5_omni_thinker_forward_patched(
     video_mask = kwargs.pop("video_mask")
     audio_mask = kwargs.pop("audio_mask")
     # --- Patch.1 ---
+
+    # --- Patch.7 ---
+    # Drain ``multimodal_metadata`` from kwargs even though qwen2_5_omni's
+    # ViT doesn't yet consume the precomputed cu_seqlens (window-attention
+    # layout; full integration deferred). Pops here prevent the dict from
+    # reaching downstream transformers code via ``**kwargs``.
+    # See .agents/knowledge/multimodal_metadata.md.
+    kwargs.pop("multimodal_metadata", None)
+    # --- Patch.7 ---
 
     # --- Patch.2 ---
     if self.training and get_parallel_state().sp_enabled:
@@ -1325,3 +1343,28 @@ def qwen2_5_omni_for_conditional_generation_forward_patched(
 )
 def qwen2_5_omni_top_get_position_id_func_patched(self):
     return self.thinker.get_position_id_func()
+
+
+# ================================================================
+# Patch: Qwen2_5OmniForConditionalGeneration.get_extra_collate_infos (NEW)
+# Declare the omni-specific collate rules (audio feature tensors) so the
+# trainer doesn't hardcode them by model_type — the model owns its own
+# modality-specific collate topology. Tuples are
+# (pack_dim, sp_slice, sp_pad_value, sp_pad_scale); MainCollator coerces them.
+#
+# NOTE: qwen2_5_omni deliberately does NOT expose get_metadata_collate_func
+# (its window-attention ViT is not yet wired — see multimodal_metadata.md).
+# The transforms still emit image_grid_thw_list onto the batch; with no
+# metadata hook it stays top-level (absorbed by the forward's **kwargs).
+# This is intentional, not an oversight.
+# ================================================================
+@config.override_method(
+    "Qwen2_5OmniForConditionalGeneration.get_extra_collate_infos",
+    description="Declare omni-specific (audio) collate rules for the VeOmni collator",
+)
+def qwen2_5_omni_top_get_extra_collate_infos_patched(self):
+    return {
+        "audio_feature_lengths": (0, False, None, None),
+        "input_features": (0, True, 0, 1),
+        "audio_mask": (-1, False, 0, 1),
+    }

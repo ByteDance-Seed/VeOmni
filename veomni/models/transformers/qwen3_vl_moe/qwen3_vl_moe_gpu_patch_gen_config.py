@@ -48,6 +48,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     config as qwen3_vl_config,
 )
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
@@ -175,6 +176,12 @@ config.override_method(
     replacement=qwen3_vl_get_position_id_func_patched,
     name_map=_NAME_MAP,
     description="Use VeOmni precomputed position-id function and unified multimodal token ids",
+)
+config.override_method(
+    "Qwen3VLMoeForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_vl_get_metadata_collate_func_patched,
+    name_map=_NAME_MAP,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 
 
@@ -316,11 +323,29 @@ def qwen3_vl_moe_model_forward_patched(
         inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
+    # --- Patch.6 ---
+    # Mirror of qwen3_vl: unpack per-modality ViT kwargs from
+    # `multimodal_metadata` (collator-precomputed) so the patched ViT
+    # forward can skip the in-forward .tolist() / cu_seqlens build.
+    # See .agents/knowledge/multimodal_metadata.md.
+    multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+    image_vit_kwargs = {
+        "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+        "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+        "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+    }
+    video_vit_kwargs = {
+        "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+        "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+        "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+    }
+    # --- Patch.6 ---
+
     fake_deepstack = None
 
     if pixel_values is not None:
         image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True
+            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
         )
         image_embeds = image_outputs.pooler_output
         deepstack_image_embeds = image_outputs.deepstack_features
@@ -370,7 +395,7 @@ def qwen3_vl_moe_model_forward_patched(
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
         )
         video_embeds = video_outputs.pooler_output
         deepstack_video_embeds = video_outputs.deepstack_features

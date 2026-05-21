@@ -513,11 +513,22 @@ class BaseTrainer(Stateful, ABC):
         self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Preprocess micro batches before forward pass."""
-        micro_batch = {
-            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in micro_batch.items()
-        }
+        """Preprocess micro batches before forward pass.
+
+        Tensors are moved to ``self.device`` non-blockingly. Nested dicts
+        (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``) are
+        recursed so inner tensor values land on the device too; Python ints
+        / lists / etc. pass through unchanged.
+        """
+
+        def _to_device(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                return v.to(self.device, non_blocking=True)
+            if isinstance(v, dict):
+                return {k: _to_device(vv) for k, vv in v.items()}
+            return v
+
+        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
