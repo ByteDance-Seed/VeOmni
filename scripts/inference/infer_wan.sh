@@ -31,7 +31,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/veomni/models/diffusers/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/}"
+MODEL_PATH="${MODEL_PATH:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}"
 OUTPUT_DIR="${OUTPUT_DIR:-./inference_outputs/wan_t2v}"
 LORA_PATH="${LORA_PATH:-}"
 LORA_WEIGHT="${LORA_WEIGHT:-1.0}"
@@ -88,7 +88,7 @@ fi
 # I2V (image-to-video) variant — uncomment to use, requires --input_image:
 #
 # "${LAUNCHER[@]}" "${REPO_ROOT}/scripts/inference/infer_omni.py" \
-#     --model_path /mnt/hdfs/veomni/models/Wan-AI/Wan2.1-I2V-14B-480P \
+#     --model_path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
 #     --output_dir "${OUTPUT_DIR%/}/_i2v" \
 #     --prompts "the cat slowly stretches and yawns" \
 #     --negative_prompt "${NEGATIVE_PROMPT}" \

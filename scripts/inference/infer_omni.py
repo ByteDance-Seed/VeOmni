@@ -30,7 +30,7 @@ Examples
 Baseline T2I (pretrained Qwen-Image):
 
     python scripts/inference/infer_omni.py \\
-        --model_path /mnt/hdfs/veomni/models/Qwen/Qwen-Image \\
+        --model_path Qwen/Qwen-Image \\
         --output_dir ./inference_outputs/baseline \\
         --prompts "a corgi wearing a tiny astronaut helmet, studio lighting" \\
         --num_inference_steps 50 --height 1024 --width 1024 \\
@@ -39,7 +39,7 @@ Baseline T2I (pretrained Qwen-Image):
 T2I with a VeOmni-fine-tuned transformer swapped in:
 
     python scripts/inference/infer_omni.py \\
-        --model_path /mnt/hdfs/veomni/models/Qwen/Qwen-Image \\
+        --model_path Qwen/Qwen-Image \\
         --transformer_path ./qwen-image-sft/checkpoints/global_step_200/hf_ckpt \\
         --output_dir ./inference_outputs/ft_step200 \\
         --prompts "a corgi wearing a tiny astronaut helmet, studio lighting" \\

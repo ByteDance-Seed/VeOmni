@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/veomni/models/Qwen/Qwen-Image}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen-Image}"
 OUTPUT_DIR="${OUTPUT_DIR:-./inference_outputs/qwen_image}"
 TRANSFORMER_PATH="${TRANSFORMER_PATH:-}"
 
