@@ -80,9 +80,9 @@ patchgen config is the single biggest accelerator for catching subtle
 signature/contract drift while iterating.
 
 ```bash
-mkdir -p .agents_workspace/hf_reference/<m>/v5_2_0
+mkdir -p .agents_workspace/hf_reference/<m>/v5_8_1
 
-curl -sL -o .agents_workspace/hf_reference/<m>/v5_2_0/modeling_<m>.py \
+curl -sL -o .agents_workspace/hf_reference/<m>/v5_8_1/modeling_<m>.py \
   "https://github.com/huggingface/transformers/raw/v5.8.1/src/transformers/models/<m>/modeling_<m>.py"
 ```
 
@@ -90,15 +90,17 @@ For VLMs also grab `processing_<m>.py` / `image_processing_<m>.py` /
 `configuration_<m>.py` if you expect processor-side or config-shape work.
 
 If you are **refreshing** an existing patchgen-generated file across a
-transformers minor bump (e.g. `5.2.0 → 5.3.0`), pull both versions side-by-side
-and diff to spot contract drift:
+transformers minor bump (e.g. the current pin `5.8.1 → 5.9.0`), pull both
+versions side-by-side and diff to spot contract drift — substitute the
+`<old_ver>` / `<new_ver>` tags with the actual versions you are migrating
+between:
 
 ```bash
 mkdir -p .agents_workspace/hf_reference/<m>/{old,new}
 curl -sL -o .agents_workspace/hf_reference/<m>/old/modeling_<m>.py \
-  "https://github.com/huggingface/transformers/raw/v5.8.1/src/transformers/models/<m>/modeling_<m>.py"
+  "https://github.com/huggingface/transformers/raw/<old_ver>/src/transformers/models/<m>/modeling_<m>.py"
 curl -sL -o .agents_workspace/hf_reference/<m>/new/modeling_<m>.py \
-  "https://github.com/huggingface/transformers/raw/v5.3.0/src/transformers/models/<m>/modeling_<m>.py"
+  "https://github.com/huggingface/transformers/raw/<new_ver>/src/transformers/models/<m>/modeling_<m>.py"
 diff -u .agents_workspace/hf_reference/<m>/{old,new}/modeling_<m>.py | less
 ```
 

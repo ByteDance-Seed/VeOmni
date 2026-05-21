@@ -220,6 +220,10 @@ def mm_token_type_ids_from_input_ids(input_ids, config):
     # RoPE (M-RoPE): text=0, image=1, video=2 per token. HF's processor emits
     # it, but VeOmni's data pipeline carries modality only via the multimodal
     # token ids inside `input_ids`, so derive the type ids from those here.
+    # `config` selects the token-id namespace and must match `input_ids`: the
+    # live model config on the `forward` path, the IMAGE/VIDEO_INPUT_INDEX fake
+    # config in the `get_position_id` precompute path. Do not unify the two
+    # call sites onto one config.
     mm_token_type_ids = torch.zeros_like(input_ids)
     mm_token_type_ids[input_ids == config.image_token_id] = 1
     mm_token_type_ids[input_ids == config.video_token_id] = 2
