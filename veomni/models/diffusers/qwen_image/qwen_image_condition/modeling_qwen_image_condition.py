@@ -197,13 +197,11 @@ class QwenImageConditionModel(PreTrainedModel):
 
         return prompt_embeds, prompt_embeds_mask
 
-    def _encode_image_to_latents(self, image) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
+    def _encode_image_to_latents(self, image) -> torch.Tensor:
+        # Return the raw posterior parameters ([1, 2*z_dim, F, H, W]
         image_tensor = self._image_to_tensor(image).to(device=self.vae.device, dtype=self.vae.dtype)
         posterior: DiagonalGaussianDistribution = self.vae.encode(image_tensor).latent_dist
-        latents = self._normalize_latents(posterior.mode())
-        packed_latents = self._pack_latents(latents)
-        latent_height, latent_width = latents.shape[-2:]
-        return packed_latents, [(1, latent_height // 2, latent_width // 2)]
+        return posterior.parameters
 
     @torch.no_grad()
     def get_condition(self, inputs, images, **kwargs) -> dict[str, Any]:
@@ -211,14 +209,11 @@ class QwenImageConditionModel(PreTrainedModel):
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt=prompts)
 
         latents_list = []
-        img_shapes = []
         for sample_images in images:
             sample_images = self._as_list(sample_images)
             if len(sample_images) != 1:
                 raise ValueError("Qwen-Image text-to-image training expects exactly one target image per sample.")
-            sample_latents, sample_img_shapes = self._encode_image_to_latents(sample_images[0])
-            latents_list.append(sample_latents)
-            img_shapes.append(sample_img_shapes)
+            latents_list.append(self._encode_image_to_latents(sample_images[0]))
 
         encoder_hidden_states = [prompt_embeds[idx : idx + 1] for idx in range(len(prompts))]
         if prompt_embeds_mask is None:
@@ -230,7 +225,6 @@ class QwenImageConditionModel(PreTrainedModel):
             "latents": latents_list,
             "encoder_hidden_states": encoder_hidden_states,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
-            "img_shapes": img_shapes,
         }
 
     def process_condition(
@@ -252,19 +246,24 @@ class QwenImageConditionModel(PreTrainedModel):
             if img_shapes is not None:
                 ready_inputs["img_shapes"] = img_shapes
             return ready_inputs
-        if latents is None or encoder_hidden_states is None or img_shapes is None:
+
+        if latents is None or encoder_hidden_states is None:
             raise ValueError(
-                "Qwen-Image condition processing requires latents, encoder hidden states, and img_shapes."
+                "Qwen-Image condition processing requires latents (raw VAE posterior parameters from "
+                "``get_condition``) and encoder hidden states."
             )
 
         latents_list = self._as_list(latents)
         encoder_hidden_states_list = self._as_list(encoder_hidden_states, len(latents_list))
         encoder_hidden_states_mask_list = self._as_list(encoder_hidden_states_mask, len(latents_list))
-        img_shapes_list = self._as_list(img_shapes, len(latents_list))
 
-        image_seq_len = int(latents_list[0].shape[1])
-        for idx, sample_latents in enumerate(latents_list[1:], start=1):
-            if int(sample_latents.shape[1]) != image_seq_len:
+        first_params = latents_list[0]
+        first_h, first_w = int(first_params.shape[-2]), int(first_params.shape[-1])
+        image_seq_len = (first_h // 2) * (first_w // 2)
+        for idx, sample_params in enumerate(latents_list[1:], start=1):
+            sample_h, sample_w = int(sample_params.shape[-2]), int(sample_params.shape[-1])
+            sample_seq_len = (sample_h // 2) * (sample_w // 2)
+            if sample_seq_len != image_seq_len:
                 # ``mu`` shifts the FlowMatchEulerDiscreteScheduler schedule based on the
                 # packed image sequence length; a single ``set_timesteps`` call therefore
                 # encodes one resolution. Mixing packed lengths in one micro-batch would
@@ -272,7 +271,7 @@ class QwenImageConditionModel(PreTrainedModel):
                 raise ValueError(
                     "Qwen-Image condition expects all samples in a micro-batch to share the "
                     f"same packed image sequence length; got {image_seq_len} at index 0 and "
-                    f"{int(sample_latents.shape[1])} at index {idx}."
+                    f"{sample_seq_len} at index {idx}."
                 )
         if (not self._timesteps_ready) or (self._timesteps_image_seq_len != image_seq_len):
             scheduler_cfg = self.scheduler.config
@@ -303,10 +302,15 @@ class QwenImageConditionModel(PreTrainedModel):
         if self.config.guidance_scale is not None:
             packed_conditions["guidance"] = []
 
-        for sample_latents, sample_context, sample_context_mask, sample_img_shapes in zip(
-            latents_list, encoder_hidden_states_list, encoder_hidden_states_mask_list, img_shapes_list
+        for sample_params, sample_context, sample_context_mask in zip(
+            latents_list, encoder_hidden_states_list, encoder_hidden_states_mask_list
         ):
-            sample_latents = sample_latents.to(self.generator.device)
+            sample_latents_raw = DiagonalGaussianDistribution(sample_params).mode()
+            sample_latents_norm = self._normalize_latents(sample_latents_raw).to(self.generator.device)
+            sample_latents = self._pack_latents(sample_latents_norm)
+            latent_height, latent_width = sample_latents_norm.shape[-2:]
+            sample_img_shapes = [(1, latent_height // 2, latent_width // 2)]
+
             noise = torch.randn(
                 sample_latents.shape,
                 dtype=sample_latents.dtype,
