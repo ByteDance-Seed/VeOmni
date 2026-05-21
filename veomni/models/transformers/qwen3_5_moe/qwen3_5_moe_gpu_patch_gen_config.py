@@ -60,11 +60,13 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
     qwen3_5_text_model_update_linear_attn_mask,
+    qwen3_5_text_rotary_embedding_forward_patched,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
     qwen3_5_vision_model_rot_pos_emb,
+    qwen3_5_vision_rotary_embedding_forward_patched,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -263,6 +265,12 @@ def qwen3_5_moe_sparse_moe_block_forward_patched(
 # ── ViT patches ───────────────────────────────────────────────────────────────
 
 config.override_method(
+    "Qwen3_5MoeTextRotaryEmbedding.forward",
+    replacement=qwen3_5_text_rotary_embedding_forward_patched,
+    description="Move expanded inverse frequencies onto x.device in text MRoPE",
+)
+
+config.override_method(
     "Qwen3_5MoeModel.get_image_features",
     replacement=qwen3_5_model_get_image_features,
     description="Remove unnecessary split operation to maintain contiguous memory layout.",
@@ -278,6 +286,12 @@ config.override_method(
     "Qwen3_5MoeVisionModel.rot_pos_emb",
     replacement=qwen3_5_vision_model_rot_pos_emb,
     description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionRotaryEmbedding.forward",
+    replacement=qwen3_5_vision_rotary_embedding_forward_patched,
+    description="Allow vision RoPE freq tables to be materialized on the active compute device.",
 )
 
 config.override_method(

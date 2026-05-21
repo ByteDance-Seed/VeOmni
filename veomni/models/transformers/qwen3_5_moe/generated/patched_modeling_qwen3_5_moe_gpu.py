@@ -15,12 +15,16 @@
 #      Propagate _moe_implementation from top-level config to text_config
 #    - method_override: Qwen3_5MoeSparseMoeBlock.forward
 #      Avoid in-place += on custom autograd Function output; call maybe_replay_indices for RL router replay
+#    - method_override: Qwen3_5MoeTextRotaryEmbedding.forward
+#      Move expanded inverse frequencies onto x.device in text MRoPE
 #    - method_override: Qwen3_5MoeModel.get_image_features
 #      Remove unnecessary split operation to maintain contiguous memory layout.
 #    - method_override: Qwen3_5MoeModel.get_placeholder_mask
 #      Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.
 #    - method_override: Qwen3_5MoeVisionModel.rot_pos_emb
 #      Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.
+#    - method_override: Qwen3_5MoeVisionRotaryEmbedding.forward
+#      Allow vision RoPE freq tables to be materialized on the active compute device.
 #    - method_override: Qwen3_5MoeVisionModel.fast_pos_embed_interpolate
 #      Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.
 #    - method_override: Qwen3_5MoeVisionModel.forward
@@ -150,6 +154,12 @@ def get_position_id(main_func, self, **kwargs):
 logger = logging.get_logger(__name__)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5MoeVisionRotaryEmbedding
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3_5MoeVisionRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
@@ -160,10 +170,17 @@ class Qwen3_5MoeVisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(seq, self.inv_freq)
+    def forward(self, seqlen, compute_device):
+        inv_freq = self.inv_freq.to(device=compute_device)
+        seq = torch.arange(seqlen, device=compute_device, dtype=inv_freq.dtype)
+        freqs = torch.outer(seq, inv_freq)
         return freqs
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5MoeTextRotaryEmbedding
+# Methods patched: forward
+# ======================================================================
 
 
 class Qwen3_5MoeTextRotaryEmbedding(nn.Module):
@@ -221,11 +238,13 @@ class Qwen3_5MoeTextRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        # In contrast to other models, Qwen3_5Moe has different position ids for the grids
+        # In contrast to other models, Qwen3_5 has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1).to(x.device)
+        )
         position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
@@ -1515,7 +1534,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
 
         self.post_init()
 
-    def rot_pos_emb(self, grid_thw) -> torch.Tensor:
+    def rot_pos_emb(self, grid_thw, compute_device) -> torch.Tensor:
         merge_size = self.spatial_merge_size
 
         # Modification: reuse the host-materialized grid metadata from the caller when available.
@@ -1526,20 +1545,19 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
 
         max_hw = max(max(h, w) for _, h, w in grid_thw_list)
-        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
-        device = freq_table.device
+        freq_table = self.rotary_pos_emb(max_hw, compute_device)  # (max_hw, dim // 2)
 
         total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
-        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=compute_device)
 
         offset = 0
         for num_frames, height, width in grid_thw_list:
             merged_h, merged_w = height // merge_size, width // merge_size
 
-            block_rows = torch.arange(merged_h, device=device)  # block row indices
-            block_cols = torch.arange(merged_w, device=device)  # block col indices
-            intra_row = torch.arange(merge_size, device=device)  # intra-block row offsets
-            intra_col = torch.arange(merge_size, device=device)  # intra-block col offsets
+            block_rows = torch.arange(merged_h, device=compute_device)  # block row indices
+            block_cols = torch.arange(merged_w, device=compute_device)  # block col indices
+            intra_row = torch.arange(merge_size, device=compute_device)  # intra-block row offsets
+            intra_col = torch.arange(merge_size, device=compute_device)  # intra-block col offsets
 
             # Compute full-resolution positions
             row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
@@ -1561,7 +1579,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         embeddings = embeddings.flatten(1)
         return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw):
+    def fast_pos_embed_interpolate(self, grid_thw, compute_device):
         """
         Efficient implementation adapted from vLLM's Qwen-VL optimization.
 
@@ -1589,8 +1607,8 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         # accept a list directly; fall back to `.tolist()` if a raw tensor is still passed in.
         grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
         for t, h, w in grid_thw_list:
-            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device, dtype=torch.float64)
-            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device, dtype=torch.float64)
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=compute_device, dtype=torch.float64)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=compute_device, dtype=torch.float64)
 
             h_floor = h_idxs.to(torch.long)
             w_floor = w_idxs.to(torch.long)
@@ -1650,6 +1668,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
             `torch.Tensor`: hidden_states.
         """
         hidden_states = self.patch_embed(hidden_states)
+        compute_device = hidden_states.device
 
         # Modification: materialize `grid_thw` to a host list once, and reuse it for everything that
         # needs t/h/w as Python ints (`fast_pos_embed_interpolate` and the `cu_seqlens` /
@@ -1666,7 +1685,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         # ViT forward host-device-sync-free (1 -> 0). See .pr-drafts/tingyang-fix-qwen3_5_key_fix.md.
         grid_thw_list = grid_thw.tolist()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list, compute_device)
 
         # --- Patch.1: Sequence parallel padding and slicing for position embeddings ---
         if get_parallel_state().sp_enabled:
@@ -1703,7 +1722,7 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw_list)
+        rotary_pos_emb = self.rot_pos_emb(grid_thw_list, compute_device)
 
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
@@ -1793,26 +1812,27 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         # Run a fake ViT forward so every FSDP rank touches the vision tower.
         # This prevents reduce-scatter hangs when some ranks have no real images/videos.
         """
+        compute_device = torch.device("cuda", get_device_id())
         if get_parallel_state().sp_enabled:
             sp_size = get_parallel_state().sp_size
 
             # Fake patch sequence for one local rank:
             # 16 patch tokens, each token flattened from:
             #   3 channels * 2 temporal patches * 16 * 16 spatial patch
-            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=compute_device)
             # grid_thw describes the *global* pre-sharded vision grid, not the local shard.
             # Here:
             #   T = 1
             #   H = 4 * sp_size
             #   W = 4
             # so total global patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
-            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=compute_device)
             dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
         else:
-            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=compute_device)
             # Non-SP case: a minimal valid 4x4 patch grid.
             # Total patch tokens = 1 * 4 * 4 = 16.
-            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
+            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=compute_device)
             dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
         return self(**dummy_data)
 
