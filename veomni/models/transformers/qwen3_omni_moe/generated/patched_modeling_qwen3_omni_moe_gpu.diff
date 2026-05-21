@@ -978,7 +978,7 @@
 
          deepstack_feature_lists = []
          for layer_num, blk in enumerate(self.blocks):
-@@ -1239,17 +1488,37 @@
+@@ -1239,17 +1488,51 @@
                  )
                  deepstack_feature_lists.append(deepstack_feature)
 
@@ -1006,18 +1006,32 @@
 +        # MixedPrecision the module's reported dtype may lag the per-call compute
 +        # cast, causing float/bf16 mismatches when the real-data rank runs in bf16.
 +        dtype = self.patch_embed.proj.weight.dtype
++        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
 +        if get_parallel_state().sp_enabled:
-+            sp_size = get_parallel_state().sp_size
-+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
-+            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
++            # grid_thw describes the *global* pre-sharded vision grid (H scaled by sp_size).
++            t, h, w = 1, 4 * get_parallel_state().sp_size, 4
 +        else:
-+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
-+            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
-+        return self(hidden_states=pixel_values, grid_thw=grid_thw)
++            t, h, w = 1, 4, 4
++        grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
++
++        # Precompute the ViT metadata host-side and pass it straight to forward:
++        # dummy_forward runs inside Thinker.forward, so the collator can't
++        # precompute it — but t / h / w are Python ints here, so the dummy ViT
++        # forward skips the `grid_thw.tolist()` + cu_seqlens build it would
++        # otherwise sync on.
++        cu = [0]
++        for _ in range(t):
++            cu.append(cu[-1] + h * w)
++        vit_kwargs = {
++            "vit_grid_thw_list": [[t, h, w]],
++            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
++            "vit_max_seqlen": h * w,
++        }
++        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
 
 
  class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Module):
-@@ -1341,13 +1610,24 @@
+@@ -1341,13 +1624,24 @@
          return freqs_t
 
 
@@ -1048,7 +1062,7 @@
          super().__init__()
          self.num_experts = config.num_experts
          self.hidden_dim = config.hidden_size
-@@ -1363,6 +1643,20 @@
+@@ -1363,6 +1657,20 @@
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
          final_hidden_states = torch.zeros_like(hidden_states)
@@ -1069,7 +1083,7 @@
          with torch.no_grad():
              expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
              expert_mask = expert_mask.permute(2, 1, 0)
-@@ -1661,6 +1955,12 @@
+@@ -1661,6 +1969,12 @@
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
@@ -1082,7 +1096,7 @@
  @auto_docstring(
      custom_intro=(
          "Text part of Qwen3OmniMoeThinker, "
-@@ -1693,21 +1993,30 @@
+@@ -1693,21 +2007,30 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1123,7 +1137,7 @@
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple | MoeModelOutputWithPast:
          r"""
-@@ -1715,13 +2024,10 @@
+@@ -1715,13 +2038,10 @@
              The mask of the visual positions.
          deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
              The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
@@ -1137,7 +1151,7 @@
          if use_cache and past_key_values is None and not torch.jit.is_tracing():
              past_key_values = DynamicCache(config=self.config)
 
-@@ -1734,7 +2040,6 @@
+@@ -1734,7 +2054,6 @@
                  past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
              )
 
@@ -1145,7 +1159,7 @@
          if position_ids is None:
              position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
          elif position_ids.ndim == 2:
-@@ -1757,10 +2062,8 @@
+@@ -1757,10 +2076,8 @@
 
          hidden_states = inputs_embeds
 
@@ -1156,7 +1170,7 @@
          for layer_idx, decoder_layer in enumerate(self.layers):
              layer_outputs = decoder_layer(
                  hidden_states,
-@@ -1773,7 +2076,6 @@
+@@ -1773,7 +2090,6 @@
              )
              hidden_states = layer_outputs
 
@@ -1164,7 +1178,7 @@
              if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
                  hidden_states = self._deepstack_process(
                      hidden_states,
-@@ -1783,18 +2085,37 @@
+@@ -1783,18 +2099,37 @@
 
          hidden_states = self.norm(hidden_states)
 
@@ -1206,7 +1220,7 @@
          hidden_states[visual_pos_masks, :] = local_this
          return hidden_states
 
-@@ -1890,6 +2211,12 @@
+@@ -1890,6 +2225,12 @@
 
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
@@ -1219,7 +1233,7 @@
 
 
  @auto_docstring(
-@@ -1967,38 +2294,30 @@
+@@ -1967,38 +2308,30 @@
          pixel_values = pixel_values.type(self.visual.dtype)
          return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
 
@@ -1272,7 +1286,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -2050,6 +2369,25 @@
+@@ -2050,6 +2383,25 @@
          special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
          return special_image_mask, special_video_mask, special_audio_mask
 
@@ -1298,7 +1312,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -2061,7 +2399,6 @@
+@@ -2061,7 +2413,6 @@
          image_grid_thw=None,
          video_grid_thw=None,
          attention_mask=None,
@@ -1306,7 +1320,7 @@
          audio_feature_lengths=None,
          position_ids=None,
          past_key_values=None,
-@@ -2069,151 +2406,244 @@
+@@ -2069,151 +2420,244 @@
          rope_deltas=None,
          labels=None,
          use_cache=None,
@@ -1638,7 +1652,7 @@
                      audio_feature_lengths,
                      video_second_per_grid,
                  )
-@@ -2221,11 +2651,20 @@
+@@ -2221,11 +2665,20 @@
                  self.rope_deltas = rope_deltas
              else:
                  batch_size, seq_length = input_ids.shape
@@ -1660,7 +1674,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2235,39 +2674,78 @@
+@@ -2235,39 +2688,78 @@
              use_cache=use_cache,
              output_router_logits=output_router_logits,
              cache_position=cache_position,
@@ -1755,7 +1769,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2319,1548 +2797,112 @@
+@@ -2319,1548 +2811,112 @@
 
          return model_inputs
 
@@ -3400,7 +3414,7 @@
 
      def disable_talker(self):
          if hasattr(self, "talker"):
-@@ -4132,19 +3174,67 @@
+@@ -4132,19 +3188,67 @@
 
          return thinker_result.sequences, talker_wavs.float()
 

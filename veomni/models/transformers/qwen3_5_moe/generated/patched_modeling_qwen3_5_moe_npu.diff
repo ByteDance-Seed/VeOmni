@@ -1111,7 +1111,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -1364,6 +1784,34 @@
+@@ -1364,6 +1784,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1121,32 +1121,34 @@
 +        # Run a fake ViT forward so every FSDP rank touches the vision tower.
 +        # This prevents reduce-scatter hangs when some ranks have no real images/videos.
 +        """
++        # 16 patch tokens, each flattened from 3 channels * 2 temporal * 16 * 16 spatial.
++        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
 +        if get_parallel_state().sp_enabled:
-+            sp_size = get_parallel_state().sp_size
-+
-+            # Fake patch sequence for one local rank:
-+            # 16 patch tokens, each token flattened from:
-+            #   3 channels * 2 temporal patches * 16 * 16 spatial patch
-+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-+            # grid_thw describes the *global* pre-sharded vision grid, not the local shard.
-+            # Here:
-+            #   T = 1
-+            #   H = 4 * sp_size
-+            #   W = 4
-+            # so total global patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
-+            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
-+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
++            # grid_thw describes the *global* pre-sharded vision grid (H scaled by
++            # sp_size): total patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
++            t, h, w = 1, 4 * get_parallel_state().sp_size, 4
 +        else:
-+            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-+            # Non-SP case: a minimal valid 4x4 patch grid.
-+            # Total patch tokens = 1 * 4 * 4 = 16.
-+            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
-+            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
-+        return self(**dummy_data)
++            # Non-SP case: a minimal valid 4x4 patch grid (1 * 4 * 4 = 16 tokens).
++            t, h, w = 1, 4, 4
++        grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
++
++        # Precompute the ViT metadata host-side and pass it straight to forward:
++        # dummy_forward runs inside Model.forward, so the collator can't precompute
++        # it — but t / h / w are Python ints here, so the dummy ViT forward skips
++        # the `grid_thw.tolist()` + cu_seqlens build it would otherwise sync on.
++        cu = [0]
++        for _ in range(t):
++            cu.append(cu[-1] + h * w)
++        vit_kwargs = {
++            "vit_grid_thw_list": [[t, h, w]],
++            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
++            "vit_max_seqlen": h * w,
++        }
++        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
 
 
  @dataclass
-@@ -1420,6 +1868,39 @@
+@@ -1420,6 +1870,39 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1186,7 +1188,7 @@
 
 
  class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-@@ -1512,15 +1993,40 @@
+@@ -1512,15 +1995,40 @@
 
      def _update_linear_attn_mask(self, attention_mask, cache_position):
          """
@@ -1235,7 +1237,7 @@
 
 
  @auto_docstring
-@@ -1532,7 +2038,19 @@
+@@ -1532,7 +2040,19 @@
      config: Qwen3_5MoeConfig
      _no_split_modules = ["Qwen3_5MoeTextDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
@@ -1255,7 +1257,7 @@
          super().__init__(config)
          self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
          self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
-@@ -1659,64 +2177,44 @@
+@@ -1659,64 +2179,44 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1346,7 +1348,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1769,6 +2267,7 @@
+@@ -1769,6 +2269,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1354,7 +1356,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
-@@ -1777,6 +2276,8 @@
+@@ -1777,6 +2278,8 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1363,7 +1365,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1784,27 +2285,150 @@
+@@ -1784,27 +2287,150 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1524,7 +1526,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1815,6 +2439,17 @@
+@@ -1815,6 +2441,17 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -1542,7 +1544,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1914,6 +2549,12 @@
+@@ -1914,6 +2551,12 @@
      return overall_loss * num_experts
 
 
@@ -1555,7 +1557,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1934,6 +2575,7 @@
+@@ -1934,6 +2577,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1563,7 +1565,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1949,7 +2591,7 @@
+@@ -1949,7 +2593,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1572,7 +1574,7 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1993,24 +2635,60 @@
+@@ -1993,24 +2637,60 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1645,7 +1647,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2018,7 +2696,15 @@
+@@ -2018,7 +2698,15 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1662,7 +1664,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2759,7 @@
+@@ -2073,6 +2761,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1670,7 +1672,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2089,58 +2776,7 @@
+@@ -2089,58 +2778,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1730,7 +1732,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,37 +2792,72 @@
+@@ -2156,37 +2794,72 @@
          )
 
          hidden_states = outputs[0]
@@ -1818,7 +1820,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2413,6 +3084,25 @@
+@@ -2413,6 +3086,25 @@
 
          return input_ids, model_kwargs
 

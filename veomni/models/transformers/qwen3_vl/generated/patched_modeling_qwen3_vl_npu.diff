@@ -954,7 +954,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -812,11 +1222,77 @@
+@@ -812,11 +1222,94 @@
 
          merged_hidden_states = self.merger(hidden_states)
 
@@ -1021,7 +1021,24 @@
 +            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
 +        # --- Patch.3 ---
 +
-+        return self(hidden_states=pixel_values, grid_thw=grid_thw)
++        # --- Patch.4 ---
++        # Precompute the ViT metadata host-side and pass it straight to forward.
++        # dummy_forward runs *inside* Model.forward (FSDP path for ranks with no
++        # real images), so the collator can't precompute it — but t / h / w are
++        # Python ints right here, so the dummy ViT forward skips the
++        # `grid_thw.tolist()` + cu_seqlens build it would otherwise sync on. The
++        # dummy grid is constructed SP-divisible, so there is no sp-pad tail.
++        cu = [0]
++        for _ in range(t):
++            cu.append(cu[-1] + h * w)
++        vit_kwargs = {
++            "vit_grid_thw_list": [[t, h, w]],
++            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
++            "vit_max_seqlen": h * w,
++        }
++        # --- Patch.4 ---
++
++        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
 +        # --- Patch.1 ---
 +
 +
@@ -1032,7 +1049,7 @@
 
 
  @auto_docstring(
-@@ -940,15 +1416,35 @@
+@@ -940,15 +1433,35 @@
              past_key_values=past_key_values,
          )
 
@@ -1068,7 +1085,7 @@
 
 
  @auto_docstring
-@@ -1081,6 +1577,13 @@
+@@ -1081,6 +1594,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1082,7 +1099,7 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
-@@ -1088,10 +1591,8 @@
+@@ -1088,10 +1608,8 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1094,7 +1111,7 @@
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          """
-@@ -1099,52 +1600,31 @@
+@@ -1099,52 +1617,31 @@
          vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
              pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
          )
@@ -1164,7 +1181,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1184,6 +1664,24 @@
+@@ -1184,6 +1681,24 @@
              position_ids = None
          return position_ids
 
@@ -1189,7 +1206,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1212,39 +1710,166 @@
+@@ -1212,39 +1727,166 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1372,7 +1389,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1254,24 +1879,56 @@
+@@ -1254,24 +1896,56 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1434,7 +1451,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1286,7 +1943,10 @@
+@@ -1286,7 +1960,10 @@
          )
 
          return Qwen3VLModelOutputWithPast(
@@ -1446,7 +1463,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1318,6 +1978,12 @@
+@@ -1318,6 +1995,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1459,7 +1476,7 @@
 
 
  class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
-@@ -1372,6 +2038,16 @@
+@@ -1372,6 +2055,16 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1476,7 +1493,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1388,54 +2064,7 @@
+@@ -1388,54 +2081,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1532,7 +1549,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1451,22 +2080,52 @@
+@@ -1451,22 +2097,52 @@
          )
 
          hidden_states = outputs[0]
@@ -1592,7 +1609,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1693,6 +2352,39 @@
+@@ -1693,6 +2369,39 @@
 
          return input_ids, model_kwargs
 

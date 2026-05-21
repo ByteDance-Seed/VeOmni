@@ -220,21 +220,18 @@ CASES = [
 # multi-line Python override bodies (warnings land on comment / blank / pure
 # Python lines), giving more allowlist noise than wins.
 #
-# The clean fix is **out-of-scope for this PR**: precompute mrope position_ids
-# AND rope_deltas in the data collator (``veomni/data/data_collator.py``) /
-# data transform (``veomni/data/multimodal/multimodal_transform.py``), thread
-# both in as model inputs, and short-circuit the ``self.get_rope_index(...)``
-# call in ``Model.forward`` when both are provided.
-# ``Qwen3VLForConditionalGeneration.get_position_id_func`` (already patched)
-# is the existing hook the data pipeline uses for CPU precomputation —
-# extending it to also emit ``rope_deltas`` removes the runtime call entirely.
-# Tracked as follow-up: requires collator + transform + forward signature
-# changes across qwen3_vl / qwen3_vl_moe (GPU + NPU).
+# The clean fix is **out-of-scope for this PR**: precompute the mrope
+# position_ids in the data transform (``get_position_id_func`` already runs
+# there) and short-circuit the ``self.get_rope_index(...)`` call in
+# ``Model.forward`` when position_ids is provided. (rope_deltas is NOT needed
+# — it is generation-only; the training forward never reads it.)
+# Tracked as follow-up: requires transform + forward signature changes
+# across qwen3_vl / qwen3_vl_moe (GPU + NPU).
 _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
     "algorithm-essential: get_rope_index does per-sample padding strip (GPU boolean indexing) + "
     "argwhere for vision_start positions + a one-shot input_ids.tolist() — intrinsic to the "
-    "variable-shape mrope algorithm. Clean fix is to precompute position_ids + rope_deltas in "
-    "the data collator and skip the call; out-of-scope for this PR."
+    "variable-shape mrope algorithm. Clean fix is to precompute position_ids in the data "
+    "transform and skip the call; out-of-scope for this PR."
 )
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     # qwen3_vl-fa2: Stage 1 (multimodal_metadata_precompute) wired the ViT
@@ -250,32 +247,32 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     #    for why the in-place override was reverted and the collator-side fix
     #    tracked as follow-up).
     "qwen3_vl-fa2": {
-        ("patched_modeling_qwen3_vl_gpu.py", 983): (
+        ("patched_modeling_qwen3_vl_gpu.py", 979): (
             "algorithm-essential: `rot_pos_ids(...).to(device)` H2D copy of a CPU tensor "
             "returned by the lru_cached helper; over-reported by torch sync-debug mode."
         ),
-        ("patched_modeling_qwen3_vl_gpu.py", 1465): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1486): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1488): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1492): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1496): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1534): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", 1536): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1478): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1499): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1501): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1505): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1509): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1547): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", 1549): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_vl_moe-fa2-fused: mirrors qwen3_vl (the moe config imports the
     # vision forward / rot_pos_emb / fast_pos_embed_interpolate helpers from
     # qwen3_vl and registers its own Model.forward + get_rope_index).
     "qwen3_vl_moe-fa2-fused": {
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1028): (
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1024): (
             "algorithm-essential: see qwen3_vl-fa2 (rot_pos_ids H2D copy)."
         ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1655): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1676): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1678): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1682): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1686): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1724): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_moe_gpu.py", 1726): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1668): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1689): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1691): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1695): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1699): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1737): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_moe_gpu.py", 1739): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_omni_moe-fa2-fused: Stage 2 (multimodal_metadata_precompute) wired
     # the omni ViT forward to consume the precomputed cu_seqlens / max_seqlen,
@@ -286,16 +283,16 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
     # qwen3_vl), so 4 algorithm-essential D2H/H2D sites remain, documented
     # in PR #764. Full omni ViT-helper migration is tracked as follow-up.
     "qwen3_omni_moe-fa2-fused": {
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1282): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1278): (
             "algorithm-essential: D2H `grid_thw.tolist()` for rot_pos_emb host-side loop."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1321): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1317): (
             "algorithm-essential: D2H `grid_thw.tolist()` for fast_pos_embed_interpolate."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1363): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1359): (
             "algorithm-essential: `torch.tensor(idx_list, device=cuda)` H2D copy; over-reported."
         ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", 1364): (
+        ("patched_modeling_qwen3_omni_moe_gpu.py", 1360): (
             "algorithm-essential: `torch.tensor(weight_list, device=cuda)` H2D copy; over-reported."
         ),
     },

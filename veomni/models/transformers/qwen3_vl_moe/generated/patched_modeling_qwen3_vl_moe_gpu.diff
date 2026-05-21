@@ -915,7 +915,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -802,11 +1239,71 @@
+@@ -802,11 +1239,88 @@
 
          merged_hidden_states = self.merger(hidden_states)
 
@@ -982,12 +982,29 @@
 +            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
 +        # --- Patch.3 ---
 +
-+        return self(hidden_states=pixel_values, grid_thw=grid_thw)
++        # --- Patch.4 ---
++        # Precompute the ViT metadata host-side and pass it straight to forward.
++        # dummy_forward runs *inside* Model.forward (FSDP path for ranks with no
++        # real images), so the collator can't precompute it — but t / h / w are
++        # Python ints right here, so the dummy ViT forward skips the
++        # `grid_thw.tolist()` + cu_seqlens build it would otherwise sync on. The
++        # dummy grid is constructed SP-divisible, so there is no sp-pad tail.
++        cu = [0]
++        for _ in range(t):
++            cu.append(cu[-1] + h * w)
++        vit_kwargs = {
++            "vit_grid_thw_list": [[t, h, w]],
++            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
++            "vit_max_seqlen": h * w,
++        }
++        # --- Patch.4 ---
++
++        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
 +        # --- Patch.1 ---
 
 
  class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
-@@ -896,6 +1393,12 @@
+@@ -896,6 +1410,12 @@
              idx = slice(offset, length, 3)
              freqs_t[..., idx] = freqs[dim, ..., idx]
          return freqs_t
@@ -1000,7 +1017,7 @@
 
 
  @auto_docstring(
-@@ -1019,9 +1522,23 @@
+@@ -1019,9 +1539,23 @@
              past_key_values=past_key_values,
          )
 
@@ -1024,7 +1041,7 @@
          visual_pos_masks = visual_pos_masks.to(hidden_states.device)
          visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
          hidden_states = hidden_states.clone()
-@@ -1084,6 +1601,12 @@
+@@ -1084,6 +1618,12 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1037,7 +1054,7 @@
 
 
  @auto_docstring
-@@ -1216,6 +1739,13 @@
+@@ -1216,6 +1756,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1051,7 +1068,7 @@
      @can_return_tuple
      @auto_docstring
      def get_image_features(
-@@ -1223,10 +1753,8 @@
+@@ -1223,10 +1770,8 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1063,7 +1080,7 @@
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          """
-@@ -1234,52 +1762,31 @@
+@@ -1234,52 +1779,31 @@
          vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
              pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
          )
@@ -1133,7 +1150,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1319,6 +1826,16 @@
+@@ -1319,6 +1843,16 @@
              position_ids = None
          return position_ids
 
@@ -1150,7 +1167,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1347,39 +1864,160 @@
+@@ -1347,39 +1881,160 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1327,7 +1344,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1389,24 +2027,48 @@
+@@ -1389,24 +2044,48 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1381,7 +1398,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1421,7 +2083,11 @@
+@@ -1421,7 +2100,11 @@
          )
 
          return Qwen3VLMoeModelOutputWithPast(
@@ -1394,7 +1411,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1506,6 +2172,12 @@
+@@ -1506,6 +2189,12 @@
 
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
@@ -1407,7 +1424,7 @@
 
 
  class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMixin):
-@@ -1560,6 +2232,14 @@
+@@ -1560,6 +2249,14 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1422,7 +1439,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1576,59 +2256,7 @@
+@@ -1576,59 +2273,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1483,7 +1500,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1644,29 +2272,65 @@
+@@ -1644,29 +2289,65 @@
          )
 
          hidden_states = outputs[0]
@@ -1567,7 +1584,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1674,7 +2338,9 @@
+@@ -1674,7 +2355,9 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
@@ -1578,7 +1595,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1901,6 +2567,51 @@
+@@ -1901,6 +2584,51 @@
 
          return input_ids, model_kwargs
 

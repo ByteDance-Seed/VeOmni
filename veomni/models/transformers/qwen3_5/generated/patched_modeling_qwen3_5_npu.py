@@ -1629,28 +1629,30 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         # Run a fake ViT forward so every FSDP rank touches the vision tower.
         # This prevents reduce-scatter hangs when some ranks have no real images/videos.
         """
+        # 16 patch tokens, each flattened from 3 channels * 2 temporal * 16 * 16 spatial.
+        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
         if get_parallel_state().sp_enabled:
-            sp_size = get_parallel_state().sp_size
-
-            # Fake patch sequence for one local rank:
-            # 16 patch tokens, each token flattened from:
-            #   3 channels * 2 temporal patches * 16 * 16 spatial patch
-            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-            # grid_thw describes the *global* pre-sharded vision grid, not the local shard.
-            # Here:
-            #   T = 1
-            #   H = 4 * sp_size
-            #   W = 4
-            # so total global patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
-            grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
-            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
+            # grid_thw describes the *global* pre-sharded vision grid (H scaled by
+            # sp_size): total patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
+            t, h, w = 1, 4 * get_parallel_state().sp_size, 4
         else:
-            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-            # Non-SP case: a minimal valid 4x4 patch grid.
-            # Total patch tokens = 1 * 4 * 4 = 16.
-            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
-            dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
-        return self(**dummy_data)
+            # Non-SP case: a minimal valid 4x4 patch grid (1 * 4 * 4 = 16 tokens).
+            t, h, w = 1, 4, 4
+        grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
+
+        # Precompute the ViT metadata host-side and pass it straight to forward:
+        # dummy_forward runs inside Model.forward, so the collator can't precompute
+        # it — but t / h / w are Python ints here, so the dummy ViT forward skips
+        # the `grid_thw.tolist()` + cu_seqlens build it would otherwise sync on.
+        cu = [0]
+        for _ in range(t):
+            cu.append(cu[-1] + h * w)
+        vit_kwargs = {
+            "vit_grid_thw_list": [[t, h, w]],
+            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+            "vit_max_seqlen": h * w,
+        }
+        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
 
 
 @dataclass

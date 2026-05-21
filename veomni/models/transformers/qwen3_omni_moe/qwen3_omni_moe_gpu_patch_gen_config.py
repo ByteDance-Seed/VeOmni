@@ -745,14 +745,28 @@ def qwen3_omni_moe_vision_dummy_forward_patched(self):
     # MixedPrecision the module's reported dtype may lag the per-call compute
     # cast, causing float/bf16 mismatches when the real-data rank runs in bf16.
     dtype = self.patch_embed.proj.weight.dtype
+    pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
     if get_parallel_state().sp_enabled:
-        sp_size = get_parallel_state().sp_size
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
-        grid_thw = torch.tensor([[1, 4 * sp_size, 4]], dtype=torch.int32, device=self.device)
+        # grid_thw describes the *global* pre-sharded vision grid (H scaled by sp_size).
+        t, h, w = 1, 4 * get_parallel_state().sp_size, 4
     else:
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
-        grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
-    return self(hidden_states=pixel_values, grid_thw=grid_thw)
+        t, h, w = 1, 4, 4
+    grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
+
+    # Precompute the ViT metadata host-side and pass it straight to forward:
+    # dummy_forward runs inside Thinker.forward, so the collator can't
+    # precompute it — but t / h / w are Python ints here, so the dummy ViT
+    # forward skips the `grid_thw.tolist()` + cu_seqlens build it would
+    # otherwise sync on.
+    cu = [0]
+    for _ in range(t):
+        cu.append(cu[-1] + h * w)
+    vit_kwargs = {
+        "vit_grid_thw_list": [[t, h, w]],
+        "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+        "vit_max_seqlen": h * w,
+    }
+    return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
 
 
 # ================================================================

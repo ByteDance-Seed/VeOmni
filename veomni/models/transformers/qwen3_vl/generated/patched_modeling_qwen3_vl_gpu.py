@@ -1257,7 +1257,24 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
             pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
         # --- Patch.3 ---
 
-        return self(hidden_states=pixel_values, grid_thw=grid_thw)
+        # --- Patch.4 ---
+        # Precompute the ViT metadata host-side and pass it straight to forward.
+        # dummy_forward runs *inside* Model.forward (FSDP path for ranks with no
+        # real images), so the collator can't precompute it — but t / h / w are
+        # Python ints right here, so the dummy ViT forward skips the
+        # `grid_thw.tolist()` + cu_seqlens build it would otherwise sync on. The
+        # dummy grid is constructed SP-divisible, so there is no sp-pad tail.
+        cu = [0]
+        for _ in range(t):
+            cu.append(cu[-1] + h * w)
+        vit_kwargs = {
+            "vit_grid_thw_list": [[t, h, w]],
+            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+            "vit_max_seqlen": h * w,
+        }
+        # --- Patch.4 ---
+
+        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
         # --- Patch.1 ---
 
 
