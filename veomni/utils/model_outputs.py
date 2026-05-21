@@ -117,14 +117,24 @@ class FusedLinearAuxOutputMixin:
     fused_linear_aux: Optional[FusedLinearAuxOutput] = None
 
 
+_FUSED_LINEAR_AUX_ARGS_DOC = """
+    Args:
+        fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+            Per-token tensors produced by the fused-linear loss path
+            (``log_probs``, ``entropy``, ``distillation_losses``,
+            ``student_mass``, ``teacher_mass``). ``None`` on the plain
+            loss path; populated when ``return_log_probs=True``.
+    """
+
+
 @dataclass
 class CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, CausalLMOutputWithPast):
-    """``CausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = "``CausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
 
 
 @dataclass
 class MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, MoeCausalLMOutputWithPast):
-    """``MoeCausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = "``MoeCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -139,33 +149,37 @@ class MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, MoeCausalLMOutput
 
 @dataclass
 class Qwen2VLCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen2VLCausalLMOutputWithPast):
-    """``Qwen2VLCausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = "``Qwen2VLCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
 
 
 @dataclass
 class Qwen2_5_VLCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen2_5_VLCausalLMOutputWithPast):
-    """``Qwen2_5_VLCausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = "``Qwen2_5_VLCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
 
 
 @dataclass
 class Qwen3VLCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3VLCausalLMOutputWithPast):
-    """``Qwen3VLCausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = "``Qwen3VLCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
 
 
 @dataclass
 class Qwen3VLMoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3VLMoeCausalLMOutputWithPast):
-    """``Qwen3VLMoeCausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = "``Qwen3VLMoeCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
 
 
 @dataclass
 class Qwen2_5OmniThinkerCausalLMOutputWithLogProbs(
     FusedLinearAuxOutputMixin, Qwen2_5OmniThinkerCausalLMOutputWithPast
 ):
-    """``Qwen2_5OmniThinkerCausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = (
+        "``Qwen2_5OmniThinkerCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
+    )
 
 
 @dataclass
 class Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(
     FusedLinearAuxOutputMixin, Qwen3OmniMoeThinkerCausalLMOutputWithPast
 ):
-    """``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` + ``fused_linear_aux`` payload."""
+    __doc__ = (
+        "``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
+    )
