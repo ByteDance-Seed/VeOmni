@@ -397,12 +397,12 @@ def test_matches_verl_compute_forward_kl_topk():
 
 
 def test_chunk_topk_distill_saves_memory_vs_eager():
-    """Peak GPU memory: fused kernel << eager ``h @ w.T`` materialization.
+    """Peak device memory: fused kernel << eager ``h @ w.T`` materialization.
 
     The whole point of routing verl's top-k distillation through this
     kernel is to avoid materializing the ``[T, V]`` student-logits
     tensor that the non-fused path allocates. We pin that property
-    directly: measure CUDA peak memory under each path on the same
+    directly: measure peak device memory under each path on the same
     (h, w, labels, teacher_*) tensors and assert fused << eager.
 
     Sizing rationale: at V=64k the dense ``[B*L, V]`` fp32 logits
@@ -412,14 +412,23 @@ def test_chunk_topk_distill_saves_memory_vs_eager():
     time). The assertion uses a conservative 3× margin so the test
     survives PyTorch allocator-block rounding and small fluctuations.
     Skipped on CPU and on devices with less than 4 GB free.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA-only memory test")
-    free, _total = torch.cuda.mem_get_info()
-    if free < 4 * 1024**3:
-        pytest.skip(f"Need >= 4 GB free CUDA memory, got {free / 1024**3:.1f} GB")
 
-    device = torch.device("cuda")
+    Routes all device APIs through ``veomni.utils.device`` so the
+    test runs unchanged on CUDA and NPU (both back ends expose
+    ``mem_get_info`` / ``reset_peak_memory_stats`` /
+    ``max_memory_allocated`` on their respective torch modules).
+    """
+    from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type, get_torch_device, synchronize
+
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("Accelerator-only memory test")
+
+    torch_device_module = get_torch_device()
+    free, _total = torch_device_module.mem_get_info()
+    if free < 4 * 1024**3:
+        pytest.skip(f"Need >= 4 GB free device memory, got {free / 1024**3:.1f} GB")
+
+    device = torch.device(get_device_type())
     B, L, H, V, K = 1, 2048, 256, 64_000, 8
     torch.manual_seed(0)
     h = torch.randn(B, L, H, device=device, dtype=torch.float32, requires_grad=True)
@@ -432,40 +441,40 @@ def test_chunk_topk_distill_saves_memory_vs_eager():
     # Free the dense teacher_logits before timing; verl never carries
     # this around — it only has the top-k slices.
     del teacher_logits
-    torch.cuda.empty_cache()
+    empty_cache()
 
     # ---- Eager path: replicate the non-fused branch the verl FSDP
     # loss takes — `student_logits = h @ w.T` (the [T, V] materialization
     # we explicitly try to avoid), then `log_softmax + gather` to get
     # the per-top-k log-probs we'd KL-mix with the teacher.
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats(device)
+    synchronize()
+    torch_device_module.reset_peak_memory_stats(device)
     student_logits = F.linear(h, w)  # [B, L, V] fp32 — the OOM-target tensor
     student_log_probs = student_logits.log_softmax(dim=-1)  # [B, L, V] fp32
     student_topk_log_probs = student_log_probs.gather(dim=-1, index=teacher_topk_ids)  # [B, L, K]
     distill_eager = (teacher_topk_log_probs.exp() * (teacher_topk_log_probs - student_topk_log_probs)).sum(dim=-1)
     distill_eager.sum().backward()
-    torch.cuda.synchronize()
-    eager_peak = torch.cuda.max_memory_allocated(device)
+    synchronize()
+    eager_peak = torch_device_module.max_memory_allocated(device)
 
     # Free everything before the fused timing — the eager path's grads
     # would otherwise inflate the fused-path baseline.
     del student_logits, student_log_probs, student_topk_log_probs, distill_eager
     h.grad = None
     w.grad = None
-    torch.cuda.empty_cache()
+    empty_cache()
 
     # ---- Fused path: chunk_topk_distill_function streams the lm_head
     # projection chunk-by-chunk; max in-flight allocation is
     # `chunk_size × V` fp32, not `B*L × V`.
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats(device)
+    synchronize()
+    torch_device_module.reset_peak_memory_stats(device)
     _lp, _ent, distill_fused, _smass, _tmass = ctkd.chunk_topk_distill_function(
         h, w, labels, teacher_topk_ids, teacher_topk_log_probs, chunk_size=128
     )
     distill_fused.sum().backward()
-    torch.cuda.synchronize()
-    fused_peak = torch.cuda.max_memory_allocated(device)
+    synchronize()
+    fused_peak = torch_device_module.max_memory_allocated(device)
 
     # Conservative margin (3×) to allow allocator-block rounding +
     # the fact that the fused kernel still has to hold h, w, labels,
