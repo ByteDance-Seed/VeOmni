@@ -154,8 +154,6 @@ def collate_multimodal_metadata(batch, sp_pad):
     for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
         if list_key in batch:
             md[list_key] = batch.pop(list_key)
-    if "rope_deltas" in batch:
-        md["rope_deltas"] = batch.pop("rope_deltas")
     for modality, list_key, pad_key in (
         ("image", "image_grid_thw_list", "pixel_values"),
         ("video", "video_grid_thw_list", "pixel_values_videos"),

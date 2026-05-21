@@ -327,8 +327,7 @@ def qwen3_vl_moe_model_forward_patched(
     # Mirror of qwen3_vl: unpack per-modality ViT kwargs from
     # `multimodal_metadata` (collator-precomputed) so the patched ViT
     # forward can skip the in-forward .tolist() / cu_seqlens build.
-    # `rope_deltas` is intentionally not consumed — see the qwen3_vl
-    # Patch.6 comment. See .agents/knowledge/multimodal_metadata.md.
+    # See .agents/knowledge/multimodal_metadata.md.
     multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
     image_vit_kwargs = {
         "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),

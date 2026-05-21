@@ -348,9 +348,8 @@ def _process_sample_qwen_vl_base(
     position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
 
     position_id_returns = position_id_func(**position_id_func_kwargs)
-    # Squeeze position_ids to match the per-sample (no batch dim) convention used
-    # everywhere else in this dict; rope_deltas keeps its (1, 1) shape so
-    # PackingCollator can stack across samples on dim 0.
+    # Squeeze position_ids to match the per-sample (no batch dim) convention
+    # used everywhere else in this dict.
     position_id_returns["position_ids"] = position_id_returns["position_ids"].squeeze().clone()
     merge_position_id_returns(tokenized_example, position_id_returns)
 

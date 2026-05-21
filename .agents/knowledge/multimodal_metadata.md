@@ -85,7 +85,6 @@ existing runtime derivation):
 | `vit_image_max_seqlen` | `int` (Python) | same | same | Already includes SP-pad. |
 | `vit_video_cu_seqlens` | `torch.IntTensor` (CPU) | same | same | Same shape as image. |
 | `vit_video_max_seqlen` | `int` (Python) | same | same | same |
-| `rope_deltas` | `torch.LongTensor` shape `(B, 1)` | `merge_position_id_returns` via `position_id_func`; `PackingCollator` stacks per-sample `(1, 1)` → `(B, 1)`; the hook moves it into the dict | Omni Thinker.forward (generation-path KV-cache) | `(B, 1)` matches HF's own `get_rope_index` output. qwen3_vl{,_moe} Model.forward do NOT consume it. Never SP-sliced. |
 
 `n_image_tokens` / `n_video_tokens` are **not** carried — they depend on
 `spatial_merge_size` and the model derives them from `*_grid_thw_list` with a
@@ -93,12 +92,17 @@ one-line `sum(...)` when needed.
 
 `position_ids` is **NOT** in the dict — it remains a top-level kwarg.
 
+`rope_deltas` is **NOT** carried: HF's `get_rope_index` returns it for the
+generation/KV-cache decode path, but the training forward always receives a
+precomputed `position_ids` and never derives or reads `rope_deltas`. So the
+data pipeline drops it at `merge_position_id_returns`.
+
 ## Producer flow (collator pipeline)
 
 ```
 data transform (CPU worker, per-sample)
     └─ per_sample_metadata: emits image_grid_thw_list / video_grid_thw_list
-       merge_position_id_returns: propagates position_ids + rope_deltas
+       merge_position_id_returns: copies position_ids into the feature dict
        (these go into the per-sample feature dict)
 
        ↓ DataLoader batch ↓
@@ -165,7 +169,7 @@ is `None` or a key is missing. This guarantees:
 |---|---|---|
 | qwen3_vl | ✅ wired | Canonical. `collate_multimodal_metadata` helper in the gpu config; npu reuses it. |
 | qwen3_vl_moe | ✅ wired | Reuses qwen3_vl's helper + hook (`config.helpers.extend`). |
-| qwen3_omni_moe | ✅ wired | Same ViT metadata; Thinker.forward also consumes `rope_deltas`. Also exposes `get_extra_collate_infos` (audio). |
+| qwen3_omni_moe | ✅ wired | Same ViT metadata. Also exposes `get_extra_collate_infos` (audio). |
 | qwen3_5 | ✅ wired | Own `collate_multimodal_metadata` (identical formula). |
 | qwen3_5_moe | ✅ wired | Own `collate_multimodal_metadata`. |
 | qwen2_5_vl | ⚠️ fallback-only | Window-attention ViT (`cu_window_seqlens` from `get_window_index`, config-dependent). No `get_metadata_collate_func` yet — ViT keeps in-forward derivation. Full integration is a tracked follow-up (needs GPU `logits_equal_v5` verification). |

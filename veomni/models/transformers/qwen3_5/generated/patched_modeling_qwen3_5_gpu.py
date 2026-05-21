@@ -159,10 +159,6 @@ def collate_multimodal_metadata(batch, sp_pad):
     for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
         if list_key in batch:
             md[list_key] = batch.pop(list_key)
-    # rope_deltas: (B, 1) tensor stacked by PackingCollator; carried through
-    # for the generation-path KV-cache. Never SP-sliced.
-    if "rope_deltas" in batch:
-        md["rope_deltas"] = batch.pop("rope_deltas")
 
     # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
     # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.

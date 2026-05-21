@@ -242,10 +242,6 @@ def collate_multimodal_metadata(batch, sp_pad):
     for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
         if list_key in batch:
             md[list_key] = batch.pop(list_key)
-    # rope_deltas: (B, 1) tensor stacked by PackingCollator; carried through
-    # for the generation-path KV-cache. Never SP-sliced.
-    if "rope_deltas" in batch:
-        md["rope_deltas"] = batch.pop("rope_deltas")
 
     # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
     # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.
@@ -1706,15 +1702,6 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # subset that matches its modality; the patched ViT.forward consumes
         # `vit_grid_thw_list` / `vit_cu_seqlens` / `vit_max_seqlen` via kwargs
         # (with runtime fallback when absent).
-        #
-        # ``multimodal_metadata["rope_deltas"]`` is intentionally NOT consumed
-        # here: on the training path ``position_ids`` is precomputed by the data
-        # pipeline, so the gate below short-circuits ``compute_3d_position_ids``
-        # and ``self.rope_deltas`` is never read. Stashing the collator value
-        # onto ``self`` would only leak stale module state into the returned
-        # output dataclass on a later text-only batch. The generation/KV-cache
-        # path manages ``self.rope_deltas`` through its own ``get_rope_index``
-        # call when ``position_ids is None``.
         multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
         image_vit_kwargs = {
             "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),

@@ -279,10 +279,6 @@ def collate_multimodal_metadata(batch, sp_pad):
     for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
         if list_key in batch:
             md[list_key] = batch.pop(list_key)
-    # rope_deltas: (B, 1) tensor stacked by PackingCollator; carried through
-    # for the generation-path KV-cache. Never SP-sliced.
-    if "rope_deltas" in batch:
-        md["rope_deltas"] = batch.pop("rope_deltas")
 
     # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
     # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.
@@ -1922,8 +1918,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         # Mirror of qwen3_vl: unpack per-modality ViT kwargs from
         # `multimodal_metadata` (collator-precomputed) so the patched ViT
         # forward can skip the in-forward .tolist() / cu_seqlens build.
-        # `rope_deltas` is intentionally not consumed — see the qwen3_vl
-        # Patch.6 comment. See .agents/knowledge/multimodal_metadata.md.
+        # See .agents/knowledge/multimodal_metadata.md.
         multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
         image_vit_kwargs = {
             "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),

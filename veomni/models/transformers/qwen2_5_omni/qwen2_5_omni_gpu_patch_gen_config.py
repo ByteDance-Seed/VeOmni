@@ -1354,11 +1354,9 @@ def qwen2_5_omni_top_get_position_id_func_patched(self):
 #
 # NOTE: qwen2_5_omni deliberately does NOT expose get_metadata_collate_func
 # (its window-attention ViT is not yet wired — see multimodal_metadata.md).
-# The transforms still emit image_grid_thw_list / rope_deltas onto the batch;
-# with no metadata hook they stay top-level (the grid lists are absorbed by
-# **kwargs, rope_deltas binds the named forward param) — harmless: the
-# training path always supplies position_ids so the rope_deltas branch is
-# never taken. This is intentional, not an oversight.
+# The transforms still emit image_grid_thw_list onto the batch; with no
+# metadata hook it stays top-level (absorbed by the forward's **kwargs).
+# This is intentional, not an oversight.
 # ================================================================
 @config.override_method(
     "Qwen2_5OmniForConditionalGeneration.get_extra_collate_infos",

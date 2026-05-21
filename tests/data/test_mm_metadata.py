@@ -76,15 +76,16 @@ def test_per_sample_metadata_text_only():
 # ── merge_position_id_returns ───────────────────────────────────────────────
 
 
-def test_merge_position_id_returns_with_rope_deltas():
+def test_merge_position_id_returns_keeps_only_position_ids():
+    """Only ``position_ids`` is propagated; ``rope_deltas`` (generation-only)
+    is dropped — the training forward never reads it."""
     target = {}
     merge_position_id_returns(
         target,
         {"position_ids": torch.zeros(3, 5), "rope_deltas": torch.tensor([[2]])},
     )
     assert "position_ids" in target
-    assert "rope_deltas" in target
-    assert target["rope_deltas"].tolist() == [[2]]
+    assert "rope_deltas" not in target
 
 
 def test_merge_position_id_returns_position_ids_only():
@@ -92,7 +93,6 @@ def test_merge_position_id_returns_position_ids_only():
     target = {}
     merge_position_id_returns(target, {"position_ids": torch.arange(5)})
     assert "position_ids" in target
-    assert "rope_deltas" not in target
 
 
 def test_merge_position_id_returns_missing_position_ids_raises():
@@ -111,7 +111,6 @@ def _mm_sample(seq_len, image_grid_thw_list):
         "position_ids": torch.arange(seq_len, dtype=torch.long),
         "image_grid_thw": torch.tensor(image_grid_thw_list, dtype=torch.long),
         "image_grid_thw_list": image_grid_thw_list,
-        "rope_deltas": torch.tensor([[3]], dtype=torch.long),
     }
 
 
@@ -125,7 +124,6 @@ def test_packing_collator_invokes_metadata_hook_with_flattened_lists():
     def hook(batch, sp_pad):
         seen["image_grid_thw_list"] = batch["image_grid_thw_list"]
         seen["sp_pad"] = sp_pad
-        seen["rope_deltas_shape"] = batch["rope_deltas"].shape
         batch["multimodal_metadata"] = {"image_grid_thw_list": batch.pop("image_grid_thw_list")}
 
     batch = PackingCollator(metadata_collate_func=hook)(
@@ -134,7 +132,6 @@ def test_packing_collator_invokes_metadata_hook_with_flattened_lists():
     # Per-sample lists flattened across the batch before the hook sees them.
     assert seen["image_grid_thw_list"] == [[1, 4, 4], [1, 2, 2], [2, 2, 2]]
     assert seen["sp_pad"] == {"pixel_values": 0, "pixel_values_videos": 0}
-    assert seen["rope_deltas_shape"] == (2, 1)
     assert batch["multimodal_metadata"]["image_grid_thw_list"] == [[1, 4, 4], [1, 2, 2], [2, 2, 2]]
 
 
@@ -177,14 +174,12 @@ def test_preforward_recurses_into_multimodal_metadata():
             "vit_image_cu_seqlens": torch.tensor([0, 16], dtype=torch.int32),
             "vit_image_max_seqlen": 16,  # Python int → must pass through
             "image_grid_thw_list": [[1, 4, 4]],  # Python list → must pass through
-            "rope_deltas": torch.tensor([[3]], dtype=torch.long),
         },
     }
     out = {k: _to_device(v, "cpu") for k, v in micro_batch.items()}
     md = out["multimodal_metadata"]
     assert isinstance(md, dict)
     assert isinstance(md["vit_image_cu_seqlens"], torch.Tensor)
-    assert isinstance(md["rope_deltas"], torch.Tensor)
     # Non-tensor values survive
     assert md["vit_image_max_seqlen"] == 16
     assert md["image_grid_thw_list"] == [[1, 4, 4]]
@@ -207,13 +202,12 @@ def test_qwen3_vl_metadata_hook_is_picklable_and_correct():
     hook = pickle.loads(pickle.dumps(collate_multimodal_metadata))
 
     # Temporal unroll: each (t, h, w) → t cu steps of h*w patches.
-    batch = {"image_grid_thw_list": [[1, 4, 4], [1, 2, 2], [2, 2, 2]], "rope_deltas": torch.tensor([[3]])}
+    batch = {"image_grid_thw_list": [[1, 4, 4], [1, 2, 2], [2, 2, 2]]}
     hook(batch, {"pixel_values": 0, "pixel_values_videos": 0})
     md = batch["multimodal_metadata"]
     assert md["vit_image_cu_seqlens"].tolist() == [0, 16, 20, 24, 28]
     assert md["vit_image_cu_seqlens"].dtype == torch.int32
     assert md["vit_image_max_seqlen"] == 16
-    assert md["rope_deltas"].tolist() == [[3]]
     assert "image_grid_thw_list" not in batch  # popped into the metadata dict
 
     # SP-pad tail: padded pixel rows become one synthetic trailing "image".

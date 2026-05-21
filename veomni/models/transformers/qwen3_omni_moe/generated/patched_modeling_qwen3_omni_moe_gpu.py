@@ -155,10 +155,6 @@ def collate_multimodal_metadata(batch, sp_pad):
     for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
         if list_key in batch:
             md[list_key] = batch.pop(list_key)
-    # rope_deltas: (B, 1) tensor stacked by PackingCollator; the Thinker
-    # forward consumes it on the generation-path KV-cache. Never SP-sliced.
-    if "rope_deltas" in batch:
-        md["rope_deltas"] = batch.pop("rope_deltas")
 
     # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
     # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.
@@ -2462,11 +2458,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
             "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
         }
-        md_rope_deltas = multimodal_metadata.get("rope_deltas")
-        if md_rope_deltas is not None and rope_deltas is None:
-            # Honour collator-emitted rope_deltas only if the caller didn't pass
-            # one explicitly (explicit always wins).
-            rope_deltas = md_rope_deltas
         # --- Patch.11 ---
 
         # --- Patch.3 ---
@@ -3204,9 +3195,9 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
 
     # ================================================================
     # Patch: Qwen3OmniMoeForConditionalGeneration.get_metadata_collate_func (NEW)
-    # Expose the ViT metadata derivation (cu_seqlens / max_seqlen / rope_deltas)
-    # to VeOmni's collator as a picklable callable, mirroring
-    # get_position_id_func. See .agents/knowledge/multimodal_metadata.md.
+    # Expose the ViT metadata derivation (cu_seqlens / max_seqlen) to VeOmni's
+    # collator as a picklable callable, mirroring get_position_id_func.
+    # See .agents/knowledge/multimodal_metadata.md.
     # ================================================================
     def get_metadata_collate_func(self):
         # collate_multimodal_metadata is a module-level helper (defined via

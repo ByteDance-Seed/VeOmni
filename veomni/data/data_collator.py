@@ -117,11 +117,6 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "image_grid_hw": DataCollateInfo(0, False, None, None),
     "image_grid_thw": DataCollateInfo(0, False, None, None),
     "video_grid_thw": DataCollateInfo(0, False, None, None),
-    # ``rope_deltas`` is shape ``(1, 1)`` per sample (per HF / VeOmni
-    # get_position_id_func contract); pack along dim 0 → ``(B, 1)``.
-    # Never sp-sliced / sp-padded: it's a per-sample scalar that survives the
-    # entire forward unchanged.
-    "rope_deltas": DataCollateInfo(0, False, None, None),
 }
 
 

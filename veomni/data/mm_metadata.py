@@ -21,8 +21,8 @@ pipeline — the bits every Qwen multimodal transform shares:
 
   * `per_sample_metadata` — called by the data transforms; emits Python-list
     mirrors of the per-sample `grid_thw` tensors.
-  * `merge_position_id_returns` — merges `position_id_func` outputs (incl.
-    `rope_deltas`) into the per-sample feature dict.
+  * `merge_position_id_returns` — copies the `position_id_func` output into
+    the per-sample feature dict.
 
 The **batch-level** derivation (ViT `cu_seqlens` / `max_seqlen`, window
 `cu_seqlens`, the SP-pad tail extension, and bundling into the
@@ -69,23 +69,16 @@ def merge_position_id_returns(
     model_inputs: Dict[str, Any],
     position_id_returns: Dict[str, Any],
 ) -> None:
-    """Merge ``position_id_func`` outputs into ``model_inputs`` in place.
+    """Copy the ``position_id_func`` output into ``model_inputs`` in place.
 
-    ``position_id_func`` for Qwen multimodal models returns
-    ``{"position_ids": ..., "rope_deltas": ...}``. The training transforms
-    historically only kept ``position_ids``; this helper propagates
-    ``rope_deltas`` too so generation-time KV-cache code paths don't have
-    to recompute it from GPU tensors.
-
-    Default-position-id callers (text-only datasets without
-    ``position_id_func``) pass ``{"position_ids": ...}`` only, which is
-    forwarded as-is.
+    ``position_id_func`` for Qwen multimodal models returns a dict; only
+    ``position_ids`` is propagated into the training feature dict. The
+    ``rope_deltas`` it also returns is generation-only (KV-cache decode) and
+    is intentionally dropped — the training forward always receives a
+    precomputed ``position_ids`` so it never derives or reads ``rope_deltas``.
     """
     if "position_ids" not in position_id_returns:
         raise KeyError(
             f"position_id_func returned dict without 'position_ids'; got keys: {sorted(position_id_returns)}"
         )
     model_inputs["position_ids"] = position_id_returns["position_ids"]
-    rope_deltas = position_id_returns.get("rope_deltas")
-    if rope_deltas is not None:
-        model_inputs["rope_deltas"] = rope_deltas
