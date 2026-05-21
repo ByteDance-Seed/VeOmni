@@ -6,7 +6,7 @@ deriving it inside Model.forward / ViT.forward (which forces host↔device syncs
 ## Why this exists
 
 For Qwen multimodal models the runtime ViT and Model forwards historically derived
-~5-15 metadata values per step from GPU tensors:
+metadata values per step from GPU tensors:
 
 - mrope `position_ids` + `rope_deltas` (per-sample variable-shape mrope algorithm)
 - ViT `cu_seqlens` + `max_seqlen` (from `image_grid_thw`)
@@ -31,6 +31,21 @@ So the derivation lives **on the model**, exposed as a picklable hook — exactl
 mirroring how `get_position_id_func` exposes the per-sample position-id closure.
 The collator stays generic: it packs / SP-pads / SP-slices and then *invokes* the
 model's hook; it never contains model-specific metadata logic.
+
+## Single key end-to-end
+
+There is **one representation per modality** through the whole pipeline: the HF
+processor's `image_grid_thw` / `video_grid_thw` CPU `LongTensor`.
+
+- The data transform emits only those tensors (no Python-list sidecar).
+- The collator packs them via the existing `DataCollateInfo` (`pack_dim=0`,
+  `torch.cat` → `(total_images, 3)`); no special-case keys.
+- The model's `collate_multimodal_metadata` hook reads the packed tensor and does
+  `.tolist()` **once** at batch time (CPU — the collator runs in dataloader
+  workers, so no host-device sync).
+
+The grid tensor stays in the batch (Model.forward still needs it as the HF
+`get_image_features` arg); the hook only reads it.
 
 ## Two model hooks
 
@@ -60,55 +75,76 @@ hook is the bare helper reference.
 Optional. Returns model-specific `DataCollateInfo` entries (as tuples
 `(pack_dim, sp_slice, sp_pad_value, sp_pad_scale)`) that the collator merges into
 its collate-info table. Omni models use it to declare the audio feature tensors
-(`input_features`, `audio_feature_lengths`, `audio_mask`) — previously hardcoded
-by `model_type` in `vlm_trainer._build_collate_fn`.
+(`input_features`, `audio_feature_lengths`, `audio_mask`).
 
 Both hooks are resolved by `vlm_trainer._build_collate_fn` via `getattr`: a model
 that doesn't expose them simply gets the runtime fallback (see below).
 
-## The `multimodal_metadata` contract
+## The `multimodal_metadata` dict contract
 
-Single optional kwarg on Model.forward / ViT.forward:
+`collate_multimodal_metadata` writes `batch["multimodal_metadata"]`, a dict with
+(all keys optional — missing keys make the consumer fall back to runtime derivation):
 
-```python
-def forward(self, ..., multimodal_metadata: dict | None = None, ...) -> ...:
-```
-
-The dict contains the following keys (all optional — missing keys fall back to the
-existing runtime derivation):
-
-| Key | Type | Producer | Consumer | Notes |
-|---|---|---|---|---|
-| `image_grid_thw_list` | `list[list[int]]` | `per_sample_metadata` (per-sample), `PackingCollator` flattens across the batch | ViT.forward, Model.forward | Python list of `[t, h, w]` triplets. Never sent to GPU. |
-| `video_grid_thw_list` | `list[list[int]]` | same | same | same |
-| `vit_image_cu_seqlens` | `torch.IntTensor` (CPU, then auto-moved) | `collate_multimodal_metadata` hook | Vision tower's varlen attention | Already includes the SP-pad tail as one extra "image" entry. |
-| `vit_image_max_seqlen` | `int` (Python) | same | same | Already includes SP-pad. |
-| `vit_video_cu_seqlens` | `torch.IntTensor` (CPU) | same | same | Same shape as image. |
-| `vit_video_max_seqlen` | `int` (Python) | same | same | same |
+| Key | Type | Notes |
+|---|---|---|
+| `image_grid_thw_list` | `list[list[int]]` | `[t, h, w]` triplets — the hook's `.tolist()` of the packed `image_grid_thw`. Python list, never sent to GPU. |
+| `video_grid_thw_list` | `list[list[int]]` | same, for video. |
+| `vit_image_cu_seqlens` | `torch.IntTensor` (CPU, then auto-moved) | varlen-attention cu_seqlens; already includes the SP-pad tail as one extra "image" entry. |
+| `vit_image_max_seqlen` | `int` (Python) | already includes SP-pad. |
+| `vit_video_cu_seqlens` / `vit_video_max_seqlen` | same | for video. |
 
 `n_image_tokens` / `n_video_tokens` are **not** carried — they depend on
 `spatial_merge_size` and the model derives them from `*_grid_thw_list` with a
 one-line `sum(...)` when needed.
 
-`position_ids` is **NOT** in the dict — it remains a top-level kwarg.
+`position_ids` is **NOT** in the dict — it remains a top-level model.forward kwarg.
 
 `rope_deltas` is **NOT** carried: HF's `get_rope_index` returns it for the
 generation/KV-cache decode path, but the training forward always receives a
-precomputed `position_ids` and never derives or reads `rope_deltas`. So the
-data pipeline drops it at `merge_position_id_returns`.
+precomputed `position_ids` and never derives or reads `rope_deltas`. The data
+transform drops it.
+
+## Model.forward → ViT: the `vit_metadata` sub-dict
+
+The ViT processes either images or videos through the **same** module. Model.forward
+selects the per-modality slice of `multimodal_metadata` and passes it as one
+`vit_metadata` kwarg to `get_image_features` / `get_video_features`:
+
+```python
+multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+image_vit_kwargs = {
+    "vit_metadata": {
+        "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+        "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+        "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+    }
+}
+self.get_image_features(pixel_values, image_grid_thw, **image_vit_kwargs)
+```
+
+The patched ViT.forward pops the single `vit_metadata` kwarg:
+
+```python
+vit_metadata = kwargs.pop("vit_metadata", None) or {}
+precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
+precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
+precomputed_max_seqlen = vit_metadata.get("max_seqlen")
+```
+
+A model whose ViT runs `dummy_forward` (FSDP path for ranks with no real images)
+builds the same `vit_metadata` sub-dict host-side from its Python-int `t/h/w`.
 
 ## Producer flow (collator pipeline)
 
 ```
 data transform (CPU worker, per-sample)
-    └─ per_sample_metadata: emits image_grid_thw_list / video_grid_thw_list
-       merge_position_id_returns: copies position_ids into the feature dict
-       (these go into the per-sample feature dict)
+    └─ emits image_grid_thw / video_grid_thw CPU tensors (HF processor output)
+       + position_ids (rope_deltas dropped — generation-only)
 
        ↓ DataLoader batch ↓
 
 PackingCollator (CPU, generic)
-    1. torch.cat per pack_dim; *_grid_thw_list flattened across the batch
+    1. torch.cat per pack_dim — image_grid_thw packs to (total_images, 3)
     2. add_flash_attention_kwargs_from_position_ids (existing, non-SP only)
     3. non-SP: invoke metadata_collate_func(batch, sp_pad={...: 0})
 
@@ -120,15 +156,15 @@ SequenceParallelCollator (CPU, generic)
     2. add_flash_attention_kwargs_from_position_ids (existing)
     3. invoke metadata_collate_func(batch, sp_pad={pixel_values: N, ...})
 
-       ↓ Trainer.preforward (.to_device) ↓
+       ↓ Trainer.preforward (.to_device, recurses into dicts) ↓
 
 Model.forward(..., multimodal_metadata={...})
-    Tensors in the dict get auto-moved to GPU; Python ints/lists stay on CPU.
+    Tensors in the dict get moved to GPU; Python ints/lists stay on CPU.
 ```
 
 The collator carries `metadata_collate_func` (from `MainCollator`, see
 `data_collator.MetadataCollateFunc`). When it is `None` — text models, third-party
-pipelines — steps (3) are skipped and no `multimodal_metadata` is produced.
+pipelines — step (3) is skipped and no `multimodal_metadata` is produced.
 
 ## SP-pad tail handling
 
@@ -140,23 +176,12 @@ mirrors how text-side `cu_seq_lens` picks up SP-pad via the `position_ids == 0`
 zero-tail convention. The embeddings for those positions are discarded after the
 per-rank slice in Model.forward.
 
-## Consumer flow (model forward)
-
-Every consumer site follows this template:
-
-```python
-precomputed_cu_seqlens = kwargs.pop("vit_cu_seqlens", None)
-if precomputed_cu_seqlens is not None:
-    cu_seqlens = precomputed_cu_seqlens.to(device, dtype=torch.int32, non_blocking=True)
-else:
-    # Runtime fallback — existing host-side build, still does one .tolist()
-    cu_seqlens = _build_cu_seqlens_from(grid_thw)
-```
-
 ## Backwards compatibility
 
 Every consumer site **must** keep a runtime fallback for when `multimodal_metadata`
-is `None` or a key is missing. This guarantees:
+is `None` or a key is missing. The patched ViT.forward derives the value in-forward
+(the original `.tolist()` / cu_seqlens build) when `vit_metadata` is absent. This
+guarantees:
 
 1. Third-party collators / data pipelines that don't precompute keep working.
 2. Inference scripts that construct inputs manually keep working.
@@ -168,26 +193,43 @@ is `None` or a key is missing. This guarantees:
 | Model | Status | Notes |
 |---|---|---|
 | qwen3_vl | ✅ wired | Canonical. `collate_multimodal_metadata` helper in the gpu config; npu reuses it. |
-| qwen3_vl_moe | ✅ wired | Reuses qwen3_vl's helper + hook (`config.helpers.extend`). |
+| qwen3_vl_moe | ✅ wired | Reuses qwen3_vl's helper + hook. |
 | qwen3_omni_moe | ✅ wired | Same ViT metadata. Also exposes `get_extra_collate_infos` (audio). |
 | qwen3_5 | ✅ wired | Own `collate_multimodal_metadata` (identical formula). |
-| qwen3_5_moe | ✅ wired | Own `collate_multimodal_metadata`. |
-| qwen2_5_vl | ⚠️ fallback-only | Window-attention ViT (`cu_window_seqlens` from `get_window_index`, config-dependent). No `get_metadata_collate_func` yet — ViT keeps in-forward derivation. Full integration is a tracked follow-up (needs GPU `logits_equal_v5` verification). |
+| qwen3_5_moe | ✅ wired | Reuses qwen3_5's ViT forward; own `collate_multimodal_metadata`. |
+| qwen2_vl | ❌ not wired | No `get_metadata_collate_func`. Tracked follow-up. |
+| qwen2_5_vl | ⚠️ fallback-only | Window-attention ViT (`cu_window_seqlens` from `get_window_index`, config-dependent — the hook would need a `partial(..., window_size=...)`). ViT keeps in-forward derivation; drains the `vit_metadata` kwarg. Tracked follow-up (needs GPU `logits_equal_v5` verification). |
 | qwen2_5_omni | ⚠️ fallback-only | Same window-attention ViT as qwen2_5_vl. Exposes `get_extra_collate_infos` (audio) but not `get_metadata_collate_func`. |
+
+## Adding the hook to a new model (checklist)
+
+1. Add a module-level `collate_multimodal_metadata(batch, sp_pad)` helper
+   (`@config.add_helper`) — read `batch["image_grid_thw"]` / `["video_grid_thw"]`,
+   `.tolist()`, derive `vit_*_cu_seqlens` / `vit_*_max_seqlen`, write
+   `batch["multimodal_metadata"]`. Append the SP-pad tail per `sp_pad`.
+2. Add a `get_metadata_collate_func` `override_method` returning that helper
+   (or a `partial` over it if the formula needs config constants).
+3. If the model has audio / extra feature tensors, add a `get_extra_collate_infos`
+   `override_method`.
+4. Model.forward: pop `multimodal_metadata`, build the per-modality `vit_metadata`
+   sub-dict, pass to `get_image_features` / `get_video_features`.
+5. ViT.forward: pop `vit_metadata`; consume `grid_thw_list` / `cu_seqlens` /
+   `max_seqlen` with a runtime fallback when absent.
+6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side from
+   the Python-int dummy grid.
+7. Add the model to `tests/models/test_model_forward_no_implicit_sync.py`'s
+   `_MM_METADATA_WIRED_CASES` so the sync gate feeds synthetic metadata.
 
 ## Files
 
-- `veomni/data/mm_metadata.py` — generic helpers only (`per_sample_metadata`,
-  `merge_position_id_returns`). The batch-level derivation moved to the model hooks.
 - `veomni/data/data_collator.py` — `MainCollator` carries `metadata_collate_func`;
   `PackingCollator` / `SequenceParallelCollator` invoke it after SP padding.
-- `veomni/data/data_transform.py` — transforms call `per_sample_metadata` /
-  `merge_position_id_returns`.
+- `veomni/data/data_transform.py` — transforms emit the `*_grid_thw` tensors +
+  `position_ids`.
 - `veomni/trainer/vlm_trainer.py` — `_build_collate_fn` resolves the two model hooks.
 - `veomni/models/transformers/<model>/<model>_{gpu,npu}_patch_gen_config.py` —
   `collate_multimodal_metadata` helper + `get_metadata_collate_func` /
   `get_extra_collate_infos` overrides; regenerated `generated/` files.
-- `tests/data/test_mm_metadata.py` — generic helpers + collator-hook handoff + hook
-  picklability.
+- `tests/data/test_mm_metadata.py` — collator-hook handoff + hook picklability.
 - `tests/models/test_model_forward_no_implicit_sync.py` — sync gate; feeds synthetic
   `multimodal_metadata` for the wired cases.

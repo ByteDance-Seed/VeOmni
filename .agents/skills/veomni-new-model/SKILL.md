@@ -90,6 +90,15 @@ Phase 6: Test                          -> pending
 3. If the model needs custom collator logic:
    - Extend `veomni/data/data_collator.py`
 
+4. **VLM only — multimodal metadata precompute**: to keep the ViT forward free
+   of host-device CUDA syncs, derive ViT `cu_seqlens` / `max_seqlen` in the
+   collator rather than the forward. Follow the checklist in
+   `.agents/knowledge/multimodal_metadata.md` ("Adding the hook to a new model"):
+   a `collate_multimodal_metadata` patchgen helper + a `get_metadata_collate_func`
+   override, the per-modality `vit_metadata` sub-dict threaded through
+   Model.forward → ViT.forward (with a runtime fallback), and the model added to
+   `_MM_METADATA_WIRED_CASES` in the sync gate test.
+
 ## Phase 6: Test
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.

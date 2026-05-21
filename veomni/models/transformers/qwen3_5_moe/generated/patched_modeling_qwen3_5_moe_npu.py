@@ -1630,12 +1630,14 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
-        # Precomputed multimodal metadata, unpacked by Model.forward from
-        # `multimodal_metadata`. All optional with runtime fallback.
+        # Precomputed ViT metadata — a per-modality sub-dict Model.forward selects
+        # from `multimodal_metadata` and passes as the single `vit_metadata` kwarg.
+        # All .get() below fall back to None for callers that bypass MainCollator.
         # See .agents/knowledge/multimodal_metadata.md.
-        precomputed_grid_thw_list = kwargs.pop("vit_grid_thw_list", None)
-        precomputed_cu_seqlens = kwargs.pop("vit_cu_seqlens", None)
-        precomputed_max_seqlen = kwargs.pop("vit_max_seqlen", None)
+        vit_metadata = kwargs.pop("vit_metadata", None) or {}
+        precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
+        precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
+        precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 
         hidden_states = self.patch_embed(hidden_states)
 
@@ -1808,12 +1810,12 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         cu = [0]
         for _ in range(t):
             cu.append(cu[-1] + h * w)
-        vit_kwargs = {
-            "vit_grid_thw_list": [[t, h, w]],
-            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
-            "vit_max_seqlen": h * w,
+        vit_metadata = {
+            "grid_thw_list": [[t, h, w]],
+            "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+            "max_seqlen": h * w,
         }
-        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
+        return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
 
 
 @dataclass
@@ -2191,9 +2193,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         contiguous avoids Python list-overhead and enables direct execution of
         vectorized kernels in the main forward pass.
 
-        ``**kwargs`` carries collator-precomputed ViT metadata
-        (`vit_grid_thw_list` / `vit_cu_seqlens` / `vit_max_seqlen`) which is
-        forwarded to the patched ViT forward. See
+        ``**kwargs`` carries the collator-precomputed ``vit_metadata`` sub-dict
+        which is forwarded to the patched ViT forward. See
         .agents/knowledge/multimodal_metadata.md.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
@@ -2315,14 +2316,18 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         # forward can skip the in-forward .tolist() / cu_seqlens build.
         multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
         image_vit_kwargs = {
-            "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
-            "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
-            "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+            "vit_metadata": {
+                "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+                "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+                "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+            }
         }
         video_vit_kwargs = {
-            "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
-            "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
-            "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+            "vit_metadata": {
+                "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+                "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+                "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+            }
         }
         # --- Patch.6 ---
 

@@ -781,11 +781,9 @@ def qwen2_5_omni_vision_forward_patched(
     # qwen2_5_omni ViT has the same window-attention layout as qwen2_5_vl,
     # so it doesn't yet consume the precomputed multimodal_metadata; the
     # in-forward cu_seqlens / cu_window_seqlens build stays as-is. Pop the
-    # vit_* kwargs so they don't leak into per-block kwargs below.
+    # `vit_metadata` kwarg so it doesn't leak into per-block kwargs below.
     # See .agents/knowledge/multimodal_metadata.md.
-    kwargs.pop("vit_grid_thw_list", None)
-    kwargs.pop("vit_cu_seqlens", None)
-    kwargs.pop("vit_max_seqlen", None)
+    kwargs.pop("vit_metadata", None)
 
     hidden_states = self.patch_embed(hidden_states)
     rotary_pos_emb = self.rot_pos_emb(grid_thw)

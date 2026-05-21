@@ -248,21 +248,22 @@ def collate_multimodal_metadata(batch, sp_pad):
     ``batch["multimodal_metadata"]``.
     """
     md = {}
-    # *_grid_thw_list: Python list[[t, h, w]] flattened across the batch by
-    # PackingCollator. Carried through verbatim for the ViT / Model forward.
-    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
-        if list_key in batch:
-            md[list_key] = batch.pop(list_key)
-
-    # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
-    # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.
-    for modality, list_key, pad_key in (
-        ("image", "image_grid_thw_list", "pixel_values"),
-        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    # ViT varlen-attention metadata, derived from the HF processor's
+    # ``*_grid_thw`` CPU LongTensor (packed across the batch by the collator
+    # via DataCollateInfo pack_dim=0). ``.tolist()`` here is a pure-CPU op —
+    # the collator runs in dataloader workers, no host-device sync.
+    # Temporal unroll: each (t, h, w) expands to ``t`` cu steps of ``h * w``.
+    for modality, grid_key, pad_key in (
+        ("image", "image_grid_thw", "pixel_values"),
+        ("video", "video_grid_thw", "pixel_values_videos"),
     ):
-        grid_list = md.get(list_key)
+        grid = batch.get(grid_key)
+        if grid is None:
+            continue
+        grid_list = grid.tolist() if torch.is_tensor(grid) else grid
         if not grid_list:
             continue
+        md[f"{modality}_grid_thw_list"] = grid_list
         cu = [0]
         max_hw = 0
         for t, h, w in grid_list:
@@ -1104,12 +1105,15 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         grid_thw: torch.Tensor,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithDeepstackFeatures:
-        # Precomputed metadata, unpacked by Model.forward from `multimodal_metadata`.
-        # All optional with runtime fallback (third-party callers / ad-hoc tests).
+        # Precomputed ViT metadata — a per-modality sub-dict Model.forward selects
+        # from `multimodal_metadata` and passes as the single `vit_metadata` kwarg.
+        # `None` (with all .get() below falling back) for callers that bypass
+        # MainCollator (third-party pipelines / ad-hoc tests).
         # See .agents/knowledge/multimodal_metadata.md for the contract.
-        precomputed_grid_thw_list = kwargs.pop("vit_grid_thw_list", None)
-        precomputed_cu_seqlens = kwargs.pop("vit_cu_seqlens", None)
-        precomputed_max_seqlen = kwargs.pop("vit_max_seqlen", None)
+        vit_metadata = kwargs.pop("vit_metadata", None) or {}
+        precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
+        precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
+        precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 
         hidden_states = self.patch_embed(hidden_states)
 
@@ -1297,14 +1301,14 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         cu = [0]
         for _ in range(t):
             cu.append(cu[-1] + h * w)
-        vit_kwargs = {
-            "vit_grid_thw_list": [[t, h, w]],
-            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
-            "vit_max_seqlen": h * w,
+        vit_metadata = {
+            "grid_thw_list": [[t, h, w]],
+            "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+            "max_seqlen": h * w,
         }
         # --- Patch.4 ---
 
-        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
+        return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
         # --- Patch.1 ---
 
 
@@ -1743,22 +1747,25 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # --- Patch.2 ---
 
         # --- Patch.6 ---
-        # Unpack the per-modality ViT kwargs from `multimodal_metadata` (collator-
-        # precomputed; see .agents/knowledge/multimodal_metadata.md). Each
-        # `self.get_image_features` / `self.get_video_features` call gets the
-        # subset that matches its modality; the patched ViT.forward consumes
-        # `vit_grid_thw_list` / `vit_cu_seqlens` / `vit_max_seqlen` via kwargs
-        # (with runtime fallback when absent).
+        # Bundle the per-modality ViT metadata from `multimodal_metadata`
+        # (collator-precomputed; see .agents/knowledge/multimodal_metadata.md)
+        # into one `vit_metadata` sub-dict per `get_*_features` call. The patched
+        # ViT.forward reads grid_thw_list / cu_seqlens / max_seqlen from it, with
+        # runtime fallback when absent.
         multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
         image_vit_kwargs = {
-            "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
-            "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
-            "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+            "vit_metadata": {
+                "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+                "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+                "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+            }
         }
         video_vit_kwargs = {
-            "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
-            "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
-            "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+            "vit_metadata": {
+                "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+                "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+                "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+            }
         }
         # --- Patch.6 ---
 

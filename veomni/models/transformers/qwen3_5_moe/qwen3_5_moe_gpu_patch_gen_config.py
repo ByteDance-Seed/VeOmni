@@ -380,14 +380,18 @@ def qwen3_5_moe_model_forward_patched(
     # forward can skip the in-forward .tolist() / cu_seqlens build.
     multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
     image_vit_kwargs = {
-        "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
-        "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
-        "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+        }
     }
     video_vit_kwargs = {
-        "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
-        "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
-        "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+        }
     }
     # --- Patch.6 ---
 
@@ -574,21 +578,22 @@ def collate_multimodal_metadata(batch, sp_pad):
     ``batch["multimodal_metadata"]``.
     """
     md = {}
-    # *_grid_thw_list: Python list[[t, h, w]] flattened across the batch by
-    # PackingCollator. Carried through verbatim for the ViT / Model forward.
-    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
-        if list_key in batch:
-            md[list_key] = batch.pop(list_key)
-
-    # ViT varlen-attention cu_seqlens / max_seqlen. Temporal unroll: each
-    # (t, h, w) expands to ``t`` cu steps of ``h * w`` patches.
-    for modality, list_key, pad_key in (
-        ("image", "image_grid_thw_list", "pixel_values"),
-        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    # ViT varlen-attention metadata, derived from the HF processor's
+    # ``*_grid_thw`` CPU LongTensor (packed across the batch by the collator
+    # via DataCollateInfo pack_dim=0). ``.tolist()`` here is a pure-CPU op —
+    # the collator runs in dataloader workers, no host-device sync.
+    # Temporal unroll: each (t, h, w) expands to ``t`` cu steps of ``h * w``.
+    for modality, grid_key, pad_key in (
+        ("image", "image_grid_thw", "pixel_values"),
+        ("video", "video_grid_thw", "pixel_values_videos"),
     ):
-        grid_list = md.get(list_key)
+        grid = batch.get(grid_key)
+        if grid is None:
+            continue
+        grid_list = grid.tolist() if torch.is_tensor(grid) else grid
         if not grid_list:
             continue
+        md[f"{modality}_grid_thw_list"] = grid_list
         cu = [0]
         max_hw = 0
         for t, h, w in grid_list:

@@ -352,6 +352,27 @@ duplicating ~hundreds of lines per sibling model.
   `@config.override_method("<M>ForConditionalGeneration.get_position_id_func")`
   via an `add_post_import_block` that defines the helper `get_position_id` in
   generated scope (module-level, so multiprocessing can pickle it).
+- **Multimodal metadata precompute** — to keep the ViT forward host-device-sync
+  free, derive ViT `cu_seqlens` / `max_seqlen` in the collator, not the forward.
+  See `.agents/knowledge/multimodal_metadata.md` for the full contract. Checklist
+  for a new VLM:
+  1. Add a module-level `collate_multimodal_metadata(batch, sp_pad)` helper
+     (`@config.add_helper`) — read `batch["image_grid_thw"]` / `["video_grid_thw"]`,
+     `.tolist()`, derive `vit_*_cu_seqlens` / `vit_*_max_seqlen` (+ the `sp_pad`
+     tail entry), write `batch["multimodal_metadata"]`.
+  2. `@config.override_method("<M>ForConditionalGeneration.get_metadata_collate_func")`
+     returning that helper (or a `partial` over it if the formula needs config).
+  3. Optional `get_extra_collate_infos` `override_method` for audio / extra
+     feature tensors (Omni).
+  4. Model.forward: pop `multimodal_metadata`, build the per-modality
+     `vit_metadata` sub-dict (`grid_thw_list` / `cu_seqlens` / `max_seqlen`),
+     pass to `get_image_features` / `get_video_features`.
+  5. ViT.forward: pop the single `vit_metadata` kwarg; consume the precomputed
+     values **with a runtime fallback** (in-forward `.tolist()` / cu_seqlens
+     build) for callers that bypass `MainCollator`.
+  6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side.
+  7. Add the model to `_MM_METADATA_WIRED_CASES` in
+     `tests/models/test_model_forward_no_implicit_sync.py`.
   When SP is enabled and you need to all-gather `input_ids` (or any tensor that
   went through `MainCollator`'s `pack_dim=-1` path) back to full seq on each
   rank, use `torch.cat(list, dim=1)` — the collator's `PackingCollator.__call__`

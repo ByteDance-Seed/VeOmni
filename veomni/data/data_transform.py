@@ -20,8 +20,6 @@ import torch
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.registry import Registry
 
-from .mm_metadata import merge_position_id_returns, per_sample_metadata
-
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -351,17 +349,21 @@ def _process_sample_qwen_vl_base(
     # Squeeze position_ids to match the per-sample (no batch dim) convention
     # used everywhere else in this dict.
     position_id_returns["position_ids"] = position_id_returns["position_ids"].squeeze().clone()
-    merge_position_id_returns(tokenized_example, position_id_returns)
+    # Only position_ids is propagated into the training feature dict. The
+    # rope_deltas position_id_func also returns is generation-only (KV-cache
+    # decode); the training forward always receives a precomputed
+    # position_ids and never derives or reads rope_deltas.
+    tokenized_example["position_ids"] = position_id_returns["position_ids"]
 
     # Final cleanup
     tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
     tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
-    # Emit Python-list mirrors of image_grid_thw / video_grid_thw for the
-    # batch-level metadata derivation downstream (PackingCollator). Both
-    # tensors are CPU at this point; .tolist() is a pure-host op, no sync.
-    tokenized_example.update(per_sample_metadata(tokenized_example))
+    # image_inputs / video_inputs carry the HF processor's CPU `image_grid_thw`
+    # / `video_grid_thw` tensors; the collator packs them (DataCollateInfo
+    # pack_dim=0) and the model's metadata_collate_func hook derives the ViT
+    # metadata from them. No per-sample `.tolist()` sidecar needed here.
 
     return [tokenized_example]
 
@@ -520,9 +522,10 @@ def process_sample_qwen_omni(
         second_per_grids=model_inputs.pop("video_second_per_grid", None),
     )
     position_id_returns["position_ids"] = position_id_returns["position_ids"].clone()
-    merge_position_id_returns(model_inputs, position_id_returns)
-    # Python-list mirrors of grid_thw — see _process_sample_qwen_vl_base for rationale.
-    model_inputs.update(per_sample_metadata(model_inputs))
+    # Only position_ids is propagated — rope_deltas is generation-only; see
+    # _process_sample_qwen_vl_base for the rationale. grid_thw tensors flow
+    # through model_inputs and are packed by the collator.
+    model_inputs["position_ids"] = position_id_returns["position_ids"]
 
     model_inputs["image_mask"] = image_mask
     model_inputs["video_mask"] = video_mask

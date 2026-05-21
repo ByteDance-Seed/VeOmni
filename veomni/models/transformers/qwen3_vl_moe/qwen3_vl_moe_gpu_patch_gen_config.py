@@ -333,14 +333,18 @@ def qwen3_vl_moe_model_forward_patched(
     # See .agents/knowledge/multimodal_metadata.md.
     multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
     image_vit_kwargs = {
-        "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
-        "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
-        "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+        }
     }
     video_vit_kwargs = {
-        "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
-        "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
-        "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+        }
     }
     # --- Patch.6 ---
 

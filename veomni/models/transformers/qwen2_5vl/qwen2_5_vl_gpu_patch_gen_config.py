@@ -231,13 +231,11 @@ def qwen2_5_vit_forward_patched(
     # of the cu_seqlens path. Its cu_window_seqlens depends on the
     # spatial-merge window index and isn't trivially collator-derivable, so
     # this ViT doesn't yet consume the precomputed multimodal_metadata. Pop
-    # the vit_* kwargs here so they don't leak into the per-block call
-    # below; ignoring them is safe because the in-forward derivation is the
+    # the `vit_metadata` kwarg here so it doesn't leak into the per-block call
+    # below; ignoring it is safe because the in-forward derivation is the
     # same value the collator would produce.
     # See .agents/knowledge/multimodal_metadata.md.
-    kwargs.pop("vit_grid_thw_list", None)
-    kwargs.pop("vit_cu_seqlens", None)
-    kwargs.pop("vit_max_seqlen", None)
+    kwargs.pop("vit_metadata", None)
 
     hidden_states = self.patch_embed(hidden_states)
     rotary_pos_emb = self.rot_pos_emb(grid_thw)

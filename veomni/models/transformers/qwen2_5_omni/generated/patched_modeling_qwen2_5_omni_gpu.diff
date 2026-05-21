@@ -872,7 +872,7 @@
          Args:
              hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
                  The final hidden states of the model.
-@@ -1232,8 +1398,17 @@
+@@ -1232,8 +1398,15 @@
                  The temporal, height and width of feature shape of each image in LLM.
 
          Returns:
@@ -882,16 +882,14 @@
 +        # qwen2_5_omni ViT has the same window-attention layout as qwen2_5_vl,
 +        # so it doesn't yet consume the precomputed multimodal_metadata; the
 +        # in-forward cu_seqlens / cu_window_seqlens build stays as-is. Pop the
-+        # vit_* kwargs so they don't leak into per-block kwargs below.
++        # `vit_metadata` kwarg so it doesn't leak into per-block kwargs below.
 +        # See .agents/knowledge/multimodal_metadata.md.
-+        kwargs.pop("vit_grid_thw_list", None)
-+        kwargs.pop("vit_cu_seqlens", None)
-+        kwargs.pop("vit_max_seqlen", None)
++        kwargs.pop("vit_metadata", None)
 +
          hidden_states = self.patch_embed(hidden_states)
          rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-@@ -1244,6 +1419,27 @@
+@@ -1244,6 +1417,27 @@
              dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
          )
          cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
@@ -919,7 +917,7 @@
 
          seq_len, _ = hidden_states.size()
          hidden_states = hidden_states.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
-@@ -1253,17 +1449,22 @@
+@@ -1253,17 +1447,22 @@
          rotary_pos_emb = rotary_pos_emb[window_index, :, :]
          rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
 
@@ -953,7 +951,7 @@
          for layer_num, blk in enumerate(self.blocks):
              if layer_num in self.fullatt_block_indexes:
                  cu_seqlens_now = cu_seqlens
-@@ -1279,12 +1480,47 @@
+@@ -1279,12 +1478,47 @@
 
          merged_hidden_states = self.merger(hidden_states)
          reverse_indices = torch.argsort(window_index)
@@ -1001,7 +999,7 @@
 
 
  class Qwen2_5OmniRotaryEmbedding(nn.Module):
-@@ -1740,6 +1976,12 @@
+@@ -1740,6 +1974,12 @@
          )
 
 
@@ -1014,7 +1012,7 @@
  @auto_docstring(
      custom_intro="""
      The Qwen2.5OmniThinker model which consists of a audio backbone and a language model.
-@@ -1802,44 +2044,33 @@
+@@ -1802,44 +2042,33 @@
          pixel_values = pixel_values.type(self.visual.dtype)
          return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
 
@@ -1075,7 +1073,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -1891,141 +2122,176 @@
+@@ -1891,141 +2120,176 @@
          special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
          return special_image_mask, special_video_mask, special_audio_mask
 
@@ -1345,7 +1343,7 @@
                      audio_feature_lengths,
                      video_second_per_grid,
                  )
-@@ -2033,11 +2299,16 @@
+@@ -2033,11 +2297,16 @@
                  self.rope_deltas = rope_deltas
              else:
                  batch_size, seq_length = input_ids.shape
@@ -1363,7 +1361,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2045,34 +2316,69 @@
+@@ -2045,34 +2314,69 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1449,7 +1447,7 @@
 
      def prepare_inputs_for_generation(
          self,
-@@ -2123,925 +2429,32 @@
+@@ -2123,925 +2427,32 @@
 
          return model_inputs
 
@@ -2401,7 +2399,7 @@
 
 
  # Modified from Llama with a different rotate function, will fixed in next release
-@@ -3078,708 +2491,10 @@
+@@ -3078,708 +2489,10 @@
      return q_embed, k_embed
 
 
@@ -3114,7 +3112,7 @@
 
 
  ############################
-@@ -3806,22 +2521,74 @@
+@@ -3806,22 +2519,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3199,7 +3197,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3883,244 +2650,69 @@
+@@ -3883,244 +2648,69 @@
 
          return model
 

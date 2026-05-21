@@ -243,16 +243,6 @@ class PackingCollator(DataCollator):
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
             if collate_info is None:
-                # Per-sample multimodal grid_thw lists arrive as ``list[list[int]]``;
-                # flatten across the batch (one list of triplets per sample → one
-                # flat list of triplets for the whole batch). The model's
-                # ``metadata_collate_func`` hook consumes this flattened format.
-                if key in ("image_grid_thw_list", "video_grid_thw_list"):
-                    flat: List[List[int]] = []
-                    for sample_list in batch[key]:
-                        flat.extend(sample_list)
-                    batch[key] = flat
-                    continue
                 try:
                     if key.split("_")[0] in MODALITY:
                         batch[key] = torch.cat(batch[key], dim=0)
@@ -280,7 +270,7 @@ class PackingCollator(DataCollator):
             add_flash_attention_kwargs_from_position_ids(batch)
             # No SP downstream → no sp-pad. Hand the packed batch to the
             # model-provided hook (if any), which derives ``multimodal_metadata``
-            # from the flattened ``*_grid_thw_list`` using its own config. When
+            # from the packed ``*_grid_thw`` tensors using its own config. When
             # SP is enabled this is deferred to ``SequenceParallelCollator`` so
             # the hook sees the SP-padded batch + per-modality pad counts.
             if self.metadata_collate_func is not None:
