@@ -11,6 +11,7 @@ on:
       - v0.*
     paths:
       - "**/*.py"
+      - "!scripts/**/*.py"
       - .github/workflows/npu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -19,6 +20,7 @@ on:
       - main
     paths:
       - "**/*.py"
+      - "!scripts/**/*.py"
       - .github/workflows/npu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
