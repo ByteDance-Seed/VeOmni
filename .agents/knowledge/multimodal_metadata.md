@@ -93,6 +93,19 @@ that doesn't expose them simply gets the runtime fallback (see below).
 | `vit_image_max_seqlen` | `int` (Python) | already includes SP-pad. |
 | `vit_video_cu_seqlens` / `vit_video_max_seqlen` | same | for video. |
 
+Window-attention ViTs (qwen2.5-VL / qwen2.5-omni) add three more keys per
+modality — the host-side port of `get_window_index`:
+
+| Key | Type | Notes |
+|---|---|---|
+| `vit_image_cu_window_seqlens` | `torch.IntTensor` (CPU) | window-attention cu_seqlens; `unique_consecutive`'d, includes the SP-pad tail. |
+| `vit_image_window_index` | `torch.LongTensor` (CPU) | the `get_window_index` permutation that reorders the pre-merger ViT tokens. |
+| `vit_image_win_max_seqlen` | `int` (Python) | max window segment length, includes SP-pad. qwen2.5-omni omits this (its vision attention takes `.max()` on-device). |
+
+(`vit_video_*` equivalents for video.) The hook needs the vision config —
+`get_metadata_collate_func` returns `partial(collate_multimodal_metadata,
+window_size=..., spatial_merge_size=..., patch_size=...)`.
+
 `n_image_tokens` / `n_video_tokens` are **not** carried — they depend on
 `spatial_merge_size` and the model derives them from `*_grid_thw_list` with a
 one-line `sum(...)` when needed.
@@ -197,9 +210,9 @@ guarantees:
 | qwen3_omni_moe | ✅ wired | Same ViT metadata. Also exposes `get_extra_collate_infos` (audio). |
 | qwen3_5 | ✅ wired | Own `collate_multimodal_metadata` (identical formula). |
 | qwen3_5_moe | ✅ wired | Reuses qwen3_5's ViT forward; own `collate_multimodal_metadata`. |
-| qwen2_vl | ❌ not wired | No `get_metadata_collate_func`. Tracked follow-up. |
-| qwen2_5_vl | ⚠️ fallback-only | Window-attention ViT (`cu_window_seqlens` from `get_window_index`, config-dependent — the hook would need a `partial(..., window_size=...)`). ViT keeps in-forward derivation; drains the `vit_metadata` kwarg. Tracked follow-up (needs GPU `logits_equal_v5` verification). |
-| qwen2_5_omni | ⚠️ fallback-only | Same window-attention ViT as qwen2_5_vl. Exposes `get_extra_collate_infos` (audio) but not `get_metadata_collate_func`. |
+| qwen2_vl | ✅ wired | Own `collate_multimodal_metadata` (non-window ViT, same formula as qwen3_vl). |
+| qwen2_5_vl | ✅ wired | Window-attention ViT. `collate_multimodal_metadata` ports `get_window_index` host-side; `get_metadata_collate_func` `partial`-closes the vision-config dims. |
+| qwen2_5_omni | ✅ wired | Same window-attention ViT as qwen2_5_vl. Also exposes `get_extra_collate_infos` (audio); `get_metadata_collate_func` is patched on the thinker, the top-level model delegates. |
 
 ## Adding the hook to a new model (checklist)
 
@@ -207,18 +220,25 @@ guarantees:
    (`@config.add_helper`) — read `batch["image_grid_thw"]` / `["video_grid_thw"]`,
    `.tolist()`, derive `vit_*_cu_seqlens` / `vit_*_max_seqlen`, write
    `batch["multimodal_metadata"]`. Append the SP-pad tail per `sp_pad`.
+   Window-attention ViTs also emit `vit_*_cu_window_seqlens` /
+   `vit_*_window_index` (a host-side port of `get_window_index`).
 2. Add a `get_metadata_collate_func` `override_method` returning that helper
-   (or a `partial` over it if the formula needs config constants).
+   (or a `partial` over it if the formula needs config constants — e.g.
+   `window_size` / `spatial_merge_size` / `patch_size` for window attention).
 3. If the model has audio / extra feature tensors, add a `get_extra_collate_infos`
    `override_method`.
 4. Model.forward: pop `multimodal_metadata`, build the per-modality `vit_metadata`
    sub-dict, pass to `get_image_features` / `get_video_features`.
 5. ViT.forward: pop `vit_metadata`; consume `grid_thw_list` / `cu_seqlens` /
-   `max_seqlen` with a runtime fallback when absent.
+   `max_seqlen` (+ `cu_window_seqlens` / `window_index` for window attention)
+   with a runtime fallback when absent.
 6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side from
    the Python-int dummy grid.
 7. Add the model to `tests/models/test_model_forward_no_implicit_sync.py`'s
-   `_MM_METADATA_WIRED_CASES` so the sync gate feeds synthetic metadata.
+   `CASES` + `_MM_METADATA_WIRED_CASES` so the sync gate feeds synthetic
+   metadata and the bitwise-equivalence test
+   (`test_multimodal_metadata_path_matches_fallback`) gates the collate hook
+   against the in-forward fallback.
 
 ## Files
 
