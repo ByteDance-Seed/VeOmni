@@ -29,6 +29,7 @@ from torch.distributed.checkpoint import (
 )
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -50,14 +51,20 @@ _EXTRA_STATE_DIR = "extra_state"
 
 
 class ModelState(Stateful):
-    """
-    A wrapper around a model to make it stateful.
+    """A wrapper around a model to make it stateful.
+
     Args:
-        model (Model): model to wrap.
+        model: model to wrap.
+        trainable_only: when ``True`` the state_dict only contains parameters with
+            ``requires_grad=True`` (uses ``StateDictOptions(ignore_frozen_params=True)``).
+            This is the LoRA / PEFT path: frozen base weights are skipped on save and
+            ``set_model_state_dict`` runs in ``strict=False`` mode on load so the
+            (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, trainable_only: bool = False):
         self.model = model
+        self.trainable_only = trainable_only
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
@@ -69,7 +76,8 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
-        model_state_dict = get_model_state_dict(model=self.model)
+        options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
+        model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting model state_dict from ModelState wrapper, would restore ExtraParallel dim for ExtraParallel (e.g. Experts/Embeds) module"
@@ -91,7 +99,8 @@ class ModelState(Stateful):
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
 
-        set_model_state_dict(model=self.model, model_state_dict=model_state_dict)
+        options = StateDictOptions(strict=False) if self.trainable_only else None
+        set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
@@ -414,6 +423,7 @@ class DistributedCheckpointer(CheckpointerBase):
         save_async: bool = False,
         global_steps: int = None,
         storage_writer: Optional[FileSystemWriter] = None,
+        trainable_only: bool = False,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -424,6 +434,12 @@ class DistributedCheckpointer(CheckpointerBase):
             save_async: whether to save asynchronously
             global_steps: global steps
             storage_writer: storage writer backend for dcp.save and dcp.async_save. If None, will use FileSystemWriter
+            trainable_only: when True, only persist parameters with ``requires_grad=True``
+                (LoRA / PEFT path). Frozen base weights are skipped on save and must be
+                re-materialised from ``model.model_path`` at resume time. The optimizer
+                state is already trainable-only by construction (the optimizer is built
+                from ``filter(lambda p: p.requires_grad, ...)``), so this flag only
+                affects the model state dump.
         return:
             None
         """
@@ -436,7 +452,7 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_state = {"model": ModelState(state["model"])}
+        save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
         if "optimizer" in state:
             save_state["optimizer"] = OptimizerState(
                 model=state["model"], optimizer=state["optimizer"], fill_missing_optimizer_states=True
@@ -456,6 +472,7 @@ class DistributedCheckpointer(CheckpointerBase):
         state: Dict[str, Any],
         process_group=None,
         storage_reader: Optional[FileSystemReader] = None,
+        trainable_only: bool = False,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -464,6 +481,11 @@ class DistributedCheckpointer(CheckpointerBase):
             state: state to load, "model" are required,  "optimizer" and "extra_state" are optional
             process_group: process group for loading checkpoint
             storage_reader: storage reader backend for dcp.load. If None, will use FileSystemReader
+            trainable_only: when True, ``set_model_state_dict`` runs in non-strict
+                mode (``StateDictOptions(strict=False)``). Use this for LoRA / PEFT
+                resumes where the DCP only contains trainable adapter weights and the
+                frozen base must come from ``model.model_path``. Safe to enable when
+                the DCP is full (extra strictness is just dropped).
 
         return:
             state: state loaded
@@ -476,7 +498,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {"model": ModelState(state["model"])}
+        load_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
         if "optimizer" in state:
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
