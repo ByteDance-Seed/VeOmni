@@ -1577,7 +1577,7 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1993,24 +2640,59 @@
+@@ -1993,24 +2640,63 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1604,7 +1604,7 @@
 +                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
 +                # returns (loss, logits, fused_linear_aux); unpack to match the
 +                # OpSlot branch above.
-+                loss, logits, fused_linear_aux = self.loss_function(
++                loss, _, fused_linear_aux = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.vocab_size,
@@ -1612,6 +1612,10 @@
 +                    weights=self.lm_head.weight,
 +                    **kwargs,
 +                )
++                if fused_linear_aux is not None:
++                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 
@@ -1649,7 +1653,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2018,7 +2700,14 @@
+@@ -2018,7 +2704,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1665,7 +1669,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2762,7 @@
+@@ -2073,6 +2766,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1673,7 +1677,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2089,58 +2779,7 @@
+@@ -2089,58 +2783,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1733,7 +1737,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,37 +2795,70 @@
+@@ -2156,37 +2799,74 @@
          )
 
          hidden_states = outputs[0]
@@ -1763,7 +1767,7 @@
 +                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
 +                # returns (loss, logits, fused_linear_aux); unpack to match the
 +                # OpSlot branch above.
-+                loss, logits, fused_linear_aux = self.loss_function(
++                loss, _, fused_linear_aux = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -1771,6 +1775,10 @@
 +                    weights=self.lm_head.weight,
 +                    **kwargs,
 +                )
++                if fused_linear_aux is not None:
++                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 
@@ -1819,7 +1827,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2413,6 +3085,25 @@
+@@ -2413,6 +3093,25 @@
 
          return input_ids, model_kwargs
 

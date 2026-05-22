@@ -2322,7 +2322,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                 # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
                 # returns (loss, logits, fused_linear_aux); unpack to match the
                 # OpSlot branch above.
-                loss, logits, fused_linear_aux = self.loss_function(
+                loss, _, fused_linear_aux = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2330,6 +2330,10 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                     weights=self.lm_head.weight,
                     **kwargs,
                 )
+                if fused_linear_aux is not None:
+                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                    # logits so output mirrors the OpSlot branch's contract.
+                    logits = None
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.1 ---

@@ -1680,7 +1680,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2235,39 +2694,76 @@
+@@ -2235,39 +2694,80 @@
              use_cache=use_cache,
              output_router_logits=output_router_logits,
              cache_position=cache_position,
@@ -1717,7 +1717,7 @@
 +                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
 +                # returns (loss, logits, fused_linear_aux); unpack to match the
 +                # OpSlot branch above.
-+                loss, logits, fused_linear_aux = self.loss_function(
++                loss, _, fused_linear_aux = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -1726,6 +1726,10 @@
 +                    ignore_index=IGNORE_INDEX,
 +                    **kwargs,
 +                )
++                if fused_linear_aux is not None:
++                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 +        # --- Patch.8 ---
@@ -1773,7 +1777,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2319,1548 +2815,112 @@
+@@ -2319,1548 +2819,112 @@
 
          return model_inputs
 
@@ -3418,7 +3422,7 @@
 
      def disable_talker(self):
          if hasattr(self, "talker"):
-@@ -4132,19 +3192,67 @@
+@@ -4132,19 +3196,67 @@
 
          return thinker_result.sequences, talker_wavs.float()
 

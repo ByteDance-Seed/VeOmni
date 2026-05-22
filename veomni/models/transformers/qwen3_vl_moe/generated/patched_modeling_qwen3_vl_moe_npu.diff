@@ -1619,7 +1619,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1644,29 +2324,64 @@
+@@ -1644,29 +2324,68 @@
          )
 
          hidden_states = outputs[0]
@@ -1652,7 +1652,7 @@
 +                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
 +                # returns (loss, logits, fused_linear_aux); unpack to match the
 +                # OpSlot branch above.
-+                loss, logits, fused_linear_aux = self.loss_function(
++                loss, _, fused_linear_aux = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -1660,6 +1660,10 @@
 +                    weights=self.lm_head.weight,
 +                    **kwargs,
 +                )
++                if fused_linear_aux is not None:
++                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 +        # --- Patch.1 ---
@@ -1702,7 +1706,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1674,7 +2389,8 @@
+@@ -1674,7 +2393,8 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
@@ -1712,7 +1716,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1901,6 +2617,51 @@
+@@ -1901,6 +2621,51 @@
 
          return input_ids, model_kwargs
 

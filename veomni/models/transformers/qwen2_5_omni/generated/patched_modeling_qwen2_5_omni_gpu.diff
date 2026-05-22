@@ -1361,7 +1361,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2045,34 +2314,57 @@
+@@ -2045,34 +2314,61 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1407,7 +1407,7 @@
 +                # Modification: VeOmni's patched ``loss_function`` (via
 +                # LOSS_MAPPING) returns ``(loss, logits, fused_linear_aux)``;
 +                # unpack to match the OpSlot branch above.
-+                loss, logits, fused_linear_aux = self.loss_function(
++                loss, _, fused_linear_aux = self.loss_function(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.get_text_config().vocab_size,
@@ -1416,6 +1416,10 @@
 +                    ignore_index=IGNORE_INDEX,
 +                    **kwargs,
 +                )
++                if fused_linear_aux is not None:
++                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
++                    # logits so output mirrors the OpSlot branch's contract.
++                    logits = None
 +        else:
 +            logits = self.lm_head(hidden_states)
 +        # --- Patch.5 ---
@@ -1435,7 +1439,7 @@
 
      def prepare_inputs_for_generation(
          self,
-@@ -2123,925 +2415,32 @@
+@@ -2123,925 +2419,32 @@
 
          return model_inputs
 
@@ -2387,7 +2391,7 @@
 
 
  # Modified from Llama with a different rotate function, will fixed in next release
-@@ -3078,708 +2477,10 @@
+@@ -3078,708 +2481,10 @@
      return q_embed, k_embed
 
 
@@ -3100,7 +3104,7 @@
 
 
  ############################
-@@ -3806,22 +2507,74 @@
+@@ -3806,22 +2511,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3185,7 +3189,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3883,244 +2636,69 @@
+@@ -3883,244 +2640,69 @@
 
          return model
 
