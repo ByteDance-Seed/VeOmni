@@ -576,6 +576,18 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_reshard_after_backward(True)
 
+    def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int):
+        args: VeOmniArguments = self.args
+        if (
+            args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            and args.train.accelerator.dp_replicate_size > 1
+            and num_micro_steps > 1
+        ):
+            if micro_step == 0:
+                self.model.set_requires_all_reduce(False)
+            elif micro_step == num_micro_steps - 1:
+                self.model.set_requires_all_reduce(True)
+
     def train_step(
         self,
         data_iterator: Any,
@@ -599,6 +611,7 @@ class BaseTrainer(Stateful, ABC):
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
+            self._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
