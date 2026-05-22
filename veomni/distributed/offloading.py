@@ -87,7 +87,7 @@ def build_activation_offloading_context(
     return model_fwd_context, model_bwd_context
 
 
-def _reset_fsdp2_training_state(model: "torch.nn.Module") -> None:
+def _reset_training_state(model: "torch.nn.Module") -> None:
     """Force every FSDP2 param-group on ``model`` back to the IDLE training state.
 
     FSDP2's per-param-group ``_training_state`` is normally advanced by the
@@ -119,7 +119,7 @@ def _reset_fsdp2_training_state(model: "torch.nn.Module") -> None:
 
 
 @torch.no_grad()
-def offload_fsdp2_model_to_cpu(model: "torch.nn.Module", empty_cache: bool = True) -> None:
+def offload_model_to_cpu(model: "torch.nn.Module", empty_cache: bool = True) -> None:
     """Move a model wrapped by FSDP2 ``fully_shard`` to CPU.
 
     Resets any stranded FSDP2 training state, calls ``reshard()`` to drop
@@ -131,7 +131,7 @@ def offload_fsdp2_model_to_cpu(model: "torch.nn.Module", empty_cache: bool = Tru
             move so the released device memory becomes available to peers
             (e.g. a co-located vLLM rollout).
     """
-    _reset_fsdp2_training_state(model)
+    _reset_training_state(model)
     reshard = getattr(model, "reshard", None)
     if callable(reshard):
         reshard()
@@ -141,9 +141,7 @@ def offload_fsdp2_model_to_cpu(model: "torch.nn.Module", empty_cache: bool = Tru
 
 
 @torch.no_grad()
-def load_fsdp2_model_to_gpu(
-    model: "torch.nn.Module", device: Optional[Union[str, "torch.device", int]] = None
-) -> None:
+def load_model_to_gpu(model: "torch.nn.Module", device: Optional[Union[str, "torch.device", int]] = None) -> None:
     """Move a model wrapped by FSDP2 ``fully_shard`` back to a device.
 
     Args:
@@ -164,7 +162,7 @@ def _iter_inner_optimizers(optimizer: "torch.optim.Optimizer") -> "Iterable[torc
 
 
 @torch.no_grad()
-def offload_fsdp2_optimizer(optimizer: "torch.optim.Optimizer") -> None:
+def offload_optimizer(optimizer: "torch.optim.Optimizer") -> None:
     """Move all optimizer state tensors to CPU in place.
 
     Compatible with VeOmni's ``MultiOptimizer`` wrapper as well as a plain
@@ -182,7 +180,7 @@ def offload_fsdp2_optimizer(optimizer: "torch.optim.Optimizer") -> None:
 
 
 @torch.no_grad()
-def load_fsdp2_optimizer(
+def load_optimizer(
     optimizer: "torch.optim.Optimizer",
     device: Union[str, "torch.device", int],
 ) -> None:
