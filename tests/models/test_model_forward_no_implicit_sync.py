@@ -199,6 +199,16 @@ CASES = [
         dtype="bfloat16",
         forward_attr="thinker",
     ),
+    # qwen2_vl — full multimodal forward; exercises patched
+    # ``Qwen2VLModel.forward`` + the (non-window) ViT precompute consumer.
+    _logits_case("qwen2_vl-fa2"),
+    # qwen2_5_vl — full multimodal forward; exercises the window-attention
+    # ViT precompute consumer (cu_seqlens + cu_window_seqlens + the
+    # get_window_index permutation, all collator-derived).
+    _logits_case("qwen2_5_vl-fa2"),
+    # qwen2_5_omni — forward on ``model.thinker``; shares the window-attention
+    # ViT layout with qwen2_5_vl.
+    _logits_case("qwen2_5_omni-fa2"),
 ]
 
 # Acknowledged sync sites in generated/. Keyed by ``Case.case_id``;
@@ -249,6 +259,20 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
     "argwhere for vision_start positions + a one-shot input_ids.tolist() — intrinsic to the "
     "variable-shape mrope algorithm. Clean fix is to precompute position_ids in the data "
     "transform and skip the call; out-of-scope for this PR."
+)
+# The qwen2-family ViT rotary path: ``rot_pos_emb`` does a `grid_thw.tolist()`
+# D2H for its per-image position-grid loop, and the ``VisionRotaryEmbedding``
+# it feeds builds ``torch.arange(max_grid_size)`` off a GPU-derived seqlen.
+# Both are HF-verbatim and on the production ViT path. They are *fixable* —
+# qwen3_vl's ViT already derives the rotary position grid host-side — but
+# that migration is a separate effort from this PR's scope (cu_seqlens /
+# cu_window_seqlens / window_index metadata precompute, not rotary embeddings).
+# Tagged pending-fix so dead-entry detection forces cleanup once it lands.
+_PROD_PENDING_VIT_ROT_POS_EMB = (
+    "HF-prod-pending-fix: ViT rot_pos_emb `grid_thw.tolist()` D2H + the "
+    "VisionRotaryEmbedding `torch.arange(max_grid)` it feeds — HF-verbatim, production "
+    "path. Fixable by deriving the rotary position grid host-side in the collator (as "
+    "qwen3_vl's ViT does); out-of-scope for the metadata-precompute PR."
 )
 # Keyed by ``(generated-file basename, enclosing-function qualname)`` — NOT a
 # raw line number. The qualname is resolved from the sync warning's line via
@@ -322,6 +346,49 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "device=cuda)` H2D copies in fast_pos_embed_interpolate; over-reported by sync-debug."
         ),
     },
+    # qwen2_vl-fa2: the (non-window) ViT forward consumes the precomputed
+    # multimodal metadata — Model.forward selects the per-modality
+    # `vit_metadata` sub-dict and threads it to the ViT, so the fallback
+    # `.tolist()` + host-side cu_seqlens build do not fire. Residual syncs:
+    #  - rot_pos_emb / VisionRotaryEmbedding.forward: the HF-verbatim ViT
+    #    rotary path (see _PROD_PENDING_VIT_ROT_POS_EMB).
+    #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    "qwen2_vl-fa2": {
+        ("patched_modeling_qwen2_vl_gpu.py", "Qwen2VisionTransformerPretrainedModel.rot_pos_emb"): (
+            _PROD_PENDING_VIT_ROT_POS_EMB
+        ),
+        ("patched_modeling_qwen2_vl_gpu.py", "VisionRotaryEmbedding.forward"): _PROD_PENDING_VIT_ROT_POS_EMB,
+        ("patched_modeling_qwen2_vl_gpu.py", "Qwen2VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+    },
+    # qwen2_5_vl-fa2: the window-attention ViT forward consumes the precomputed
+    # metadata — cu_seqlens + cu_window_seqlens + the get_window_index
+    # permutation are all collator-derived, so the in-forward `get_window_index`
+    # (`grid_thw.tolist()` + per-image `cu.tolist()`) and the two
+    # `.max().cpu()` reductions do not fire. Residual syncs are the same
+    # HF-verbatim ViT-rotary + mrope sites as qwen2_vl.
+    "qwen2_5_vl-fa2": {
+        ("patched_modeling_qwen2_5_vl_gpu.py", "Qwen2_5_VisionTransformerPretrainedModel.rot_pos_emb"): (
+            _PROD_PENDING_VIT_ROT_POS_EMB
+        ),
+        ("patched_modeling_qwen2_5_vl_gpu.py", "Qwen2_5_VisionRotaryEmbedding.forward"): (
+            _PROD_PENDING_VIT_ROT_POS_EMB
+        ),
+        ("patched_modeling_qwen2_5_vl_gpu.py", "Qwen2_5_VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+    },
+    # qwen2_5_omni-fa2: shares the window-attention ViT layout with
+    # qwen2_5_vl — the precompute consumer eliminates the same get_window_index
+    # / cu_seqlens syncs. Residual syncs are only the HF-verbatim ViT-rotary
+    # path (the omni ViT computes its varlen `.max()` seqlen on-device, so no
+    # max-reduction sync; and the omni get_rope_index is VeOmni-patched and
+    # host-side, so it does not appear here).
+    "qwen2_5_omni-fa2": {
+        ("patched_modeling_qwen2_5_omni_gpu.py", "Qwen2_5OmniVisionEncoder.rot_pos_emb"): (
+            _PROD_PENDING_VIT_ROT_POS_EMB
+        ),
+        ("patched_modeling_qwen2_5_omni_gpu.py", "Qwen2_5_VisionRotaryEmbedding.forward"): (
+            _PROD_PENDING_VIT_ROT_POS_EMB
+        ),
+    },
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -345,45 +412,40 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen3_vl-fa2",
     "qwen3_vl_moe-fa2-fused",
     "qwen3_omni_moe-fa2-fused",
+    "qwen2_vl-fa2",
+    "qwen2_5_vl-fa2",
+    "qwen2_5_omni-fa2",
 }
 
 
-def _attach_multimodal_metadata(case: Case, fwd_kwargs: dict) -> None:
-    """Inject a synthetic ``multimodal_metadata`` dict for opted-in cases.
+def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict) -> None:
+    """Inject ``multimodal_metadata`` by running the model's real collate hook.
 
-    Builds the same fields the model's ``collate_multimodal_metadata``
-    hook (returned by ``get_metadata_collate_func``) would produce for the
-    toy single-image input used by ``_make_inputs`` (1 image with
-    ``grid_thw == [[1, m, m]]``). No-op for cases that haven't been wired
-    in their model patches yet.
+    Calls ``model.get_metadata_collate_func()`` — the exact picklable hook the
+    VeOmni collator invokes in real training — on a synthetic packed batch of
+    the toy ``*_grid_thw`` tensors. So the test feeds the model precisely what
+    production would, and the precompute consumer path is exercised with the
+    real per-model metadata derivation rather than a test reimplementation
+    (which would be circular — a bug shared by both would pass silently).
+
+    No-op for cases not in ``_MM_METADATA_WIRED_CASES`` or models without the
+    hook. The toy test has no SP, so the sp-pad counts are zero.
     """
     if case.case_id not in _MM_METADATA_WIRED_CASES:
         return
-    image_grid_thw = fwd_kwargs.get("image_grid_thw")
-    if image_grid_thw is None:
+    get_hook = getattr(model, "get_metadata_collate_func", None)
+    if get_hook is None:
         return
-    # ``_make_inputs`` builds an image-only toy multimodal input (dummy 2x2
-    # image, no video). This helper therefore only synthesises the
-    # ``vit_image_*`` keys. If a future toy input adds ``pixel_values_videos``
-    # the video ViT path would silently take the runtime fallback — assert
-    # the invariant so that change can't pass unnoticed.
-    assert "pixel_values_videos" not in fwd_kwargs, (
-        "_attach_multimodal_metadata only synthesises image metadata; "
-        "extend it for vit_video_* before adding a video toy input."
-    )
-    image_grid_thw_list = image_grid_thw.tolist()
-    cu_list = [0]
-    max_hw = 0
-    for t, h, w in image_grid_thw_list:
-        hw = h * w
-        max_hw = max(max_hw, hw)
-        for _ in range(t):
-            cu_list.append(cu_list[-1] + hw)
-    fwd_kwargs["multimodal_metadata"] = {
-        "image_grid_thw_list": image_grid_thw_list,
-        "vit_image_cu_seqlens": torch.tensor(cu_list, dtype=torch.int32, device=image_grid_thw.device),
-        "vit_image_max_seqlen": max_hw,
-    }
+    hook = get_hook()
+    if hook is None:
+        return
+    batch = {k: fwd_kwargs[k] for k in ("image_grid_thw", "video_grid_thw") if k in fwd_kwargs}
+    if not batch:
+        return
+    hook(batch, {"pixel_values": 0, "pixel_values_videos": 0})
+    md = batch.get("multimodal_metadata")
+    if md is not None:
+        fwd_kwargs["multimodal_metadata"] = md
 
 
 # torch's implicit-sync warning message; emitted by
@@ -573,18 +635,18 @@ def test_no_implicit_sync_in_generated_forward(case):
     dtype = _DTYPE_MAP[case.dtype]
     config = _make_config(case)
     input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
-    # Augment toy inputs with the multimodal_metadata that VeOmni's
-    # MainCollator would produce in real training. This exercises the
-    # precompute consumer path in patched Model.forward / ViT.forward,
-    # mirroring the contract documented in
-    # .agents/knowledge/multimodal_metadata.md. Cases that opt in here
-    # have their corresponding ViT-side fallback syncs removed from the
-    # allowlist below; cases that haven't been wired in patch_gen_config
-    # yet keep the fallback entries in ``_ALLOWED_SYNCS``.
-    _attach_multimodal_metadata(case, fwd_kwargs)
 
     model = _build_veomni_model(case, config)
     target = _forward_target(model, case)
+
+    # Augment toy inputs with the multimodal_metadata that VeOmni's
+    # MainCollator would produce in real training (built by the model's own
+    # collate hook). This exercises the precompute consumer path in patched
+    # Model.forward / ViT.forward, mirroring the contract documented in
+    # .agents/knowledge/multimodal_metadata.md. Cases that opt in here have
+    # their ViT-side fallback syncs removed from the allowlist below; cases
+    # not yet wired keep the fallback entries in ``_ALLOWED_SYNCS``.
+    _attach_multimodal_metadata(model, case, fwd_kwargs)
 
     # Warmup outside debug mode: rotary cos/sin cache fill, kernel
     # autotuning, lazy buffer materialisation — these fire once and
@@ -672,3 +734,86 @@ def test_no_implicit_sync_in_generated_forward(case):
                 f"That function no longer issues a sync — drop the entry."
             )
         raise AssertionError(f"[{case.case_id}]\n" + "\n\n".join(problems))
+
+
+# Cases the equivalence test below covers: every multimodal-metadata-wired
+# case. Built once so the parametrize id list and the body agree.
+_MM_EQUIV_CASES = [c for c in CASES if c.case_id in _MM_METADATA_WIRED_CASES]
+
+
+@pytest.mark.parametrize("case", _MM_EQUIV_CASES, ids=[c.case_id for c in _MM_EQUIV_CASES])
+def test_multimodal_metadata_path_matches_fallback(case):
+    """The precompute fast path must be bitwise-equal to the runtime fallback.
+
+    Runs the *same* model on the *same* inputs twice — once with
+    ``multimodal_metadata`` injected (the collator-precompute consumer path),
+    once without (the in-forward fallback derivation) — and asserts the logits
+    are identical.
+
+    This is the numeric gate on each model's collate hook. The metadata is
+    produced by the model's real ``get_metadata_collate_func`` hook (see
+    ``_attach_multimodal_metadata``), so a silent bug in e.g. qwen2_5_vl's
+    ported ``get_window_index`` — which feeds a ``window_index`` permutation
+    that reorders ``hidden_states`` — would make the precompute-path logits
+    diverge from the fallback and fail here. The sync gate above only checks
+    *that* the fast path is sync-free, not that it is *correct*; this test
+    closes that gap.
+    """
+    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+    if not is_transformers_version_greater_or_equal_to("5.2.0"):
+        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    if not os.path.isdir(case.toy_config_dir):
+        pytest.skip(f"Path not found: {case.toy_config_dir}")
+    if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        pytest.skip("flash_attn package not installed.")
+    if _MOE_IMPL_BY_CASE.get(case.case_id) == "fused_triton":
+        from veomni.utils.import_utils import is_fused_moe_available
+
+        if not is_fused_moe_available():
+            pytest.skip("fused_triton MoE requires triton + CUDA SM70+.")
+
+    _apply_determinism()
+
+    device = get_device_type()
+    dtype = _DTYPE_MAP[case.dtype]
+    config = _make_config(case)
+    input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+
+    model = _build_veomni_model(case, config)
+    target = _forward_target(model, case)
+
+    # Fallback path: no multimodal_metadata → ViT derives cu_seqlens / window
+    # metadata in-forward.
+    with torch.no_grad():
+        out_fallback = target(input_ids=input_ids.clone(), use_cache=False, **fwd_kwargs)
+
+    # Precompute path: the model's own collate hook builds multimodal_metadata.
+    fwd_precompute = dict(fwd_kwargs)
+    _attach_multimodal_metadata(model, case, fwd_precompute)
+    assert "multimodal_metadata" in fwd_precompute, (
+        f"[{case.case_id}] get_metadata_collate_func produced no multimodal_metadata — "
+        f"the case is in _MM_METADATA_WIRED_CASES but the hook is missing or returned nothing."
+    )
+    with torch.no_grad():
+        out_precompute = target(input_ids=input_ids.clone(), use_cache=False, **fwd_precompute)
+
+    del model
+    _release()
+
+    # Bitwise-equal: both forwards run the same weights; the only difference is
+    # where the ViT metadata came from. Any mismatch means the collate hook's
+    # derivation diverged from the model's in-forward derivation.
+    torch.testing.assert_close(
+        out_precompute.logits,
+        out_fallback.logits,
+        rtol=0,
+        atol=0,
+        msg=lambda m: (
+            f"[{case.case_id}] precompute-path logits differ from the fallback path — "
+            f"the collate hook's metadata derivation does not match the in-forward "
+            f"derivation.\n{m}"
+        ),
+    )
