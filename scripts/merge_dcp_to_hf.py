@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os
+import shutil
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
@@ -21,6 +22,73 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+
+# PEFT LoRA adapter key markers. The training DCP keeps PEFT's wrapped FQNs intact
+# (e.g. ``base_model.model.<...>.lora_A.default.weight``), so a substring check on
+# the HF-normalized keys is enough to spot a LoRA checkpoint.
+_LORA_KEY_MARKERS = (".lora_A.", ".lora_B.", ".lora_embedding_A.", ".lora_embedding_B.")
+
+
+def _is_lora_key(hf_key: str) -> bool:
+    return any(marker in hf_key for marker in _LORA_KEY_MARKERS)
+
+
+def _detect_lora(all_hf_keys: Sequence[str]) -> bool:
+    """Return True if any of the HF-normalized keys looks like a PEFT LoRA adapter."""
+    return any(_is_lora_key(k) for k in all_hf_keys)
+
+
+@torch.no_grad()
+def save_lora_adapter_weights(
+    output_dir: Union[str, os.PathLike],
+    checkpoint_path: Union[str, os.PathLike],
+    save_dtype: Optional[Union[str, torch.dtype]] = "bfloat16",
+    adapter_config_path: Optional[Union[str, os.PathLike]] = None,
+) -> None:
+    """Convert a DCP checkpoint that contains a PEFT LoRA adapter to ``adapter_model.safetensors``.
+
+    Only ``*.lora_A.*`` / ``*.lora_B.*`` keys are exported, mirroring what
+    ``veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp`` writes during
+    training. The base model weights present in the DCP (frozen during LoRA fine-tuning)
+    are intentionally dropped: at inference time they must come from the original
+    base model path the LoRA was trained against.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Saving LoRA adapter to {output_dir}")
+
+    # ``shard_size=None`` forces a single shard so we get ``adapter_model.safetensors`` directly.
+    all_keys, _total_size, _all_dcp_keys = _get_sharding_plan(checkpoint_path, shard_size=None, save_dtype=save_dtype)
+    lora_keys = {hf_k: dcp_k for hf_k, dcp_k in all_keys.items() if _is_lora_key(hf_k)}
+    if not lora_keys:
+        raise RuntimeError(
+            f"LoRA conversion requested but no LoRA keys (.lora_A./.lora_B./...) found under {checkpoint_path}"
+        )
+
+    logger.info(f"Found {len(lora_keys)} LoRA tensors; loading and re-saving as adapter_model.safetensors")
+    processed_dict = _process_shard(lora_keys, checkpoint_path, save_dtype)
+
+    save_path = os.path.join(output_dir, "adapter_model.safetensors")
+    save_file(processed_dict, save_path, metadata={"format": "pt"})
+    del processed_dict
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if adapter_config_path is not None:
+        adapter_config_path = str(adapter_config_path)
+        if not os.path.isfile(adapter_config_path):
+            raise FileNotFoundError(f"--adapter-config-path does not exist: {adapter_config_path}")
+        shutil.copyfile(adapter_config_path, os.path.join(output_dir, "adapter_config.json"))
+        logger.info(f"Copied adapter_config.json from {adapter_config_path}")
+    else:
+        logger.warning(
+            "No --adapter-config-path provided. ``adapter_model.safetensors`` was written, but you must drop "
+            "``adapter_config.json`` (from the matching training run's ``output_dir/global_step_*/``) next to it "
+            "before the adapter can be loaded by peft / diffusers."
+        )
+
+    logger.info("LoRA adapter conversion complete.")
 
 
 @torch.no_grad()
@@ -155,6 +223,26 @@ def main():
         default=2_000_000_000,
         help="Maximum shard size in bytes (default: 2GB)",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "full", "lora"),
+        default="auto",
+        help=(
+            "Conversion mode. 'auto' (default) inspects DCP keys: writes adapter_model.safetensors when the "
+            "checkpoint contains PEFT LoRA keys, otherwise writes a full sharded HF safetensors dump. "
+            "'full' / 'lora' force the corresponding mode."
+        ),
+    )
+    parser.add_argument(
+        "--adapter-config-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to the matching adapter_config.json produced during LoRA training "
+            "(usually under <output_dir>/global_step_*/adapter_config.json). Only used in 'lora' mode; "
+            "copied next to adapter_model.safetensors so the adapter is loadable as-is."
+        ),
+    )
     args = parser.parse_args()
 
     load_dir = args.load_dir
@@ -162,7 +250,27 @@ def main():
     model_assets_dir = args.model_assets_dir
     shard_size = args.shard_size
 
-    merge_to_hf_pt(load_dir, save_dir, model_assets_dir, shard_size=shard_size)
+    mode = args.mode
+    if mode == "auto":
+        _shards_for_detection, _size, _dcp_keys = _get_sharding_plan(load_dir, shard_size=None, save_dtype="bfloat16")
+        # _shards_for_detection is a single {hf_key: dcp_key} dict when shard_size is None
+        detected_lora = _detect_lora(_shards_for_detection.keys())
+        mode = "lora" if detected_lora else "full"
+        logger.info(
+            f"Auto-detected mode: {mode} "
+            f"({'LoRA keys present' if detected_lora else 'no LoRA keys; treating as full checkpoint'})"
+        )
+
+    if mode == "lora":
+        save_lora_adapter_weights(
+            output_dir=save_dir,
+            checkpoint_path=load_dir,
+            adapter_config_path=args.adapter_config_path,
+        )
+    else:
+        if args.adapter_config_path is not None:
+            logger.warning("--adapter-config-path is only used in 'lora' mode; ignoring.")
+        merge_to_hf_pt(load_dir, save_dir, model_assets_dir, shard_size=shard_size)
 
 
 if __name__ == "__main__":

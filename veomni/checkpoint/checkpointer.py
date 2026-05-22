@@ -60,6 +60,7 @@ class CheckpointerBase(ABC):
         state: Dict[str, Any],
         save_async: Optional[bool],
         global_steps: Optional[int],
+        trainable_only: bool = False,
     ):
         return
 
@@ -68,6 +69,7 @@ class CheckpointerBase(ABC):
         cls,
         path: str,
         state: Dict[str, Any],
+        trainable_only: bool = False,
     ):
         return
 
