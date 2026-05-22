@@ -84,18 +84,65 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
         raise ValueError(f"Unsupported img_shapes format: {sample_img_shapes}")
 
+    def predict_noise(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+        img_shapes: Any = None,
+        guidance: torch.Tensor | None = None,
+        additional_t_cond: torch.Tensor | None = None,
+        return_dict: bool = False,
+    ):
+        """Single raw noise prediction via the diffusers backbone.
+
+        This is the sole wrapper around the underlying diffusers ``forward``:
+        it casts inputs to the model dtype and forwards everything else
+        through. Both the supervised loss path and the inference / RL path
+        in :meth:`forward` go through this method to avoid duplicated logic.
+        """
+        param_dtype = self.dtype
+        return _QwenImageTransformer2DModel.forward(
+            self,
+            hidden_states=hidden_states.to(dtype=param_dtype),
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states.to(dtype=param_dtype),
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            img_shapes=img_shapes,
+            guidance=guidance,
+            additional_t_cond=additional_t_cond,
+            return_dict=return_dict,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.Tensor | list[torch.Tensor],
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
-        training_target: torch.Tensor | list[torch.Tensor],
-        img_shapes: Any,
+        training_target: torch.Tensor | list[torch.Tensor] | None = None,
+        img_shapes: Any = None,
         encoder_hidden_states_mask: torch.Tensor | list[torch.Tensor] | None = None,
         guidance: torch.Tensor | list[torch.Tensor] | None = None,
         additional_t_cond: torch.Tensor | list[torch.Tensor] | None = None,
         latents: torch.Tensor | list[torch.Tensor] | None = None,
+        return_dict: bool = True,
     ):
+        if training_target is None:
+            return self.predict_noise(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                img_shapes=img_shapes,
+                guidance=guidance,
+                additional_t_cond=additional_t_cond,
+                return_dict=return_dict,
+            )
+
+        if img_shapes is None:
+            raise ValueError("Qwen-Image supervised training forward requires `img_shapes`.")
+
         hidden_states_list = self._as_list(hidden_states)
         sample_count = len(hidden_states_list)
         timestep_list = self._as_list(timestep, sample_count)
@@ -105,8 +152,6 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         mask_list = self._as_list(encoder_hidden_states_mask, sample_count)
         guidance_list = self._as_list(guidance, sample_count)
         additional_t_cond_list = self._as_list(additional_t_cond, sample_count)
-
-        param_dtype = self.dtype
 
         per_sample_losses = []
         predictions = []
@@ -129,10 +174,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
             guidance_list,
             additional_t_cond_list,
         ):
-            sample_hs = sample_hs.to(dtype=param_dtype)
-            sample_enc_hs = sample_enc_hs.to(dtype=param_dtype)
-            prediction = _QwenImageTransformer2DModel.forward(
-                self,
+            prediction = self.predict_noise(
                 hidden_states=sample_hs,
                 timestep=sample_ts,
                 encoder_hidden_states=sample_enc_hs,
@@ -140,7 +182,6 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
                 img_shapes=self._normalize_img_shapes(sample_img_shapes),
                 guidance=sample_guidance,
                 additional_t_cond=sample_add_t_cond,
-                return_dict=False,
             )[0]
             predictions.append(prediction)
             per_sample_loss = F.mse_loss(prediction.float(), sample_target.float(), reduction="none")
