@@ -802,7 +802,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
                 # Modification: VeOmni's patched ``loss_function`` (via LOSS_MAPPING,
                 # installed by ``install_loss_mapping`` in
                 # ``veomni/ops/kernels/cross_entropy/__init__.py``) returns
-                # ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`` — *not* HF's stock single
+                # ``(loss, logits, fused_linear_aux)`` — *not* HF's stock single
                 # ``Tensor``. Unpack 4 values to match the OpSlot branch above; we
                 # discard the wrapper's flattened ``logits`` and keep the ones we
                 # already computed at full shape.

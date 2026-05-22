@@ -2134,7 +2134,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     #    order.
     # 5. [Loss] Delegate loss to OpSlot-guarded `veomni_causal_lm_loss` first,
     #    then fall back to `self.loss_function` (VeOmni's patched LOSS_MAPPING
-    #    returns `(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`).
+    #    returns `(loss, logits, fused_linear_aux)`).
     # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
     #    for videos without audio) before forwarding the audio tower.
     # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -2339,9 +2339,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched ``loss_function`` (via
-                # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)``;
+                # LOSS_MAPPING) returns ``(loss, logits, fused_linear_aux)``;
                 # unpack to match the OpSlot branch above.
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+                loss, logits, fused_linear_aux = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.get_text_config().vocab_size,

@@ -2734,9 +2734,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
+                # returns (loss, logits, fused_linear_aux); unpack to match the
                 # OpSlot branch above.
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+                loss, logits, fused_linear_aux = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -2891,9 +2891,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
+                # returns (loss, logits, fused_linear_aux); unpack to match the
                 # OpSlot branch above.
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+                loss, logits, fused_linear_aux = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
