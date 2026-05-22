@@ -552,10 +552,11 @@ config.override_method(
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
 class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
-    """``Qwen3_5CausalLMOutputWithPast`` extended with per-token log-prob fields.
+    """``Qwen3_5CausalLMOutputWithPast`` + ``fused_linear_aux`` payload.
 
-    log_probs (`torch.FloatTensor`, *optional*):
-        Per-token log probabilities returned by VeOmni's fused loss path.
-    entropy (`torch.FloatTensor`, *optional*):
-        Per-token softmax entropy returned by VeOmni's fused loss path.
+    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+        Per-token tensors produced by the fused-linear loss path
+        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """

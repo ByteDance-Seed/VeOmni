@@ -953,16 +953,18 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1327,28 +1630,145 @@
+@@ -1327,28 +1630,147 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
-+        # Precomputed multimodal metadata, unpacked by Model.forward from
-+        # `multimodal_metadata`. All optional with runtime fallback.
++        # Precomputed ViT metadata — a per-modality sub-dict Model.forward selects
++        # from `multimodal_metadata` and passes as the single `vit_metadata` kwarg.
++        # All .get() below fall back to None for callers that bypass MainCollator.
 +        # See .agents/knowledge/multimodal_metadata.md.
-+        precomputed_grid_thw_list = kwargs.pop("vit_grid_thw_list", None)
-+        precomputed_cu_seqlens = kwargs.pop("vit_cu_seqlens", None)
-+        precomputed_max_seqlen = kwargs.pop("vit_max_seqlen", None)
++        vit_metadata = kwargs.pop("vit_metadata", None) or {}
++        precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
++        precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
++        precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 +
          hidden_states = self.patch_embed(hidden_states)
 
@@ -1111,7 +1113,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -1364,6 +1784,36 @@
+@@ -1364,6 +1786,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1139,16 +1141,16 @@
 +        cu = [0]
 +        for _ in range(t):
 +            cu.append(cu[-1] + h * w)
-+        vit_kwargs = {
-+            "vit_grid_thw_list": [[t, h, w]],
-+            "vit_cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
-+            "vit_max_seqlen": h * w,
++        vit_metadata = {
++            "grid_thw_list": [[t, h, w]],
++            "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
++            "max_seqlen": h * w,
 +        }
-+        return self(hidden_states=pixel_values, grid_thw=grid_thw, **vit_kwargs)
++        return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
 
 
  @dataclass
-@@ -1420,6 +1870,36 @@
+@@ -1420,6 +1872,37 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1171,10 +1173,11 @@
 +        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
 +    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
 +        The rope index difference between sequence length and multimodal rope.
-+    log_probs (`torch.FloatTensor`, *optional*):
-+        Per-token log probabilities returned by VeOmni's fused loss path.
-+    entropy (`torch.FloatTensor`, *optional*):
-+        Per-token softmax entropy returned by VeOmni's fused loss path.
++    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
++        Per-token tensors produced by the fused-linear loss path
++        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
++        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
++        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
 +    """
 +
 +
@@ -1185,7 +1188,7 @@
 
 
  class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-@@ -1512,15 +1992,40 @@
+@@ -1512,15 +1995,40 @@
 
      def _update_linear_attn_mask(self, attention_mask, cache_position):
          """
@@ -1234,7 +1237,7 @@
 
 
  @auto_docstring
-@@ -1532,7 +2037,19 @@
+@@ -1532,7 +2040,19 @@
      config: Qwen3_5MoeConfig
      _no_split_modules = ["Qwen3_5MoeTextDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
@@ -1254,7 +1257,7 @@
          super().__init__(config)
          self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
          self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
-@@ -1659,64 +2176,44 @@
+@@ -1659,64 +2179,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1277,9 +1280,8 @@
 +        contiguous avoids Python list-overhead and enables direct execution of
 +        vectorized kernels in the main forward pass.
 +
-+        ``**kwargs`` carries collator-precomputed ViT metadata
-+        (`vit_grid_thw_list` / `vit_cu_seqlens` / `vit_max_seqlen`) which is
-+        forwarded to the patched ViT forward. See
++        ``**kwargs`` carries the collator-precomputed ``vit_metadata`` sub-dict
++        which is forwarded to the patched ViT forward. See
 +        .agents/knowledge/multimodal_metadata.md.
          """
          pixel_values = pixel_values.type(self.visual.dtype)
@@ -1345,7 +1347,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1769,6 +2266,7 @@
+@@ -1769,6 +2268,7 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1353,7 +1355,7 @@
          cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
-@@ -1777,6 +2275,8 @@
+@@ -1777,6 +2277,8 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1362,7 +1364,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1784,27 +2284,150 @@
+@@ -1784,27 +2286,154 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1397,14 +1399,18 @@
 +        # forward can skip the in-forward .tolist() / cu_seqlens build.
 +        multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
 +        image_vit_kwargs = {
-+            "vit_grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
-+            "vit_cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
-+            "vit_max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
++            "vit_metadata": {
++                "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
++                "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
++                "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
++            }
 +        }
 +        video_vit_kwargs = {
-+            "vit_grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
-+            "vit_cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
-+            "vit_max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
++            "vit_metadata": {
++                "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
++                "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
++                "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
++            }
 +        }
 +        # --- Patch.6 ---
 +
@@ -1523,7 +1529,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1815,6 +2438,17 @@
+@@ -1815,6 +2444,17 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -1541,7 +1547,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1914,6 +2548,12 @@
+@@ -1914,6 +2554,12 @@
      return overall_loss * num_experts
 
 
@@ -1554,7 +1560,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1934,6 +2574,7 @@
+@@ -1934,6 +2580,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1562,7 +1568,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1949,7 +2590,7 @@
+@@ -1949,7 +2596,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1571,7 +1577,7 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1993,24 +2634,59 @@
+@@ -1993,24 +2640,59 @@
          hidden_states = outputs.last_hidden_state
          # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1643,7 +1649,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2018,7 +2694,14 @@
+@@ -2018,7 +2700,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1659,7 +1665,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -2073,6 +2756,7 @@
+@@ -2073,6 +2762,7 @@
          """
          return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
@@ -1667,7 +1673,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -2089,58 +2773,7 @@
+@@ -2089,58 +2779,7 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1727,7 +1733,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2156,37 +2789,70 @@
+@@ -2156,37 +2795,70 @@
          )
 
          hidden_states = outputs[0]
@@ -1813,7 +1819,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2413,6 +3079,25 @@
+@@ -2413,6 +3085,25 @@
 
          return input_ids, model_kwargs
 
