@@ -101,7 +101,7 @@ from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 # are inference-only speech paths excluded from the generated file).
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -2322,25 +2322,19 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         # --- Patch.5 ---
         loss = None
         logits = None
-        log_probs = None
-        entropy = None
-        distillation_losses = None
-        student_mass = None
-        teacher_mass = None
+        fused_linear_aux = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss (chunked fused CE
             # when bound, falls back to ``self.loss_function`` otherwise).
             if veomni_causal_lm_loss.use_non_eager_impl:  # noqa: F821 — declared via add_post_import_block
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-                    veomni_causal_lm_loss(  # noqa: F821
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.get_text_config().vocab_size,
-                        hidden_states=hidden_states,
-                        weights=self.lm_head.weight,
-                        ignore_index=IGNORE_INDEX,
-                        **kwargs,
-                    )
+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(  # noqa: F821
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.get_text_config().vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    ignore_index=IGNORE_INDEX,
+                    **kwargs,
                 )
             else:
                 logits = self.lm_head(hidden_states)
@@ -2368,13 +2362,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
-            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-                log_probs=log_probs,
-                entropy=entropy,
-                distillation_losses=distillation_losses,
-                student_mass=student_mass,
-                teacher_mass=teacher_mass,
-            ),
+            fused_linear_aux=fused_linear_aux,
         )
         # --- Patch.7 ---
 

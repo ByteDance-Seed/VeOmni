@@ -105,7 +105,7 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
-from veomni.utils.model_outputs import FusedLinearAuxOutput, FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
@@ -2643,23 +2643,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
-        log_probs = None
-        entropy = None
-        distillation_losses = None
-        student_mass = None
-        teacher_mass = None
+        fused_linear_aux = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-                    veomni_causal_lm_loss(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.vocab_size,
-                        hidden_states=hidden_states,
-                        weights=self.lm_head.weight,
-                        **kwargs,
-                    )
+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
             else:
                 logits = self.lm_head(hidden_states)
@@ -2705,13 +2699,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
-            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-                log_probs=log_probs,
-                entropy=entropy,
-                distillation_losses=distillation_losses,
-                student_mass=student_mass,
-                teacher_mass=teacher_mass,
-            ),
+            fused_linear_aux=fused_linear_aux,
         )
 
 
@@ -2812,23 +2800,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
 
         loss = None
         logits = None
-        log_probs = None
-        entropy = None
-        distillation_losses = None
-        student_mass = None
-        teacher_mass = None
+        fused_linear_aux = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-                    veomni_causal_lm_loss(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.text_config.vocab_size,
-                        hidden_states=hidden_states,
-                        weights=self.lm_head.weight,
-                        **kwargs,
-                    )
+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
                 )
             else:
                 logits = self.lm_head(hidden_states)
@@ -2875,13 +2857,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             rope_deltas=outputs.rope_deltas,
-            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-                log_probs=log_probs,
-                entropy=entropy,
-                distillation_losses=distillation_losses,
-                student_mass=student_mass,
-                teacher_mass=teacher_mass,
-            ),
+            fused_linear_aux=fused_linear_aux,
         )
 
     def prepare_inputs_for_generation(

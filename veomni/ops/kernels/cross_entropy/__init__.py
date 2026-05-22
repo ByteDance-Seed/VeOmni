@@ -26,15 +26,19 @@ entropy path (delegated to ``chunk_logprobs_function``) when the caller forwards
 kernel to use is still made once, at ``install_loss_mapping`` /
 ``KERNEL_REGISTRY.resolve`` time, and baked in via ``functools.partial``.
 
-Wrapper return shape: ``(loss, logits, log_probs, entropy,
-distillation_losses, student_mass, teacher_mass)``. Slots 3–4 are non-``None``
-on both the log-probs and the distillation paths; slots 5–7 are non-``None``
-only on the distillation path. On the plain loss path slots 3–7 are ``None``.
-This 7-tuple lets every model `forward` do
-``loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(...)``
-followed by ``outputs.log_probs = log_probs; outputs.entropy = entropy;
-outputs.distillation_losses = distillation_losses; outputs.student_mass = student_mass;
-outputs.teacher_mass = teacher_mass`` — no per-model branch.
+Wrapper return shape: ``(loss, logits, fused_linear_aux)``. The third slot
+carries a ``FusedLinearAuxOutput`` payload on the per-token paths (with
+``log_probs`` / ``entropy`` on the log-probs path; plus ``distillation_losses``
+/ ``student_mass`` / ``teacher_mass`` on the top-k distillation path) and is
+``None`` on the plain loss path. Every model `forward` then does:
+
+    loss, logits, fused_linear_aux = self.loss_function(...)
+    return CausalLMOutputWithLogProbs(loss=loss, logits=logits,
+                                      fused_linear_aux=fused_linear_aux, ...)
+
+— a single field assignment regardless of which sub-path ran. Adding a new
+per-token tensor extends ``FusedLinearAuxOutput`` only, not every patchgen
+``forward``.
 
 The distillation path is what verl's VeOmni engine reads from on
 ``use_fused_kernels=True`` + ``distillation_use_topk=True`` so the top-k
@@ -72,6 +76,7 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from ....utils.model_outputs import FusedLinearAuxOutput
 from .chunk_logprobs import chunk_logprobs_function  # noqa: F401 re-export
 from .chunk_loss import chunk_loss_function  # noqa: F401 re-export for legacy callers
 from .chunk_topk_distill import chunk_topk_distill_function  # noqa: F401 re-export
@@ -96,23 +101,14 @@ def ForCausalLMLoss(
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> tuple[
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None, FusedLinearAuxOutput | None]:
     hidden_states = kwargs.pop("hidden_states", None)
     weights = kwargs.pop("weights", None)
     # Per-call log-probs dispatch: when the caller passes `return_log_probs=True`
     # (the model `forward` simply forwards it through `**kwargs`), skip the loss
     # path and route hidden_states+weights+labels through the chunked log-probs
-    # kernel. The loss/logits slots are vacated; the third and fourth tuple
-    # slots carry the per-token log-probabilities and softmax entropy back to
-    # the caller.
+    # kernel. The loss/logits slots are vacated; the third slot carries a
+    # ``FusedLinearAuxOutput`` payload with the per-token tensors.
     return_log_probs = kwargs.pop("return_log_probs", False)
     # ``temperature`` is part of the PPO actor contract — verl divides logits
     # by it before log_softmax. Pop here so it does not propagate into the
@@ -158,7 +154,17 @@ def ForCausalLMLoss(
                 temperature=temperature,
                 log_prob_min_clamp=log_prob_min_clamp,
             )
-            return None, None, log_probs, entropy, distill, student_mass, teacher_mass
+            return (
+                None,
+                None,
+                FusedLinearAuxOutput(
+                    log_probs=log_probs,
+                    entropy=entropy,
+                    distillation_losses=distill,
+                    student_mass=student_mass,
+                    teacher_mass=teacher_mass,
+                ),
+            )
         log_probs, entropy = chunk_logprobs_function(
             hidden_states,
             weights,
@@ -168,7 +174,7 @@ def ForCausalLMLoss(
             shift_labels=shift_labels,
             temperature=temperature,
         )
-        return None, None, log_probs, entropy, None, None, None
+        return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
     device = logits.device if logits is not None else hidden_states.device
     # Upcast to float if we need to compute the loss to avoid potential precision issues
@@ -212,7 +218,7 @@ def ForCausalLMLoss(
     if sp_enabled:
         num_valid_tokens = (labels != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
-    return loss, logits, None, None, None, None, None
+    return loss, logits, None
 
 
 def ForSequenceClassificationLoss(
@@ -227,7 +233,7 @@ def ForSequenceClassificationLoss(
     *,
     cross_entropy_fn: Callable = eager_cross_entropy,
     **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor | None, None, None, None, None, None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, None]:
     r"""
     Token-level loss for sequence classification.
 
@@ -262,16 +268,11 @@ def ForSequenceClassificationLoss(
             Scalar classification loss.
         logits (`torch.Tensor`):
             Flattened logits.
-        log_probs (`None`):
-            Always ``None`` for sequence classification — the third tuple slot
-            exists to keep the wrapper return shape uniform with
-            ``ForCausalLMLoss`` so model `forward` call sites can unpack the
-            full 7-tuple ``(loss, logits, log_probs, entropy,
-            distillation_losses, student_mass, teacher_mass)`` regardless of
-            head type.
-        entropy / distillation_losses / student_mass / teacher_mass (`None`):
-            Always ``None`` for sequence classification — slots 4–7 exist
-            for the same uniform-unpack reason as ``log_probs``.
+        fused_linear_aux (`None`):
+            Always ``None`` for sequence classification — kept so model
+            `forward` call sites can unpack the same 3-tuple shape
+            ``(loss, logits, fused_linear_aux)`` as ``ForCausalLMLoss``
+            regardless of head type.
     """
 
     # pop fused loss kwargs
@@ -328,7 +329,7 @@ def ForSequenceClassificationLoss(
     if sp_enabled:
         num_valid_tokens = (target != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
-    return loss, logits, None, None, None, None, None
+    return loss, logits, None
 
 
 # ── LOSS_MAPPING installation ────────────────────────────────────────────────
@@ -357,34 +358,26 @@ def _resolve_cross_entropy_fn(impl: str) -> Callable:
 
 def _chunk_loss_dispatch(
     *args, **kwargs
-) -> tuple[
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-]:
-    """7-tuple shim for the ``chunk_loss`` LOSS_MAPPING entry.
+) -> tuple[torch.Tensor | None, torch.Tensor | None, FusedLinearAuxOutput | None]:
+    """3-tuple shim for the ``chunk_loss`` LOSS_MAPPING entry.
 
     ``chunk_loss_function`` historically bypasses the ``ForCausalLMLoss``
     wrapper (it owns its own label shift + SP reduction) and is installed
     bare. To keep the wrapper return contract uniform — every model
-    forward unpacks ``loss, _, log_probs, entropy, distillation_losses,
-    student_mass, teacher_mass = self.loss_function(...)`` — we wrap it
-    in this shim:
+    forward unpacks ``loss, logits, fused_linear_aux =
+    self.loss_function(...)`` — we wrap it in this shim:
 
     - ``return_log_probs=True`` + teacher top-k tensors present: route
       through ``chunk_topk_distill_function`` and return
-      ``(None, None, log_probs, entropy, distillation_losses,
-      student_mass, teacher_mass)``.
+      ``(None, None, FusedLinearAuxOutput(log_probs, entropy,
+      distillation_losses, student_mass, teacher_mass))``.
     - ``return_log_probs=True`` only: route through
-      ``chunk_logprobs_function``; return ``(None, None, log_probs,
-      entropy, None, None, None)``. ``temperature`` (defaults to 1.0) is
-      forwarded so the PPO actor path can scale logits inside the kernel.
-    - otherwise: forward to ``chunk_loss_function`` and append five
-      ``None`` slots to its 2-tuple return. Pop ``temperature`` /
+      ``chunk_logprobs_function``; return ``(None, None,
+      FusedLinearAuxOutput(log_probs, entropy))``. ``temperature``
+      (defaults to 1.0) is forwarded so the PPO actor path can scale
+      logits inside the kernel.
+    - otherwise: forward to ``chunk_loss_function`` and append a single
+      ``None`` slot to its 2-tuple return. Pop ``temperature`` /
       teacher-topk kwargs defensively so a caller that always forwards
       them doesn't trip ``chunk_loss_function``'s signature.
 
@@ -423,7 +416,17 @@ def _chunk_loss_dispatch(
                 temperature=temperature,
                 log_prob_min_clamp=log_prob_min_clamp,
             )
-            return None, None, log_probs, entropy, distill, student_mass, teacher_mass
+            return (
+                None,
+                None,
+                FusedLinearAuxOutput(
+                    log_probs=log_probs,
+                    entropy=entropy,
+                    distillation_losses=distill,
+                    student_mass=student_mass,
+                    teacher_mass=teacher_mass,
+                ),
+            )
         log_probs, entropy = chunk_logprobs_function(
             hidden_states,
             weights,
@@ -433,10 +436,10 @@ def _chunk_loss_dispatch(
             shift_labels=kwargs.get("shift_labels"),
             temperature=temperature,
         )
-        return None, None, log_probs, entropy, None, None, None
+        return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
     loss, logits_out = chunk_loss_function(*args, **kwargs)
-    return loss, logits_out, None, None, None, None, None
+    return loss, logits_out, None
 
 
 def install_loss_mapping(impl: str = "eager") -> str:
@@ -451,30 +454,22 @@ def install_loss_mapping(impl: str = "eager") -> str:
     ``ForCausalLMLoss``).
 
     Contract — return type: **VeOmni's wrappers return ``(loss, logits,
-    log_probs, entropy, distillation_losses, student_mass,
-    teacher_mass)``**, not a bare ``torch.Tensor``. The 7-tuple is
+    fused_linear_aux)``**, not a bare ``torch.Tensor``. The 3-tuple is
     load-bearing: fused kernels (Liger fused linear+CE, NPU
     ``chunk_loss_function``) fold the ``lm_head`` projection into the loss,
-    so the kernel — not the caller — is where logits come out. Slots 3–4
-    (``log_probs`` / ``entropy``) are non-``None`` on the per-token
-    log-probs path and on the top-k distillation path; slots 5–7
-    (``distillation_losses`` / ``student_mass`` / ``teacher_mass``) are
-    non-``None`` only on the top-k distillation path — when the caller
-    passes ``return_log_probs=True`` + ``teacher_topk_ids`` +
+    so the kernel — not the caller — is where logits come out. The third
+    slot is a ``FusedLinearAuxOutput`` payload with per-token tensors
+    (``log_probs`` / ``entropy`` on the log-probs path; plus
+    ``distillation_losses`` / ``student_mass`` / ``teacher_mass`` on the
+    top-k distillation path) and is ``None`` on the plain loss path. When
+    the caller passes ``return_log_probs=True`` + ``teacher_topk_ids`` +
     ``teacher_topk_log_probs`` through ``forward`` kwargs, the wrapper
     short-circuits to ``chunk_topk_distill_function`` so verl's VeOmni
     engine can read these tensors off ``model_output`` without
     materializing the ``[T, V]`` student logits. Every VeOmni-patched v5
-    modeling file in-tree unpacks as ``loss, _, log_probs, entropy,
-    distillation_losses, student_mass, teacher_mass = self.loss_function(...)``
-    (or ``loss, logits, *_ = ...`` when the caller needs the fused
-    logits and ignores the extra slots). The model `forward` then assigns
-    ``outputs.log_probs = log_probs; outputs.entropy = entropy;
-    outputs.distillation_losses = distillation_losses;
-    outputs.student_mass = student_mass;
-    outputs.teacher_mass = teacher_mass`` so per-token log-probs, entropy,
-    and the three distillation tensors surface on the standard ``ModelOutput``
-    without a per-model early-exit branch.
+    modeling file in-tree unpacks as ``loss, logits, fused_linear_aux =
+    self.loss_function(...)`` and assigns ``outputs.fused_linear_aux =
+    fused_linear_aux`` — a single field regardless of which sub-path ran.
 
     This diverges from upstream ``transformers.loss.loss_utils.ForCausalLMLoss``
     which returns a bare ``Tensor``. Mixing ``install_loss_mapping`` with

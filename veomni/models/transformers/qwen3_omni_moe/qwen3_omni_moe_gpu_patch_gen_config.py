@@ -77,7 +77,7 @@ from veomni.utils.constants import (
     IMAGE_INPUT_INDEX,
     VIDEO_INPUT_INDEX,
 )
-from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -1471,15 +1471,11 @@ def qwen3_omni_moe_thinker_forward_patched(
     # --- Patch.8 ---
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
-    distillation_losses = None
-    student_mass = None
-    teacher_mass = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1491,9 +1487,9 @@ def qwen3_omni_moe_thinker_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
+            # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+            loss, logits, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1535,13 +1531,7 @@ def qwen3_omni_moe_thinker_forward_patched(
         past_key_values=outputs.past_key_values,
         router_logits=getattr(outputs, "router_logits", None),
         rope_deltas=self.rope_deltas,
-        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
-        ),
+        fused_linear_aux=fused_linear_aux,
     )
 
 

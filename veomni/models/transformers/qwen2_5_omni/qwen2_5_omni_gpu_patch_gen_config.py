@@ -81,7 +81,7 @@ from veomni.utils.constants import (
     IMAGE_INPUT_INDEX,
     VIDEO_INPUT_INDEX,
 )
-from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -979,7 +979,7 @@ def qwen2_5_omni_thinker_get_position_id_func_patched(self):
 #    order.
 # 5. [Loss] Delegate loss to OpSlot-guarded `veomni_causal_lm_loss` first,
 #    then fall back to `self.loss_function` (VeOmni's patched LOSS_MAPPING
-#    returns `(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`).
+#    returns `(loss, logits, fused_linear_aux)`).
 # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
 #    for videos without audio) before forwarding the audio tower.
 # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -1170,16 +1170,12 @@ def qwen2_5_omni_thinker_forward_patched(
     # --- Patch.5 ---
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
-    distillation_losses = None
-    student_mass = None
-    teacher_mass = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss (chunked fused CE
         # when bound, falls back to ``self.loss_function`` otherwise).
         if veomni_causal_lm_loss.use_non_eager_impl:  # noqa: F821 — declared via add_post_import_block
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(  # noqa: F821
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(  # noqa: F821
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.get_text_config().vocab_size,
@@ -1191,9 +1187,9 @@ def qwen2_5_omni_thinker_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched ``loss_function`` (via
-            # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)``;
+            # LOSS_MAPPING) returns ``(loss, logits, fused_linear_aux)``;
             # unpack to match the OpSlot branch above.
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+            loss, logits, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.get_text_config().vocab_size,
@@ -1214,13 +1210,7 @@ def qwen2_5_omni_thinker_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=self.rope_deltas,
-        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
-        ),
+        fused_linear_aux=fused_linear_aux,
     )
     # --- Patch.7 ---
 

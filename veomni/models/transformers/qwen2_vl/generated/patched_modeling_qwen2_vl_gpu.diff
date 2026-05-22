@@ -1,6 +1,6 @@
 --- a/transformers/models/qwen2_vl/modeling_qwen2_vl.py
 +++ b/patched_modeling_qwen2_vl_gpu.py
-@@ -1,3 +1,78 @@
+@@ -1,3 +1,77 @@
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
 +# ==============================================================================
@@ -69,7 +69,6 @@
 +from veomni.ops.dispatch import OpSlot
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +from veomni.utils.model_outputs import (
-+    FusedLinearAuxOutput,
 +    Qwen2VLCausalLMOutputWithLogProbs,
 +)
 +
@@ -79,7 +78,7 @@
  # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
  #
  # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-@@ -17,42 +92,6 @@
+@@ -17,42 +91,6 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  """PyTorch Qwen2-VL model."""
@@ -122,7 +121,7 @@
 
 
  logger = logging.get_logger(__name__)
-@@ -374,6 +413,12 @@
+@@ -374,6 +412,12 @@
      return attn_output, attn_weights
 
 
@@ -135,7 +134,7 @@
  class VisionAttention(nn.Module):
      def __init__(self, config: Qwen2VLVisionConfig) -> None:
          super().__init__()
-@@ -392,6 +437,7 @@
+@@ -392,6 +436,7 @@
          self,
          hidden_states: torch.Tensor,
          cu_seqlens: torch.Tensor,
@@ -143,7 +142,7 @@
          rotary_pos_emb: torch.Tensor | None = None,
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
-@@ -412,8 +458,7 @@
+@@ -412,8 +457,7 @@
          )
 
          if is_flash_attention_requested(self.config):
@@ -153,7 +152,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -430,12 +475,10 @@
+@@ -430,12 +474,10 @@
                  **kwargs,
              )
          else:
@@ -166,7 +165,7 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -699,6 +742,12 @@
+@@ -699,6 +741,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -179,7 +178,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -774,8 +823,8 @@
+@@ -774,8 +822,8 @@
          self,
          hidden_states: torch.Tensor,
          grid_thw: torch.Tensor,
@@ -190,7 +189,7 @@
          r"""
          grid_thw (`torch.LongTensor` of shape `(num_images, 3)`):
              The temporal, height and width dimensions of feature shape for each image. Each row contains [t, h, w] values.
-@@ -783,7 +832,6 @@
+@@ -783,7 +831,6 @@
          hidden_states = self.patch_embed(hidden_states)
          rotary_pos_emb = self.rot_pos_emb(grid_thw)
          emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
@@ -198,7 +197,7 @@
 
          cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
              dim=0,
-@@ -795,10 +843,27 @@
+@@ -795,10 +842,27 @@
          )
          cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -226,7 +225,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -809,6 +874,23 @@
+@@ -809,6 +873,23 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -250,7 +249,7 @@
 
 
  @auto_docstring
-@@ -966,6 +1048,12 @@
+@@ -966,6 +1047,12 @@
              hidden_states=all_hidden_states,
              attentions=all_self_attns,
          )
@@ -263,7 +262,7 @@
 
 
  @auto_docstring
-@@ -1134,9 +1222,6 @@
+@@ -1134,9 +1221,6 @@
          """
          pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
@@ -273,7 +272,7 @@
 
          return vision_outputs
 
-@@ -1156,9 +1241,6 @@
+@@ -1156,9 +1240,6 @@
          """
          pixel_values = pixel_values.type(self.visual.dtype)
          vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
@@ -283,7 +282,7 @@
 
          return vision_outputs
 
-@@ -1268,31 +1350,57 @@
+@@ -1268,31 +1349,57 @@
          rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
              The rope index difference between sequence length and multimodal rope.
          """
@@ -350,7 +349,7 @@
 
          if position_ids is None:
              position_ids = self.compute_3d_position_ids(
-@@ -1303,6 +1411,10 @@
+@@ -1303,6 +1410,10 @@
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
              )
@@ -361,7 +360,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1326,6 +1438,12 @@
+@@ -1326,6 +1437,12 @@
              rope_deltas=self.rope_deltas,
          )
          return output if return_dict else output.to_tuple()
@@ -374,7 +373,7 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1401,65 +1519,30 @@
+@@ -1401,65 +1518,30 @@
          cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -447,7 +446,7 @@
              image_grid_thw=image_grid_thw,
              video_grid_thw=video_grid_thw,
              position_ids=position_ids,
-@@ -1475,23 +1558,59 @@
+@@ -1475,23 +1557,47 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -457,11 +456,7 @@
 -
          loss = None
 +        logits = None
-+        log_probs = None
-+        entropy = None
-+        distillation_losses = None
-+        student_mass = None
-+        teacher_mass = None
++        fused_linear_aux = None
          if labels is not None:
 -            loss = self.loss_function(
 -                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
@@ -470,19 +465,7 @@
 -        return Qwen2VLCausalLMOutputWithPast(
 +            # Modification: OpSlot guard for cross-entropy loss.
 +            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-+                    veomni_causal_lm_loss(
-+                        logits=logits,
-+                        labels=labels,
-+                        vocab_size=self.config.text_config.vocab_size,
-+                        hidden_states=hidden_states,
-+                        weights=self.lm_head.weight,
-+                        **kwargs,
-+                    )
-+                )
-+            else:
-+                logits = self.lm_head(hidden_states)
-+                loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
++                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
 +                    logits=logits,
 +                    labels=labels,
 +                    vocab_size=self.config.text_config.vocab_size,
@@ -490,8 +473,18 @@
 +                    weights=self.lm_head.weight,
 +                    **kwargs,
 +                )
-+                if log_probs is not None:
-+                    # log_probs path empties loss/logits slots; clear the local 3D
++            else:
++                logits = self.lm_head(hidden_states)
++                loss, _, fused_linear_aux = self.loss_function(
++                    logits=logits,
++                    labels=labels,
++                    vocab_size=self.config.text_config.vocab_size,
++                    hidden_states=hidden_states,
++                    weights=self.lm_head.weight,
++                    **kwargs,
++                )
++                if fused_linear_aux is not None:
++                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
 +                    # logits so output mirrors the OpSlot branch's contract.
 +                    logits = None
 +        else:
@@ -506,17 +499,11 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
-+            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-+                log_probs=log_probs,
-+                entropy=entropy,
-+                distillation_losses=distillation_losses,
-+                student_mass=student_mass,
-+                teacher_mass=teacher_mass,
-+            ),
++            fused_linear_aux=fused_linear_aux,
          )
 
      def prepare_inputs_for_generation(
-@@ -1710,5 +1829,19 @@
+@@ -1710,5 +1816,19 @@
 
          return input_ids, model_kwargs
 

@@ -93,7 +93,7 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutput, FusedLinearAuxOutputMixin
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
 
 
 # Additional import blocks for patches
@@ -2317,27 +2317,11 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
-        log_probs = None
-        entropy = None
-        distillation_losses = None
-        student_mass = None
-        teacher_mass = None
+        fused_linear_aux = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-                    veomni_causal_lm_loss(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.vocab_size,
-                        hidden_states=hidden_states,
-                        weights=self.lm_head.weight,
-                        **kwargs,
-                    )
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -2345,8 +2329,18 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
                     weights=self.lm_head.weight,
                     **kwargs,
                 )
-                if log_probs is not None:
-                    # log_probs path empties loss/logits slots; clear the local 3D
+            else:
+                logits = self.lm_head(hidden_states)
+                loss, _, fused_linear_aux = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+                if fused_linear_aux is not None:
+                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
                     # logits so output mirrors the OpSlot branch's contract.
                     logits = None
         else:
@@ -2355,13 +2349,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         return CausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
-            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-                log_probs=log_probs,
-                entropy=entropy,
-                distillation_losses=distillation_losses,
-                student_mass=student_mass,
-                teacher_mass=teacher_mass,
-            ),
+            fused_linear_aux=fused_linear_aux,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -2511,27 +2499,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
-        log_probs = None
-        entropy = None
-        distillation_losses = None
-        student_mass = None
-        teacher_mass = None
+        fused_linear_aux = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-                    veomni_causal_lm_loss(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.text_config.vocab_size,
-                        hidden_states=hidden_states,
-                        weights=self.lm_head.weight,
-                        **kwargs,
-                    )
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2539,8 +2511,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                     weights=self.lm_head.weight,
                     **kwargs,
                 )
-                if log_probs is not None:
-                    # log_probs path empties loss/logits slots; clear the local 3D
+            else:
+                logits = self.lm_head(hidden_states)
+                loss, _, fused_linear_aux = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+                if fused_linear_aux is not None:
+                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
                     # logits so output mirrors the OpSlot branch's contract.
                     logits = None
         else:
@@ -2553,13 +2535,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
-            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-                log_probs=log_probs,
-                entropy=entropy,
-                distillation_losses=distillation_losses,
-                student_mass=student_mass,
-                teacher_mass=teacher_mass,
-            ),
+            fused_linear_aux=fused_linear_aux,
         )
 
     def prepare_inputs_for_generation(
