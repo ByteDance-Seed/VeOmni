@@ -75,7 +75,13 @@ class CheckpointerCallback(Callback):
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
             self.trainer.checkpointer.save_future.result()
 
-        self.trainer.checkpointer.load(args.train.checkpoint.load_path, state)
+        extra_kwargs: dict = {}
+        # LoRA training: the DCP only contains trainable (LoRA / PEFT) params; the
+        # frozen base must have been freshly loaded from ``model.model_path`` before
+        # this point. We tolerate missing base keys via ``StateDictOptions(strict=False)``.
+        if args.train.checkpoint.manager == "dcp" and bool(getattr(args.model, "lora_config", None)):
+            extra_kwargs["trainable_only"] = True
+        self.trainer.checkpointer.load(args.train.checkpoint.load_path, state, **extra_kwargs)
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
         self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
@@ -118,7 +124,15 @@ class CheckpointerCallback(Callback):
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
-        self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
+        extra_kwargs: dict = {}
+        # LoRA training: skip frozen base weights in the DCP model dump.
+        # For a 20B base with rank-128 LoRA this drops the model state from ~40 GB to ~1-2 GB.
+        # The optimizer state is already trainable-only (build_optimizer filters by requires_grad).
+        if args.train.checkpoint.manager == "dcp" and bool(getattr(args.model, "lora_config", None)):
+            extra_kwargs["trainable_only"] = True
+        self.trainer.checkpointer.save(
+            save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async, **extra_kwargs
+        )
 
         # Empty cache and barrier
         helper.empty_cache()
