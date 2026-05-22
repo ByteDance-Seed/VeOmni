@@ -273,6 +273,56 @@ bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
     --train.checkpoint.load_path auto          # auto-picks latest DCP checkpoint
 ```
 
+### 5.3 Qwen-Image LoRA (DiT, FSDP2)
+
+Config: [`configs/dit/qwen_image_lora.yaml`](../../configs/dit/qwen_image_lora.yaml)
+
+The Qwen-Image transformer uses a **dual-stream** MMDiT block: each `QwenImageTransformerBlock` carries a separate image-stream attention projection (`to_q`, `to_k`, `to_v`, `to_out.0`) and a text-stream one (`add_q_proj`, `add_k_proj`, `add_v_proj`, `to_add_out`), plus paired `img_mlp` / `txt_mlp` FeedForward sub-modules. The recommended target set covers both streams:
+
+```yaml
+model:
+  lora_config:
+    rank: 128
+    alpha: 64
+    lora_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - net.0.proj
+      - net.2
+
+train:
+  init_device: meta
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+```
+
+`net.0.proj` and `net.2` are substring-matched, so they hit the Linear layers inside both `img_mlp` and `txt_mlp` (each is a `diffusers.models.attention.FeedForward`).
+
+Launch (e.g. 8 GPUs, single-node):
+
+```shell
+NPROC_PER_NODE=8
+
+bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
+    --model.model_path           /path/to/Qwen-Image/transformer \
+    --model.condition_model_path /path/to/Qwen-Image \
+    --data.train_path            /path/to/dataset \
+    --train.global_batch_size    8 \
+    --train.micro_batch_size     1 \
+    --train.checkpoint.output_dir ./exp/qwen_image_lora \
+    --train.checkpoint.save_hf_weights true \
+    --train.num_train_epochs 3
+```
+
+`HFLoraCkptCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.{bin,safetensors}}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`).
+
 ---
 
 ## 6. Testing
