@@ -116,6 +116,22 @@ def test_opslot_fused_npu_on_gpu_raises():
         slot.bind("npu")
 
 
+@pytest.mark.parametrize(
+    ("op_name", "variant"),
+    [
+        ("rotary_pos_emb", "full"),
+        ("rms_norm", "standard"),
+    ],
+)
+@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
+@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
+def test_opslot_npu_text_kernels_are_registered_and_hw_gated(op_name, variant):
+    """NPU text kernels should be known to OpSlot dispatch before HW gating."""
+    slot = OpSlot(op_name, variant)
+    with pytest.raises(RuntimeError, match="device_type='npu'"):
+        slot.bind("npu")
+
+
 def test_opslot_eager_skips_hw_check():
     """'eager' resolves to None without touching HardwareRequirement."""
     slot = OpSlot("moe_experts", "standard")
@@ -184,3 +200,14 @@ def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc, _
 @pytest.mark.parametrize("impl_name", ["triton", "quack", "npu"])
 def test_moe_experts_registry_has_kernel(impl_name):
     assert impl_name in KERNEL_REGISTRY.list_available("moe_experts", "standard")
+
+
+@pytest.mark.parametrize(
+    ("op_name", "variant"),
+    [
+        ("rotary_pos_emb", "full"),
+        ("rms_norm", "standard"),
+    ],
+)
+def test_npu_text_kernel_registry_has_kernel(op_name, variant):
+    assert "npu" in KERNEL_REGISTRY.list_available(op_name, variant)

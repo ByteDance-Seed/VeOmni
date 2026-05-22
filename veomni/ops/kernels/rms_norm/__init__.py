@@ -22,6 +22,7 @@ Models can register a ``triton`` backend via ``extra_backends`` in their
 """
 
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
 register_op(
@@ -42,5 +43,17 @@ register_op(
                 replace_forward=True,
             ),
         },
+    )
+)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rms_norm",
+        variant="standard",
+        factory=lambda: __import__("veomni.ops.kernels.rms_norm.npu", fromlist=["rms_norm_npu"]).rms_norm_npu,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="Ascend NPU fused RMSNorm",
     )
 )

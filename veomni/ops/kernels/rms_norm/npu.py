@@ -21,11 +21,16 @@
 import torch_npu
 
 
+def rms_norm_npu(hidden_states, weight, eps):
+    """NPU optimized RMSNorm implementation for OpSlot dispatch."""
+    if hidden_states.dtype != weight.dtype:
+        hidden_states = hidden_states.to(weight.dtype)
+    return torch_npu.npu_rms_norm(hidden_states, weight, epsilon=eps)[0]
+
+
 def rms_norm_forward_npu(self, x):
     """NPU optimized implementation for RMSNorm."""
-    if x.dtype != self.weight.dtype:
-        x = x.to(self.weight.dtype)
-    return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.variance_epsilon)[0]
+    return rms_norm_npu(x, self.weight, self.variance_epsilon)
 
 
-__all__ = ["rms_norm_forward_npu"]
+__all__ = ["rms_norm_forward_npu", "rms_norm_npu"]

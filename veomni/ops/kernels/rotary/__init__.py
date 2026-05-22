@@ -22,6 +22,7 @@ Models can register a ``triton`` (deterministic bmm / Wan DiT) backend via
 """
 
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
 register_op(
@@ -41,5 +42,19 @@ register_op(
                 requires=("torch_npu",),
             ),
         },
+    )
+)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rotary_pos_emb",
+        variant="full",
+        factory=lambda: (
+            __import__("veomni.ops.kernels.rotary.npu", fromlist=["apply_rotary_pos_emb_npu"]).apply_rotary_pos_emb_npu
+        ),
+        hardware=HardwareRequirement(device_type="npu"),
+        description="Ascend NPU fused RoPE (full head_dim)",
     )
 )
