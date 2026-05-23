@@ -230,9 +230,14 @@ class MoERouterMonitor:
     # ---------------------- Internal ----------------------
 
     def _register_layer(self, module: nn.Module) -> None:
-        """Capture the layer's stable order at attach time."""
+        """Capture the layer's stable order at attach time.
+
+        Idempotent: calling :func:`attach_moe_router_monitor` more than once
+        on the same model (or otherwise re-registering a router) must not
+        produce duplicate rows in the heatmap.
+        """
         mid = id(module)
-        if mid not in self._counts:
+        if mid not in self._layer_order:
             self._layer_order.append(mid)
 
     def _reset_counts(self) -> None:
@@ -266,12 +271,20 @@ class MoERouterMonitor:
         """Stack per-layer counts and all-reduce across the configured DP+SP group.
 
         Returns an on-device ``[num_moe_layers, num_experts]`` long tensor.
+        Layers that were registered at attach time but did not fire during
+        the interval (e.g. routing-gated layers, partial-network warmup) are
+        included as zero rows so the heatmap shape stays stable across
+        intervals.
         """
         if not self._counts:
             # No data recorded yet — return an empty tensor on CPU.
             return torch.zeros(0, self.num_experts, dtype=torch.long)
 
-        matrix = torch.stack([self._counts[mid] for mid in self._layer_order])
+        # Device hint from any allocated counts tensor — we need it to
+        # synthesize zero rows for layers that haven't fired yet.
+        device = next(iter(self._counts.values())).device
+        zero_row = torch.zeros(self.num_experts, dtype=torch.long, device=device)
+        matrix = torch.stack([self._counts.get(mid, zero_row) for mid in self._layer_order])
 
         # All-reduce across the DP+SP group so the heatmap aggregates every
         # distinct token slice. EP siblings hold the replicated gate and

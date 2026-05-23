@@ -281,6 +281,52 @@ def test_extractor_returning_none_fails_loud():
         set_active_monitor(None)
 
 
+def test_attach_is_idempotent():
+    """Re-attaching to the same model must not duplicate heatmap rows."""
+    monitor = MoERouterMonitor(num_experts=4)
+    model = TwoLayerModel(num_experts=4, top_k=2)
+    attach_moe_router_monitor(model, monitor)
+    attach_moe_router_monitor(model, monitor)  # second attach must be a no-op for _layer_order
+
+    set_active_monitor(monitor)
+    try:
+        model.router0.set_next_indices(torch.zeros(4, 2, dtype=torch.long))
+        model.router1.set_next_indices(torch.zeros(4, 2, dtype=torch.long))
+        model(torch.zeros(4, 8))
+        # Two routers in the model -> exactly 2 rows.
+        load = monitor.get_load_matrix(current_step=0)
+        assert load.shape == (2, 4), f"expected 2 rows, got {load.shape}"
+    finally:
+        set_active_monitor(None)
+
+
+def test_unfired_layers_appear_as_zero_rows():
+    """A router registered at attach time but never invoked must not crash.
+
+    Some MoE families have conditionally-routed layers (e.g. capacity gating
+    that skips a layer when no tokens are routed to it). The heatmap shape
+    must stay stable; the skipped layer just shows up cold.
+    """
+    monitor = MoERouterMonitor(num_experts=4)
+    model = TwoLayerModel(num_experts=4, top_k=2)
+    attach_moe_router_monitor(model, monitor)
+
+    set_active_monitor(monitor)
+    try:
+        # Only router0 fires; router1 stays cold this interval.
+        model.router0.set_next_indices(torch.zeros(4, 2, dtype=torch.long))
+        model.router0(torch.zeros(4, 8))
+
+        load = monitor.get_load_matrix(current_step=1)
+        assert load.shape == (2, 4)
+        # Router0 routed every token to expert 0 -> first row [1, 0, 0, 0].
+        assert torch.allclose(load[0], torch.tensor([1.0, 0.0, 0.0, 0.0]))
+        # Router1 never fired -> normalized row is all-zero (clamp(min=1.0) keeps it cold).
+        assert torch.allclose(load[1], torch.zeros(4))
+    finally:
+        set_active_monitor(None)
+
+
 def test_attach_returns_zero_when_no_routers():
     class Plain(nn.Module):
         def __init__(self):
