@@ -20,6 +20,8 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
+from ..utils.device import empty_cache, get_device_id, get_device_type
+
 
 class OffloadPolicy(enum.Enum):
     OFFLOAD = 0
@@ -119,7 +121,7 @@ def _reset_training_state(model: "torch.nn.Module") -> None:
 
 
 @torch.no_grad()
-def offload_model_to_cpu(model: "torch.nn.Module", empty_cache: bool = True) -> None:
+def offload_model_to_cpu(model: "torch.nn.Module", empty_device_cache: bool = True) -> None:
     """Move a model wrapped by FSDP2 ``fully_shard`` to CPU.
 
     Resets any stranded FSDP2 training state, calls ``reshard()`` to drop
@@ -127,17 +129,18 @@ def offload_model_to_cpu(model: "torch.nn.Module", empty_cache: bool = True) -> 
 
     Args:
         model: Root module returned by :func:`parallelize_model_fsdp2`.
-        empty_cache: If ``True``, calls ``torch.cuda.empty_cache()`` after the
-            move so the released device memory becomes available to peers
-            (e.g. a co-located vLLM rollout).
+        empty_device_cache: If ``True``, calls
+            :func:`veomni.utils.device.empty_cache` after the move so the
+            released device memory becomes available to peers (e.g. a
+            co-located vLLM rollout).
     """
     _reset_training_state(model)
     reshard = getattr(model, "reshard", None)
     if callable(reshard):
         reshard()
     model.cpu()
-    if empty_cache and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if empty_device_cache and get_device_type() != "cpu":
+        empty_cache()
 
 
 @torch.no_grad()
@@ -149,7 +152,7 @@ def load_model_to_gpu(model: "torch.nn.Module", device: Optional[Union[str, "tor
         device: Target device. Defaults to the current CUDA device.
     """
     if device is None:
-        device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        device = get_device_id() if get_device_type() != "cpu" else "cpu"
     model.to(device)
 
 
