@@ -17,6 +17,8 @@
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
 #    - method_override: DeepseekV3TopkRouter.forward
 #      Disable autocast around fp32 router linear for VeRL actor/rollout parity
+#    - method_override: DeepseekV3MoE.forward
+#      Report top-k indices to the MoE load-balance monitor
 #    - method_override: DeepseekV3ForCausalLM.forward
 #      OpSlot guard for fused cross entropy in DeepseekV3ForCausalLM.forward
 #    - method_override: DeepseekV3ForCausalLM.get_parallel_plan
@@ -60,6 +62,7 @@ from veomni.ops import fused_moe_forward
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.moe_monitor import record_router_indices
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -284,6 +287,12 @@ class DeepseekV3NaiveMoe(nn.Module):
         return final_hidden_states
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV3MoE
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV3MoE(nn.Module):
     """
     A mixed expert module containing shared experts.
@@ -329,11 +338,26 @@ class DeepseekV3MoE(nn.Module):
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_indices, topk_weights
 
+    # ================================================================
+    # Patch: DeepseekV3MoE.forward
+    # 1. After the family-specific top-k math in ``route_tokens_to_experts``
+    #    (sigmoid + bias correction + group routing) produces ``topk_indices``,
+    #    feed those indices into the MoE load-balance monitor. Symmetric to the
+    #    ``maybe_replay_indices`` call other families make in their SparseMoeBlock
+    #    patches. No-op when no monitor is active.
+    # ================================================================
     def forward(self, hidden_states):
         residuals = hidden_states
         orig_shape = hidden_states.shape
         router_logits = self.gate(hidden_states)
         topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
+        # --- Patch.1 ---
+        # Hand the actual top-k indices used by this layer to the load-balance
+        # monitor. The router itself only produces logits; the chosen experts
+        # come out of ``route_tokens_to_experts``. Keyed on ``self.gate`` so the
+        # monitor's layer order matches the router module identity.
+        record_router_indices(self.gate, topk_indices)
+        # --- Patch.1 ---
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)

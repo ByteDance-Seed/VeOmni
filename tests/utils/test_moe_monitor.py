@@ -32,10 +32,13 @@ import torch.nn as nn
 
 from veomni.utils import moe_monitor
 from veomni.utils.moe_monitor import (
+    EXTERNAL_RECORD_ROUTERS,
     ROUTER_EXTRACTORS,
     MoERouterMonitor,
     attach_moe_router_monitor,
     get_active_monitor,
+    record_router_indices,
+    register_external_record_router,
     register_router_extractor,
     set_active_monitor,
 )
@@ -325,6 +328,101 @@ def test_unfired_layers_appear_as_zero_rows():
         assert torch.allclose(load[1], torch.zeros(4))
     finally:
         set_active_monitor(None)
+
+
+def test_deepseek_v3_style_external_record_path():
+    """DeepSeek-V3's top-k math lives in the MoE block, not the router.
+
+    The router class is registered in EXTERNAL_RECORD_ROUTERS so attach
+    pre-registers it (stable layer order); the patched MoE block then calls
+    record_router_indices(self.gate, topk_indices) explicitly. This test
+    simulates that pattern with a fake router class and asserts the monitor
+    receives the indices correctly.
+    """
+
+    class FakeDeepSeekRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(8, 4))  # 8 experts, hidden=4
+
+        def forward(self, x):
+            # DeepSeek-V3 router returns only logits — the MoE block does the topk.
+            return x @ self.weight.T
+
+    # Register under the real class name so EXTERNAL_RECORD_ROUTERS picks it up.
+    FakeDeepSeekRouter.__name__ = "DeepseekV3TopkRouter"
+    assert "DeepseekV3TopkRouter" in EXTERNAL_RECORD_ROUTERS
+
+    class FakeDeepSeekMoE(nn.Module):
+        """Mimics DeepseekV3MoE.forward calling record_router_indices."""
+
+        def __init__(self):
+            super().__init__()
+            self.gate = FakeDeepSeekRouter()
+
+        def forward(self, hidden_states, topk_indices):
+            self.gate(hidden_states)  # produces logits (unused here)
+            # Patched DeepseekV3MoE.forward calls this after route_tokens_to_experts.
+            record_router_indices(self.gate, topk_indices)
+            return hidden_states
+
+    monitor = MoERouterMonitor(num_experts=8)
+    model = nn.ModuleList([FakeDeepSeekMoE(), FakeDeepSeekMoE()])
+    attached = attach_moe_router_monitor(model, monitor)
+    # Both router instances pre-registered, no hooks attached (no extractor for this class).
+    assert attached == 2, f"expected 2 external-record routers, got {attached}"
+
+    set_active_monitor(monitor)
+    try:
+        # Layer 0: 6 tokens, top_k=2, every token chooses expert 0.
+        # Layer 1: 6 tokens, top_k=2, every token chooses expert 7.
+        idx0 = torch.zeros(6, 2, dtype=torch.long)
+        idx1 = torch.full((6, 2), 7, dtype=torch.long)
+        model[0](torch.zeros(6, 4), idx0)
+        model[1](torch.zeros(6, 4), idx1)
+
+        load = monitor.get_load_matrix(current_step=0)
+        assert load.shape == (2, 8)
+        assert torch.allclose(load[0], torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        assert torch.allclose(load[1], torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+    finally:
+        set_active_monitor(None)
+
+
+def test_record_router_indices_noop_when_paused_or_inactive():
+    """record_router_indices must be a cheap no-op when the monitor is paused/off."""
+
+    class R(nn.Module):
+        def forward(self, x):
+            return x
+
+    R.__name__ = "DeepseekV3TopkRouter"
+    monitor = MoERouterMonitor(num_experts=4)
+    router = R()
+    attach_moe_router_monitor(nn.ModuleList([router]), monitor)
+
+    # Monitor not active — call must not crash and not record.
+    record_router_indices(router, torch.zeros(2, 1, dtype=torch.long))
+    assert monitor._counts == {}
+
+    set_active_monitor(monitor)
+    try:
+        monitor.pause()
+        record_router_indices(router, torch.zeros(2, 1, dtype=torch.long))
+        assert monitor._counts == {}, "paused monitor must drop the record"
+        monitor.resume()
+        record_router_indices(router, torch.zeros(2, 1, dtype=torch.long))
+        assert monitor._counts != {}, "resumed monitor must accept the record"
+    finally:
+        set_active_monitor(None)
+
+
+def test_register_external_record_router_is_idempotent():
+    """Registering the same class twice must not break anything."""
+    before = len(EXTERNAL_RECORD_ROUTERS)
+    register_external_record_router("DeepseekV3TopkRouter")  # already there
+    register_external_record_router("DeepseekV3TopkRouter")
+    assert len(EXTERNAL_RECORD_ROUTERS) == before
 
 
 def test_attach_returns_zero_when_no_routers():

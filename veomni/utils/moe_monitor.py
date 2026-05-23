@@ -35,19 +35,30 @@ logging backend (wandb / tensorboard / mlflow / verl ``Tracking``).
 
 Adding a new model family
 -------------------------
-Register an extractor that returns ``router_indices`` of shape
-``[num_tokens, top_k]`` from the router module's forward output::
+**Case A — router forward output exposes top-k indices** (Qwen3 family).
+Register an extractor::
 
     @register_router_extractor("MyNewRouter")
     def _extract(output):
-        # output is whatever ``MyNewRouter.forward`` returns
         return output["indices"]  # or output[2], etc.
 
-If a router family doesn't surface indices in its forward output (e.g.
-DeepSeek-V3's bias-corrected sigmoid top-k consumed inside ``SparseMoeBlock``),
-do not try to recompute them here — the gating math is family-specific and
-prone to drift. Instead, expose indices in the patched router's return value
-the same way ``Qwen3MoeTopKRouter`` does and register an extractor for it.
+**Case B — top-k math lives downstream of the router** (DeepSeek-V3 family).
+The router only produces logits; the actual top-k is computed inside the
+patched MoE block (with sigmoid + bias correction + group routing for
+DeepSeek-V3). For these families:
+
+1. Call :func:`register_external_record_router` for the router class so
+   :func:`attach_moe_router_monitor` pre-registers the layer (stable order
+   in the heatmap).
+2. Insert one line into the patched MoE block's ``forward`` right after the
+   indices are computed::
+
+       record_router_indices(self.gate, topk_indices)
+
+   Symmetric to :func:`maybe_replay_indices` in ``moe_router_replay.py``.
+
+Do not try to recompute the top-k inside this module — the gating math is
+family-specific and prone to drift.
 """
 
 from typing import Any, Callable, Dict, List, Optional
@@ -116,6 +127,39 @@ def _extract_qwen3_topk(output: Any) -> Optional[torch.Tensor]:
 
 
 # ---------------------------------------------------------------------------
+# External-record routers. Families whose router forward doesn't surface
+# indices (DeepSeek-V3) record by calling :func:`record_router_indices`
+# explicitly from the patched MoE block. We still want
+# :func:`attach_moe_router_monitor` to count and pre-register these modules
+# so the heatmap layer order is stable across resumes.
+# ---------------------------------------------------------------------------
+EXTERNAL_RECORD_ROUTERS: set[str] = set()
+
+
+def register_external_record_router(class_name: str) -> None:
+    """Mark a router class as recording via explicit ``record_router_indices()``
+    calls rather than a forward hook."""
+    EXTERNAL_RECORD_ROUTERS.add(class_name)
+
+
+register_external_record_router("DeepseekV3TopkRouter")
+
+
+def record_router_indices(router_module: nn.Module, indices: torch.Tensor) -> None:
+    """Record expert selections from a family-patched MoE block.
+
+    Called from inside the patched ``DeepseekV3MoE.forward`` (and any other
+    family whose top-k math lives downstream of the router). No-op when no
+    monitor is active or the monitor is paused. Symmetric to
+    :func:`veomni.utils.moe_router_replay.maybe_replay_indices`.
+    """
+    monitor = _active_monitor
+    if monitor is None or monitor._paused:
+        return
+    monitor.record(router_module, indices)
+
+
+# ---------------------------------------------------------------------------
 # Hook builder.
 # ---------------------------------------------------------------------------
 
@@ -140,24 +184,31 @@ def _make_router_hook(extractor: RouterExtractor):
 
 
 def attach_moe_router_monitor(model: nn.Module, monitor: "MoERouterMonitor") -> int:
-    """Walk ``model`` and register a forward hook on every recognized router module.
+    """Walk ``model`` and wire up every recognized router module.
 
-    Recognition is by class name lookup in :data:`ROUTER_EXTRACTORS`. Each router
-    module's stable layer order is captured at attach time so logs are consistent
-    across resumes (independent of which layer's forward runs first at step 0).
+    Two recognition paths:
 
-    Returns the number of routers attached. The caller should treat 0 as an
-    error — the monitor is enabled but will never accumulate any data.
+    * :data:`ROUTER_EXTRACTORS` — routers whose forward output exposes top-k
+      indices. A forward hook is registered.
+    * :data:`EXTERNAL_RECORD_ROUTERS` — routers whose patched MoE block calls
+      :func:`record_router_indices` directly. No hook is registered, but the
+      layer is pre-registered so the heatmap row order is stable.
+
+    Each router's order is captured at attach time so logs are consistent
+    across resumes. Returns the number of routers wired up. The caller should
+    treat 0 as an error — the monitor is enabled but will never accumulate data.
     """
     attached = 0
     for mod in model.modules():
         cls_name = type(mod).__name__
         extractor = ROUTER_EXTRACTORS.get(cls_name)
-        if extractor is None:
-            continue
-        mod.register_forward_hook(_make_router_hook(extractor))
-        monitor._register_layer(mod)
-        attached += 1
+        if extractor is not None:
+            mod.register_forward_hook(_make_router_hook(extractor))
+            monitor._register_layer(mod)
+            attached += 1
+        elif cls_name in EXTERNAL_RECORD_ROUTERS:
+            monitor._register_layer(mod)
+            attached += 1
     monitor._attached_count = attached
     return attached
 
