@@ -519,7 +519,13 @@ class TrainingArguments:
     )
     moe_load_balance_monitor_interval: int = field(
         default=0,
-        metadata={"help": "Log MoE expert load heatmap every N steps. 0 = disabled. Requires wandb.enable=True."},
+        metadata={
+            "help": (
+                "Log MoE expert load heatmap every N steps. 0 = disabled. Counts are "
+                "all-reduced across EP and DP groups so the heatmap is global. "
+                "Wandb logging is performed only when train.wandb.enable=True."
+            )
+        },
     )
 
     # sub-argument groups

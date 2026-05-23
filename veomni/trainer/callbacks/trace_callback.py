@@ -32,76 +32,97 @@ if TYPE_CHECKING:
 
 
 class MoERouterMonitorCallback(Callback):
+    """Monitors MoE expert load distribution and logs heatmaps to wandb.
+
+    Activation is gated only by ``moe_load_balance_monitor_interval > 0``; the
+    monitor itself does not require wandb. Logging to wandb is gated by
+    ``wandb.enable`` and ``global_rank == 0``.
+    """
+
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         self.monitor = None
 
         args: "VeOmniArguments" = self.trainer.args
-        if not args.train.wandb.enable:
-            logger.info_rank0("MoE router monitor disabled (wandb not enabled).")
-            return
         if args.train.moe_load_balance_monitor_interval <= 0:
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
             return
 
         config = self.trainer.model_config
-        if hasattr(config, "num_experts"):
-            from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
-
-            self.monitor = MoERouterMonitor(config.num_experts)
-            set_active_monitor(self.monitor)
-            logger.info_rank0(
-                f"MoE router monitor enabled: num_experts={config.num_experts}, "
-                f"interval={args.train.moe_load_balance_monitor_interval}"
-            )
-        else:
+        if not hasattr(config, "num_experts"):
             logger.warning_rank0(
                 "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
                 "MoE router monitor not activated."
             )
+            return
+
+        from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
+
+        # Process groups are read lazily in on_train_begin once the device
+        # mesh is guaranteed to be initialized.
+        self.monitor = MoERouterMonitor(num_experts=config.num_experts)
+        set_active_monitor(self.monitor)
+        ps = get_parallel_state()
+        logger.info_rank0(
+            f"MoE router monitor created: num_experts={config.num_experts}, "
+            f"interval={args.train.moe_load_balance_monitor_interval}, "
+            f"ep_size={ps.ep_size if ps.ep_enabled else 1}"
+        )
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        if self.monitor is None:
+            return
+        from ...utils.moe_monitor import attach_moe_router_monitor
+
+        # fsdp_group is the dp_sp mesh dim — exactly the set of ranks that
+        # hold distinct token slices. EP is intentionally not in this group;
+        # see MoERouterMonitor.__init__ docstring.
+        self.monitor.dp_group = get_parallel_state().fsdp_group
+
+        attached = attach_moe_router_monitor(self.trainer.model, self.monitor)
+        if attached == 0:
+            logger.warning_rank0(
+                "MoE router monitor: no recognized router modules found in the model. "
+                "Disabling monitor. To add support for a new router class, register an "
+                "extractor in veomni/utils/moe_monitor.py (see ROUTER_EXTRACTORS)."
+            )
+            from ...utils.moe_monitor import set_active_monitor
+
+            set_active_monitor(None)
+            self.monitor = None
+        else:
+            logger.info_rank0(f"MoE router monitor: attached to {attached} router module(s).")
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if (
-            self.monitor
-            and state.global_step % args.train.moe_load_balance_monitor_interval == 0
-            and args.train.global_rank == 0
-        ):
-            import wandb
+        if self.monitor is None or state.global_step % args.train.moe_load_balance_monitor_interval != 0:
+            return
 
-            load_matrix = self.monitor.get_load_matrix(current_step=state.global_step)
-            num_layers = load_matrix.shape[0]
-            if num_layers == 0:
-                logger.warning_rank0(
-                    f"Step {state.global_step}: MoE router monitor has no recorded data. "
-                    "Check that router forward hooks are registered (e.g. PatchQwen3MoeTopKRouter)."
-                )
-                return
-            from ...utils.moe_monitor import MoERouterMonitor
+        # compute_metrics runs an all-reduce across EP/DP groups, so every rank
+        # must call it — but only rank 0 logs.
+        metrics = self.monitor.compute_metrics(current_step=state.global_step)
+        if not metrics or args.train.global_rank != 0 or not args.train.wandb.enable:
+            return
 
-            image = self.monitor.create_wandb_image(load_matrix)
-            vio = MoERouterMonitor.compute_vio(load_matrix)
-            max_vio, min_vio, avg_vio = vio["max_vio"], vio["min_vio"], vio["avg_vio"]
-            metrics = {"moe/expert_load_heatmap": image}
-            for i in range(num_layers):
-                metrics[f"moe/max_vio/layer_{i}"] = max_vio[i].item()
-                metrics[f"moe/min_vio/layer_{i}"] = min_vio[i].item()
-                metrics[f"moe/avg_vio/layer_{i}"] = avg_vio[i].item()
-            metrics["moe/max_vio/max"] = max_vio.max().item()
-            metrics["moe/max_vio/avg"] = max_vio.mean().item()
-            metrics["moe/min_vio/max"] = min_vio.max().item()
-            metrics["moe/min_vio/avg"] = min_vio.mean().item()
-            metrics["moe/avg_vio/max"] = avg_vio.max().item()
-            metrics["moe/avg_vio/avg"] = avg_vio.mean().item()
-            wandb.log(metrics, step=state.global_step)
-            logger.info_rank0(
-                f"Step {state.global_step}: uploaded MoE load balance heatmap "
-                f"({num_layers} layers, {load_matrix.shape[1]} experts, "
-                f"steps {self.monitor._last_step_range[0]}-{self.monitor._last_step_range[1]}), "
-                f"max_vio: max={vio['max_vio'].max().item():.4f} avg={vio['max_vio'].mean().item():.4f}, "
-                f"min_vio: max={vio['min_vio'].max().item():.4f} avg={vio['min_vio'].mean().item():.4f}, "
-                f"avg_vio: max={vio['avg_vio'].max().item():.4f} avg={vio['avg_vio'].mean().item():.4f}."
-            )
+        import wandb
+
+        wandb_metrics = {}
+        for k, v in metrics.items():
+            if k.endswith("expert_load_heatmap"):
+                start, end = self.monitor._last_step_range
+                wandb_metrics[k] = wandb.Image(v, caption=f"Steps {start}-{end}")
+            else:
+                wandb_metrics[k] = v
+        wandb.log(wandb_metrics, step=state.global_step)
+
+        start, end = self.monitor._last_step_range
+        logger.info_rank0(
+            f"Step {state.global_step}: uploaded MoE load balance heatmap "
+            f"(steps {start}-{end}), "
+            f"max_vio max={metrics['moe/max_vio/max']:.4f} avg={metrics['moe/max_vio/avg']:.4f}, "
+            f"min_vio max={metrics['moe/min_vio/max']:.4f} avg={metrics['moe/min_vio/avg']:.4f}, "
+            f"avg_vio max={metrics['moe/avg_vio/max']:.4f} avg={metrics['moe/avg_vio/avg']:.4f}."
+        )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.monitor is not None:
