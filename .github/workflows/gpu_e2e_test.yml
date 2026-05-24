@@ -35,7 +35,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2"
   NCCL_DEBUG: "WARN"
   # uv's default 30s timeout is too short for the ~617 MiB
   # nvidia-cudnn-cu12 wheel on the CN runners; bump to 5 min so a
@@ -63,7 +63,7 @@ jobs:
     # 120m budget fits the e2e suite plus the diffusers e2e step.
     timeout-minutes: 120
     container:
-      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2
       volumes:
         - /mnt/veomni_ci:/mnt/veomni_ci:ro
       options: >-
