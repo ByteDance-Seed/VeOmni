@@ -112,9 +112,25 @@ class FusedLinearAuxOutputMixin:
     """Single ``fused_linear_aux`` field added to every ``*WithLogProbs``
     dataclass. Inherited alongside the HF base class so per-model
     subclasses don't repeat the field.
+
+    Also exposes ``log_probs`` and ``entropy`` as read-only properties
+    that proxy to ``fused_linear_aux``. Restores the pre-#780 attribute
+    surface so external consumers (notably verl's
+    ``prepare_model_outputs`` at
+    ``verl/workers/engine/{fsdp,automodel}/transformer_impl.py``) can keep
+    reading ``output.log_probs`` / ``output.entropy`` directly without
+    knowing about the nested ``FusedLinearAuxOutput`` payload.
     """
 
     fused_linear_aux: Optional[FusedLinearAuxOutput] = None
+
+    @property
+    def log_probs(self) -> Optional[torch.Tensor]:
+        return self.fused_linear_aux.log_probs if self.fused_linear_aux is not None else None
+
+    @property
+    def entropy(self) -> Optional[torch.Tensor]:
+        return self.fused_linear_aux.entropy if self.fused_linear_aux is not None else None
 
 
 _FUSED_LINEAR_AUX_ARGS_DOC = """

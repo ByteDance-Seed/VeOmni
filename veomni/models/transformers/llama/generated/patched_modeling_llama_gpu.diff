@@ -1,6 +1,6 @@
 --- a/transformers/models/llama/modeling_llama.py
 +++ b/patched_modeling_llama_gpu.py
-@@ -1,52 +1,79 @@
+@@ -1,52 +1,68 @@
 -# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
@@ -41,7 +41,7 @@
 +
  from collections.abc import Callable
  from typing import Optional
-
+-
  import torch
  from torch import nn
 -
@@ -51,25 +51,15 @@
 -from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
 -from ...masking_utils import create_causal_mask
 -from ...modeling_layers import (
-+from transformers.activations import ACT2FN
-+from transformers.cache_utils import Cache, DynamicCache
-+from transformers.generation import GenerationMixin
-+from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
-+from transformers.masking_utils import create_causal_mask
-+from transformers.modeling_layers import (
-     GenericForQuestionAnswering,
-     GenericForSequenceClassification,
-     GenericForTokenClassification,
-     GradientCheckpointingLayer,
- )
+-    GenericForQuestionAnswering,
+-    GenericForSequenceClassification,
+-    GenericForTokenClassification,
+-    GradientCheckpointingLayer,
+-)
 -from ...modeling_outputs import (
-+
-+# Additional imports for patches
-+from transformers.modeling_outputs import (
-     BaseModelOutputWithPast,
-     CausalLMOutputWithPast,
-+    SequenceClassifierOutputWithPast,
- )
+-    BaseModelOutputWithPast,
+-    CausalLMOutputWithPast,
+-)
 -from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 -from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 -from ...processing_utils import Unpack
@@ -77,21 +67,29 @@
 -from ...utils.generic import maybe_autocast, merge_with_config_defaults
 -from ...utils.output_capturing import capture_outputs
 -from .configuration_llama import LlamaConfig
++from transformers.activations import ACT2FN
++from transformers.cache_utils import Cache, DynamicCache
++from transformers.generation import GenerationMixin
++from transformers.integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
++from transformers.masking_utils import create_causal_mask
++from transformers.modeling_layers import GenericForQuestionAnswering, GenericForSequenceClassification, GenericForTokenClassification, GradientCheckpointingLayer
++from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 +from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-+from transformers.models.llama.configuration_llama import LlamaConfig
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 +from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 +from transformers.utils.output_capturing import capture_outputs
++from transformers.models.llama.configuration_llama import LlamaConfig
++
++# Additional imports for patches
++from transformers.modeling_outputs import SequenceClassifierOutputWithPast
++from veomni.utils.model_outputs import FusedLinearAuxOutput, FusedLinearAuxOutputMixin, CausalLMOutputWithLogProbs
 +
 +# Additional import blocks for patches
 +# ── OpSlot declarations ──────────────────────────────────────────────────
 +# These are bound at model-build time by _bind_veomni_ops() in auto.py.
 +from veomni.ops.dispatch import OpSlot
-+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
-+
-+
 +veomni_rms_norm = OpSlot("rms_norm", "standard")
 +veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
 +veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
@@ -109,7 +107,7 @@
 
 
  @use_kernel_forward_from_hub("RMSNorm")
-@@ -59,7 +86,12 @@
+@@ -59,7 +75,12 @@
          self.weight = nn.Parameter(torch.ones(hidden_size))
          self.variance_epsilon = eps
 
@@ -122,7 +120,7 @@
          input_dtype = hidden_states.dtype
          hidden_states = hidden_states.to(torch.float32)
          variance = hidden_states.pow(2).mean(-1, keepdim=True)
-@@ -142,30 +174,34 @@
+@@ -142,30 +163,34 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -176,7 +174,7 @@
 
 
  class LlamaMLP(nn.Module):
-@@ -179,7 +215,12 @@
+@@ -179,7 +204,12 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -189,7 +187,7 @@
          down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
          return down_proj
 
-@@ -437,6 +478,12 @@
+@@ -437,6 +467,12 @@
          )
 
 
@@ -202,7 +200,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -452,6 +499,7 @@
+@@ -452,6 +488,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -210,7 +208,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -467,24 +515,7 @@
+@@ -467,24 +504,7 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> CausalLMOutputWithPast:
@@ -236,7 +234,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -496,24 +527,111 @@
+@@ -496,24 +516,111 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -324,10 +322,10 @@
 +        logits = None
 +        if labels is not None:
 +            # Modification: OpSlot guard for cross-entropy loss.
-+            # Seq-cls heads have no log-probs / entropy path; the third and
-+            # fourth tuple slots are always None.
++            # Seq-cls heads have no fused-linear-aux payload; the third slot
++            # of the unified loss-wrapper return is always None.
 +            if veomni_seq_cls_loss.use_non_eager_impl:
-+                loss, logits, _, _, _, _, _ = veomni_seq_cls_loss(
++                loss, logits, _ = veomni_seq_cls_loss(
 +                    logits=logits,
 +                    labels=labels,
 +                    num_labels=self.num_labels,
@@ -337,7 +335,7 @@
 +                )
 +            else:
 +                logits = self.score(hidden_states)
-+                loss, _, _, _, _, _, _ = self.loss_function(
++                loss, _, _ = self.loss_function(
 +                    logits=logits, labels=labels, num_labels=self.num_labels, **kwargs
 +                )
 +        else:
@@ -356,3 +354,9 @@
 
 
  class LlamaForQuestionAnswering(GenericForQuestionAnswering, LlamaPreTrainedModel):
+@@ -530,4 +637,4 @@
+     "LlamaForSequenceClassification",
+     "LlamaForQuestionAnswering",
+     "LlamaForTokenClassification",
+-]
++]

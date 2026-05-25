@@ -606,10 +606,10 @@ class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreT
         logits = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
-            # Seq-cls heads have no log-probs / entropy path; the third and
-            # fourth tuple slots are always None.
+            # Seq-cls heads have no fused-linear-aux payload; the third slot
+            # of the unified loss-wrapper return is always None.
             if veomni_seq_cls_loss.use_non_eager_impl:
-                loss, logits, _, _, _, _, _ = veomni_seq_cls_loss(
+                loss, logits, _ = veomni_seq_cls_loss(
                     logits=logits,
                     labels=labels,
                     num_labels=self.num_labels,
@@ -619,9 +619,7 @@ class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreT
                 )
             else:
                 logits = self.score(hidden_states)
-                loss, _, _, _, _, _, _ = self.loss_function(
-                    logits=logits, labels=labels, num_labels=self.num_labels, **kwargs
-                )
+                loss, _, _ = self.loss_function(logits=logits, labels=labels, num_labels=self.num_labels, **kwargs)
         else:
             logits = self.score(hidden_states)
 
