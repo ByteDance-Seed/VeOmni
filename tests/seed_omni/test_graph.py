@@ -382,7 +382,10 @@ def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
     g = TrainingGraph(nodes=nodes, edges=edges, training_edges=_JANUS_TRAIN_EDGES)
     out = g.to_mermaid(title="Janus Joint Training")
 
-    assert out.startswith("---\ntitle: Janus Joint Training\n---\nflowchart TD")
+    # Frontmatter, ELK renderer hint, then LR flowchart.
+    assert out.startswith("---\ntitle: Janus Joint Training\n---\n")
+    assert "%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%" in out
+    assert "flowchart LR" in out
 
     assert re.search(r'\bvision_encoder\["vision_encoder<br/><i>vision_encoder\.forward</i>"\]', out)
     assert re.search(r'\bvq_encode\["vq_encode<br/><i>vq_decoder\.encode</i>"\]', out)
@@ -398,16 +401,27 @@ def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
 
     assert ":::source" in out and ":::sink" in out
 
+    # Per-rank invisible subgraphs (col0 = sources, col1 = middle, col2 = sinks).
+    assert "subgraph col0" in out and "subgraph col1" in out and "subgraph col2" in out
+    # The rank-banding subgraphs are styled invisible.
+    assert "style col0 fill:transparent,stroke:none" in out
+
     assert "raw_batch -.-> vision_encoder" in out
     assert "raw_batch -.-> vq_encode" in out
+
+    # The single-loss protocol means each module collects its own _loss; we no
+    # longer draw a `losses` collector node or any fan-in arrows to it.
+    assert "losses" not in out
     for n in ("vision_encoder", "vq_encode", "run_ar", "vq_loss"):
-        assert f"{n} -.-> losses" in out
+        assert f"{n} -.-> losses" not in out
 
 
 def test_to_mermaid_compact_view_drops_io():
     nodes, edges = _janus_joint_pools()
     g = TrainingGraph(nodes=nodes, edges=edges, training_edges=_JANUS_TRAIN_EDGES)
     out = g.to_mermaid(show_io=False)
+    # `losses` is unconditionally absent (per-module _loss). `raw_batch` is
+    # gated by show_io.
     assert "raw_batch" not in out and "losses" not in out
     assert "vision_encoder" in out
     # Even in compact view the explicit `end` sink should still render.

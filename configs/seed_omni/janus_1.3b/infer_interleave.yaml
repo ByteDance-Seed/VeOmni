@@ -29,10 +29,30 @@
 # nodes that happen to produce a single fixed token.
 
 generation_graph:
-  initial: text_ar
-  done_state: done
+  # `done` is auto-injected by the framework — never declare it here, never
+  # set `done_state`.  Transitions whose `next_state: done` will land on the
+  # built-in terminal state which then triggers each module's `finalize`
+  # hook (text decode / image save / etc).
+
+  initial: prompt_to_text
 
   states:
+    prompt_to_text:
+      # Multi-source: siglip_encode + tok_encode both feed janus_llama.
+      # The order in `body` defines edge processing order; janus_llama
+      # only executes after both `vision_to_ar` and `tok_enc_to_ar` have
+      # been processed (topological execution rule).  ar_to_tok_decode
+      # then samples the first reply token.
+      body:
+        - vision_to_ar          # siglip_encode → janus_llama (und_image_embeds)
+        - tok_enc_to_ar         # tok_encode    → janus_llama (inputs_embeds)
+        - ar_to_tok_decode      # janus_llama   → tok_decode  (hidden_states)
+        - tok_decode_sink
+      token_length: { type: fixed, value: 1 }
+      transitions:
+        - { condition: { type: token_match, token_id: 100001 }, next_state: done }   # </s> on first token
+        - { condition: { type: steps_complete }, next_state: text_ar }
+
     text_ar:
       # tok_encode → janus_llama → tok_decode (variable, until transition fires).
       # tok_decode writes input_ids/last_token_id back into ctx so the next
@@ -62,16 +82,21 @@ generation_graph:
         - { condition: { type: steps_complete }, next_state: image_vq }
 
     image_vq:
-      # 576 = 24 × 24 VQ grid.  vae_decode in inference mode samples from its
-      # generation head AND looks up the codebook embedding in one call;
-      # vae_decode_to_ar feeds that embedding back into the next iteration's
-      # janus_llama call as inputs_embeds.
+      # No fixed budget — loop until vae_decode signals image completion.
+      # vae_decode in inference mode samples from its generation head AND
+      # looks up the codebook embedding in one call; vae_decode_to_ar feeds
+      # that embedding back into the next iteration's janus_llama call as
+      # inputs_embeds.  On the final patch (e.g. 576-th of a 24×24 grid)
+      # JanusVqvae.decode appends `image_complete=True` to its output dict,
+      # which lands in ctx and fires the ctx_flag transition below.  The
+      # framework auto-clears the flag on transition so it never stale-fires
+      # in image_vq_end.
       body:
         - ar_to_vae_decode    # janus_llama  → vae_decode    (hidden_states)
         - vae_decode_to_ar    # vae_decode   → janus_llama   (embed → inputs_embeds)
-      token_length: { type: fixed, value: 576 }
+      token_length: { type: variable }
       transitions:
-        - { condition: { type: steps_complete }, next_state: image_vq_end }
+        - { condition: { type: ctx_flag, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       # Emit <end_of_image>, run AR once on it.  Mirrors image_vq_start.
@@ -82,8 +107,3 @@ generation_graph:
       token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: steps_complete }, next_state: text_ar }
-
-    done:
-      body: []
-      token_length: { type: fixed, value: 0 }
-      transitions: []

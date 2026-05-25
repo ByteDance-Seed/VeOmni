@@ -375,7 +375,21 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
     # Generation graph painted on top.
     assert cfg.has_generation_graph()
     assert "states" in cfg.generation_graph
-    assert "done" in cfg.generation_graph["states"]
+    # `done` is framework-injected — must NOT be authored in YAML.
+    assert "done" not in cfg.generation_graph["states"], (
+        f"`done` should be auto-injected by GenerationGraph, not declared in {infer_yaml}. "
+        "Remove the `done:` block from the inference YAML."
+    )
+    assert "done_state" not in cfg.generation_graph, (
+        "`done_state` is no longer configurable — the terminal state name is hardcoded to 'done'."
+    )
+    # At least one transition must funnel into the built-in `done` state — otherwise
+    # the FSM has no way to terminate via condition.
+    assert any(
+        t.get("next_state") == "done"
+        for state in cfg.generation_graph["states"].values()
+        for t in state.get("transitions", [])
+    ), f"{infer_yaml} has no transition to `done` — the FSM cannot terminate."
     # Each inference body should reference only edges that exist in the pool.
     for state_name, state in cfg.generation_graph["states"].items():
         for e in state.get("body", []):

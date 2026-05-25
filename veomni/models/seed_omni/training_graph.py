@@ -245,47 +245,88 @@ class TrainingGraph:
         multiple nodes of the same module are visually distinct.  Edges with
         ``to: end`` render as dashed arrows into a single ``end`` terminal.
 
+        Layout
+        ------
+        Direction is ``LR`` (left → right) and active nodes are bucketed into
+        invisible per-rank subgraphs by topological depth.  This forces the
+        renderer to lay out encoders / backbone / heads as parallel columns
+        rather than zig-zagging across the canvas.  The ELK renderer
+        (``defaultRenderer: elk``) is requested up-front so edges route
+        orthogonally with mostly straight segments — closer to what one
+        would draw by hand for a multi-modal training pipeline.
+
+        Single-loss protocol
+        --------------------
+        Each module collects its own scalar ``_loss`` (token-mean over its
+        own micro-batches); ``OmniModel`` sums them.  There is no central
+        ``losses`` collector, so the diagram only carries real data-flow
+        edges — no dashed fan-in to a pseudo loss node.
+
         Parameters
         ----------
         show_io:
             When True (default), draws a dashed ``raw_batch`` pseudo-node
-            feeding every source node, plus a dashed ``losses`` pseudo-node
-            collecting from every active node (each module may emit at most
-            one ``_loss`` scalar).
+            that fans out to every source node so the diagram makes the
+            graph's external inputs explicit.  Pass False for a compact
+            view that drops the pseudo-node.
         title:
             Optional Mermaid ``title:`` directive.
         """
         lines: List[str] = []
         if title:
             lines += ["---", f"title: {title}", "---"]
-        lines.append("flowchart TD")
+        # Request the ELK renderer for orthogonal, mostly-straight edge routing.
+        lines.append("%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%")
+        lines.append("flowchart LR")
 
         sources = set(self.sources)
         sinks = set(self.sinks)
 
-        if show_io:
+        # Topological depth per active node — the rank used for column banding.
+        # Sources sit at depth 0; every other node is one beyond its deepest
+        # active predecessor.  Edges into the virtual `end` don't count.
+        depth: Dict[str, int] = {}
+        active_predecessors: Dict[str, List[str]] = defaultdict(list)
+        for e in self._active_edges:
+            if not is_end(e.to):
+                active_predecessors[e.to].append(e.from_)
+        for n in self._execution_order:
+            preds = active_predecessors.get(n, [])
+            depth[n] = 0 if not preds else 1 + max(depth[p] for p in preds)
+
+        rank_to_nodes: Dict[int, List[str]] = defaultdict(list)
+        for n in self._execution_order:
+            rank_to_nodes[depth[n]].append(n)
+        ranks = sorted(rank_to_nodes)
+
+        if show_io and sources:
             lines.append("    raw_batch[(raw batch)]:::io")
-            lines.append("    losses[(losses)]:::io")
 
-        for n in self.active_nodes():
-            label = f"{n.name}<br/><i>{n.module}.{n.method}</i>"
-            cls = (
-                "both"
-                if n.name in sources and n.name in sinks
-                else "source"
-                if n.name in sources
-                else "sink"
-                if n.name in sinks
-                else "middle"
-            )
-            lines.append(f'    {n.name}["{label}"]:::{cls}')
+        # One invisible subgraph per topological rank — the renderer keeps each
+        # rank as a vertical stack, and the columns line up left-to-right.
+        for r in ranks:
+            lines.append(f"    subgraph col{r} [ ]")
+            lines.append("        direction TB")
+            for n_name in rank_to_nodes[r]:
+                n = self._node_by_name[n_name]
+                label = f"{n.name}<br/><i>{n.module}.{n.method}</i>"
+                cls = (
+                    "both"
+                    if n.name in sources and n.name in sinks
+                    else "source"
+                    if n.name in sources
+                    else "sink"
+                    if n.name in sinks
+                    else "middle"
+                )
+                lines.append(f'        {n.name}["{label}"]:::{cls}')
+            lines.append("    end")
 
-        # Virtual end sink (only drawn when at least one edge targets it).
         has_end = any(is_end(e.to) for e in self._active_edges)
         if has_end:
             lines.append('    end_sink(("end")):::end_sink')
 
-        if show_io:
+        if show_io and sources:
             for n in sorted(sources):
                 lines.append(f"    raw_batch -.-> {n}")
 
@@ -295,9 +336,9 @@ class TrainingGraph:
             target = "end_sink" if is_end(e.to) else e.to
             lines.append(f"    {e.from_} {arrow} {target}")
 
-        if show_io:
-            for n in self._execution_order:
-                lines.append(f"    {n} -.-> losses")
+        # Hide the rank-banding subgraph borders — they only constrain layout.
+        for r in ranks:
+            lines.append(f"    style col{r} fill:transparent,stroke:none")
 
         lines += [
             "    classDef source fill:#dff,stroke:#06c,stroke-width:2px",

@@ -45,8 +45,12 @@
 # YAML — just permissive edges + model-side `is None` guards.
 
 generation_graph:
+  # `done` is auto-injected by the framework — never declare it here, never
+  # set `done_state`.  Transitions whose `next_state: done` will land on the
+  # built-in terminal state which then triggers each module's `finalize`
+  # hook.
+
   initial: prompt_to_text
-  done_state: done
 
   states:
     prompt_to_text:
@@ -75,8 +79,3 @@ generation_graph:
       token_length: { type: variable }
       transitions:
         - { condition: { type: token_match, token_id: 100001 }, next_state: done }   # </s>
-
-    done:
-      body: []
-      token_length: { type: fixed, value: 0 }
-      transitions: []

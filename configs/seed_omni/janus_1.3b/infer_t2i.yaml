@@ -23,8 +23,13 @@
 # the boundary token and the FSM enters the VQ loop.
 
 generation_graph:
+  # `done` is auto-injected by the framework — never declare it here, never
+  # set `done_state`.  The `image_vq_end → done` transition lands on the
+  # built-in terminal state which then triggers each module's `finalize`
+  # hook (e.g. `janus_vqvae.finalize` saves the accumulated VQ patches as
+  # an image on disk).
+
   initial: prompt_to_image
-  done_state: done
 
   states:
     prompt_to_image:
@@ -50,12 +55,19 @@ generation_graph:
         - { condition: { type: steps_complete }, next_state: image_vq }
 
     image_vq:
+      # No fixed budget — loop until vae_decode signals image completion.
+      # JanusVqvae.decode tracks its own grid position internally; on the
+      # final patch (e.g. 576-th for a 24×24 grid, or whenever the model
+      # decides via its own EOS-of-image logic) it appends
+      # `image_complete=True` to its output dict, which lands in ctx and
+      # fires the ctx_flag transition below.  The framework auto-clears
+      # the flag on transition so it never stale-fires in image_vq_end.
       body:
         - ar_to_vae_decode
         - vae_decode_to_ar
-      token_length: { type: fixed, value: 576 }
+      token_length: { type: variable }
       transitions:
-        - { condition: { type: steps_complete }, next_state: image_vq_end }
+        - { condition: { type: ctx_flag, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       # Janus T2I-only: emit <end_of_image> for symmetry, then stop.  No
@@ -67,8 +79,3 @@ generation_graph:
       token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: steps_complete }, next_state: done }
-
-    done:
-      body: []
-      token_length: { type: fixed, value: 0 }
-      transitions: []

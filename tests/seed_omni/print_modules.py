@@ -91,7 +91,30 @@ class PrintVQVAE(_PrintBase):
     * ``decode(hidden_states, gt_token_ids?)``
       → training: ``_loss`` (CE over VQ tokens at gen-image positions).
       → inference: ``embed`` (next-step input for the AR backbone).
+
+    Inference termination signal
+    ----------------------------
+    A real Janus VQ decoder loops over a fixed grid (24×24 = 576 patches)
+    and raises an internal "image complete" event on the final patch; the
+    FSM's ``image_vq`` state runs ``token_length: variable`` and listens
+    for that event via a ``ctx_flag(image_complete)`` transition.
+
+    Tests configure the simulated grid size via ``image_steps`` — after
+    ``image_steps`` consecutive inference ``decode()`` calls the module
+    appends ``image_complete=True`` to its output dict and resets the
+    counter (so the next image span starts fresh).  ``image_steps=None``
+    (the default) disables the signal entirely.
     """
+
+    def __init__(
+        self,
+        name: str,
+        log: List[str],
+        image_steps: Optional[int] = None,
+    ):
+        super().__init__(name, log)
+        self._image_steps: Optional[int] = image_steps
+        self._decode_calls: int = 0
 
     def encode(self, **kwargs: Any) -> Dict[str, Any]:
         self._record("encode", **kwargs)
@@ -104,7 +127,14 @@ class PrintVQVAE(_PrintBase):
         self._record("decode", **kwargs)
         if kwargs.get("gt_token_ids") is not None:
             return {"_loss": _scalar_loss(0.7)}
-        return {"embed": "<vq_decode_embed>"}
+        # Inference path — emit `image_complete` on the last patch of the
+        # simulated grid, then reset the counter for the next image span.
+        self._decode_calls += 1
+        out: Dict[str, Any] = {"embed": "<vq_decode_embed>"}
+        if self._image_steps is not None and self._decode_calls >= self._image_steps:
+            out["image_complete"] = True
+            self._decode_calls = 0
+        return out
 
 
 # ── Text embedding head: encode (wte) + decode (LM head) ─────────────────────

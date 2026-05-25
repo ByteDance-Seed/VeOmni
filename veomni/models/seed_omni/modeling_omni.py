@@ -55,6 +55,16 @@ Inference
   * ``fsm.maybe_transition(ctx)`` — first matching condition wins.
   * Stop when ``fsm.is_done()`` or ``max_new_tokens`` exhausts.
 
+Once the FSM reaches the built-in ``done`` state (auto-injected by
+``GenerationGraph`` — never declared in YAML), ``generate`` calls
+:meth:`OmniModule.finalize` on every active module and merges any non-empty
+return values into ``ctx['finalize'][<module_name>]``.  This is where
+modules turn their accumulated step outputs into something usable:
+``TextEmbed.finalize`` tokenizer-decodes all generated ``input_ids``,
+``JanusVqvae.finalize`` saves accumulated VQ patches as images on disk,
+etc.  The default ``finalize`` is a no-op so modules that have nothing to
+report cost nothing.
+
 Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
 print-driven flow tests collect the visit log from there to assert the
 expected node order and transition timing.
@@ -249,6 +259,24 @@ class OmniModel(nn.Module):
                     break
 
             self.generation_graph.maybe_transition(ctx, trace=trace)
+
+        # Finalize: hand ctx + request to every active module's `finalize`
+        # hook.  This is the framework's contract for "what does the built-in
+        # `done` state actually do" — modules turn accumulated step outputs
+        # into usable artefacts (decoded text, saved images, waveforms).
+        # We collect non-empty returns under a single `finalize` sub-dict so
+        # callers have one place to look without polluting the main ctx.
+        finalize_outputs: Dict[str, Dict[str, Any]] = {}
+        for name, raw in self.named_omni_modules():
+            out = raw.finalize(ctx=ctx, request=request)
+            if not isinstance(out, dict):
+                raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
+            if out:
+                finalize_outputs[name] = out
+                if trace is not None:
+                    trace.append(f"finalize:{name}")
+        if finalize_outputs:
+            ctx["finalize"] = finalize_outputs
 
         return ctx
 

@@ -53,6 +53,19 @@ Optional hooks
     The global tokenizer lives at ``OmniConfig.tokenizer_path`` and is NOT
     returned here.  Default: ``[]``.
 
+``finalize(*, ctx, request) -> dict``
+    Inference-only post-processing hook called *once* when the FSM
+    enters the framework-injected ``done`` state.  Override to dump
+    accumulated outputs — e.g. tokenizer-decode all generated text,
+    save accumulated VQ patches as images, write audio waveforms.
+    The framework does not impose an accumulation scheme; modules that
+    need cross-step history are responsible for maintaining it inside
+    ``ctx`` during ``generate_step`` (typical shape: append the current
+    step's ``last_token_id`` / ``vq_token_id`` into a running list).
+    Return value is collected under ``ctx['finalize'][<module_name>]``
+    so callers can read decoded text, image paths, etc.  Default:
+    ``{}`` (no-op — module has nothing to finalize).
+
 ``dummy_inputs(*, batch_size, device, dtype) -> dict``
     Zero-tensor placeholders the trainer fills in **during training** for
     micro-batches that are missing one of this module's inputs (e.g. a
@@ -187,6 +200,26 @@ class OmniModule:
         LM head samples a token here.
         """
         return self.forward(**kwargs)
+
+    def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
+        """Post-generation hook called once when the FSM enters ``done``.
+
+        ``OmniModel.generate`` invokes this on every active module after the
+        FSM loop terminates, then merges any non-empty return values into
+        ``ctx['finalize'][<module_name>]``.  Use it to dump the module's
+        accumulated outputs to a usable form — e.g. tokenizer-decode
+        ``input_ids`` to text, save VQ patch sequences as images on disk,
+        write audio waveforms.
+
+        The framework imposes **no accumulation scheme**: modules that need
+        per-step history (which most generative modules do — text, images,
+        audio) are responsible for appending into a running list inside
+        ``ctx`` during their ``generate_step``, then reading it back here.
+
+        Inference-only.  Default: ``{}`` (no-op — module has nothing to
+        finalize).
+        """
+        return {}
 
     # ── Parallelism / assets ──────────────────────────────────────────────────
 

@@ -69,6 +69,18 @@ expose specialised inference routines.
 
         ``{type: steps_complete}``
             Fires when the current state has run its allotted iterations.
+            Useless on a ``token_length: variable`` state (steps_done never
+            reaches ``None``).
+
+        ``{type: ctx_flag, key: K}``
+            Fires when ``context[K]`` is truthy.  Used by states that loop
+            until a *module* declares completion — the module writes
+            ``ctx[K] = True`` from inside its ``generate_step`` (e.g. a VQ
+            decoder emits ``image_complete = True`` after the final patch
+            of a 24×24 grid; an audio codec emits ``audio_complete = True``
+            on EOS-of-audio).  The framework **auto-clears** ``ctx[K]``
+            once the transition fires so a stale flag never leaks into the
+            next state.  Pair with ``token_length: variable``.
 
         ``{type: always}``
             Unconditional — useful as a fallback / terminal transition.
@@ -94,19 +106,48 @@ from typing import Any, Callable, Dict, List, Optional
 from .graph import END, EdgeDef, NodeDef, is_end
 
 
+# Reserved name for the framework-injected terminal state.  Every FSM
+# automatically gains a ``done`` state with empty body, no transitions, and
+# zero-length token budget — users must NOT declare it in their YAML.  All
+# transitions whose ``next_state`` is ``"done"`` therefore land on this
+# built-in state, and ``OmniModel.generate`` calls each active module's
+# :meth:`OmniModule.finalize` hook once the FSM enters it.
+DONE_STATE_NAME: str = "done"
+
+
 # ── Condition helpers ─────────────────────────────────────────────────────────
+
+
+_KNOWN_CONDITION_TYPES = frozenset({"token_match", "steps_complete", "ctx_flag", "always"})
 
 
 @dataclass
 class _Condition:
     type: str
     token_id: Optional[int] = None
+    key: Optional[str] = None  # used by ctx_flag
+
+    def __post_init__(self) -> None:
+        # Catch malformed YAML at FSM build time, not at first transition
+        # check (which would otherwise silently never fire).
+        if self.type not in _KNOWN_CONDITION_TYPES:
+            raise ValueError(f"Unknown FSM condition type '{self.type}'. Supported: {sorted(_KNOWN_CONDITION_TYPES)}.")
+        if self.type == "token_match" and self.token_id is None:
+            raise ValueError("Condition `token_match` requires `token_id`.")
+        if self.type == "ctx_flag" and not self.key:
+            raise ValueError("Condition `ctx_flag` requires a non-empty `key`.")
+        if self.type != "token_match" and self.token_id is not None:
+            raise ValueError(f"Condition `{self.type}` does not accept `token_id`.")
+        if self.type != "ctx_flag" and self.key is not None:
+            raise ValueError(f"Condition `{self.type}` does not accept `key`.")
 
     def check(self, context: Dict[str, Any], steps_done: int, total_steps: Optional[int]) -> bool:
         if self.type == "token_match":
             return context.get("last_token_id") == self.token_id
         if self.type == "steps_complete":
             return total_steps is not None and steps_done >= total_steps
+        if self.type == "ctx_flag":
+            return bool(context.get(self.key))
         if self.type == "always":
             return True
         return False
@@ -114,6 +155,8 @@ class _Condition:
     def describe(self) -> str:
         if self.type == "token_match":
             return f"token_match({self.token_id})"
+        if self.type == "ctx_flag":
+            return f"ctx_flag({self.key})"
         return self.type
 
 
@@ -252,10 +295,42 @@ class GenerationGraph:
         self._node_pool: Dict[str, NodeDef] = node_pool
         self._edge_pool: Dict[str, EdgeDef] = edge_pool
 
+        # `done` is reserved — auto-injected below.  Users must NOT redeclare
+        # it; doing so silently lets a custom body/transitions override the
+        # framework's terminal semantics, which is exactly the kind of magic
+        # we are trying to avoid.
+        if DONE_STATE_NAME in fsm_config["states"]:
+            raise ValueError(
+                f"State name '{DONE_STATE_NAME}' is reserved and auto-injected by the framework. "
+                f"Remove the explicit `{DONE_STATE_NAME}:` block from your generation_graph YAML — "
+                f"transitions targeting `next_state: {DONE_STATE_NAME}` will land on the built-in "
+                f"terminal state, which then triggers each active module's `finalize` hook."
+            )
+        # The pre-existing `done_state` config knob is gone — the framework
+        # always uses `DONE_STATE_NAME`.  If the user still has it lying
+        # around, reject loudly so they migrate cleanly.
+        if "done_state" in fsm_config:
+            raise ValueError(
+                "`generation_graph.done_state` is no longer configurable — the terminal state "
+                f"is hardcoded to '{DONE_STATE_NAME}'. Remove the `done_state:` line from your "
+                "generation_graph YAML."
+            )
+
         self._initial: str = fsm_config["initial"]
         self._states: Dict[str, _State] = {
             name: _State(name, spec, node_pool, edge_pool) for name, spec in fsm_config["states"].items()
         }
+
+        # Inject the built-in terminal state.  Empty body, zero-length token
+        # budget, no outgoing transitions: the FSM "rests" here and the
+        # orchestrator picks up the post-processing baton via finalize hooks.
+        self._states[DONE_STATE_NAME] = _State(
+            DONE_STATE_NAME,
+            {"body": [], "token_length": {"type": "fixed", "value": 0}, "transitions": []},
+            node_pool,
+            edge_pool,
+        )
+
         if self._initial not in self._states:
             raise KeyError(
                 f"GenerationGraph initial state '{self._initial}' not in declared states {sorted(self._states)}."
@@ -267,11 +342,7 @@ class GenerationGraph:
                         f"State '{name}' transitions to undeclared state "
                         f"'{trans.next_state}' (known states: {sorted(self._states)})."
                     )
-        self._done_sentinel: Optional[str] = fsm_config.get("done_state")
-        if self._done_sentinel is not None and self._done_sentinel not in self._states:
-            raise KeyError(
-                f"GenerationGraph done_state '{self._done_sentinel}' not in declared states {sorted(self._states)}."
-            )
+        self._done_sentinel: str = DONE_STATE_NAME
 
         # Runtime state — reset before each generate call.
         self._current: str = self._initial
@@ -289,8 +360,8 @@ class GenerationGraph:
         self._total_steps = self._current_state.token_length.resolve(self._request, {})
 
     def is_done(self) -> bool:
-        """Return True when the FSM has reached the configured terminal state."""
-        return self._done_sentinel is not None and self._current == self._done_sentinel
+        """Return True when the FSM has reached the framework-injected terminal state."""
+        return self._current == self._done_sentinel
 
     # ── Step & Transition ─────────────────────────────────────────────────────
 
@@ -448,12 +519,20 @@ class GenerationGraph:
         """Check transitions for the current state.
 
         Returns True if a transition fired (state changed).
+
+        For ``ctx_flag`` transitions the matched key is popped from
+        ``context`` *after* logging the trace and *before* the state
+        switch — this keeps a one-shot signal from re-firing the same
+        transition (or unintentionally firing a transition with the same
+        flag in the next state).
         """
         state = self._current_state
         for trans in state.transitions:
             if trans.condition.check(context, self._steps_in_state, self._total_steps):
                 if trace is not None:
                     trace.append(f"transition: {state.name} -> {trans.next_state} [{trans.condition.describe()}]")
+                if trans.condition.type == "ctx_flag" and trans.condition.key is not None:
+                    context.pop(trans.condition.key, None)
                 self._transition_to(trans.next_state, context)
                 return True
         return False
@@ -483,42 +562,132 @@ class GenerationGraph:
     # ── Visualization ─────────────────────────────────────────────────────────
 
     def to_mermaid(self, title: Optional[str] = None) -> str:
-        """Render the FSM as a Mermaid ``stateDiagram-v2``.
+        """Render the FSM as a Mermaid ``flowchart LR`` with body subgraphs.
 
-        Each state is annotated with its derived node sequence and its
-        ``token_length`` policy.  Transitions are labelled with the condition;
-        the initial state is connected from ``[*]`` and the configured
-        ``done_state`` (if any) flows to ``[*]``.
+        Visual conventions
+        ------------------
+        Each non-``done`` state is rendered as a labelled subgraph whose
+        interior is a mini-flow over the body's data edges (same
+        ``output → as`` labels as the training graph; ``to: end`` sink
+        edges are filtered out since they don't carry data — they only
+        pin a node into the body).  The body's node names inside the
+        subgraph are namespaced as ``<state>__<node>`` so the same node
+        can appear in multiple states without ID collisions.
+
+        A dashed self-loop on each subgraph carries the iteration count:
+
+        * ``token_length: fixed: N``  → label ``×N``
+        * ``variable`` / ``from_request[K]`` / ``from_generated_text[K]``
+          → no label.  These have no static upper bound, matching
+          "如果没有次数限制那就不写数字".
+
+        State transitions are thick arrows (``==>``) carrying the firing
+        condition (e.g. ``token_match(100016)``, ``steps_complete``).
+        The line weight + simpler label distinguishes them visually from
+        the intra-body data edges.
+
+        A small ``▶`` node marks FSM entry; a small ``⏹`` terminal absorbs
+        every transition that targets the built-in ``done`` state.  The
+        ``done`` state itself is NOT drawn — its body is empty by
+        construction (framework-injected, not user-declared), and
+        rendering it would just add a redundant box.
+
+        Layout uses ``flowchart LR`` + the ELK renderer to match the
+        training graph's left-to-right column-banded look.
         """
         lines: List[str] = []
         if title:
             lines += ["---", f"title: {title}", "---"]
-        lines.append("stateDiagram-v2")
+        lines.append("%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%")
+        lines.append("flowchart LR")
 
-        lines.append(f"    [*] --> {self._initial}")
+        done_name = self._done_sentinel
 
+        # ── Entry / terminal markers (small circles) ──────────────────────────
+        lines.append('    fsm_start(("▶")):::fsm_start')
+        has_done_target = done_name is not None and any(
+            trans.next_state == done_name for state in self._states.values() for trans in state.transitions
+        )
+        if has_done_target:
+            lines.append('    fsm_done(("⏹")):::fsm_terminal')
+
+        # ── Body subgraphs (skip the done state — empty body, no value) ───────
+        drawn: List[str] = []
         for name, state in self._states.items():
-            seq_str = " → ".join(state.node_sequence) if state.node_sequence else "(empty)"
-            tl_str = state.token_length.describe()
-            label = f"{name}<br/>nodes: [{seq_str}]<br/>token_length: {tl_str}"
-            lines.append(f"    {name} : {label}")
+            if name == done_name:
+                continue
+            drawn.append(name)
+            lines.append(f"    subgraph state_{name} [{name}]")
+            lines.append("        direction LR")
+            for n_name in state.node_sequence:
+                n = self._node_pool[n_name]
+                node_label = f"{n.name}<br/><i>{n.module}.{n.method}</i>"
+                lines.append(f'        {name}__{n.name}["{node_label}"]:::body_node')
+            for e in state.body:
+                if is_end(e.to):
+                    # `to: end` sinks are declarative pins — they don't carry
+                    # data, so they don't appear inside the body's mini-flow.
+                    continue
+                edge_label = self._edge_label(e)
+                arrow = f"-->|{edge_label}|" if edge_label else "-->"
+                lines.append(f"        {name}__{e.from_} {arrow} {name}__{e.to}")
+            lines.append("    end")
 
-        for name, state in self._states.items():
-            for trans in state.transitions:
-                lines.append(f"    {name} --> {trans.next_state} : {trans.condition.describe()}")
+        # ── Self-loops carrying the per-state iteration count ─────────────────
+        for name in drawn:
+            loop_label = self._loop_label(self._states[name].token_length)
+            if loop_label:
+                lines.append(f'    state_{name} -.->|"{loop_label}"| state_{name}')
+            else:
+                lines.append(f"    state_{name} -.-> state_{name}")
 
-        if self._done_sentinel and self._done_sentinel in self._states:
-            lines.append(f"    {self._done_sentinel} --> [*]")
+        # ── Entry edge ────────────────────────────────────────────────────────
+        if self._initial in self._states and self._initial != done_name:
+            lines.append(f"    fsm_start ==> state_{self._initial}")
 
+        # ── State transitions (thick ==> arrows with quoted condition labels) ─
+        for name in drawn:
+            for trans in self._states[name].transitions:
+                if trans.next_state == done_name:
+                    target = "fsm_done"
+                else:
+                    target = f"state_{trans.next_state}"
+                cond = trans.condition.describe()
+                lines.append(f'    state_{name} ==>|"{cond}"| {target}')
+
+        # ── Class definitions / styling ──────────────────────────────────────
         lines += [
-            "    classDef initial fill:#dff,stroke:#06c,stroke-width:2px",
-            "    classDef terminal fill:#eee,stroke:#666,stroke-width:1px,stroke-dasharray:3 3",
-            f"    class {self._initial} initial",
+            "    classDef body_node fill:#fff,stroke:#666",
+            "    classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px",
+            "    classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3",
         ]
-        if self._done_sentinel and self._done_sentinel in self._states:
-            lines.append(f"    class {self._done_sentinel} terminal")
+        if self._initial in self._states and self._initial != done_name:
+            # Highlight the initial state's subgraph background to mirror the
+            # training graph's source-node colouring (light blue accent).
+            lines.append(f"    style state_{self._initial} fill:#eef,stroke:#06c,stroke-width:2px")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _edge_label(e: EdgeDef) -> str:
+        """Render a body edge's data-routing label — same shape as the training graph's."""
+        if e.output_key and e.as_ and e.output_key != e.as_:
+            return f'"{e.output_key} → {e.as_}"'
+        if e.output_key:
+            return f'"{e.output_key}"'
+        return ""
+
+    @staticmethod
+    def _loop_label(tl: _TokenLength) -> str:
+        """Self-loop label encoding the iteration count.
+
+        Only ``fixed: N`` produces a static count (``×N``).  Variable and
+        runtime-resolved kinds (``from_request`` / ``from_generated_text``)
+        return an empty string — the loop arrow is drawn unlabelled.
+        """
+        if tl.type == "fixed" and tl.value is not None:
+            return f"×{tl.value}"
+        return ""
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

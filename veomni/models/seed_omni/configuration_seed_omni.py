@@ -47,9 +47,13 @@ YAML structure (maps 1-to-1 to this class):
 
   # ── Inference FSM.  Each state.body is a list of EDGE NAMES; node order
   #    is derived (unique endpoints in declaration order, excluding `end`).
+  #    The `done` state is auto-injected by the framework — never declare
+  #    it here, never set `done_state`.  Transitions whose
+  #    `next_state: done` land on the built-in terminal state which then
+  #    triggers each active module's `finalize` hook (text decode /
+  #    image save / etc).
   generation_graph:
     initial: text_ar
-    done_state: done
     states:
       text_ar:
         body: [tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
@@ -61,10 +65,6 @@ YAML structure (maps 1-to-1 to this class):
         token_length: {type: fixed, value: 576}
         transitions:
           - {condition: {type: steps_complete}, next_state: text_ar}
-      done:
-        body: []
-        token_length: {type: fixed, value: 0}
-        transitions: []
 """
 
 from copy import deepcopy
